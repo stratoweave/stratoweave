@@ -1,4 +1,4 @@
-GENERATED_ACT := src/stratoweave/device_meta_config.act src/stratoweave/ietf_restconf_monitoring.act
+GENERATED_ACT := src/stratoweave/device_meta_config.act src/stratoweave/ietf_restconf_monitoring.act src/stratoweave/ietf_yang_library.act
 
 .PHONY: build
 build: $(GENERATED_ACT)

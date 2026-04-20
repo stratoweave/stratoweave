@@ -3,10 +3,12 @@ import http_router
 import json
 import logging
 import net
+import hash.wyhash as wyhash
 import xml
 
 import stratoweave.device as swdev
 import stratoweave.ietf_restconf_monitoring as rcmon
+import stratoweave.ietf_yang_library as yl
 import stratoweave.tmf_api
 import stratoweave.ttt as ttt
 import yang
@@ -113,13 +115,23 @@ def _node_with_ns(node: yang.gdata.Node, snode: yang.schema.DNode) -> yang.gdata
     raise ValueError("Unexpected node type for RESTCONF GET serialization: {type(node)}")
 
 
-def _build_restconf_monitoring_gdata(top_schema: yang.schema.DRoot) -> yang.gdata.Node:
+def _build_restconf_monitoring_gdata(schemas: list[yang.schema.DRoot]) -> yang.gdata.Node:
     """Build an ietf-restconf-monitoring datastore view (as gdata).
+
+    The `capabilities` leaf-list advertises RESTCONF protocol capabilities and
+    one module capability URI per module in the merged `module_metadata` of
+    every provided schema, so it reflects the same namespace set that
+    ietf-yang-library advertises.
     """
     capabilities = ["urn:ietf:params:restconf:capability:defaults:1.0?basic-mode=explicit"]
 
-    for ns in sorted(top_schema.module_metadata.keys()):
-        meta = top_schema.module_metadata[ns]
+    merged_meta = {}
+    for schema in schemas:
+        for ns, meta in schema.module_metadata.items():
+            merged_meta[ns] = meta
+
+    for ns in sorted(merged_meta.keys()):
+        meta = merged_meta[ns]
         uri = "{ns}?module={meta.module}"
         if meta.revision is not None:
             uri += "&revision={meta.revision}"
@@ -132,6 +144,83 @@ def _build_restconf_monitoring_gdata(top_schema: yang.schema.DRoot) -> yang.gdat
             ),
         ),
     )
+    return root.to_gdata()
+
+
+def _build_yang_library_gdata(schemas: list[yang.schema.DRoot]) -> yang.gdata.Node:
+    """Build an ietf-yang-library datastore view (as gdata).
+
+    Walks every provided schema to construct a unified library view so that the
+    advertised set reflects every top-level subtree this server actually serves
+    (CFS + each operational view), not just a single schema.
+
+    A module is classified as `implement` iff any schema has a top-level node
+    (data node, RPC, or notification) in that namespace; everything else goes
+    under `import-only-module`. This keeps purely imported modules
+    (ietf-inet-types, ietf-yang-types, ietf-datastores, ...) from being
+    misadvertised as implemented.
+
+    `content-id` is a deterministic hash of the assembled `yang-library`
+    subtree using a fixed placeholder content-id, so it changes whenever any
+    served YANG library content changes.
+    """
+    merged_meta = {}
+    implemented_ns = set()
+    for schema in schemas:
+        for ns, meta in schema.module_metadata.items():
+            merged_meta[ns] = meta
+        for child in schema.children:
+            implemented_ns.add(child.namespace)
+        for rpc in schema.rpcs:
+            implemented_ns.add(rpc.namespace)
+        # TODO: notifications?
+
+    modules = []
+    import_only_modules = []
+    for ns in sorted(merged_meta.keys()):
+        meta = merged_meta[ns]
+        rev_opt = meta.revision
+        if ns in implemented_ns:
+            modules.append(yl.ietf_yang_library__yang_library__module_set__module_entry(
+                name=meta.module,
+                namespace=ns,
+                revision=rev_opt,
+            ))
+        else:
+            import_only_modules.append(yl.ietf_yang_library__yang_library__module_set__import_only_module_entry(
+                name=meta.module,
+                revision=rev_opt if rev_opt is not None else "",
+                namespace=ns,
+            ))
+
+    module_set = [
+        yl.ietf_yang_library__yang_library__module_set_entry(
+            name="default",
+            module=modules,
+            import_only_module=import_only_modules,
+        ),
+    ]
+    schema = [
+        yl.ietf_yang_library__yang_library__schema_entry(
+            name="default",
+            module_set=["default"],
+        ),
+    ]
+    datastore = [
+        yl.ietf_yang_library__yang_library__datastore_entry(
+            name=yl.ietf_datastores_running,
+            schema="default",
+        ),
+    ]
+    yang_library = yl.ietf_yang_library__yang_library(
+        content_id="__content_id_placeholder__",
+        module_set=module_set,
+        schema=schema,
+        datastore=datastore,
+    )
+    root = yl.root(yang_library=yang_library)
+    content_id = wyhash.hash(0, root.to_gdata().prsrc(deterministic=True).encode())
+    yang_library.content_id = str(content_id)
     return root.to_gdata()
 
 
@@ -201,13 +290,16 @@ actor HttpServer(
     _ROUTER_CTX_DEVICE_KEY = "dev"
     http_log = logging.Logger(log_handler)
 
+    # Use an actor method because a lambda whose body is an actor action call
+    # `lambda: cfs.newsession().get()` gets the action effect and yields a
+    # Msg[gdata.Node] at runtime, which must be awaited on
     def _top_data():
-        session = cfs.newsession()
-        return session.get()
+        return cfs.newsession().get()
 
-    _restconf_views: list[(schema: yang.schema.DRoot, data: proc() -> yang.gdata.Node)] = [
-        (schema=rcmon.SRC_DNODE, data=lambda: _build_restconf_monitoring_gdata(top_schema)),
-        (schema=top_schema, data=_top_data),
+    _restconf_views = [
+        _RestconfView(rcmon.SRC_DNODE, lambda: _build_restconf_monitoring_gdata([top_schema, rcmon.SRC_DNODE, yl.SRC_DNODE])),
+        _RestconfView(yl.SRC_DNODE, lambda: _build_yang_library_gdata([top_schema, rcmon.SRC_DNODE, yl.SRC_DNODE])),
+        _RestconfView(top_schema, _top_data)
     ]
     _restconf_view_by_module = _build_restconf_view_by_module(_restconf_views)
 
@@ -636,6 +728,23 @@ actor HttpServer(
         # RESTCONF root resource discovery
         respond(200, {"Content-Type": "application/xrd+xml"}, '<XRD xmlns="http://docs.oasis-open.org/ns/xri/xrd-1.0">\n  <Link rel="restconf" href="{restconf_root}"/>\n</XRD>')
 
+    def _router_handle_yang_library_version(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        yl_meta = yl.SRC_DNODE.module_metadata["urn:ietf:params:xml:ns:yang:ietf-yang-library"]
+        rev_opt = yl_meta.revision
+        if rev_opt is not None:
+            accept = ctx.request.headers.get("accept")
+            if accept is not None and accept not in {"application/yang-data+json", "application/yang-data+xml"}:
+                respond(406, {}, "Not Acceptable")
+                return
+            if accept == "application/yang-data+xml":
+                respond(200, {"Content-Type": "application/yang-data+xml"},
+                    '<yang-library-version xmlns="urn:ietf:params:xml:ns:yang:ietf-restconf">{rev_opt}</yang-library-version>')
+            else:
+                respond(200, {"Content-Type": "application/yang-data+json"},
+                    json.encode({"ietf-restconf:yang-library-version": rev_opt}))
+            return
+        respond(500, {}, "Missing ietf-yang-library revision")
+
     def _router_build_restconf_routes(g: http_router.RouteGroup):
         g.get("/*rest_path", _router_handle_restconf_get)
         g.post("/*rest_path", _router_handle_restconf_write)
@@ -650,6 +759,7 @@ actor HttpServer(
     http_router_root.get("/config-queue", _router_handle_config_queue)
     http_router_root.get("/device", _router_handle_device_list)
     http_router_root.route("/device/{{name}}", _router_build_device_routes)
+    http_router_root.get("{restconf_root}/yang-library-version", _router_handle_yang_library_version)
     http_router_root.route("{restconf_root}/data", _router_build_restconf_routes)
     http_router_root.get("/layer/{{idx}}", _router_handle_layer_get)
 
