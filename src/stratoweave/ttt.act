@@ -128,24 +128,26 @@ class LinkUpdate():
         return v == s if isinstance(v, str) else False
 
 class CfgResult():
-    pass
-
-class CfgOk(CfgResult):
     empty: bool
     requests: list[LinkRequest]
     updates: list[LinkUpdate]
-    def __init__(self, empty=False, requests=[], updates=[]):
+    errors: list[Exception]
+    def __init__(self, empty=False, requests=[], updates=[], errors=[]):
         self.empty = empty
         self.requests = requests
         self.updates = updates
+        self.errors = errors
     def __str__(self):
-        return 'CfgOk(empty=True)' if self.empty else 'CfgOk()'
+        if self.errors:
+            return 'CfgError(' + str(self.errors) + ')'
+        else:
+            return 'CfgOk(empty=True)' if self.empty else 'CfgOk()'
 
-class CfgError(CfgResult):
-    def __init__(self, exception: Exception):
-        self.exception = exception
-    def __str__(self):
-        return 'CfgError(' + str(self.exception) + ')'
+def CfgOk(empty=False, requests=[], updates=[]):
+    return CfgResult(empty, requests, updates, [])
+
+def CfgError(exception: Exception):
+    return CfgResult(empty=False, requests=[], updates=[], errors=[exception])
 
 
 class Path():
@@ -450,11 +452,6 @@ actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_
                     return
             else:
                 raise ValueError("Missing DB buffer for staged DB flush")
-        else:
-            commit(tid, True)
-            edit_config_finish("Ok", True)
-            return
-
         commit(tid, True)
         edit_config_finish("Ok", True)
 
@@ -465,29 +462,26 @@ actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_
         configure(tid, {'_': diff})
         res = apply(tid, force)
         #print('   #', tid, '(Layer)', name, 'EDIT_CONFIG', 'PREP RESULT', res, err=True)
-        requests, updates = (res.requests, res.updates) if isinstance(res, CfgOk) else ([], [])
-        while requests or updates:
-            res = root.linkage(tid, requests, updates, lower, dbuf)
-            requests, updates = (res.requests, res.updates) if isinstance(res, CfgOk) else ([], [])
-        if isinstance(res, CfgOk):
+        while res.requests or res.updates:
+            res = root.linkage(tid, res.requests, res.updates, lower, dbuf)
+        if not res.errors:
             done_cont = done
             comp_cont = complete
             lock(tid, edit_config_cont)                                     # yield await
         else:
-            result = res.exception if isinstance(res, CfgError) else 'Ok'
             if done is not None:
-                done(result)
+                done(res.errors[0])
             if complete is not None:
-                complete(result)
+                complete(res.errors[0])
 
     def edit_config_cont(res):
         #print('####', tid_state, '(Layer)', name, 'edit_config_cont', err=True)
         if tid_state is not None:
-            if isinstance(res, CfgOk):
+            if not res.errors:
                 _flush_dbuffer_then_commit()
             else:
                 commit(tid_state, False)
-                edit_config_finish(res.exception if isinstance(res, CfgError) else 'Ok', False)
+                edit_config_finish(res.errors[0], False)
 
     def edit_config_finish(result: value, ok: bool):
         if tid_state is not None:
@@ -512,7 +506,7 @@ actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_
         buf = {}
         #print('   #', tid, '(Layer)', name, 'APPLY\n' + per_src(diff), err=True)
         res = root.configure(tid, diff, lower, force, dbuf)
-        if not isinstance(res, CfgError) and lower is not None:
+        if not res.errors and lower is not None:
             res = lower.apply(tid, force=False)
         #print('   #', tid, '(Layer)', name, 'APPLY RESULT', res, err=True)
         return res
@@ -523,9 +517,9 @@ actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_
         if buf:                                         # An upper layer has re-configured
             #print('####', tid, '(Layer)', name, 'LOCK RE-APPLY', err=True)
             res = apply(tid, force=False)
-            if isinstance(res, Exception):
+            if res.errors:
                 if done is not None:
-                    done(CfgError(res))
+                    done(res)
                 return
         tid_state = tid
         lock_cont = done
@@ -565,12 +559,12 @@ actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_
         tid = 'tr' + actorid()
         #print('####', tid, '(Layer)', name, 'recompute', actorid(), err=True)
         res = apply(tid, force)
-        if isinstance(res, CfgOk):
+        if not res.errors:
             done_cont = done
             comp_cont = complete
             lock(tid, edit_config_cont)                                     # yield await
         else:
-            result = res.exception if isinstance(res, CfgError) else 'Ok'
+            result = res.errors[0]
             if done is not None:
                 done(result)
             if complete is not None:
@@ -694,15 +688,13 @@ class _ContainerTransaction(_Transaction):
         empty = True
         requests = []
         updates = []
+        errors = []
         for r in results.values():
-            if isinstance(r, CfgError):
-                #print('   # ...... (Container)', _format_path(self.path), 'ANALYZE ERROR:', r, err=True)
-                return r
-            if isinstance(r, CfgOk):
-                empty = empty and r.empty
-                requests += r.requests
-                updates += r.updates
-        r = CfgOk(empty, requests, updates)
+            empty = empty and r.empty
+            requests += r.requests
+            updates += r.updates
+            errors += r.errors
+        r = CfgResult(empty, requests, updates, errors)
         #print('   # ...... (Container)', _format_path(self.path), 'ANALYZE RESULT:', r, err=True)
         return r
 
@@ -979,7 +971,7 @@ class _ListTransaction(_Transaction):
 
         def op(key, res):
             path = _db_path(self.path) + [key]
-            if isinstance(res, CfgOk) and not res.empty and key in leaves_by_key:
+            if not res.errors and not res.empty and key in leaves_by_key:
                 return swdb.put_op(path, swdb.ATTR_KEYS, gdata.Container(leaves_by_key[key]))
             else:
                 return swdb.del_op(path, swdb.ATTR_KEYS)
@@ -991,16 +983,14 @@ class _ListTransaction(_Transaction):
         empty = True
         requests = []
         updates = []
+        errors = []
         for r in results.values():
-            if isinstance(r, CfgError):
-                #print('   # ...... (List)', _format_path(self.path), 'ANALYZE ERROR:', r, err=True)
-                return r
-            if isinstance(r, CfgOk):
-                empty = empty and r.empty
-                requests += r.requests
-                updates += r.updates
+            empty = empty and r.empty
+            requests += r.requests
+            updates += r.updates
+            errors += r.errors
         #print('   # ...... (List)', _format_path(self.path), 'ANALYZE RESULT:', res, err=True)
-        return CfgOk(empty, requests, updates)
+        return CfgResult(empty, requests, updates, errors)
 
     def linkage(self, tid, requests, updates, out, dbuf):
         results = {}
@@ -1051,7 +1041,7 @@ class _ListTransaction(_Transaction):
             tr.commit(tid, ok)
         deletes = set()
         for key,res in self.accum.items():
-            if isinstance(res, CfgOk) and res.empty:
+            if res.empty:
                 #print('   #', tid, '(List)', _format_path(self.path), 'DELETE ELEMENT', key, err=True)
                 deletes.add(key)
         self.liststate.release(tid, ok, deletes)
