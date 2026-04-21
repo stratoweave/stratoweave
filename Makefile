@@ -1,24 +1,24 @@
 .PHONY: build
-build: src/orchestron/device_meta_config.act
+build: src/stratoweave/device_meta_config.act
 	acton build $(DEP_OVERRIDES)
 
 .PHONY: build-ldep
-build-ldep: src/orchestron/device_meta_config.act
+build-ldep: src/stratoweave/device_meta_config.act
 	$(MAKE) build DEP_OVERRIDES="--dep yang=../acton-yang --dep netconf=../netconf --dep http_router=../http-router --dep actmf=../actmf"
 
 .PHONY: gen
-gen: src/orchestron/device_meta_config.act
+gen: src/stratoweave/device_meta_config.act
 
 .PHONY: gen-ldep
 gen-ldep: DEP_OVERRIDES=--dep yang=../acton-yang
-gen-ldep: src/orchestron/device_meta_config.act
+gen-ldep: src/stratoweave/device_meta_config.act
 	$(MAKE) --always-make gen DEP_OVERRIDES="--dep yang=../acton-yang"
 
-src/orchestron/device_meta_config.act: gen_dmc/out/bin/gen_dmc src/orchestron/yang.act
+src/stratoweave/device_meta_config.act: gen_dmc/out/bin/gen_dmc src/stratoweave/yang.act
 	gen_dmc/out/bin/gen_dmc
 
-gen_dmc/out/bin/gen_dmc: gen_dmc/src/gen_dmc.act src/orchestron/yang.act
-	cp -a src/orchestron/yang.act gen_dmc/src/oyang.act
+gen_dmc/out/bin/gen_dmc: gen_dmc/src/gen_dmc.act src/stratoweave/yang.act
+	cp -a src/stratoweave/yang.act gen_dmc/src/swyang.act
 	cd gen_dmc && acton build $(subst ../,../../,$(DEP_OVERRIDES))
 
 .PHONY: test
