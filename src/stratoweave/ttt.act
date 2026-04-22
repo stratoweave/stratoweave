@@ -157,51 +157,70 @@ def CfgError(exception: Exception):
 
 
 class Path():
-    def __init__(self, name: str):
-        self.name = name
-        self.ns = ""
-        self.parent = None
+    name: str
+    namespace: () -> str
 
     def __str__(self):
         parts = _format_path(self)
         return "/" + "/".join(parts) if parts else "/"
 
+class PathRoot(Path):
+    def __init__(self, name: str):
+        self.name = name
+    def namespace(self):
+        return ""
+
 class PathElem(Path):
-    def __init__(self, i: gdata.Id, parent: ?Path):
+    def __init__(self, i: gdata.Id, parent: Path):
         self.name = i.name
         self.ns = i.q
         self.parent = parent
+    def namespace(self):
+        return self.ns
 
 class PathKey(Path):
-    def __init__(self, keystr: str, parent: ?Path, keyvals: dict[gdata.Id, gdata.Node], ):
+    def __init__(self, keystr: str, parent: Path, keyvals: dict[gdata.Id, gdata.Node], ):
         self.name = keystr
-        self.ns = parent.ns if parent is not None else ""
         self.parent = parent
         self.keyvals = keyvals
+    def namespace(self):
+        return self.parent.namespace()
 
-def _format_path(path: ?Path):
-    if path is not None:
-        par = path.parent
-        r1 = _format_path(par)
-        r2 = ["{path.name}#{path.ns}" if path.ns and par is not None and path.ns != par.ns else path.name]
-        return r1 + r2
+def _format_path(p: Path):
+    if isinstance(p, PathElem):
+        name = "{p.name}#{p.ns}" if p.ns and p.ns != p.parent.namespace() else p.name
+        return _format_path(p.parent) + [name]
+    elif isinstance(p, PathKey):
+        return _format_path(p.parent) + [p.name]
     else:
-        return []
+        return [p.name]
 
 # Reverse the given Path and construct a linear FNode with value-matching key leaves
-def fnode(p: ?Path) -> gdata.FNode:
-    pp, name, children = None, None, []
-    if isinstance(p, PathKey):
-        pp = p.parent
-        children = [ gdata.FNode(k, value_match=v.val) for k,v in p.keyvals.items() if isinstance(v, gdata.Leaf) ]
-    elif isinstance(p, PathElem):
-        pp = p.parent
-    if pp is not None:
-        name = gdata.Id(pp.ns,pp.name)
-        children.append(fnode(pp.parent))
-    return gdata.FNode(name, None, children)
+def fnode(p: Path, tail: ?gdata.FNode=None) -> gdata.FNode:
+    name = gdata.Id("",p.name)
+    child = [tail] if tail is not None else []
+    if isinstance(p, PathElem):
+        name = gdata.Id(p.ns, p.name)
+        return fnode(p.parent, gdata.FNode(name, children=child))
+    elif isinstance(p, PathKey):
+        keys = [ gdata.FNode(k, value_match=v.val) for k,v in p.keyvals.items() if isinstance(v, gdata.Leaf) ]
+        return fnode(p.parent, gdata.FNode(name, child+keys))
+    else:
+        return gdata.FNode(name, children=child)
 
-def make_rooted(p: ?Path, tree: gdata.Node):
+#def fnode(p: ?Path) -> gdata.FNode:
+#    pp, name, children = None, None, []
+#    if isinstance(p, PathKey):
+#        pp = p.parent
+#        children = [ gdata.FNode(k, value_match=v.val) for k,v in p.keyvals.items() if isinstance(v, gdata.Leaf) ]
+#    elif isinstance(p, PathElem):
+#        pp = p.parent
+#    if pp is not None:
+#        name = gdata.Id(pp.ns,pp.name)
+#        children.append(fnode(pp.parent))
+#    return gdata.FNode(name, None, children)
+
+def make_rooted(p: Path, tree: gdata.Node):
     if isinstance(p, PathKey):
         return make_rooted(p.parent, gdata.List(list(p.keyvals.keys()), [tree]))
     elif isinstance(p, PathElem):
@@ -209,17 +228,17 @@ def make_rooted(p: ?Path, tree: gdata.Node):
     else:
         return tree
 
-def _db_path(path: ?Path) -> list[value]:
-    if path is None:
-        return []
-    path1 = expect(path, "Missing expected path in _db_path")
-    par = _db_path(path1.parent)
-    if isinstance(path1, PathElem):
-        par.append(gdata.Id(path1.ns, path1.name))
-    elif path1.parent is None and path1.name.endswith(":"):
-        par.append(path1.name[:-1])
+def _db_path(path: Path) -> list[value]:
+    if isinstance(path, PathElem):
+        par = _db_path(path.parent)
+        par.append(gdata.Id(path.ns, path.name))
+    elif isinstance(path, PathKey):
+        par = _db_path(path.parent)
+        par.append(path.name)
+    elif path.name.endswith(":"):
+        par = [path.name[:-1]]
     else:
-        par.append(path1.name)
+        par = [path.name]
     return par
 
 class YieldState[T(Hashable)](object):
@@ -270,7 +289,7 @@ actor Node(impl: _Node):
         return impl.is_empty()
 
 class _Node(object):
-    path: ?Path
+    path: Path
     newtrans: proc() -> Transaction
     get: proc() -> gdata.Node
     def bind_db(self, db: ?lmdb.Db) -> None:
@@ -322,7 +341,7 @@ actor Transaction(impl: _Transaction):
         impl.update_dynstate(dynstate)
 
 class _Transaction(object):
-    path: ?Path
+    path: Path
     configure:  proc(tid: str, diff: dict[str,gdata.Node], out: ?Session, force: ?bool, dbuf: ?swdb.Buffer) -> CfgResult
     linkage: proc(tid: str, requests: list[LinkRequest], updates: list[LinkUpdate], out: ?Session, dbuf: ?swdb.Buffer) -> CfgResult
     # yield action
@@ -350,8 +369,8 @@ class _Transaction(object):
 
 ####################### Layer ########################
 
-actor Layer(name: str, rootgen: proc(?Path, ?Layer)->Node, lower: ?Layer, db_arg: ?lmdb.Db=None):
-    root = rootgen(Path(name+":"), lower)
+actor Layer(name: str, rootgen: proc(Path, ?Layer)->Node, lower: ?Layer, db_arg: ?lmdb.Db=None):
+    root = rootgen(PathRoot(name), lower)
     root.bind_db(db_arg)
 
     def load_from_db(top_only=False):
@@ -587,7 +606,7 @@ actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_
 
 ############## Containers ##################
 
-def Container(template={}, ns:?str=None, module:?str=None) -> proc(?Path, ?Layer)->Node:
+def Container(template={}, ns:?str=None, module:?str=None) -> proc(Path, ?Layer)->Node:
     return lambda path, lower: Node(_Container(path, template, ns, module, lower))
 
 class _Container(_Node):
@@ -595,7 +614,7 @@ class _Container(_Node):
     ns: ?str
     module: ?str
 
-    def __init__(self, path, template: dict[gdata.Id, proc(?Path, ?Layer)->Node], ns, module, lower: ?Layer):
+    def __init__(self, path, template: dict[gdata.Id, proc(Path, ?Layer)->Node], ns, module, lower: ?Layer):
         self.path = path
         self.elems = {key: templ(PathElem(key,path), lower) for key, templ in template.items()}
         self.ns = ns
@@ -799,7 +818,7 @@ class _ContainerTransaction(_Transaction):
 
 ################# Lists ####################
 
-def List(template, key_names: list[gdata.Id], ns:?str=None, module:?str=None) -> proc(?Path, ?Layer)->Node:
+def List(template, key_names: list[gdata.Id], ns:?str=None, module:?str=None) -> proc(Path, ?Layer)->Node:
     return lambda path, lower: Node(_List(path, template, key_names, ns, module, lower))
 
 class _List(_Node):
@@ -848,7 +867,7 @@ class _List(_Node):
         return self.liststate.is_empty()
 
 
-actor ListState(path, template: proc(?Path, ?Layer) -> Node, ns: ?str, module: ?str, lower: ?Layer):
+actor ListState(path, template: proc(Path, ?Layer) -> Node, ns: ?str, module: ?str, lower: ?Layer):
     var elems = {}
     var active = {}
     var provisional = set()
@@ -1398,7 +1417,7 @@ class TransformActorParams:
         self.dev = dev
 
 
-def Transform(function, act: ?(proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None)=None, build_links: ?proc(gdata.Node) -> list[TaggedPath]=None, lower: ?Layer=None, log_handler: ?logging.Handler=None) -> proc(?Path, ?Layer)->Node:
+def Transform(function, act: ?(proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None)=None, build_links: ?proc(gdata.Node) -> list[TaggedPath]=None, lower: ?Layer=None, log_handler: ?logging.Handler=None) -> proc(Path, ?Layer)->Node:
     proc def _create_transform_node(path, lower):
         transform = _Transform(path, function, build_links, lower, log_handler)
         node = Node(transform)
@@ -1512,7 +1531,7 @@ class TransformFunction(object):
 
 ################# RFSTransform ###################
 
-def RFSTransform(function, dev_registry: swdev.DeviceRegistry, act: ?(proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None)=None, lower: ?Layer=None, log_handler: ?logging.Handler=None) -> proc(?Path, ?Layer)->Node:
+def RFSTransform(function, dev_registry: swdev.DeviceRegistry, act: ?(proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None)=None, lower: ?Layer=None, log_handler: ?logging.Handler=None) -> proc(Path, ?Layer)->Node:
     proc def _create_rfs_transform_node(path, lower):
         rfs_transform = _RFSTransform(path, function, dev_registry, lower, log_handler)
         node = Node(rfs_transform)
@@ -1533,15 +1552,17 @@ class _RFSTransform(_TransformBase):
 def RFSTransaction(path, function, dev_registry, lower, log_handler):
     return Transaction(_RFSTransaction(path, function, dev_registry, lower, log_handler))
 
-def devname_from_rfs_path(path: ?Path):
+def devname_from_rfs_path(path: Path):
     def loop(p):
-        if p is not None:
+        if isinstance(p, PathKey):
             par = p.parent
-            if isinstance(p, PathKey) and isinstance(par, PathElem) and par.name == "rfs":
+            if isinstance(par, PathElem) and par.name == "rfs":
                 return p.name
-            return loop(par)
+        elif isinstance(p, PathElem):
+            par = p.parent
         else:
             raise ValueError("_RFSTransaction: unable to determine device name from path: {path}")
+        return loop(par)
     return loop(path)
 
 class _RFSTransaction(_TransformTransactionBase):
@@ -1684,7 +1705,7 @@ class RFSFunction(object):
 
 ################# Device #####################
 
-def Device(dev_registry: swdev.DeviceRegistry, log_handler: ?logging.Handler=None) -> proc(?Path, ?Layer)->Node:
+def Device(dev_registry: swdev.DeviceRegistry, log_handler: ?logging.Handler=None) -> proc(Path, ?Layer)->Node:
     return lambda path, _lower: Node(_Device(path, dev_registry, log_handler))
 
 class _Device(_TransformBase):
@@ -1695,7 +1716,7 @@ class _Device(_TransformBase):
 def DeviceTransaction(path, dev_registry, log_handler):
     return Transaction(_DeviceTransaction(path, dev_registry, log_handler))
 
-def devname_from_device_path(path: ?Path):
+def devname_from_device_path(path: Path):
     if isinstance(path, PathKey):
         return path.name
     raise ValueError("DeviceTransaction: path component is not a key: {path} ({type(path)})")
@@ -1725,7 +1746,7 @@ class _DeviceTransaction(_TransformTransactionBase):
 
 ################# DeviceConfig #####################
 
-def DeviceConfig(dev_registry: swdev.DeviceRegistry, log_handler: ?logging.Handler=None) -> proc(?Path, ?Layer)->Node:
+def DeviceConfig(dev_registry: swdev.DeviceRegistry, log_handler: ?logging.Handler=None) -> proc(Path, ?Layer)->Node:
     return lambda path, _lower: Node(_DeviceConfig(path, dev_registry, log_handler))
 
 class _DeviceConfig(_TransformBase):
@@ -1736,7 +1757,7 @@ class _DeviceConfig(_TransformBase):
 def DeviceConfigTransaction(path, dev_registry, log_handler):
     return Transaction(_DeviceConfigTransaction(path, dev_registry, log_handler))
 
-def devname_from_deviceconfig_path(path: ?Path):
+def devname_from_deviceconfig_path(path: Path):
     if isinstance(path, PathKey):
         return path.name
     raise ValueError("DeviceConfigTransaction: path component is not a key: {path} ({type(path)})")
