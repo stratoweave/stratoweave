@@ -218,23 +218,16 @@ def _respond_restconf_subtree(path_elements: list[yang.data.PathElement], data: 
         return
 
     fnode = _path_elements_to_fnode(path_elements)
-    node = yang.gdata.filter(data, fnode)
-    if node is not None:
-        # Walk down the filtered tree to the target node because we only return the subtree
-        for i in range(1, len(path_elements)):
-            elem = path_elements[i]
-            maybe_list = node  # avoids widening a narrowed loop var (node)
-            if isinstance(maybe_list, yang.gdata.List):
-                # We already filtered the list to the matching entry;
-                # descend into that entry before looking for the next child.
-                if len(maybe_list.elements) == 0:
-                    respond(404, {}, "No data at path")
-                    return
-                node = maybe_list.elements[0]
-            child_id = yang.gdata.Id(elem.node.namespace, elem.node.name)
-            child = node.children.get(child_id)
-            if child is not None:
-                node = child
+    filtered = yang.gdata.filter(data, fnode)
+    if filtered is not None:
+        node = _walk_to_target(filtered, path_elements)
+        if node is not None:
+            # Ensure top-level node gdata node in the filtered subtree always has namespace qualifiers
+            target_snode = path_elements[-1].node
+            target_id = yang.gdata.Id(target_snode.namespace, target_snode.name)
+            result = yang.gdata.Container({target_id: _node_with_ns(node, target_snode)})
+            if accept == "application/yang-data+xml":
+                respond(200, {"Content-Type": "application/yang-data+xml"}, result.to_xmlstr())
             else:
                 respond(404, {}, "No data at path")
                 return
@@ -247,10 +240,16 @@ def _respond_restconf_subtree(path_elements: list[yang.data.PathElement], data: 
             respond(200, {"Content-Type": "application/yang-data+xml"}, result.to_xmlstr())
         else:
             respond(200, {"Content-Type": "application/yang-data+json"}, result.to_yang_jsonstr())
-    else:
-        respond(404, {}, "No data at path")
+        return
+    respond(404, {}, "No data at path")
 
 
+def _path_exists(current_config: yang.gdata.Node, path_elements: list[yang.data.PathElement]) -> bool:
+    """Whether the resource identified by path_elements exists in current_config."""
+    if len(path_elements) <= 1:
+        return True
+    fnode = _path_elements_to_fnode(path_elements)
+    return yang.gdata.filter(current_config, fnode) is not None
 
 
 actor RestconfServer(
@@ -274,14 +273,16 @@ actor RestconfServer(
     ]
     _restconf_view_by_module = _build_restconf_view_by_module(_restconf_views)
 
-    def _router_make_edit_done(respond, success_status: int):
+    def _router_make_edit_done(respond, success_status: int, headers: ?dict[str, str] = None):
+        response_headers: dict[str, str] = {}
+        if headers is not None:
+            response_headers = headers
         def on_done(result):
             if isinstance(result, Exception):
                 # TODO: extract more context from error
                 respond(500, {}, str(result))
             else:
-                # TODO: location redirect?
-                respond(success_status, {}, "")
+                respond(success_status, response_headers, "")
         return on_done
 
     def _router_handle_restconf_get(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
@@ -355,10 +356,14 @@ actor RestconfServer(
 
     def _router_handle_restconf_put(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
         input_config = _router_parse_write_body(ctx, respond)
-        # TODO: per RFC 8040 §4.5, distinguish create (201 + Location) from
-        # replace (204) — currently always returns 204.
         if input_config is not None:
-            _router_apply_write(ctx, input_config, _router_make_edit_done(respond, 204))
+            # Per RFC 8040 §4.5: PUT creates (201 + Location) if the target did
+            # not exist, replaces (204) otherwise.
+            path_elements = yang.json.resolve_json_path(top_schema, _split_restconf_path(ctx.param("rest_path")))
+            if _path_exists(cfs.newsession().get(), path_elements):
+                _router_apply_write(ctx, input_config, _router_make_edit_done(respond, 204))
+            else:
+                _router_apply_write(ctx, input_config, _router_make_edit_done(respond, 201, {"Location": ctx.path}))
 
     def _router_handle_yang_library_version(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
         yl_meta = yl.SRC_DNODE.module_metadata["urn:ietf:params:xml:ns:yang:ietf-yang-library"]
