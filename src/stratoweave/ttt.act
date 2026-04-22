@@ -110,10 +110,16 @@ class LinkRequest():
         self.subscriber = subscriber
         self.status = status
     def tail(self):
-        return LinkRequest(self.tag, self.publisher.children[0], self.subscriber, self.status)
+        return LinkRequest(self.tag, self.publisher.children[0] if self.publisher.children else gdata.FNode(), self.subscriber, self.status)
     def vequal(self, s):
         v = self.publisher.value_match
         return v == s if isinstance(v, str) else False
+#    def __str__(self):
+#        return "LinkRequest(" + \
+#               "\n    tag=" + str(self.tag) + \
+#               "\n    publisher=" + self.publisher.prsrc() + \
+#               "\n    subscriber=" + self.subscriber.prsrc() + \
+#               "\n    status=" + str(self.status) + ")"
 
 class LinkUpdate():
     def __init__(self, tag: str, publisher: gdata.FNode, subscriber: gdata.FNode, config: gdata.Node):
@@ -188,6 +194,8 @@ def fnode(p: ?Path) -> gdata.FNode:
     if isinstance(p, PathKey):
         pp = p.parent
         children = [ gdata.FNode(k, value_match=v.val) for k,v in p.keyvals.items() if isinstance(v, gdata.Leaf) ]
+    elif isinstance(p, PathElem):
+        pp = p.parent
     if pp is not None:
         name = gdata.Id(pp.ns,pp.name)
         children.append(fnode(pp.parent))
@@ -457,6 +465,7 @@ actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_
         res = apply(tid, force)
         #print('   #', tid, '(Layer)', name, 'EDIT_CONFIG', 'PREP RESULT', res, err=True)
         while res.requests or res.updates:
+            #print('####', tid, '(Layer)', name, 'LINKAGE', len(res.requests), len(res.updates), err=True)
             res = root.linkage(tid, res.requests, res.updates, lower, dbuf)
         if not res.errors:
             done_cont = done
@@ -500,9 +509,11 @@ actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_
         buf = {}
         #print('   #', tid, '(Layer)', name, 'APPLY\n' + per_src(diff), err=True)
         res = root.configure(tid, diff, lower, force, dbuf)
-        if not res.errors and lower is not None:
-            res = lower.apply(tid, force=False)
         #print('   #', tid, '(Layer)', name, 'APPLY RESULT', res, err=True)
+        if not res.errors and lower is not None:
+            lowres = lower.apply(tid, force=False)
+            if lowres.errors:
+                res = CfgResult(res.empty, res.requests, res.updates, res.errors+lowres.errors)
         return res
 
     # yield action
@@ -522,7 +533,7 @@ actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_
     def lock_cont1(res):
         #print('####', tid_state, '(Layer)', name, 'lock_cont1', err=True)
         if tid_state is not None:
-            if not isinstance(res, Exception) and lower is not None:
+            if not res.errors and lower is not None:
                 #print('   #', tid_state, '(Layer)', name, 'LOCK LOWER', err=True)
                 lower.lock(tid_state, lock_cont2)                           # yield await
             else:
@@ -689,14 +700,16 @@ class _ContainerTransaction(_Transaction):
             updates += r.updates
             errors += r.errors
         r = CfgResult(empty, requests, updates, errors)
-        #print('   # ...... (Container)', _format_path(self.path), 'ANALYZE RESULT:', r, err=True)
+        #print('   # ...... (Container)', _format_path(self.path), 'ANALYZE RESULT:', r, len(requests), len(updates), len(errors), err=True)
         return r
 
     def linkage(self, tid, requests, updates, out, dbuf):
+        #print('####', tid, '(Container)', _format_path(self.path), 'linkage', len(requests), len(updates), err=True)
         results = {}
         for child,elem in self.elems.items():
             reqs = [ r.tail() for r in requests if r.publisher.name == child ]
             upds = [ u.tail() for u in updates if u.subscriber.name == child ]
+            #print('   #', tid, '(Container)', _format_path(self.path), 'LINKAGE CHILD', child, len(reqs), len(upds), err=True)
             if reqs or upds:
                 results[child] = elem.linkage(tid, reqs, upds, out, dbuf)
         return self._analyze(results)
@@ -983,14 +996,17 @@ class _ListTransaction(_Transaction):
             requests += r.requests
             updates += r.updates
             errors += r.errors
-        #print('   # ...... (List)', _format_path(self.path), 'ANALYZE RESULT:', res, err=True)
-        return CfgResult(empty, requests, updates, errors)
+        res = CfgResult(empty, requests, updates, errors)
+        #print('   # ...... (List)', _format_path(self.path), 'ANALYZE RESULT:', res, len(requests), len(updates), len(errors), err=True)
+        return res
 
     def linkage(self, tid, requests, updates, out, dbuf):
+        #print('####', tid, '(List)', _format_path(self.path), 'linkage', len(requests), len(updates), err=True)
         results = {}
         for key,elem in self.elems.items():
             reqs = [ r.tail() for r in requests if r.vequal(key) ]
             upds = [ u.tail() for u in updates if u.vequal(key) ]
+            #print('   #', tid, '(List)', _format_path(self.path), 'LINKAGE ELEMENT', key, len(reqs), len(upds), err=True)
             if reqs or upds:
                 results[key] = elem.linkage(tid, reqs, upds, out, dbuf)
         return self._analyze(results)
@@ -1223,6 +1239,9 @@ class _TransformTransactionBase(_Transaction):
                     linked = prune(linked, s.path)
             self.candidate_subscriptions[tid] = subscriptions
             self.candidate_linked[tid] = linked
+        #print('####', tid, '(Transform)', _format_path(self.path), 'link_requests:', err=True)
+        #for r in req:
+        #    print('    ', tid, '(Transform)', _format_path(self.path), 'req:', r, err=True)
         return req
 
     def link_updates(self, tid, merged):
@@ -1235,6 +1254,7 @@ class _TransformTransactionBase(_Transaction):
         return upd
 
     def linkage(self, tid, requests, updates, out, dbuf):
+        #print('####', tid, '(Transform)', _format_path(self.path), 'linkage:', len(requests), len(updates), err=True)
         if requests:
             if tid not in self.candidate_subscribers:
                 self.candidate_subscribers[tid] = self.subscribers
@@ -1243,7 +1263,7 @@ class _TransformTransactionBase(_Transaction):
                 if r.status:
                     subscribers.append(TaggedPath(r.tag, r.subscriber))
                 else:
-                    subscribers = list(filter(lambda s: s.path != r.publisher, subscribers))
+                    subscribers = list(filter(lambda s: s.path != r.subscriber, subscribers))
             self.candidate_subscribers[tid] = subscribers
         ###
         if updates:
