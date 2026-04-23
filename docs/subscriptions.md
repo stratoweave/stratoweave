@@ -14,18 +14,150 @@ The callback receives one merged gdata tree for that owner.
 The public shape is intentionally small:
 
 ```acton
-subs = yang.gdata.SubscriptionManager(
+import yang.gdata as gdata
+import mini.devices.ietf_oper as ietf_oper
+
+subs = gdata.SubscriptionManager(
     dev.tree_provider(),
     "base-config",
     on_state,
 )
 
 want = set([
-    yang.gdata.SubscriptionSpec(_system_state_filter(), period=0.05)
+    ietf_oper.subs.system_state.clock.subscribe(depth=1, period=0.05)
 ])
 
 subs.declare(want)
 ```
+
+## Generated Subscription Helpers
+
+Generated operational device modules such as `mini.devices.ietf_oper`
+also expose a typed path API for building subscription filters. The
+generated `_oper` module combines the config-false operational adata
+tree with the `SubscriptionNode` helpers used for subscriptions.
+
+Start from the generated root:
+
+```acton
+import mini.devices.ietf_oper as ietf_oper
+
+sub = ietf_oper.subs
+```
+
+The generated module builds one shared filter path tree as the
+`subs` module constant, rather than constructing a fresh helper tree
+for each use.
+
+### Subscribe To A Whole Subtree
+
+Call `subscribe(...)` directly on a path to subscribe to everything
+below that node:
+
+```acton
+# /system-state/clock
+spec = sub.system_state.clock.subscribe(period=0.05)
+```
+
+### Subscribe To Direct Children Only
+
+Use `depth=1` when you want the direct children of a container or list
+entry, rather than the whole subtree:
+
+```acton
+# /system-state/clock/current-datetime
+# /system-state/clock/boot-datetime
+spec = sub.system_state.clock.subscribe(depth=1, period=0.05)
+```
+
+`depth` currently only supports `1`.
+
+### Subscribe To One Keyed List Entry
+
+Use `entry(...)` on generated list paths to add key predicates without
+writing `FNode` filters manually:
+
+```acton
+iface = sub.interfaces.interface.entry("eth0")
+
+# /interfaces/interface[name="eth0"]
+spec = iface.subscribe(period=1.0)
+```
+
+### Select Specific Children
+
+Use `select=[...]` to keep the list entry or container as the anchor,
+but only subscribe to specific descendants below it:
+
+```acton
+iface = sub.interfaces.interface.entry("eth0")
+
+spec = iface.subscribe(
+    select=[iface.statistics, iface.ipv4],
+    period=1.0,
+)
+```
+
+Every selected path must be below the anchor used for `subscribe(...)`.
+
+### Merge Overlapping Descendants
+
+Selected descendants from the same subtree are merged into one filter:
+
+```acton
+iface = sub.interfaces.interface.entry("eth0")
+
+spec = iface.subscribe(
+    select=[
+        iface.statistics.in_octets,
+        iface.statistics.out_octets,
+    ],
+    period=1.0,
+)
+```
+
+This produces one `statistics` branch with both leaves below it.
+
+### Inspect The Raw Filter
+
+Use `filt()` when you want the raw `FNode` without immediately wrapping
+it in a `SubscriptionSpec`:
+
+```acton
+clock_filt = sub.system_state.clock.filt()
+spec = gdata.SubscriptionSpec(clock_filt, period=0.05)
+```
+
+This is useful in tests and when integrating with older code that still
+constructs `SubscriptionSpec` directly.
+
+### Declare Multiple Filters For One Owner
+
+`SubscriptionManager` still works on a set of `SubscriptionSpec`
+objects, so you can mix several generated filters in one declaration:
+
+```acton
+iface = sub.interfaces.interface.entry("eth0")
+
+want = set([
+    sub.system_state.clock.subscribe(depth=1, period=0.05),
+    iface.subscribe(select=[iface.statistics, iface.ipv4], period=1.0),
+])
+
+subs.declare(want)
+```
+
+### On-Change Subscriptions
+
+Omitting `period` creates an on-change `SubscriptionSpec`:
+
+```acton
+spec = sub.system_state.clock.subscribe(depth=1)
+```
+
+The generated filter helper supports this directly. The current
+`NetconfDriver` limitation still applies, so on-change subscriptions are
+not yet accepted there.
 
 ## `SubscriptionSpec`
 
