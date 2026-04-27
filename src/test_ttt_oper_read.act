@@ -1,0 +1,162 @@
+import testing
+
+import stratoweave.ttt as ttt
+import yang.gdata as gdata
+
+TEST_NS = "urn:test-oper"
+
+def q(n: str) -> gdata.Id:
+    return gdata.Id(TEST_NS, n)
+
+
+class OperTransform(ttt.TransformFunction):
+    def transform_wrapper(self, cfg: gdata.Node, linked: gdata.Node, memory: ?gdata.Node, dynstate: ?gdata.Node):
+        return gdata.Container(), None
+
+
+actor OperPublisher(path: ttt.Path, update_oper: proc(?gdata.Node) -> None):
+    def on_conf(conf: gdata.Node, memory: ?gdata.Node):
+        name = conf.get_opt_str(q("name"))
+        if name is None:
+            name = str(path)
+        update_oper(gdata.Container({
+            q("status"): gdata.Leaf("up-" + name!),
+            q("metrics"): gdata.Container({
+                q("rx"): gdata.Leaf(u64(len(name!))),
+            }),
+        }))
+
+
+def OperPublisherCtor(params: ttt.TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None:
+    act = OperPublisher(params.path, params.update_oper)
+    return act.on_conf
+
+
+def _service_cfg() -> gdata.Node:
+    return gdata.Container({
+        q("service"): gdata.List([q("name")], [
+            gdata.Container({
+                q("name"): gdata.Leaf("svc-a"),
+                q("enabled"): gdata.Leaf(True),
+            }),
+            gdata.Container({
+                q("name"): gdata.Leaf("svc-b"),
+                q("enabled"): gdata.Leaf(True),
+            }),
+        ]),
+    })
+
+
+def _service_oper_all() -> gdata.Node:
+    return gdata.Container({
+        q("service"): gdata.List([q("name")], [
+            gdata.Container({
+                q("name"): gdata.Leaf("svc-a"),
+                q("status"): gdata.Leaf("up-svc-a"),
+                q("metrics"): gdata.Container({
+                    q("rx"): gdata.Leaf(u64(5)),
+                }),
+            }),
+            gdata.Container({
+                q("name"): gdata.Leaf("svc-b"),
+                q("status"): gdata.Leaf("up-svc-b"),
+                q("metrics"): gdata.Container({
+                    q("rx"): gdata.Leaf(u64(5)),
+                }),
+            }),
+        ]),
+    })
+
+
+actor get_data_filters_list_entries(t: testing.AsyncT):
+    layer = ttt.Layer("top", ttt.Container({
+        q("service"): ttt.List(ttt.Transform(OperTransform, OperPublisherCtor), [q("name")]),
+    }), None)
+    var attempts = 0
+
+    def cont(_r: value):
+        after 0: check()
+
+    def check():
+        attempts += 1
+        filt = gdata.FNode(q("service"), children=[
+            gdata.FNode(q("name"), value_match="svc-b"),
+            gdata.FNode(q("status")),
+        ])
+        expected = gdata.Container({
+            q("service"): gdata.List([q("name")], [
+                gdata.Container({
+                    q("name"): gdata.Leaf("svc-b"),
+                    q("status"): gdata.Leaf("up-svc-b"),
+                }),
+            ]),
+        })
+        filtered = layer.newsession().get_data(filt)
+        if filtered is None:
+            if attempts > 20:
+                t.failure(ValueError("Timed out waiting for filtered data, got None"))
+                return
+            after 0.01: check()
+            return
+        if filtered != expected:
+            if attempts > 20:
+                t.failure(ValueError("Timed out waiting for filtered data, got " + filtered!.prsrc(deterministic=True)))
+                return
+            after 0.01: check()
+            return
+        testing.assertEqual(filtered!.prsrc(deterministic=True), expected.prsrc(deterministic=True))
+        t.success()
+
+    layer.edit_config(_service_cfg(), cont)
+
+
+actor read_data_merges_config_and_oper(t: testing.AsyncT):
+    layer = ttt.Layer("top", ttt.Container({
+        q("service"): ttt.List(ttt.Transform(OperTransform, OperPublisherCtor), [q("name")]),
+    }), None)
+    var attempts = 0
+
+    def cont(_r: value):
+        after 0: check()
+
+    def check():
+        attempts += 1
+        data = layer.newsession().get_data()
+        if data is None:
+            if attempts > 20:
+                t.failure(ValueError("Timed out waiting for merged data, got None"))
+                return
+            after 0.01: check()
+            return
+        filtered = gdata.filter(data, gdata.FNode(children=[
+            gdata.FNode(q("service"), children=[
+                gdata.FNode(q("name"), value_match="svc-a"),
+                gdata.FNode(q("enabled")),
+                gdata.FNode(q("status")),
+            ]),
+        ]))
+        expected = gdata.Container({
+            q("service"): gdata.List([q("name")], [
+                gdata.Container({
+                    q("name"): gdata.Leaf("svc-a"),
+                    q("enabled"): gdata.Leaf(True),
+                    q("status"): gdata.Leaf("up-svc-a"),
+                }),
+            ]),
+        })
+        if filtered is None:
+            if attempts > 20:
+                t.failure(ValueError("Timed out waiting for merged data, got " + data!.prsrc(deterministic=True)))
+                return
+            after 0.01: check()
+            return
+        if filtered != expected:
+            if attempts > 20:
+                t.failure(ValueError("Timed out waiting for merged data, got " + filtered!.prsrc(deterministic=True)))
+                return
+            after 0.01: check()
+            return
+        testing.assertEqual(filtered!.prsrc(deterministic=True), expected.prsrc(deterministic=True))
+        t.success()
+
+    layer.edit_config(_service_cfg(), cont)
