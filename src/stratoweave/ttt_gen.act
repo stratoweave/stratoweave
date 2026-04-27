@@ -48,7 +48,7 @@ class TTTSrc(object):
         self.base_defs = base_defs
         self.act_defs = act_defs
 
-def children_to_tttsrc(sn: schema.DNodeInner, spath: list[schema.DNode], root: schema.DRoot) -> TTTSrc:
+def children_to_tttsrc(sn: schema.DNodeInner, spath: list[schema.DNode], root: schema.DRoot, oper_yang_module: ?str=None) -> TTTSrc:
     input_classes = []
     state_classes = []
     imports = []
@@ -59,7 +59,7 @@ def children_to_tttsrc(sn: schema.DNodeInner, spath: list[schema.DNode], root: s
     for child in sn.children:
         if isinstance(child, schema.DLeaf):
             continue
-        res = dschema_to_tttsrc(child, spath + [child], root, set_ns=child.namespace!=sn.namespace)
+        res = dschema_to_tttsrc(child, spath + [child], root, oper_yang_module, set_ns=child.namespace!=sn.namespace)
         input_classes.extend(res.input_classes)
         state_classes.extend(res.state_classes)
         imports.extend(res.imports)
@@ -70,7 +70,7 @@ def children_to_tttsrc(sn: schema.DNodeInner, spath: list[schema.DNode], root: s
     children_src = ", ".join(elems)
     return TTTSrc(src=children_src, input_classes=input_classes, state_classes=state_classes, imports=imports, defs=defs, base_defs=base_defs, act_defs=act_defs)
 
-def dschema_to_tttsrc(sn: schema.DNode, spath: list[schema.DNode], root: schema.DRoot, indent=0, set_ns=True) -> TTTSrc:
+def dschema_to_tttsrc(sn: schema.DNode, spath: list[schema.DNode], root: schema.DRoot, oper_yang_module: ?str=None, indent=0, set_ns=True) -> TTTSrc:
     input_classes = []
     state_classes = []
     imports = []
@@ -131,6 +131,18 @@ def dschema_to_tttsrc(sn: schema.DNode, spath: list[schema.DNode], root: schema.
         \"\"\"Return the modeled input type for this transform\"\"\"
         return {input_class}
 """
+        if oper_yang_module is not None:
+            type_helpers += """
+    @staticmethod
+    def state_type():
+        \"\"\"Return the modeled operational state type for this transform\"\"\"
+        return {input_class}__oper
+
+    @staticmethod
+    def new_state(path: ttt.Path):
+        \"\"\"Create modeled operational state for this transform path\"\"\"
+        return {input_class}__oper.from_gdata(ttt.path_key_data(path))
+"""
         if dynstate_class is not None:
             wrapper_extra_params += ", modeled_dynstate"
             wrapper_extra_models += "        modeled_dynstate = {dynstate_class}.from_gdata(dynstate) if dynstate is not None else None\n"
@@ -145,10 +157,17 @@ def dschema_to_tttsrc(sn: schema.DNode, spath: list[schema.DNode], root: schema.
             transform_actor_ctor = transform.name + "TransformCtor"
             transform_actor_extra_params = ", ttt.expect(params.dev, \"Missing expected DeviceMgr param to {transform_actor_fq}.\")" if ext.name == "rfs-transform" else ""
             memory_conv = ", {memory_class}.from_gdata(m) if m is not None else None" if memory_class is not None else ""
+            oper_update_wrapper = ""
+            oper_update_arg = "params.update_oper"
+            if oper_yang_module is not None:
+                oper_update_wrapper = """    def update_oper_type_wrapper(oper: ?{oper_yang_module}.{input_class}):
+        params.update_oper(oper.to_gdata() if oper is not None else None)
+"""
+                oper_update_arg = "update_oper_type_wrapper"
             act_defs.append("""def {transform_actor_ctor}(params: ttt.TransformActorParams) -> ?proc(yang.gdata.Node, ?yang.gdata.Node) -> None:
     def update_dynstate_type_wrapper(dynstate: ?{dynstate_class}):
         params.update_dynstate(dynstate.to_gdata() if dynstate is not None else None)
-    act = {transform_actor_fq}(params.path, update_dynstate_type_wrapper, params.update_oper{transform_actor_extra_params})
+{oper_update_wrapper}    act = {transform_actor_fq}(params.path, update_dynstate_type_wrapper, {oper_update_arg}{transform_actor_extra_params})
     return proc lambda c, m: act.on_conf({input_class}.from_gdata(c){memory_conv})
 """)
         else:
@@ -235,7 +254,7 @@ def dschema_to_tttsrc(sn: schema.DNode, spath: list[schema.DNode], root: schema.
                     return TTTSrc(src="ttt.List(ttt.DeviceConfig(dev_registry, log_handler), {_fq_list_keys(sn)}{nsq(sn)})", input_classes=input_classes, state_classes=state_classes, imports=imports, defs=defs, base_defs=base_defs, act_defs=act_defs)
 
         # List without an extension
-        children_res = children_to_tttsrc(sn, spath, root)
+        children_res = children_to_tttsrc(sn, spath, root, oper_yang_module)
         input_classes.extend(children_res.input_classes)
         state_classes.extend(children_res.state_classes)
         imports.extend(children_res.imports)
@@ -250,7 +269,7 @@ def dschema_to_tttsrc(sn: schema.DNode, spath: list[schema.DNode], root: schema.
                 if ext.name == "transform" or ext.name == "rfs-transform":
                     return transform_ext_to_tttsrc(sn, ext)
         sn_children = sn.children
-        children_res = children_to_tttsrc(sn, spath, root)
+        children_res = children_to_tttsrc(sn, spath, root, oper_yang_module)
         input_classes.extend(children_res.input_classes)
         state_classes.extend(children_res.state_classes)
         imports.extend(children_res.imports)
@@ -261,8 +280,8 @@ def dschema_to_tttsrc(sn: schema.DNode, spath: list[schema.DNode], root: schema.
 
     raise NotImplementedError("Unhandled schema type: {type(sn)}: {schema.get_path_name(spath)}")
 
-def ttt_prsrc(root: schema.DRoot, input_yang_module: str, output_yang_module: ?str) -> (base: str, ttt: str):
-    ts = dschema_to_tttsrc(root, [root], root)
+def ttt_prsrc(root: schema.DRoot, input_yang_module: str, output_yang_module: ?str, oper_yang_module: ?str=None) -> (base: str, ttt: str):
+    ts = dschema_to_tttsrc(root, [root], root, oper_yang_module)
 
     base_src = "# WARNING WARNING WARNING WARNING WARNING\n"
     base_src += "# DO NOT MODIFY THIS FILE!! This file is generated!\n"
@@ -270,6 +289,8 @@ def ttt_prsrc(root: schema.DRoot, input_yang_module: str, output_yang_module: ?s
     base_src += "import logging\nimport xml\nimport stratoweave.ttt as ttt\nimport yang.adata\nimport yang.gdata\nimport yang.xml\n\n"
     for ic in ts.input_classes:
         base_src += "from {input_yang_module} import {ic}\n"
+        if oper_yang_module is not None:
+            base_src += "from {oper_yang_module} import {ic} as {ic}__oper\n"
     base_src += "from {input_yang_module} import SRC_DNODE\n"
 
     if output_yang_module is not None:
@@ -285,7 +306,10 @@ def ttt_prsrc(root: schema.DRoot, input_yang_module: str, output_yang_module: ?s
     ttt_src += "# WARNING WARNING WARNING WARNING WARNING\n\n"
     ttt_src += "import logging\n\n"
     ttt_src += "import stratoweave.device as swdev\n"
-    ttt_src += "import stratoweave.ttt as ttt\nimport yang.gdata\n\n"
+    ttt_src += "import stratoweave.ttt as ttt\nimport yang.gdata\n"
+    if oper_yang_module is not None and len(ts.act_defs) > 0:
+        ttt_src += "import {oper_yang_module}\n"
+    ttt_src += "\n"
     ttt_src += "\n".join(list(set(ts.imports))) + "\n\n"
     for sc in ts.state_classes:
         ttt_src += "from {input_yang_module} import {sc}\n"
