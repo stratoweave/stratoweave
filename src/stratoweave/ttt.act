@@ -223,6 +223,27 @@ def make_rooted(p: Path, tree: gdata.Node):
     else:
         return tree
 
+def _with_path_keys(p: Path, tree: gdata.Node) -> gdata.Node:
+    if isinstance(p, PathKey) and isinstance(tree, gdata.Container):
+        children = dict(tree.children.items())
+        children.update(p.keyvals.items())
+        return gdata.Container(children, presence=tree.presence, ns=tree.ns, module=tree.module, txid=tree.txid)
+    return tree
+
+def path_key_data(p: Path) -> gdata.Node:
+    if isinstance(p, PathKey):
+        return gdata.Container(dict(p.keyvals.items()))
+    return gdata.Container()
+
+def _filter_data(data: ?gdata.Node, filt: ?gdata.FNode) -> ?gdata.Node:
+    if data is None:
+        return None
+    if filt is not None:
+        if filt.name is not None:
+            return gdata.filter(data, gdata.FNode(children=[filt]))
+        return gdata.filter(data, filt)
+    return data
+
 def _db_path(path: Path) -> list[value]:
     if isinstance(path, PathElem):
         par = _db_path(path.parent)
@@ -268,6 +289,9 @@ actor Node(impl: _Node):
     def get():
         return impl.get()
 
+    def get_data():
+        return impl.get_data()
+
     def bind_db(db: ?lmdb.Db):
         """Attach DB handle to this node (and its children)
 
@@ -287,6 +311,8 @@ class _Node(object):
     path: Path
     newtrans: proc() -> Transaction
     get: proc() -> gdata.Node
+    def get_data(self) -> gdata.Node:
+        return self.get()
     def bind_db(self, db: ?lmdb.Db) -> None:
         pass
     restore: proc(list[str], str, ?str, bytes) -> None
@@ -320,6 +346,9 @@ actor Transaction(impl: _Transaction):
     def get():
         return impl.get()
 
+    def get_data():
+        return impl.get_data()
+
     def bind_db(db: ?lmdb.Db):
         impl.bind_db(db)
 
@@ -330,10 +359,13 @@ actor Transaction(impl: _Transaction):
         return impl.is_empty()
 
     def init_dynstate(node: Node, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None):
-        impl.init_dynstate(node, act, update_dynstate)
+        impl.init_dynstate(node, act, update_dynstate, update_oper)
 
     def update_dynstate(dynstate: ?gdata.Node):
         impl.update_dynstate(dynstate)
+
+    def update_oper(oper: ?gdata.Node):
+        impl.update_oper(oper)
 
 class _Transaction(object):
     path: Path
@@ -346,6 +378,8 @@ class _Transaction(object):
     wait_complete: proc(actself: Transaction, tid: str, done: action(value) -> None) -> None
     wait_complete_cont: proc(actself: Transaction, res: value) -> None
     get: proc() -> gdata.Node
+    def get_data(self) -> gdata.Node:
+        return self.get()
 
     def bind_db(self, db: ?lmdb.Db) -> None:
         pass
@@ -356,10 +390,13 @@ class _Transaction(object):
     def is_empty(self) -> bool:
         return True
 
-    proc def init_dynstate(self, node: Node, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None, update_dynstate: proc(?gdata.Node)->None):
+    proc def init_dynstate(self, node: Node, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None, update_dynstate: proc(?gdata.Node)->None, update_oper: proc(?gdata.Node)->None):
         pass
 
     proc def update_dynstate(self, dynstate: ?gdata.Node) -> None:
+        pass
+
+    proc def update_oper(self, oper: ?gdata.Node) -> None:
         pass
 
 ####################### Layer ########################
@@ -414,6 +451,9 @@ actor Layer(name: str, rootgen: proc(Path, ?Layer)->Node, lower: ?Layer, db_arg:
 
     def get():
         return root.get()
+
+    def get_data(filt: ?gdata.FNode=None) -> ?gdata.Node:
+        return _filter_data(root.get_data(), filt)
 
 
 actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_arg: ?swdb.Buffer=None):
@@ -598,6 +638,9 @@ actor Session(name: str, rootnode: Node, lowerlayer: ?Layer, db: ?lmdb.Db, dbuf_
         #print('####', '(Layer)', name, 'GET', root, err=True)
         return root.get()
 
+    def get_data(filt: ?gdata.FNode=None) -> ?gdata.Node:
+        return _filter_data(root.get_data(), filt)
+
     def below():
         return lower if lower is not None else self
 
@@ -624,6 +667,13 @@ class _Container(_Node):
     def get(self):
         #print('####', '(Container)', _format_path(self.path), actorid(), 'NODE GET', err=True)
         res = {tag: node.get() for tag, node in self.elems.items()}
+        path = self.path
+        if isinstance(path, PathKey):
+            res.update(path.keyvals.items())
+        return gdata.Container(res, ns=self.ns, module=self.module)
+
+    def get_data(self):
+        res = {tag: node.get_data() for tag, node in self.elems.items()}
         path = self.path
         if isinstance(path, PathKey):
             res.update(path.keyvals.items())
@@ -813,6 +863,13 @@ class _ContainerTransaction(_Transaction):
             res.update(path.keyvals.items())
         return gdata.Container(res, ns=self.ns, module=self.module)
 
+    def get_data(self):
+        res = {tag: elem.get_data() for tag, elem in self.elems.items()}
+        path = self.path
+        if isinstance(path, PathKey):
+            res.update(path.keyvals.items())
+        return gdata.Container(res, ns=self.ns, module=self.module)
+
 
 ################# Lists ####################
 
@@ -840,6 +897,12 @@ class _List(_Node):
         for key, node in self.liststate.all().items():
             r = node.get()
             res.append(r)
+        return gdata.List(self.key_names, res, ns=self.ns, module=self.module)
+
+    def get_data(self):
+        res = []
+        for key, node in self.liststate.all().items():
+            res.append(node.get_data())
         return gdata.List(self.key_names, res, ns=self.ns, module=self.module)
 
     def bind_db(self, db: ?lmdb.Db) -> None:
@@ -1118,6 +1181,16 @@ class _ListTransaction(_Transaction):
             res.append(r)
         return gdata.List(self.key_names, res, ns=self.ns, module=self.module)
 
+    def get_data(self):
+        res = []
+        for key, node in self.liststate.all().items():
+            if key in self.elems:
+                r = self.elems[key].get_data()
+            else:
+                r = node.get_data()
+            res.append(r)
+        return gdata.List(self.key_names, res, ns=self.ns, module=self.module)
+
 def ListTransaction(path, liststate: ListState, key_names, ns, module):
     return Transaction(_ListTransaction(path, liststate, key_names, ns, module))
 
@@ -1132,6 +1205,9 @@ class _TransformBase(_Node):
 
     def get(self):
         return self.transaction.get()
+
+    def get_data(self):
+        return self.transaction.get_data()
 
     def bind_db(self, db: ?lmdb.Db) -> None:
         self.transaction.bind_db(db)
@@ -1151,6 +1227,7 @@ class _TransformTransactionBase(_Transaction):
     essays: dict[str, (?gdata.Node, ?gdata.Node)]
     running: dict[str, gdata.Node]
     output: ?gdata.Node
+    oper: ?gdata.Node
     locker: ?str
     pending: list[(Transaction, str, ?Session, action(CfgResult)->None, ?swdb.Buffer)]
 
@@ -1178,6 +1255,7 @@ class _TransformTransactionBase(_Transaction):
         self.path = path
         self.running = {}
         self.output = None
+        self.oper = None
         self.locker = None
         self.pending = []
         self.linked = gdata.Container()
@@ -1348,6 +1426,8 @@ class _TransformTransactionBase(_Transaction):
             if ok:
                 self.running = candidate
                 self.output = essay.0 if essay is not None else None
+                if candidate == {}:
+                    self.oper = None
                 self.update_memory(essay.1 if essay is not None else None)
                 self.linked = linked
                 self.subscriptions = subscriptions
@@ -1404,10 +1484,21 @@ class _TransformTransactionBase(_Transaction):
         else:
             return gdata.Container()
 
+    def get_data(self):
+        data = self.get()
+        oper = self.oper
+        if oper is not None:
+            data = gdata.merge(data, _with_path_keys(self.path, oper))
+        return _with_path_keys(self.path, data)
+
+    proc def update_oper(self, oper):
+        self.oper = oper
+
 class TransformActorParams:
-    def __init__(self, path: Path, update_dynstate: proc(?gdata.Node) -> None, dev: ?swdev.DeviceMgr):
+    def __init__(self, path: Path, update_dynstate: proc(?gdata.Node) -> None, update_oper: proc(?gdata.Node) -> None, dev: ?swdev.DeviceMgr):
         self.path = path
         self.update_dynstate = update_dynstate
+        self.update_oper = update_oper
         self.dev = dev
 
 
@@ -1481,9 +1572,9 @@ class _TransformTransaction(_TransformTransactionBase):
             return
         _TransformTransactionBase.restore(self, attr, qualifier, raw)
 
-    proc def init_dynstate(self, node, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None, update_dynstate):
+    proc def init_dynstate(self, node, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None, update_dynstate, update_oper):
         self.node = node
-        self.function.init_dynstate(act, update_dynstate, unwrap(self.path))
+        self.function.init_dynstate(act, update_dynstate, update_oper, unwrap(self.path))
 
     proc def update_dynstate(self, dynstate):
         if self.dynstate == dynstate:
@@ -1515,8 +1606,8 @@ class TransformFunction(object):
     def transform_xml(self, cfg, linked, memory, dynstate):
         return gdata.Container(), None
 
-    proc def init_dynstate(self, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None, update_dynstate: proc(?gdata.Node)->None, path: Path):
-        self._on_conf = act(TransformActorParams(path, update_dynstate, None))
+    proc def init_dynstate(self, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None, update_dynstate: proc(?gdata.Node)->None, update_oper: proc(?gdata.Node)->None, path: Path):
+        self._on_conf = act(TransformActorParams(path, update_dynstate, update_oper, None))
 
     proc def on_conf(self, conf: gdata.Node, memory: ?gdata.Node):
         _on_conf = self._on_conf
@@ -1643,9 +1734,9 @@ class _RFSTransaction(_TransformTransactionBase):
             return
         _TransformTransactionBase.restore(self, attr, qualifier, raw)
 
-    proc def init_dynstate(self, node, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None, update_dynstate):
+    proc def init_dynstate(self, node, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None, update_dynstate, update_oper):
         self.node = node
-        self.function.init_dynstate(act, update_dynstate, unwrap(self.path), self.dev)
+        self.function.init_dynstate(act, update_dynstate, update_oper, unwrap(self.path), self.dev)
 
     proc def update_dynstate(self, dynstate):
         if self.dynstate == dynstate:
@@ -1688,8 +1779,8 @@ class RFSFunction(object):
     def transform_xml(self, cfg, di, memory, dynstate):
         return (gdata.Container(), None)
 
-    proc def init_dynstate(self, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None, update_dynstate: proc(?gdata.Node)->None, path: Path, dev: swdev.DeviceMgr):
-        self._on_conf = act(TransformActorParams(path, update_dynstate, dev))
+    proc def init_dynstate(self, act: proc(TransformActorParams) -> ?proc(gdata.Node, ?gdata.Node) -> None, update_dynstate: proc(?gdata.Node)->None, update_oper: proc(?gdata.Node)->None, path: Path, dev: swdev.DeviceMgr):
+        self._on_conf = act(TransformActorParams(path, update_dynstate, update_oper, dev))
 
     proc def on_conf(self, conf: gdata.Node, memory: ?gdata.Node):
         _on_conf = self._on_conf
