@@ -31,7 +31,7 @@ def _split_restconf_path(text: str) -> list[str]:
 # Workaround for Acton compiled issues with named tuples as dict values in the
 # module-to-view dispatch map.
 class _RestconfView(value):
-    def __init__(self, schema: yang.schema.DRoot, data: proc() -> yang.gdata.Node):
+    def __init__(self, schema: yang.schema.DRoot, data: proc(?yang.gdata.FNode) -> ?yang.gdata.Node):
         self.schema = schema
         self.data = data
 
@@ -208,26 +208,31 @@ def _node_with_ns(node: yang.gdata.Node, snode: yang.schema.DNode) -> yang.gdata
     raise ValueError("Unexpected node type for RESTCONF GET serialization: {type(node)}")
 
 
-def _respond_restconf_subtree(path_elements: list[yang.data.PathElement], data: yang.gdata.Node, accept: ?str, respond: proc(int, dict[str, str], str) -> None,
+def _respond_restconf_subtree(path_elements: list[yang.data.PathElement], data: ?yang.gdata.Node, accept: ?str, respond: proc(int, dict[str, str], str) -> None,
 ) -> None:
-    if len(path_elements) <= 1:
-        if accept == "application/yang-data+xml":
-            respond(200, {"Content-Type": "application/yang-data+xml"}, data.to_xmlstr())
-        else:
-            respond(200, {"Content-Type": "application/yang-data+json"}, data.to_yang_jsonstr())
-        return
-
-    fnode = _path_elements_to_fnode(path_elements)
-    filtered = yang.gdata.filter(data, fnode)
-    if filtered is not None:
-        node = _walk_to_target(filtered, path_elements)
-        if node is not None:
-            # Ensure top-level node gdata node in the filtered subtree always has namespace qualifiers
-            target_snode = path_elements[-1].node
-            target_id = yang.gdata.Id(target_snode.namespace, target_snode.name)
-            result = yang.gdata.Container({target_id: _node_with_ns(node, target_snode)})
+    if data is not None:
+        if len(path_elements) <= 1:
             if accept == "application/yang-data+xml":
-                respond(200, {"Content-Type": "application/yang-data+xml"}, result.to_xmlstr())
+                respond(200, {"Content-Type": "application/yang-data+xml"}, data.to_xmlstr())
+            else:
+                respond(200, {"Content-Type": "application/yang-data+json"}, data.to_yang_jsonstr())
+            return
+
+        # Walk the (already filtered) tree to the target node so we only return its subtree.
+        node = data
+        for elem in path_elements[1:]:
+            maybe_list = node  # avoids widening a narrowed loop var (node)
+            if isinstance(maybe_list, yang.gdata.List):
+                # We already filtered the list to the matching entry;
+                # descend into that entry before looking for the next child.
+                if len(maybe_list.elements) == 0:
+                    respond(404, {}, "No data at path")
+                    return
+                node = maybe_list.elements[0]
+            child_id = yang.gdata.Id(elem.node.namespace, elem.node.name)
+            child = node.children.get(child_id)
+            if child is not None:
+                node = child
             else:
                 respond(404, {}, "No data at path")
                 return
@@ -262,13 +267,12 @@ actor RestconfServer(
     # Use an actor method because a lambda whose body is an actor action call
     # `lambda: cfs.newsession().get_data()` gets the action effect and yields a
     # Msg[gdata.Node] at runtime, which must be awaited on
-    def _top_data() -> yang.gdata.Node:
-        data = cfs.newsession().get_data()
-        return data if data is not None else yang.gdata.Container()
+    def _top_data(filt: ?yang.gdata.FNode) -> ?yang.gdata.Node:
+        return cfs.newsession().get_data(filt)
 
     _restconf_views = [
-        _RestconfView(rcmon.SRC_DNODE, lambda: _build_restconf_monitoring_gdata([top_schema, rcmon.SRC_DNODE, yl.SRC_DNODE])),
-        _RestconfView(yl.SRC_DNODE, lambda: _build_yang_library_gdata([top_schema, rcmon.SRC_DNODE, yl.SRC_DNODE])),
+        _RestconfView(rcmon.SRC_DNODE, lambda filt: yang.gdata.filter(_build_restconf_monitoring_gdata([top_schema, rcmon.SRC_DNODE, yl.SRC_DNODE]), filt)),
+        _RestconfView(yl.SRC_DNODE, lambda filt: yang.gdata.filter(_build_yang_library_gdata([top_schema, rcmon.SRC_DNODE, yl.SRC_DNODE]), filt)),
         _RestconfView(top_schema, _top_data)
     ]
     _restconf_view_by_module = _build_restconf_view_by_module(_restconf_views)
@@ -296,7 +300,9 @@ actor RestconfServer(
         if len(path_segments) == 0:
             merged = yang.gdata.Container()
             for i, view in enumerate(_restconf_views):
-                merged = yang.gdata.merge(merged, view.data())
+                data = view.data()
+                if data is not None:
+                    merged = yang.gdata.merge(merged, data)
             _respond_restconf_subtree([], merged, accept, respond)
             return
 
@@ -309,11 +315,12 @@ actor RestconfServer(
                 raise ValueError("No RESTCONF view for top-level module {top_level_module}")
             view = _restconf_view_by_module[top_level_module]
             path_elements = yang.restconf.resolve_path(view.schema, path_segments)
+            filter = _path_elements_to_fnode(path_elements)
         except ValueError as e:
             respond(404, {}, str(e))
             return
         else:
-            _respond_restconf_subtree(path_elements, view.data(), accept, respond)
+            _respond_restconf_subtree(path_elements, view.data(filter), accept, respond)
 
     def _router_handle_restconf_delete(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
         input_config = yang.restconf.from_json_path(top_schema, None, _split_restconf_path(ctx.param("rest_path")), yang.data.OP_REMOVE, loose=True)
