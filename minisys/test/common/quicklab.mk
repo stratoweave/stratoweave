@@ -70,11 +70,11 @@ RESTCONF_PORT=$(shell docker inspect -f '{{(index (index .NetworkSettings.Ports 
 
 .PHONY: send-config-async
 send-config-async:
-	curl -X PUT -H "Content-Type: application/yang-data+xml" -H "Async: true" -d @$(FILE) http://localhost:$(RESTCONF_PORT)/restconf/data
+	curl -X PATCH -H "Content-Type: application/yang-data+xml" -H "Async: true" -d @$(FILE) http://localhost:$(RESTCONF_PORT)/restconf/data
 
 .PHONY: send-config-wait
 send-config-wait:
-	curl -X PUT -H "Content-Type: application/yang-data+xml" -d @$(FILE) http://localhost:$(RESTCONF_PORT)/restconf/data
+	curl -X PATCH -H "Content-Type: application/yang-data+xml" -d @$(FILE) http://localhost:$(RESTCONF_PORT)/restconf/data
 
 .PHONY: get-data get-router get-telemetry
 get-data:
