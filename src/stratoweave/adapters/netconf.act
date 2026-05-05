@@ -18,7 +18,8 @@ from stratoweave.device_meta_config import \
 from stratoweave.adapters.adapter import \
     DeviceAdapter, ModCap, DISCONNECTED, CONNECTING, CONNECTED, TRANSACTION, \
     NotConnectedError, BusyError, LockedError, TxidMismatchError, ConfigError, \
-    parse_cap, modset_eq, mock_preset_capabilities
+    SharedSubscription, SubscriptionOwner, parse_cap, modset_eq, \
+    mock_preset_capabilities, subscription_delay, merge_subscription_tree
 
 def extract_txid(conf: ?xml.Node) -> ?str:
     """Attempt to extract a txid from configuration
@@ -32,33 +33,6 @@ def extract_txid(conf: ?xml.Node) -> ?str:
             for attr_name, attr_value in configuration_tag.attributes:
                 if attr_name == "junos:commit-seconds":
                     return attr_value
-
-
-class SharedSubscription(object):
-    """One physical device subscription shared by one or more owners."""
-    spec: yang.gdata.SubscriptionSpec
-    latest: ?yang.gdata.Node
-    owners: set[str]
-    active: bool
-
-    def __init__(self, spec: yang.gdata.SubscriptionSpec):
-        self.spec = yang.gdata.SubscriptionSpec(spec.filt, period=spec.period)
-        self.latest = None
-        self.owners = set()
-        self.active = True
-
-
-class SubscriptionOwner(object):
-    """One declarative subscriber with its desired specs and merged state."""
-    @property
-    cb: action(?yang.gdata.Node, ?Exception) -> None
-    want: set[yang.gdata.SubscriptionSpec]
-    last_merged: ?yang.gdata.Node
-
-    def __init__(self, cb: action(?yang.gdata.Node, ?Exception) -> None, want: set[yang.gdata.SubscriptionSpec], last_merged: ?yang.gdata.Node=None):
-        self.cb = cb
-        self.want = set(want)
-        self.last_merged = last_merged
 
 
 NS_IETF_SYSTEM = "urn:ietf:params:xml:ns:yang:ietf-system"
@@ -1031,14 +1005,6 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
         if client is not None:
             client.rpc(xml_rpc, rpc_reply)
 
-    def _sub_delay(spec: yang.gdata.SubscriptionSpec) -> float:
-        def ns_to_s(ns: u64) -> float:
-            return float(ns) / 1000000000.0
-        pn = spec.period
-        if pn is not None:
-            return ns_to_s(pn)
-        return float(1)
-
     def _build_subtree_filter(filt: yang.gdata.FNode) -> xml.Node:
         return xml.Node("filter", attributes=[("type", "subtree")], children=filt.to_filter_xml(deterministic=True))
 
@@ -1056,20 +1022,10 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
         return None
 
     def _owner_publish(owner_id: str, err: ?Exception=None):
-        def _merge_subscription_tree(want: set[yang.gdata.SubscriptionSpec], active: dict[yang.gdata.SubscriptionSpec, SharedSubscription]) -> ?yang.gdata.Node:
-            merged = None
-            for spec in yang.gdata.hack_sorted(iter(want)):
-                if spec in active:
-                    sub = active[spec]
-                    if sub.latest is not None:
-                        base = merged if merged is not None else yang.gdata.Container({})
-                        merged = yang.gdata.patch(base, sub.latest)
-            return merged
-
         if owner_id not in sub_owners:
             return
         owner = sub_owners[owner_id]
-        merged = _merge_subscription_tree(owner.want, subs)
+        merged = merge_subscription_tree(owner.want, subs)
         if err is not None or merged != owner.last_merged:
             owner.last_merged = merged
             sub_owners[owner_id] = owner
@@ -1086,7 +1042,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
         st = subs[spec]
         if not st.active:
             return
-        delay = _sub_delay(st.spec)
+        delay = subscription_delay(st.spec)
         after delay: _sub_tick(spec)
 
     def _sub_tick(spec: yang.gdata.SubscriptionSpec):
@@ -1231,4 +1187,3 @@ class NetconfAdapter(DeviceAdapter):
     # TODO: try removing proc. at the time of writing this, it led to crash in CPS
     proc def get_mock_server(self) -> ?NetconfMockServer:
         return self._driver.get_mock_server()
-
