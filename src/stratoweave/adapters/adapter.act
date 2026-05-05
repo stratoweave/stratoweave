@@ -1,0 +1,378 @@
+import logging
+import process
+import testing
+import xml
+
+import yang.adata
+import yang.gdata
+
+from stratoweave.device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig
+
+DISCONNECTED  = 0
+CONNECTING    = 1
+CONNECTED     = 2
+TRANSACTION   = 3
+
+class MockRoot(yang.adata.MNode):
+    """Mock root node for mock devices"""
+    def __init__(self):
+        self._name = "dummy"
+        self._ns = "dummy_ns"
+        self._schema = None
+        self._parent = None
+
+    mut def to_gdata(self) -> yang.gdata.Node:
+        return yang.gdata.Leaf(self._name)
+
+    @staticmethod
+    mut def from_gdata(self, gdata: ?yang.gdata.Node=None) -> yang.adata.MNode:
+        return MockRoot()
+
+    mut def prsrc(self, self_name='ad') -> str:
+        return f"{self_name}.{self._name}"
+
+class DeviceError(Exception):
+    """Exception raised when the device configuration fails
+    """
+
+class TransientError(DeviceError):
+    """Transient errors are temporary and can typically be recovered from by retrying
+    """
+
+class PermanentError(DeviceError):
+    """Permanent errors are typically not recoverable
+
+    Like the device things the configuration is invalid, which is not going to
+    change no matter how many times we retry
+    """
+
+class NotConnectedError(TransientError):
+    """The device is not connected
+    """
+
+class BusyError(TransientError):
+    """The device is busy, i.e. it is currently processing a configuration transaction
+    """
+
+class LockedError(TransientError):
+    """The device is locked, i.e. it is not possible to configure it at the moment
+    """
+
+class TxidMismatchError(TransientError):
+    """The device's txid doesn't match the expected txid, configuration drift detected
+    """
+
+class ConfigError(PermanentError):
+    """Configuration error, i.e. the device rejected the configuration
+
+    Retrying the same configuration typically does not help.
+
+    Args:
+        message (str): The error message from the device
+        conf: The configuration sent to the device that caused the error,
+            normally a diff computed from the current running configuration and
+            the target configuration.
+        target_conf: The target configuration, i.e. the configuration that we
+            intended to have on the device, which is the entire declarative
+            configuration for the device as outputted by transforms.
+    """
+    conf: ?yang.gdata.Node
+    target_conf: ?yang.gdata.Node
+
+    def __init__(self, message: str="", conf: ?yang.gdata.Node=None, target_conf: ?yang.gdata.Node=None):
+        PermanentError.__init__(self, message)
+        self.conf = conf
+        self.target_conf = target_conf
+
+class ModCap(object):
+    name: str
+    namespace: str
+    revision: ?str
+    feature: list[str]
+
+    def __init__(self, name: str, namespace: str, revision: ?str=None, feature: list[str]=[]):
+        self.name = name
+        self.namespace = namespace
+        self.revision = revision
+        self.feature = feature
+
+    def __str__(self) -> str:
+        return f"ModCap(name={self.name}, namespace={self.namespace}, revision={self.revision}, feature={self.feature})"
+
+extension ModCap(Eq):
+    def __eq__(self, other: ModCap) -> bool:
+        self_revision = self.revision
+        other_revision = other.revision
+        revision_eq = (self_revision is None and other_revision is None) or (self_revision is not None and other_revision is not None and self_revision == other_revision)
+        return self.name == other.name and self.namespace == other.namespace and revision_eq and self.feature == other.feature
+
+
+def hash_modset(modset: dict[str, ModCap]) -> str:
+    # TODO: use a better hash function
+    # We use map here instead of a list comprehension to avoid creating the
+    # intermediate list of strings. Ideally we could achieve the same with a
+    # generator expression.
+    modset_str = map(lambda m: str(modset[m]), sorted(modset.keys()))
+    return str(hash("".join(modset_str)))
+
+
+def modset_eq(a: dict[str, ModCap], b: dict[str, ModCap]) -> bool:
+    if len(a) != len(b):
+        return False
+    if set(a.keys()) != set(b.keys()):
+        return False
+    for k in a.keys():
+        if a[k] != b[k]:
+            return False
+    return True
+
+
+def parse_cap(tcap: str) -> ModCap:
+    parts = tcap.split("?", 1)
+
+    name = parts[0]
+    namespace = parts[0]
+    revision = None
+    feature = []
+
+    qps = {}
+    if len(parts) > 1:
+        qparts = parts[1].split("&")
+        for qpart in qparts:
+            qkvparts = qpart.split("=")
+            if len(qkvparts) == 2:
+                qk, qv = qkvparts[0], qkvparts[1]
+                qps[qk] = qv
+
+    if "module" in qps:
+        name = qps["module"]
+    if "revision" in qps:
+        revision = qps["revision"]
+
+    return ModCap(name, namespace, revision, feature)
+
+
+def mock_preset_capabilities(presets: list[str]) -> list[str]:
+    caps: list[str] = []
+    if "cisco-ios-xr" in presets:
+        caps.extend([
+            "http://cisco.com/ns/yang/Cisco-IOS-XR-um-hostname-cfg?module=Cisco-IOS-XR-um-hostname-cfg&revision=2021-04-21",
+            "http://cisco.com/ns/yang/Cisco-IOS-XR-um-interface-cfg?module=Cisco-IOS-XR-um-interface-cfg&revision=2022-07-11",
+            "http://cisco.com/ns/yang/Cisco-IOS-XR-um-if-ipv4-cfg?module=Cisco-IOS-XR-um-if-ipv4-cfg&revision=2022-07-11",
+        ])
+    if "juniper-junos" in presets:
+        caps.extend([
+            "http://xml.juniper.net/netconf/junos/1.0",
+            "http://xml.juniper.net/dmi/system/1.0",
+        ])
+    if "ietf" in presets:
+        caps.extend([
+            "urn:ietf:params:xml:ns:yang:ietf-system?module=ietf-system&revision=2014-08-06",
+        ])
+    return caps
+
+
+class DeviceAdapter(object):
+    """Abstract base class for Device Adapters
+    """
+    _log_handler: logging.Handler
+    _pcap: ?process.ProcessCap
+
+    def supports_mocking(self) -> bool:
+        return False
+
+    set_dmc: proc(new_dmc: DeviceMetaConfig) -> None
+
+    ## Configure the device with the given configuration
+    ##
+    ## :param done: callback to call when the configuration is done
+    ## :param new_diff: the diff to apply (computed by DeviceMgr)
+    ## :param new_conf: the new configuration to apply
+    ## :param running_conf: the current running configuration (with device txid)
+    configure: proc(done: action(?Exception, ?yang.gdata.Node) -> None, new_diff: yang.gdata.Node, new_conf: yang.gdata.Node, running_conf: ?yang.gdata.Node) -> None
+
+    get_capabilities: proc() -> list[str]
+
+    get_modules: proc() -> dict[str, ModCap]
+
+    ## Get the current running config from the device
+    ##
+    ## :param done: callback to call when the operation is completed
+    ##
+    ## This is an async operation with the results available in the callback.
+    fetch_config: proc(done: action(?yang.gdata.Node, ?Exception) -> None) -> None
+
+    get_config: proc() -> ?yang.gdata.Node
+
+    rpc_xml: proc(cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node) -> None
+
+    declare_subscriptions: proc(str, action(?yang.gdata.Node, ?Exception) -> None, set[yang.gdata.SubscriptionSpec]) -> None
+    remove_subscriptions: proc(str) -> None
+
+
+class NoAdapter(DeviceAdapter):
+    def __init__(self, bundled_schema: object, log_handler, pcap):
+        self._bundled_schema = bundled_schema
+        self._log_handler = log_handler
+        self._pcap = pcap
+        self._log = logging.Logger(self._log_handler)
+
+    def set_dmc(self, new_dmc):
+        self._log.debug("NoAdapter.set_dmc", {"new_dmc": new_dmc.to_gdata().to_yang_jsonstr()})
+
+    def configure(self, done, new_diff, new_conf, running_conf):
+        # The NoAdapter cannot configure anything, so we just call done() with False
+        done(NotConnectedError(), None)
+
+    def get_capabilities(self):
+        return []
+
+    def get_modules(self):
+        return {}
+
+    def fetch_config(self, done: action(?yang.gdata.Node, ?Exception) -> None):
+        pass
+
+    def get_config(self):
+        pass
+
+    def rpc_xml(self, cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node) -> None:
+        pass
+
+    def declare_subscriptions(self, owner_id: str, cb: action(?yang.gdata.Node, ?Exception) -> None, want: set[yang.gdata.SubscriptionSpec]):
+        cb(None, NotConnectedError())
+
+    def remove_subscriptions(self, owner_id: str):
+        pass
+
+class MockAdapter(DeviceAdapter):
+    """Mock device adapter
+    """
+    def __init__(self, on_connect: action(dict[str, ModCap], ?u64) -> None, bundled_schema: object, log_handler, pcap: ?process.ProcessCap):
+        self._on_connect = on_connect
+        self._bundled_schema = bundled_schema
+        self._log_handler = log_handler
+        self._pcap = pcap
+        self._log = logging.Logger(self._log_handler)
+        self._modset = {}
+        self._dmc = None
+        self._driver = MockDriver(self._on_connect, self._bundled_schema, self._log_handler, self._pcap)
+
+    def set_dmc(self, new_dmc: DeviceMetaConfig):
+        self._driver.set_dmc(new_dmc)
+
+    def configure(self, done, new_diff, new_conf, running_conf):
+        return self._driver.configure(done, new_diff, new_conf, running_conf)
+
+    def get_capabilities(self) -> list[str]:
+        return self._driver.get_capabilities()
+
+    def get_modules(self) -> dict[str, ModCap]:
+        return self._driver.get_modules()
+
+    def fetch_config(self, done):
+        return self._driver.fetch_config(done)
+
+    def get_config(self):
+        return self._driver.get_config()
+
+    def rpc_xml(self, cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node) -> None:
+        return self._driver.rpc_xml(cb, xml_rpc)
+
+    def declare_subscriptions(self, owner_id: str, cb: action(?yang.gdata.Node, ?Exception) -> None, want: set[yang.gdata.SubscriptionSpec]):
+        # TODO: can / should subscriptions do something on a MockAdapter ?
+        cb(None, NotConnectedError())
+
+    def remove_subscriptions(self, owner_id: str):
+        pass
+
+actor MockDriver(on_connect: action(dict[str, ModCap], ?u64) -> None, bundled_schema: object, log_handler: logging.Handler, pcap: ?process.ProcessCap):
+    _log = logging.Logger(log_handler)
+    _log.info("MockDriver starting up")
+
+    var dmc: ?DeviceMetaConfig = None
+    var modset: dict[str, ModCap] = {}
+
+    var conn_state: int = DISCONNECTED
+    var running_conf: ?yang.gdata.Node = None
+
+    def set_dmc(new_dmc):
+        if dmc is not None and new_dmc is not None:
+            old_dmcg = dmc.to_gdata()
+            new_dmcg = new_dmc.to_gdata()
+            if old_dmcg is not None and new_dmcg is not None:
+                if yang.gdata.diff(old_dmcg, new_dmcg) is not None:
+                    _log.debug("Device.set_dmc: ignoring new device meta-config identical to current device meta-config")
+                    return
+        _log.debug("MockAdapter.set_dmc", {"new_dmc": new_dmc.to_gdata().to_yang_jsonstr()})
+        _dmc = new_dmc
+
+        preset_caps = mock_preset_capabilities(new_dmc.mock.preset)
+        for cap in preset_caps:
+            m = parse_cap(cap)
+            modset[m.name] = m
+            _log.debug("Adding preset cap", {"cap": m.name})
+#
+        if len(new_dmc.mock.module.elements) > 0:
+            for mock_cap in new_dmc.mock.module.elements:
+                m = ModCap(mock_cap.name, mock_cap.namespace, mock_cap.revision, mock_cap.feature)
+                _log.debug("Adding mock cap", {"cap": m.name})
+                modset[m.name] = m
+
+        if len(modset) > 0:
+            _log.debug("Mock capabilities set, \"connecting\"...")
+            conn_state = CONNECTED
+            running_conf = yang.gdata.Container()
+            schema_hash: ?u64 = u64(42)
+            on_connect(modset, schema_hash)
+        else:
+            _log.debug("No mock capabilities set, idling as not connected")
+
+    def configure(done, new_diff, new_conf, running_conf):
+        if conn_state == CONNECTED:
+            _log.debug("MockAdapter.configure: device 'connected', responding done")
+            running_conf = new_conf
+            done(None, new_conf)
+        else:
+            _log.debug("MockAdapter.configure: device not connected")
+            done(NotConnectedError(), None)
+
+    def get_capabilities():
+        return []
+
+    def get_modules():
+        return modset
+
+    def fetch_config(done):
+        done(running_conf, None)
+
+    def get_config():
+        return running_conf
+
+    def rpc_xml(cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node) -> None:
+        cb(xml.Node("ok"), None)
+
+
+
+
+def _test_parse_cap_base():
+    mod = parse_cap("urn:ietf:params:netconf:base:1.1")
+    testing.assertEqual(mod.name, "urn:ietf:params:netconf:base:1.1")
+    testing.assertEqual(mod.namespace, "urn:ietf:params:netconf:base:1.1")
+    testing.assertEqual(mod.revision, None)
+    testing.assertEqual(mod.feature, [])
+
+def _test_parse_cap_xr_isis():
+    mod = parse_cap("http://cisco.com/ns/yang/Cisco-IOS-XR-isis-act?module=Cisco-IOS-XR-isis-act&revision=2019-10-01")
+    testing.assertEqual(mod.name, "Cisco-IOS-XR-isis-act")
+    testing.assertEqual(mod.namespace, "http://cisco.com/ns/yang/Cisco-IOS-XR-isis-act")
+    testing.assertEqual(mod.revision, "2019-10-01")
+    testing.assertEqual(mod.feature, [])
+
+def _test_parse_cap_xr_hostname():
+    mod = parse_cap("http://cisco.com/ns/yang/Cisco-IOS-XR-um-hostname-cfg?module=Cisco-IOS-XR-um-hostname-cfg&revision=2021-04-21")
+    testing.assertEqual(mod.name, "Cisco-IOS-XR-um-hostname-cfg")
+    testing.assertEqual(mod.namespace, "http://cisco.com/ns/yang/Cisco-IOS-XR-um-hostname-cfg")
+    testing.assertEqual(mod.revision, "2021-04-21")
+    testing.assertEqual(mod.feature, [])
