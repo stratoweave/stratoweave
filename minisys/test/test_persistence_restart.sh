@@ -79,7 +79,7 @@ elif [[ ! -x "$BIN_FILE" ]]; then
 fi
 
 start_mini
-"$CURL_BIN" -fsS -X PUT \
+"$CURL_BIN" -fsS -X PATCH \
     --connect-timeout 1 \
     --max-time 5 \
     -H "Content-Type: application/yang-data+json" \
