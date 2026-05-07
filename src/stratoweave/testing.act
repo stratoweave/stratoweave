@@ -1,3 +1,5 @@
+import file
+import fs
 import logging
 import testing
 import xml
@@ -93,6 +95,10 @@ class TestRig(object):
 
     @staticmethod
     def build(sysspec: swapp.SysSpec, log_handler: logging.Handler) -> TestRig:
+        """Construct a TestRig with a fresh device registry, layer stack, and
+        RfsReconf wiring. Equivalent to `stratoweave.test_main` but reachable
+        from inside the testing module without a circular import.
+        """
         dev_registry = swdev.DeviceRegistry(sysspec.device_types, log_handler=log_handler)
         cfs = sysspec.get_layers(dev_registry, log_handler, None)
         swapp.RfsReconf(dev_registry, cfs)
@@ -111,3 +117,109 @@ actor TransformTester(t: testing.AsyncT, sysspec: swapp.SysSpec, input_config: g
         t.success(tr.device_adata_snapshot())
 
     tr.edit_config(input_config, cont, layer_depth)
+
+
+class ServiceDiscoveryHelpers(object):
+    """Service-discovery helpers built on top of a `TestRig`: parsing
+    per-device XML inputs and rendering a combined input-adata +
+    round-trip-diff snapshot.
+    """
+    def __init__(self, rig: TestRig):
+        self.rig = rig
+
+    def parse_device_xml(self, device_type: str, xml_text: str) -> gdata.Node:
+        """Parse a device XML config string into a gdata.Node using the
+        bundled schema for `device_type`.
+        """
+        dev_type = self.rig.sysspec.device_types.get(device_type)
+        if dev_type is None:
+            raise ValueError(f"Unknown device type: {device_type}")
+        schema = dev_type!.bundled_schema.src_dnode
+        return yang.xml.from_xml(schema, xml.decode(xml_text), loose=True)
+
+    def snapshot(self,
+            device_inputs: dict[str, gdata.Node],
+            input_root_gdata: gdata.Node,
+            layer_depth: int=0) -> str:
+        """Assemble a combined SD snapshot string with two sections:
+          1. Layer-`layer_depth` adata text (what discovery produced for that
+             layer).
+          2. Per-device round-trip diff between each input gdata in
+             `device_inputs` and the device's regenerated running/target conf.
+
+        Call this after `rig.edit_config(input_root_gdata, cont, layer_depth)`
+        completes (i.e. from inside `cont`), so the device registry holds the
+        regenerated configuration produced by the TTT transforms below
+        `layer_depth`.
+        """
+        schema = self.rig.sysspec.schema_for_layer(layer_depth)
+        input_text = yang.data.pradata(schema, input_root_gdata, self_name="l{layer_depth}", loose=True)
+        diff_text = self._render_round_trip_diff(device_inputs)
+        return f"# === Layer {layer_depth} adata ===\n{input_text}\n\n# === Round-trip diff (per device) ===\n{diff_text}"
+
+    def _render_round_trip_diff(self, device_inputs: dict[str, gdata.Node]) -> str:
+        registry_names = [n for n in self.rig.dev_registry.list()]
+        input_names = [n for n in device_inputs.keys()]
+        parts = []
+        for name in sorted(input_names):
+            if name not in registry_names:
+                parts.append("# device {name}\nMISSING from device registry")
+                continue
+            dev = self.rig.dev_registry.get(name)
+            regen_opt = dev.get_running_conf()
+            if regen_opt is None:
+                regen_opt = dev.get_target_conf()
+            if regen_opt is not None:
+                # diff(regen, input): additions == lost in round trip
+                d = gdata.diff(regen_opt, device_inputs[name])
+                if d is not None:
+                    parts.append("# device {name}\n{d.to_xmlstr(pretty=True, deterministic=True)}")
+                else:
+                    parts.append("# device {name}\nno diff")
+            else:
+                parts.append(f"# device {name}\nNo regenerated config")
+        for name in sorted([n for n in registry_names if n not in input_names]):
+            parts.append(f"# device {name}\nextra device, no input to compare")
+        return "\n\n".join(parts)
+
+
+actor ServiceDiscoveryTester(t: testing.EnvT, sysspec: swapp.SysSpec, xml_dir: str, discover: proc(dict[str, gdata.Node]) -> gdata.Node, layer_depth: int=0):
+    """Drive a service-discovery test from a pure `discover` function.
+
+    `xml_dir` (relative to the test cwd) contains one subdirectory per
+    device type, named after a key in `sysspec.device_types`. Each `*.xml`
+    file in a type subdir is a device input parsed with that type's
+    bundled schema; the filename without `.xml` is the device name (must
+    be unique across subdirs). The parsed inputs are passed to `discover`
+    as a dict keyed by device name, and the returned gdata is applied at
+    `layer_depth` (0 = top/CFS layer) via the standard TTT layers. Once
+    the apply completes, a combined input-adata + round-trip-diff snapshot
+    is reported via `t.success(...)`.
+    """
+    fc = file.FileCap(t.env.cap)
+    rfc = file.ReadFileCap(fc)
+    file_fs = file.FS(fc)
+
+    tr = TestRig.build(sysspec, t.log_handler)
+    sd = ServiceDiscoveryHelpers(tr)
+
+    device_inputs = {}
+    for type_name in sorted(await async file_fs.listdir(xml_dir)):
+        type_dir = "{xml_dir}/{type_name}"
+        st = await async file_fs.lstat(type_dir)
+        if not st.is_dir():
+            continue
+        entries = await async file_fs.listdir(type_dir)
+        for fname in sorted([e for e in entries if fs.glob("*.xml", e)]):
+            name = fname[:-4]
+            rf = file.ReadFile(rfc, "{type_dir}/{fname}")
+            text = (await async rf.read()).decode()
+            await async rf.close()
+            device_inputs[name] = sd.parse_device_xml(type_name, text)
+
+    discovered_gdata = discover(device_inputs)
+
+    def cont(r: value):
+        t.success(sd.snapshot(device_inputs, discovered_gdata, layer_depth))
+
+    tr.edit_config(discovered_gdata, cont, layer_depth)
