@@ -866,3 +866,84 @@ actor transform_dynstate(t: testing.AsyncT):
     s1.edit_config(gdata.Container({q("leaf"): gdata.Leaf(39)}))
 
 ########################
+# Link regression tests
+########################
+
+class LinkedAsnSubscriber(ttt.TransformFunction):
+    def transform_wrapper(self, cfg: gdata.Node, linked: gdata.Node, memory: ?gdata.Node, dynstate: ?gdata.Node):
+        out_children: dict[gdata.Id, gdata.Node] = {}
+        if isinstance(cfg, gdata.Container):
+            for k, v in cfg.children.items():
+                out_children[k] = v
+        network_node = linked.get_opt_cnt(q("network"))
+        if network_node is not None:
+            gs_node = network_node.get_opt_cnt(q("global-settings"))
+            if gs_node is not None:
+                asn_leaf = gs_node.get_opt_leaf(q("asn"))
+                if asn_leaf is not None:
+                    out_children[q("seen_asn")] = asn_leaf
+        return gdata.Container(out_children), None
+
+def _link_to_global_settings(conf: gdata.Node) -> list[ttt.TaggedPath]:
+    return [ttt.TaggedPath('global', gdata.FNode(q("network"), children=[
+        gdata.FNode(q("global-settings")),
+    ]))]
+
+
+# When the subscriber lives in a list and a later tx touches only the
+# publisher, the list element transactions are not configured in that tx.
+# Linkage still has to reach the existing list entry and the resulting
+# commit must release the ListState cleanly. The compound key (string + int)
+# also covers per-type and multi-key value_match rendering in one shot.
+actor link_subscriber_in_list_re_runs_on_publisher_update(t: testing.AsyncT):
+    stack = ttt.Layer("top",
+        ttt.Container({
+            q("network"): ttt.Container({
+                q("global-settings"): ttt.Transform(ttt.PassThrough),
+                q("router"): ttt.List(
+                    ttt.Transform(LinkedAsnSubscriber, None, _link_to_global_settings),
+                    [q("name"), q("id")],
+                ),
+            }),
+        }),
+        ttt.Sink())
+
+    cfg_init = gdata.Container({
+        q("network"): gdata.Container({
+            q("global-settings"): gdata.Container({q("asn"): gdata.Leaf(11)}),
+            q("router"): gdata.List([q("name"), q("id")], [
+                gdata.Container({
+                    q("name"): gdata.Leaf("r1"),
+                    q("id"): gdata.Leaf(1),
+                }),
+            ]),
+        }),
+    })
+    cfg_bump_asn = gdata.Container({
+        q("network"): gdata.Container({
+            q("global-settings"): gdata.Container({q("asn"): gdata.Leaf(22)}),
+        }),
+    })
+
+    expected_after_bump = gdata.Container({
+        q("asn"): gdata.Leaf(22),
+        q("id"): gdata.Leaf(1),
+        q("name"): gdata.Leaf("r1"),
+        q("seen_asn"): gdata.Leaf(22),
+    })
+
+    sess1 = stack.newsession()
+
+    def cont2(_r: value):
+        testing.assertEqual(
+            sess1.below().get(),
+            expected_after_bump,
+        )
+        t.success()
+
+    def cont1(_r: value):
+        sess2 = stack.newsession()
+        sess2.edit_config(cfg_bump_asn, complete=cont2)
+
+    sess1.edit_config(cfg_init, cont1)
+########################
