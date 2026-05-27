@@ -200,19 +200,18 @@ def _format_path(p: Path):
     else:
         return [p.name]
 
-# Reverse the given Path and construct a linear FNode with value-matching key leaves
+# Reverse the given Path and construct a linear FNode chain. List entries
+# become a single FNode whose value_match is the compound key string already
+# computed by key_str on PathKey construction
 def fnode(p: Path, tails: list[gdata.FNode]=[]) -> gdata.FNode:
-    name = gdata.Id("",p.name)
     if isinstance(p, PathElem):
-        name = gdata.Id(p.ns, p.name)
-        return fnode(p.parent, [gdata.FNode(name, children=tails)])
+        return fnode(p.parent, [gdata.FNode(gdata.Id(p.ns, p.name), children=tails)])
     elif isinstance(p, PathKey):
-        keys = [ gdata.FNode(k, value_match=v.val) for k,v in p.keyvals.items() if isinstance(v, gdata.Leaf) ]
-        return fnode(p.parent, tails+keys)
+        return fnode(p.parent, [gdata.FNode(value_match=p.name, children=tails)])
     elif tails:
         return tails[0]
     else:
-        return gdata.FNode(name)
+        return gdata.FNode(gdata.Id("", p.name))
 
 def make_rooted(p: Path, tree: gdata.Node):
     if isinstance(p, PathKey):
@@ -1331,6 +1330,14 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, ns: ?str, module: ?s
 
         return {k: elems[k] for k in keys1}
 
+    def acquire_existing(tid: str, keys: set[str]) -> dict[str, Node]:
+        keys1 = {k for k in keys if k in elems}
+        if tid in active:
+            active[tid] |= keys1
+        else:
+            active[tid] = keys1
+        return {k: elems[k] for k in keys1}
+
     def release(tid: str, ok: bool, deletes: set[str]):
         #print('====', tid, path, 'release', ok, 'deletes:', deletes, 'provisional:', provisional, err=True)
         if ok:
@@ -1457,6 +1464,30 @@ class _ListTransaction(_Transaction):
 
     def linkage(self, tid, requests, updates, out, dbuf):
         #print('####', tid, '(List)', _format_path(self.path), 'linkage', len(requests), len(updates), err=True)
+        # linkage can now be a transaction entry point, so like configure()
+        # it must clear the previous transaction stale state
+        if self.reset:
+            self.elems = {}
+            self.accum = {}
+            self.reset = False
+
+        # linkage may target list entries committed by an earlier tx and not
+        # configured in this one. Acquire those existing entries so we can
+        # dispatch linkage to them
+        keys_needed = set()
+        for r in requests:
+            vm = r.publisher.value_match
+            if isinstance(vm, str):
+                keys_needed.add(vm)
+        for u in updates:
+            vm = u.subscriber.value_match
+            if isinstance(vm, str):
+                keys_needed.add(vm)
+        existing = self.liststate.acquire_existing(tid, keys_needed)
+        for k,node in existing.items():
+            if k not in self.elems:
+                self.elems[k] = node.newtrans()
+
         results = {}
         for key,elem in self.elems.items():
             reqs = [ r.tail() for r in requests if r.vequal(key) ]
