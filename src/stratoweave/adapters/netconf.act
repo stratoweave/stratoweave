@@ -18,7 +18,7 @@ from stratoweave.device_meta_config import \
 from stratoweave.adapters.adapter import \
     DeviceAdapter, ModCap, DISCONNECTED, CONNECTING, CONNECTED, TRANSACTION, \
     NotConnectedError, BusyError, LockedError, TxidMismatchError, ConfigError, \
-    SharedSubscription, SubscriptionOwner, parse_cap, modset_eq, \
+    SharedSubscription, SubscriptionOwner, parse_cap, \
     mock_preset_capabilities, subscription_delay, merge_subscription_tree
 
 def extract_txid(conf: ?xml.Node) -> ?str:
@@ -318,6 +318,39 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
 
     NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
 
+    def _modset_from_capabilities(capabilities: list[str]) -> dict[str, ModCap]:
+        new_modset = {}
+        for cap in capabilities:
+            if "?module=" not in cap and "&module=" not in cap:
+                continue
+            m = parse_cap(cap)
+            new_modset[m.name] = m
+        return new_modset
+
+    def _supports_schema_discovery(capabilities: list[str]) -> bool:
+        for cap in capabilities:
+            if "urn:ietf:params:netconf:capability:yang-library" in cap:
+                return True
+            if "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring" in cap:
+                return True
+        return False
+
+    def _modset_from_schema_list(schema_list: list[(identifier: str, namespace: str, version: str, format: str)]) -> dict[str, ModCap]:
+        new_modset = {}
+        for s in schema_list:
+            if s.format != "yang":
+                continue
+            revision = None
+            if len(s.version) > 0:
+                revision = s.version
+            new_modset[s.identifier] = ModCap(s.identifier, s.namespace, revision)
+        return new_modset
+
+    def _has_capability(capability: str) -> bool:
+        if client is not None:
+            return capability in client.get_capabilities()
+        return False
+
     def _on_connect(c: netconf.Client, err):
         if client is not None and c is not client:
             _log.debug("Device._on_connect: ignoring connection from old client")
@@ -326,6 +359,12 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
         schemas = []
         sw = time.Stopwatch()
         schema_getter: ?netconf.SchemaGetter = None
+        schema_modset: dict[str, ModCap] = {}
+
+        def finish_connect(new_modset: dict[str, ModCap], new_schema_hash: ?u64=None):
+            modset = new_modset
+            schema_hash = new_schema_hash
+            dev.on_connect(modset, schema_hash)
 
         def list_schemas(c1: netconf.Client, schema_list: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
             if client is not None and c1 is not client:
@@ -333,8 +372,24 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
                 return
 
             if error is not None:
-                _log.error("Device._on_connect: error listing schemas", {"error": str(error)})
-                download_complete(None, error)
+                if _supports_schema_discovery(c.get_capabilities()):
+                    _log.error("Device._on_connect: schema discovery failed", {"error": str(error)})
+                    modset = {}
+                    after 1: c.restart()
+                else:
+                    details = {"reason": "no schema discovery method advertised", "error": str(error)}
+                    _log.warning("Device._on_connect: falling back to YANG module capabilities", details)
+                    finish_connect(_modset_from_capabilities(c.get_capabilities()))
+                return
+
+            schema_modset = _modset_from_schema_list(schema_list)
+            if len(schema_modset) == 0:
+                _log.warning("Device._on_connect: schema discovery returned no YANG modules")
+                finish_connect(schema_modset)
+                return
+
+            if not dmc.feature_flags.runtime_schema_fetch:
+                finish_connect(schema_modset)
                 return
 
             schemas_to_download = []
@@ -355,7 +410,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
 
             if len(schemas_to_download) == 0:
                 _log.warning("Device._on_connect: no schemas available for download")
-                download_complete(None, None)
+                finish_connect(schema_modset)
                 return
             _log.debug("Device._on_connect: found schemas to download", {"count": len(schemas_to_download)})
             schema_getter = netconf.SchemaGetter(c1)
@@ -373,12 +428,12 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
                 _log.debug("Device._on_connect: downloaded schema", {"index": index, "total": total, "identifier": schema_id.identifier})
                 schemas.append(schema_data)
 
-        def download_complete(sg, error):
+        def download_complete(sg, error=None):
             if schema_getter is not None and sg is not None and sg is not schema_getter:
                 _log.debug("Device._on_connect: ignoring connection from old client")
                 return
             if error is not None:
-                _log.error("Device._on_connect: error downloading schemas", {"error": str(err)})
+                _log.error("Device._on_connect: error downloading schemas", {"error": str(error)})
                 modset = {}
                 after 1: c.restart()
             else:
@@ -387,13 +442,11 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
                 result = schema_registry.add_schema(schemas)
                 if result.error is not None:
                     _log.error("Device._on_connect: failed to compile schemas", {"error": str(result.error)})
-                    modset = {}
-                    schema_hash = None
-                    # after 1: c.restart()
+                    finish_connect(schema_modset)
                 else:
                     schema_hash = result.hash
                     _log.debug("Device._on_connect: compiled schemas", {"duration": sw.elapsed().to_float()})
-                    dev.on_connect(modset, schema_hash)
+                    finish_connect(schema_modset, schema_hash)
 
         if err is not None:
             if state == CONNECTING:
@@ -408,22 +461,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
         else:
             _log.info("Device._on_connect: connected to device")
             state = CONNECTED
-
-            new_modset: dict[str, ModCap] = {}
-            for cap in c.get_capabilities():
-                m = parse_cap(cap)
-                new_modset[m.name] = m
-
-            # TODO: check yang-library instead!!
-
-            if not modset_eq(modset, new_modset):
-                modset = new_modset
-
-            if dmc.feature_flags.runtime_schema_fetch:
-                c.list_schemas(list_schemas)
-            else:
-                schema_hash = None
-                dev.on_connect(modset, schema_hash)
+            c.list_schemas(list_schemas)
 
     def _on_notif(c, n):
         if client is not None and c is not client:
@@ -923,13 +961,13 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
         raise ValueError("No writable datastore available")
 
     def has_candidate():
-        return "urn:ietf:params:netconf:capability:candidate:1.0" in modset
+        return _has_capability("urn:ietf:params:netconf:capability:candidate:1.0")
 
     def has_confirmed_commit():
-        return "urn:ietf:params:netconf:capability:confirmed-commit:1.0" in modset
+        return _has_capability("urn:ietf:params:netconf:capability:confirmed-commit:1.0")
 
     def has_writable_running():
-        return "urn:ietf:params:netconf:capability:writable-running:1.0" in modset
+        return _has_capability("urn:ietf:params:netconf:capability:writable-running:1.0")
 
     def is_junos():
         for m in modset.values():
