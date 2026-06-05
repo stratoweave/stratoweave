@@ -947,3 +947,152 @@ actor link_subscriber_in_list_re_runs_on_publisher_update(t: testing.AsyncT):
 
     sess1.edit_config(cfg_init, cont1)
 ########################
+
+
+# Subscriber transform for the test below: it reflects each linked
+# /netinfra/router entry as seen_<name> = <id>, so the test can assert which
+# router entries were delivered as linked input.
+class LinkedRouterSubscriber(ttt.TransformFunction):
+    def transform_wrapper(self, cfg, linked, memory, dynstate):
+        out_children: dict[gdata.Id, gdata.Node] = {}
+        netinfra_node = linked.get_opt_cnt(q("netinfra"))
+        if netinfra_node is not None:
+            router_list = netinfra_node.get_opt_list(q("router"))
+            if router_list is not None:
+                for entry in router_list.elements:
+                    rname = entry.get_opt_value(q("name"))
+                    id_leaf = entry.get_opt_leaf(q("id"))
+                    if rname is not None and id_leaf is not None:
+                        out_children[q("seen_{rname}")] = id_leaf
+        return gdata.Container(out_children), None
+
+# A linkable publisher whose own downstream output is irrelevant to the link,
+# so it emits nothing. (A PassThrough here would echo each entry's flat
+# {name,id} to the shared sink root, where two list entries collide on those
+# leaves and abort the commit.)
+class RouterPublisher(ttt.TransformFunction):
+    def transform_wrapper(self, cfg, linked, memory, dynstate):
+        return gdata.Container(), None
+
+# A faithful copy of the router leafref portion of the generated
+# _build_target_links_l3vpn__l3vpn_entry: it reads the 'conf' parameter,
+# walking the endpoint list and rendering one router demand per device value.
+def _build_target_links_l3vpn(conf: gdata.Node) -> list[ttt.TaggedPath]:
+    res = []
+    # leafref link: router
+    _l0 = conf.get_opt_list(q("endpoint"))
+    if _l0 is not None:
+        for _e0 in _l0.elements:
+            _v1 = _e0.get_opt_value(q("device"))
+            if _v1 is not None:
+                res.append(ttt.TaggedPath('router', gdata.FNode(q("netinfra"), children=[gdata.FNode(q("router"), children=[gdata.FNode(q("name"), value_match=_v1)])])))
+    return res
+
+
+# Linking via leafref into a single-key list entry: the l3vpn endpoint/device
+# leaf is a leafref to /netinfra/router/name (`sw:link router`). Two routers
+# exist but the only endpoint references r1, so r1's entry must be delivered to
+# the subscriber transform and r2 must be filtered out.
+actor link_into_list_delivers_only_referenced_entry(t: testing.AsyncT):
+    stack = ttt.Layer("top",
+        ttt.Container({
+            q("netinfra"): ttt.Container({
+                q("router"): ttt.List(
+                    ttt.Transform(RouterPublisher),
+                    [q("name")],
+                ),
+            }),
+            q("l3vpn"): ttt.Transform(LinkedRouterSubscriber, None, _build_target_links_l3vpn),
+        }),
+        ttt.Sink())
+
+    cfg = gdata.Container({
+        q("netinfra"): gdata.Container({
+            q("router"): gdata.List([q("name")], [
+                gdata.Container({
+                    q("name"): gdata.Leaf("r1"),
+                    q("id"): gdata.Leaf(1),
+                }),
+                gdata.Container({
+                    q("name"): gdata.Leaf("r2"),
+                    q("id"): gdata.Leaf(2),
+                }),
+            ]),
+        }),
+        q("l3vpn"): gdata.Container({
+            q("endpoint"): gdata.List([q("device")], [
+                gdata.Container({
+                    q("device"): gdata.Leaf("r1"),
+                }),
+            ]),
+        }),
+    })
+
+    expected = gdata.Container({
+        q("seen_r1"): gdata.Leaf(1),
+    })
+
+    sess = stack.newsession()
+
+    def cont(_r: value):
+        testing.assertEqual(sess.below().get().prsrc(deterministic=True), expected.prsrc(deterministic=True))
+        t.success()
+
+    sess.edit_config(cfg, complete=cont)
+########################
+
+
+# Both list entries referenced: two endpoints reference r1 and r2, so
+# build_target_links emits a demand per device and both /netinfra/router
+# entries must be delivered to the subscriber transform.
+actor link_into_list_delivers_all_referenced_entries(t: testing.AsyncT):
+    stack = ttt.Layer("top",
+        ttt.Container({
+            q("netinfra"): ttt.Container({
+                q("router"): ttt.List(
+                    ttt.Transform(RouterPublisher),
+                    [q("name")],
+                ),
+            }),
+            q("l3vpn"): ttt.Transform(LinkedRouterSubscriber, None, _build_target_links_l3vpn),
+        }),
+        ttt.Sink())
+
+    cfg = gdata.Container({
+        q("netinfra"): gdata.Container({
+            q("router"): gdata.List([q("name")], [
+                gdata.Container({
+                    q("name"): gdata.Leaf("r1"),
+                    q("id"): gdata.Leaf(1),
+                }),
+                gdata.Container({
+                    q("name"): gdata.Leaf("r2"),
+                    q("id"): gdata.Leaf(2),
+                }),
+            ]),
+        }),
+        q("l3vpn"): gdata.Container({
+            q("endpoint"): gdata.List([q("device")], [
+                gdata.Container({
+                    q("device"): gdata.Leaf("r1"),
+                }),
+                gdata.Container({
+                    q("device"): gdata.Leaf("r2"),
+                }),
+            ]),
+        }),
+    })
+
+    expected = gdata.Container({
+        q("seen_r1"): gdata.Leaf(1),
+        q("seen_r2"): gdata.Leaf(2),
+    })
+
+    sess = stack.newsession()
+
+    def cont(_r: value):
+        testing.assertEqual(sess.below().get().prsrc(deterministic=True), expected.prsrc(deterministic=True))
+        t.success()
+
+    sess.edit_config(cfg, complete=cont)
+########################

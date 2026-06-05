@@ -184,7 +184,7 @@ class PathElem(Path):
         return self.ns
 
 class PathKey(Path):
-    def __init__(self, keystr: str, parent: Path, keyvals: dict[gdata.Id, gdata.Node], ):
+    def __init__(self, keystr: str, parent: Path, keyvals: dict[gdata.Id, gdata.Node]):
         self.name = keystr
         self.parent = parent
         self.keyvals = keyvals
@@ -200,14 +200,35 @@ def _format_path(p: Path):
     else:
         return [p.name]
 
-# Reverse the given Path and construct a linear FNode chain. List entries
-# become a single FNode whose value_match is the compound key string already
-# computed by key_str on PathKey construction
-def fnode(p: Path, tails: list[gdata.FNode]=[]) -> gdata.FNode:
+# Reverse a Path into a linear gdata.FNode chain in *routing* form: a list
+# entry collapses to a single unnamed FNode whose value_match is the compound
+# key string (PathKey.name, precomputed by key_str). A transform names itself
+# as a link subscriber with this (route_fpath); List.linkage routes messages
+# back to it by matching that value_match against each element's key_str.
+# Sibling path_filter() renders the same Path in gdata *filter* form.
+def path_route(p: Path, tails: list[gdata.FNode]=[]) -> gdata.FNode:
     if isinstance(p, PathElem):
-        return fnode(p.parent, [gdata.FNode(gdata.Id(p.ns, p.name), children=tails)])
+        return path_route(p.parent, [gdata.FNode(gdata.Id(p.ns, p.name), children=tails)])
     elif isinstance(p, PathKey):
-        return fnode(p.parent, [gdata.FNode(value_match=p.name, children=tails)])
+        return path_route(p.parent, [gdata.FNode(value_match=p.name, children=tails)])
+    elif tails:
+        return tails[0]
+    else:
+        return gdata.FNode(gdata.Id("", p.name))
+
+# Reverse a Path into a linear gdata.FNode chain in gdata *filter* form: each
+# list key becomes a named key-leaf predicate FNode(keyId, value_match=val) --
+# the convention used by build_target_links, gdata.filter and gdata.prune,
+# which reject the unnamed-entry form (they require named children). A transform
+# advertises itself as a link publisher with this (filter_fpath) so it matches
+# the subscriber's generated demand and can be pruned from the linked tree.
+# Sibling path_route() renders the same Path in routing form.
+def path_filter(p: Path, tails: list[gdata.FNode]=[]) -> gdata.FNode:
+    if isinstance(p, PathElem):
+        return path_filter(p.parent, [gdata.FNode(gdata.Id(p.ns, p.name), children=tails)])
+    elif isinstance(p, PathKey):
+        key_preds = [gdata.FNode(kid, value_match=(kv.val if isinstance(kv, gdata.Leaf) else None)!) for kid, kv in p.keyvals.items()]
+        return path_filter(p.parent, key_preds + tails)
     elif tails:
         return tails[0]
     else:
@@ -1668,7 +1689,8 @@ class _TransformTransactionBase(_Transaction):
     candidate_subscribers: dict[str, list[TaggedPath]]          # As above, per ongoing transaction
     @property
     build_links: ?proc(gdata.Node) -> list[TaggedPath]
-    fpath: gdata.FNode
+    route_fpath: gdata.FNode
+    filter_fpath: gdata.FNode
 
     me: str
     db: ?lmdb.Db
@@ -1694,7 +1716,8 @@ class _TransformTransactionBase(_Transaction):
         self.subscribers = []
         self.candidate_subscribers = {}
         self.build_links = build_links
-        self.fpath = fnode(path)
+        self.route_fpath = path_route(path)
+        self.filter_fpath = path_filter(path)
 
         self.db = None
         self.me = ''  # Initialize first before any self reference
@@ -1720,7 +1743,7 @@ class _TransformTransactionBase(_Transaction):
             #print('   #', tid, '(Transform)', _format_path(self.path), 'EMPTY CONFIG', err=True)
             self.clear(tid, out)
             self.stage_db_state(tid, dbuf)
-            req = [ LinkRequest(s.tag,s.path,self.fpath,False) for s in self.subscriptions ]
+            req = [ LinkRequest(s.tag,s.path,self.route_fpath,False) for s in self.subscriptions ]
             upd = self.link_updates(tid, gdata.Container())
             return CfgOk(empty=True, requests=req, updates=upd)
         else:
@@ -1753,10 +1776,10 @@ class _TransformTransactionBase(_Transaction):
             latest_subs = build_links(merged)
             for s in latest_subs:
                 if s not in cand_subs:
-                    req.append(LinkRequest(s.tag, s.path, self.fpath, True))
+                    req.append(LinkRequest(s.tag, s.path, self.route_fpath, True))
             for s in cand_subs:
                 if s not in latest_subs:
-                    req.append(LinkRequest(s.tag, s.path, self.fpath, False))
+                    req.append(LinkRequest(s.tag, s.path, self.route_fpath, False))
                     cand_linked = prune(cand_linked, s.path)
             self.candidate_subscriptions[tid] = latest_subs
             self.candidate_linked[tid] = cand_linked
@@ -1768,7 +1791,7 @@ class _TransformTransactionBase(_Transaction):
         rooted = make_rooted(self.path, merged)
         upd = []
         for u in cand_subscribers:
-            upd.append(LinkUpdate(u.tag, self.fpath, u.path, rooted))
+            upd.append(LinkUpdate(u.tag, self.filter_fpath, u.path, rooted))
         #print('####', tid, '(Transform)', _format_path(self.path), 'link_updates:', len(upd), err=True)
         return upd
 
