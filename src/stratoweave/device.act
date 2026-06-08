@@ -503,6 +503,21 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, pcap: ?process.ProcessCap=N
         _update_approval_state()
 
 
+    def _complete_tids(tids: set[str]):
+        """Dispatch and release the wait_complete callbacks for the given tids
+
+        We also drop the config queue and reconf registrations beacuse at this
+        point we're done - config was either applied or the device is already in
+        sync.
+        """
+        for tid in tids:
+            cb = callbacks.get(tid)
+            if cb is not None:
+                cb(True)
+                del callbacks[tid]
+            reconf_tids.discard(tid)
+            del confq[tid]
+
     def _send_config():
         """Send configuration to the device adapter
 
@@ -632,13 +647,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, pcap: ?process.ProcessCap=N
                     del conf_log[0]
 
                 last_sent_diff = new_diff
-                for tid in current_tids:
-                    cb = callbacks.get(tid)
-                    if cb is not None:
-                        cb(True)
-                        del callbacks[tid]
-                    reconf_tids.discard(tid)
-                    del confq[tid]
+                _complete_tids(current_tids)
                 current_tids = set()
                 _update_approval_state()
                 if len(confq) > 0:
@@ -649,25 +658,22 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, pcap: ?process.ProcessCap=N
         if running_conf is not None and send_conf is not None:
             send_conf2 = config_fixer(running_conf, send_conf)
             send_diff = yang.gdata.diff(running_conf, send_conf2) if send_conf2 is not None else None
+            all_tids = set(pending_tids)
+            all_tids.update(reconf_tids)
             if send_diff is not None:
                 if last_sent_diff is not None:
                     if send_diff == last_sent_diff:
                         _log.info("Reconciliation loop detected, target diff is same as last diff sent, stopping", {"diff": send_diff})
                         return
                 # Actually send the configuration
-                current_tids = set(pending_tids)
-                current_tids.update(reconf_tids)
+                current_tids = all_tids
                 _log.debug("DeviceMgr._send_config: sending intended target configuration", {"current_tids": current_tids, "diff": send_diff})
                 adapter.configure(lambda e, c: on_configured(e, c, send_diff), send_diff, send_conf, running_conf)
             else:
-                _log.debug("DeviceMgr.configure: no diff between running and target config, nothing to do", {"pending_tids": pending_tids})
-                # No diff, so complete the pending transactions immediately
-                for tid in pending_tids:
-                    cb = callbacks.get(tid)
-                    if cb is not None:
-                        cb(True)
-                        del callbacks[tid]
-                    del confq[tid]
+                # No diff: the device already holds the intended config, so the
+                # pending transactions and any reconf_tids are satisfied.
+                _log.debug("DeviceMgr._send_config: no diff between running and target config, nothing to do", {"completed_tids": all_tids})
+                _complete_tids(all_tids)
                 _update_approval_state()
         else:
             if running_conf is None:
