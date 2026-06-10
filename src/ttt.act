@@ -1801,12 +1801,33 @@ class _TransformTransactionBase(_Transaction):
         #print('####', tid, '(Transform)', _format_path(self.path), 'linkage:', len(requests), len(updates), err=True)
         if requests:
             subscribers = self.candidate_subscribers.get_def(tid, self.subscribers)
+            new_subscribers = []
             for r in requests:
                 if r.status:
-                    subscribers.append(TaggedPath(r.tag, r.subscriber))
+                    new_subscriber = TaggedPath(r.tag, r.subscriber)
+                    subscribers.append(new_subscriber)
+                    new_subscribers.append(new_subscriber)
                 else:
                     subscribers = list(filter(lambda s: s.path != r.subscriber, subscribers))
             self.candidate_subscribers[tid] = subscribers
+            if not updates and tid not in self.diffs:
+                # This publisher is untouched in this transaction: only its
+                # subscriber set changed, so its published state is unchanged
+                # and existing subscribers already hold it. Deliver the
+                # current state to the new subscribers only and skip the
+                # forced recompute. Without this, every link
+                # subscribe/unsubscribe (e.g. each service create or delete)
+                # fans a full state broadcast out to every subscriber, making
+                # such transactions cost O(existing subscribers) transform
+                # recomputes. The lock phase re-configures this transform, so
+                # candidate/essay state is in place before commit.
+                upd = []
+                if new_subscribers:
+                    merged_now = merge(self.running) if self.running else gdata.Container()
+                    rooted = make_rooted(self.path, merged_now)
+                    for s in new_subscribers:
+                        upd.append(LinkUpdate(s.tag, self.filter_fpath, s.path, rooted))
+                return CfgOk(empty = not self.running, updates=upd)
         ###
         if updates:
             linked = self.candidate_linked.get_def(tid, self.linked)
@@ -1871,9 +1892,12 @@ class _TransformTransactionBase(_Transaction):
 
     def commit(self, tid, ok):
         #print('####', tid, '(Transform)', _format_path(self.path), 'commit', ok, err=True)
-        self.diffs.pop(tid)
+        # The pops must tolerate a missing tid: a transform reached only by
+        # subscription bookkeeping has no config state for the transaction if
+        # it is aborted before its lock-time re-configure runs.
+        self.diffs.pop_def(tid, {})
         candidate = self.candidates.pop_def(tid, {})
-        essay = self.essays.pop(tid)
+        essay = self.essays.pop_def(tid, (None, None))
         linked = self.candidate_linked.pop_def(tid, self.linked)
         subscriptions = self.candidate_subscriptions.pop_def(tid, self.subscriptions)
         subscribers = self.candidate_subscribers.pop_def(tid, self.subscribers)
