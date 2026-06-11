@@ -55,7 +55,7 @@ def create_crpd_gdata_config(seq) -> yang.gdata.Node:
 
     system = yang.gdata.Container({
         q("login"): yang.gdata.Container({
-            q("announcement"): yang.gdata.Leaf("string", f"Test banner from StratoWeave, seq: {seq}")
+            q("announcement"): yang.gdata.Leaf(f"Test banner from StratoWeave, seq: {seq}")
         })
     })
     config_children = {
@@ -78,6 +78,11 @@ actor _test_txid(t: testing.EnvT):
     3. Create a NetconfAdapter instance
     4. Send a configuration through the adapter TWICE to test check_txid efficiency
     5. Use a direct netconf.Client to verify the configuration was applied
+
+    JUNOS restarts sshd while committing system{} configuration, so the test
+    needs headroom for connect retries; run it with an extended deadline:
+
+        acton test --tag crpd --jobs 1 --max-time 10000 --module stratoweave.test_device_crpd
     """
     t.require("crpd")
     log = logging.Logger(t.log_handler)
@@ -85,6 +90,7 @@ actor _test_txid(t: testing.EnvT):
 
     var adapter: ?swna.NetconfAdapter = None
     var verification_client: ?netconf.Client = None
+    var verify_connect_attempts = 0
 
     # Create a mock DeviceMgr
     dev_types = {}
@@ -253,8 +259,15 @@ actor _test_txid(t: testing.EnvT):
 
         def on_verify_connect(c: netconf.Client, err: ?Exception):
             if err is not None:
-                log.error("Verification client failed to connect", {"error": str(err)})
-                t.failure(err)
+                # JUNOS restarts sshd as part of committing system{} config, so
+                # a connection right after a commit can land in the restart
+                # window and be dropped. Retry a few times before giving up.
+                if verify_connect_attempts < 5:
+                    log.info("Verification client connect failed, retrying", {"error": str(err)})
+                    after 0.5: start_verification_client()
+                else:
+                    log.error("Verification client failed to connect", {"error": str(err)})
+                    t.failure(err)
             else:
                 log.info("Verification client connected")
                 verification_client = c
@@ -292,17 +305,20 @@ actor _test_txid(t: testing.EnvT):
             else:
                 t.success()
 
-        # Create the verification client
-        verification_client = netconf.Client(
-            net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
-            test_address,
-            test_port,
-            test_username,
-            test_password,
-            on_connect=on_verify_connect,
-            log_handler=t.log_handler,
-            skip_host_key_check=True
-        )
+        def start_verification_client():
+            verify_connect_attempts += 1
+            verification_client = netconf.Client(
+                net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                test_address,
+                test_port,
+                test_username,
+                test_password,
+                on_connect=on_verify_connect,
+                log_handler=t.log_handler,
+                skip_host_key_check=True
+            )
+
+        start_verification_client()
 
     # Start the test by first setting up and verifying the server
     setup_test()
