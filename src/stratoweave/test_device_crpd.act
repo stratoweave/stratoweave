@@ -1,7 +1,7 @@
 """StratoWeave Device tests"""
 
 import logging
-import process
+import net
 import testing
 import xml
 import yang.adata
@@ -55,7 +55,7 @@ def create_crpd_gdata_config(seq) -> yang.gdata.Node:
 
     system = yang.gdata.Container({
         q("login"): yang.gdata.Container({
-            q("announcement"): yang.gdata.Leaf("string", f"Test banner from StratoWeave, seq: {seq}")
+            q("announcement"): yang.gdata.Leaf(f"Test banner from StratoWeave, seq: {seq}")
         })
     })
     config_children = {
@@ -78,6 +78,11 @@ actor _test_txid(t: testing.EnvT):
     3. Create a NetconfAdapter instance
     4. Send a configuration through the adapter TWICE to test check_txid efficiency
     5. Use a direct netconf.Client to verify the configuration was applied
+
+    JUNOS restarts sshd while committing system{} configuration, so the test
+    needs headroom for connect retries; run it with an extended deadline:
+
+        acton test --tag crpd --jobs 1 --max-time 10000 --module stratoweave.test_device_crpd
     """
     t.require("crpd")
     log = logging.Logger(t.log_handler)
@@ -85,6 +90,7 @@ actor _test_txid(t: testing.EnvT):
 
     var adapter: ?swna.NetconfAdapter = None
     var verification_client: ?netconf.Client = None
+    var verify_connect_attempts = 0
 
     # Create a mock DeviceMgr
     dev_types = {}
@@ -176,7 +182,7 @@ actor _test_txid(t: testing.EnvT):
 
         # Create setup client
         setup_client = netconf.Client(
-            process.ProcessCap(t.env.auth),
+            net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
             test_address,
             test_port,
             test_username,
@@ -232,7 +238,7 @@ actor _test_txid(t: testing.EnvT):
 
         # Create DeviceMgr and NetconfAdapter
         schema_registry = stratoweave.device.SchemaRegistry()
-        dev = stratoweave.device.DeviceMgr(dev_types, process.ProcessCap(t.env.auth), "test-device", t.log_handler, on_reconf, schema_registry)
+        dev = stratoweave.device.DeviceMgr(dev_types, net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))), "test-device", t.log_handler, on_reconf, schema_registry)
 
         # Create a simple device schema
         schema = stratoweave.device.DeviceSchema.mock()
@@ -241,7 +247,7 @@ actor _test_txid(t: testing.EnvT):
         test_dmc = create_test_dmc()
 
         # Create the NetconfAdapter - this will trigger connection
-        local_adapter = swna.NetconfAdapter(dev, schema, test_dmc, schema_registry, t.log_handler, process.ProcessCap(t.env.auth))
+        local_adapter = swna.NetconfAdapter(dev, schema, test_dmc, schema_registry, t.log_handler, net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))))
         adapter = local_adapter
         if local_adapter is not None:
             local_adapter.set_dmc(test_dmc)
@@ -253,8 +259,15 @@ actor _test_txid(t: testing.EnvT):
 
         def on_verify_connect(c: netconf.Client, err: ?Exception):
             if err is not None:
-                log.error("Verification client failed to connect", {"error": str(err)})
-                t.failure(err)
+                # JUNOS restarts sshd as part of committing system{} config, so
+                # a connection right after a commit can land in the restart
+                # window and be dropped. Retry a few times before giving up.
+                if verify_connect_attempts < 5:
+                    log.info("Verification client connect failed, retrying", {"error": str(err)})
+                    after 0.5: start_verification_client()
+                else:
+                    log.error("Verification client failed to connect", {"error": str(err)})
+                    t.failure(err)
             else:
                 log.info("Verification client connected")
                 verification_client = c
@@ -292,17 +305,20 @@ actor _test_txid(t: testing.EnvT):
             else:
                 t.success()
 
-        # Create the verification client
-        verification_client = netconf.Client(
-            process.ProcessCap(t.env.auth),
-            test_address,
-            test_port,
-            test_username,
-            test_password,
-            on_connect=on_verify_connect,
-            log_handler=t.log_handler,
-            skip_host_key_check=True
-        )
+        def start_verification_client():
+            verify_connect_attempts += 1
+            verification_client = netconf.Client(
+                net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                test_address,
+                test_port,
+                test_username,
+                test_password,
+                on_connect=on_verify_connect,
+                log_handler=t.log_handler,
+                skip_host_key_check=True
+            )
+
+        start_verification_client()
 
     # Start the test by first setting up and verifying the server
     setup_test()
@@ -367,7 +383,7 @@ actor _test_direct_get_config_with_filter(t: testing.EnvT):
 
     # Create the client and connect
     client = netconf.Client(
-        process.ProcessCap(t.env.auth),
+        net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
         test_address,
         test_port,
         test_username,
