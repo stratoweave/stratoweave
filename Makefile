@@ -1,4 +1,4 @@
-GENERATED_ACT := src/stratoweave/device_meta_config.act src/stratoweave/ietf_restconf_monitoring.act src/stratoweave/ietf_yang_library.act
+GENERATED_ACT := src/device_meta_config.act src/ietf_restconf_monitoring.act src/ietf_yang_library.act
 
 .PHONY: build
 build: $(GENERATED_ACT)
@@ -17,13 +17,13 @@ gen-ldep: $(GENERATED_ACT)
 	$(MAKE) --always-make gen DEP_OVERRIDES="--dep yang=../acton-yang"
 
 .NOTPARALLEL: $(GENERATED_ACT)
-$(GENERATED_ACT): gen_adata/out/bin/gen_adata src/stratoweave/yang.act
-	@if [ ! -f "$@" ] || [ "$@" -ot gen_adata/out/bin/gen_adata ] || [ "$@" -ot src/stratoweave/yang.act ]; then \
+$(GENERATED_ACT): gen_adata/out/bin/gen_adata src/swyang.act
+	@if [ ! -f "$@" ] || [ "$@" -ot gen_adata/out/bin/gen_adata ] || [ "$@" -ot src/swyang.act ]; then \
 		gen_adata/out/bin/gen_adata; \
 	fi
 
-gen_adata/out/bin/gen_adata: gen_adata/src/gen_adata.act src/stratoweave/yang.act
-	cp -a src/stratoweave/yang.act gen_adata/src/swyang.act
+gen_adata/out/bin/gen_adata: gen_adata/src/gen_adata.act src/swyang.act
+	cp -a src/swyang.act gen_adata/src/swyang.act
 	cd gen_adata && acton build $(subst ../,../../,$(DEP_OVERRIDES))
 
 .PHONY: test
