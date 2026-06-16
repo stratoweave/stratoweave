@@ -1096,3 +1096,123 @@ actor link_into_list_delivers_all_referenced_entries(t: testing.AsyncT):
 
     sess.edit_config(cfg, complete=cont)
 ########################
+
+# Subscriber for the fan-out regression test below: it links to
+# /network/global-settings and counts its own transform invocations through
+# the memory mechanism, emitting the count as runs_<name> in its output. The
+# run count is committed state visible in the sink layer, so the test can
+# assert exactly how many times each subscriber's transform function has run
+# without any out-of-band counters.
+class CountingLinkedSubscriber(ttt.TransformFunction):
+    def transform_wrapper(self, cfg, linked, memory, dynstate):
+        runs = 1
+        if memory is not None:
+            mem = memory
+            if isinstance(mem, gdata.Leaf):
+                mv = mem.val
+                if isinstance(mv, int):
+                    runs = mv + 1
+        name = "unknown"
+        if isinstance(cfg, gdata.Container):
+            n = cfg.get_opt_value(q("name"))
+            if n is not None:
+                name = str(n)
+        out_children: dict[gdata.Id, gdata.Node] = {}
+        out_children[q("runs_{name}")] = gdata.Leaf(runs)
+        network_node = linked.get_opt_cnt(q("network"))
+        if network_node is not None:
+            gs_node = network_node.get_opt_cnt(q("global-settings"))
+            if gs_node is not None:
+                asn_leaf = gs_node.get_opt_leaf(q("asn"))
+                if asn_leaf is not None:
+                    out_children[q("asn_{name}")] = asn_leaf
+        return gdata.Container(out_children), gdata.Leaf(runs)
+
+
+# Subscribing must not re-run existing subscribers: when a transaction only
+# adds a new subscriber (a new link request), the publisher's state is
+# unchanged, so existing subscribers already hold the correct linked input
+# and must not be force-recomputed. Without targeted link updates the
+# publisher answers every new link request by broadcasting its full state to
+# ALL subscribers, so creating subscriber N re-runs all N-1 existing
+# subscriber transforms; with one service created per transaction that makes
+# service creation cost O(existing services).
+#
+# Updates on a real publisher change must still reach every subscriber,
+# which the final asn bump asserts.
+actor link_subscribe_does_not_rerun_existing_subscribers(t: testing.AsyncT):
+    stack = ttt.Layer("top",
+        ttt.Container({
+            q("network"): ttt.Container({
+                q("global-settings"): ttt.Transform(RouterPublisher),
+            }),
+            q("service"): ttt.List(
+                ttt.Transform(CountingLinkedSubscriber, None, _link_to_global_settings),
+                [q("name")],
+            ),
+        }),
+        ttt.Sink())
+
+    def _service(name: str) -> gdata.Node:
+        return gdata.Container({q("name"): gdata.Leaf(name)})
+
+    cfg_init = gdata.Container({
+        q("network"): gdata.Container({
+            q("global-settings"): gdata.Container({q("asn"): gdata.Leaf(11)}),
+        }),
+        q("service"): gdata.List([q("name")], [
+            _service("s1"),
+            _service("s2"),
+            _service("s3"),
+        ]),
+    })
+    cfg_add_s4 = gdata.Container({
+        q("service"): gdata.List([q("name")], [
+            _service("s4"),
+        ]),
+    })
+    cfg_bump_asn = gdata.Container({
+        q("network"): gdata.Container({
+            q("global-settings"): gdata.Container({q("asn"): gdata.Leaf(22)}),
+        }),
+    })
+
+    expected_init = gdata.Container({
+        q("runs_s1"): gdata.Leaf(1), q("asn_s1"): gdata.Leaf(11),
+        q("runs_s2"): gdata.Leaf(1), q("asn_s2"): gdata.Leaf(11),
+        q("runs_s3"): gdata.Leaf(1), q("asn_s3"): gdata.Leaf(11),
+    })
+    # The new subscriber runs once; the existing subscribers' run counts are
+    # unchanged because the publisher state they link to is unchanged.
+    expected_after_add = gdata.Container({
+        q("runs_s1"): gdata.Leaf(1), q("asn_s1"): gdata.Leaf(11),
+        q("runs_s2"): gdata.Leaf(1), q("asn_s2"): gdata.Leaf(11),
+        q("runs_s3"): gdata.Leaf(1), q("asn_s3"): gdata.Leaf(11),
+        q("runs_s4"): gdata.Leaf(1), q("asn_s4"): gdata.Leaf(11),
+    })
+    # A real publisher change re-runs every subscriber exactly once.
+    expected_after_bump = gdata.Container({
+        q("runs_s1"): gdata.Leaf(2), q("asn_s1"): gdata.Leaf(22),
+        q("runs_s2"): gdata.Leaf(2), q("asn_s2"): gdata.Leaf(22),
+        q("runs_s3"): gdata.Leaf(2), q("asn_s3"): gdata.Leaf(22),
+        q("runs_s4"): gdata.Leaf(2), q("asn_s4"): gdata.Leaf(22),
+    })
+
+    sess1 = stack.newsession()
+
+    def cont3(_r: value):
+        testing.assertEqual(sess1.below().get().prsrc(deterministic=True), expected_after_bump.prsrc(deterministic=True))
+        t.success()
+
+    def cont2(_r: value):
+        testing.assertEqual(sess1.below().get().prsrc(deterministic=True), expected_after_add.prsrc(deterministic=True))
+        sess3 = stack.newsession()
+        sess3.edit_config(cfg_bump_asn, complete=cont3)
+
+    def cont1(_r: value):
+        testing.assertEqual(sess1.below().get().prsrc(deterministic=True), expected_init.prsrc(deterministic=True))
+        sess2 = stack.newsession()
+        sess2.edit_config(cfg_add_s4, complete=cont2)
+
+    sess1.edit_config(cfg_init, complete=cont1)
+########################
