@@ -1,0 +1,353 @@
+"""Integration tests for the northbound NETCONF server.
+
+Two angles, both against a real TTT layer:
+  - a netconf.Client drives a NetconfSession over an in-process pipe pair, which
+    exercises the RPC -> TTT logic (edit-config round trip, per-node
+    operation= semantics) without any transport; and
+  - a netconf.Client connects to a full NetconfServer over a real loopback SSH
+    transport, exercising listen/accept, password auth, the ephemeral host key,
+    and framing end to end.
+"""
+
+import logging
+import net
+import testing
+import std.xml as xml
+
+import netconf
+
+import ttt as ttt
+import yang
+import yang.gdata as gdata
+import yang.schema as yschema
+
+import netconf_server as swnetconf
+
+
+DEMO_NS = "urn:demo"
+DEMO_YANG = r"""module demo {
+  yang-version "1.1";
+  namespace "urn:demo";
+  prefix d;
+  container system {
+    leaf hostname { type string; }
+    leaf location { type string; }
+  }
+}"""
+
+
+def _q(n: str) -> gdata.Id:
+    return gdata.Id(DEMO_NS, n)
+
+
+def _demo_schema() -> yschema.DRoot:
+    return yang.compile([DEMO_YANG])
+
+
+def _demo_layer() -> ttt.Layer:
+    # Top container matches the schema's top-level `system` node; PassThrough
+    # retains whatever config is written so get-config can read it back.
+    return ttt.Layer("top", ttt.Container({
+        _q("system"): ttt.Transform(ttt.PassThrough),
+    }), None)
+
+
+def _leaf_text_from_reply(reply: ?xml.Node, leaf_name: str) -> ?str:
+    """Dig <rpc-reply><data><system><LEAF> out of a get-config reply."""
+    if reply is not None:
+        for data in reply.children:
+            if data.tag == "data":
+                for system in data.children:
+                    if system.tag == "system":
+                        for leaf in system.children:
+                            if leaf.tag == leaf_name:
+                                return leaf.text
+    return None
+
+
+actor _test_edit_config_roundtrip(t: testing.AsyncT):
+    """edit-config (merge) into running, then read it back via get-config."""
+    lh = logging.Handler("nctest")
+    schema = _demo_schema()
+    layer = _demo_layer()
+    caps = swnetconf.build_capabilities(schema)
+
+    pipes = netconf.actor_pipe_pair()
+    server = swnetconf.NetconfSession(pipes.server, lh, schema, layer, caps)
+
+    var done = False
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_get(c: netconf.Client, reply: ?xml.Node, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        hostname = _leaf_text_from_reply(reply, "hostname")
+        location = _leaf_text_from_reply(reply, "location")
+        if hostname != "r1":
+            fail(ValueError("expected hostname r1, got {hostname}"))
+            return
+        if location != "lab":
+            fail(ValueError("expected location lab, got {location}"))
+            return
+        if not done:
+            done = True
+            t.success()
+
+    def _on_edit(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        c.get_config(_on_get, "running")
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            fail(ValueError("client connect failed: {e}"))
+            return
+        config = xml.decode('<system xmlns="urn:demo"><hostname>r1</hostname><location>lab</location></system>')
+        c.edit_config([config], _on_edit)
+
+    client = netconf.Client(None, "mock", 0, "admin", "admin", None, _on_connect, None, True, lh, pipe=pipes.client)
+
+    after 5.0: fail(ValueError("timed out waiting for NETCONF round trip"))
+
+
+actor _test_edit_config_delete(t: testing.AsyncT):
+    """A second edit-config with operation="delete" removes a leaf."""
+    lh = logging.Handler("nctest")
+    schema = _demo_schema()
+    layer = _demo_layer()
+    caps = swnetconf.build_capabilities(schema)
+
+    pipes = netconf.actor_pipe_pair()
+    server = swnetconf.NetconfSession(pipes.server, lh, schema, layer, caps)
+
+    var done = False
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_get_after_delete(c: netconf.Client, reply: ?xml.Node, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        # hostname deleted; location must remain.
+        if _leaf_text_from_reply(reply, "hostname") is not None:
+            fail(ValueError("expected hostname to be deleted"))
+            return
+        if _leaf_text_from_reply(reply, "location") != "lab":
+            fail(ValueError("expected location lab to survive delete"))
+            return
+        if not done:
+            done = True
+            t.success()
+
+    def _on_delete(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        c.get_config(_on_get_after_delete, "running")
+
+    def _on_seed(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        # Delete just the hostname leaf via nc:operation="delete". NB: the xmlns:nc
+        # declaration must sit on the element carrying the operation attribute --
+        # yang.xml._get_netconf_operation does not resolve prefixes declared on an
+        # ancestor (see its disabled _test_get_nc_op_pref_ancestor, "TODO: fix!").
+        del_xml = xml.decode('<system xmlns="urn:demo"><hostname xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0" nc:operation="delete">r1</hostname></system>')
+        c.edit_config([del_xml], _on_delete)
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            fail(ValueError("client connect failed: {e}"))
+            return
+        seed = xml.decode('<system xmlns="urn:demo"><hostname>r1</hostname><location>lab</location></system>')
+        c.edit_config([seed], _on_seed)
+
+    client = netconf.Client(None, "mock", 0, "admin", "admin", None, _on_connect, None, True, lh, pipe=pipes.client)
+
+    after 5.0: fail(ValueError("timed out waiting for NETCONF delete round trip"))
+
+
+actor _test_edit_config_rejects_nonrunning_target(t: testing.AsyncT):
+    """edit-config to a datastore other than running is refused, not applied."""
+    lh = logging.Handler("nctest")
+    schema = _demo_schema()
+    layer = _demo_layer()
+    caps = swnetconf.build_capabilities(schema)
+
+    pipes = netconf.actor_pipe_pair()
+    server = swnetconf.NetconfSession(pipes.server, lh, schema, layer, caps)
+
+    var done = False
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_edit(c: netconf.Client, err: ?netconf.NetconfError):
+        # We asked to write the candidate datastore, which v1 does not serve, so
+        # the server must reject it rather than silently apply to running.
+        if err is not None:
+            if not done:
+                done = True
+                t.success()
+        else:
+            fail(ValueError("expected edit-config target=candidate to be rejected"))
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            fail(ValueError("client connect failed: {e}"))
+            return
+        config = xml.decode('<system xmlns="urn:demo"><hostname>nope</hostname></system>')
+        c.edit_config([config], _on_edit, datastore="candidate")
+
+    client = netconf.Client(None, "mock", 0, "admin", "admin", None, _on_connect, None, True, lh, pipe=pipes.client)
+
+    after 5.0: fail(ValueError("timed out waiting for edit-config rejection"))
+
+
+actor _test_ssh_edit_config_roundtrip(t: testing.EnvT):
+    """Full NetconfServer over a real loopback SSH transport.
+
+    Stands up a NetconfServer on an ephemeral port (default admin/admin auth,
+    ephemeral host key), connects a netconf.Client over SSH, and runs an
+    edit-config -> get-config round trip -- exercising listen/accept, auth and
+    framing, not just the RPC handler.
+    """
+    lh = t.log_handler
+    schema = _demo_schema()
+    layer = _demo_layer()
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+
+    var done = False
+    var server: ?swnetconf.NetconfServer = None
+
+    def _teardown():
+        s = server
+        if s is not None:
+            s.close()
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            _teardown()
+            t.failure(e)
+
+    def _on_get(c: netconf.Client, reply: ?xml.Node, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        if _leaf_text_from_reply(reply, "hostname") != "r1":
+            fail(ValueError("expected hostname r1 over SSH"))
+            return
+        if not done:
+            done = True
+            c.close(None)
+            _teardown()
+            t.success()
+
+    def _on_edit(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        c.get_config(_on_get, "running")
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            fail(ValueError("SSH connect failed: {e}"))
+            return
+        config = xml.decode('<system xmlns="urn:demo"><hostname>r1</hostname></system>')
+        c.edit_config([config], _on_edit)
+
+    def _on_listen(err: ?Exception):
+        if err is not None:
+            fail(ValueError("NETCONF SSH listen failed: {err}"))
+            return
+        s = server
+        if s is not None:
+            port = await async s.bound_port()
+            netconf.Client(connect_cap, "127.0.0.1", port, "admin", "admin", None, _on_connect, None, True, lh)
+
+    server = swnetconf.NetconfServer(listen_cap, log_handler=lh, top_schema=schema, cfs=layer, address="127.0.0.1", port=0, on_listen=_on_listen)
+
+    after 15.0: fail(ValueError("timed out waiting for SSH NETCONF round trip"))
+
+
+actor _test_ssh_session_cleanup(t: testing.EnvT):
+    """NetconfServer reclaims a session when its SSH transport closes.
+
+    Connects over SSH (so active_sessions becomes 1), drops the client, then
+    waits for the server to prune the session back to 0 -- guarding against the
+    _sessions list growing without bound as clients come and go.
+    """
+    lh = t.log_handler
+    schema = _demo_schema()
+    layer = _demo_layer()
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+
+    var done = False
+    var server: ?swnetconf.NetconfServer = None
+    var attempts = 0
+
+    def _teardown():
+        s = server
+        if s is not None:
+            s.close()
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            _teardown()
+            t.failure(e)
+
+    def _await_cleanup():
+        attempts += 1
+        s = server
+        if s is not None:
+            n = await async s.active_sessions()
+            if n == 0:
+                if not done:
+                    done = True
+                    _teardown()
+                    t.success()
+                return
+            if attempts > 300:
+                fail(ValueError("session not reclaimed; active_sessions={n}"))
+                return
+            after 0.02: _await_cleanup()
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            fail(ValueError("SSH connect failed: {e}"))
+            return
+        s = server
+        if s is not None:
+            active = await async s.active_sessions()
+            if active < 1:
+                fail(ValueError("expected an active session after connect, got {active}"))
+                return
+        # Drop the transport; the server should reclaim the session.
+        c.close(None)
+        after 0.05: _await_cleanup()
+
+    def _on_listen(err: ?Exception):
+        if err is not None:
+            fail(ValueError("NETCONF SSH listen failed: {err}"))
+            return
+        s = server
+        if s is not None:
+            port = await async s.bound_port()
+            netconf.Client(connect_cap, "127.0.0.1", port, "admin", "admin", None, _on_connect, None, True, lh)
+
+    server = swnetconf.NetconfServer(listen_cap, log_handler=lh, top_schema=schema, cfs=layer, address="127.0.0.1", port=0, on_listen=_on_listen)
+
+    after 15.0: fail(ValueError("timed out waiting for session cleanup"))

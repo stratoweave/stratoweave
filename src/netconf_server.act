@@ -1,0 +1,266 @@
+import logging
+import net
+import std.xml as xml
+
+import netconf
+import ssh.pipe as sshpipe
+
+import ttt as ttt
+import yang.gdata as ygdata
+import yang.schema as yschema
+import yang.xml as yxml
+
+
+# NETCONF base namespace, used on the <data> wrapper of get/get-config replies.
+NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
+CAP_WRITABLE_RUNNING = "urn:ietf:params:netconf:capability:writable-running:1.0"
+
+
+def build_capabilities(schema: yschema.DRoot) -> list[str]:
+    """Build the NETCONF <hello> capability list for a top-level schema.
+
+    Advertises NETCONF base 1.0/1.1 and writable-running, plus one module
+    capability URI (namespace?module=NAME[&revision=REV]) per module in the
+    schema's metadata, so a client can discover every served namespace from the
+    hello exchange.
+    """
+    caps = [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1, CAP_WRITABLE_RUNNING]
+    for ns in sorted(schema.module_metadata.keys()):
+        meta = schema.module_metadata[ns]
+        uri = "{ns}?module={meta.module}"
+        rev = meta.revision
+        if rev is not None:
+            uri = uri + "&revision={rev}"
+        caps.append(uri)
+    return caps
+
+
+actor StaticAuthChecker(expected_user: str, expected_password: str):
+    """An SSH authentication check for a single static username + password.
+
+    `check` has the asynchronous (continuation-passing) shape that
+    SshPipeListener expects: it inspects the offered credentials and calls
+    respond(True) to accept or respond(False) to reject. The async shape is the
+    point -- a real implementation can reach out to an authentication service
+    (RADIUS/LDAP/TACACS+) and call respond from that IO callback; this static
+    one answers immediately. Public-key attempts (password None) are rejected.
+    """
+    def check(user: str, password: ?str, pubkey: ?bytes, respond: action(bool) -> None):
+        respond(user == expected_user and password == expected_password)
+
+
+actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRoot, cfs: ttt.Layer, capabilities: ?list[str]=None, on_close: ?action(NetconfSession) -> None=None):
+    """A single NETCONF session driving the configuration tree.
+
+    Wraps a netconf.Server bound to `pipe` (one transport channel) and handles
+    its RPCs against the `cfs` layer. v1 supports writable-running only:
+    get/get-config read the running datastore and edit-config applies straight
+    into it; everything else -- candidate's commit/discard-changes and
+    lock/unlock -- is rejected with operation-not-supported rather than faked.
+    Incoming <config> is parsed against `top_schema`, carrying per-node NETCONF
+    operation= semantics (merge/create/delete/remove/replace) into the edit.
+
+    `on_close`, if given, is called with this session when its transport drops,
+    so the owner can release its reference and let the session be reclaimed.
+    """
+    _log = logging.Logger(log_handler)
+
+    def _extract_filter(op: xml.Node) -> (?xml.Node, ?str):
+        for child in op.children:
+            if isinstance(child, xml.Node) and child.tag == "filter":
+                filter_type = None
+                for attr_name, attr_val in child.attributes:
+                    if attr_name == "type" or attr_name.split(":", -1)[-1] == "type":
+                        filter_type = attr_val
+                        break
+                if filter_type is None:
+                    filter_type = "subtree"
+                return (child, filter_type)
+        return (None, None)
+
+    def _extract_config(op: xml.Node) -> ?xml.Node:
+        for child in op.children:
+            if isinstance(child, xml.Node) and child.tag == "config":
+                return child
+        return None
+
+    def _expect_xml_node(n: ?xml.Node, ctx: str) -> xml.Node:
+        if n is not None:
+            return n
+        raise ValueError("expected xml.Node for: {ctx}")
+
+    def _datastore(op: xml.Node, wrapper_tag: str) -> ?str:
+        # The datastore named inside <target>/<source> (e.g. "running"), or None
+        # if the wrapper or its datastore element is absent. v1 only serves
+        # running, so callers require this to equal "running".
+        for child in op.children:
+            if isinstance(child, xml.Node) and child.tag == wrapper_tag:
+                for ds in child.children:
+                    if isinstance(ds, xml.Node):
+                        return ds.tag
+        return None
+
+    def _read(filter_node: ?xml.Node) -> list[xml.Node]:
+        filt: ?ygdata.FNode = None
+        if filter_node is not None:
+            filt = yxml.from_filter_xml(top_schema, filter_node)
+        data = cfs.newsession().get_data(filt)
+        if data is not None:
+            return data.to_xml(deterministic=True)
+        return []
+
+    def _parse_config(config_node: xml.Node) -> ygdata.Container:
+        # Wrap the <config> children in a <data> root and parse against the top
+        # schema. yxml.from_xml carries per-node NETCONF operation= attributes
+        # (merge/create/delete/remove/replace) into the gdata diff, which TTT's
+        # edit_config honors directly.
+        data_children: list[xml.Node] = []
+        for child in config_node.children:
+            if isinstance(child, xml.Node):
+                data_children.append(child)
+        wrapper = xml.Node("data", children=data_children)
+        return yxml.from_xml(top_schema, wrapper, loose=True)
+
+    def on_rpc(s: netconf.Server, message_id: str, op: xml.Node):
+        _log.debug("NETCONF rpc", {"message_id": message_id, "op": op.tag})
+
+        if op.tag == "get" or op.tag == "get-config":
+            if op.tag == "get-config" and _datastore(op, "source") != "running":
+                s.send_error(message_id, "operation-not-supported", "Only the running datastore is supported")
+                return
+            filter_node, filter_type = _extract_filter(op)
+            if filter_type is not None and filter_type != "subtree":
+                s.send_error(message_id, "operation-not-supported", "Unsupported filter type: {filter_type}")
+                return
+            data_children: list[xml.Node] = []
+            try:
+                data_children = _read(filter_node)
+            except Exception as e:
+                s.send_error(message_id, "invalid-value", "Failed to read datastore: {e}")
+                return
+            s.send_reply(message_id, [xml.Node("data", [(None, NS_NC_1_0)], children=data_children)])
+        elif op.tag == "edit-config":
+            if _datastore(op, "target") != "running":
+                s.send_error(message_id, "operation-not-supported", "Only the running datastore is writable")
+                return
+            config_node = _extract_config(op)
+            if config_node is None:
+                s.send_error(message_id, "missing-element", "Missing <config> in <edit-config>")
+                return
+            cfg = _expect_xml_node(config_node, "edit-config <config>")
+
+            def _on_done(result):
+                if isinstance(result, Exception):
+                    s.send_error(message_id, "operation-failed", "edit-config failed: {result}")
+                else:
+                    s.send_ok(message_id)
+            try:
+                # yxml.from_xml carries per-node NETCONF operation= attributes into
+                # the gdata diff; the `complete` callback fires <ok> only after the
+                # edit has been applied, persisted and committed through the TTT pipeline.
+                diff = _parse_config(cfg)
+                cfs.newsession().edit_config(diff, None, _on_done)
+            except Exception as e:
+                s.send_error(message_id, "invalid-value", "Failed to apply edit-config: {e}")
+                return
+        else:
+            # Everything beyond get/get-config/edit-config (close-session is
+            # handled inside netconf.Server). This includes candidate's commit/
+            # discard-changes and lock/unlock, which we deliberately do not fake:
+            # writable-running auto-commits every edit, and a no-op lock would
+            # hand out an exclusion guarantee we cannot keep.
+            s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
+
+    def _on_conn(s: netconf.Server, err: ?Exception):
+        # on_connect doubles as the disconnect signal: err is None on connect and
+        # non-None when the transport drops (channel close / EOF). On drop, tell
+        # the owner so it can release its reference and let us be reclaimed.
+        if err is not None:
+            cb = on_close
+            if cb is not None:
+                cb(self)
+
+    var server: netconf.Server = netconf.Server(pipe=pipe, on_connect=_on_conn, on_rpc=on_rpc, capabilities=capabilities, log_handler=log_handler)
+
+
+actor NetconfServer(
+    listen_cap: net.TCPListenCap,
+    log_handler: logging.Handler,
+    top_schema: yschema.DRoot,
+    cfs: ttt.Layer,
+    address: str = "::",
+    port: int = 830,
+    username: str = "admin",
+    password: str = "admin",
+    auth_check: ?action(str, ?str, ?bytes, action(bool) -> None) -> None = None,
+    host_key: ?str = None,
+    on_listen: ?action(?Exception) -> None = None,
+):
+    """Northbound NETCONF server over SSH.
+
+    Listens for SSH connections on `port` and serves the `netconf` subsystem;
+    each accepted channel becomes an independent NetconfSession sharing the `cfs`
+    configuration tree. `host_key` is the SSH host private key material (PEM /
+    OpenSSH text); when None the SSH library generates an ephemeral in-memory
+    host key per run. Reading a key from disk is the caller's job.
+
+    Authentication defaults to a static username/password check
+    (StaticAuthChecker). Pass `auth_check` to plug in any checker with the same
+    asynchronous shape -- e.g. one validating credentials against an external
+    service over the network before responding.
+    """
+    _log = logging.Logger(log_handler)
+    _capabilities = build_capabilities(top_schema)
+    _auth = auth_check if auth_check is not None else StaticAuthChecker(username, password).check
+    var _sessions: list[NetconfSession] = []
+    var listener: ?sshpipe.SshPipeListener = None
+
+    def _on_listen(l: sshpipe.SshPipeListener, err: ?Exception):
+        if err is not None:
+            # Non-fatal: a failed NETCONF bind must not take down the rest of the app.
+            _log.error("NETCONF SSH listen error", {"address": address, "port": port, "error": err})
+        else:
+            _log.info("NETCONF server listening", {"address": address, "port": port})
+        cb = on_listen
+        if cb is not None:
+            cb(err)
+
+    def _session_closed(s: NetconfSession):
+        # Drop the closed session so it (and its netconf.Server + pipe) can be
+        # reclaimed; without this _sessions would grow unbounded.
+        remaining: list[NetconfSession] = []
+        for x in _sessions:
+            if not (x is s):
+                remaining.append(x)
+        _sessions = remaining
+        _log.debug("NETCONF session closed", {"active_sessions": len(remaining)})
+
+    def _on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
+        _log.info("NETCONF session accepted")
+        _sessions.append(NetconfSession(p, log_handler, top_schema, cfs, _capabilities, on_close=_session_closed))
+
+    listener = sshpipe.SshPipeListener(
+        listen_cap,
+        address=address,
+        port=port,
+        on_listen=_on_listen,
+        on_accept=_on_accept,
+        auth_check=_auth,
+        subsystem="netconf",
+        host_key=host_key,
+        log_handler=log_handler)
+
+    def bound_port() -> int:
+        l = listener
+        if l is not None:
+            return int(l.bound_port())
+        raise ValueError("NETCONF server is not listening")
+
+    def active_sessions() -> int:
+        return len(_sessions)
+
+    def close():
+        l = listener
+        if l is not None:
+            l.close()
+        listener = None

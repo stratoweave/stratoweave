@@ -29,12 +29,20 @@ class AppArgs(value):
     config_files: list[str]
     db_path: ?str
     http_port: int
+    netconf_port: int
+    netconf_host_key_path: ?str
+    netconf_user: str
+    netconf_password: str
     exit_on_done: bool
 
-    def __init__(self, config_files: list[str]=[], db_path: ?str=None, http_port: int=80, exit_on_done: bool=False):
+    def __init__(self, config_files: list[str]=[], db_path: ?str=None, http_port: int=80, netconf_port: int=830, netconf_host_key_path: ?str=None, netconf_user: str="admin", netconf_password: str="admin", exit_on_done: bool=False):
         self.config_files = config_files
         self.db_path = db_path
         self.http_port = http_port
+        self.netconf_port = netconf_port
+        self.netconf_host_key_path = netconf_host_key_path
+        self.netconf_user = netconf_user
+        self.netconf_password = netconf_password
         self.exit_on_done = exit_on_done
 
 
@@ -44,12 +52,17 @@ class AppArgs(value):
         p.add_arg("file", "Config XML file(s)", False, "+")
         p.add_option("db", "str", default="", help="LMDB directory for TTT persistence")
         p.add_option("http-port", "int", default=80, help="HTTP listen port")
+        p.add_option("netconf-port", "int", default=830, help="NETCONF SSH listen port")
+        p.add_option("netconf-host-key", "str", default="", help="SSH host key file for NETCONF; ephemeral in-memory key if unset")
+        p.add_option("netconf-user", "str", default="admin", help="NETCONF SSH username (v1 static credential)")
+        p.add_option("netconf-password", "str", default="admin", help="NETCONF SSH password (v1 static credential)")
         p.add_bool("exit-on-done", "Exit after startup config has been applied")
 
         try:
             args = p.parse(argv)
             db_path = args.get_str("db")
-            return AppArgs(args.get_strlist("file"), db_path if db_path != "" else None, args.get_int("http-port"), args.get_bool("exit-on-done"))
+            host_key = args.get_str("netconf-host-key")
+            return AppArgs(args.get_strlist("file"), db_path if db_path != "" else None, args.get_int("http-port"), args.get_int("netconf-port"), host_key if host_key != "" else None, args.get_str("netconf-user"), args.get_str("netconf-password"), args.get_bool("exit-on-done"))
         except argparse.PrintUsage as exc:
             print(exc.error_message)
             exit(0)
@@ -124,8 +137,9 @@ actor StartupConfigApplier(config_files: list[str], exit_on_done: bool, top_sche
         after 0.5: _apply()
 
 
-actor StartupBootstrap(cfs: ttt.Layer, restore_from_db: bool, start_runtime: proc() -> None, exit: action(int) -> None, log_handler: logging.Handler):
+actor StartupBootstrap(cfs: ttt.Layer, restore_from_db: bool, netconf_host_key_path: ?str, rfcap: file.ReadFileCap, start_runtime: proc(?str) -> None, exit: action(int) -> None, log_handler: logging.Handler):
     var log = logging.Logger(log_handler)
+    var _netconf_host_key: ?str = None
 
     def _recompute_done(result):
         if isinstance(result, Exception):
@@ -133,11 +147,24 @@ actor StartupBootstrap(cfs: ttt.Layer, restore_from_db: bool, start_runtime: pro
             exit(1)
             return
         log.info("Restored TTT state reconciled")
-        start_runtime()
+        start_runtime(_netconf_host_key)
 
     def _run():
+        # The NETCONF SSH layer wants host-key material, not a path, so read the
+        # configured key file here (before launching the runtime) and forward it.
+        hkp = netconf_host_key_path
+        if hkp is not None:
+            try:
+                f = file.ReadFile(rfcap, hkp)
+                _netconf_host_key = (await async f.read()).decode()
+                f.close()
+            except Exception as e:
+                log.error("Error reading NETCONF host key", {"path": hkp, "error": e})
+                exit(1)
+                return
+
         if not restore_from_db:
-            start_runtime()
+            start_runtime(_netconf_host_key)
             return
 
         log.info("Loading persisted TTT state")
