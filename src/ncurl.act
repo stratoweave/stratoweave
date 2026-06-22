@@ -1,0 +1,1098 @@
+#!/usr/bin/env acton
+"""ncurl - NETCONF URL tool
+
+A command-line tool for interacting with NETCONF devices, like curl but for
+NETCONF. Maybe one day we'll do RESTCONF and gNMI (the other YANG-based
+transports), and then we'll be network curl.
+"""
+
+import argparse
+import file
+import netconf.fixups as fixups
+import logging
+import netconf
+import net
+import time
+import std.xml as xml
+
+
+import yang
+import yang.data as ydata
+import yang.xml as yxml
+import ncurl.schema_filter as schema_filter
+
+
+def build_explicit_schemas_list(explicit_modules: list[str], format: str) -> list[(identifier: str, version: ?str, format: ?str)]:
+    """Build a list of schemas to download from explicit module specifications"""
+    schemas_to_download = []
+    for module in explicit_modules:
+        # Parse module specification (might include version as module@version)
+        if "@" in module:
+            module_parts = module.split("@", 1)
+            schemas_to_download.append((identifier=module_parts[0], version=module_parts[1], format=format))
+        else:
+            schemas_to_download.append((identifier=module, version=None, format=format))
+    return schemas_to_download
+
+
+def unwrap[T](a: ?T, msg: ?str=None) -> T:
+    if a is not None:
+        return a
+    errmsg = msg if msg is not None else "Expected non-None value"
+    raise ValueError(errmsg)
+
+
+def resolve_client_fixups(args, log_handler):
+    log = logging.Logger(log_handler)
+    no_fixups = args.get_bool("no-fixups")
+    if no_fixups:
+        log.info("NETCONF fixups: disabled (--no-fixups)")
+        return []
+    log.info("NETCONF fixups: enabled (default)")
+    return fixups.FIXUPS
+
+
+def _node_text(node) -> str:
+    if node.text is None:
+        return ""
+    text = str(node.text)
+    ws_stripped = text.replace(" ", "").replace("\t", "").replace("\n", "").replace("\r", "")
+    if ws_stripped == "":
+        return ""
+    return text.strip()
+
+
+def _color_value(value: str, use_color: bool) -> str:
+    if not use_color:
+        return value
+    return "\x1b[36m{value}\x1b[0m"
+
+
+def _inline_key(node) -> (str, str):
+    key_tags = ["name", "id", "index", "key"]
+    for key_tag in key_tags:
+        for child in node.children:
+            if child.tag == key_tag and len(child.children) == 0:
+                key_text = _node_text(child)
+                if key_text != "":
+                    return (key_tag, key_text)
+    return ("", "")
+
+
+def _is_hidden_key_child(child, key_tag: str, key_text: str) -> bool:
+    return key_tag != "" and child.tag == key_tag and len(child.children) == 0 and _node_text(child) == key_text
+
+
+def _tree_node_parts(node):
+    key_tag, key_text = _inline_key(node)
+    label = node.tag
+    if key_text != "":
+        label = "{label} {key_text}"
+    visible_children = [child for child in node.children if not _is_hidden_key_child(child, key_tag, key_text)]
+    return (label=label, text=_node_text(node), visible_children=visible_children)
+
+
+def _flatten_single_path(node, base_label: str) -> (label: str, value: ?str):
+    parts = _tree_node_parts(node)
+    label = "{base_label} {parts.label}"
+    if parts.text != "":
+        return (label=label, value=parts.text)
+    if len(parts.visible_children) == 1:
+        return _flatten_single_path(parts.visible_children[0], label)
+    return (label=label, value=None)
+
+
+def _collect_tree_rows(node, depth: int) -> list[(depth: int, label: str, value: ?str)]:
+    rows = []
+    parts = _tree_node_parts(node)
+    label = parts.label
+    node_text = parts.text
+    visible_children = parts.visible_children
+
+    # Recursively flatten single-child container chains into one row.
+    if node_text == "" and len(visible_children) == 1:
+        flattened = _flatten_single_path(visible_children[0], label)
+        if flattened.value is not None:
+            rows.append((depth=depth, label=flattened.label, value=flattened.value))
+            return rows
+
+    if len(visible_children) == 0:
+        leaf_value = node_text if node_text != "" else None
+        rows.append((depth=depth, label=label, value=leaf_value))
+        return rows
+
+    rows.append((depth=depth, label=label, value=None))
+    for child in visible_children:
+        rows.extend(_collect_tree_rows(child, depth + 1))
+    return rows
+
+
+def render_data_tree(data_node, use_color: bool=True) -> str:
+    rows = []
+    for child in data_node.children:
+        rows.extend(_collect_tree_rows(child, 0))
+
+    if len(rows) == 0:
+        text = _node_text(data_node)
+        data_value = text if text != "" else None
+        rows.append((depth=0, label="data", value=data_value))
+
+    rendered_rows = []
+    for row in rows:
+        rendered_rows.append((left="{'  ' * row.depth}{row.label}", value=row.value))
+
+    value_column = 20
+    for row in rendered_rows:
+        if row.value is not None and len(row.left) > value_column:
+            value_column = len(row.left)
+
+    lines = []
+    for row in rendered_rows:
+        left = row.left
+        if row.value is not None:
+            lines.append("{left.ljust(value_column)} : {_color_value(str(row.value), use_color)}")
+        else:
+            lines.append(left)
+    return "\n".join(lines)
+
+
+def extract_rpc_content(request_xml: str) -> xml.Node:
+    try:
+        root = xml.decode(request_xml)
+    except xml.XmlParseError as parse_error:
+        raise ValueError("Invalid RPC XML: {parse_error.error_message}")
+
+    if root.tag == "rpc":
+        if len(root.children) == 0:
+            raise ValueError("RPC request must contain an operation element")
+        if len(root.children) > 1:
+            raise ValueError("RPC request must contain exactly one operation element")
+        return root.children[0]
+
+    if root.tag == "rpc-reply":
+        raise ValueError("RPC request must not be an rpc-reply")
+    if root.tag == "hello":
+        raise ValueError("RPC request must not be a hello message")
+
+    return root
+
+
+actor CmdListSchemas(env, args, log_handler):
+    """List available schemas from a NETCONF server"""
+
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    password = args.get_str("password")
+    skip_host_key_check = args.get_bool("insecure")
+    client_fixups = resolve_client_fixups(args, log_handler)
+
+    var schemas_found = []
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            print("Error: Failed to connect: {e}", err=True)
+            env.exit(1)
+        else:
+            c.list_schemas(_on_list_schemas)
+
+    def _on_list_schemas(c: netconf.Client, schemas: list[(identifier: ?str, namespace: ?str, version: ?str, format: ?str)], error: ?netconf.NetconfError):
+        for schema in schemas:
+            schemas_found.append(schema)
+
+        def _close_cb():
+            _display_schemas()
+
+        c.close(_close_cb)
+
+    def _display_schemas():
+        print("Available schemas:")
+        print("==================")
+        count = 0
+        for schema in schemas_found:
+            version_str = str(schema.version) if schema.version is not None else "N/A"
+            format_str = str(schema.format) if schema.format is not None else "N/A"
+            identifier_str = str(schema.identifier) if schema.identifier is not None else "N/A"
+            namespace_str = str(schema.namespace) if schema.namespace is not None else "N/A"
+            print("  {identifier_str:<40} {version_str:<15} {format_str:<5} {namespace_str}")
+            count += 1
+
+        print("\nTotal schemas: {count}")
+        env.exit(0)
+
+    c = netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth))),
+                      on_connect=_on_connect,
+                      on_notif=None,
+                      address=host,
+                      username=username,
+                      key=None,
+                      password=password,
+                      port=port,
+                      skip_host_key_check=skip_host_key_check,
+                      log_handler=log_handler,
+                      fixups=client_fixups)
+
+
+actor CmdHello(env, args, log_handler):
+    """Print NETCONF server capabilities from hello exchange"""
+
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    password = args.get_str("password")
+    skip_host_key_check = args.get_bool("insecure")
+    client_fixups = resolve_client_fixups(args, log_handler)
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            print("Error: Failed to connect: {e}", err=True)
+            env.exit(1)
+        else:
+            capabilities = c.get_capabilities()
+            print("Server capabilities:")
+            print("====================")
+            print("\n".join(["  {c}" for c in capabilities]))
+
+            def _close_cb():
+                env.exit(0)
+
+            c.close(_close_cb)
+
+    netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth))),
+                   on_connect=_on_connect,
+                   on_notif=None,
+                   address=host,
+                   username=username,
+                   key=None,
+                   password=password,
+                   port=port,
+                   skip_host_key_check=skip_host_key_check,
+                   log_handler=log_handler,
+                   fixups=client_fixups)
+
+
+actor CmdGetData(env, args, log_handler, use_get_config: bool):
+    """Get data from a NETCONF server using get or get-config"""
+
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    password = args.get_str("password")
+    skip_host_key_check = args.get_bool("insecure")
+    client_fixups = resolve_client_fixups(args, log_handler)
+    filter_subtree = args.get_str("filter-subtree")
+    filter_xpath = args.get_str("filter-xpath")
+    xpath_namespaces = args.get_strlist("xpath-namespaces")
+    output_file = args.get_str("output")
+    format = args.get_str("format")
+    module_sets = args.get_strlist("module-set")
+    explicit_modules = args.get_strlist("module")
+    request_label = "configuration" if use_get_config else "data"
+    save_label = "Configuration" if use_get_config else "Data"
+
+    var config_xml: ?xml.Node = None
+    var client: ?netconf.Client = None
+    var schemas: list[str] = []
+    var strict_quoting = True
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            print("Error: Failed to connect: {e}", err=True)
+            env.exit(1)
+
+        # Validate that module-set and module are mutually exclusive
+        if module_sets != [] and explicit_modules != []:
+            print("Error: Cannot specify both --module-set and --module options", err=True)
+            env.exit(1)
+
+        # Parse and validate module sets
+        if module_sets != []:
+            warnings = schema_filter.validate_module_sets(module_sets)
+            for warning in warnings:
+                print(warning, err=True)
+
+        # Build filter if provided
+        filter_node: ?xml.Node = None
+
+        if filter_subtree != "" and filter_xpath != "":
+            print("Error: Cannot specify both filter-subtree and filter-xpath", err=True)
+            env.exit(1)
+
+        if filter_subtree != "":
+            # Wrap subtree filter in <filter> element
+            try:
+                subtree_node = xml.decode(filter_subtree)
+                filter_node = xml.Node("filter", attributes=[("type", "subtree")], children=[subtree_node], text=None)
+            except xml.XmlParseError as parse_error:
+                print("Error: Invalid subtree filter XML: {parse_error.error_message}", err=True)
+                env.exit(1)
+        elif filter_xpath != "":
+            # Create XPath filter with proper namespace
+            filter_attrs = [("type", "xpath"), ("select", filter_xpath)]
+
+            # Add namespace declarations if provided
+            # Each namespace should be in format "prefix=uri"
+            nsdefs = []
+            for ns_decl in xpath_namespaces:
+                parts = ns_decl.split("=")
+                if len(parts) == 2:
+                    prefix = parts[0].strip()
+                    uri = parts[1].strip()
+                    nsdefs.append((prefix, uri))
+                else:
+                    print("Error: Invalid namespace format '{ns_decl}'. Use prefix=uri", err=True)
+                    env.exit(1)
+
+            filter_node = xml.Node("filter", nsdefs, attributes=filter_attrs)
+
+        if use_get_config:
+            source = args.get_str("source")
+            c.get_config(_on_get_data, source, filter_node)
+        else:
+            c.get(_on_get_data, filter_node)
+
+    def _on_get_data(c: netconf.Client, result: ?xml.Node, error: ?netconf.NetconfError):
+        # Check for errors
+        if error is not None:
+            print("Error getting {request_label}: {error.error_message}", err=True)
+            env.exit(1)
+
+        # Extract data element
+        if result is not None:
+            for child in result.children:
+                if child.tag == "data":
+                    config_xml = child
+                    break
+
+        if config_xml is None:
+            print("No data element in response", err=True)
+            env.exit(1)
+
+        # For raw-xml and tree, output directly from XML without schema download
+        if format == "raw-xml" or format == "tree":
+            if config_xml is not None:
+                if format == "tree":
+                    _output_data(render_data_tree(config_xml, use_color=output_file == ""))
+                    return
+                # Extract just the configuration data content
+                config = ""
+                if len(config_xml.children) > 0:
+                    # Encode children of data element
+                    for data_child in config_xml.children:
+                        config += data_child.encode()
+                elif config_xml.text is not None:
+                    # If data element has text content
+                    config = str(config_xml.text)
+                _output_data(config)
+        else:
+            # If format is not raw-xml/tree, fetch schemas
+            print("Fetching schemas for data conversion...")
+            # Check if explicit modules are provided
+            if len(explicit_modules) > 0:
+                schemas_to_download = build_explicit_schemas_list(explicit_modules, format)
+
+                print("Downloading {len(schemas_to_download)} specified schemas")
+                schema_getter = netconf.SchemaGetter(c)
+                sg = schema_getter
+                if sg is not None:
+                    sg.download(_on_schema_download, _on_schemas_complete, schemas_to_download)
+            else:
+                # List all schemas and filter based on module sets (or download all if no module sets)
+                c.list_schemas(_on_list_schemas)
+    def _on_list_schemas(c: netconf.Client, schemas: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
+        if error is not None:
+            print("Error: Failed to list schemas: {error}", err=True)
+            env.exit(1)
+            return
+
+        schemas_to_download = []
+        for s in schemas:
+            # Skip non-YANG schemas
+            if s.format != "yang":
+                continue
+            # Skip known broken models
+            if s.identifier.startswith("junos-rpc"):
+                print("Skipping {s.identifier}: undefined grouping common-forwarding", err=True)
+                continue
+            elif s.identifier == "tailf-rollback" or s.identifier.startswith("cicso-xe-openconfig"):
+                print("Skipping {s.identifier}: Cisco IOS XE", err=True)
+                continue
+            if not schema_filter.should_include_module(s.identifier, module_sets):
+                continue
+            if s.identifier == "openconfig-isis-types" and s.version == "2017-01-13":
+                print("Skipping {s.identifier}: incorrect escape in double-quoted string", err=True)
+                strict_quoting = False
+            schemas_to_download.append((identifier=s.identifier, version=s.version, format=s.format))
+
+        if len(schemas_to_download) == 0:
+            print("No schemas available for download", err=True)
+            env.exit(1)
+            return
+
+        print("Found {len(schemas_to_download)} schemas to download")
+        sg = netconf.SchemaGetter(c)
+        sg.download(_on_schema_download, _on_schemas_complete, schemas_to_download)
+
+    def _on_schema_download(sg: netconf.SchemaGetter, current_index: int, total_schemas: int, schema: (identifier: str, version: ?str, format: ?str), schema_data: ?str, error: ?netconf.NetconfError):
+        """Collect downloaded schemas into the list"""
+        if error is not None:
+            print("Error downloading {schema.identifier}: {error}", err=True)
+        elif schema_data is not None:
+            schemas.append(schema_data)
+            print("Downloaded [{current_index}/{total_schemas}]: {schema.identifier}")
+        else:
+            print("Warning: no schema data received for {schema.identifier}", err=True)
+
+    def _on_schemas_complete(sg: netconf.SchemaGetter, error: ?netconf.NetconfError):
+        """Called when all schemas have been downloaded"""
+        if error is not None:
+            print("Error fetching schemas: {error.error_message}", err=True)
+            def _close_cb():
+                env.exit(1)
+            if client is not None:
+                client.close(_close_cb)
+            else:
+                env.exit(1)
+            return
+        def _close_cb():
+            env.exit(1)
+
+        print("Retrieved {len(schemas)} schemas")
+
+        t0 = time.Stopwatch()
+        fc = file.FileCap(env.cap)
+        root = yang.compile_with_cache(schemas, strict_quoting=strict_quoting, fc=fc)
+        print("Compiled schemas in {t0.elapsed().to_float()}s")
+        t0.reset()
+        c = config_xml
+        if c is not None:
+            gdata = yxml.from_xml(root, c, loose=True)
+            print("Parsed config to gdata in {t0.elapsed().to_float()}s")
+
+            if format == "json":
+                _output_data(gdata.to_yang_jsonstr())
+                return
+            elif format == "acton-gdata":
+                _output_data(gdata.prsrc())
+                return
+            elif format == "acton-adata":
+                _output_data(ydata.pradata(root, gdata, loose=True))
+                return
+            elif format == "xml":
+                _output_data(gdata.to_xmlstr())
+                return
+
+            print("Unknown output format")
+            if client is not None:
+                client.close(_close_cb)
+            else:
+                env.exit(1)
+        else:
+            print("No config")
+            if client is not None:
+                client.close(_close_cb)
+            else:
+                env.exit(1)
+
+    def _output_data(config):
+        """Output the configuration data"""
+        if output_file != "":
+            # Write to file
+            f = file.WriteFile(file.WriteFileCap(file.FileCap(env.auth)), output_file)
+            f.write(config.encode())
+            f.close()
+            print("{save_label} saved to: {output_file}")
+        else:
+            # Print to stdout
+            print(config)
+
+        def _close_cb():
+            env.exit(0)
+
+        if client is not None:
+            client.close(_close_cb)
+        else:
+            env.exit(0)
+
+    client = netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth))),
+                      on_connect=_on_connect,
+                      on_notif=None,
+                      address=host,
+                      username=username,
+                      key=None,
+                      password=password,
+                      port=port,
+                      skip_host_key_check=skip_host_key_check,
+                      log_handler=log_handler,
+                      fixups=client_fixups)
+
+
+actor CmdEditConfig(env, args, log_handler):
+    """Edit configuration on a NETCONF server"""
+
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    password = args.get_str("password")
+    skip_host_key_check = args.get_bool("insecure")
+    target = args.get_str("target")
+    default_operation = args.get_str("default-operation")
+    config_source = args.get_str("config")
+    should_commit = args.get_bool("commit")
+    client_fixups = resolve_client_fixups(args, log_handler)
+
+    var config = ""
+    var client: ?netconf.Client = None
+    var stdin_buffer: list[str] = []
+    var empty_line_count = 0
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            print("Error: Failed to connect: {e}", err=True)
+            env.exit(1)
+
+        client = c
+        _do_edit_config()
+
+    def _on_stdin(input: str):
+        # Check for empty input (just newline) or special marker
+        # TODO: propagate EOF from Acton, handle it here ...
+        if input == "\n":
+            empty_line_count += 1
+            if empty_line_count >= 2:
+                # Two empty lines means end of input
+                config = "".join(stdin_buffer).strip()
+                _connect_and_edit()
+                return
+            stdin_buffer.append(input)
+        else:
+            empty_line_count = 0
+            stdin_buffer.append(input)
+
+    def _connect_and_edit():
+        netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth))),
+                          on_connect=_on_connect,
+                          on_notif=None,
+                          address=host,
+                          username=username,
+                          key=None,
+                          password=password,
+                          port=port,
+                          skip_host_key_check=skip_host_key_check,
+                          log_handler=log_handler,
+                          fixups=client_fixups)
+
+    def _do_edit_config():
+        if client is not None:
+            config_xml = xml.decode("<data>{config}</data>")
+            client.edit_config(config_xml.children, _on_edit_config, target, default_operation=default_operation if default_operation != "merge" else None)
+
+    def _on_edit_config(c: netconf.Client, error: ?netconf.NetconfError):
+        if error is not None:
+            print("Error editing config: {error.error_message}", err=True)
+            env.exit(1)
+        else:
+            print("Configuration successfully applied to {target} datastore")
+            if should_commit and target == "candidate":
+                c.commit(_on_commit)
+                return
+
+        def _close_cb():
+            env.exit(0 if error is None else 1)
+
+        c.close(_close_cb)
+
+    def _on_commit(c: netconf.Client, error: ?netconf.NetconfError):
+        if error is not None:
+            print("Error committing configuration: {error.error_message}", err=True)
+            env.exit(1)
+        else:
+            print("Configuration committed successfully")
+
+        def _close_cb():
+            env.exit(0 if error is None else 1)
+
+        c.close(_close_cb)
+
+    if config_source == "-":
+        print("Reading configuration from stdin (enter empty line or press Ctrl+D to finish)...", err=True)
+        env.stdin_install(on_stdin=_on_stdin)
+    else:
+        try:
+            f = file.ReadFile(file.ReadFileCap(file.FileCap(env.auth)), config_source)
+            config = f.read().decode()
+            f.close()
+            _connect_and_edit()
+        except Exception as ex:
+            print("Error reading file '{config_source}': {ex}", err=True)
+            env.exit(1)
+
+
+actor CmdRpc(env, args, log_handler):
+    """Send a raw RPC to a NETCONF server"""
+
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    password = args.get_str("password")
+    skip_host_key_check = args.get_bool("insecure")
+    rpc_source = args.get_str("request")
+    output_file = args.get_str("output")
+    client_fixups = resolve_client_fixups(args, log_handler)
+
+    var request_xml = ""
+    var rpc_content: ?xml.Node = None
+    var client: ?netconf.Client = None
+    var stdin_buffer: list[str] = []
+    var empty_line_count = 0
+
+    def _parse_request() -> bool:
+        try:
+            rpc_content = extract_rpc_content(request_xml)
+            return True
+        except ValueError as ex:
+            print("Error parsing RPC request: {ex}", err=True)
+            env.exit(1)
+            return False
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            print("Error: Failed to connect: {e}", err=True)
+            env.exit(1)
+            return
+
+        client = c
+        if rpc_content is None:
+            print("Error: No RPC content to send", err=True)
+            env.exit(1)
+            return
+        c.rpc(unwrap(rpc_content, "Expected RPC content"), _on_rpc)
+
+    def _close_and_exit(exit_code: int):
+        def _close_cb():
+            env.exit(exit_code)
+
+        if client is not None:
+            client.close(_close_cb)
+        else:
+            env.exit(exit_code)
+
+    def _emit_reply(reply: str, exit_code: int, error: ?netconf.NetconfError=None):
+        if output_file != "":
+            f = file.WriteFile(file.WriteFileCap(file.FileCap(env.auth)), output_file)
+            f.write(reply.encode())
+            f.close()
+            print("RPC reply saved to: {output_file}")
+        else:
+            print(reply)
+
+        if error is not None:
+            print("RPC returned error: {error}", err=True)
+
+        _close_and_exit(exit_code)
+
+    def _on_rpc(c: netconf.Client, result: ?xml.Node, error: ?netconf.NetconfError):
+        if result is None:
+            if error is not None:
+                print("Error sending RPC: {error}", err=True)
+            else:
+                print("Error sending RPC: no rpc-reply received", err=True)
+            _close_and_exit(1)
+            return
+
+        _emit_reply(unwrap(result, "Expected rpc-reply").encode(), 1 if error is not None else 0, error)
+
+    def _connect_and_send():
+        netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth))),
+                       on_connect=_on_connect,
+                       on_notif=None,
+                       address=host,
+                       username=username,
+                       key=None,
+                       password=password,
+                       port=port,
+                       skip_host_key_check=skip_host_key_check,
+                       log_handler=log_handler,
+                       fixups=client_fixups)
+
+    def _on_stdin(input: str):
+        # Check for empty input (just newline) or special marker
+        # TODO: propagate EOF from Acton, handle it here ...
+        if input == "\n":
+            empty_line_count += 1
+            if empty_line_count >= 2:
+                request_xml = "".join(stdin_buffer).strip()
+                if _parse_request():
+                    _connect_and_send()
+                return
+            stdin_buffer.append(input)
+        else:
+            empty_line_count = 0
+            stdin_buffer.append(input)
+
+    if rpc_source == "-":
+        print("Reading RPC XML from stdin (enter empty line or press Ctrl+D to finish)...", err=True)
+        env.stdin_install(on_stdin=_on_stdin)
+    else:
+        try:
+            f = file.ReadFile(file.ReadFileCap(file.FileCap(env.auth)), rpc_source)
+            request_xml = f.read().decode()
+            f.close()
+            if _parse_request():
+                _connect_and_send()
+        except Exception as ex:
+            print("Error reading file '{rpc_source}': {ex}", err=True)
+            env.exit(1)
+
+
+actor CmdCommit(env, args, log_handler):
+    """Commit the candidate configuration to the running configuration"""
+
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    password = args.get_str("password")
+    skip_host_key_check = args.get_bool("insecure")
+    client_fixups = resolve_client_fixups(args, log_handler)
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            print("Error: Failed to connect: {e}", err=True)
+            env.exit(1)
+        else:
+            c.commit(_on_commit)
+
+    def _on_commit(c: netconf.Client, error: ?netconf.NetconfError):
+        if error is not None:
+            print("Error committing configuration: {error.error_message}", err=True)
+            env.exit(1)
+        else:
+            print("Configuration committed successfully")
+
+        def _close_cb():
+            env.exit(0 if error is None else 1)
+
+        c.close(_close_cb)
+
+    netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth))),
+                      on_connect=_on_connect,
+                      on_notif=None,
+                      address=host,
+                      username=username,
+                      key=None,
+                      password=password,
+                      port=port,
+                      skip_host_key_check=skip_host_key_check,
+                      log_handler=log_handler,
+                      fixups=client_fixups)
+
+
+actor CmdDiscardChanges(env, args, log_handler):
+    """Discard changes in the candidate configuration"""
+
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    password = args.get_str("password")
+    skip_host_key_check = args.get_bool("insecure")
+    client_fixups = resolve_client_fixups(args, log_handler)
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            print("Error: Failed to connect: {e}", err=True)
+            env.exit(1)
+        else:
+            c.discard_changes(_on_discard_changes)
+
+    def _on_discard_changes(c: netconf.Client, error: ?netconf.NetconfError):
+        if error is not None:
+            print("Error discarding changes: {error.error_message}", err=True)
+            env.exit(1)
+        else:
+            print("Candidate configuration changes discarded successfully")
+
+        def _close_cb():
+            env.exit(0 if error is None else 1)
+
+        c.close(_close_cb)
+
+    netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth))),
+                      on_connect=_on_connect,
+                      on_notif=None,
+                      address=host,
+                      username=username,
+                      key=None,
+                      password=password,
+                      port=port,
+                      skip_host_key_check=skip_host_key_check,
+                      log_handler=log_handler,
+                      fixups=client_fixups)
+
+
+actor CmdGetSchema(env, args, log_handler):
+    """Download schema(s) from a NETCONF server"""
+
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    password = args.get_str("password")
+    skip_host_key_check = args.get_bool("insecure")
+    client_fixups = resolve_client_fixups(args, log_handler)
+    format = args.get_str("format")
+    output_dir = args.get_str("output-dir")
+    module_sets = args.get_strlist("module-set")
+    explicit_modules = args.get_strlist("module")
+
+    var client: ?netconf.Client = None
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            print("Error: Failed to connect: {e}", err=True)
+            env.exit(1)
+
+        # Validate that module-set and module are mutually exclusive
+        if module_sets != [] and explicit_modules != []:
+            print("Error: Cannot specify both --module-set and --module options", err=True)
+            env.exit(1)
+
+        # Parse and validate module sets
+        if module_sets != []:
+            warnings = schema_filter.validate_module_sets(module_sets)
+            for warning in warnings:
+                print(warning, err=True)
+
+        client = c  # Store client for later use
+
+        # Check if explicit modules are provided
+        if len(explicit_modules) > 0:
+            schemas_to_download = build_explicit_schemas_list(explicit_modules, format)
+
+            print("Downloading {len(schemas_to_download)} specified schemas")
+            schema_getter = netconf.SchemaGetter(c)
+            sg = schema_getter
+            if sg is not None:
+                sg.download(_on_schema_download, _on_schemas_complete, schemas_to_download)
+        else:
+            # List all schemas and filter based on module sets (or download all if no module sets)
+            c.list_schemas(_on_list_schemas)
+
+    def _on_list_schemas(c: netconf.Client, schemas: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
+        if error is not None:
+            print("Error: Failed to list schemas: {error}", err=True)
+            env.exit(1)
+            return
+
+        # Convert to tuple argument for SchemaGetter.download (no namespace field)
+        schemas_to_download = [(identifier=s.identifier, version=s.version, format=s.format) for s in schemas]
+
+        if len(schemas_to_download) == 0:
+            print("No matching schemas found to download", err=True)
+            env.exit(1)
+            return
+
+        print("Found {len(schemas_to_download)} schemas to download")
+        sg = netconf.SchemaGetter(c)
+        sg.download(_on_schema_download, _on_schemas_complete, schemas_to_download)
+
+    def _on_schema_download(sg: netconf.SchemaGetter, current_index: int, total_schemas: int, schema: (identifier: str, version: ?str, format: ?str), schema_data: ?str, error: ?netconf.NetconfError):
+        """Handle each downloaded schema"""
+        print("Downloading [{current_index}/{total_schemas}]: {schema.identifier}")
+        if error is not None:
+            print("  {error}")
+        elif schema_data is not None:
+            # Build proper filename with identifier and version
+            filename = "{schema.identifier}"
+            if schema.version is not None and schema.version != "":
+                filename = "{schema.identifier}@{schema.version}"
+            if schema.format is not None and schema.format != "":
+                filename = "{filename}.{schema.format}"
+            else:
+                filename = "{filename}.yang"
+
+            if output_dir not in {"", "."}:
+                fs = file.FS(file.FileCap(env.auth))
+                try:
+                    await async fs.mkdir(output_dir)
+                except OSError as err:
+                    if "already exists" not in err.error_message:
+                        raise err
+                filepath = file.join_path([output_dir, filename])
+            else:
+                filepath = filename
+
+            # Write to file
+            f = file.WriteFile(file.WriteFileCap(file.FileCap(env.auth)), filepath)
+            f.write(schema_data.encode())
+            f.close()
+            print("  Saved to: {filepath}")
+        else:
+            print("  Warning: No data received for {schema.identifier}")
+
+    def _on_schemas_complete(sg: netconf.SchemaGetter, error: ?netconf.NetconfError):
+        """Called when all schemas have been downloaded"""
+        if error is not None:
+            print("\nError downloading schemas: {error.error_message}", err=True)
+            env.exit(1)
+            return
+
+        print("\nAll schemas downloaded successfully!")
+        _close_and_exit()
+
+    def _close_and_exit():
+        if client is not None:
+            def _close_cb():
+                env.exit(0)
+            client.close(_close_cb)
+        else:
+            env.exit(0)
+
+    # Connect and start the download process
+    client = netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth))),
+                  on_connect=_on_connect,
+                  on_notif=None,
+                  address=host,
+                  username=username,
+                  key=None,
+                  password=password,
+                  port=port,
+                  skip_host_key_check=skip_host_key_check,
+                  log_handler=log_handler,
+                  fixups=client_fixups)
+
+
+actor main(env):
+    logh = logging.Handler()
+
+    def cmd_list_schemas(args):
+        """Command handler for list-schemas"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdListSchemas(env, args, logh)
+
+    def cmd_get(args):
+        """Command handler for get"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdGetData(env, args, logh, False)
+
+    def cmd_get_config(args):
+        """Command handler for get-config"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdGetData(env, args, logh, True)
+
+    def cmd_hello(args):
+        """Command handler for hello"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdHello(env, args, logh)
+
+    def cmd_get_schema(args):
+        """Command handler for get-schema"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdGetSchema(env, args, logh)
+
+    def cmd_edit_config(args):
+        """Command handler for edit-config"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdEditConfig(env, args, logh)
+
+    def cmd_rpc(args):
+        """Command handler for rpc"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdRpc(env, args, logh)
+
+    def cmd_commit(args):
+        """Command handler for commit"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdCommit(env, args, logh)
+
+    def cmd_discard_changes(args):
+        """Command handler for discard-changes"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdDiscardChanges(env, args, logh)
+
+    def _parse_args():
+        p = argparse.Parser()
+
+        # Global options
+        p.add_option("host", "str", "?", "localhost", "NETCONF server hostname")
+        p.add_option("port", "int", "?", 42830, "NETCONF server port")
+        p.add_option("username", "str", "?", "admin", "Username for authentication")
+        p.add_option("password", "str", "?", "admin", "Password for authentication")
+        p.add_bool("verbose", "Verbose logging from SSH / NETCONF client")
+        p.add_bool("insecure", "Disable SSH host key verification")
+        p.add_bool("no-fixups", "Disable NETCONF client fixups/workarounds")
+
+        # Commands
+        p_hello = p.add_cmd("hello", "Print server capabilities from hello exchange", cmd_hello)
+        p_list_schemas = p.add_cmd("list-schemas", "List available schemas", cmd_list_schemas)
+
+        p_get = p.add_cmd("get", "Get data from NETCONF server", cmd_get)
+        p_get.add_option("filter-subtree", "str", "?", "", "XML subtree filter")
+        p_get.add_option("filter-xpath", "str", "?", "", "XPath expression for filtering")
+        p_get.add_option("xpath-namespaces", "strlist", "*", [], "Namespace declarations for XPath filtering (format: prefix=uri)")
+        p_get.add_option("format", "str", "?", "raw-xml", "Output format (raw-xml, tree, xml, json, acton-gdata or acton-adata)")
+        p_get.add_option("output", "str", "?", "", "Output file (if not specified, prints to stdout)")
+        module_sets_help = "Module set(s) to include ({schema_filter.get_module_set_names()})"
+        p_get.add_option("module-set", "strlist", "+", [], module_sets_help)
+        p_get.add_option("module", "strlist", "+", [], "Module(s) to include")
+
+        p_get_config = p.add_cmd("get-config", "Get configuration from NETCONF server", cmd_get_config)
+        p_get_config.add_option("source", "str", "?", "running", "Configuration datastore (running, startup, candidate)")
+        p_get_config.add_option("filter-subtree", "str", "?", "", "XML subtree filter")
+        p_get_config.add_option("filter-xpath", "str", "?", "", "XPath expression for filtering")
+        p_get_config.add_option("xpath-namespaces", "strlist", "*", [], "Namespace declarations for XPath filtering (format: prefix=uri)")
+        p_get_config.add_option("format", "str", "?", "raw-xml", "Output format (raw-xml, tree, xml, json, acton-gdata or acton-adata)")
+        p_get_config.add_option("output", "str", "?", "", "Output file (if not specified, prints to stdout)")
+        module_sets_help = "Module set(s) to include ({schema_filter.get_module_set_names()})"
+        p_get_config.add_option("module-set", "strlist", "+", [], module_sets_help)
+        p_get_config.add_option("module", "strlist", "+", [], "Module(s) to include")
+
+        p_get_schema = p.add_cmd("get-schema", "Download schema(s) from NETCONF server", cmd_get_schema)
+        p_get_schema.add_option("format", "str", "?", "yang", "Schema format (yang or yin)")
+        p_get_schema.add_option("output-dir", "str", "?", "schemas", "Output directory for downloaded schemas")
+        module_sets_help = "Module set(s) to include ({schema_filter.get_module_set_names()})"
+        p_get_schema.add_option("module-set", "strlist", "+", [], module_sets_help)
+        p_get_schema.add_option("module", "strlist", "+", [], "Module(s) to include (optionally with version as module@version)")
+
+        p_edit_config = p.add_cmd("edit-config", "Edit configuration on NETCONF server", cmd_edit_config)
+        p_edit_config.add_option("target", "str", "?", "candidate", "Configuration datastore (running, startup, candidate)")
+        p_edit_config.add_option("default-operation", "str", "?", "merge", "Default operation (merge, replace, none)")
+        p_edit_config.add_bool("commit", "Commit changes (only applies when target is candidate)")
+        p_edit_config.add_arg("config", "Configuration XML, or - to read from stdin", False)
+
+        p_rpc = p.add_cmd("rpc", "Send raw RPC XML to NETCONF server", cmd_rpc)
+        p_rpc.add_option("output", "str", "?", "", "Output file (if not specified, prints to stdout)")
+        p_rpc.add_arg("request", "RPC XML file path, or - to read from stdin", False)
+
+        p_commit = p.add_cmd("commit", "Commit candidate configuration to running", cmd_commit)
+
+        p_discard = p.add_cmd("discard-changes", "Discard changes in candidate configuration", cmd_discard_changes)
+
+        return p.parse(env.argv)
+
+    try:
+        args = _parse_args()
+        cmd = args.cmd
+        if cmd is not None:
+            cmd(args)
+        else:
+            env.exit(0)
+    except argparse.ArgumentError as exc:
+        print(str(exc), err=True)
+        env.exit(1)
