@@ -7,6 +7,13 @@ Two angles, both against a real TTT layer:
   - a netconf.Client connects to a full NetconfServer over a real loopback SSH
     transport, exercising listen/accept, password auth, the ephemeral host key,
     and framing end to end.
+
+YANG-push subscriptions are served per session by a TttSubscriptionService, and
+covered over the pipe: a periodic establish-subscription is accepted (returns a
+subscription-id), a raw on-change establish-subscription is rejected with an
+rpc-error (the client helper only builds periodic requests), and two sessions on
+one TTT layer stay isolated, with a datastore change reaching both. A loopback-SSH
+test also checks that a session's subscriptions are released when it closes.
 """
 
 import logging
@@ -211,6 +218,177 @@ actor _test_edit_config_rejects_nonrunning_target(t: testing.AsyncT):
     client = netconf.Client(None, "mock", 0, "admin", "admin", None, _on_connect, None, True, lh, pipe=pipes.client)
 
     after 5.0: fail(ValueError("timed out waiting for edit-config rejection"))
+
+
+actor _test_subscription_rejects_on_change(t: testing.AsyncT):
+    """An on-change establish-subscription is rejected: v1 serves periodic only,
+    so the server fails closed rather than quietly serving full-tree pushes."""
+    lh = logging.Handler("nctest")
+    schema = _demo_schema()
+    layer = _demo_layer()
+    caps = swnetconf.build_capabilities(schema)
+
+    pipes = netconf.actor_pipe_pair()
+    server = swnetconf.NetconfSession(pipes.server, lh, schema, layer, caps)
+
+    var done = False
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_reply(c: netconf.Client, reply: ?xml.Node, err: ?netconf.NetconfError):
+        # The client helper only builds periodic requests, so send a raw on-change
+        # establish; the server must reject it with an rpc-error.
+        if err is not None:
+            if not done:
+                done = True
+                t.success()
+        else:
+            fail(ValueError("expected on-change to be rejected, got a reply"))
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            fail(ValueError("client connect failed: {e}"))
+            return
+        op = xml.decode('<establish-subscription xmlns="urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications"><datastore xmlns="urn:ietf:params:xml:ns:yang:ietf-yang-push" xmlns:ds="urn:ietf:params:xml:ns:yang:ietf-datastores">ds:operational</datastore><on-change xmlns="urn:ietf:params:xml:ns:yang:ietf-yang-push"><dampening-period>0</dampening-period></on-change></establish-subscription>')
+        c.rpc(op, _on_reply)
+
+    client = netconf.Client(None, "mock", 0, "admin", "admin", None, _on_connect, None, True, lh, pipe=pipes.client)
+    after 5.0: fail(ValueError("timed out waiting for on-change rejection"))
+
+
+actor _test_subscription_periodic_accepted(t: testing.AsyncT):
+    """A periodic establish-subscription is accepted and returns a subscription-id."""
+    lh = logging.Handler("nctest")
+    schema = _demo_schema()
+    layer = _demo_layer()
+    caps = swnetconf.build_capabilities(schema)
+
+    pipes = netconf.actor_pipe_pair()
+    server = swnetconf.NetconfSession(pipes.server, lh, schema, layer, caps)
+
+    var done = False
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_sub(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+        elif sub_id is not None:
+            if not done:
+                done = True
+                t.success()
+        else:
+            fail(ValueError("expected a subscription id"))
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            fail(ValueError("client connect failed: {e}"))
+            return
+        # period in centiseconds; datastore defaults to operational.
+        c.establish_subscription(_on_sub, period=100)
+
+    client = netconf.Client(None, "mock", 0, "admin", "admin", None, _on_connect, None, True, lh, pipe=pipes.client)
+    after 5.0: fail(ValueError("timed out waiting for periodic subscription reply"))
+
+
+actor _test_subscription_per_session_isolation(t: testing.AsyncT):
+    """Two sessions sharing one cfs keep independent subscriptions: a datastore
+    change must reach BOTH. Regression for colliding TTT owner ids, where the
+    second session's establish overwrote the first session's callback so a change
+    (or the other session's delete) silently dropped the first subscription."""
+    lh = logging.Handler("nctest")
+    schema = _demo_schema()
+    layer = _demo_layer()
+    caps = swnetconf.build_capabilities(schema)
+
+    pipesA = netconf.actor_pipe_pair()
+    serverA = swnetconf.NetconfSession(pipesA.server, lh, schema, layer, caps, session_seq=1)
+    pipesB = netconf.actor_pipe_pair()
+    serverB = swnetconf.NetconfSession(pipesB.server, lh, schema, layer, caps, session_seq=2)
+
+    var done = False
+    var a_count = 0
+    var b_count = 0
+    var a0 = 0
+    var b0 = 0
+    var attempts = 0
+    var clientA: ?netconf.Client = None
+    var clientB: ?netconf.Client = None
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_notif_a(c: netconf.Client, n: xml.Node):
+        a_count += 1
+    def _on_notif_b(c: netconf.Client, n: xml.Node):
+        b_count += 1
+
+    def _check():
+        attempts += 1
+        # Both sessions must observe a push after the change, not just one.
+        if a_count > a0 and b_count > b0:
+            if not done:
+                done = True
+                t.success()
+            return
+        if attempts > 120:
+            fail(ValueError("change did not reach both sessions: a {a0}->{a_count} b {b0}->{b_count}"))
+            return
+        after 0.05: _check()
+
+    def _on_edited(c: netconf.Client, err: ?netconf.NetconfError):
+        pass
+
+    def _begin_change():
+        # Baselines have settled; record counts, then change the datastore.
+        a0 = a_count
+        b0 = b_count
+        ca = clientA
+        if ca is not None:
+            cfg = xml.decode('<system xmlns="urn:demo"><location>lab</location></system>')
+            ca.edit_config([cfg], _on_edited)
+        _check()
+
+    def _on_sub_b(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        after 0.2: _begin_change()
+
+    def _on_connect_b(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            fail(ValueError("B connect failed: {e}"))
+            return
+        c.establish_subscription(_on_sub_b, period=5)
+
+    def _on_sub_a(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        clientB = netconf.Client(None, "mockB", 0, "admin", "admin", None, _on_connect_b, _on_notif_b, True, lh, pipe=pipesB.client)
+
+    def _on_seed(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        c.establish_subscription(_on_sub_a, period=5)
+
+    def _on_connect_a(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            fail(ValueError("A connect failed: {e}"))
+            return
+        # Seed some config so the baseline is non-empty and deterministic.
+        seed = xml.decode('<system xmlns="urn:demo"><hostname>r1</hostname></system>')
+        c.edit_config([seed], _on_seed)
+
+    clientA = netconf.Client(None, "mockA", 0, "admin", "admin", None, _on_connect_a, _on_notif_a, True, lh, pipe=pipesA.client)
+    after 12.0: fail(ValueError("timed out: a={a_count} b={b_count}"))
 
 
 actor _test_ssh_edit_config_roundtrip(t: testing.EnvT):
