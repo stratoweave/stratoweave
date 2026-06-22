@@ -11,6 +11,8 @@ import yang.xml as yxml
 
 import netconf
 import device as swdev
+import ietf_yang_library as yl
+import monitoring
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig
 from adapters.adapter import \
@@ -33,8 +35,7 @@ def extract_txid(conf: ?xml.Node) -> ?str:
                     return attr_value
 
 
-NS_IETF_SYSTEM = "urn:ietf:params:xml:ns:yang:ietf-system"
-IETF_SYSTEM_MODULE = "ietf-system"
+NS_YANG_LIBRARY = "urn:ietf:params:xml:ns:yang:ietf-yang-library"
 
 NETCONF_MOCK_IETF_SYSTEM_YANG = r"""module ietf-system {
   yang-version "1.1";
@@ -61,52 +62,103 @@ def _netconf_mock_default_oper_schema() -> yschema.DRoot:
         return yschema.DRoot()
 
 
-def _netconf_mock_default_oper_ds() -> ygdata.Node:
-    def q(name: str) -> ygdata.Id:
-        return ygdata.Id(NS_IETF_SYSTEM, name)
-
-    return ygdata.Container({
-        q("system-state"): ygdata.Container({
-            q("clock"): ygdata.Container({
-                q("current-datetime"): ygdata.Leaf("2026-01-01T00:00:00Z", ns=NS_IETF_SYSTEM, module=IETF_SYSTEM_MODULE),
-                q("boot-datetime"): ygdata.Leaf("2025-12-31T00:00:00Z", ns=NS_IETF_SYSTEM, module=IETF_SYSTEM_MODULE)
-            }, ns=NS_IETF_SYSTEM, module=IETF_SYSTEM_MODULE)
-        }, ns=NS_IETF_SYSTEM, module=IETF_SYSTEM_MODULE)
-    })
-
-
 def _mock_capabilities_from_dmc(new_dmc: DeviceMetaConfig) -> list[str]:
+    """True protocol capabilities for the mock device hello exchange.
+    """
     caps: list[str] = [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1,
         "urn:ietf:params:netconf:capability:writable-running:1.0",
         "urn:ietf:params:netconf:capability:candidate:1.0"]
-    preset_caps = mock_preset_capabilities(new_dmc.mock.preset)
-    for cap in preset_caps:
+    # Presets are hardcoded vendor hello strings (a mix of true caps and module
+    # caps); they pass through untouched until presets are removed.
+    for cap in mock_preset_capabilities(new_dmc.mock.preset):
         caps.append(cap)
-
-    for mock_cap in new_dmc.mock.module.elements:
-        cap = mock_cap.namespace + "?module=" + mock_cap.name
-        rev = mock_cap.revision
-        if rev is not None:
-            cap = cap + "&revision=" + rev
-        features = mock_cap.feature
-        if len(features) > 0:
-            cap = cap + "&features=" + ",".join(features)
-        caps.append(cap)
-
     return caps
 
 
-actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: ?list[str]=None, config_schema: ?yschema.DRoot=None):
+actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[str], config_schema: yschema.DRoot, operational_schema: yschema.DRoot):
+    # `capabilities` carries true NETCONF protocol capabilities only.
+    # `config_schema` and `operational_schema` are used both for parsing as well
+    # as module inventory. If ietf-yang-library is present, then the mock server
+    # adds it to the capabilities and populates the oper state. If not, then all
+    # modules are advertised as capabilities.
     _log = logging.Logger(log_handler)
 
-    var oper_schema: yschema.DRoot = _netconf_mock_default_oper_schema()
-    var oper_ds: ygdata.Node = _netconf_mock_default_oper_ds()
-    var conf_schema: yschema.DRoot = oper_schema
-    if config_schema is not None:
-        conf_schema = config_schema
+    # Schemas are mutable so tests can swap them on the fly via set_*_ds(...).
+    var conf_schema: yschema.DRoot = config_schema
+    var oper_schema: yschema.DRoot = operational_schema
+    # The mock starts with no operational data; tests that exercise <get>
+    # side-load it via set_oper_ds(...). Fabricating ambient operational state
+    # here would leak non-deterministically into transforms that read it.
+    var oper_ds: ygdata.Node = ygdata.Container({})
     var conf_ds: ygdata.Node = ygdata.Container({})
     var rpc_log: list[(message_id: str, op: xml.Node)] = []
     NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
+
+    def _bundled_caps(module_metadata: dict[str, (module: str, revision: ?str)]) -> list[str]:
+        """YANG module capability URIs (`<namespace>?module=<name>&revision=<rev>`)
+        for every module in `module_metadata`."""
+        caps = []
+        for ns, meta in module_metadata.items():
+            cap = ns + "?module=" + meta.module
+            rev = meta.revision
+            if rev is not None:
+                cap = cap + "&revision=" + rev
+            caps.append(cap)
+        return caps
+
+    def _merge_module_metadata(schemas: list[yschema.DRoot]) -> dict[str, (module: str, revision: ?str)]:
+        """The device's advertised module inventory: every schema's modules."""
+        merged = {}
+        for s in schemas:
+            for ns, meta in s.module_metadata.items():
+                merged[ns] = meta
+        return merged
+
+    def _build_yl_view(config_schema: yschema.DRoot, operational_schema: yschema.DRoot) -> ?(root: ygdata.Node, content_id: str):
+        """The ietf-yang-library view to serve, or None when the inventory doesn't
+        implement it. Recomputed whenever the served schema changes so the library
+        and its content-id track the current module set."""
+        inventory = _merge_module_metadata([config_schema, operational_schema])
+        if NS_YANG_LIBRARY in inventory:
+            return monitoring.build_yang_library([config_schema, operational_schema])
+        return None
+
+    def _advertised_module_caps(schemas: list[yschema.DRoot],
+                                yl_view: ?(root: ygdata.Node, content_id: str)) -> list[str]:
+        """Capabilities for the hello, either protocl+ietf-yang-library or every module as capability"""
+        if yl_view is not None:
+            yl_rev = yl.SRC_DNODE.module_metadata[NS_YANG_LIBRARY].revision
+            return ["urn:ietf:params:netconf:capability:yang-library:1.1?{"revision={yl_rev}&" if yl_rev is not None else ""}content-id={yl_view.content_id}"]
+        return _bundled_caps(_merge_module_metadata(schemas))
+
+    def _merged_schema(schemas: list[yschema.DRoot]) -> yschema.DRoot:
+        children = []
+        identities = []
+        rpcs = []
+        module_metadata = {}
+
+        for schema in schemas:
+            for child in schema.children:
+                if not isinstance(child, yschema.DRpc):
+                    children.append(child)
+            for identity in schema.identities:
+                identities.append(identity)
+            for rpc in schema.rpcs:
+                rpcs.append(rpc)
+            for ns, meta in schema.module_metadata.items():
+                module_metadata[ns] = meta
+
+        return yschema.DRoot(
+            children=children,
+            identities=identities,
+            rpcs=rpcs,
+            module_metadata=module_metadata,
+        )
+
+    # Serve ietf-yang-library only when the device's inventory implements it.
+    # Otherwise the modules are advertised as additiona "?module=..." capabilities.
+    var yl_view = _build_yl_view(config_schema, operational_schema)
+    all_capabilities = capabilities + _advertised_module_caps([config_schema, operational_schema], yl_view)
 
     def send_reply_with_log(s: netconf.Server, message_id: str, children: list[xml.Node]):
         rpc_reply = xml.Node("rpc-reply", [(None, NS_NC_1_0)], None, [("message-id", message_id)], children)
@@ -162,6 +214,30 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: ?list[
 
         return current.to_xml(deterministic=True)
 
+    def _get_schema() -> yschema.DRoot:
+        schemas = [conf_schema, oper_schema]
+        if yl_view is not None:
+            schemas.append(yl.SRC_DNODE)
+        return _merged_schema(schemas)
+
+    def _get_data() -> ygdata.Node:
+        base = ygdata.merge(conf_ds, oper_ds)
+        if yl_view is not None:
+            return ygdata.merge(base, yl_view.root)
+        return base
+
+    def _filtered_get_data(filter_node: ?xml.Node) -> list[xml.Node]:
+        current = _get_data()
+
+        if filter_node is not None:
+            filt = yxml.from_filter_xml(_get_schema(), filter_node)
+            filtered: ?ygdata.Node = ygdata.filter(current, filt)
+            if filtered is not None:
+                return filtered.to_xml(deterministic=True)
+            return []
+
+        return current.to_xml(deterministic=True)
+
     def _extract_config(op: xml.Node) -> ?xml.Node:
         for child in op.children:
             if isinstance(child, xml.Node) and child.tag == "config":
@@ -199,7 +275,7 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: ?list[
             data_children: list[xml.Node] = []
             try:
                 if op.tag == "get":
-                    data_children = _filtered_oper_data(filter_node)
+                    data_children = _filtered_get_data(filter_node)
                 else:
                     data_children = _filtered_conf_data(filter_node)
             except Exception as e:
@@ -229,19 +305,21 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: ?list[
         else:
             send_error(s, message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
 
-    var server: netconf.Server = netconf.Server(pipe=pipe, on_rpc=on_rpc, log_handler=log_handler, capabilities=capabilities)
+    var server: netconf.Server = netconf.Server(pipe=pipe, on_rpc=on_rpc, log_handler=log_handler, capabilities=all_capabilities)
 
     def set_oper_ds(new_oper_ds: ygdata.Node, schema: ?yschema.DRoot=None):
-        """Set operational datastore for replies to <get>."""
+        """Set the operational datastore (and optionally its schema) for <get>."""
         oper_ds = new_oper_ds
         if schema is not None:
             oper_schema = schema
+            yl_view = _build_yl_view(conf_schema, oper_schema)
 
     def set_conf_ds(new_conf_ds: ygdata.Node, schema: ?yschema.DRoot=None):
-        """Set configuration datastore for replies to <get-config>."""
+        """Set the configuration datastore (and optionally its schema) for <get-config>."""
         conf_ds = new_conf_ds
         if schema is not None:
             conf_schema = schema
+            yl_view = _build_yl_view(conf_schema, oper_schema)
 
 
 actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, init_dmc: DeviceMetaConfig, schema_registry: swdev.SchemaRegistry, log_handler: logging.Handler, connect_cap: ?net.TCPConnectCap):
@@ -494,10 +572,13 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
         if use_mock_server:
             state = CONNECTING
             pipes = netconf.actor_pipe_pair()
-            bundled_caps = ["{ns}?module={meta.module}{"&revision={meta.revision}" if meta.revision is not None else ""}" for ns, meta in bundled_schema.src_dnode.module_metadata.items()]
-            ms = NetconfMockServer(pipes.server, _con_log_handler, _mock_capabilities_from_dmc(new_dmc) + bundled_caps, bundled_schema.src_dnode)
+            # The mock owns its module-facing output: it derives its module
+            # inventory from these schemas and serves ietf-yang-library iff the
+            # inventory implements it.
+            oper_schema = bundled_schema.oper_src_dnode if len(bundled_schema.oper_src_dnode.children) > 0 else _netconf_mock_default_oper_schema()
+            caps = _mock_capabilities_from_dmc(new_dmc)
+            ms = NetconfMockServer(pipes.server, _con_log_handler, caps, bundled_schema.src_dnode, oper_schema)
             mock_server = ms
-            ms.set_oper_ds(_netconf_mock_default_oper_ds(), bundled_schema.oper_src_dnode)
             client = netconf.Client(connect_cap,
                                     "dummy-address",
                                     0,

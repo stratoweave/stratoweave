@@ -10,6 +10,7 @@ import yang.schema as yschema
 
 import device as swdev
 import adapters.netconf as swna
+import swyang
 
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
@@ -99,8 +100,8 @@ def make_netconf_mock_dmc(name: str) -> DeviceMetaConfig:
         mock=Mock(enabled=True)
     )
 
-def new_netconf_mock_device_mgr(t: testing.EnvT, name: str, on_reconf: action(str) -> None) -> swdev.DeviceMgr:
-    schema = yang.compile([swna.NETCONF_MOCK_IETF_SYSTEM_YANG])
+def new_netconf_mock_device_mgr(t: testing.EnvT, name: str, on_reconf: action(str) -> None, extra_models: list[str]=[]) -> swdev.DeviceMgr:
+    schema = yang.compile([swna.NETCONF_MOCK_IETF_SYSTEM_YANG] + extra_models)
     dev_types = {
         "netconf": swdev.DeviceType(
             name="netconf",
@@ -177,6 +178,70 @@ actor _test_get(t: testing.EnvT):
 
     start()
     after 2.0: fail("Timed out waiting for mock NETCONF get")
+
+
+actor _test_get_yang_library(t: testing.EnvT):
+    """ietf-yang-library discovery + <get> against the mock NETCONF server.
+
+    1. Create a DeviceMgr whose device schema bundles ietf-yang-library, so the
+       mock's inventory implements it and the mock advertises + serves the
+       library (rather than falling back to per-module capabilities).
+    2. Wait until schema discovery has populated the module set with
+       ietf-yang-library — proof the client discovered modules from the served
+       library.
+    3. Send <get> with the ietf-yang-library subtree filter the client uses.
+    4. Snapshot the returned filtered <data> XML.
+    """
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-yanglib", noop_on_reconf,
+        extra_models=[swyang.ietf_yang_library, swyang.ietf_yang_types,
+                      swyang.ietf_inet_types, swyang.ietf_datastores])
+    var done = False
+
+    def fail(msg: str):
+        if done:
+            return
+        done = True
+        t.failure(ValueError(msg))
+
+    def succeed(data: ?str):
+        if done:
+            return
+        done = True
+        t.success(data)
+
+    def on_get(r: ?xml.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail("Mock yang-library <get> failed: {err}")
+            return
+        succeed(_data_xml_from_rpc_reply(r))
+
+    def start():
+        if done:
+            return
+        if "ietf-yang-library" not in dev.get_modules().0:
+            after 0.01: start()
+            return
+        msg = async dev.get_adapter()
+        adapter = await msg
+        if isinstance(adapter, swna.NetconfAdapter):
+            rpc = xml.Node("get", children=[
+                xml.Node("filter", attributes=[("type", "subtree")], children=[
+                    xml.Node("yang-library", [(None, swna.NS_YANG_LIBRARY)], children=[
+                        xml.Node("module-set"),
+                        xml.Node("schema"),
+                        xml.Node("datastore")
+                    ])
+                ])
+            ])
+            dev.rpc_xml(on_get, rpc)
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    start()
 
 
 actor _test_subscribe_periodic(t: testing.EnvT):
