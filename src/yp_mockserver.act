@@ -1,0 +1,163 @@
+"""Standalone YANG-push-capable mock NETCONF server.
+
+A self-contained NETCONF server (over SSH) that serves YANG-push subscriptions
+backed by the InterfaceCountersBackend mock data generator — no datastore engine
+(no TTT) involved. It exists so a client such as ncurl monitor can connect to a
+real NETCONF/SSH server and stream periodic pushes of generated data.
+
+Each accepted SSH session gets its own netconf.Server + a NetconfSubscriptionService
+wired to its own InterfaceCountersBackend, so subscribers are independent. Besides
+the subscription RPCs (establish/delete-subscription), a plain <get> returns the
+backend's current interface-counters snapshot.
+
+Run:  yp_mockserver [--address ::] [--port 12830] [--username admin]
+                     [--password admin] [--interfaces eth0,eth1] [--verbose]
+"""
+
+import argparse
+import logging
+import net
+import std.xml as xml
+
+import ssh.pipe as sshpipe
+
+import netconf
+import netconf.yp as nyp
+import yp
+import yp.mock_backend as mb
+
+
+actor StaticAuthChecker(expected_user: str, expected_password: str):
+    """A single static username + password SSH auth check."""
+    def check(user: str, password: ?str, pubkey: ?bytes, respond: action(bool) -> None):
+        respond(user == expected_user and password == expected_password)
+
+
+actor YpMockSession(pipe,
+                    log_handler: logging.Handler,
+                    if_names: list[str],
+                    on_close: ?action(YpMockSession) -> None=None):
+    """One NETCONF session: a Server + a YANG-push service over a mock backend."""
+    _log = logging.Logger(log_handler)
+    backend = mb.InterfaceCountersBackend(if_names)
+    var service: ?nyp.NetconfSubscriptionService = None
+
+    def on_rpc(s: netconf.Server, message_id: str, op: xml.Node):
+        if yp.is_subscription_rpc(op.tag):
+            sv = service
+            if sv is not None:
+                sv.handle_rpc(message_id, op)
+            else:
+                s.send_error(message_id, "operation-failed", "subscription service not ready")
+        elif op.tag == "get":
+            s.send_reply(message_id, [xml.Node("data", [(None, netconf.NS_NC_1_0)], children=backend.snapshot())])
+        else:
+            s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: " + op.tag)
+
+    def _on_conn(s: netconf.Server, err: ?Exception):
+        if err is not None:
+            sv = service
+            if sv is not None:
+                sv.shutdown()
+            cb = on_close
+            if cb is not None:
+                cb(self)
+
+    server = netconf.Server(pipe=pipe, on_connect=_on_conn, on_rpc=on_rpc, log_handler=log_handler)
+    service = nyp.NetconfSubscriptionService(server, backend, log_handler)
+
+
+actor YpMockServer(listen_cap: net.TCPListenCap,
+                   log_handler: logging.Handler,
+                   if_names: list[str],
+                   address: str="::",
+                   port: int=12830,
+                   username: str="admin",
+                   password: str="admin",
+                   on_listen: ?action(?Exception) -> None=None):
+    """SSH listener that turns each accepted channel into a YpMockSession."""
+    _log = logging.Logger(log_handler)
+    _auth = StaticAuthChecker(username, password).check
+    var sessions: list[YpMockSession] = []
+    var listener: ?sshpipe.SshPipeListener = None
+
+    def _session_closed(s: YpMockSession):
+        remaining: list[YpMockSession] = []
+        for x in sessions:
+            if not (x is s):
+                remaining.append(x)
+        sessions = remaining
+
+    def _on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
+        _log.info("session accepted")
+        sessions.append(YpMockSession(p, log_handler, if_names, on_close=_session_closed))
+
+    def _on_listen(l: sshpipe.SshPipeListener, err: ?Exception):
+        if err is not None:
+            _log.error("listen error", {"address": address, "port": port, "error": err})
+        else:
+            _log.info("yp mock server listening", {"address": address, "port": port})
+        cb = on_listen
+        if cb is not None:
+            cb(err)
+
+    listener = sshpipe.SshPipeListener(
+        listen_cap,
+        address=address,
+        port=port,
+        on_listen=_on_listen,
+        on_accept=_on_accept,
+        auth_check=_auth,
+        subsystem="netconf",
+        host_key=None,
+        log_handler=log_handler)
+
+    def close():
+        l = listener
+        if l is not None:
+            l.close()
+
+
+actor main(env):
+    logh = logging.Handler()
+
+    def _run(args):
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        else:
+            logh.set_output_level(logging.INFO)
+            logh.add_sink(logging.ConsoleSink())
+
+        address = args.get_str("address")
+        port = args.get_int("port")
+        username = args.get_str("username")
+        password = args.get_str("password")
+        if_names = args.get_strlist("interfaces")
+        if if_names == []:
+            if_names = ["eth0", "eth1"]
+
+        listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.auth)))
+        YpMockServer(listen_cap, logh, if_names, address, port, username, password)
+        # No env.exit(): the SSH listener keeps the runtime alive until killed.
+
+    def _parse_args():
+        p = argparse.Parser()
+        p.add_option("address", "str", "?", "::", "Listen address")
+        p.add_option("port", "int", "?", 12830, "Listen port")
+        p.add_option("username", "str", "?", "admin", "Username for authentication")
+        p.add_option("password", "str", "?", "admin", "Password for authentication")
+        p.add_option("interfaces", "strlist", "*", [], "Interface names to generate counters for")
+        p.add_bool("verbose", "Verbose logging")
+        return p.parse(env.argv)
+
+    try:
+        args = _parse_args()
+        cmd = args.cmd
+        if cmd is not None:
+            cmd(args)
+        else:
+            _run(args)
+    except argparse.ArgumentError as exc:
+        print(str(exc), err=True)
+        env.exit(1)
