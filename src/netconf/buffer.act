@@ -1,0 +1,428 @@
+import testing
+
+
+class IncompleteReadError(Exception):
+    def __init__(self):
+        self.error_message = "Not enough data to read from buffer"
+        self.msg = "Not enough data to read from buffer"
+
+class Buffer(object):
+    parts: list[bytes]
+    i: int
+    j: int
+    total_bytes: int
+    unread_bytes: int
+    _cached_pattern: ?bytes
+    _cached_search_i: int
+    _cached_search_j: int
+    _cached_search_index: int
+
+    def __init__(self):
+        self.parts = []
+        self.i = 0
+        self.j = 0
+        self.total_bytes = 0
+        self.unread_bytes = 0
+        self._cached_pattern = None
+        self._cached_search_i = 0
+        self._cached_search_j = 0
+        self._cached_search_index = 0
+
+    def write_bytes(self, data: bytes):
+        l = len(data)
+        self.parts.append(data)
+        self.total_bytes += l
+        self.unread_bytes += l
+
+    def write_str(self, data: str):
+        self.write_bytes(data.encode())
+
+    def consume(self):
+        #print("CONSUME!", self.i, self.j)
+        if self.i > 0:
+            # TODO: use a queue rather then list, i.e. parts: queue[bytes] to avoid copying/moving all elements in list
+            self.parts = self.parts[self.i:]
+            self.i = 0
+        if self.j > 0:
+            if len(self.parts) > 0:
+                #self.parts[0] = self.parts[0][self.j:]
+                parts: list[bytes] = self.parts # Workaround type-checker bug?
+                parts[0] = parts[0][self.j:]
+            self.j = 0
+        self.total_bytes = self.unread_bytes
+        # Invalidate cache after consume
+        self._cached_pattern = None
+        #print("CONSUMED!", self.parts)
+
+    def rewind(self):
+        #print("REWIND!")
+        self.i = 0
+        self.j = 0
+        self.unread_bytes = self.total_bytes
+        # Invalidate cache after rewind
+        self._cached_pattern = None
+
+    def read_bytes_count(self) -> int:
+        return self.total_bytes - self.unread_bytes
+
+    def has_unread_bytes(self) -> bool:
+        return self.unread_bytes > 0
+
+    def assert_unread_bytes(self, count: int) -> value: # (bool | IncompleteReadError)
+        # if self.unread_bytes < count:
+        #     raise IncompleteReadError()
+        if self.unread_bytes < count:
+            return IncompleteReadError()
+        else:
+            return True
+
+    def read_bytes(self, count: int) -> bytes: # (bytes | IncompleteReadError)
+        #print("READ", count)
+        #print("READ0!", self.i, self.j)
+        if count > self.unread_bytes:
+            raise IncompleteReadError()
+        remaining = count
+        acc = []
+        parts: list[bytes] = self.parts # Workaround type-checker bug?
+        while remaining > 0:
+            #part = self.parts[self.i]
+            part = parts[self.i]
+            next_j = self.j + remaining
+            chunk = part[self.j:next_j]
+            chunk_len = len(chunk)
+            remaining -= chunk_len
+            if next_j >= len(part):
+                self.i += 1
+                next_j = 0
+            self.j = next_j
+            acc.append(chunk)
+        self.unread_bytes -= count
+        #print("READ1!", self.i, self.j)
+        # Invalidate cache after read since buffer position has changed
+        self._cached_pattern = None
+        return bytes([]).join(acc)
+
+    def read_all_bytes(self) -> bytes:
+        b = self.read_bytes(self.unread_bytes)
+        if isinstance(b, bytes):
+            return b
+        else:
+            return bytes([])
+
+    def skip_bytes(self, count: int) -> value: # (bool | IncompleteReadError):
+        #print("SKIP", count)
+        #print("SKIP0!", self.i, self.j)
+        if count > self.unread_bytes:
+            return IncompleteReadError()
+        remaining = count
+        parts: list[bytes] = self.parts # Workaround type-checker bug?
+        while remaining > 0:
+            #part = self.parts[self.i]
+            part = parts[self.i]
+            part_len = len(part)
+            part_remain = part_len - self.j
+            if remaining < part_remain:
+                self.j += remaining
+                break
+            remaining -= part_remain
+            self.i += 1
+            self.j = 0
+        self.unread_bytes -= count
+        #print("SKIP0!", self.i, self.j)
+        # Invalidate cache after skip since buffer position has changed
+        self._cached_pattern = None
+        return True
+
+    def find_bytes(self, pattern: bytes) -> value: # (index: int | err: IncompleteReadError)
+        pattern_len = len(pattern)
+        if pattern_len == 0:
+            return 0
+        elif pattern_len > self.unread_bytes:
+            return IncompleteReadError()
+
+        # Check if we have any parts to search
+        if len(self.parts) == 0:
+            return IncompleteReadError()
+
+        if self._cached_pattern == pattern:
+            index = self._cached_search_index
+            _i = self._cached_search_i
+            _j = self._cached_search_j
+        else:
+            index = 0   # tracks absolute position in buffer
+            _i = self.i # current part (index of self.parts)
+            _j = self.j # current position in current part
+            self._cached_pattern = pattern
+
+        while index <= self.unread_bytes - pattern_len:
+            pos = self.parts[_i].find(chr(pattern[0]).encode(), _j)
+
+            if pos >= 0:
+                # Found first byte, update index to this position
+                index += pos - _j
+
+                # Scan the rest of the pattern byte-by-byte because the pattern
+                # may be split across parts
+                scan_i = _i
+                scan_j = pos + 1
+                for pattern_index in range(1, pattern_len):
+                    if scan_j >= len(self.parts[scan_i]):
+                        # Advance to next part
+                        scan_j = 0
+                        scan_i += 1
+                        if scan_i >= len(self.parts):
+                            # Exhausted all parts
+                            break
+                    if self.parts[scan_i][scan_j] != pattern[pattern_index]:
+                        break
+                    scan_j += 1
+                else:
+                    return index
+
+                # No match, advance position by 1 and continue
+                _j = pos + 1
+                index += 1
+            else:
+                # First byte not found in rest of this part
+                index += len(self.parts[_i]) - _j
+                _i += 1
+                _j = 0
+                if _i >= len(self.parts):
+                    # Exhausted all parts
+                    break
+
+        # Cache current position for next search
+        self._cached_search_i = _i
+        self._cached_search_j = _j
+        self._cached_search_index = index
+
+        return IncompleteReadError()
+
+    def match_bytes(self, pattern: bytes) -> value: # (is_match: bool | err: IncompleteReadError)
+        b = self.read_bytes(len(pattern))
+        if isinstance(b, bytes):
+            return b == pattern
+        else:
+            return b
+
+def _test_buffer_find_bytes_start():
+    """Test finding 'hello' at beginning of buffer"""
+    buf = Buffer()
+    buf.write_str("hello world, this is bob")
+    result = buf.find_bytes("hello".encode())
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 0, "Should find 'hello' at position 0")
+
+
+def _test_buffer_find_bytes_mid():
+    """Test finding 'world' in middle of buffer"""
+    buf = Buffer()
+    buf.write_str("hello world, this is bob")
+    result = buf.find_bytes("world".encode())
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 6, "Should find 'world' at position 6")
+
+
+def _test_buffer_find_bytes_end():
+    """Test finding 'world' in middle of buffer"""
+    buf = Buffer()
+    buf.write_str("hello world, this is bob")
+    result = buf.find_bytes("bob".encode())
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 21, "Should find 'bob' at position 21")
+
+
+def _test_buffer_find_bytes_one():
+    """Test finding space character in buffer"""
+    buf = Buffer()
+    buf.write_str("hello world")
+    result = buf.find_bytes(" ".encode())
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 5, "Should find space at position 5")
+
+
+def _test_buffer_find_bytes_not_found():
+    """Test pattern not found returns IncompleteReadError"""
+    buf = Buffer()
+    buf.write_str("hello world")
+    result = buf.find_bytes("xyz".encode())
+    testing.assertTrue(isinstance(result, IncompleteReadError), "Should return IncompleteReadError for non-existent pattern")
+
+
+# Test overlapping patterns
+
+def _test_buffer_find_bytes_separator_single_bracket():
+    """Test finding NETCONF separator preceded by single ]"""
+    buf = Buffer()
+    separator = "]]>]]>".encode()
+    buf.write_str("]]]>]]>")
+    result = buf.find_bytes(separator)
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 1, "Should find separator at position 1 after single ]")
+
+
+def _test_buffer_find_bytes_separator_double_bracket():
+    """Test finding NETCONF separator preceded by double ]]"""
+    buf = Buffer()
+    separator = "]]>]]>".encode()
+    buf.write_str("]]]]>]]>")
+    result = buf.find_bytes(separator)
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 2, "Should find separator at position 2 after double ]]")
+
+
+def _test_buffer_find_bytes_separator_mixed_prefix():
+    """Test finding NETCONF separator preceded by ]>]"""
+    buf = Buffer()
+    separator = "]]>]]>".encode()
+    buf.write_str("]>]]]>]]>")
+    result = buf.find_bytes(separator)
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 3, "Should find separator at position 3 after ]>]")
+
+
+def _test_buffer_find_bytes_split_across_two_parts():
+    """Test finding pattern split across two buffer parts"""
+    buf = Buffer()
+    separator = "]]>]]>".encode()
+    buf.write_str("data]]")
+    buf.write_str(">]]>more")
+    result = buf.find_bytes(separator)
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 4, "Should find separator split across parts")
+
+
+def _test_buffer_find_bytes_split_with_overlap():
+    """Test finding pattern with overlapping character before split"""
+    buf = Buffer()
+    separator = "]]>]]>".encode()
+    buf.write_str("data]")
+    buf.write_str("]]>]]>more")
+    result = buf.find_bytes(separator)
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 5, "Should find separator with ] before split")
+
+
+def _test_buffer_find_bytes_across_three_parts():
+    """Test finding pattern split across 3 buffer parts"""
+    buf = Buffer()
+    buf.write_str("ab")
+    buf.write_str("cd")
+    buf.write_str("ef")
+    result = buf.find_bytes("cde".encode())
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 2, "Should find pattern across 3 parts")
+
+
+def _test_buffer_find_bytes_separator_four_parts():
+    """Test finding NETCONF separator split across 4 parts"""
+    buf = Buffer()
+    separator = "]]>]]>".encode()
+    buf.write_str("]")
+    buf.write_str("]>")
+    buf.write_str("]")
+    buf.write_str("]>")
+    result = buf.find_bytes(separator)
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 0, "Should find separator split across 4 parts")
+
+
+def _test_buffer_find_bytes_empty_pattern():
+    """Test finding empty pattern returns 0"""
+    buf = Buffer()
+    buf.write_str("test")
+    result = buf.find_bytes("".encode())
+    testing.assertTrue(isinstance(result, int), "Should return int for empty pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 0, "Empty pattern should return 0")
+
+
+def _test_buffer_find_bytes_pattern_too_long():
+    """Test pattern longer than buffer returns IncompleteReadError"""
+    buf = Buffer()
+    buf.write_str("short")
+    result = buf.find_bytes("very long pattern".encode())
+    testing.assertTrue(isinstance(result, IncompleteReadError), "Pattern longer than buffer should return IncompleteReadError")
+
+
+def _test_buffer_find_bytes_pattern_at_end():
+    """Test finding pattern at the very end of buffer"""
+    buf = Buffer()
+    buf.write_str("data]]>]]>")
+    result = buf.find_bytes("]]>]]>".encode())
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, 4, "Should find pattern at end of buffer")
+
+
+def _test_buffer_find_bytes_first_separator():
+    """Test finding first separator in buffer"""
+    buf = Buffer()
+    separator = "]]>]]>".encode()
+    buf.write_str("first]]>]]>second]]>]]>third")
+    pos = buf.find_bytes(separator)
+    testing.assertTrue(isinstance(pos, int), "Should return int for found pattern")
+    if isinstance(pos, int):
+        testing.assertEqual(pos, 5, "Should find first separator at position 5")
+
+
+def _test_buffer_find_bytes_after_consume():
+    """Test finding separator after consume operation"""
+    buf = Buffer()
+    separator = "]]>]]>".encode()
+    buf.write_str("first]]>]]>second]]>]]>third")
+
+    # Find and skip past first separator
+    pos = buf.find_bytes(separator)
+    if isinstance(pos, int):
+        skip_result = buf.skip_bytes(pos + len(separator))
+        if isinstance(skip_result, bool):
+            buf.consume()
+
+            # Find second separator
+            pos2 = buf.find_bytes(separator)
+            testing.assertTrue(isinstance(pos2, int), "Should return int for found pattern")
+            if isinstance(pos2, int):
+                testing.assertEqual(pos2, 6, "Should find second separator at position 6 after consume")
+
+
+def _test_buffer_find_bytes_performance():
+    """Test performance of finding pattern at end of large buffer with 64k chunks"""
+
+    buf = Buffer()
+    pattern = "]]>]]>".encode()
+    chunk_size = 64 * 1024  # 64KB chunks
+    total_size = 2 * 1024 * 1024  # 2MB total
+
+    # Create a chunk of data that doesn't contain the pattern
+    chunk_data = ("x" * chunk_size).encode()
+
+    # Write chunks to buffer (2MB total) and search after each chunk
+    num_chunks = total_size // chunk_size
+    for i in range(num_chunks):
+        buf.write_bytes(chunk_data)
+        # Search for pattern after each chunk (should not be found)
+        result = buf.find_bytes(pattern)
+        testing.assertTrue(isinstance(result, IncompleteReadError), f"Should not find pattern after chunk {i+1}")
+
+    # Add pattern at the very end
+    buf.write_str("]]>]]>")
+
+    # Now search for pattern (should be found at end)
+    result = buf.find_bytes(pattern)
+
+    # Verify pattern was found at correct position
+    testing.assertTrue(isinstance(result, int), "Should return int for found pattern")
+    if isinstance(result, int):
+        testing.assertEqual(result, total_size, "Should find pattern at position 2MB")

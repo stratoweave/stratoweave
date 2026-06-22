@@ -1,0 +1,151 @@
+import std.xml as xml
+from netconf.fixups.base import Fixup
+
+def unwrap[T](a: ?T, msg: ?str=None) -> T:
+    if a is not None:
+        return a
+    errmsg = msg if msg is not None else "Expected non-None value"
+    raise ValueError(errmsg)
+
+
+# Prototype for xml navigation TODO: Upstream to xml module!?
+protocol XmlNav:
+    one: (str, ?str) -> xml.Node
+    many: (str, ?str) -> list[xml.Node]
+    opt: (str, ?str) -> ?xml.Node
+
+
+def find_ns(nsdefs: list[(?str, str)], prefix: ?str) -> ?str:
+    for p, uri in nsdefs:
+        if p == prefix:
+            return uri
+    return None
+
+
+def child_namespace(parent: xml.Node, child: xml.Node) -> ?str:
+    # Best-effort namespace resolution from local declarations only.
+    ns = find_ns(child.nsdefs, child.prefix)
+    if ns is not None:
+        return ns
+    return find_ns(parent.nsdefs, child.prefix)
+
+
+def child_matches(parent: xml.Node, child: xml.Node, tag: str, ns: ?str) -> bool:
+    if child.tag != tag:
+        return False
+    if ns is None:
+        return True
+    cns = child_namespace(parent, child)
+    return cns is not None and cns == ns
+
+
+def matching_children(parent: xml.Node, tag: str, ns: ?str) -> list[xml.Node]:
+    return [c for c in parent.children if child_matches(parent, c, tag, ns)]
+
+
+extension xml.Node(XmlNav):
+    def one(self, tag: str, ns: ?str=None) -> xml.Node:
+        matches = matching_children(self, tag, ns)
+        count = len(matches)
+        if count == 1:
+            return matches[0]
+        if ns is None:
+            raise ValueError("Expected one child <{tag}> under <{self.tag}>, got {count}")
+        raise ValueError("Expected one child <{tag}> in ns <{ns}> under <{self.tag}>, got {count}")
+
+    def opt(self, tag: str, ns: ?str=None) -> ?xml.Node:
+        matches = matching_children(self, tag, ns)
+        count = len(matches)
+        if count <= 1:
+            if count == 1:
+                return matches[0]
+            return None
+        if ns is None:
+            raise ValueError("Expected at most one child <{tag}> under <{self.tag}>, got {count}")
+        raise ValueError("Expected at most one child <{tag}> in ns <{ns}> under <{self.tag}>, got {count}")
+
+    def many(self, tag: str, ns: ?str=None) -> list[xml.Node]:
+        return matching_children(self, tag, ns)
+
+
+mut def ensure_key_from_config(entry: xml.Node, key_name: str) -> bool:
+    if len(entry.many(key_name, None)) > 0:
+        return False
+
+    key_text: ?str = None
+    try:
+        key_text = entry.one("config", None).one(key_name, None).text
+    except ValueError:
+        return False
+    if key_text is None:
+        return False
+
+    key_leaf = xml.Node(key_name, text=key_text)
+    entry.children.insert(0, key_leaf)
+    return True
+
+
+mut def patch_tree(n: xml.Node) -> (int, int, int):
+    patched = 0
+    relevant = 0
+    missing = 0
+    if n.tag == "interface":
+        relevant += 1
+        has_name = True
+        try:
+            has_name = n.opt("name", None) is not None
+        except ValueError:
+            has_name = True
+        if not has_name:
+            missing += 1
+            if ensure_key_from_config(n, "name"):
+                patched += 1
+    elif n.tag == "subinterface":
+        relevant += 1
+        has_index = True
+        try:
+            has_index = n.opt("index", None) is not None
+        except ValueError:
+            has_index = True
+        if not has_index:
+            missing += 1
+            if ensure_key_from_config(n, "index"):
+                patched += 1
+
+    for c in n.children:
+        child_patched, child_relevant, child_missing = patch_tree(c)
+        patched += child_patched
+        relevant += child_relevant
+        missing += child_missing
+    return patched, relevant, missing
+
+
+class OpenConfigListKeyFixup(Fixup):
+    """Fix broken OpenConfig list entries missing key leaves at list-entry level.
+
+    Some devices return list entries like:
+      <interface><config><name>...</name></config>...</interface>
+    while omitting the list key leaf:
+      <interface><name>...</name>...</interface>
+
+    This fixup mirrors key values from config/name and config/index up to
+    interface/name and subinterface/index respectively.
+    """
+    def __init__(self):
+        Fixup.__init__(self, "openconfig-list-keys")
+
+    def activate(self, capabilities: list[str]) -> bool:
+        for cap in capabilities:
+            if "openconfig-interfaces" in cap or "http://openconfig.net/yang/interfaces" in cap:
+                return True
+        return False
+
+    mut def on_response(self, rpc_reply: xml.Node) -> xml.Node:
+        patched, relevant, missing = patch_tree(rpc_reply)
+        if relevant == 0:
+            return rpc_reply
+
+        if missing == 0:
+            self.active = False
+            self.deactivate_reason = "observed clean relevant reply"
+        return rpc_reply

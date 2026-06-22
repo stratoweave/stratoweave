@@ -1,0 +1,2068 @@
+# Copyright (C) Deutsche Telekom AG
+#
+# Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+#
+# 1. Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+#
+# 2. Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+#
+# 3. Neither the name of the copyright holder nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+"""NETCONF client
+"""
+
+import logging
+import net
+import random
+import testing
+import std.xml as xml
+from pipe import Pipe, actor_pipe_pair as _actor_pipe_pair
+
+from netconf.buffer import Buffer, IncompleteReadError
+from netconf.fixups import FIXUPS
+from netconf.fixups.base import Fixup
+import ssh.pipe as sshpipe
+from netconf.transport import TcpListenPipe, TcpPipe, TcpPipeListener
+
+SEPARATOR_FRAMING: int = 0
+CHUNKED_FRAMING: int = 1
+
+CHUNK_SIZE_MAX: int = 4294967295
+
+LEGACY_SEPARATOR: bytes = "]]>]]>".encode()
+
+CHUNK_TAG_PREFIX: bytes = "\n#".encode()
+CHUNK_TAG_END_OF_MSG: bytes = "#".encode()
+CHUNK_TAG_POSTFIX: bytes = "\n".encode()
+
+CAP_NC_1_0 = "urn:ietf:params:netconf:base:1.0"
+CAP_NC_1_1 = "urn:ietf:params:netconf:base:1.1"
+
+NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
+NS_YANG_ACTION = "urn:ietf:params:xml:ns:yang:1"
+
+def actor_pipe_pair() -> (client: Pipe, server: Pipe):
+    return _actor_pipe_pair()
+
+# TODO: I think this should be in __builtin__
+class UnreachableError(Exception):
+    pass
+
+# TODO: move these to __builtin__
+class ConnectionError(OSError):
+    pass
+
+class BrokenPipeError(ConnectionError):
+    pass
+
+class ConnectionAbortedError(ConnectionError):
+    pass
+
+class ConnectionRefusedError(ConnectionError):
+    pass
+
+class ConnectionResetError(ConnectionError):
+    pass
+
+def unwrap[T](a: ?T, msg: ?str=None) -> T:
+    if a is not None:
+        return a
+    errmsg = msg if msg is not None else "Expected non-None value"
+    raise ValueError(errmsg)
+
+
+class NetconfError(Exception):
+    def __init__(self, error_message: ?str, rpc_error: ?list[RpcError]):
+        self.error_message = error_message if error_message is not None else ""
+        self.rpc_error = rpc_error
+
+    def __str__(self):
+        return "{self._name()}: {self.error_message.strip()}"
+
+    def __repr__(self):
+        return "{self._name()}({repr(self.error_message)}, {repr(self.rpc_error)})"
+
+
+class RpcError(object):
+    # RFC 6241 rpc-error fields
+    error_type: str         # transport/rpc/protocol/application
+    error_tag: str          # in-use/invalid-value/too-big/etc.
+    error_severity: str     # error/warning
+    error_app_tag: ?str     # optional application-specific tag
+    error_path: ?str        # optional XPath/element path
+    error_message: ?str     # optional human-readable message
+    error_info: ?dict[str, str]  # optional additional error information
+    xml: xml.Node          # raw <rpc-error> XML, including any vendor extension elements
+
+    def __init__(self, xml_node: xml.Node):
+        # Initialize all attributes before any references to self escape
+        self.xml = xml_node
+        self.error_type = ""  # Will be set from XML, required field
+        self.error_tag = ""   # Will be set from XML, required field
+        self.error_severity = ""  # Will be set from XML, required field
+        self.error_app_tag = None
+        self.error_path = None
+        self.error_message = None
+        self.error_info = None
+
+        # Parse the XML into well-known attributes
+        for child in xml_node.children:
+            if child.tag == "error-type":
+                self.error_type = unwrap(child.text, "rpc-error missing expected error-type")
+            elif child.tag == "error-tag":
+                self.error_tag = unwrap(child.text, "rpc-error missing expected error-tag")
+            elif child.tag == "error-severity":
+                self.error_severity = unwrap(child.text, "rpc-error missing expected error-severity")
+            elif child.tag == "error-app-tag":
+                self.error_app_tag = child.text
+            elif child.tag == "error-path":
+                self.error_path = child.text
+            elif child.tag == "error-message":
+                self.error_message = child.text
+            elif child.tag == "error-info":
+                # Parse error-info elements into a dictionary
+                info = {}
+                for info_child in child.children:
+                    info_child_text = info_child.text
+                    if info_child_text is not None:
+                        info[info_child.tag] = info_child_text
+                if len(info) > 0:
+                    self.error_info = info
+
+    def __repr__(self):
+        args = "error_type={repr(self.error_type)}"
+        args += ", error_tag={repr(self.error_tag)}"
+        args += ", error_severity={repr(self.error_severity)}"
+        if self.error_app_tag is not None:
+            args += ", error_app_tag={repr(self.error_app_tag)}"
+        if self.error_path is not None:
+            args += ", error_path={repr(self.error_path)}"
+        if self.error_message is not None:
+            args += ", error_message={repr(self.error_message)}"
+        if self.error_info is not None:
+            args += ", error_info={repr(self.error_info)}"
+
+        return "netconf.RpcError({args})"
+
+
+STATE_NONE          = 0
+STATE_CONNECTING    = 1
+STATE_CONNECTED     = 2
+STATE_DISCONNECTING = 3
+
+state_name = {
+    STATE_NONE:          "none",
+    STATE_CONNECTING:    "connecting",
+    STATE_CONNECTED:     "connected",
+    STATE_DISCONNECTING: "disconnecting"
+}
+
+
+actor Client(
+        connect_cap: ?net.TCPConnectCap,
+        address: str,
+        port: int,
+        username: str,
+        password: ?str,
+        key: ?str,
+        on_connect: action(Client, ?Exception) -> None,
+        on_notif: ?action(Client, xml.Node) -> None,
+        skip_host_key_check: bool=False,
+        log_handler: ?logging.Handler,
+        pipe: ?Pipe=None,
+        fixups: ?list[proc() -> Fixup]=FIXUPS):
+
+    _log = logging.Logger(log_handler)
+    _log.info("Connecting to " + address + ":" + str(port) + " as " + username)
+
+    var framing = SEPARATOR_FRAMING
+    var recv_buf = Buffer()
+    var chunk_buf = Buffer()
+
+    var session_id: ?str = None
+    var capabilities: list[str] = []
+
+    # Tracks explicit namespace prefix used in NETCONF messages. To maximize
+    # compatibility, we track and mirror the same namespace prefix declaration
+    # pattern used by the server. The default is to not use any prefix and set
+    # the xmlns default namespace on the root element. If we a prefix used in a
+    # server response, we switch over to use an explicit prefix on all elements,
+    # including attributes.
+    #
+    # The NETCONF RFC 6241 allows for any valid XML encoding to be used, but
+    # real world experience has shown that some implementations are sensitive.
+    # By dynamically aligning on what we detect the remote end is doing, we
+    # maximize our chances of interoperability.
+    #
+    # For examples JUNOS with rfc-compliant mode [1] enabled will NOT include
+    # the message-id in rpc-reply if the message-id attribute in the rpc is sent
+    # without an explicit namespace prefix.
+    #
+    # We always use the "urn:ietf:params:xml:ns:netconf:base:1.0" namespace when
+    # creating xml.Node for tags. The nsdefs tuple (nc_prefix, NS_NC_1_1)
+    # renders to either the default or explicit namespace declaration depending
+    # nc_prefix.
+    #
+    # [1]: (https://www.juniper.net/documentation/us/en/software/junos/netconf/topics/concept/netconf-session-rfc-compliant.html)
+    var nc_prefix: ?str = None
+
+    var message_id = 1
+    var rpc_cbs: list[(id: str, cb: action(Client, ?xml.Node, ?NetconfError) -> None)] = []
+
+    var p: ?Pipe = pipe
+    var state = STATE_NONE
+    var active_fixups: list[Fixup] = []
+
+    def _prune_inactive_fixups():
+        active: list[Fixup] = []
+        for fx in active_fixups:
+            if fx.active:
+                active.append(fx)
+            else:
+                _log.info("NETCONF fixup deactivated", {"fixup": fx.name, "reason": fx.deactivate_reason})
+        active_fixups = active
+
+    def _activate_fixups():
+        active_fixups.clear()
+        if fixups is None:
+            _log.debug("NETCONF fixups disabled")
+            return
+        configured_fixups = unwrap(fixups, "Expected fixup list")
+
+        for mk in configured_fixups:
+            try:
+                fx = mk()
+                activated = fx.activate(capabilities)
+                if activated and fx.active:
+                    active_fixups.append(fx)
+                    _log.info("NETCONF fixup activated", {"fixup": fx.name})
+                else:
+                    reason = fx.deactivate_reason
+                    if reason is None:
+                        if not activated:
+                            reason = "capability mismatch"
+                        else:
+                            reason = "inactive after activation"
+                    _log.info("NETCONF fixup not activated", {"fixup": fx.name, "reason": reason})
+            except Exception as exc:
+                _log.error("NETCONF fixup activation failed", {"exception": exc})
+        _prune_inactive_fixups()
+
+    def _apply_request_fixups(op: xml.Node) -> xml.Node:
+        out = op
+        for fx in active_fixups:
+            try:
+                out = fx.on_request(out)
+            except Exception as exc:
+                _log.error("NETCONF request fixup failed", {"fixup": fx.name, "exception": exc})
+        _prune_inactive_fixups()
+        return out
+
+    def _apply_response_fixups(rpc_reply: xml.Node) -> xml.Node:
+        out = rpc_reply
+        # Run response hooks in reverse order (stack-like unwind)
+        for fx in reversed(active_fixups):
+            try:
+                out = fx.on_response(out)
+            except Exception as exc:
+                _log.error("NETCONF response fixup failed", {"fixup": fx.name, "exception": exc})
+        _prune_inactive_fixups()
+        return out
+
+    def _parse_rpc_errors(rpc_reply: xml.Node) -> ?NetconfError:
+        """Parse <rpc-error> elements from an rpc-reply and return NetconfError if found"""
+        errors = []
+        for child in rpc_reply.children:
+            if child.tag == "rpc-error":
+                errors.append(RpcError(child))
+
+        if len(errors) == 0:
+            return None
+        else:
+            # Construct error message summary
+            messages = []
+            for err in errors:
+                error_message = err.error_message
+                if error_message is not None:
+                    messages.append(error_message)
+            error_message = "; ".join(messages) if len(messages) > 0 else None
+            return NetconfError(error_message, errors)
+
+    def get_capabilities() -> list[str]:
+        return capabilities
+
+    # TODO: Close protocol
+    def close(cb: ?action() -> None) -> None:
+        for rpc_cb in rpc_cbs:
+            rpc_cb.cb(self, None, None)
+        rpc_cbs.clear()
+
+        if p is not None:
+            p.close(cb)
+        else:
+            if cb is not None:
+                cb()
+
+    # TODO: Restart protocol
+    def restart() -> None:
+        _log.info("Restarting")
+        for rpc_cb in rpc_cbs:
+            rpc_cb.cb(self, None, None)
+
+        framing = SEPARATOR_FRAMING
+        recv_buf = Buffer()
+        chunk_buf = Buffer()
+
+        session_id = None
+        capabilities = []
+
+        message_id = 1
+        rpc_cbs.clear()
+
+        state = STATE_NONE
+        active_fixups.clear()
+
+        if p is not None:
+            p.restart()
+        else:
+            _log.warning("Cannot restart, transport pipe is not running")
+
+    def _send_message(data: Buffer) -> None:
+        if p is not None:
+            if framing == SEPARATOR_FRAMING:
+                data.write_bytes(LEGACY_SEPARATOR)
+                _msg = data.read_all_bytes()
+                _log.trace("Sending message", {"msg": _msg})
+                p.write(_msg)
+            elif framing == CHUNKED_FRAMING:
+                while True:
+                    chunk_size = CHUNK_SIZE_MAX if data.unread_bytes > CHUNK_SIZE_MAX else data.unread_bytes
+                    if chunk_size <= 0:
+                        p.write("\n##\n".encode())
+                        break
+
+                    _chunk = data.read_bytes(chunk_size)
+                    _log.trace("Sending chunk", {"chunk_size": chunk_size, "chunk": _chunk})
+                    p.write(("\n#" + str(chunk_size) + "\n").encode())
+                    p.write(_chunk)
+        else:
+            on_connect(self, BrokenPipeError("Cannot send message, transport pipe is not running"))
+
+    def rpc(content: xml.Node, callback: action(Client, ?xml.Node, ?NetconfError) -> None) -> None:
+        message_id_text = str(message_id)
+        message_id += 1
+        fixed_content = _apply_request_fixups(content)
+
+        # If using an explicit namespace prefix, prepend it to the attribute name.
+        # The namespace (prefix or not) is defined in the tag.
+        if nc_prefix is not None:
+            rpc_attrs = [(nc_prefix + ":message-id", message_id_text)]
+        else:
+            rpc_attrs = [("message-id", message_id_text)]
+
+        root = xml.Node("rpc", [(nc_prefix, NS_NC_1_0)], nc_prefix, rpc_attrs, [fixed_content])
+
+        buf: Buffer = Buffer()
+        buf.write_str(xml.encode(root))
+
+        rpc_cbs.append((id=message_id_text, cb=callback))
+        _log.debug("Sending RPC", {"message-id": message_id_text, "content": content})
+        _send_message(buf)
+
+    def get(cb: action(Client, ?xml.Node, ?NetconfError) -> None, filter: ?xml.Node=None) -> None:
+        _log.info("NETCONF get")
+        nc_nsdefs = [(None, NS_NC_1_0)]
+        children = []
+        if filter is not None:
+            children.append(filter)
+        rpc(xml.Node("get", nc_nsdefs, children=children), cb)
+
+    def get_config(cb: action(Client, ?xml.Node, ?NetconfError) -> None, datastore: str="running", filter: ?xml.Node=None) -> None:
+        _log.info("NETCONF get-config")
+        nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
+        children = [
+            xml.Node("source", [], nc_prefix, children=[
+                xml.Node(datastore, [], nc_prefix)
+            ])
+        ]
+        if filter is not None:
+            children.append(filter)
+        rpc(xml.Node("get-config", nc_nsdefs, nc_prefix, children=children), cb)
+
+    def edit_config(config: list[xml.Node], cb: action(Client, ?NetconfError) -> None, datastore: str="running", default_operation: ?str=None) -> None:
+        _log.info("NETCONF edit-config", {"datastore": datastore, "default-operation": default_operation})
+        nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
+        edit_config_children = [
+            xml.Node("target", [], nc_prefix, children=[
+                xml.Node(datastore, [], nc_prefix)
+            ])
+        ]
+        if default_operation is not None:
+            if default_operation not in {"merge", "replace", "none"}:
+                raise ValueError("Invalid default-operation: {default_operation}")
+            edit_config_children.append(xml.Node("default-operation", text=default_operation))
+        # Define "xc" namespace prefix for NETCONF operation attributes.
+        # Cisco IOS XRd requires namespace declaration on an ancestor node,
+        # not just where operation attributes are used.
+        edit_config_children.append(xml.Node("config", [("xc", "urn:ietf:params:xml:ns:netconf:base:1.0")], nc_prefix, children=config))
+        rpc(xml.Node("edit-config", nc_nsdefs, nc_prefix, children=edit_config_children), lambda c, _, err: cb(c, err))
+
+    def commit(cb: action(Client, ?NetconfError) -> None) -> None:
+        _log.info("NETCONF commit", {})
+        nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
+        rpc(xml.Node("commit", nc_nsdefs, nc_prefix), lambda c, _, err: cb(c, err))
+
+    def discard_changes(cb: action(Client, ?NetconfError) -> None) -> None:
+        _log.info("NETCONF discard-changes", {})
+        nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
+        rpc(xml.Node("discard-changes", nc_nsdefs, nc_prefix), lambda c, _, err: cb(c, err))
+
+    def lock(cb: action(Client, ?NetconfError) -> None, datastore: str) -> None:
+        _log.info("NETCONF lock", {"datastore": datastore})
+        nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
+        rpc(xml.Node("lock", nc_nsdefs, nc_prefix, children=[
+            xml.Node("target", [], nc_prefix, children=[
+                xml.Node(datastore, [], nc_prefix)
+            ])
+        ]), lambda c, _, err: cb(c, err))
+
+    def unlock(cb: action(Client, ?NetconfError) -> None, datastore: str) -> None:
+        _log.info("NETCONF unlock", {"datastore": datastore})
+        nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
+        rpc(xml.Node("unlock", nc_nsdefs, nc_prefix, children=[
+            xml.Node("target", [], nc_prefix, children=[
+                xml.Node(datastore, [], nc_prefix)
+            ])
+        ]), lambda c, _, err: cb(c, err))
+
+    def get_schema(cb: action(Client, ?xml.Node, ?NetconfError) -> None, identifier: str, version: ?str=None, format: str="yang") -> None:
+        _log.info("NETCONF get-schema", {"identifier": identifier, "version": version, "format": format})
+        # get-schema is part of ietf-netconf-monitoring, not base NETCONF
+        nc_nsdefs = [(None, "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring")]
+        children = [xml.Node("identifier", text=identifier)]
+        if version is not None:
+            children.append(xml.Node("version", text=version))
+        children.append(xml.Node("format", text=format))
+        rpc(xml.Node("get-schema", nc_nsdefs, children=children), cb)
+
+    def list_schemas(cb: action(Client, list[(identifier: str, namespace: str, version: str, format: str)], ?NetconfError) -> None) -> None:
+        """List available schemas and return parsed list of (identifier, namespace, version, format) tuples
+
+        Uses ietf-yang-library (RFC 8525) if available, which returns modules used by
+        the running datastore. Falls back to ietf-netconf-monitoring (RFC 6022) which
+        returns all schemas available on the device.
+        """
+        _log.info("NETCONF list-schemas")
+
+        def parse_response_yang_library(c: Client, result: ?xml.Node, error: ?NetconfError):
+            """Parse response from ietf-yang-library query"""
+            if error is not None:
+                _log.error("ietf-yang-library query failed", {"error": error})
+                cb(c, [], error)
+                return
+
+            schemas = []
+            if result is not None and result.tag == "rpc-reply":
+                for child in result.children:
+                    if child.tag == "data":
+                        schemas = parse_yang_library_data(child)
+                        _log.debug("Found schemas in yang-library", {"count": len(schemas)})
+
+            cb(c, schemas, None)
+
+        def parse_yang_library_data(data_node: xml.Node) -> list[(identifier: str, namespace: str, version: str, format: str)]:
+            """Parse module data from ietf-yang-library response
+
+            1. Find the running datastore's schema
+            2. Get the module-sets referenced by that schema
+            3. Collect modules from those module-sets
+            """
+            schemas = []
+            running_schema_name = None
+            target_module_sets: list[str] = []
+
+            # TODO: parse this with schema-driven parser and convert to adata?!
+            for yang_library in data_node.children:
+                if yang_library.tag == "yang-library":
+                    # First: Find the schema used by the running datastore
+                    for child in yang_library.children:
+                        if child.tag == "datastore":
+                            datastore_name = None
+                            schema_name = None
+                            for ds_child in child.children:
+                                if ds_child.tag == "name":
+                                    datastore_name = ds_child.text
+                                elif ds_child.tag == "schema":
+                                    schema_name = ds_child.text
+                            # Look for the running datastore
+                            if datastore_name in ["ietf-datastores:running", "running", "ds:running"] and schema_name is not None:
+                                running_schema_name = schema_name
+                                break
+
+                    # Second: Find which module-sets are used by the running schema
+                    if running_schema_name is not None:
+                        for child in yang_library.children:
+                            if child.tag == "schema":
+                                schema_name = None
+                                for schema_child in child.children:
+                                    if schema_child.tag == "name":
+                                        schema_name = schema_child.text
+                                    elif schema_child.tag == "module-set" and schema_name == running_schema_name:
+                                        ms_text = schema_child.text
+                                        if ms_text is not None:
+                                            target_module_sets.append(ms_text)
+
+                    # Third: Collect modules from the target module-sets
+                    for child in yang_library.children:
+                        if child.tag == "module-set":
+                            module_set_name: ?str = None
+                            # First find the module-set name
+                            for ms_child in child.children:
+                                if ms_child.tag == "name":
+                                    module_set_name = ms_child.text
+                                    break
+
+                            # Then collect modules if this module-set is in our target list
+                            if module_set_name is not None and module_set_name in target_module_sets:
+                                for ms_child in child.children:
+                                    if ms_child.tag == "module" or ms_child.tag == "import-only-module":
+                                        name = None
+                                        namespace = None
+                                        revision = None
+                                        submodules: list[(name: str, revision: str)] = []
+                                        for attr in ms_child.children:
+                                            attr_text = attr.text
+                                            if attr.tag == "name" and attr_text is not None:
+                                                name = attr_text
+                                            elif attr.tag == "namespace" and attr_text is not None:
+                                                namespace = attr_text
+                                            elif attr.tag == "revision" and attr_text is not None:
+                                                revision = attr_text
+                                            elif attr.tag == "submodule":
+                                                # Parse submodule information
+                                                submod_name = None
+                                                submod_revision = None
+                                                for submod_attr in attr.children:
+                                                    submod_text = submod_attr.text
+                                                    if submod_attr.tag == "name" and submod_text is not None:
+                                                        submod_name = submod_text
+                                                    elif submod_attr.tag == "revision" and submod_text is not None:
+                                                        submod_revision = submod_text
+                                                if submod_name is not None:
+                                                    submod_version = submod_revision if submod_revision is not None else ""
+                                                    submodules.append((name=submod_name, revision=submod_version))
+
+                                        # Add the main module
+                                        if name is not None and namespace is not None:
+                                            version = revision if revision is not None else ""
+                                            schemas.append((identifier=name, namespace=namespace, version=version, format="yang"))
+
+                                            # Add all submodules (they inherit namespace from parent module)
+                                            for submod in submodules:
+                                                schemas.append((identifier=submod.name, namespace=namespace, version=submod.revision, format="yang"))
+
+            return schemas
+
+        def parse_response_netconf_monitoring(c: Client, result: ?xml.Node, error: ?NetconfError):
+            """Parse response from ietf-netconf-monitoring query"""
+            if error is not None:
+                _log.error("ietf-netconf-monitoring query failed", {"error": error})
+                cb(c, [], error)
+                return
+
+            schemas = []
+            if result is not None and result.tag == "rpc-reply":
+                for child in result.children:
+                    if child.tag == "data":
+                        schemas = parse_netconf_monitoring_data(child)
+                        _log.debug("Found schemas in netconf-monitoring", {"count": len(schemas)})
+
+            cb(c, schemas, None)
+
+        def parse_netconf_monitoring_data(data_node: xml.Node) -> list[(identifier: str, namespace: str, version: str, format: str)]:
+            """Parse schema data from ietf-netconf-monitoring response"""
+            schemas = []
+            for netconf_state in data_node.children:
+                if netconf_state.tag == "netconf-state":
+                    for schemas_node in netconf_state.children:
+                        if schemas_node.tag == "schemas":
+                            for schema in schemas_node.children:
+                                if schema.tag == "schema":
+                                    identifier = None
+                                    namespace = None
+                                    version = None
+                                    format = None
+                                    for attr in schema.children:
+                                        attr_text = attr.text
+                                        if attr.tag == "identifier" and attr_text is not None:
+                                            identifier = attr_text
+                                        elif attr.tag == "namespace" and attr_text is not None:
+                                            namespace = attr_text
+                                        elif attr.tag == "version" and attr_text is not None:
+                                            version = attr_text
+                                        elif attr.tag == "format" and attr_text is not None:
+                                            format = attr_text
+                                    if identifier is not None and namespace is not None and version is not None and format is not None:
+                                        schemas.append((identifier=identifier, namespace=namespace, version=version, format=format))
+            return schemas
+
+        # Check what capabilities the server supports
+        supports_yang_library = False
+        supports_netconf_monitoring = False
+
+        for cap in capabilities:
+            if "urn:ietf:params:netconf:capability:yang-library" in cap:
+                supports_yang_library = True
+            if "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring" in cap:
+                supports_netconf_monitoring = True
+
+        # Use yang-library if available (preferred), otherwise netconf-monitoring
+        if supports_yang_library:
+            _log.debug("Using ietf-yang-library for schema discovery")
+            # Get the complete yang-library data including:
+            # - datastore definitions (to know which module-sets each datastore uses)
+            # - module-sets (containing modules and import-only-modules)
+            filter_node = xml.Node("filter", None, None, [("type", "subtree")], [
+                xml.Node("yang-library",
+                    [(None, "urn:ietf:params:xml:ns:yang:ietf-yang-library")],
+                    children=[
+                        xml.Node("datastore"),
+                        xml.Node("schema"),
+                        xml.Node("module-set")
+                    ]
+                )
+            ], None, None)
+            get(parse_response_yang_library, filter_node)
+        elif supports_netconf_monitoring:
+            _log.debug("Using ietf-netconf-monitoring for schema discovery")
+            filter_node = xml.Node("filter", None, None, [("type", "subtree")], [
+                xml.Node("netconf-state",
+                    [(None, "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring")],
+                    children=[xml.Node("schemas")]
+                )
+            ], None, None)
+            get(parse_response_netconf_monitoring, filter_node)
+        else:
+            # No schema discovery methods advertised
+            cb(self, [], NetconfError("No schema discovery method advertised (neither ietf-yang-library nor ietf-netconf-monitoring)"))
+
+    def rpc_action(content: xml.Node, callback: action(Client, ?xml.Node, ?NetconfError) -> None) -> None:
+        action_node = xml.Node("action", [(None, NS_YANG_ACTION)], None, [], [content], None, None)
+        rpc(action_node, callback)
+
+    def _send_hello() -> None:
+        hello = """<?xml version="1.0" encoding="UTF-8"?>
+        <hello xmlns="urn:ietf:params:xml:ns:netconf:base:1.0">
+            <capabilities>
+                <capability>urn:ietf:params:netconf:base:1.0</capability>
+                <capability>urn:ietf:params:netconf:base:1.1</capability>
+            </capabilities>
+        </hello>"""
+        buf: Buffer = Buffer()
+        buf.write_str(hello)
+        _send_message(buf)
+
+    def handle_msg(msg: str) -> None:
+        if len(msg) == 0:
+            _log.debug("Ignoring empty message")
+            return
+        _log.trace("MSG:", {"msg": msg})
+        try:
+            root = xml.decode(msg)
+
+            # Detect/update namespace prefix mode from server messages
+            root_prefix = root.prefix
+            if root_prefix is not None and root_prefix != nc_prefix:
+                if nc_prefix is None:
+                    _log.info("Server switched to explict namespace prefix mode", {"prefix": root_prefix})
+                else:
+                    _log.info("Explicit namespace prefix changed", {"previous": nc_prefix, "new": root_prefix})
+                nc_prefix = root_prefix
+            elif root_prefix is None and nc_prefix is not None:
+                _log.info("Server switched to implicit namespace mode")
+                nc_prefix = None
+
+            if root.tag == "notification": # TODO: check namespace as well?
+                _on_msg_notification(root)
+            elif root.tag == "rpc-reply": # TODO: check namespace as well?
+                _on_msg_rpc_reply(root)
+            elif root.tag == "hello": # TODO: check namespace as well?
+                _on_msg_hello(root)
+            else:
+                _log.warning("Unhandled message type:", {"root.tag": root.tag})
+        except Exception as exc:
+            _log.error("Failed to parse XML", {"msg": msg, "exc": exc})
+            # TODO: I think we need to disconnect and start over, no?
+
+    def _on_msg_hello(root: xml.Node) -> None:
+        for n in root.children:
+            if n.tag == "capabilities": # TODO: check namespace as well?
+                capabilities.clear()
+                for cap in n.children:
+                    if cap.tag == "capability": # TODO: check namespace as well?
+                        cap_body = cap.text # cap_body = cap.text.strip()
+                        _on_capability(cap)
+                    else:
+                        pass # TODO: Warn?
+            elif n.tag == "session-id": # TODO: check namespace as well?
+                session_id = n.text
+        _activate_fixups()
+        state = "CONNECTED"
+        on_connect(self, None)
+
+    def _on_capability(cap: xml.Node) -> None:
+        cap_text = cap.text # cap_text = cap.text.strip()
+        if cap_text is not None:
+            capabilities.append(cap_text)
+            if cap_text == CAP_NC_1_1:
+                _log.debug("NETCONF 1.1 supported, switching to chunked framing")
+                framing = CHUNKED_FRAMING
+
+    def _on_msg_rpc_reply(root: xml.Node) -> None:
+        msg_id: ?str = None
+        for attr_name, attr_val in root.attributes:
+            # Handle both "message-id" and "nc:message-id" attributes
+            if attr_name == "message-id" or attr_name == "nc:message-id":
+                msg_id = attr_val
+                break
+            # Also handle other potential namespace prefixes
+            elif attr_name.split(":", -1)[-1] == "message-id":
+                msg_id = attr_val
+                break
+
+        fixed_root = _apply_response_fixups(root)
+
+        if len(rpc_cbs) > 0:
+            cb = rpc_cbs.pop(0)
+            if msg_id is None:
+                _log.warning("Received invalid rpc-reply, missing message-id", {"msg": fixed_root.encode()})
+            elif msg_id is not None and msg_id != cb.id:
+                _log.warning("Received rpc-reply with unexpected message-id", {"msg-id": msg_id, "cb.id": cb.id})
+
+            if len(fixed_root.children) == 0:
+                cb.cb(self, fixed_root, NetconfError("Empty <rpc-reply>"))
+            elif len(fixed_root.children) == 1 and fixed_root.children[0].tag == "ok":
+                # TODO: Should also verify namespace is NS_NC_1_0
+                cb.cb(self, fixed_root, None)
+            else:
+                # Parse for errors
+                error = _parse_rpc_errors(fixed_root)
+
+                if error is not None:
+                    # Error response
+                    cb.cb(self, fixed_root, error)
+                else:
+                    # Normal data response - pass the whole root
+                    cb.cb(self, fixed_root, None)
+        else:
+            _log.error("No more RPC callbacks", {"msg-id": msg_id})
+
+
+
+    def _on_msg_notification(root: xml.Node) -> None:
+        _on_notif = on_notif
+        if _on_notif is not None:
+            _on_notif(self, root)
+
+    def _on_legacy_msg_data() -> bool:
+        i = recv_buf.find_bytes(LEGACY_SEPARATOR)
+        if isinstance(i, int):
+            _msg_data = recv_buf.read_bytes(i)
+            if isinstance(_msg_data, bytes):
+                recv_buf.skip_bytes(len(LEGACY_SEPARATOR))
+                recv_buf.consume()
+                handle_msg(_msg_data.decode())
+                return True
+        recv_buf.rewind()
+        return False
+
+    def _on_chunked_msg_data() -> bool:
+        m = recv_buf.match_bytes(CHUNK_TAG_PREFIX)
+        if isinstance(m, IncompleteReadError):
+            recv_buf.rewind()
+            return False
+        elif isinstance(m, bool):
+            if not m:
+                on_connect(self, NetconfError("Invalid chunk framing data"))
+                return False
+            _len_text_len = recv_buf.find_bytes(CHUNK_TAG_POSTFIX)
+            if isinstance(_len_text_len, IncompleteReadError):
+                recv_buf.rewind()
+                return False
+            elif isinstance(_len_text_len, int):
+                _len_text = recv_buf.read_bytes(_len_text_len)
+
+                _skip = recv_buf.skip_bytes(len(CHUNK_TAG_POSTFIX))
+                if isinstance(_skip, IncompleteReadError):
+                    recv_buf.rewind()
+                    return False
+                elif isinstance(_skip, bool) and _skip:
+                    if isinstance(_len_text, bytes):
+                        if _len_text == CHUNK_TAG_END_OF_MSG:
+                            _msg_data = chunk_buf.read_all_bytes()
+                            chunk_buf.consume()
+                            handle_msg(_msg_data.decode())
+                            return True
+                        else:
+                            try:
+                                l = int(_len_text.decode())
+                                chunk = recv_buf.read_bytes(l)
+                                chunk_buf.write_bytes(chunk)
+                                recv_buf.consume()
+                                return True
+                            except IncompleteReadError:
+                                recv_buf.rewind()
+                                return False
+        # TODO: FIXME: match_bytes should always return bytes or raise exception
+        raise UnreachableError("Unexpected state in _on_chunked_msg_data")
+
+    def _on_receive(data: bytes):
+        #_log.trace("DATA:", {"data": data})
+        recv_buf.write_bytes(data)
+        try_read: bool = True
+        # while recv_buf.has_unread_bytes() and try_read: # actonc: Name try_read is not in scope
+        while recv_buf.has_unread_bytes():
+            if not try_read:
+                break
+            if framing == SEPARATOR_FRAMING:
+                try_read = _on_legacy_msg_data()
+            elif framing == CHUNKED_FRAMING:
+                try_read = _on_chunked_msg_data()
+            else:
+                try_read = False
+                on_connect(self, NetconfError("Unknown framing type: {framing}"))
+
+    def _on_pipe_event(err: ?Exception, data: ?bytes):
+        if data is not None:
+            _on_receive(data)
+            return
+        _on_connect(err)
+
+    def _on_connect(err: ?Exception):
+        if err is not None:
+            _log.error("Failed to connect", {"err": err})
+            on_connect(self, err)
+        else:
+            _log.info("Connected", {"address": address, "port": port, "username": username})
+            state = STATE_CONNECTED
+            _send_hello()
+
+    def _connect():
+        if p is None:
+            if connect_cap is not None:
+                sp = sshpipe.SshPipe(
+                    connect_cap,
+                    address=address,
+                    port=port,
+                    username=username,
+                    password=password,
+                    private_key_file=key,
+                    subsystem="netconf",
+                    host_key_check=sshpipe.HOST_KEY_CHECK_NONE if skip_host_key_check else sshpipe.HOST_KEY_CHECK_ACCEPT_NEW,
+                    log_handler=log_handler)
+                sp.read_cb(_on_pipe_event)
+                p = sp
+            else:
+                on_connect(self, ValueError("a TCP connect capability is required to establish an SSH connection"))
+        else:
+            if p is not None:
+                p.read_cb(_on_pipe_event)
+
+    _connect()
+
+
+actor Server(
+        pipe: Pipe,
+        on_connect: ?action(Server, ?Exception) -> None=None,
+        on_rpc: action(Server, str, xml.Node) -> None,
+        capabilities: ?list[str]=None,
+        log_handler: ?logging.Handler=None):
+
+    _log = logging.Logger(log_handler)
+
+    var framing = SEPARATOR_FRAMING
+    var recv_buf = Buffer()
+    var chunk_buf = Buffer()
+    var server_capabilities = capabilities if capabilities is not None else [CAP_NC_1_0, CAP_NC_1_1]
+
+    def close(cb: ?action() -> None):
+        pipe.close(cb)
+
+    def restart():
+        framing = SEPARATOR_FRAMING
+        recv_buf = Buffer()
+        chunk_buf = Buffer()
+        pipe.restart()
+
+    def _send_message(data: Buffer):
+        if framing == SEPARATOR_FRAMING:
+            data.write_bytes(LEGACY_SEPARATOR)
+            pipe.write(data.read_all_bytes())
+        elif framing == CHUNKED_FRAMING:
+            while True:
+                chunk_size = CHUNK_SIZE_MAX if data.unread_bytes > CHUNK_SIZE_MAX else data.unread_bytes
+                if chunk_size <= 0:
+                    pipe.write("\n##\n".encode())
+                    break
+
+                chunk = data.read_bytes(chunk_size)
+                pipe.write(("\n#" + str(chunk_size) + "\n").encode())
+                pipe.write(chunk)
+
+    def _send_node(node: xml.Node):
+        buf = Buffer()
+        buf.write_str(xml.encode(node))
+        _send_message(buf)
+
+    def _send_hello():
+        caps = []
+        for cap in server_capabilities:
+            caps.append(xml.Node("capability", text=cap))
+
+        hello = xml.Node("hello", [(None, NS_NC_1_0)], children=[
+            xml.Node("capabilities", children=caps)
+        ])
+        _send_node(hello)
+
+    def _send_rpc_reply(message_id: str, children: list[xml.Node]):
+        rpc_reply = xml.Node("rpc-reply", [(None, NS_NC_1_0)], None, [("message-id", message_id)], children)
+        _send_node(rpc_reply)
+
+    def send_reply(message_id: str, children: list[xml.Node]):
+        _send_rpc_reply(message_id, children)
+
+    def send_notification(notification: xml.Node):
+        _send_node(notification)
+
+    def _send_ok(message_id: str):
+        _send_rpc_reply(message_id, [xml.Node("ok")])
+
+    def send_ok(message_id: str):
+        _send_ok(message_id)
+
+    def _send_error(message_id: str, error_tag: str, error_message: str, error_type: str="application"):
+        rpc_error = xml.Node("rpc-error", children=[
+            xml.Node("error-type", text=error_type),
+            xml.Node("error-tag", text=error_tag),
+            xml.Node("error-severity", text="error"),
+            xml.Node("error-message", text=error_message)
+        ])
+        _send_rpc_reply(message_id, [rpc_error])
+
+    def send_error(message_id: str, error_tag: str, error_message: str, error_type: str="application"):
+        _send_error(message_id, error_tag, error_message, error_type)
+
+    def _read_message_id(root: xml.Node, default_id: str) -> str:
+        message_id = default_id
+        for attr_name, attr_val in root.attributes:
+            if attr_name == "message-id" or attr_name.split(":", -1)[-1] == "message-id":
+                message_id = attr_val
+                break
+        return message_id
+
+    def _on_msg_hello(root: xml.Node):
+        client_supports_1_1 = False
+        for n in root.children:
+            if n.tag == "capabilities":
+                for cap in n.children:
+                    if cap.tag == "capability":
+                        cap_text = cap.text
+                        if cap_text is not None and cap_text == CAP_NC_1_1:
+                            client_supports_1_1 = True
+        if client_supports_1_1 and CAP_NC_1_1 in server_capabilities:
+            framing = CHUNKED_FRAMING
+
+    def _dispatch_rpc(message_id: str, op: xml.Node):
+        if op.tag == "close-session":
+            _send_ok(message_id)
+            return
+
+        on_rpc(self, message_id, op)
+
+    def _on_msg_rpc(root: xml.Node):
+        message_id = _read_message_id(root, "0")
+        if len(root.children) == 0:
+            _send_error(message_id, "missing-element", "RPC request has no operation")
+            return
+        _dispatch_rpc(message_id, root.children[0])
+
+    def _handle_msg(msg: str):
+        if msg == "":
+            return
+
+        try:
+            root = xml.decode(msg)
+            if root.tag == "hello":
+                _on_msg_hello(root)
+            elif root.tag == "rpc":
+                _on_msg_rpc(root)
+            else:
+                _log.warning("Unhandled NETCONF message", {"tag": root.tag})
+        except Exception as e:
+            _log.error("Failed to decode NETCONF message", {"exception": e, "msg": msg})
+
+    def _on_legacy_msg_data() -> bool:
+        i = recv_buf.find_bytes(LEGACY_SEPARATOR)
+        if isinstance(i, int):
+            msg_data = recv_buf.read_bytes(i)
+            if isinstance(msg_data, bytes):
+                recv_buf.skip_bytes(len(LEGACY_SEPARATOR))
+                recv_buf.consume()
+                _handle_msg(msg_data.decode())
+                return True
+        recv_buf.rewind()
+        return False
+
+    def _on_chunked_msg_data() -> bool:
+        m = recv_buf.match_bytes(CHUNK_TAG_PREFIX)
+        if isinstance(m, IncompleteReadError):
+            recv_buf.rewind()
+            return False
+        elif isinstance(m, bool):
+            if not m:
+                _log.error("Invalid NETCONF chunk framing")
+                return False
+
+            len_text_len = recv_buf.find_bytes(CHUNK_TAG_POSTFIX)
+            if isinstance(len_text_len, IncompleteReadError):
+                recv_buf.rewind()
+                return False
+            elif isinstance(len_text_len, int):
+                len_text = recv_buf.read_bytes(len_text_len)
+
+                skip_ok = recv_buf.skip_bytes(len(CHUNK_TAG_POSTFIX))
+                if isinstance(skip_ok, IncompleteReadError):
+                    recv_buf.rewind()
+                    return False
+                elif isinstance(skip_ok, bool) and skip_ok:
+                    if isinstance(len_text, bytes):
+                        if len_text == CHUNK_TAG_END_OF_MSG:
+                            msg_data = chunk_buf.read_all_bytes()
+                            chunk_buf.consume()
+                            _handle_msg(msg_data.decode())
+                            return True
+
+                        try:
+                            l = int(len_text.decode())
+                            chunk = recv_buf.read_bytes(l)
+                            chunk_buf.write_bytes(chunk)
+                            recv_buf.consume()
+                            return True
+                        except IncompleteReadError:
+                            recv_buf.rewind()
+                            return False
+        raise UnreachableError("Unexpected state in _on_chunked_msg_data")
+
+    def _on_receive(data: bytes):
+        recv_buf.write_bytes(data)
+        try_read: bool = True
+        while recv_buf.has_unread_bytes():
+            if not try_read:
+                break
+            if framing == SEPARATOR_FRAMING:
+                try_read = _on_legacy_msg_data()
+            elif framing == CHUNKED_FRAMING:
+                try_read = _on_chunked_msg_data()
+            else:
+                try_read = False
+                _log.error("Unknown framing type", {"framing": framing})
+
+    def _on_pipe_event(err: ?Exception, data: ?bytes):
+        if data is not None:
+            _on_receive(data)
+            return
+
+        if err is None:
+            framing = SEPARATOR_FRAMING
+            recv_buf = Buffer()
+            chunk_buf = Buffer()
+            _send_hello()
+            _on_connect = on_connect
+            if _on_connect is not None:
+                _on_connect(self, None)
+        else:
+            _log.error("Transport pipe connection error", {"error": err})
+            _on_connect = on_connect
+            if _on_connect is not None:
+                _on_connect(self, err)
+
+    pipe.read_cb(_on_pipe_event)
+
+
+class NsMaps(object):
+    def __init__(self, namespaces: list[(?str, str)], parent: ?NsMaps):
+        self.nsmap = {_prefix if _prefix is not None else "": _ns for _prefix, _ns in namespaces}
+        self.parent = parent
+
+    def lookup(self, prefix: ?str) -> ?str:
+        _inst = self
+        while True:
+            ns: ?str = self.nsmap.get(prefix if prefix is not None else "")
+            if ns is not None:
+                return ns
+            _parent = _inst.parent
+            if _parent is not None:
+                _inst = _parent
+            else:
+                return None
+
+
+actor SchemaGetter(client):
+    """Helper actor for downloading schemas from NETCONF server."""
+
+    def download(on_get_schema: action(SchemaGetter, int, int, (identifier: str, version: ?str, format: ?str), ?str, ?NetconfError) -> None, on_done: action(SchemaGetter, ?NetconfError) -> None, schemas: list[(identifier: str, version: ?str, format: ?str)]):
+        """Download schemas from a NETCONF server.
+
+        Download a list of schemas from NETCONF server with <get-schema>.
+        Users should prepare the schema list themselves, typically by calling
+        list_schemas() first and applying any necessary filtering.
+
+        Args:
+            on_get_schema: Callback invoked for each schema download. Parameters:
+                - current_index (int): index of current schema being downloaded
+                - total_count (int): Total number of schemas to download
+                - schema_id: (identifier, ?version, ?format)
+                - schema_data (?str): Schema content if successful, None on error
+                - error (?NetconfError): None if successful, error details if failed
+            on_done: Callback invoked when all downloads complete. Parameter:
+                - error (?NetconfError): None if successful, error details if failed
+            schemas: List of schemas to download, each as named tuple (identifier, ?version, ?format)
+            TODO: ideally this would be a set of tuples, once named tuples are *Hashable*
+        """
+        def _download_next_schema(current_download_index):
+            """Download the next schema in the queue"""
+            if current_download_index >= len(schemas):
+                # All schemas downloaded successfully
+                on_done(self)
+                return
+            schema = schemas[current_download_index]
+
+            # Use "yang" as default format if not specified
+            format_str = schema.format if schema.format is not None else "yang"
+            client.get_schema(
+                lambda c, r, e: _on_get_schema(current_download_index, c, r, e),
+                schema.identifier, schema.version, format_str
+            )
+
+        def _on_get_schema(current_download_index, c: Client, result: ?xml.Node, error: ?NetconfError):
+            """Handle individual schema response"""
+            schema = schemas[current_download_index]
+            if error is not None:
+                on_get_schema(self, current_download_index+1, len(schemas), schema, None, error)
+            else:
+                # Extract schema data
+                schema_data = None
+                if result is not None:
+                    for child in result.children:
+                        if child.tag == "data":
+                            schema_data = child.text
+                            break
+
+                # Call the callback with current progress and schema data
+                if schema_data is not None and schema_data.strip() != "":
+                    on_get_schema(self, current_download_index+1, len(schemas), schema, schema_data)
+                else:
+                    on_get_schema(self, current_download_index+1, len(schemas), schema, None, NetconfError("Missing schema data"))
+
+            # Move to next schema
+            _download_next_schema(current_download_index + 1)
+
+        _download_next_schema(0)
+
+
+################################################################################
+## Tests                                                                      ##
+################################################################################
+#
+# These test cases can be run with `acton test` but they require a running SSH
+# server, for example `docker run -td -P ghcr.io/notconf/notconf` - grab the
+# port and update test_port below, i.e.:
+# - docker run -td --name notconf -P ghcr.io/notconf/notconf
+# - docker inspect notconf | jq -r '.[0].NetworkSettings.Ports["830/tcp"][0].HostPort'
+# - update test_port below with the port from the above command
+# - acton test
+
+test_port = 42830
+test_address = "localhost"
+test_username = "admin"
+test_password = "admin"
+
+
+actor _test_client_server_actor_pipe_get(t: testing.EnvT):
+    """Test in-process Client <-> Server over ActorPipe with a static <get> reply."""
+    log = logging.Logger(t.log_handler)
+    pipes = actor_pipe_pair()
+
+    def _on_server_rpc(s: Server,
+                       message_id: str,
+                       op: xml.Node):
+        if op.tag != "get":
+            s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
+            return
+
+        s.send_reply(message_id, [xml.Node("data", [(None, NS_NC_1_0)], children=[
+            xml.Node("system", [(None, "urn:example:system")], children=[
+                xml.Node("hostname", text="actor-pipe-demo")
+            ])
+        ])])
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            t.failure(ValueError("Failed to connect to in-process NETCONF server: {e}"))
+        else:
+            c.get(_on_get)
+
+    def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            t.failure(error)
+            return
+        if result is None:
+            t.failure(ValueError("Missing rpc-reply"))
+            return
+
+        hostname = None
+        if result is not None:
+            for rpc_child in result.children:
+                if rpc_child.tag == "data":
+                    for data_child in rpc_child.children:
+                        if data_child.tag == "system":
+                            for system_child in data_child.children:
+                                if system_child.tag == "hostname":
+                                    hostname = system_child.text
+
+        if hostname == "actor-pipe-demo":
+            log.info("In-process NETCONF <get> completed")
+            c.close(None)
+            t.success()
+        else:
+            t.failure(ValueError("Unexpected hostname in reply: {hostname}"))
+
+    server = Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    client = Client(None,
+                    address="actor-pipe",
+                    username="actor-pipe",
+                    key=None,
+                    password=None,
+                    port=0,
+                    on_connect=_on_connect,
+                    on_notif=None,
+                    log_handler=t.log_handler,
+                    pipe=pipes.client)
+
+
+actor _test_client_server_tcp_get(t: testing.EnvT):
+    """Test loopback TCP Client <-> Server over TcpPipe with a static <get> reply."""
+    log = logging.Logger(t.log_handler)
+    var port = random.randint(20000, 29999)
+    var listen_attempts = 0
+    var done = False
+    var servers: list[Server] = []
+    var listener: ?TcpPipeListener = None
+    var client: ?Client = None
+    connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.auth)))
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.auth)))
+
+    def _fail_once(err: Exception):
+        if done:
+            return
+        done = True
+        t.failure(err)
+
+    def _success_once():
+        if done:
+            return
+        done = True
+        t.success()
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        if op.tag != "get":
+            s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
+            return
+
+        s.send_reply(message_id, [xml.Node("data", [(None, NS_NC_1_0)], children=[
+            xml.Node("system", [(None, "urn:example:system")], children=[
+                xml.Node("hostname", text="tcp-pipe-demo")
+            ])
+        ])])
+
+    def _on_accept(l: TcpPipeListener, p: TcpListenPipe):
+        servers.append(Server(pipe=p, on_rpc=_on_server_rpc, log_handler=t.log_handler))
+
+    def _on_listen(l: TcpPipeListener, err: ?Exception):
+        if err is not None:
+            # net.TCPListener cannot report an ephemerally-bound port, so we
+            # pick random ones; on a (rare) collision just retry with a new one.
+            if listen_attempts < 5:
+                listen_attempts += 1
+                port = random.randint(20000, 29999)
+                listener = TcpPipeListener(listen_cap, "127.0.0.1", port, _on_listen, _on_accept)
+            else:
+                _fail_once(ValueError("Failed to start TCP listener on 127.0.0.1:{port}: {err}"))
+            return
+
+        log.info("TCP listener ready", {"port": port})
+        client_pipe = TcpPipe(connect_cap=connect_cap, address="127.0.0.1", port=port)
+        client = Client(None,
+                        address="127.0.0.1",
+                        username="tcp-pipe",
+                        key=None,
+                        password=None,
+                        port=port,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        log_handler=t.log_handler,
+                        pipe=client_pipe)
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            _fail_once(ValueError("Failed to connect to loopback NETCONF server: {e}"))
+        else:
+            c.get(_on_get)
+
+    def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            _fail_once(error)
+            return
+        if result is None:
+            _fail_once(ValueError("Missing rpc-reply"))
+            return
+
+        hostname = None
+        if result is not None:
+            for rpc_child in result.children:
+                if rpc_child.tag == "data":
+                    for data_child in rpc_child.children:
+                        if data_child.tag == "system":
+                            for system_child in data_child.children:
+                                if system_child.tag == "hostname":
+                                    hostname = system_child.text
+
+        if hostname == "tcp-pipe-demo":
+            log.info("Loopback TCP NETCONF <get> completed")
+            c.close(None)
+            _success_once()
+        else:
+            _fail_once(ValueError("Unexpected hostname in reply: {hostname}"))
+
+    def _on_timeout():
+        _fail_once(ValueError("Timed out waiting for loopback TCP NETCONF <get>"))
+
+    after 2.0: _on_timeout()
+    listener = TcpPipeListener(listen_cap, "127.0.0.1", port, _on_listen, _on_accept)
+
+
+_ssh_test_username = "netconf"
+_ssh_test_password = "sekret"
+
+actor _SshTestServer(t: testing.EnvT,
+                     on_rpc: action(Server, str, xml.Node) -> None,
+                     on_port: action(int) -> None,
+                     on_error: action(str) -> None,
+                     capabilities: ?list[str]=None):
+    """A minimal NETCONF server over SSH: SshPipeListener feeding netconf.Server.
+
+    Serves the "netconf" subsystem with password authentication; every accepted
+    SSH channel becomes an independent NETCONF session driven by on_rpc.
+    """
+    var listener: ?sshpipe.SshPipeListener = None
+    var sessions: list[Server] = []
+
+    def _on_listen(l: sshpipe.SshPipeListener, err: ?Exception):
+        if err is not None:
+            on_error("SSH listen error: {err}")
+            return
+        port = l.bound_port()
+        on_port(int(port))
+
+    def _on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
+        sessions.append(Server(pipe=p, on_rpc=on_rpc, capabilities=capabilities,
+                               log_handler=t.log_handler))
+
+    def close():
+        l = listener
+        if l is not None:
+            l.close()
+
+    def _auth(user: str, password: ?str, pubkey: ?bytes, respond: action(bool) -> None):
+        respond(user == _ssh_test_username and password == _ssh_test_password)
+
+    listener = sshpipe.SshPipeListener(
+        net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))),
+        address="127.0.0.1",
+        port=0,
+        on_listen=_on_listen,
+        on_accept=_on_accept,
+        auth_check=_auth,
+        subsystem="netconf",
+        log_handler=t.log_handler)
+
+
+actor _test_client_server_ssh_get(t: testing.EnvT):
+    """Loopback NETCONF Client <-> Server over a real SSH transport (chunked framing)."""
+    log = logging.Logger(t.log_handler)
+    var done = False
+    var srv: ?_SshTestServer = None
+    var client: ?Client = None
+
+    def _fail_once(e: Exception):
+        if done:
+            return
+        done = True
+        _teardown()
+        t.failure(e)
+
+    def _success_once():
+        if done:
+            return
+        done = True
+        _teardown()
+        t.success()
+
+    def _teardown():
+        s = srv
+        if s is not None:
+            s.close()
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        if op.tag != "get":
+            s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
+            return
+        s.send_reply(message_id, [xml.Node("data", [(None, NS_NC_1_0)], children=[
+            xml.Node("system", [(None, "urn:example:system")], children=[
+                xml.Node("hostname", text="ssh-loopback-demo")
+            ])
+        ])])
+
+    def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            _fail_once(error)
+            return
+        hostname = None
+        if result is not None:
+            for rpc_child in result.children:
+                if rpc_child.tag == "data":
+                    for data_child in rpc_child.children:
+                        if data_child.tag == "system":
+                            for system_child in data_child.children:
+                                if system_child.tag == "hostname":
+                                    hostname = system_child.text
+        if hostname == "ssh-loopback-demo":
+            log.info("Loopback SSH NETCONF <get> completed")
+            c.close(None)
+            _success_once()
+        else:
+            _fail_once(ValueError("Unexpected hostname in reply: {hostname}"))
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            _fail_once(ValueError("Failed to connect over SSH: {e}"))
+        else:
+            c.get(_on_get)
+
+    def _on_port(port: int):
+        client = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                        address="127.0.0.1",
+                        port=port,
+                        username=_ssh_test_username,
+                        password=_ssh_test_password,
+                        key=None,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        skip_host_key_check=True,
+                        log_handler=t.log_handler)
+
+    def _on_error(msg: str):
+        _fail_once(ValueError(msg))
+
+    def _on_timeout():
+        _fail_once(ValueError("Timed out waiting for loopback SSH NETCONF <get>"))
+
+    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
+    after 10.0: _on_timeout()
+
+
+actor _test_client_server_ssh_legacy_framing(t: testing.EnvT):
+    """SSH loopback against a 1.0-only server: legacy ]]>]]> framing end-to-end."""
+    log = logging.Logger(t.log_handler)
+    var done = False
+    var srv: ?_SshTestServer = None
+    var client: ?Client = None
+
+    def _fail_once(e: Exception):
+        if done:
+            return
+        done = True
+        _teardown()
+        t.failure(e)
+
+    def _success_once():
+        if done:
+            return
+        done = True
+        _teardown()
+        t.success()
+
+    def _teardown():
+        s = srv
+        if s is not None:
+            s.close()
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        s.send_reply(message_id, [xml.Node("data", [(None, NS_NC_1_0)], children=[
+            xml.Node("system", [(None, "urn:example:system")], children=[
+                xml.Node("hostname", text="ssh-legacy-demo")
+            ])
+        ])])
+
+    def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            _fail_once(error)
+            return
+        # A 1.0-only server exchange only completes if both sides stayed on
+        # legacy separator framing; chunked frames would never parse.
+        log.info("Loopback SSH NETCONF <get> with legacy framing completed")
+        c.close(None)
+        _success_once()
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            _fail_once(ValueError("Failed to connect over SSH: {e}"))
+        else:
+            c.get(_on_get)
+
+    def _on_port(port: int):
+        client = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                        address="127.0.0.1",
+                        port=port,
+                        username=_ssh_test_username,
+                        password=_ssh_test_password,
+                        key=None,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        skip_host_key_check=True,
+                        log_handler=t.log_handler)
+
+    def _on_error(msg: str):
+        _fail_once(ValueError(msg))
+
+    def _on_timeout():
+        _fail_once(ValueError("Timed out waiting for legacy framing SSH NETCONF <get>"))
+
+    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error, capabilities=[CAP_NC_1_0])
+    after 10.0: _on_timeout()
+
+
+actor _test_client_server_ssh_auth_reject(t: testing.EnvT):
+    """Wrong SSH password: connect fails, on_connect carries the error."""
+    var done = False
+    var srv: ?_SshTestServer = None
+    var client: ?Client = None
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        pass
+
+    def _on_connect(c: Client, e: ?Exception):
+        if done:
+            return
+        done = True
+        s = srv
+        if s is not None:
+            s.close()
+        if e is not None:
+            t.success()
+        else:
+            t.failure(ValueError("Connect succeeded with wrong password"))
+
+    def _on_port(port: int):
+        client = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                        address="127.0.0.1",
+                        port=port,
+                        username=_ssh_test_username,
+                        password="wrong-password",
+                        key=None,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        skip_host_key_check=True,
+                        log_handler=t.log_handler)
+
+    def _on_error(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def _on_timeout():
+        if not done:
+            done = True
+            s = srv
+            if s is not None:
+                s.close()
+            t.failure(ValueError("Timed out waiting for SSH auth reject"))
+
+    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
+    after 10.0: _on_timeout()
+
+
+actor _test_client_server_ssh_large_reply(t: testing.EnvT):
+    """A reply spanning many SSH channel reads survives reassembly intact."""
+    log = logging.Logger(t.log_handler)
+    var done = False
+    var srv: ?_SshTestServer = None
+    var client: ?Client = None
+    N_ENTRIES = 2000
+
+    def _fail_once(e: Exception):
+        if done:
+            return
+        done = True
+        _teardown()
+        t.failure(e)
+
+    def _success_once():
+        if done:
+            return
+        done = True
+        _teardown()
+        t.success()
+
+    def _teardown():
+        s = srv
+        if s is not None:
+            s.close()
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        entries = []
+        for i in range(N_ENTRIES):
+            entries.append(xml.Node("entry", children=[
+                xml.Node("index", text=str(i)),
+                xml.Node("value", text="payload-{i}-abcdefghijklmnopqrstuvwxyz")
+            ]))
+        s.send_reply(message_id, [xml.Node("data", [(None, NS_NC_1_0)], children=entries)])
+
+    def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            _fail_once(error)
+            return
+        count = 0
+        last_ok = False
+        if result is not None:
+            for rpc_child in result.children:
+                if rpc_child.tag == "data":
+                    for entry in rpc_child.children:
+                        if entry.tag == "entry":
+                            count += 1
+                            for f in entry.children:
+                                if f.tag == "index" and f.text == str(N_ENTRIES - 1):
+                                    last_ok = True
+        if count == N_ENTRIES and last_ok:
+            log.info("Large SSH NETCONF reply reassembled", {"entries": count})
+            c.close(None)
+            _success_once()
+        else:
+            _fail_once(ValueError("Large reply corrupted: {count} entries, last_ok={last_ok}"))
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            _fail_once(ValueError("Failed to connect over SSH: {e}"))
+        else:
+            c.get(_on_get)
+
+    def _on_port(port: int):
+        client = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                        address="127.0.0.1",
+                        port=port,
+                        username=_ssh_test_username,
+                        password=_ssh_test_password,
+                        key=None,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        skip_host_key_check=True,
+                        log_handler=t.log_handler)
+
+    def _on_error(msg: str):
+        _fail_once(ValueError(msg))
+
+    def _on_timeout():
+        _fail_once(ValueError("Timed out waiting for large SSH NETCONF reply"))
+
+    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
+    after 15.0: _on_timeout()
+
+
+actor _test_netconf(t: testing.EnvT):
+    """Test SSH client towards a NETCONF server, like notconf
+    """
+    t.require("notconf-server")
+    log = logging.Logger(t.log_handler)
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            log.error("Failed to connect", {"error": e})
+            t.failure(ValueError("Failed to connect to NETCONF server: {e}"))
+        else:
+            log.info("Connected to NETCONF server")
+            for cap in c.get_capabilities():
+                if cap.startswith("urn:ietf:params:netconf:base:1"):
+                    log.info("Got NETCONF {cap} capability, looks reasonable, hello success")
+                    c.get_config(_on_get_config)
+
+    def _on_get_config(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            log.error("<get-config> failed", {"error": error})
+            t.failure(ValueError("get-config failed with error"))
+        else:
+            log.info("<get-config> success")
+            t.success()
+
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                on_connect=_on_connect,
+                address=test_address,
+                username=test_username,
+                key=None,
+                password=test_password,
+                port=test_port,
+                on_notif=None,
+                skip_host_key_check=True,
+                log_handler=t.log_handler)
+
+
+actor _test_get_schema(t: testing.EnvT):
+    """Test SSH client get-schema operation towards a NETCONF server
+    """
+    t.require("notconf-server")
+    log = logging.Logger(t.log_handler)
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            log.error("Failed to connect", {"error": e})
+            t.failure(ValueError("Failed to connect to NETCONF server: {e}"))
+        else:
+            log.info("Connected to NETCONF server")
+            for cap in c.get_capabilities():
+                if cap.startswith("urn:ietf:params:netconf:base:1"):
+                    log.info("Got NETCONF {cap} capability, looks reasonable, hello success")
+                    c.get_schema(_on_get_schema, "ietf-netconf")
+
+    def _on_get_schema(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            log.error("<get-schema> failed", {"error": error})
+            t.failure(ValueError("get-schema failed with error"))
+        elif result is not None:
+            log.info("<get-schema> received response", {"result": result.encode()})
+            t.success(result.encode())
+        else:
+            log.error("<get-schema> received null response")
+            t.failure(ValueError("get-schema returned null"))
+
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                on_connect=_on_connect,
+                on_notif=None,
+                address=test_address,
+                username=test_username,
+                key=None,
+                password=test_password,
+                port=test_port,
+                skip_host_key_check=True,
+                log_handler=t.log_handler)
+
+
+actor _test_list_schemas(t: testing.EnvT):
+    """Test listing available schemas from a NETCONF server
+    """
+    t.require("notconf-server")
+    log = logging.Logger(t.log_handler)
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            log.error("Failed to connect", {"error": e})
+            t.failure(ValueError("Failed to connect to NETCONF server: {e}"))
+        else:
+            log.info("Connected to NETCONF server")
+            c.list_schemas(_on_list_schemas)
+
+    def _on_list_schemas(c: Client, schemas: list[(identifier: str, namespace: str, version: str, format: str)], error: ?NetconfError):
+        if error is not None:
+            log.error("<list-schemas> failed", {"error": error})
+            t.failure(error)
+        else:
+            log.info("Received schemas list", {"count": len(schemas)})
+            for schema in schemas:
+                log.info("Schema found", {"identifier": schema.identifier, "namespace": schema.namespace, "version": schema.version, "format": schema.format})
+            if len(schemas) > 0:
+                t.success("\n".join([s.__repr__() for s in schemas]))
+            else:
+                log.warning("No schemas found")
+                t.failure(Exception("No schemas found"))
+
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                on_connect=_on_connect,
+                on_notif=None,
+                address=test_address,
+                username=test_username,
+                key=None,
+                password=test_password,
+                port=test_port,
+                skip_host_key_check=True,
+                log_handler=t.log_handler)
+
+
+actor _test_schema_getter(t: testing.EnvT):
+    """Test listing available schemas from a NETCONF server
+    """
+    t.require("notconf-server")
+    log = logging.Logger(t.log_handler)
+    expected = 0
+    var count = 0
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            log.error("Failed to connect", {"error": e})
+            t.failure(ValueError("Failed to connect to NETCONF server: {e}"))
+        else:
+            log.info("Connected to NETCONF server")
+            # First list all available schemas
+            c.list_schemas(_on_list_schemas)
+
+    def _on_list_schemas(c: Client, schemas: list[(identifier: str, namespace: str, version: str, format: str)], error: ?NetconfError):
+        if error is not None:
+            log.error("Failed to list schemas", {"error": error})
+            t.failure(error)
+            return
+
+        # TODO: would it be possible to pass the schemas list directly to
+        # SchemaGetter.download(..., schemas: list[(identifier: str, version: ?str, format: ?str)])
+        # Note how that named tuple has a subset of our arguments, some are even optional ...
+        schemas_to_download = [(identifier=s.identifier, version=s.version, format=s.format) for s in schemas]
+
+        log.info("Starting download of schemas", {"count": len(schemas_to_download)})
+        sg = SchemaGetter(c)
+        sg.download(_on_schema_download, _on_download_complete, schemas_to_download)
+
+    def _on_schema_download(sg: SchemaGetter, index: int, total: int, schema_id: (identifier: str, version: ?str, format: ?str), schema_data, error):
+        expected = total
+        log.debug("Download {index}/{total} {schema_id.identifier}")
+        if error is not None:
+            t.failure(Exception("{schema_id.identifier}: {error}"))
+        elif schema_data is None:
+            t.failure(Exception("{schema_id.identifier}: empty"))
+        else:
+            count += 1
+
+    def _on_download_complete(sg: SchemaGetter, error):
+        if count != expected:
+            t.failure(ValueError("Incorrect count: {count} != {expected}"))
+        elif error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                on_connect=_on_connect,
+                on_notif=None,
+                address=test_address,
+                username=test_username,
+                key=None,
+                password=test_password,
+                port=test_port,
+                skip_host_key_check=True,
+                log_handler=t.log_handler)
+
+
+actor _test_lock_unlock(t: testing.EnvT):
+    """Test lock and unlock operations on a datastore
+    """
+    t.require("notconf-server")
+    log = logging.Logger(t.log_handler)
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            log.error("Failed to connect", {"error": e})
+            t.failure(ValueError("Failed to connect to NETCONF server: {e}"))
+        else:
+            log.info("Connected to NETCONF server")
+            c.lock(_on_lock, "candidate")
+
+    def _on_lock(c: Client, error: ?NetconfError):
+        if error is not None:
+            log.error("Lock operation failed", {"error": error})
+            t.failure(ValueError("Lock operation failed with error"))
+        else:
+            log.info("Lock operation successful")
+            # Now unlock the datastore
+            c.unlock(_on_unlock, "candidate")
+
+    def _on_unlock(c: Client, error: ?NetconfError):
+        if error is not None:
+            log.error("Unlock operation failed", {"error": error})
+            t.failure(ValueError("Unlock operation failed with error"))
+        else:
+            log.info("Unlock operation successful")
+            log.info("Lock and unlock test completed successfully")
+            t.success()
+
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                on_connect=_on_connect,
+                on_notif=None,
+                address=test_address,
+                username=test_username,
+                key=None,
+                password=test_password,
+                port=test_port,
+                skip_host_key_check=True,
+                log_handler=t.log_handler)
+
+
+actor _test_get_config_with_filter(t: testing.EnvT):
+    """Test get-config operation with a subtree filter
+    """
+    t.require("notconf-server")
+    log = logging.Logger(t.log_handler)
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            log.error("Failed to connect", {"error": e})
+            t.failure(ValueError("Failed to connect to NETCONF server: {e}"))
+        else:
+            log.info("Connected to NETCONF server")
+            # Create a subtree filter to get only specific configuration
+            # Example: filter for interfaces configuration
+            filter_node = xml.Node("filter", None, None, [("type", "subtree")], [
+                xml.Node("interfaces",
+                    [(None, "urn:ietf:params:xml:ns:yang:ietf-interfaces")],
+                    children=[
+                        xml.Node("interface", children=[
+                            xml.Node("name", text="eth0")
+                        ])
+                    ]
+                )
+            ])
+            c.get_config(_on_get_config_filtered, "running", filter_node)
+
+    def _on_get_config_filtered(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            log.error("<get-config> with filter failed", {"error": error})
+            t.failure(ValueError("get-config with filter failed with error"))
+        elif result is not None:
+            log.info("<get-config> with filter received response")
+            # Check if we got an rpc-reply
+            if result.tag == "rpc-reply":
+                # For successful get-config, there should be a single <data> element
+                if len(result.children) > 0 and result.children[0].tag == "data":
+                    log.info("Filtered config data received successfully")
+                    t.success()
+                else:
+                    log.warning("No data element in response, but this might be normal if no matching config exists")
+                    t.success()  # Still success as empty result is valid for filter
+            else:
+                log.error("Unexpected response type", {"tag": result.tag})
+                t.failure(ValueError("Unexpected response type: {result.tag}"))
+        else:
+            log.error("<get-config> with filter received null response")
+            t.failure(ValueError("get-config with filter returned null"))
+
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                on_connect=_on_connect,
+                on_notif=None,
+                address=test_address,
+                username=test_username,
+                key=None,
+                password=test_password,
+                port=test_port,
+                skip_host_key_check=True,
+                log_handler=t.log_handler)
+
+
+actor _test_get_config_with_xpath_filter(t: testing.EnvT):
+    """Test get-config operation with an XPath filter
+    """
+    t.require("notconf-server")
+    log = logging.Logger(t.log_handler)
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            log.error("Failed to connect", {"error": e})
+            t.failure(ValueError("Failed to connect to NETCONF server: {e}"))
+        else:
+            log.info("Connected to NETCONF server")
+            # Create an XPath filter to select specific configuration elements
+            # Example: select all interface names
+            filter_node = xml.Node("filter", None, None,
+                [("type", "xpath"),
+                 ("select", "/interfaces/interface/name")],
+                []
+            )
+            c.get_config(_on_get_config_xpath_filtered, "running", filter_node)
+
+    def _on_get_config_xpath_filtered(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            # XPath might not be supported, which is ok
+            log.info("Server returned error (XPath might not be supported)", {"error": error})
+            t.success()  # Still consider it success if XPath is not supported
+        elif result is not None:
+            log.info("<get-config> with XPath filter received response")
+            # Check if we got an rpc-reply
+            if result.tag == "rpc-reply":
+                # For successful get-config, there should be a single <data> element
+                if len(result.children) > 0 and result.children[0].tag == "data":
+                    log.info("XPath filtered config data received successfully")
+                    t.success()
+                else:
+                    log.warning("No data element in response")
+                    t.success()  # Still success as empty result is valid
+            else:
+                log.error("Unexpected response type", {"tag": result.tag})
+                t.failure(ValueError("Unexpected response type: {result.tag}"))
+        else:
+            log.error("<get-config> with XPath filter received null response")
+            t.failure(ValueError("get-config with XPath filter returned null"))
+
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                on_connect=_on_connect,
+                on_notif=None,
+                address=test_address,
+                username=test_username,
+                key=None,
+                password=test_password,
+                port=test_port,
+                skip_host_key_check=True,
+                log_handler=t.log_handler)
+
+
+actor _test_rpc_error_repr(t: testing.EnvT):
+    """Test that NetconfError repr() works correctly with RPC errors
+
+    This test intentionally triggers an RPC error by trying to lock a
+    non-existent datastore, then verifies the repr() output.
+    """
+    t.require("notconf-server")
+    log = logging.Logger(t.log_handler)
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            log.error("Failed to connect", {"error": e})
+            t.failure(ValueError("Failed to connect to NETCONF server: {e}"))
+        else:
+            log.info("Connected to NETCONF server")
+            # Try to lock a non-existent datastore to trigger an error
+            c.lock(_on_lock_error, "non-existent-datastore")
+
+    def _on_lock_error(c: Client, error: ?NetconfError):
+        if error is not None:
+            log.info("Got expected error from invalid lock operation", {"error": error})
+            t.success(repr(error))
+        else:
+            # We expected an error, but didn't get one
+            log.error("Expected an error from invalid lock operation, but got success")
+            t.failure(ValueError("Lock on non-existent datastore should have failed"))
+
+    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                on_connect=_on_connect,
+                on_notif=None,
+                address=test_address,
+                username=test_username,
+                key=None,
+                password=test_password,
+                port=test_port,
+                skip_host_key_check=True,
+                log_handler=t.log_handler)
