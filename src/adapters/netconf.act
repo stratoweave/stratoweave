@@ -4,7 +4,6 @@ import net
 import time
 import std.xml as xml
 
-import yang
 import yang.schema as yschema
 import yang.gdata as ygdata
 import yang.xml as yxml
@@ -13,13 +12,14 @@ import netconf
 import device as swdev
 import ietf_yang_library as yl
 import monitoring
+from device_schema import DeviceSchema
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig
 from adapters.adapter import \
     DeviceAdapter, ModCap, DISCONNECTED, CONNECTING, CONNECTED, TRANSACTION, \
     NotConnectedError, BusyError, LockedError, TxidMismatchError, ConfigError, \
     SharedSubscription, SubscriptionOwner, parse_cap, \
-    mock_preset_capabilities, subscription_delay, merge_subscription_tree
+    subscription_delay, merge_subscription_tree
 
 def extract_txid(conf: ?xml.Node) -> ?str:
     """Attempt to extract a txid from configuration
@@ -37,30 +37,6 @@ def extract_txid(conf: ?xml.Node) -> ?str:
 
 NS_YANG_LIBRARY = "urn:ietf:params:xml:ns:yang:ietf-yang-library"
 
-NETCONF_MOCK_IETF_SYSTEM_YANG = r"""module ietf-system {
-  yang-version "1.1";
-  namespace "urn:ietf:params:xml:ns:yang:ietf-system";
-  prefix sys;
-  container system-state {
-    config false;
-    container clock {
-      leaf current-datetime {
-        type string;
-      }
-      leaf boot-datetime {
-        type string;
-      }
-    }
-  }
-}"""
-
-
-def _netconf_mock_default_oper_schema() -> yschema.DRoot:
-    try:
-        return yang.compile([NETCONF_MOCK_IETF_SYSTEM_YANG])
-    except Exception:
-        return yschema.DRoot()
-
 
 def _mock_capabilities_from_dmc(new_dmc: DeviceMetaConfig) -> list[str]:
     """True protocol capabilities for the mock device hello exchange.
@@ -68,29 +44,37 @@ def _mock_capabilities_from_dmc(new_dmc: DeviceMetaConfig) -> list[str]:
     caps: list[str] = [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1,
         "urn:ietf:params:netconf:capability:writable-running:1.0",
         "urn:ietf:params:netconf:capability:candidate:1.0"]
-    # Presets are hardcoded vendor hello strings (a mix of true caps and module
-    # caps); they pass through untouched until presets are removed.
-    for cap in mock_preset_capabilities(new_dmc.mock.preset):
+    for mock_cap in new_dmc.mock.module.elements:
+        cap = mock_cap.namespace + "?module=" + mock_cap.name
+        rev = mock_cap.revision
+        if rev is not None:
+            cap = cap + "&revision=" + rev
+        features = mock_cap.feature
+        if len(features) > 0:
+            cap = cap + "&features=" + ",".join(features)
         caps.append(cap)
     return caps
 
 
-actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[str], config_schema: yschema.DRoot, operational_schema: yschema.DRoot):
+actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[str], bundled_schema: DeviceSchema):
     # `capabilities` carries true NETCONF protocol capabilities only.
-    # `config_schema` and `operational_schema` are used both for parsing as well
-    # as module inventory. If ietf-yang-library is present, then the mock server
-    # adds it to the capabilities and populates the oper state. If not, then all
-    # modules are advertised as capabilities.
+    # The bundled_schema config and oper roots are used both for
+    # parsing and as the module inventory. If ietf-yang-library is present, then
+    # the mock server adds it to the capabilities and populates the oper state.
+    # If not, then all modules are advertised as capabilities.
     _log = logging.Logger(log_handler)
 
+    config_schema = bundled_schema.src_dnode
+    operational_schema = bundled_schema.oper_src_dnode
+
     # Schemas are mutable so tests can swap them on the fly via set_*_ds(...).
-    var conf_schema: yschema.DRoot = config_schema
-    var oper_schema: yschema.DRoot = operational_schema
+    var conf_schema = config_schema
+    var oper_schema = operational_schema
     # The mock starts with no operational data; tests that exercise <get>
     # side-load it via set_oper_ds(...). Fabricating ambient operational state
     # here would leak non-deterministically into transforms that read it.
-    var oper_ds: ygdata.Node = ygdata.Container({})
-    var conf_ds: ygdata.Node = ygdata.Container({})
+    var oper_ds = ygdata.Container({})
+    var conf_ds = ygdata.Container({})
     var rpc_log: list[(message_id: str, op: xml.Node)] = []
     NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
 
@@ -322,7 +306,7 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
             yl_view = _build_yl_view(conf_schema, oper_schema)
 
 
-actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, init_dmc: DeviceMetaConfig, schema_registry: swdev.SchemaRegistry, log_handler: logging.Handler, connect_cap: ?net.TCPConnectCap):
+actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc: DeviceMetaConfig, schema_registry: swdev.SchemaRegistry, log_handler: logging.Handler, connect_cap: ?net.TCPConnectCap):
     """NETCONF device adapter
 
     It is possible to configure a device using different transaction commit
@@ -564,7 +548,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
         dmc = new_dmc
 
     def _connect(new_dmc):
-        use_mock_server = system_mock or new_dmc.mock.enabled or len(new_dmc.mock.preset) > 0 or len(new_dmc.mock.module.elements) > 0
+        use_mock_server = system_mock or new_dmc.mock.enabled or len(new_dmc.mock.module.elements) > 0
 
         username = new_dmc.credentials.username
         password = new_dmc.credentials.password
@@ -573,11 +557,10 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, in
             state = CONNECTING
             pipes = netconf.actor_pipe_pair()
             # The mock owns its module-facing output: it derives its module
-            # inventory from these schemas and serves ietf-yang-library iff the
-            # inventory implements it.
-            oper_schema = bundled_schema.oper_src_dnode if len(bundled_schema.oper_src_dnode.children) > 0 else _netconf_mock_default_oper_schema()
+            # inventory from the bundled schema and serves ietf-yang-library iff
+            # the inventory implements it.
             caps = _mock_capabilities_from_dmc(new_dmc)
-            ms = NetconfMockServer(pipes.server, _con_log_handler, caps, bundled_schema.src_dnode, oper_schema)
+            ms = NetconfMockServer(pipes.server, _con_log_handler, caps, bundled_schema)
             mock_server = ms
             client = netconf.Client(connect_cap,
                                     "dummy-address",
@@ -1261,7 +1244,7 @@ class NetconfAdapter(DeviceAdapter):
     def supports_mocking(self) -> bool:
         return True
 
-    def __init__(self, dev: swdev.DeviceMgr, bundled_schema: swdev.DeviceSchema, init_dmc: DeviceMetaConfig, schema_registry: swdev.SchemaRegistry, log_handler, connect_cap: ?net.TCPConnectCap):
+    def __init__(self, dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc: DeviceMetaConfig, schema_registry: swdev.SchemaRegistry, log_handler, connect_cap: ?net.TCPConnectCap):
         self._dev = dev
         self._bundled_schema = bundled_schema
         self._schema_registry = schema_registry
