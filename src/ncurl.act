@@ -18,8 +18,16 @@ import std.xml as xml
 
 import yang
 import yang.data as ydata
+import yang.gdata as ygdata
+import yang.schema as yschema
 import yang.xml as yxml
+import device as swdev
+import adapters.netconf as swna
 import ncurl.schema_filter as schema_filter
+
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials
 
 
 def build_explicit_schemas_list(explicit_modules: list[str], format: str) -> list[(identifier: str, version: ?str, format: ?str)]:
@@ -960,6 +968,115 @@ actor CmdGetSchema(env, args, log_handler):
                   fixups=client_fixups)
 
 
+actor CmdMonitor(env, args, log_handler):
+    """Monitor operational data from a NETCONF device.
+
+    Builds a stratoweave DeviceAdapter and declares a periodic subscription,
+    relying on the adapter to realize that subscription in whatever way the
+    device supports. Each update is printed as it arrives, until --count
+    updates have been received (0 = run until interrupted).
+    """
+
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    password = args.get_str("password")
+    count = args.get_int("count")
+    filter_subtree = args.get_str("filter-subtree")
+
+    owner_id = "ncurl-monitor"
+    var dev: ?swdev.DeviceMgr = None
+    var received = 0
+    var subscribed = False
+    var done = False
+
+    pstr = args.get_str("period")
+    var period: ?float = None
+    try:
+        period = float(pstr)
+    except ValueError:
+        period = None
+
+    # Parse the optional subtree filter XML up front (syntax only). It is turned
+    # into a typed filter once the device's schema is known (in _on_connect),
+    # since that conversion needs the schema.
+    var filter_node: ?xml.Node = None
+    var filter_error: ?str = None
+    if filter_subtree != "":
+        try:
+            filter_node = xml.Node("filter", attributes=[("type", "subtree")], children=[xml.decode(filter_subtree)])
+        except xml.XmlParseError as e:
+            filter_error = e.error_message
+
+    def _finish(code: int):
+        if not done:
+            done = True
+            d = dev
+            if d is not None:
+                d.remove_subscriptions(owner_id)
+            env.exit(code)
+
+    def _on_update(n: ?ygdata.Node, err: ?Exception):
+        if err is not None:
+            print("Error: subscription update failed: {err}", err=True)
+            _finish(1)
+            return
+        received += 1
+        if n is not None:
+            print(n.to_xmlstr())
+        if count > 0 and received >= count:
+            _finish(0)
+
+    def _on_connect(name: str):
+        # on_reconf can fire more than once; only subscribe the first time.
+        if subscribed:
+            return
+        d = dev
+        p = period
+        if d is not None and p is not None:
+            filt: ?ygdata.FNode = None
+            fnode = filter_node
+            if fnode is not None:
+                schema = d.get_fetched_schema()
+                if schema is not None:
+                    try:
+                        filt = yxml.from_filter_xml(schema, fnode)
+                    except Exception as e:
+                        print("Error: --filter-subtree did not match the device schema: {e}", err=True)
+                        _finish(1)
+                        return
+                else:
+                    print("Error: device schema not available for --filter-subtree", err=True)
+                    _finish(1)
+                    return
+            subscribed = True
+            d.declare_subscriptions(owner_id, _on_update, {ygdata.SubscriptionSpec(filt, period=p)})
+
+    if period is None:
+        print("Error: --period must be a number of seconds, got '{pstr}'", err=True)
+        env.exit(1)
+    elif filter_error is not None:
+        print("Error: invalid --filter-subtree XML: {filter_error}", err=True)
+        env.exit(1)
+    else:
+        # Build a stratoweave DeviceAdapter pointed at the target device and
+        # start connecting. An empty bundled schema + runtime_schema_fetch lets
+        # it work against arbitrary devices: the schema is fetched from the
+        # device at connect. Connection is asynchronous; _on_connect fires once
+        # the device is ready.
+        cap = net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth)))
+        schema_registry = swdev.SchemaRegistry()
+        dev_types = {
+            "netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter, src_dnode=yschema.DRoot())
+        }
+        dmc = DeviceMetaConfig(name="ncurl-target", credentials=Credentials(username, password), type="netconf")
+        dmc.address.create("primary", host, u64(port))
+        dmc.feature_flags.runtime_schema_fetch = True
+        device = swdev.DeviceMgr(dev_types, cap, "ncurl-target", log_handler, _on_connect, schema_registry)
+        device.set_dmc(dmc)
+        dev = device
+
+
 actor main(env):
     logh = logging.Handler()
 
@@ -1026,6 +1143,13 @@ actor main(env):
             logh.add_sink(logging.ConsoleSink())
         CmdDiscardChanges(env, args, logh)
 
+    def cmd_monitor(args):
+        """Command handler for monitor"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdMonitor(env, args, logh)
+
     def _parse_args():
         p = argparse.Parser()
 
@@ -1083,6 +1207,11 @@ actor main(env):
         p_commit = p.add_cmd("commit", "Commit candidate configuration to running", cmd_commit)
 
         p_discard = p.add_cmd("discard-changes", "Discard changes in candidate configuration", cmd_discard_changes)
+
+        p_monitor = p.add_cmd("monitor", "Monitor operational data from a NETCONF device", cmd_monitor)
+        p_monitor.add_option("period", "str", "?", "1.0", "Poll period in seconds")
+        p_monitor.add_option("count", "int", "?", 0, "Stop after N updates (0 = run until interrupted)")
+        p_monitor.add_option("filter-subtree", "str", "?", "", "XML subtree filter (limits what is monitored)")
 
         return p.parse(env.argv)
 
