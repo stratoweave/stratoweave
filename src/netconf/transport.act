@@ -1,0 +1,200 @@
+"""Byte stream pipe transport abstractions.
+
+NETCONF and many other protocols runs on top of a byte stream transport. It
+looks more or less as a pipe. Many underlying transport protocols provide such a
+pipe, like TCP, SSH, TLS but unix sockets or just two actors sending messages
+between them. It is useful to be able to abstract over the transport protocol
+and just use a pipe interface so that we can support multiple transport
+protocols without changing the protocol implementation.
+
+This module provides TCP Pipe adapters. SSH Pipe adapters (SshPipe,
+SshPipeListener) are provided by the ssh package's ssh.pipe module.
+"""
+
+import logging
+import net
+from pipe import Pipe
+
+class TcpPipe(Pipe):
+    _endpoint: _TcpClientPipeEndpoint
+
+    def __init__(self,
+                 connect_cap: net.TCPConnectCap,
+                 address: str,
+                 port: int,
+                 read_cb: ?action(?Exception, ?bytes) -> None=None,
+                 connect_timeout: float=10.0):
+        self._endpoint = _TcpClientPipeEndpoint(connect_cap, address, port, connect_timeout)
+        if read_cb is not None:
+            self._endpoint.read_cb(read_cb)
+
+    proc def write(self, data: bytes):
+        self._endpoint.write(data)
+
+    proc def read_cb(self, cb: action(?Exception, ?bytes) -> None):
+        self._endpoint.read_cb(cb)
+
+    proc def close(self, on_close: ?action() -> None):
+        self._endpoint.close(on_close)
+
+    proc def restart(self):
+        self._endpoint.restart()
+
+
+actor _TcpClientPipeEndpoint(connect_cap: net.TCPConnectCap, address: str, port: int, connect_timeout: float):
+    def _noop_read_cb(error: ?Exception, data: ?bytes):
+        pass
+
+    var _read_cb: action(?Exception, ?bytes) -> None = _noop_read_cb
+    var _has_read_cb = False
+    var _connected_pending = False
+    var _conn: ?net.TCPConnection = None
+
+    def _emit_connected_if_pending():
+        if _has_read_cb and _connected_pending:
+            _connected_pending = False
+            await async _read_cb(None, None)
+
+    def _ensure_connected():
+        if _conn is not None:
+            return
+
+        _conn = net.TCPConnection(connect_cap, address, port, _on_connect, _on_receive, _on_error)
+
+    def _on_connect(c: net.TCPConnection):
+        _conn = c
+        _connected_pending = True
+        _emit_connected_if_pending()
+
+    def _on_receive(c: net.TCPConnection, data: bytes):
+        if _has_read_cb:
+            await async _read_cb(None, data)
+
+    def _on_error(c: net.TCPConnection, error: str):
+        if _has_read_cb:
+            await async _read_cb(OSError(error), None)
+
+    def write(data: bytes):
+        c = _conn
+        if c is not None:
+            c.write(data)
+        else:
+            raise ValueError("Unable to write, TCP client pipe is not connected")
+
+    def read_cb(cb: action(?Exception, ?bytes) -> None):
+        _read_cb = cb
+        _has_read_cb = True
+        _ensure_connected()
+        _emit_connected_if_pending()
+
+    def close(on_close: ?action() -> None):
+        c = _conn
+        if c is not None:
+            def _on_close(_c: net.TCPConnection):
+                _conn = None
+                _connected_pending = False
+                if on_close is not None:
+                    await async on_close()
+
+            c.close(_on_close)
+        elif on_close is not None:
+            await async on_close()
+
+    def restart():
+        c = _conn
+        if c is not None:
+            c.reconnect()
+        else:
+            _ensure_connected()
+
+class TcpListenPipe(Pipe):
+    _endpoint: _TcpListenPipeEndpoint
+
+    def __init__(self,
+                 connection: net.TCPListenConnection,
+                 read_cb: ?action(?Exception, ?bytes) -> None=None):
+        self._endpoint = _TcpListenPipeEndpoint(connection)
+        if read_cb is not None:
+            self._endpoint.read_cb(read_cb)
+
+    proc def write(self, data: bytes):
+        self._endpoint.write(data)
+
+    proc def read_cb(self, cb: action(?Exception, ?bytes) -> None):
+        self._endpoint.read_cb(cb)
+
+    proc def close(self, on_close: ?action() -> None):
+        self._endpoint.close(on_close)
+
+    proc def restart(self):
+        self._endpoint.restart()
+
+
+actor _TcpListenPipeEndpoint(connection: net.TCPListenConnection):
+    def _noop_read_cb(error: ?Exception, data: ?bytes):
+        pass
+
+    var _read_cb: action(?Exception, ?bytes) -> None = _noop_read_cb
+    var _has_read_cb = False
+    var _connected_pending = True
+    var _cb_installed = False
+    var _conn = connection
+
+    def _emit_connected_if_pending():
+        if _has_read_cb and _connected_pending:
+            _connected_pending = False
+            await async _read_cb(None, None)
+
+    def _maybe_install_cb():
+        if _cb_installed:
+            return
+        _conn.cb_install(_on_receive, _on_error, _on_remote_close)
+        _cb_installed = True
+
+    def _on_receive(c: net.TCPListenConnection, data: bytes):
+        if _has_read_cb:
+            await async _read_cb(None, data)
+
+    def _on_error(c: net.TCPListenConnection, error: str):
+        if _has_read_cb:
+            await async _read_cb(OSError(error), None)
+
+    def _on_remote_close(c: net.TCPListenConnection):
+        if _has_read_cb:
+            await async _read_cb(OSError("TCP remote side closed connection"), None)
+
+    def write(data: bytes):
+        _conn.write(data)
+
+    def read_cb(cb: action(?Exception, ?bytes) -> None):
+        _read_cb = cb
+        _has_read_cb = True
+        _maybe_install_cb()
+        _emit_connected_if_pending()
+
+    def close(on_close: ?action() -> None):
+        _conn.close()
+        if on_close is not None:
+            await async on_close()
+
+    def restart():
+        raise ValueError("Unable to restart, accepted TCP listener connection cannot reconnect")
+
+
+actor TcpPipeListener(listen_cap: net.TCPListenCap,
+                      address: str,
+                      port: int,
+                      on_listen: action(TcpPipeListener, ?Exception) -> None,
+                      on_accept: action(TcpPipeListener, TcpListenPipe) -> None):
+    var listener: ?net.TCPListener = None
+
+    def _on_listen(l: net.TCPListener, error: ?str):
+        if error is not None:
+            on_listen(self, OSError(error))
+        else:
+            on_listen(self, None)
+
+    def _on_accept(c: net.TCPListenConnection):
+        on_accept(self, TcpListenPipe(connection=c))
+
+    listener = net.TCPListener(listen_cap, address, port, _on_listen, _on_accept)
