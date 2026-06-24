@@ -1,0 +1,199 @@
+name: ncurl
+
+on:
+  push:
+
+env:
+  # ncurl ships as a standalone artifact under its own name even though it now
+  # lives in the stratoweave monorepo (github.repository would be stratoweave).
+  IMAGE: ghcr.io/stratoweave/ncurl
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actonlang/setup-acton@v1
+        with:
+          channel: 'tip'
+      - name: "Check out repository code"
+        uses: actions/checkout@v4
+      - name: "Cache acton stuff"
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/acton
+            ~/.cache/ayang
+            out
+            !out/bin
+          # Hacky cache update:
+          # https://github.com/actions/cache/blob/main/tips-and-workarounds.md#update-a-cache
+          key: ncurl-acton-${{ github.run_id }}
+          restore-keys: |
+            ncurl-acton
+      - name: "Start notconf in background"
+        run: |
+          docker run -td --name notconf --publish 42830:830 ghcr.io/notconf/notconf
+      - run: make
+      - name: "Wait for notconf"
+        run: |
+          for i in {1..30}; do
+            status="$(docker inspect --format '{{.State.Health.Status}}' notconf)"
+            echo "notconf health: ${status}"
+
+            if [ "${status}" = "healthy" ]; then
+              exit 0
+            fi
+
+            if [ "${status}" = "unhealthy" ]; then
+              docker logs notconf
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          docker logs notconf
+          exit 1
+      - name: "Test ncurl list-schemas"
+        run: out/bin/ncurl list-schemas
+      - name: "Test ncurl get-config"
+        run: out/bin/ncurl get-config
+      - name: "Test ncurl get-config with subtree filter"
+        run: out/bin/ncurl get-config --filter-subtree '<netconf-server xmlns="urn:ietf:params:xml:ns:yang:ietf-netconf-server"/>'
+      - name: "Test ncurl get-config and save to file"
+        run: |
+          out/bin/ncurl get-config --output test-config.xml
+          test -f test-config.xml
+      - name: "Test ncurl get-schema for all schemas"
+        run: out/bin/ncurl get-schema
+      - name: "Test ncurl get-schema for specific module"
+        run: out/bin/ncurl get-schema --module ietf-netconf-monitoring
+      - name: "Test ncurl get-schema for specific module-set"
+        run: out/bin/ncurl get-schema --module-set ietf
+      - name: "Test ncurl verbose mode"
+        run: out/bin/ncurl --verbose list-schemas
+      - name: "Test ncurl get-config with JSON format"
+        run: out/bin/ncurl get-config --format json
+      - name: "Test ncurl get-config with specific modules"
+        run: out/bin/ncurl get-config --format acton-adata --module ietf-netconf-acm --module ietf-yang-types
+      - name: "Test ncurl get-config with specific module-set"
+        run: out/bin/ncurl get-config --format acton-adata --module-set ietf
+      - name: "Test ncurl edit-config with file input"
+        run: |
+          out/bin/ncurl edit-config test/test-edit-config.xml --commit
+          out/bin/ncurl get-config --filter-subtree '<interfaces xmlns="urn:ietf:params:xml:ns:yang:ietf-interfaces"/>' | grep -q "test-interface"
+        # TODO: enable when we can detect EOF in stdin callback
+#      - name: "Test ncurl edit-config with stdin input"
+#        run: |
+#          cat test/test-edit-config.xml | out/bin/ncurl edit-config -
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ncurl-linux-x86_64
+          path: out/bin/ncurl
+      - run: make build-linux-aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ncurl-linux-aarch64
+          path: out/bin/ncurl
+      - run: make build-macos-aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ncurl-macos-aarch64
+          path: out/bin/ncurl
+
+  release:
+    # Only run on the main branch
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      # Required for uploading release assets
+      contents: write
+    needs: build-and-test
+    env:
+      TAG: tip
+    steps:
+      - name: "Check out repository code"
+        uses: actions/checkout@v4
+      - name: Delete tag
+        run: gh release delete ${{ env.TAG }} --cleanup-tag --yes || true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: "Download all binary artifacts"
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ncurl-*
+      - name: "Prepare binary release assets"
+        run: |
+          mkdir -p release-assets
+          cp ncurl-linux-x86_64/ncurl release-assets/ncurl-linux-x86_64
+          cp ncurl-linux-aarch64/ncurl release-assets/ncurl-linux-aarch64
+          cp ncurl-macos-aarch64/ncurl release-assets/ncurl-macos-aarch64
+      - name: "Upload artifacts as release packages"
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          artifacts: "release-assets/ncurl-*"
+          draft: false
+          prerelease: true
+          name: ${{ env.TAG }}
+          tag: ${{ env.TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          replacesArtifacts: true
+
+  build-container-images:
+    if: github.ref == 'refs/heads/main'
+    needs: build-and-test
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: "Check out repository code"
+        uses: actions/checkout@v4
+      - name: "Download binary artifact"
+        uses: actions/download-artifact@v4
+        with:
+          name: ncurl-linux-${{ matrix.arch }}
+          path: out/bin
+      - name: "Make binary executable"
+        run: chmod +x out/bin/ncurl
+      - name: "Log in to GHCR"
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: "Build and push arch-specific container image"
+        run: |
+          docker build --pull -f Dockerfile.ncurl -t ${{ env.IMAGE }}:latest-${{ matrix.arch }} .
+          docker push ${{ env.IMAGE }}:latest-${{ matrix.arch }}
+
+  create-container-manifest:
+    if: github.ref == 'refs/heads/main'
+    needs: build-container-images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: "Log in to GHCR"
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: "Create and push multi-arch manifests"
+        run: |
+          docker manifest create ${{ env.IMAGE }}:latest \
+            ${{ env.IMAGE }}:latest-x86_64 \
+            ${{ env.IMAGE }}:latest-aarch64
+          docker manifest push ${{ env.IMAGE }}:latest
+      - name: "Inspect published manifest"
+        run: docker manifest inspect ${{ env.IMAGE }}:latest

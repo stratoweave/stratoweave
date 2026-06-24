@@ -2,11 +2,23 @@ GENERATED_ACT := src/device_meta_config.act src/ietf_restconf_monitoring.act src
 
 .PHONY: build
 build: $(GENERATED_ACT)
-	acton build $(DEP_OVERRIDES)
+	acton build $(DEP_OVERRIDES) $(TARGET)
 
 .PHONY: build-ldep
 build-ldep: $(GENERATED_ACT)
-	$(MAKE) build DEP_OVERRIDES="--dep yang=../acton-yang --dep netconf=../netconf --dep http_router=../http-router --dep actmf=../actmf"
+	$(MAKE) build DEP_OVERRIDES="--dep yang=../acton-yang --dep http_router=../http-router --dep actmf=../actmf"
+
+.PHONY: build-linux-x86_64
+build-linux-x86_64:
+	$(MAKE) build TARGET="--target x86_64-linux-gnu.2.27"
+
+.PHONY: build-linux-aarch64
+build-linux-aarch64:
+	$(MAKE) build TARGET="--target aarch64-linux-gnu.2.27"
+
+.PHONY: build-macos-aarch64
+build-macos-aarch64:
+	$(MAKE) build TARGET="--target aarch64-macos"
 
 .PHONY: gen
 gen: $(GENERATED_ACT)
@@ -32,7 +44,7 @@ test:
 
 .PHONY: test-ldep
 test-ldep:
-	$(MAKE) test DEP_OVERRIDES="--dep yang=../acton-yang --dep netconf=../netconf --dep http_router=../http-router --dep actmf=../actmf"
+	$(MAKE) test DEP_OVERRIDES="--dep yang=../acton-yang --dep http_router=../http-router --dep actmf=../actmf"
 
 .PHONY: pkg-upgrade
 pkg-upgrade:
@@ -52,8 +64,8 @@ test-mini: check-mini-is-up-to-date
 
 .PHONY: test-mini-ldep
 test-mini-ldep: check-mini-is-up-to-date
-	cd minisys && acton test --dep yang=../../acton-yang --dep netconf=../../netconf --dep http_router=../../http-router --dep actmf=../../actmf
-	ACTON_BUILD_ARGS="--dep yang=../acton-yang --dep netconf=../netconf --dep http_router=../http-router --dep actmf=../actmf" bash minisys/test/test_persistence_restart.sh
+	cd minisys && acton test --dep yang=../../acton-yang --dep http_router=../../http-router --dep actmf=../../actmf
+	ACTON_BUILD_ARGS="--dep yang=../acton-yang --dep http_router=../http-router --dep actmf=../actmf" bash minisys/test/test_persistence_restart.sh
 
 .PHONY: check-mini-is-up-to-date
 check-mini-is-up-to-date:
@@ -66,7 +78,7 @@ build-mini:
 
 .PHONY: build-mini-ldep
 build-mini-ldep:
-	cd minisys && acton build --dep yang=../../acton-yang --dep netconf=../../netconf --dep http_router=../../http-router --dep actmf=../../actmf
+	cd minisys && acton build --dep yang=../../acton-yang --dep http_router=../../http-router --dep actmf=../../actmf
 
 .PHONY: gen-mini
 gen-mini:
@@ -74,4 +86,4 @@ gen-mini:
 
 .PHONY: gen-mini-ldep
 gen-mini-ldep:
-	cd minisys/gen && acton build --dep yang=../../../acton-yang --dep netconf=../../../netconf --dep http_router=../../../http-router --dep actmf=../../../actmf && out/bin/gen
+	cd minisys/gen && acton build --dep yang=../../../acton-yang --dep http_router=../../../http-router --dep actmf=../../../actmf && out/bin/gen
