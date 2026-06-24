@@ -1,0 +1,203 @@
+import logging
+import net
+import std.xml as xml
+
+import yang.schema as yschema
+import yang.gdata as ygdata
+
+import gnmi
+import gnmi.proto as gproto
+import gnmi.gnyang.gnmi as gnyang
+import device as swdev
+from device_schema import DeviceSchema
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig
+from adapters.adapter import \
+    DeviceAdapter, ModCap, DISCONNECTED, CONNECTING, CONNECTED, \
+    NotConnectedError, SubscriptionOwner
+
+
+def _parse_gnmi_path(s: str) -> gproto.Path:
+    """Parse a gNMI path string like /interface[name=mgmt0]/statistics into a
+    proto.Path. Keys are written [k=v] (gNMI style, unquoted)."""
+    elems: list[gproto.PathElem] = []
+    for part in s.split("/"):
+        if part != "":
+            name = part
+            keys: list[(str, str)] = []
+            br = part.find("[")
+            if br >= 0:
+                name = part[:br]
+                for seg in part[br:].split("["):
+                    seg = seg.strip()
+                    if seg != "":
+                        kv = seg.replace("]", "")
+                        eq = kv.find("=")
+                        if eq >= 0:
+                            keys.append((kv[:eq], kv[eq + 1:]))
+            elems.append(gproto.PathElem(name, keys))
+    return gproto.Path(elems)
+
+
+actor GnmiDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc: DeviceMetaConfig, schema_registry: swdev.SchemaRegistry, log_handler: logging.Handler, connect_cap: ?net.TCPConnectCap):
+    """gNMI device adapter driver.
+
+    gNMI has no schema download, so the schema is supplied locally (compiled from
+    --yang-dir and carried in the bundled schema). On connect the driver reports a
+    module set derived from that bundle so DeviceMgr fires the reconf that lets the
+    monitor declare subscriptions; it then streams notifications, parsing each into
+    gdata with the same renderer the NETCONF monitor uses.
+    """
+    _log = logging.Logger(log_handler)
+    _log.info("GnmiDriver starting up")
+    _con_log_handler = logging.Handler("gnmi")
+    _con_log_handler.set_handler(log_handler)
+    _con_log_handler.set_output_level(logging.TRACE if init_dmc.debug.connection else logging.WARNING)
+
+    var dmc: DeviceMetaConfig = init_dmc
+    var client: ?gnmi.Client = None
+    var state: int = DISCONNECTED
+    var modset: dict[str, ModCap] = {}
+    var schema_hash = None
+    var sub_owners: dict[str, SubscriptionOwner] = {}
+    # gNMI subscription path (from --path); set before subscriptions are declared.
+    var sub_path: str = ""
+
+    def _modset_from_bundle() -> dict[str, ModCap]:
+        new_modset = {}
+        for ns, meta in bundled_schema.module_inventory().items():
+            new_modset[meta.module] = ModCap(meta.module, ns, meta.revision, [])
+        return new_modset
+
+    def _on_connect(c: gnmi.Client):
+        cl = client
+        if cl is not None and c is not cl:
+            return
+        state = CONNECTED
+        modset = _modset_from_bundle()
+        dev.on_connect(modset, schema_hash)
+
+    def _on_error(c: gnmi.Client, e: str):
+        _log.error("GnmiDriver: connection error", {"error": e})
+        modset = {}
+
+    def _connect(new_dmc: DeviceMetaConfig):
+        username = new_dmc.credentials.username
+        password = new_dmc.credentials.password
+        if not len(new_dmc.address.elements) > 0:
+            _log.debug("GnmiDriver: no address configured")
+            return
+        addr = new_dmc.address.elements[0]
+        address = addr.address
+        addr_port = addr.port
+        port = addr_port if addr_port is not None else bigint(57400)
+        creds: ?(str, str) = None
+        if username is not None and password is not None:
+            creds = (username, password)
+        if connect_cap is not None and address is not None:
+            state = CONNECTING
+            target = "{address}:{port}"
+            c = gnmi.Client(connect_cap, target, _on_connect, _on_error,
+                            insecure=False, log_handler=_con_log_handler,
+                            tls_verify=False, basic_creds=creds)
+            client = c
+
+    def set_dmc(new_dmc: DeviceMetaConfig):
+        _connect(new_dmc)
+        dmc = new_dmc
+
+    def set_sub_path(path: str):
+        sub_path = path
+
+    def configure(done: action(?Exception, ?ygdata.Node) -> None, new_diff, new_conf, running_conf):
+        # Read-only adapter: nothing to push.
+        done(NotConnectedError(), None)
+
+    def get_capabilities() -> list[str]:
+        return []
+
+    def get_modules() -> dict[str, ModCap]:
+        return modset
+
+    def fetch_config(done: action(?ygdata.Node, ?Exception) -> None) -> None:
+        # No running config concept for a streaming-telemetry adapter.
+        done(None, None)
+
+    def get_config() -> ?ygdata.Node:
+        return None
+
+    def rpc_xml(cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node) -> None:
+        cb(None, NotConnectedError())
+
+    def _on_response(resp: gproto.SubscribeResponse):
+        if resp.sync_response:
+            return
+        notif = resp.update
+        if notif is not None:
+            try:
+                container = gnyang.from_gnmi_notif(bundled_schema.src_dnode, notif, loose=True)
+                for owner_id, owner in sub_owners.items():
+                    owner.cb(container, None)
+            except Exception as e:
+                for owner_id, owner in sub_owners.items():
+                    owner.cb(None, e)
+
+    def declare_subscriptions(owner_id: str, cb: action(?ygdata.Node, ?Exception) -> None, want: set[ygdata.SubscriptionSpec]):
+        sub_owners[owner_id] = SubscriptionOwner(cb, want, None)
+        c = client
+        if c is not None:
+            for spec in want:
+                period = spec.period
+                sample_interval = period if period is not None else u64(0)
+                paths = [_parse_gnmi_path(sub_path)] if sub_path != "" else [gproto.Path([])]
+                c.subscribe(_on_response, gproto.Path([]), paths, gproto.STREAM, gproto.SAMPLE, sample_interval)
+
+    def remove_subscriptions(owner_id: str):
+        if owner_id in sub_owners:
+            del sub_owners[owner_id]
+
+    _connect(dmc)
+
+
+class GnmiAdapter(DeviceAdapter):
+
+    def supports_mocking(self) -> bool:
+        return False
+
+    def __init__(self, dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc: DeviceMetaConfig, schema_registry: swdev.SchemaRegistry, log_handler, connect_cap: ?net.TCPConnectCap):
+        self._dev = dev
+        self._bundled_schema = bundled_schema
+        self._schema_registry = schema_registry
+        self._log_handler = log_handler
+        self._connect_cap = connect_cap
+        self._driver = GnmiDriver(self._dev, self._bundled_schema, init_dmc, self._schema_registry, self._log_handler, self._connect_cap)
+
+    def set_dmc(self, new_dmc: DeviceMetaConfig):
+        self._driver.set_dmc(new_dmc)
+
+    def configure(self, done, new_diff, new_conf, running_conf):
+        return self._driver.configure(done, new_diff, new_conf, running_conf)
+
+    def get_capabilities(self) -> list[str]:
+        return self._driver.get_capabilities()
+
+    def get_modules(self) -> dict[str, ModCap]:
+        return self._driver.get_modules()
+
+    def fetch_config(self, done: action(?ygdata.Node, ?Exception) -> None) -> None:
+        self._driver.fetch_config(done)
+
+    def get_config(self):
+        return self._driver.get_config()
+
+    def rpc_xml(self, cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node) -> None:
+        return self._driver.rpc_xml(cb, xml_rpc)
+
+    def declare_subscriptions(self, owner_id: str, cb: action(?ygdata.Node, ?Exception) -> None, want: set[ygdata.SubscriptionSpec]):
+        self._driver.declare_subscriptions(owner_id, cb, want)
+
+    def remove_subscriptions(self, owner_id: str):
+        self._driver.remove_subscriptions(owner_id)
+
+    def set_sub_path(self, path: str):
+        self._driver.set_sub_path(path)
