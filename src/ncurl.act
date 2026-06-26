@@ -24,6 +24,7 @@ import yang.xml as yxml
 import device as swdev
 import adapters.netconf as swna
 import schema_filter
+import yang_dir as local_yang
 
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
@@ -1023,6 +1024,7 @@ actor CmdMonitor(env, args, log_handler):
     filter_subtree = args.get_str("filter-subtree")
     format = args.get_str("format")
     on_change = args.get_bool("on-change")
+    yang_dir = args.get_str("yang-dir")
 
     owner_id = "ncurl-monitor"
     var dev: ?swdev.DeviceMgr = None
@@ -1030,6 +1032,8 @@ actor CmdMonitor(env, args, log_handler):
     var subscribed = False
     var done = False
     var status_str = "connecting"
+    # Local schemas serve both data parsing and subtree filter resolution.
+    var local_schema: ?yschema.DRoot = None
 
     pstr = args.get_str("period")
     var period: ?float = None
@@ -1084,7 +1088,8 @@ actor CmdMonitor(env, args, log_handler):
             filt: ?ygdata.FNode = None
             fnode = filter_node
             if fnode is not None:
-                schema = d.get_fetched_schema()
+                ls = local_schema
+                schema = ls if ls is not None else d.get_fetched_schema()
                 if schema is not None:
                     try:
                         filt = yxml.from_filter_xml(schema, fnode)
@@ -1109,23 +1114,32 @@ actor CmdMonitor(env, args, log_handler):
     elif filter_error is not None:
         print("Error: invalid --filter-subtree XML: {filter_error}", err=True)
         env.exit(1)
+    elif yang_dir == "" and (len(args.get_strlist("module")) > 0 or len(args.get_strlist("module-set")) > 0):
+        print("Error: monitor --module and --module-set require --yang-dir", err=True)
+        env.exit(1)
     else:
-        # Build a stratoweave DeviceAdapter pointed at the target device and
-        # start connecting. An empty bundled schema + runtime_schema_fetch lets
-        # it work against arbitrary devices: the schema is fetched from the
-        # device at connect. Connection is asynchronous; _on_connect fires once
-        # the device is ready.
-        cap = net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth)))
-        schema_registry = swdev.SchemaRegistry()
-        dev_types = {
-            "netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter, src_dnode=yschema.DRoot())
-        }
-        dmc = DeviceMetaConfig(name="ncurl-target", credentials=Credentials(username, password), type="netconf")
-        dmc.address.create("primary", host, u64(port))
-        dmc.feature_flags.runtime_schema_fetch = True
-        device = swdev.DeviceMgr(dev_types, cap, "ncurl-target", log_handler, _on_connect, schema_registry)
-        device.set_dmc(dmc)
-        dev = device
+        # Finish local compilation before connecting. A load failure must not
+        # fall back to fetching a different schema from the device.
+        try:
+            if yang_dir != "":
+                local_schema = local_yang.load(file.FileCap(env.cap), yang_dir, args.get_strlist("module"), args.get_strlist("module-set"))
+        except Exception as e:
+            print("Error: cannot load --yang-dir {yang_dir}: {e}", err=True)
+            env.exit(1)
+        else:
+            sch = local_schema
+            bundled = sch if sch is not None else yschema.DRoot()
+            cap = net.TCPConnectCap(net.TCPCap(net.NetCap(env.auth)))
+            schema_registry = swdev.SchemaRegistry()
+            dev_types = {
+                "netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter, src_dnode=bundled)
+            }
+            dmc = DeviceMetaConfig(name="ncurl-target", credentials=Credentials(username, password), type="netconf")
+            dmc.address.create("primary", host, u64(port))
+            dmc.feature_flags.runtime_schema_fetch = sch is None
+            device = swdev.DeviceMgr(dev_types, cap, "ncurl-target", log_handler, _on_connect, schema_registry)
+            device.set_dmc(dmc)
+            dev = device
 
 
 actor main(env):
@@ -1265,6 +1279,10 @@ actor main(env):
         p_monitor.add_option("filter-subtree", "str", "?", "", "XML subtree filter (limits what is monitored)")
         p_monitor.add_option("format", "str", "?", "tree", "Output format: tree (live view) or raw (xml)")
         p_monitor.add_bool("on-change", "Subscribe on-change instead of periodic (RFC 8641); the device must support yang-push")
+        p_monitor.add_option("yang-dir", "str", "?", "", "Load the device schema from .yang files in this directory and its subdirectories, without downloading schemas")
+        monitor_module_sets_help = "Module set(s) to compile from --yang-dir ({schema_filter.get_module_set_names()})"
+        p_monitor.add_option("module-set", "strlist", "+", [], monitor_module_sets_help)
+        p_monitor.add_option("module", "strlist", "+", [], "Module(s) to compile from --yang-dir, optionally module@revision, with import/include dependencies")
 
         return p.parse(env.argv)
 
