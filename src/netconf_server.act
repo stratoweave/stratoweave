@@ -10,10 +10,18 @@ import yang.gdata as ygdata
 import yang.schema as yschema
 import yang.xml as yxml
 
+import yp
+import yp_ttt
+
 
 # NETCONF base namespace, used on the <data> wrapper of get/get-config replies.
 NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
 CAP_WRITABLE_RUNNING = "urn:ietf:params:netconf:capability:writable-running:1.0"
+
+# YANG-push / subscribed-notifications module capabilities (RFC 8639 / 8641),
+# advertised in <hello> so a client can discover dynamic-subscription support.
+CAP_SUBSCRIBED_NOTIFICATIONS = "urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications?module=ietf-subscribed-notifications"
+CAP_YANG_PUSH = "urn:ietf:params:xml:ns:yang:ietf-yang-push?module=ietf-yang-push"
 
 
 def build_capabilities(schema: yschema.DRoot) -> list[str]:
@@ -24,7 +32,8 @@ def build_capabilities(schema: yschema.DRoot) -> list[str]:
     schema's metadata, so a client can discover every served namespace from the
     hello exchange.
     """
-    caps = [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1, CAP_WRITABLE_RUNNING]
+    caps = [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1, CAP_WRITABLE_RUNNING,
+            CAP_SUBSCRIBED_NOTIFICATIONS, CAP_YANG_PUSH]
     for ns in sorted(schema.module_metadata.keys()):
         meta = schema.module_metadata[ns]
         uri = "{ns}?module={meta.module}"
@@ -49,7 +58,7 @@ actor StaticAuthChecker(expected_user: str, expected_password: str):
         respond(user == expected_user and password == expected_password)
 
 
-actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRoot, cfs: ttt.Layer, capabilities: ?list[str]=None, on_close: ?action(NetconfSession) -> None=None):
+actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRoot, cfs: ttt.Layer, capabilities: ?list[str]=None, on_close: ?action(NetconfSession) -> None=None, session_seq: int=0):
     """A single NETCONF session driving the configuration tree.
 
     Wraps a netconf.Server bound to `pipe` (one transport channel) and handles
@@ -60,10 +69,17 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
     Incoming <config> is parsed against `top_schema`, carrying per-node NETCONF
     operation= semantics (merge/create/delete/remove/replace) into the edit.
 
+    YANG-push (RFC 8641) periodic subscriptions are served from the same cfs
+    datastore via a per-session TttSubscriptionService, which drives TTT's native
+    declare_subscriptions: establish/delete-subscription RPCs are routed to it and
+    it streams push-update notifications back over this session. session_seq makes
+    the per-session subscription owner ids unique on the shared cfs.
+
     `on_close`, if given, is called with this session when its transport drops,
     so the owner can release its reference and let the session be reclaimed.
     """
     _log = logging.Logger(log_handler)
+    var service: ?yp_ttt.TttSubscriptionService = None
 
     def _extract_filter(op: xml.Node) -> (?xml.Node, ?str):
         for child in op.children:
@@ -124,7 +140,13 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
     def on_rpc(s: netconf.Server, message_id: str, op: xml.Node):
         _log.debug("NETCONF rpc", {"message_id": message_id, "op": op.tag})
 
-        if op.tag == "get" or op.tag == "get-config":
+        if yp.is_subscription_rpc(op.tag):
+            sv = service
+            if sv is not None:
+                sv.handle_rpc(message_id, op)
+            else:
+                s.send_error(message_id, "operation-failed", "subscription service not ready")
+        elif op.tag == "get" or op.tag == "get-config":
             if op.tag == "get-config" and _datastore(op, "source") != "running":
                 s.send_error(message_id, "operation-not-supported", "Only the running datastore is supported")
                 return
@@ -173,14 +195,21 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
 
     def _on_conn(s: netconf.Server, err: ?Exception):
         # on_connect doubles as the disconnect signal: err is None on connect and
-        # non-None when the transport drops (channel close / EOF). On drop, tell
-        # the owner so it can release its reference and let us be reclaimed.
+        # non-None when the transport drops (channel close / EOF). On drop, stop
+        # any subscriptions (so the publisher stops pushing to a dead transport)
+        # and tell the owner so it can release its reference.
         if err is not None:
+            sv = service
+            if sv is not None:
+                sv.shutdown()
             cb = on_close
             if cb is not None:
                 cb(self)
 
     var server: netconf.Server = netconf.Server(pipe=pipe, on_connect=_on_conn, on_rpc=on_rpc, capabilities=capabilities, log_handler=log_handler)
+    # owner_prefix must be unique per session: TTT keys subscriptions by owner id,
+    # so sessions sharing this cfs must not collide on "yp-<sub_id>".
+    service = yp_ttt.TttSubscriptionService(server, cfs, owner_prefix="yp-" + str(session_seq), log_handler=log_handler)
 
 
 actor NetconfServer(
@@ -213,6 +242,7 @@ actor NetconfServer(
     _capabilities = build_capabilities(top_schema)
     _auth = auth_check if auth_check is not None else StaticAuthChecker(username, password).check
     var _sessions: list[NetconfSession] = []
+    var _session_seq: int = 0
     var listener: ?sshpipe.SshPipeListener = None
 
     def _on_listen(l: sshpipe.SshPipeListener, err: ?Exception):
@@ -236,8 +266,9 @@ actor NetconfServer(
         _log.debug("NETCONF session closed", {"active_sessions": len(remaining)})
 
     def _on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
-        _log.info("NETCONF session accepted")
-        _sessions.append(NetconfSession(p, log_handler, top_schema, cfs, _capabilities, on_close=_session_closed))
+        _session_seq += 1
+        _log.info("NETCONF session accepted", {"session": _session_seq})
+        _sessions.append(NetconfSession(p, log_handler, top_schema, cfs, _capabilities, on_close=_session_closed, session_seq=_session_seq))
 
     listener = sshpipe.SshPipeListener(
         listen_cap,

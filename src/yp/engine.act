@@ -1,0 +1,125 @@
+"""Transport-agnostic YANG-push publisher (RFC 8641).
+
+YangPushPublisher implements periodic YANG-push: it allocates subscription ids,
+runs the per-subscription timers, and delivers fully-built push-update
+notification nodes through an injected sink, pulling its content from an injected
+backend. It knows nothing about NETCONF or RESTCONF.
+
+It also carries the slice of RFC 8639 subscribed-notifications that this needs:
+subscription-id allocation and establish/delete. The full 8639 framework is
+broader - event-stream subscriptions, modify/kill, the subscription-state
+notifications - and when we want those it makes sense to factor a
+content-agnostic subscription service out of here.
+
+A binding such as netconf.yp.NetconfSubscriptionService (or a future RESTCONF one)
+handles the transport-specific parts: decoding the establish/delete request,
+sending the right reply, and wiring deliver to where notifications go - a NETCONF
+session's send_notification, or a RESTCONF event stream. The publisher never
+touches the transport so both can share it.
+
+Lifecycle is split into establish (allocate the id, no emission) and start (begin
+emitting) so a binding can send its reply before the first push, which guarantees
+ordering, and so RESTCONF has its seam: there establish happens on one request and
+delivery attaches on a later GET to the stream.
+
+The data source is the injected backend, a YangPushBackend the publisher simply
+calls: snapshot returns the current contents and sample advances the source by one
+step and returns the new contents. A concrete backend is a class in front of an
+actor, so reading real datastore state still happens in the actor while the
+publisher gets its value back from a plain call.
+"""
+
+import logging
+import std.xml as xml
+
+import yp
+
+
+class YangPushBackend(object):
+    """The datastore source the publisher pulls from.
+
+    snapshot returns the current contents (a list of top-level data nodes, one per
+    module) without advancing. sample advances the source by one step and returns
+    the new contents. A concrete backend is a class delegating to an actor, which
+    is what lets the publisher read the value back from an ordinary call even when
+    the actor had to do real work to produce it."""
+    snapshot: proc() -> list[xml.Node]
+    sample: proc() -> list[xml.Node]
+
+
+class SubState(object):
+    interval: float     # tick period in seconds
+    active: bool
+
+    def __init__(self, interval: float):
+        self.interval = interval
+        self.active = True
+
+
+actor YangPushPublisher(deliver: action(xml.Node) -> None,
+                        backend: YangPushBackend,
+                        log_handler: ?logging.Handler=None):
+    """Drives periodic YANG-push (RFC 8641) push-update notifications, delivering
+    through deliver and pulling content from backend."""
+
+    _log = logging.Logger(log_handler)
+    var subs: dict[int, SubState] = {}
+    var next_id: int = 1
+
+    def establish(params: yp.EstablishParams) -> ?int:
+        """Allocate a periodic subscription and return its id, or None when the
+        request is not a valid periodic subscription - no positive <period>, which
+        also covers an on-change request since it carries no period. Does not emit
+        yet; the binding sends its reply, then calls start."""
+        pp = params.periodic_period
+        if pp is not None:
+            if pp > 0:
+                interval = float(pp) / 100.0
+                sub_id = next_id
+                next_id += 1
+                subs[sub_id] = SubState(interval)
+                _log.info("establish-subscription id={sub_id} period={interval}s")
+                return sub_id
+        return None
+
+    def start(sub_id: int) -> None:
+        """Begin emitting for a subscription: the first push-update baseline, then
+        schedule the periodic ticks."""
+        if sub_id in subs:
+            st = subs[sub_id]
+            if st.active:
+                snap = backend.snapshot()
+                deliver(yp.build_notification(yp.event_time_now(), yp.build_push_update(sub_id, snap)))
+                after st.interval: _tick(sub_id)
+
+    def delete(sub_id: int) -> bool:
+        """Stop and remove a subscription. Returns False if unknown."""
+        if sub_id in subs:
+            st = subs[sub_id]
+            st.active = False
+            del subs[sub_id]
+            _log.info("delete-subscription id={sub_id}")
+            return True
+        return False
+
+    def stop_all() -> None:
+        """Stop and forget every subscription, e.g. when the session closes.
+
+        Acton after-timers can't be cancelled, but _tick re-checks that the
+        subscription is still around and bails without re-arming once it's gone, so
+        dropping them here makes the next tick a no-op and stops writes to a dead
+        transport."""
+        n = len(subs)
+        for st in subs.values():
+            st.active = False
+        subs = {}
+        if n > 0:
+            _log.info("stopping all subscriptions (count={n})")
+
+    def _tick(sub_id: int) -> None:
+        if sub_id in subs:
+            st = subs[sub_id]
+            if st.active:
+                contents = backend.sample()
+                deliver(yp.build_notification(yp.event_time_now(), yp.build_push_update(sub_id, contents)))
+                after st.interval: _tick(sub_id)

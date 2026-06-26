@@ -1,0 +1,221 @@
+"""YANG-push — protocol primitives (RFC 8639 / 8640 / 8641).
+
+This module (yp) is pure and transport-agnostic: it builds and parses the XML for
+dynamic subscriptions and their push notifications. It has no dependency on
+NETCONF (or any transport), so it is reused by the NETCONF client/server, a future
+RESTCONF binding, and tests alike.
+
+Scope: periodic subscriptions only. The push payload is the full datastore
+snapshot (push-update). On-change subscriptions and their yang-patch deltas
+(push-change-update) are out of scope here and rejected by the server.
+
+Layering:
+  - yp.engine adds the transport-agnostic YangPushPublisher actor that drives
+    periodic emission using these builders.
+  - netconf adds thin Client.establish_subscription / delete_subscription helpers;
+    netconf.yp is the server-side NETCONF (RFC 8640) binding.
+
+Wire-format notes (RFC 8641):
+  - The notification envelope namespace is RFC 5277 notification:1.0; the
+    push-update payload carries its own ietf-yang-push namespace.
+  - period is in centiseconds (500 == 5 s).
+  - The subscription-id is a per-session monotonic uint32 starting at 1 and is
+    returned TOP-LEVEL in the rpc-reply (an augmented reply), not in output.
+"""
+
+import std.xml as xml
+import time
+
+# Namespaces
+NS_SN: str = "urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications"
+NS_YP: str = "urn:ietf:params:xml:ns:yang:ietf-yang-push"
+NS_NOTIF: str = "urn:ietf:params:xml:ns:netconf:notification:1.0"
+NS_DATASTORES: str = "urn:ietf:params:xml:ns:yang:ietf-datastores"
+
+# RFC 8342 datastore identity values (without the ds: prefix)
+DATASTORE_OPERATIONAL: str = "operational"
+DATASTORE_RUNNING: str = "running"
+
+
+class EstablishParams(object):
+    """Parsed parameters of an incoming <establish-subscription> (server side).
+
+    The filter is not captured here; a binding that cannot honour a filter rejects
+    a request that carries one. datastore is captured but not enforced here.
+    """
+    datastore: ?str
+    periodic_period: ?int   # centiseconds; None if no <period> was given
+
+    def __init__(self, datastore: ?str, periodic_period: ?int):
+        self.datastore = datastore
+        self.periodic_period = periodic_period
+
+
+class PushUpdate(object):
+    """Parsed push-update notification (a full filtered snapshot)."""
+    sub_id: ?int
+    event_time: ?str
+    contents: list[xml.Node]   # the children of <datastore-contents>
+
+    def __init__(self, sub_id: ?int, event_time: ?str, contents: list[xml.Node]):
+        self.sub_id = sub_id
+        self.event_time = event_time
+        self.contents = contents
+
+
+# ----------------------------------------------------------------------------
+# Builders
+# ----------------------------------------------------------------------------
+
+def event_time_now() -> str:
+    """An RFC 3339 timestamp for a notification <eventTime>."""
+    return str(time.utcnow())
+
+
+def build_establish_subscription(
+        datastore: str=DATASTORE_OPERATIONAL,
+        subtree_filter: ?list[xml.Node]=None,
+        xpath_filter: ?str=None,
+        period: ?int=None) -> xml.Node:
+    """Build a periodic <establish-subscription> operation node (RFC 8639 + 8641).
+
+    A filter is optional; pass either subtree_filter (the filter's top-level data
+    nodes, each carrying its own module namespace) or xpath_filter.
+    """
+    children: list[xml.Node] = []
+
+    # <datastore> is an identityref in the ietf-datastores module, carried in the
+    # ietf-yang-push namespace.
+    children.append(xml.Node("datastore",
+        nsdefs=[(None, NS_YP), ("ds", NS_DATASTORES)],
+        text="ds:" + datastore))
+
+    if subtree_filter is not None:
+        children.append(xml.Node("datastore-subtree-filter", nsdefs=[(None, NS_YP)],
+            children=subtree_filter))
+    elif xpath_filter is not None:
+        children.append(xml.Node("datastore-xpath-filter", nsdefs=[(None, NS_YP)],
+            text=xpath_filter))
+
+    if period is not None:
+        children.append(xml.Node("periodic", nsdefs=[(None, NS_YP)], children=[
+            xml.Node("period", text=str(period))
+        ]))
+
+    return xml.Node("establish-subscription", nsdefs=[(None, NS_SN)], children=children)
+
+
+def build_delete_subscription(sub_id: int) -> xml.Node:
+    """Build a <delete-subscription> operation node (RFC 8639)."""
+    return xml.Node("delete-subscription", nsdefs=[(None, NS_SN)], children=[
+        xml.Node("id", text=str(sub_id))
+    ])
+
+
+def build_subscription_id_reply(sub_id: int) -> xml.Node:
+    """The <id> element returned top-level in the establish-subscription reply."""
+    return xml.Node("id", nsdefs=[(None, NS_SN)], text=str(sub_id))
+
+
+def build_notification(event_time: str, payload: xml.Node) -> xml.Node:
+    """Wrap a payload in the RFC 5277 <notification> envelope."""
+    return xml.Node("notification", nsdefs=[(None, NS_NOTIF)], children=[
+        xml.Node("eventTime", text=event_time),
+        payload
+    ])
+
+
+def build_push_update(sub_id: int, contents: list[xml.Node]) -> xml.Node:
+    """Build a <push-update> payload around the datastore-contents subtree(s).
+
+    contents is a list because a datastore snapshot generally has several
+    top-level data nodes (one per module), not a single subtree."""
+    return xml.Node("push-update", nsdefs=[(None, NS_YP)], children=[
+        xml.Node("id", text=str(sub_id)),
+        xml.Node("datastore-contents", children=contents)
+    ])
+
+
+# ----------------------------------------------------------------------------
+# Parsers
+# ----------------------------------------------------------------------------
+
+def _child_by_tag(node: ?xml.Node, tag: str) -> ?xml.Node:
+    if node is not None:
+        for c in node.children:
+            if c.tag == tag:
+                return c
+    return None
+
+
+def _parse_int(s: ?str) -> ?int:
+    if s is not None:
+        try:
+            return int(s)
+        except ValueError:
+            return None
+    return None
+
+
+def _text_of(node: ?xml.Node) -> ?str:
+    if node is not None:
+        return node.text
+    return None
+
+
+def parse_subscription_id(rpc_reply: xml.Node) -> ?int:
+    """Extract the subscription-id from an establish-subscription <rpc-reply>.
+
+    The id is a top-level child of the rpc-reply (an augmented reply).
+    """
+    id_node = _child_by_tag(rpc_reply, "id")
+    if id_node is not None:
+        return _parse_int(id_node.text)
+    return None
+
+
+def notification_payload(notif: xml.Node) -> ?xml.Node:
+    """Return the push payload element of a <notification> (skips <eventTime>)."""
+    for c in notif.children:
+        if c.tag != "eventTime":
+            return c
+    return None
+
+
+def notification_event_time(notif: xml.Node) -> ?str:
+    et = _child_by_tag(notif, "eventTime")
+    return et.text if et is not None else None
+
+
+def parse_push_update(notif: xml.Node) -> ?PushUpdate:
+    """Parse a <notification> whose payload is a <push-update>, else None."""
+    payload = notification_payload(notif)
+    if payload is not None:
+        if payload.tag == "push-update":
+            sub_id = _parse_int(_text_of(_child_by_tag(payload, "id")))
+            dc = _child_by_tag(payload, "datastore-contents")
+            contents = dc.children if dc is not None else []
+            return PushUpdate(sub_id, notification_event_time(notif), contents)
+    return None
+
+
+def parse_establish_subscription(op: xml.Node) -> EstablishParams:
+    """Parse an incoming <establish-subscription> operation node (server side)."""
+    datastore = _text_of(_child_by_tag(op, "datastore"))
+    period = _parse_int(_text_of(_child_by_tag(_child_by_tag(op, "periodic"), "period")))
+    return EstablishParams(datastore, period)
+
+
+def parse_delete_subscription(op: xml.Node) -> ?int:
+    """Parse the subscription-id from an incoming <delete-subscription>."""
+    return _parse_int(_text_of(_child_by_tag(op, "id")))
+
+
+def is_subscription_rpc(tag: str) -> bool:
+    """True if an RPC operation tag belongs to ietf-subscribed-notifications.
+
+    Lets a server's on_rpc route subscription RPCs to a PushPublisher without
+    itself depending on the publisher (cross-actor calls can't return a routing
+    flag synchronously).
+    """
+    return tag == "establish-subscription" or tag == "delete-subscription" or tag == "modify-subscription" or tag == "kill-subscription" or tag == "resync-subscription"

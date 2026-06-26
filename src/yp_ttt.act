@@ -1,0 +1,147 @@
+"""TTT-backed YANG-push for the northbound NETCONF server (periodic / full-tree).
+
+TttSubscriptionService is the NETCONF binding that serves dynamic YANG-push
+(RFC 8641) subscriptions straight from a ttt.Layer datastore via TTT's native
+subscription mechanism (declare_subscriptions). On establish-subscription it
+declares a TTT subscription; TTT samples the datastore on the spec period and
+pushes the current merged tree to our callback, which we frame as a NETCONF
+push-update notification carrying the full datastore-contents.
+
+Supported v1 subset, enforced before a subscription is accepted (anything outside
+it gets an rpc-error rather than being silently served as something else):
+
+  - periodic subscriptions only; on-change is not supported;
+  - the running or operational datastore;
+  - no filter - the whole datastore is pushed, so a request that carries a
+    subtree/xpath filter is rejected rather than quietly widened.
+
+Known deviation, still under discussion: TTT subscriptions are
+periodic-with-change-suppression, so a subscription only pushes when the datastore
+actually changes (at most once per period), not unconditionally every period.
+
+This belongs at the app layer (it couples netconf to ttt); the mock server keeps
+the transport-only netconf.yp binding so it stays TTT-free.
+"""
+
+import logging
+import std.xml as xml
+
+import ttt
+import yang.gdata as gdata
+
+from netconf import Server
+import yp
+
+
+actor TttSubscriptionService(server: Server, cfs: ttt.Layer,
+                             owner_prefix: str="yp",
+                             log_handler: ?logging.Handler=None):
+    """Serves YANG-push subscriptions for one NETCONF session from cfs.
+
+    Route establish-subscription / delete-subscription here from the server's
+    on_rpc (gate with yp.is_subscription_rpc); call shutdown when the session
+    closes so TTT stops sampling for it. owner_prefix must be unique per session:
+    TTT keys subscriptions by owner id, so two sessions sharing one cfs must not
+    collide."""
+
+    _log = logging.Logger(log_handler)
+    var active: set[int] = set()
+    var next_id: int = 1
+
+    def _owner_id(sub_id: int) -> str:
+        return owner_prefix + "-" + str(sub_id)
+
+    def _datastore_supported(ds: ?str) -> bool:
+        # The <datastore> is an identityref, e.g. "ds:operational"; compare the
+        # bare identity name.
+        if ds is not None:
+            local = ds.split(":")[-1]
+            return local == "running" or local == "operational"
+        return False
+
+    def _has_filter(op: xml.Node) -> bool:
+        for c in op.children:
+            if c.tag == "datastore-subtree-filter" or c.tag == "datastore-xpath-filter":
+                return True
+        return False
+
+    def _has_on_change(op: xml.Node) -> bool:
+        for c in op.children:
+            if c.tag == "on-change":
+                return True
+        return False
+
+    def _contents(tree: ?gdata.Node) -> list[xml.Node]:
+        if tree is not None:
+            return tree.to_xml(deterministic=True)
+        return []
+
+    def _on_tree(sub_id: int, tree: ?gdata.Node, err: ?Exception) -> None:
+        """TTT subscription callback: a fresh full merged tree (or an error).
+        Frame it as a push-update, unless the subscription is already gone."""
+        if sub_id in active:
+            if err is not None:
+                _log.error("subscription sample error id={sub_id} error={err}")
+            else:
+                server.send_notification(yp.build_notification(
+                    yp.event_time_now(), yp.build_push_update(sub_id, _contents(tree))))
+
+    def handle_rpc(message_id: str, op: xml.Node) -> None:
+        """Handle a subscription RPC. Route here when is_subscription_rpc."""
+        if op.tag == "establish-subscription":
+            params = yp.parse_establish_subscription(op)
+            pp = params.periodic_period
+            # Enforce the v1 subset before allocating an id, so unsupported request
+            # shapes fail closed instead of being served as full-tree periodic.
+            if _has_on_change(op):
+                server.send_error(message_id, "operation-not-supported",
+                    "on-change subscriptions are not supported; use a periodic subscription")
+            elif pp is not None:
+                if pp <= 0:
+                    server.send_error(message_id, "invalid-value",
+                        "<period> must be a positive number of centiseconds")
+                elif not _datastore_supported(params.datastore):
+                    server.send_error(message_id, "invalid-value",
+                        "unsupported datastore; this server serves running and operational")
+                elif _has_filter(op):
+                    server.send_error(message_id, "operation-not-supported",
+                        "filtered subscriptions are not supported; the whole datastore is pushed")
+                else:
+                    sub_id = next_id
+                    next_id += 1
+                    active.add(sub_id)
+                    period_s = float(pp) / 100.0
+                    _log.info("establish-subscription id={sub_id} mode=periodic period={period_s}s")
+                    # Reply with the id BEFORE the subscription can push (ordering).
+                    server.send_reply(message_id, [yp.build_subscription_id_reply(sub_id)])
+                    spec = gdata.SubscriptionSpec(None, period=period_s)
+                    cfs.declare_subscriptions(_owner_id(sub_id),
+                        (lambda tree, err: _on_tree(sub_id, tree, err)), {spec})
+            else:
+                server.send_error(message_id, "missing-element",
+                    "a periodic <period> is required")
+        elif op.tag == "delete-subscription":
+            did = yp.parse_delete_subscription(op)
+            ok = False
+            if did is not None:
+                if did in active:
+                    cfs.remove_subscriptions(_owner_id(did))
+                    active.discard(did)
+                    _log.info("delete-subscription id={did}")
+                    ok = True
+            if ok:
+                server.send_ok(message_id)
+            else:
+                server.send_error(message_id, "invalid-value", "no such subscription")
+        else:
+            server.send_error(message_id, "operation-not-supported", "unsupported subscription RPC: " + op.tag)
+
+    def shutdown() -> None:
+        """Release every subscription for this session (call on disconnect) so
+        TTT stops sampling on our behalf."""
+        n = len(active)
+        for sid in active:
+            cfs.remove_subscriptions(_owner_id(sid))
+        active = set()
+        if n > 0:
+            _log.info("stopping all subscriptions (count={n})")

@@ -1,0 +1,63 @@
+"""NETCONF binding for the YANG-push engine (RFC 8640).
+
+This is the thin, transport-specific layer over the generic
+yp.engine.YangPushPublisher: it decodes the NETCONF establish-subscription /
+delete-subscription RPCs, sends the NETCONF rpc-reply carrying the
+subscription-id (or ok / rpc-error), and wires the engine's delivery sink to the
+session's Server.send_notification.
+
+One NetconfSubscriptionService instance belongs to one NETCONF session; route
+subscription RPCs to handle_rpc from the server's on_rpc, using
+yp.is_subscription_rpc to decide. A future RESTCONF binding is the analogous file
+wiring the same engine to an HTTP event stream.
+"""
+
+import logging
+import std.xml as xml
+
+from netconf import Server
+import yp
+from yp.engine import YangPushPublisher, YangPushBackend
+
+
+actor NetconfSubscriptionService(server: Server,
+                                 backend: YangPushBackend,
+                                 log_handler: ?logging.Handler=None):
+    """Binds a YangPushPublisher to a single NETCONF session.
+
+    The data source is the injected backend, so any backend (the mock
+    InterfaceCountersBackend, or another that reads a real datastore) can drive
+    it."""
+
+    pub = YangPushPublisher((lambda n: server.send_notification(n)), backend, log_handler)
+
+    def handle_rpc(message_id: str, op: xml.Node) -> None:
+        """Handle a subscription RPC. Route here when is_subscription_rpc."""
+        if op.tag == "establish-subscription":
+            # Reply before the first push: establish allocates the id, we send the
+            # rpc-reply, then start begins emission, so ordering is guaranteed. A
+            # request without a positive <period> (including on-change, which has
+            # none) is rejected rather than served as something it didn't ask for.
+            sub_id = pub.establish(yp.parse_establish_subscription(op))
+            if sub_id is not None:
+                server.send_reply(message_id, [yp.build_subscription_id_reply(sub_id)])
+                pub.start(sub_id)
+            else:
+                server.send_error(message_id, "invalid-value",
+                    "a positive periodic <period> is required")
+        elif op.tag == "delete-subscription":
+            did = yp.parse_delete_subscription(op)
+            ok = False
+            if did is not None:
+                ok = pub.delete(did)
+            if ok:
+                server.send_ok(message_id)
+            else:
+                server.send_error(message_id, "invalid-value", "no such subscription")
+        else:
+            server.send_error(message_id, "operation-not-supported", "unsupported subscription RPC: " + op.tag)
+
+    def shutdown() -> None:
+        """Stop all of this session's subscriptions. Call when the NETCONF session
+        closes so the publisher stops pushing to a dead transport."""
+        pub.stop_all()
