@@ -7,9 +7,12 @@ import std.xml as xml
 import yang.schema as yschema
 import yang.gdata as ygdata
 import yang.xml as yxml
+import yang.ypatch as ypatch
 
 import netconf
+import netconf.yp as nyp
 import yp
+from yp.engine import YangPushBackend
 import device as swdev
 import ietf_yang_library as yl
 import monitoring
@@ -55,6 +58,32 @@ def _mock_capabilities_from_dmc(new_dmc: DeviceMetaConfig) -> list[str]:
     return caps
 
 
+class _MockPushBackend(YangPushBackend):
+    """Fronts a NetconfMockServer's operational datastore for YANG-push: snapshot and
+    sample return the current oper data, change returns a yang-patch of what changed
+    since the last push. The two procs are the server's own methods, so the data is
+    read live in the server actor (the class-in-front-of-an-actor pattern)."""
+    @property
+    _snap: proc() -> list[xml.Node]
+    @property
+    _chg: proc() -> ?xml.Node
+
+    def __init__(self, snap: proc() -> list[xml.Node], chg: proc() -> ?xml.Node):
+        self._snap = snap
+        self._chg = chg
+
+    def snapshot(self) -> list[xml.Node]:
+        return self._snap()
+
+    def sample(self) -> list[xml.Node]:
+        # The mock's oper data changes only via set_oper_ds, so a periodic sample is
+        # the current snapshot (no synthetic advance).
+        return self._snap()
+
+    def change(self) -> ?xml.Node:
+        return self._chg()
+
+
 actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[str], bundled_schema: DeviceSchema):
     # `capabilities` carries true NETCONF protocol capabilities only.
     # The bundled_schema config and oper roots are used both for
@@ -75,6 +104,9 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
     var oper_ds = ygdata.Container({})
     var conf_ds = ygdata.Container({})
     var rpc_log: list[(message_id: str, op: xml.Node)] = []
+    # YANG-push: the last operational tree pushed, to diff against for on-change.
+    var _yp_last: ?ygdata.Node = None
+    var yp_service: ?nyp.NetconfSubscriptionService = None
     NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
 
     def _merged_schema(schemas: list[yschema.DRoot]) -> yschema.DRoot:
@@ -208,10 +240,32 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
         wrapper = xml.Node("data", children=data_children)
         return yxml.from_xml(conf_schema, wrapper, loose=True)
 
+    def _yp_snapshot() -> list[xml.Node]:
+        # Current operational data as a push baseline, recorded so the next on-change
+        # diff is taken from what was last pushed.
+        _yp_last = oper_ds
+        return oper_ds.to_xml(deterministic=True)
+
+    def _yp_change() -> ?xml.Node:
+        # A yang-patch of what changed since the last push, or None if unchanged.
+        prev = _yp_last
+        cur = oper_ds
+        _yp_last = cur
+        d = ygdata.diff(prev, cur)
+        if d is not None:
+            return ypatch.diff_to_patch(d, "mock-change").to_xml()
+        return None
+
     def on_rpc(s: netconf.Server, message_id: str, op: xml.Node):
         rpc_log.append((message_id=message_id, op=op))
         _log.debug("NetconfMockServer received rpc", {"message_id": message_id, "op": op.tag, "rpc_xml": op.encode()})
 
+        if yp.is_subscription_rpc(op.tag):
+            if yp_service is not None:
+                yp_service.handle_rpc(message_id, op)
+            else:
+                send_error(s, message_id, "operation-failed", "subscription service not ready")
+            return
         if op.tag == "get" or op.tag == "get-config":
             filter_node, filter_type = _extract_filter(op)
             if filter_type is not None and filter_type != "subtree":
@@ -252,6 +306,7 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
             send_error(s, message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
 
     var server: netconf.Server = netconf.Server(pipe=pipe, on_rpc=on_rpc, log_handler=log_handler, capabilities=all_capabilities)
+    yp_service = nyp.NetconfSubscriptionService(server, _MockPushBackend(_yp_snapshot, _yp_change), log_handler)
 
     def set_oper_ds(new_oper_ds: ygdata.Node, schema: ?yschema.DRoot=None):
         """Set the operational datastore (and optionally its schema) for <get>."""
@@ -259,6 +314,10 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
         if schema is not None:
             oper_schema = schema
             yl_view = monitoring.build_yl_view([conf_schema, oper_schema])
+        # Operational data changed: fan out an on-change push-change-update to any
+        # on-change subscribers (no-op when there are none).
+        if yp_service is not None:
+            yp_service.trigger_change()
 
     def set_conf_ds(new_conf_ds: ygdata.Node, schema: ?yschema.DRoot=None):
         """Set the configuration datastore (and optionally its schema) for <get-config>."""
@@ -553,6 +612,17 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                         err = ValueError("unparseable push-update for subscription id={sid} (no usable device schema?)")
                         for owner_id in st.owners:
                             _owner_publish(owner_id, err)
+            return
+        # A push-change-update is an on-change yang-patch delta; apply it onto the
+        # subscription's last-known tree (seeded by the sync-on-start baseline) so
+        # on-change renders the same full tree a periodic push would.
+        pcu = yp.parse_push_change_update(n)
+        if pcu is not None:
+            csid = pcu.sub_id
+            if csid is not None and csid in yp_subid_spec:
+                cspec = yp_subid_spec[csid]
+                if cspec in subs and subs[cspec].active:
+                    _apply_push_change(cspec, csid, pcu)
             return
         _log.debug("Notification from device (no matching push-update subscription)")
 
@@ -1014,15 +1084,19 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
     def subscription_status() -> SubscriptionStatus:
         # How subscriptions are realized against this device, decided from its
-        # capabilities at connect ("connecting" until then). yang-push is true
-        # periodic (the device pushes on the period); poll emulates periodic with
-        # client-side <get>.
+        # capabilities at connect ("connecting" until then). yang-push is a native
+        # push (periodic, or on-change when any active sub asked for it); poll
+        # emulates periodic with client-side <get>.
         m = _yang_push
         if m is None:
             return SubscriptionStatus(SUBSCRIPTION_CONNECTING)
+        periodic = True
+        for spec, _st in subs.items():
+            if spec.on_change:
+                periodic = False
         if m:
-            return SubscriptionStatus(SUBSCRIPTION_YANG_PUSH, periodic=True, emulated=False)
-        return SubscriptionStatus(SUBSCRIPTION_POLL, periodic=True, emulated=True)
+            return SubscriptionStatus(SUBSCRIPTION_YANG_PUSH, periodic=periodic, emulated=False)
+        return SubscriptionStatus(SUBSCRIPTION_POLL, periodic=periodic, emulated=True)
 
     def subscription_method() -> str:
         return subscription_status().method
@@ -1150,15 +1224,20 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
     def _build_subtree_filter(filt: ygdata.FNode) -> xml.Node:
         return xml.Node("filter", attributes=[("type", "subtree")], children=filt.to_filter_xml(deterministic=True))
 
+    def _oper_schema() -> ?yschema.DRoot:
+        # The schema to parse/patch operational data against: the runtime-fetched one
+        # when enabled, else the bundled oper schema.
+        if dmc.feature_flags.runtime_schema_fetch:
+            return schema_registry.get_schema(schema_hash)
+        return bundled_schema.oper_src_dnode
+
     def _parse_data_node(data_tag: xml.Node) -> ?ygdata.Node:
         # Parse a <data> element (from a <get> reply or a push-update's
         # datastore-contents) against the device's schema.
-        if dmc.feature_flags.runtime_schema_fetch:
-            fetched_schema = schema_registry.get_schema(schema_hash)
-            if fetched_schema is not None:
-                return yxml.from_xml(fetched_schema, data_tag, loose=True)
-            return None
-        return yxml.from_xml(bundled_schema.oper_src_dnode, data_tag, loose=True)
+        s = _oper_schema()
+        if s is not None:
+            return yxml.from_xml(s, data_tag, loose=True)
+        return None
 
     def _parse_get_reply(r: ?xml.Node) -> ?ygdata.Node:
         if r is not None:
@@ -1176,6 +1255,32 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             owner.last_merged = merged
             sub_owners[owner_id] = owner
             owner.cb(merged, err)
+
+    def _apply_push_change(spec: ygdata.SubscriptionSpec, sid: int, pcu: yp.PushChangeUpdate):
+        # Replay the push-change-update's yang-patch onto the subscription's latest
+        # tree: edit_to_gdata builds a gdata patch subtree per edit, applied with
+        # gdata.patch (so removes drop nodes), then publish the updated tree.
+        st = subs[spec]
+        yp_xml = pcu.yang_patch
+        root = _oper_schema()
+        if yp_xml is not None and root is not None:
+            try:
+                patch = ypatch.Patch.from_xml(yp_xml)
+                cur: ?ygdata.Node = st.latest if st.latest is not None else ygdata.Container({})
+                for e in patch.edits:
+                    cur = ygdata.patch(cur, ypatch.edit_to_gdata(root, e))
+                st.latest = cur
+                subs[spec] = st
+                for owner_id in st.owners:
+                    _owner_publish(owner_id)
+            except Exception as ex:
+                err = ValueError("unapplicable push-change-update id={sid}: {ex}")
+                for owner_id in st.owners:
+                    _owner_publish(owner_id, err)
+        else:
+            err = ValueError("push-change-update id={sid} with no yang-patch or no device schema")
+            for owner_id in st.owners:
+                _owner_publish(owner_id, err)
 
     def _sub_cancel(spec: ygdata.SubscriptionSpec):
         if spec in subs:
@@ -1218,6 +1323,13 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             return
         if method:
             _yp_ensure(spec)
+        elif st.spec.on_change:
+            # on-change can only be realized by a device that pushes natively; there
+            # is no poll emulation for it, so fail rather than silently degrade.
+            err = ValueError("on-change subscription requires device yang-push support")
+            for owner_id in st.owners:
+                _owner_publish(owner_id, err)
+            _sub_cancel(spec)
         else:
             _sub_tick(spec)
 
@@ -1231,12 +1343,6 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         st = subs[spec]
         if not st.active:
             return
-        period_cs = _period_centiseconds(st.spec.period)
-        if period_cs is None:
-            err = ValueError("yang-push requires a periodic subscription")
-            for owner_id in st.owners:
-                _owner_publish(owner_id, err)
-            return
         c = client
         if c is not None:
             filt_xml: ?list[xml.Node] = None
@@ -1246,7 +1352,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 # it would subscribe to the entire datastore and leak far more
                 # operational data than the subscriber asked for.
                 filt_xml = ygdata.expect(sf, "subscription filter").to_filter_xml(deterministic=True)
-            yp_pending.add(spec)
+
             def on_est(cc: netconf.Client, sid: ?int, err: ?netconf.NetconfError):
                 yp_pending.discard(spec)
                 c2 = client
@@ -1259,7 +1365,21 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     elif sid is not None and spec in subs:
                         yp_subid_spec[sid] = spec
                         yp_spec_subid[spec] = sid
-            c.establish_subscription(on_est, period=period_cs, subtree_filter=filt_xml)
+
+            if st.spec.on_change:
+                # sync-on-start makes the device send a full push-update baseline
+                # first, seeding latest; later push-change-updates apply as deltas.
+                yp_pending.add(spec)
+                c.establish_subscription(on_est, on_change=True, sync_on_start=True, subtree_filter=filt_xml)
+            else:
+                period_cs = _period_centiseconds(st.spec.period)
+                if period_cs is not None:
+                    yp_pending.add(spec)
+                    c.establish_subscription(on_est, period=period_cs, subtree_filter=filt_xml)
+                else:
+                    err = ValueError("yang-push requires a periodic subscription")
+                    for owner_id in st.owners:
+                        _owner_publish(owner_id, err)
 
     def _sub_schedule_next(spec: ygdata.SubscriptionSpec):
         if spec not in subs:
