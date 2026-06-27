@@ -1,37 +1,53 @@
 """Self-contained mock data backend for YANG-push demos and tests.
 
-This deliberately has no dependency on any datastore engine: it is a tiny periodic
-data generator modelling a handful of interface counters, ietf-interfaces style.
-It exists so the same backend can drive both the in-process push demo over an
-actor pipe and the standalone mock server that ncurl connects to.
+This deliberately has no dependency on any datastore engine: it is a tiny data
+generator modelling a handful of interface counters, ietf-interfaces style. It
+exists so the same backend can drive both the in-process push demo over an actor
+pipe and the standalone mock server that ncurl connects to.
 
-InterfaceCountersBackend is the YangPushBackend the publisher pulls from: snapshot
-returns the current counters and sample advances them once and returns the new
-contents. The mutable counter state lives in an actor, with a small class in front
-of it so the publisher gets its values back from a plain call.
+InterfaceCountersBackend is the YangPushBackend the publisher pulls from. It holds
+its state as a gdata tree: snapshot returns the current counters as XML and oper_data
+the same as a gdata tree (for <get>); sample advances them once and returns the new
+XML (periodic). The mutable state lives in an actor, with a small class in front so
+the publisher gets its values back from a plain call.
 """
 
 import std.xml as xml
+
+import yang.gdata as gdata
+
 from yp.engine import YangPushBackend
 
-NS_IF: str = "urn:ietf:params:xml:ns:yang:ietf-interfaces"
+NS_IF: str = "urn:mock:interfaces"
 
 
-def _interface_node(name: str, in_octets: int, out_octets: int) -> xml.Node:
-    return xml.Node("interface", children=[
-        xml.Node("name", text=name),
-        xml.Node("statistics", children=[
-            xml.Node("in-octets", text=str(in_octets)),
-            xml.Node("out-octets", text=str(out_octets))
-        ])
-    ])
+class MockBackend(YangPushBackend):
+    """A YangPushBackend that also exposes its current operational state as a gdata
+    tree, for serving <get> and for overlaying further operational state (e.g. the
+    ietf-yang-library tree) on top of it.
+
+    oper_data is declared via proc here because a concrete class method that awaits
+    an actor call (return self._c.oper_data()) only compiles when the method is
+    declared in a proc-typed parent - otherwise the CPS pass crashes."""
+    oper_data: proc() -> gdata.Node
 
 
-def _interfaces_node(names: list[str], in_octets: dict[str, int], out_octets: dict[str, int]) -> xml.Node:
-    ifaces: list[xml.Node] = []
-    for n in names:
-        ifaces.append(_interface_node(n, in_octets[n], out_octets[n]))
-    return xml.Node("interfaces", nsdefs=[(None, NS_IF)], children=ifaces)
+def _tree(if_names: list[str], in_octets: dict[str, int], out_octets: dict[str, int]) -> gdata.Container:
+    """Build the interface-counters gdata tree for the current counter values.
+
+    ns on the top container gives the periodic push-update its xmlns; the leaf
+    namespaces come from each Id, so the tree filters and renders against the
+    mock-interfaces schema."""
+    entries: list[gdata.Node] = []
+    for n in if_names:
+        entries.append(gdata.Container({
+            gdata.Id(NS_IF, "name"): gdata.Leaf(n),
+            gdata.Id(NS_IF, "in-octets"): gdata.Leaf(in_octets[n]),
+            gdata.Id(NS_IF, "out-octets"): gdata.Leaf(out_octets[n]),
+        }))
+    iflist = gdata.List([gdata.Id(NS_IF, "name")], entries)
+    return gdata.Container({gdata.Id(NS_IF, "interfaces"):
+        gdata.Container({gdata.Id(NS_IF, "interface"): iflist}, ns=NS_IF)})
 
 
 actor _Counters(if_names: list[str], in_step: int, out_step: int):
@@ -43,24 +59,33 @@ actor _Counters(if_names: list[str], in_step: int, out_step: int):
         in_octets[_n] = 0
         out_octets[_n] = 0
 
-    def snapshot() -> list[xml.Node]:
-        return [_interfaces_node(if_names, in_octets, out_octets)]
-
-    def sample() -> list[xml.Node]:
+    def _advance() -> None:
         for n in if_names:
             in_octets[n] = in_octets[n] + in_step
             out_octets[n] = out_octets[n] + out_step
-        return [_interfaces_node(if_names, in_octets, out_octets)]
+
+    def snapshot() -> list[xml.Node]:
+        return _tree(if_names, in_octets, out_octets).to_xml(deterministic=True)
+
+    def oper_data() -> gdata.Container:
+        return _tree(if_names, in_octets, out_octets)
+
+    def sample() -> list[xml.Node]:
+        _advance()
+        return _tree(if_names, in_octets, out_octets).to_xml(deterministic=True)
 
 
-class InterfaceCountersBackend(YangPushBackend):
-    """A mock backend whose per-interface octet counters increase on each sample."""
+class InterfaceCountersBackend(MockBackend):
+    """A mock backend whose per-interface octet counters increase on each pull."""
 
     def __init__(self, if_names: list[str], in_step: int=100, out_step: int=200):
         self._c = _Counters(if_names, in_step, out_step)
 
     def snapshot(self) -> list[xml.Node]:
         return self._c.snapshot()
+
+    def oper_data(self) -> gdata.Node:
+        return self._c.oper_data()
 
     def sample(self) -> list[xml.Node]:
         return self._c.sample()
