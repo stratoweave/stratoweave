@@ -1,9 +1,12 @@
 """In-process YANG-push demo/test over an actor pipe.
 
 A mock NETCONF Server (driven by a self-contained InterfaceCountersBackend via a
-YangPushPublisher) and a Client are wired together with actor_pipe_pair(). The
-client establishes a periodic subscription and asserts that repeated push-update
-snapshots arrive, then deletes it.
+YangPushPublisher) and a Client are wired together with actor_pipe_pair(). One test
+establishes a periodic subscription and asserts repeated push-update snapshots
+arrive; another establishes an on-change subscription and asserts the
+push-change-update notifications carry an RFC 8072 yang-patch with merge edits for
+the advancing counters — a full wire round-trip of the delta path. Both then delete
+the subscription.
 
 Pure NETCONF library bits — no sockets, no TTT. Exercises the Client's
 establish_subscription / delete_subscription helpers end-to-end.
@@ -17,6 +20,7 @@ import netconf
 import yp
 import yp.mock_backend as mb
 import netconf.yp as yn
+import yang.ypatch as ypatch
 
 
 actor _test_yangpush_periodic(t: testing.EnvT):
@@ -81,6 +85,109 @@ actor _test_yangpush_periodic(t: testing.EnvT):
 
     def _on_timeout() -> None:
         _fail(ValueError("Timed out: updates={updates}"))
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    service = yn.NetconfSubscriptionService(server, backend, log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=_on_connect,
+                            on_notif=_on_notif,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    after 10.0: _on_timeout()
+
+
+def _counter_merge_edits(p: ypatch.Patch) -> int:
+    """Count yang-patch merge edits that target an interface octet counter."""
+    n = 0
+    for e in p.edits:
+        last = e.target.split("/")[-1]
+        if e.operation == ypatch.OP_MERGE and (last == "in-octets" or last == "out-octets"):
+            n += 1
+    return n
+
+
+actor _test_yangpush_on_change(t: testing.EnvT):
+    """Client subscribes on-change; expect push-change-update notifications whose
+    yang-patch carries merge edits for the advancing counters."""
+    log = logging.Logger(t.log_handler)
+    pipes = netconf.actor_pipe_pair()
+
+    var service: ?yn.NetconfSubscriptionService = None
+    var changes = 0
+    var done = False
+    var sub_id_seen: ?int = None
+
+    backend = mb.InterfaceCountersBackend(["eth0"])
+
+    def _fail(e: Exception) -> None:
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_deleted(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if not done:
+            done = True
+            c.close(None)
+            log.info("on-change push demo ok: changes={changes}")
+            t.success()
+
+    def _on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        if yp.is_subscription_rpc(op.tag):
+            if service is not None:
+                service.handle_rpc(message_id, op)
+        else:
+            s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        pcu = yp.parse_push_change_update(notif)
+        if pcu is not None:
+            yp_node = pcu.yang_patch
+            if yp_node is not None:
+                patch = ypatch.Patch.from_xml(yp_node)
+                if _counter_merge_edits(patch) >= 1:
+                    changes += 1
+                    sub_id_seen = pcu.sub_id
+                    log.info("push-change-update id={pcu.sub_id} changes={changes} edits={len(patch.edits)}")
+                    if changes >= 3 and not done:
+                        sid = sub_id_seen
+                        if sid is not None:
+                            c.delete_subscription(_on_deleted, sid)
+                    elif not done:
+                        _trigger()
+                    return
+                _fail(ValueError("push-change-update yang-patch carried no counter merge edit"))
+                return
+            _fail(ValueError("push-change-update missing yang-patch"))
+            return
+        _fail(ValueError("Unexpected notification: " + notif.encode()))
+
+    def _trigger() -> None:
+        # On-change is event-driven: ask the server-side service to emit a delta.
+        if service is not None:
+            service.trigger_change()
+
+    def _on_sub(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+        elif sub_id is None:
+            _fail(ValueError("establish-subscription returned no id"))
+        else:
+            sub_id_seen = sub_id
+            _trigger()
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            _fail(ValueError("connect failed: " + str(e)))
+        else:
+            c.establish_subscription(_on_sub, on_change=True)
+
+    def _on_timeout() -> None:
+        _fail(ValueError("Timed out: changes={changes}"))
 
     server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
     service = yn.NetconfSubscriptionService(server, backend, log_handler=t.log_handler)
