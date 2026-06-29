@@ -1,4 +1,5 @@
 import diff
+import file
 import json
 import logging
 import net
@@ -43,7 +44,7 @@ class DeviceType(object):
         self.adapter_type = adapter_type
         self.bundled_schema = DeviceSchema(name, src_dnode, oper_src_dnode)
 
-actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnectCap=None, log_handler: logging.Handler):
+actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnectCap=None, log_handler: logging.Handler, file_cap: ?file.FileCap=None):
     """Device Registry keeps track of all devices and hands out references to
     them based on name.
 
@@ -54,7 +55,7 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPC
 
     var devices_needing_approval = {}
 
-    schema_registry = SchemaRegistry()
+    schema_registry = SchemaRegistry(file_cap)
 
     action def _dummy_reconf(name: str):
         # Dummy reconf callback, used to avoid None
@@ -100,7 +101,7 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPC
         return devices_needing_approval
 
 
-actor SchemaRegistry():
+actor SchemaRegistry(file_cap: ?file.FileCap=None):
     var store: dict[u64, yschema.DRoot] = {}
 
     def _list_hash(l: list[str]) -> u64:
@@ -109,11 +110,81 @@ actor SchemaRegistry():
             h.update(le.encode())
         return h.finalize()
 
+    def _schema_bundle_cache_path(cache_key: str) -> ?str:
+        if file_cap is None:
+            return None
+
+        fs = file.FS(file_cap!)
+
+        def mkdir(path: str):
+            try:
+                fs.mkdir(path)
+            except OSError as err:
+                if "already exists" not in err.error_message:
+                    raise err
+
+        cache_root = file.join_path([fs.homedir(), ".cache"])
+        stratoweave_root = file.join_path([cache_root, "stratoweave"])
+        bundle_root = file.join_path([stratoweave_root, "netconf-schema-bundles"])
+        mkdir(cache_root)
+        mkdir(stratoweave_root)
+        mkdir(bundle_root)
+        return file.join_path([bundle_root, "{cache_key}.json"])
+
+    def get_schema_bundle(cache_key: str) -> (schemas: ?list[str], error: ?Exception):
+        if file_cap is None:
+            return (schemas=None, error=None)
+        try:
+            cache_path = _schema_bundle_cache_path(cache_key)
+            if cache_path is None:
+                return (schemas=None, error=None)
+            rf = None
+            try:
+                rf = file.ReadFile(file.ReadFileCap(file_cap!), cache_path!)
+            except FileNotFoundError:
+                return (schemas=None, error=None)
+
+            if rf is None:
+                return (schemas=None, error=None)
+            json_content = rf!.read().decode()
+            rf!.close()
+            payload = json.decode(json_content)
+            if isinstance(payload, dict):
+                version = payload.get("version")
+                sources_data = payload.get("sources")
+                if isinstance(version, int) and version == 1 and isinstance(sources_data, list):
+                    sources = []
+                    for source in sources_data:
+                        if not isinstance(source, str):
+                            raise ValueError("Invalid schema bundle cache entry")
+                        sources.append(source)
+                    return (schemas=sources, error=None)
+            raise ValueError("Invalid schema bundle cache entry")
+        except Exception as e:
+            return (schemas=None, error=e)
+
+    def put_schema_bundle(cache_key: str, sources: list[str]) -> ?Exception:
+        if file_cap is None:
+            return None
+        try:
+            cache_path = _schema_bundle_cache_path(cache_key)
+            if cache_path is None:
+                return None
+            payload = json.encode({"version": 1, "sources": sources}, pretty=False)
+            wf = file.WriteFile(file.WriteFileCap(file_cap!), cache_path!)
+            wf.write(payload.encode())
+            wf.close()
+        except Exception as e:
+            return e
+
     def add_schema(yang_src: list[str]) -> (hash: ?u64, error: ?Exception):
         content_hash = _list_hash(yang_src)
         if content_hash not in store:
             try:
-                compiled_schema = yang.compile(yang_src, strict_quoting=False)
+                if file_cap is not None:
+                    compiled_schema = yang.compile_with_cache(yang_src, strict_quoting=False, fc=file_cap!)
+                else:
+                    compiled_schema = yang.compile(yang_src, strict_quoting=False)
                 store[content_hash] = compiled_schema
             except Exception as e:
                 # Schema compilation failed, return error

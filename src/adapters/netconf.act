@@ -49,6 +49,68 @@ XPATH_PREFERRED_PREFIXES = {
     "urn:ietf:params:xml:ns:yang:ietf-yang-library": "yanglib",
 }
 
+def _schema_bundle_cache_key(
+    capabilities: list[str],
+    schema_list: list[(identifier: str, namespace: str, version: str, format: str)],
+    schemas_to_download: list[(identifier: str, version: ?str, format: ?str)],
+    module_sets: list[str]
+) -> str:
+    lines = ["stratoweave-netconf-schema-bundle-v1"]
+    for cap in sorted(capabilities):
+        lines.append("cap\t" + cap)
+    for module_set in sorted(module_sets):
+        lines.append("module-set\t" + module_set)
+    schema_records = []
+    for s in schema_list:
+        schema_records.append("schema\t{s.identifier}\t{s.namespace}\t{s.version}\t{s.format}")
+    for record in sorted(schema_records):
+        lines.append(record)
+    download_records = []
+    for s in schemas_to_download:
+        version = s.version if s.version is not None else ""
+        format = s.format if s.format is not None else ""
+        download_records.append("download\t{s.identifier}\t{version}\t{format}")
+    for record in sorted(download_records):
+        lines.append(record)
+    return str(wyhash.hash(0, "\n".join(lines).encode()))
+
+
+def _test_schema_bundle_cache_key_ignores_advertisement_order():
+    capabilities1 = ["cap-b", "cap-a"]
+    capabilities2 = ["cap-a", "cap-b"]
+    schemas1 = [
+        (identifier="mod-b", namespace="urn:b", version="2024-01-01", format="yang"),
+        (identifier="mod-a", namespace="urn:a", version="2024-01-02", format="yang"),
+    ]
+    schemas2 = [
+        (identifier="mod-a", namespace="urn:a", version="2024-01-02", format="yang"),
+        (identifier="mod-b", namespace="urn:b", version="2024-01-01", format="yang"),
+    ]
+    downloads1 = [
+        (identifier="mod-b", version="2024-01-01", format="yang"),
+        (identifier="mod-a", version="2024-01-02", format="yang"),
+    ]
+    downloads2 = [
+        (identifier="mod-a", version="2024-01-02", format="yang"),
+        (identifier="mod-b", version="2024-01-01", format="yang"),
+    ]
+    testing.assertEqual(_schema_bundle_cache_key(capabilities1, schemas1, downloads1, ["no-openconfig"]),
+                        _schema_bundle_cache_key(capabilities2, schemas2, downloads2, ["no-openconfig"]))
+
+
+def _test_schema_bundle_cache_key_includes_download_set():
+    schemas = [
+        (identifier="mod-a", namespace="urn:a", version="2024-01-02", format="yang"),
+        (identifier="mod-b", namespace="urn:b", version="2024-01-01", format="yang"),
+    ]
+    key1 = _schema_bundle_cache_key(["cap-a"], schemas, [
+        (identifier="mod-a", version="2024-01-02", format="yang"),
+    ], ["ietf"])
+    key2 = _schema_bundle_cache_key(["cap-a"], schemas, [
+        (identifier="mod-b", version="2024-01-01", format="yang"),
+    ], ["ietf"])
+    testing.assertEqual(key1 == key2, False)
+
 def extract_txid(conf: ?xml.Node) -> ?str:
     """Attempt to extract a txid from configuration
 
@@ -702,6 +764,8 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         schemas = []
         sw = time.Stopwatch()
         schema_getter: ?netconf.SchemaGetter = None
+        schema_cache_key: ?str = None
+        schema_download_failed = False
         schema_modset: dict[str, ModCap] = {}
 
         def finish_connect(new_modset: dict[str, ModCap], new_schema_hash: ?u64=None):
@@ -774,6 +838,15 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 finish_connect(schema_modset)
                 return
             _log.debug("Device._on_connect: found schemas to download", {"count": len(schemas_to_download)})
+            schema_cache_key = _schema_bundle_cache_key(c.get_capabilities(), schema_list, schemas_to_download, RUNTIME_SCHEMA_MODULE_SETS)
+            cached = schema_registry.get_schema_bundle(schema_cache_key!)
+            if cached.error is not None:
+                _log.warning("Device._on_connect: failed to load cached schema bundle", {"error": str(cached.error)})
+            elif cached.schemas is not None:
+                schemas = cached.schemas!
+                _log.debug("Device._on_connect: using cached schema bundle", {"key": schema_cache_key!, "count": len(schemas)})
+                compile_schemas()
+                return
             schema_getter = netconf.SchemaGetter(c1)
             schema_getter.download(schema_download, download_complete, schemas_to_download)
 
@@ -783,11 +856,24 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 return
             if error is not None:
                 _log.error("Device._on_connect: error downloading schema", {"error": str(error), "identifier": schema_id.identifier})
+                schema_download_failed = True
             elif schema_data is None:
                 _log.error("Device._on_connect: error downloading schema", {"error": "empty schema data", "identifier": schema_id.identifier})
+                schema_download_failed = True
             elif schema_data is not None:
                 _log.debug("Device._on_connect: downloaded schema", {"index": index, "total": total, "identifier": schema_id.identifier})
                 schemas.append(schema_data)
+
+        def compile_schemas():
+            sw.reset()
+            result = schema_registry.add_schema(schemas)
+            if result.error is not None:
+                _log.error("Device._on_connect: failed to compile schemas", {"error": str(result.error)})
+                finish_connect(schema_modset)
+            else:
+                schema_hash = result.hash
+                _log.debug("Device._on_connect: compiled schemas", {"duration": sw.elapsed().to_float()})
+                finish_connect(schema_modset, schema_hash)
 
         def download_complete(sg, error=None):
             if schema_getter is not None and sg is not None and sg is not schema_getter:
@@ -799,15 +885,14 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 after 1: c.restart()
             else:
                 _log.debug("Device._on_connect: finished downloading schemas", {"duration": sw.elapsed().to_float()})
-                sw.reset()
-                result = schema_registry.add_schema(schemas)
-                if result.error is not None:
-                    _log.error("Device._on_connect: failed to compile schemas", {"error": str(result.error)})
-                    finish_connect(schema_modset)
-                else:
-                    schema_hash = result.hash
-                    _log.debug("Device._on_connect: compiled schemas", {"duration": sw.elapsed().to_float()})
-                    finish_connect(schema_modset, schema_hash)
+                if schema_cache_key is not None:
+                    if schema_download_failed:
+                        _log.warning("Device._on_connect: not storing partial schema bundle cache", {"downloaded": len(schemas)})
+                    else:
+                        cache_error = schema_registry.put_schema_bundle(schema_cache_key!, schemas)
+                        if cache_error is not None:
+                            _log.warning("Device._on_connect: failed to store schema bundle cache", {"error": str(cache_error)})
+                compile_schemas()
 
         if err is not None:
             if state == CONNECTING:
