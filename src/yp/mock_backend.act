@@ -6,19 +6,24 @@ exists so the same backend can drive both the in-process push demo over an actor
 pipe and the standalone mock server that ncurl connects to.
 
 InterfaceCountersBackend is the YangPushBackend the publisher pulls from. It holds
-its state as a gdata tree: snapshot returns the current counters as XML and oper_data
-the same as a gdata tree (for <get>); sample advances them once and returns the new
-XML (periodic). The mutable state lives in an actor, with a small class in front so
-the publisher gets its values back from a plain call.
+its state as a gdata tree so it can serve every pull from one source: snapshot
+returns the current counters as XML and oper_data the same as a gdata tree (for
+<get>); sample advances them once and returns the new XML (periodic); and change
+advances them once and returns an RFC 8072 yang-patch of the delta (on-change) by
+running gdata.diff over the before/after trees and rendering it with ypatch. The
+mutable state lives in an actor, with a small class in front so the publisher gets
+its values back from a plain call.
 """
 
 import std.xml as xml
 
 import yang.gdata as gdata
+import yang.ypatch as ypatch
 
 from yp.engine import YangPushBackend
 
 NS_IF: str = "urn:mock:interfaces"
+MOD_IF: str = "mock-interfaces"
 
 
 class MockBackend(YangPushBackend):
@@ -35,9 +40,10 @@ class MockBackend(YangPushBackend):
 def _tree(if_names: list[str], in_octets: dict[str, int], out_octets: dict[str, int]) -> gdata.Container:
     """Build the interface-counters gdata tree for the current counter values.
 
-    ns on the top container gives the periodic push-update its xmlns; the leaf
-    namespaces come from each Id, so the tree filters and renders against the
-    mock-interfaces schema."""
+    ns gives the periodic push-update its xmlns. module is set on the interfaces
+    container — the root->interfaces namespace boundary — so the on-change yang-patch
+    targets are module-qualified (/mock-interfaces:interfaces/...) and resolve against
+    a schema that also carries ietf-interfaces' /interfaces."""
     entries: list[gdata.Node] = []
     for n in if_names:
         entries.append(gdata.Container({
@@ -47,13 +53,14 @@ def _tree(if_names: list[str], in_octets: dict[str, int], out_octets: dict[str, 
         }))
     iflist = gdata.List([gdata.Id(NS_IF, "name")], entries)
     return gdata.Container({gdata.Id(NS_IF, "interfaces"):
-        gdata.Container({gdata.Id(NS_IF, "interface"): iflist}, ns=NS_IF)})
+        gdata.Container({gdata.Id(NS_IF, "interface"): iflist}, ns=NS_IF, module=MOD_IF)})
 
 
 actor _Counters(if_names: list[str], in_step: int, out_step: int):
-    """Holds the mutable per-interface counters and produces snapshots/samples."""
+    """Holds the mutable per-interface counters and produces snapshots/samples/changes."""
     var in_octets: dict[str, int] = {}
     var out_octets: dict[str, int] = {}
+    var patch_seq: int = 0
 
     for _n in if_names:
         in_octets[_n] = 0
@@ -74,6 +81,16 @@ actor _Counters(if_names: list[str], in_step: int, out_step: int):
         _advance()
         return _tree(if_names, in_octets, out_octets).to_xml(deterministic=True)
 
+    def change() -> ?xml.Node:
+        old = _tree(if_names, in_octets, out_octets)
+        _advance()
+        new = _tree(if_names, in_octets, out_octets)
+        d = gdata.diff(old, new)
+        if d is not None:
+            patch_seq += 1
+            return ypatch.diff_to_patch(d, "patch" + str(patch_seq)).to_xml()
+        return None
+
 
 class InterfaceCountersBackend(MockBackend):
     """A mock backend whose per-interface octet counters increase on each pull."""
@@ -89,3 +106,6 @@ class InterfaceCountersBackend(MockBackend):
 
     def sample(self) -> list[xml.Node]:
         return self._c.sample()
+
+    def change(self) -> ?xml.Node:
+        return self._c.change()

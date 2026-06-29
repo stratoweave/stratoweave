@@ -348,6 +348,191 @@ actor _test_subscribe_periodic(t: testing.EnvT):
     after 2.0: fail("Timed out waiting for periodic subscription updates")
 
 
+# The ietf-yang-push import closure (minus ietf-yang-library, so the mock advertises
+# per-module caps and the client discovers ietf-yang-push directly): enough for the
+# mock to advertise yang-push so the adapter establishes a real on-change subscription.
+YP_CLOSURE: list[str] = [
+    swyang.ietf_datastores,
+    swyang.ietf_yang_types,
+    swyang.ietf_inet_types,
+    swyang.ietf_yang_push,
+    swyang.ietf_subscribed_notifications,
+    swyang.ietf_restconf,
+    swyang.ietf_yang_patch,
+    swyang.ietf_interfaces,
+    swyang.ietf_netconf_acm,
+    swyang.ietf_network_instance,
+    swyang.ietf_ip,
+    swyang.ietf_yang_schema_mount,
+]
+
+
+actor _test_subscribe_on_change(t: testing.EnvT):
+    """On-change subscription via the device adapter against a yang-push-capable mock.
+
+    1. DeviceMgr in mock mode whose schema advertises ietf-yang-push, so the adapter
+       establishes a real on-change subscription (not poll emulation).
+    2. Seed oper data and subscribe on-change; the sync-on-start baseline is update 1.
+    3. On the baseline, mutate the oper datastore once; the mock emits a
+       push-change-update whose yang-patch the adapter applies onto the subscription
+       tree.
+    4. On update 2, assert the applied current-datetime, then tear down.
+    """
+    mock_current_datetime_1 = "2026-02-21T10:11:12Z"
+    mock_current_datetime_2 = "2026-02-21T10:11:13Z"
+    mock_boot_datetime = "2025-12-31T00:00:00Z"
+
+    var updates = 0
+    var done = False
+    var mock_server: ?swna.NetconfMockServer = None
+
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-onchange", noop_on_reconf, extra_models=YP_CLOSURE)
+
+    def fail(msg: str):
+        if done:
+            return
+        done = True
+        t.failure(ValueError(msg))
+
+    def succeed():
+        if done:
+            return
+        done = True
+        t.success()
+
+    def on_update(n: ?ygdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail("Subscription update error: {err}")
+            return
+        dt = _current_datetime_from_tree(n)
+        if dt is None:
+            fail("Subscription update missing current-datetime")
+            return
+
+        updates += 1
+        if updates == 1:
+            if dt != mock_current_datetime_1:
+                fail("Unexpected baseline datetime: {dt}")
+                return
+            ms = mock_server
+            if ms is not None:
+                ms.set_oper_ds(_mock_oper_ds(mock_current_datetime_2, mock_boot_datetime))
+            else:
+                fail("Missing mock server for on-change update")
+                return
+        elif updates == 2:
+            if dt != mock_current_datetime_2:
+                fail("Unexpected on-change datetime: {dt}")
+                return
+            dev.remove_subscriptions("test-subscribe-on-change")
+            succeed()
+        else:
+            fail("Unexpected extra subscription update: {updates}")
+
+    def start():
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            mock_server = adapter.get_mock_server()
+            ms = mock_server
+            if ms is not None:
+                ms.set_oper_ds(_mock_oper_ds(mock_current_datetime_1, mock_boot_datetime))
+                want = set([ygdata.SubscriptionSpec(None, on_change=True)])
+                dev.declare_subscriptions("test-subscribe-on-change", on_update, want)
+            else:
+                fail("Expected NetconfMockServer from NetconfAdapter")
+                return
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    start()
+
+    after 2.0: fail("Timed out waiting for on-change subscription updates")
+
+
+actor _test_subscribe_periodic_yang_push(t: testing.EnvT):
+    """Periodic subscription that rides real yang-push (not poll emulation) because
+    the mock advertises ietf-yang-push: exercises the adapter's push-update path with
+    a device that pushes natively, the counterpart to _test_subscribe_periodic's poll
+    emulation."""
+    mock_current_datetime_1 = "2026-02-21T10:11:12Z"
+    mock_current_datetime_2 = "2026-02-21T10:11:13Z"
+    mock_boot_datetime = "2025-12-31T00:00:00Z"
+
+    var updates = 0
+    var done = False
+    var mock_server: ?swna.NetconfMockServer = None
+
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-periodic-push", noop_on_reconf, extra_models=YP_CLOSURE)
+
+    def fail(msg: str):
+        if done:
+            return
+        done = True
+        t.failure(ValueError(msg))
+
+    def succeed():
+        if done:
+            return
+        done = True
+        t.success()
+
+    def on_update(n: ?ygdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail("Subscription update error: {err}")
+            return
+        dt = _current_datetime_from_tree(n)
+        if dt is None:
+            fail("Subscription update missing current-datetime")
+            return
+
+        updates += 1
+        if updates == 1:
+            if dt != mock_current_datetime_1:
+                fail("Unexpected first datetime: {dt}")
+                return
+            ms = mock_server
+            if ms is not None:
+                ms.set_oper_ds(_mock_oper_ds(mock_current_datetime_2, mock_boot_datetime))
+            else:
+                fail("Missing mock server for subscription update")
+                return
+        elif updates == 2:
+            if dt != mock_current_datetime_2:
+                fail("Unexpected second datetime: {dt}")
+                return
+            dev.remove_subscriptions("test-periodic-push")
+            succeed()
+        else:
+            fail("Unexpected extra subscription update: {updates}")
+
+    def start():
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            mock_server = adapter.get_mock_server()
+            ms = mock_server
+            if ms is not None:
+                ms.set_oper_ds(_mock_oper_ds(mock_current_datetime_1, mock_boot_datetime))
+                want = set([ygdata.SubscriptionSpec(None, period=0.05)])
+                dev.declare_subscriptions("test-periodic-push", on_update, want)
+            else:
+                fail("Expected NetconfMockServer from NetconfAdapter")
+                return
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    start()
+
+    after 2.0: fail("Timed out waiting for periodic yang-push subscription updates")
+
+
 actor _test_subscription_manager_declare(t: testing.EnvT):
     """Declarative subscription manager over NETCONF mock subscriptions."""
     mock_current_datetime_1 = "2026-02-21T10:11:12Z"

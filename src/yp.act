@@ -5,13 +5,15 @@ dynamic subscriptions and their push notifications. It has no dependency on
 NETCONF (or any transport), so it is reused by the NETCONF client/server, a future
 RESTCONF binding, and tests alike.
 
-Scope: periodic subscriptions only. The push payload is the full datastore
-snapshot (push-update). On-change subscriptions and their yang-patch deltas
-(push-change-update) are out of scope here and rejected by the server.
+Scope: periodic and on-change subscriptions. A periodic push carries the full
+datastore snapshot (push-update); an on-change push carries an RFC 8072 yang-patch
+of what changed (push-change-update). This module only frames the XML around a
+yang-patch — the patch itself is built by the caller (acton-yang's ypatch from a
+gdata.diff) and embedded here, so yp keeps no dependency on the schema or gdata.
 
 Layering:
   - yp.engine adds the transport-agnostic YangPushPublisher actor that drives
-    periodic emission using these builders.
+    periodic and on-change emission using these builders.
   - netconf adds thin Client.establish_subscription / delete_subscription helpers;
     netconf.yp is the server-side NETCONF (RFC 8640) binding.
 
@@ -40,15 +42,25 @@ DATASTORE_RUNNING: str = "running"
 class EstablishParams(object):
     """Parsed parameters of an incoming <establish-subscription> (server side).
 
-    The filter is not captured here; a binding that cannot honour a filter rejects
-    a request that carries one. datastore is captured but not enforced here.
+    A subscription is either periodic (periodic_period set) or on-change (on_change
+    True, with optional dampening_period and sync_on_start). The filter is not
+    captured here; a binding that cannot honour a filter rejects a request that
+    carries one. datastore is captured but not enforced here.
     """
     datastore: ?str
-    periodic_period: ?int   # centiseconds; None if no <period> was given
+    periodic_period: ?int    # centiseconds; None if no <period> was given
+    on_change: bool          # True if an <on-change> element was present
+    dampening_period: ?int   # centiseconds; on-change only, None if absent
+    sync_on_start: bool      # on-change: send a full baseline before deltas
 
-    def __init__(self, datastore: ?str, periodic_period: ?int):
+    def __init__(self, datastore: ?str, periodic_period: ?int,
+                 on_change: bool=False, dampening_period: ?int=None,
+                 sync_on_start: bool=False):
         self.datastore = datastore
         self.periodic_period = periodic_period
+        self.on_change = on_change
+        self.dampening_period = dampening_period
+        self.sync_on_start = sync_on_start
 
 
 class PushUpdate(object):
@@ -61,6 +73,18 @@ class PushUpdate(object):
         self.sub_id = sub_id
         self.event_time = event_time
         self.contents = contents
+
+
+class PushChangeUpdate(object):
+    """Parsed push-change-update notification (an on-change yang-patch delta)."""
+    sub_id: ?int
+    event_time: ?str
+    yang_patch: ?xml.Node   # the <yang-patch> element from <datastore-changes>
+
+    def __init__(self, sub_id: ?int, event_time: ?str, yang_patch: ?xml.Node):
+        self.sub_id = sub_id
+        self.event_time = event_time
+        self.yang_patch = yang_patch
 
 
 # ----------------------------------------------------------------------------
@@ -76,11 +100,17 @@ def build_establish_subscription(
         datastore: str=DATASTORE_OPERATIONAL,
         subtree_filter: ?list[xml.Node]=None,
         xpath_filter: ?str=None,
-        period: ?int=None) -> xml.Node:
-    """Build a periodic <establish-subscription> operation node (RFC 8639 + 8641).
+        period: ?int=None,
+        on_change: bool=False,
+        dampening_period: ?int=None,
+        sync_on_start: bool=False) -> xml.Node:
+    """Build an <establish-subscription> operation node (RFC 8639 + 8641).
 
-    A filter is optional; pass either subtree_filter (the filter's top-level data
-    nodes, each carrying its own module namespace) or xpath_filter.
+    Pass period (centiseconds) for a periodic subscription, or on_change=True for an
+    on-change one (optionally with dampening_period centiseconds and sync_on_start).
+    on-change takes precedence if both are given. A filter is optional; pass either
+    subtree_filter (the filter's top-level data nodes, each carrying its own module
+    namespace) or xpath_filter.
     """
     children: list[xml.Node] = []
 
@@ -97,7 +127,14 @@ def build_establish_subscription(
         children.append(xml.Node("datastore-xpath-filter", nsdefs=[(None, NS_YP)],
             text=xpath_filter))
 
-    if period is not None:
+    if on_change:
+        oc_children: list[xml.Node] = []
+        if dampening_period is not None:
+            oc_children.append(xml.Node("dampening-period", text=str(dampening_period)))
+        if sync_on_start:
+            oc_children.append(xml.Node("sync-on-start"))
+        children.append(xml.Node("on-change", nsdefs=[(None, NS_YP)], children=oc_children))
+    elif period is not None:
         children.append(xml.Node("periodic", nsdefs=[(None, NS_YP)], children=[
             xml.Node("period", text=str(period))
         ]))
@@ -133,6 +170,17 @@ def build_push_update(sub_id: int, contents: list[xml.Node]) -> xml.Node:
     return xml.Node("push-update", nsdefs=[(None, NS_YP)], children=[
         xml.Node("id", text=str(sub_id)),
         xml.Node("datastore-contents", children=contents)
+    ])
+
+
+def build_push_change_update(sub_id: int, yang_patch: xml.Node) -> xml.Node:
+    """Build a <push-change-update> payload wrapping an RFC 8072 <yang-patch>.
+
+    yang_patch is a fully-built <yang-patch> element — e.g. from acton-yang's
+    ypatch.diff_to_patch(...).to_xml() — and rides inside <datastore-changes>."""
+    return xml.Node("push-change-update", nsdefs=[(None, NS_YP)], children=[
+        xml.Node("id", text=str(sub_id)),
+        xml.Node("datastore-changes", children=[yang_patch])
     ])
 
 
@@ -199,11 +247,30 @@ def parse_push_update(notif: xml.Node) -> ?PushUpdate:
     return None
 
 
+def parse_push_change_update(notif: xml.Node) -> ?PushChangeUpdate:
+    """Parse a <notification> whose payload is a <push-change-update>, else None.
+
+    The yang_patch field is the <yang-patch> element carried in <datastore-changes>;
+    feed it to ypatch.Patch.from_xml to read the edits."""
+    payload = notification_payload(notif)
+    if payload is not None:
+        if payload.tag == "push-change-update":
+            sub_id = _parse_int(_text_of(_child_by_tag(payload, "id")))
+            dc = _child_by_tag(payload, "datastore-changes")
+            yang_patch = _child_by_tag(dc, "yang-patch")
+            return PushChangeUpdate(sub_id, notification_event_time(notif), yang_patch)
+    return None
+
+
 def parse_establish_subscription(op: xml.Node) -> EstablishParams:
     """Parse an incoming <establish-subscription> operation node (server side)."""
     datastore = _text_of(_child_by_tag(op, "datastore"))
     period = _parse_int(_text_of(_child_by_tag(_child_by_tag(op, "periodic"), "period")))
-    return EstablishParams(datastore, period)
+    oc = _child_by_tag(op, "on-change")
+    on_change = oc is not None
+    dampening_period = _parse_int(_text_of(_child_by_tag(oc, "dampening-period")))
+    sync_on_start = _child_by_tag(oc, "sync-on-start") is not None
+    return EstablishParams(datastore, period, on_change, dampening_period, sync_on_start)
 
 
 def parse_delete_subscription(op: xml.Node) -> ?int:

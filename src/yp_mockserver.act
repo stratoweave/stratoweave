@@ -6,19 +6,22 @@ backed by the InterfaceCountersBackend mock data generator — no datastore engi
 real NETCONF/SSH server and stream pushes of generated data.
 
 Each accepted SSH session gets its own netconf.Server + a NetconfSubscriptionService
-wired to its own InterfaceCountersBackend, so subscribers are independent.
+wired to its own InterfaceCountersBackend, so subscribers are independent. It serves
+periodic subscriptions (timer-driven push-update) and on-change subscriptions
+(push-change-update carrying a yang-patch). On-change is event-driven: press Enter
+on the server's stdin to trigger a change, and every on-change subscriber gets a
+push-change-update with the delta.
 
 The mock has a real schema (a small mock-interfaces module compiled with the
-ietf-yang-library and ietf-yang-push closures), so it is a proper discoverable
-NETCONF server: it advertises and serves ietf-yang-library and answers <get-schema>
-with module source, so a client like ncurl can discover the schema, fetch it, and
-render the data. Because ietf-yang-push is in the advertised module set, the client
-establishes a real yang-push subscription rather than falling back to periodic <get>
-polling. A plain <get> returns the interface-counters operational data merged with
-the ietf-yang-library tree, subtree-filtered.
+ietf-yang-library closure), so it is a proper discoverable NETCONF server: it
+advertises and serves ietf-yang-library (via monitoring.build_yang_library) and
+answers <get-schema> with module source, so a client like ncurl can discover the
+schema, fetch it, and render the data. A plain <get> returns the interface-counters
+operational data merged with the ietf-yang-library tree, subtree-filtered.
 
 Run:  yp_mockserver [--address ::] [--port 12830] [--username admin]
                     [--password admin] [--interfaces eth0,eth1] [--verbose]
+Press Enter to trigger an on-change update; 'q' then Enter to quit.
 """
 
 import argparse
@@ -141,6 +144,11 @@ class OperBackend(mb.MockBackend):
             return ygdata.merge(base, yl)
         return base
 
+    def change(self) -> ?xml.Node:
+        # The yang-library tree is static, so an on-change delta is just the counter
+        # change the inner backend produces.
+        return self._counters.change()
+
 
 actor StaticAuthChecker(expected_user: str, expected_password: str):
     """A single static username + password SSH auth check."""
@@ -193,6 +201,12 @@ actor YpMockSession(pipe,
         else:
             s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: " + op.tag)
 
+    def trigger_change() -> None:
+        """Emit on-change push-change-updates to this session's subscribers, from
+        the backend's current delta."""
+        if service is not None:
+            service.trigger_change()
+
     def _on_conn(s: netconf.Server, err: ?Exception):
         if err is not None:
             sv = service
@@ -232,6 +246,12 @@ actor YpMockServer(listen_cap: net.TCPListenCap,
         _log.info("session accepted")
         sessions.append(YpMockSession(p, log_handler, if_names, ms, on_close=_session_closed))
 
+    def trigger_all() -> None:
+        """Trigger an on-change update on every active session."""
+        print("triggered on-change update across {len(sessions)} session(s)")
+        for s in sessions:
+            s.trigger_change()
+
     def _on_listen(l: sshpipe.SshPipeListener, err: ?Exception):
         if err is not None:
             _log.error("listen error", {"address": address, "port": port, "error": err})
@@ -260,6 +280,20 @@ actor YpMockServer(listen_cap: net.TCPListenCap,
 
 actor main(env):
     logh = logging.Handler()
+    var server: ?YpMockServer = None
+
+    def _do_trigger() -> None:
+        if server is not None:
+            server.trigger_all()
+
+    def _on_input(chunk: str) -> None:
+        """stdin 'button': pressing Enter triggers an on-change update; a line of
+        just 'q' quits."""
+        for line in chunk.split("\n"):
+            if line.strip() == "q":
+                env.exit(0)
+                return
+        after 0.0: _do_trigger()
 
     def _run(args):
         if args.get_bool("verbose"):
@@ -278,7 +312,9 @@ actor main(env):
             if_names = ["eth0", "eth1"]
 
         listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.auth)))
-        YpMockServer(listen_cap, logh, if_names, build_mock_schema(), address, port, username, password)
+        server = YpMockServer(listen_cap, logh, if_names, build_mock_schema(), address, port, username, password)
+        env.stdin_install(on_stdin=_on_input)
+        print("yp mock server ready. Press Enter to trigger an on-change update; 'q' then Enter to quit.")
         # No env.exit(): the SSH listener keeps the runtime alive until killed.
 
     def _parse_args():

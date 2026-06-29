@@ -1,9 +1,11 @@
 """Transport-agnostic YANG-push publisher (RFC 8641).
 
-YangPushPublisher implements periodic YANG-push: it allocates subscription ids,
-runs the per-subscription timers, and delivers fully-built push-update
-notification nodes through an injected sink, pulling its content from an injected
-backend. It knows nothing about NETCONF or RESTCONF.
+YangPushPublisher implements periodic and on-change YANG-push: it allocates
+subscription ids, runs the per-subscription timers, and delivers fully-built
+push-update (periodic) or push-change-update (on-change) notification nodes through
+an injected sink, pulling its content from an injected backend. It knows nothing
+about NETCONF or RESTCONF, and nothing about the schema or how a delta is computed
+- the backend hands it a ready yang-patch, so this stays content-agnostic.
 
 It also carries the slice of RFC 8639 subscribed-notifications that this needs:
 subscription-id allocation and establish/delete. The full 8639 framework is
@@ -40,37 +42,55 @@ class YangPushBackend(object):
 
     snapshot returns the current contents (a list of top-level data nodes, one per
     module) without advancing. sample advances the source by one step and returns
-    the new contents. A concrete backend is a class delegating to an actor, which
-    is what lets the publisher read the value back from an ordinary call even when
-    the actor had to do real work to produce it."""
+    the new full contents (periodic). change advances the source and returns a
+    ready-built <yang-patch> of what changed since the last call, or None if nothing
+    changed (on-change) — the backend owns the diff and its yang-patch rendering, so
+    the publisher stays content-agnostic. A concrete backend is a class delegating
+    to an actor, which is what lets the publisher read the value back from an
+    ordinary call even when the actor had to do real work to produce it."""
     snapshot: proc() -> list[xml.Node]
     sample: proc() -> list[xml.Node]
+    change: proc() -> ?xml.Node
 
 
 class SubState(object):
     interval: float     # tick period in seconds
+    on_change: bool     # on-change subscription (vs periodic)
+    sync_on_start: bool # on-change: emit a full baseline before the first delta
     active: bool
 
-    def __init__(self, interval: float):
+    def __init__(self, interval: float, on_change: bool=False, sync_on_start: bool=False):
         self.interval = interval
+        self.on_change = on_change
+        self.sync_on_start = sync_on_start
         self.active = True
 
 
 actor YangPushPublisher(deliver: action(xml.Node) -> None,
                         backend: YangPushBackend,
                         log_handler: ?logging.Handler=None):
-    """Drives periodic YANG-push (RFC 8641) push-update notifications, delivering
-    through deliver and pulling content from backend."""
+    """Drives periodic (timer) and on-change (event-driven) YANG-push, delivering
+    push-update / push-change-update through deliver and pulling content from
+    backend. On-change deltas are emitted by trigger_change, not a timer."""
 
     _log = logging.Logger(log_handler)
     var subs: dict[int, SubState] = {}
     var next_id: int = 1
 
     def establish(params: yp.EstablishParams) -> ?int:
-        """Allocate a periodic subscription and return its id, or None when the
-        request is not a valid periodic subscription - no positive <period>, which
-        also covers an on-change request since it carries no period. Does not emit
-        yet; the binding sends its reply, then calls start."""
+        """Allocate a subscription and return its id, or None when the request is
+        neither a valid periodic one (positive <period>) nor an on-change one. Does
+        not emit yet; the binding sends its reply, then calls start.
+
+        On-change subscriptions are event-driven: nothing is pushed until something
+        calls trigger_change - a real source on a datastore change, or the mock
+        server on a manual trigger."""
+        if params.on_change:
+            sub_id = next_id
+            next_id += 1
+            subs[sub_id] = SubState(0.0, on_change=True, sync_on_start=params.sync_on_start)
+            _log.info("establish-subscription id={sub_id} mode=on-change")
+            return sub_id
         pp = params.periodic_period
         if pp is not None:
             if pp > 0:
@@ -78,19 +98,26 @@ actor YangPushPublisher(deliver: action(xml.Node) -> None,
                 sub_id = next_id
                 next_id += 1
                 subs[sub_id] = SubState(interval)
-                _log.info("establish-subscription id={sub_id} period={interval}s")
+                _log.info("establish-subscription id={sub_id} mode=periodic period={interval}s")
                 return sub_id
         return None
 
     def start(sub_id: int) -> None:
-        """Begin emitting for a subscription: the first push-update baseline, then
-        schedule the periodic ticks."""
+        """Begin emitting for a subscription: a first full baseline (always for
+        periodic; for on-change only when sync-on-start), then schedule the ticks."""
         if sub_id in subs:
             st = subs[sub_id]
             if st.active:
-                snap = backend.snapshot()
-                deliver(yp.build_notification(yp.event_time_now(), yp.build_push_update(sub_id, snap)))
-                after st.interval: _tick(sub_id)
+                if st.on_change:
+                    # Event-driven: only the optional sync-on-start baseline emits
+                    # now; deltas wait for trigger_change.
+                    if st.sync_on_start:
+                        snap = backend.snapshot()
+                        deliver(yp.build_notification(yp.event_time_now(), yp.build_push_update(sub_id, snap)))
+                else:
+                    snap = backend.snapshot()
+                    deliver(yp.build_notification(yp.event_time_now(), yp.build_push_update(sub_id, snap)))
+                    after st.interval: _tick(sub_id)
 
     def delete(sub_id: int) -> bool:
         """Stop and remove a subscription. Returns False if unknown."""
@@ -123,3 +150,21 @@ actor YangPushPublisher(deliver: action(xml.Node) -> None,
                 contents = backend.sample()
                 deliver(yp.build_notification(yp.event_time_now(), yp.build_push_update(sub_id, contents)))
                 after st.interval: _tick(sub_id)
+
+    def trigger_change() -> None:
+        """Emit a push-change-update to every active on-change subscription from the
+        backend's current delta. This is the event-driven entry point: a real
+        datastore source calls it on a change, and the mock server wires it to a
+        manual trigger. The delta is computed once and fanned out, so multiple
+        on-change subs on one backend stay consistent."""
+        targets: list[int] = []
+        for sid, st in subs.items():
+            if st.active and st.on_change:
+                targets.append(sid)
+        if len(targets) == 0:
+            return
+        _log.info("on-change trigger: notifying {len(targets)} subscription(s)")
+        patch = backend.change()
+        if patch is not None:
+            for sid in targets:
+                deliver(yp.build_notification(yp.event_time_now(), yp.build_push_change_update(sid, patch)))
