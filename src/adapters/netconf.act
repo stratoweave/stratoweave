@@ -113,6 +113,115 @@ def _test_yang_push_dialect_yang_library_modules():
         testing.assertEqual(dialect, True)
 
 
+def _xpath_literal(v) -> ?str:
+    if isinstance(v, ygdata.VWildcard):
+        return None
+    s = ygdata.yang_str(v)
+    if "'" in s:
+        return None
+    return "'" + s + "'"
+
+
+def _xpath_name(name: ygdata.Id, prefixes: dict[str, str], nsdefs: list[(?str, str)]) -> str:
+    if name.q == "":
+        return name.name
+    if name.q not in prefixes:
+        prefix = "ypf" + str(len(prefixes))
+        prefixes[name.q] = prefix
+        nsdefs.append((prefix, name.q))
+    return prefixes[name.q] + ":" + name.name
+
+
+def _fnode_xpath_step(filt: ygdata.FNode, prefixes: dict[str, str], nsdefs: list[(?str, str)]) -> ?str:
+    if filt.name is None or filt.value_match is not None:
+        return None
+
+    step = _xpath_name(filt.name!, prefixes, nsdefs)
+    predicates: list[str] = []
+    path_child: ?str = None
+
+    for child in filt.children:
+        if child.value_match is not None:
+            if child.name is None or len(child.children) > 0:
+                return None
+            lit = _xpath_literal(child.value_match!)
+            if lit is None:
+                return None
+            predicates.append(_xpath_name(child.name!, prefixes, nsdefs) + "=" + lit!)
+        else:
+            if path_child is not None:
+                return None
+            child_path = _fnode_xpath_step(child, prefixes, nsdefs)
+            if child_path is None:
+                return None
+            path_child = child_path
+
+    if len(predicates) > 0:
+        step = step + "[" + " and ".join(predicates) + "]"
+
+    if path_child is not None:
+        return step + "/" + path_child!
+    return step
+
+
+def _fnode_to_xpath_filter(filt: ygdata.FNode) -> (xpath: ?str, nsdefs: list[(?str, str)]):
+    root = filt
+    if root.name is None:
+        if root.value_match is not None or len(root.children) != 1:
+            return (xpath=None, nsdefs=[])
+        root = root.children[0]
+
+    prefixes: dict[str, str] = {}
+    nsdefs: list[(?str, str)] = []
+    path = _fnode_xpath_step(root, prefixes, nsdefs)
+    if path is None:
+        return (xpath=None, nsdefs=[])
+    return (xpath="/" + path!, nsdefs=nsdefs)
+
+
+def _test_fnode_to_xpath_filter_simple_path():
+    ns = "urn:test:system"
+    res = _fnode_to_xpath_filter(ygdata.FNode(children=[
+        ygdata.FNode(ygdata.Id(ns, "system-state"), children=[
+            ygdata.FNode(ygdata.Id(ns, "clock"), children=[
+                ygdata.FNode(ygdata.Id(ns, "current-datetime"))
+            ])
+        ])
+    ]))
+    testing.assertEqual(res.xpath, "/ypf0:system-state/ypf0:clock/ypf0:current-datetime")
+    testing.assertEqual(len(res.nsdefs), 1)
+    testing.assertEqual(res.nsdefs[0].0, "ypf0")
+    testing.assertEqual(res.nsdefs[0].1, ns)
+
+
+def _test_fnode_to_xpath_filter_list_predicate():
+    ns = "urn:test:interfaces"
+    res = _fnode_to_xpath_filter(ygdata.FNode(children=[
+        ygdata.FNode(ygdata.Id(ns, "interfaces"), children=[
+            ygdata.FNode(ygdata.Id(ns, "interface"), children=[
+                ygdata.FNode(ygdata.Id(ns, "name"), value_match="eth0"),
+                ygdata.FNode(ygdata.Id(ns, "in-octets"))
+            ])
+        ])
+    ]))
+    testing.assertEqual(res.xpath, "/ypf0:interfaces/ypf0:interface[ypf0:name='eth0']/ypf0:in-octets")
+    testing.assertEqual(len(res.nsdefs), 1)
+    testing.assertEqual(res.nsdefs[0].1, ns)
+
+
+def _test_fnode_to_xpath_filter_rejects_multi_branch():
+    ns = "urn:test:system"
+    res = _fnode_to_xpath_filter(ygdata.FNode(children=[
+        ygdata.FNode(ygdata.Id(ns, "system-state"), children=[
+            ygdata.FNode(ygdata.Id(ns, "clock"), children=[
+                ygdata.FNode(ygdata.Id(ns, "current-datetime")),
+                ygdata.FNode(ygdata.Id(ns, "boot-datetime"))
+            ])
+        ])
+    ]))
+    testing.assertEqual(res.xpath is None, True)
+
+
 def _mock_capabilities_from_dmc(new_dmc: DeviceMetaConfig) -> list[str]:
     """True protocol capabilities for the mock device hello exchange.
     """
@@ -1436,12 +1545,25 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         c = client
         if c is not None:
             filt_xml: ?list[xml.Node] = None
+            xpath_filter: ?str = None
+            xpath_nsdefs: list[(?str, str)] = []
             sf = st.spec.filt
             if sf is not None:
-                # Carry the whole filter, including multi-root filters; dropping
-                # it would subscribe to the entire datastore and leak far more
-                # operational data than the subscriber asked for.
-                filt_xml = ygdata.expect(sf, "subscription filter").to_filter_xml(deterministic=True)
+                filt = sf!
+                if _yp_event_notifs:
+                    xpath = _fnode_to_xpath_filter(filt)
+                    if xpath.xpath is None:
+                        err = ValueError("event-notifications yang-push only supports simple subscription filters")
+                        for owner_id in st.owners:
+                            _owner_publish(owner_id, err)
+                        return
+                    xpath_filter = xpath.xpath
+                    xpath_nsdefs = xpath.nsdefs
+                else:
+                    # Carry the whole filter, including multi-root filters; dropping
+                    # it would subscribe to the entire datastore and leak far more
+                    # operational data than the subscriber asked for.
+                    filt_xml = filt.to_filter_xml(deterministic=True)
 
             def on_est(cc: netconf.Client, sid: ?int, err: ?netconf.NetconfError):
                 yp_pending.discard(spec)
@@ -1461,13 +1583,15 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 # first, seeding latest; later push-change-updates apply as deltas.
                 yp_pending.add(spec)
                 c.establish_subscription(on_est, on_change=True, sync_on_start=True,
-                    subtree_filter=filt_xml, event_notifs=_yp_event_notifs)
+                    subtree_filter=filt_xml, xpath_filter=xpath_filter,
+                    event_notifs=_yp_event_notifs, xpath_nsdefs=xpath_nsdefs)
             else:
                 period_cs = _period_centiseconds(st.spec.period)
                 if period_cs is not None:
                     yp_pending.add(spec)
                     c.establish_subscription(on_est, period=period_cs, subtree_filter=filt_xml,
-                        event_notifs=_yp_event_notifs)
+                        xpath_filter=xpath_filter, event_notifs=_yp_event_notifs,
+                        xpath_nsdefs=xpath_nsdefs)
                 else:
                     err = ValueError("yang-push requires a periodic subscription")
                     for owner_id in st.owners:
