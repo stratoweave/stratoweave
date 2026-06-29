@@ -1,16 +1,16 @@
 """Standalone YANG-push-capable mock NETCONF server.
 
 A self-contained NETCONF server (over SSH) that serves YANG-push subscriptions
-backed by the InterfaceCountersBackend mock data generator — no datastore engine
-(no TTT) involved. It exists so a client such as ncurl monitor can connect to a
-real NETCONF/SSH server and stream pushes of generated data.
+backed by one shared InterfaceCountersBackend mock data source — no datastore
+engine (no TTT) involved. It exists so a client such as ncurl monitor can connect
+to a real NETCONF/SSH server and stream pushes of generated data.
 
-Each accepted SSH session gets its own netconf.Server + a NetconfSubscriptionService
-wired to its own InterfaceCountersBackend, so subscribers are independent. It serves
+Each accepted SSH session gets its own netconf.Server + NetconfSubscriptionService,
+all observing the same continuously advancing InterfaceCountersBackend. It serves
 periodic subscriptions (timer-driven push-update) and on-change subscriptions
-(push-change-update carrying a yang-patch). On-change is event-driven: press Enter
-on the server's stdin to trigger a change, and every on-change subscriber gets a
-push-change-update with the delta.
+(push-change-update carrying a yang-patch). The server advances the shared source
+on a timer and fans the resulting change out to active sessions; pressing Enter
+triggers an immediate extra advance.
 
 The mock has a real schema (a small mock-interfaces module compiled with the
 ietf-yang-library closure), so it is a proper discoverable NETCONF server: it
@@ -21,7 +21,7 @@ operational data merged with the ietf-yang-library tree, subtree-filtered.
 
 Run:  yp_mockserver [--address ::] [--port 12830] [--username admin]
                     [--password admin] [--interfaces eth0,eth1] [--verbose]
-Press Enter to trigger an on-change update; 'q' then Enter to quit.
+Press Enter to trigger an immediate on-change update; 'q' then Enter to quit.
 """
 
 import argparse
@@ -94,7 +94,7 @@ def build_mock_schema() -> MockSchema:
 
 
 class OperBackend(mb.MockBackend):
-    """The mock's operational datastore: the per-session interface counters overlaid
+    """The mock's operational datastore: the shared interface counters overlaid
     with the static ietf-yang-library tree.
 
     This single source feeds both <get> and the yang-push subscription, so a periodic
@@ -116,6 +116,9 @@ class OperBackend(mb.MockBackend):
 
     def prepare_filter(self, subtree_filter: ?list[xml.Node]) -> ?ygdata.FNode:
         return self._counters.prepare_filter(subtree_filter)
+
+    def advance(self) -> None:
+        self._counters.advance()
 
     def snapshot(self, filter: ?ygdata.FNode) -> list[xml.Node]:
         data = self._counters.snapshot(filter)
@@ -146,12 +149,11 @@ actor StaticAuthChecker(expected_user: str, expected_password: str):
 
 actor YpMockSession(pipe,
                     log_handler: logging.Handler,
-                    if_names: list[str],
+                    backend: mb.MockBackend,
                     ms: MockSchema,
                     on_close: ?action(YpMockSession) -> None=None):
     """One NETCONF session: a Server + a YANG-push service over a mock backend."""
     _log = logging.Logger(log_handler)
-    backend = OperBackend(if_names, ms.schema, ms.yl_view)
     var service: ?nyp.NetconfSubscriptionService = None
 
     def _get_data() -> ygdata.Node:
@@ -216,10 +218,12 @@ actor YpMockServer(listen_cap: net.TCPListenCap,
                    port: int=12830,
                    username: str="admin",
                    password: str="admin",
+                   tick_interval: float=1.0,
                    on_listen: ?action(?Exception) -> None=None):
     """SSH listener that turns each accepted channel into a YpMockSession."""
     _log = logging.Logger(log_handler)
     _auth = StaticAuthChecker(username, password).check
+    backend = OperBackend(if_names, ms.schema, ms.yl_view)
     var sessions: list[YpMockSession] = []
     var listener: ?sshpipe.SshPipeListener = None
 
@@ -232,13 +236,28 @@ actor YpMockServer(listen_cap: net.TCPListenCap,
 
     def _on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
         _log.info("session accepted")
-        sessions.append(YpMockSession(p, log_handler, if_names, ms, on_close=_session_closed))
+        sessions.append(YpMockSession(p, log_handler, backend, ms, on_close=_session_closed))
 
-    def trigger_all() -> None:
-        """Trigger an on-change update on every active session."""
-        print("triggered on-change update across {len(sessions)} session(s)")
+    def _notify_sessions(report: bool=False) -> None:
+        """Trigger an on-change update on every active session. The per-session
+        subscriber counts are logged by each publisher; here we just report how many
+        sessions were poked, computed before the loop so no int is held across an
+        actor-call await (that pattern trips an RTS codegen bug)."""
+        if report:
+            print("triggered on-change update across {len(sessions)} session(s)")
         for s in sessions:
             s.trigger_change()
+
+    def trigger_all() -> None:
+        """Advance the shared counter source once and notify all active sessions."""
+        backend.advance()
+        _notify_sessions(report=True)
+
+    def _tick() -> None:
+        backend.advance()
+        _notify_sessions()
+        if tick_interval > 0.0:
+            after tick_interval: _tick()
 
     def _on_listen(l: sshpipe.SshPipeListener, err: ?Exception):
         if err is not None:
@@ -259,6 +278,9 @@ actor YpMockServer(listen_cap: net.TCPListenCap,
         subsystem="netconf",
         host_key=None,
         log_handler=log_handler)
+
+    if tick_interval > 0.0:
+        after tick_interval: _tick()
 
     def close():
         l = listener
@@ -295,14 +317,22 @@ actor main(env):
         port = args.get_int("port")
         username = args.get_str("username")
         password = args.get_str("password")
+        tick_interval_s = args.get_str("tick-interval")
+        tick_interval = 1.0
+        try:
+            tick_interval = float(tick_interval_s)
+        except ValueError:
+            print("Error: --tick-interval must be a number of seconds, got '{tick_interval_s}'", err=True)
+            env.exit(1)
+            return
         if_names = args.get_strlist("interfaces")
         if if_names == []:
             if_names = ["eth0", "eth1"]
 
         listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.auth)))
-        server = YpMockServer(listen_cap, logh, if_names, build_mock_schema(), address, port, username, password)
+        server = YpMockServer(listen_cap, logh, if_names, build_mock_schema(), address, port, username, password, tick_interval)
         env.stdin_install(on_stdin=_on_input)
-        print("yp mock server ready. Press Enter to trigger an on-change update; 'q' then Enter to quit.")
+        print("yp mock server ready. Advancing every {tick_interval}s; press Enter for an immediate update; 'q' then Enter to quit.")
         # No env.exit(): the SSH listener keeps the runtime alive until killed.
 
     def _parse_args():
@@ -312,6 +342,7 @@ actor main(env):
         p.add_option("username", "str", "?", "admin", "Username for authentication")
         p.add_option("password", "str", "?", "admin", "Password for authentication")
         p.add_option("interfaces", "strlist", "*", [], "Interface names to generate counters for")
+        p.add_option("tick-interval", "str", "?", "1.0", "Seconds between automatic counter advances (0 disables the timer)")
         p.add_bool("verbose", "Verbose logging")
         return p.parse(env.argv)
 

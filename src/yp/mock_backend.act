@@ -8,11 +8,11 @@ pipe and the standalone mock server that ncurl connects to.
 InterfaceCountersBackend is the YangPushBackend the publisher pulls from. It holds
 its state as a gdata tree so it can serve every pull from one source: snapshot
 returns the current counters as XML and oper_data the same as a gdata tree (for
-<get>); sample advances them once and returns the new XML (periodic); and change
-advances them once and returns an RFC 8072 yang-patch of the delta (on-change) by
-running gdata.diff over the before/after filtered trees and rendering it with
-ypatch. The mutable state lives in an actor, with a small class in front so the
-publisher gets its values back from a plain call.
+<get>); sample returns the current XML for periodic push; change renders the most
+recent explicit counter advance as an RFC 8072 yang-patch by running gdata.diff
+over the before/after filtered trees and rendering it with ypatch. The mutable
+state lives in an actor, with a small class in front so the publisher gets its
+values back from a plain call.
 """
 
 import std.xml as xml
@@ -49,10 +49,11 @@ class MockBackend(YangPushBackend):
     tree, for serving <get> and for overlaying further operational state (e.g. the
     ietf-yang-library tree) on top of it.
 
-    oper_data is declared via proc here because a concrete class method that awaits
-    an actor call (return self._c.oper_data()) only compiles when the method is
-    declared in a proc-typed parent - otherwise the CPS pass crashes."""
+    oper_data is declared via proc here because a concrete class method that
+    awaits an actor call (return self._c.oper_data()) only compiles when the
+    method is declared in a proc-typed parent - otherwise the CPS pass crashes."""
     oper_data: proc() -> gdata.Node
+    advance: proc() -> None
 
 
 def _tree(if_names: list[str], in_octets: dict[str, int], out_octets: dict[str, int]) -> gdata.Container:
@@ -82,16 +83,21 @@ actor _Counters(if_names: list[str], in_step: int, out_step: int, schema: ?ysche
     """Holds the mutable per-interface counters and produces snapshots/samples/changes."""
     var in_octets: dict[str, int] = {}
     var out_octets: dict[str, int] = {}
-    var patch_seq: int = 0
+    var change_seq: int = 0
+    var last_old: ?gdata.Node = None
+    var last_new: ?gdata.Node = None
 
     for _n in if_names:
         in_octets[_n] = 0
         out_octets[_n] = 0
 
-    def _advance() -> None:
+    def advance() -> None:
+        last_old = _tree(if_names, in_octets, out_octets)
         for n in if_names:
             in_octets[n] = in_octets[n] + in_step
             out_octets[n] = out_octets[n] + out_step
+        last_new = _tree(if_names, in_octets, out_octets)
+        change_seq += 1
 
     def prepare_filter(subtree_filter: ?list[xml.Node]) -> ?gdata.FNode:
         if subtree_filter is not None:
@@ -110,7 +116,6 @@ actor _Counters(if_names: list[str], in_step: int, out_step: int, schema: ?ysche
         return _tree(if_names, in_octets, out_octets)
 
     def sample(filter: ?gdata.FNode) -> list[xml.Node]:
-        _advance()
         data = _tree(if_names, in_octets, out_octets)
         if filter is not None:
             xml_nodes = gdata.filter(data, filter)?.to_xml(deterministic=True)
@@ -118,18 +123,16 @@ actor _Counters(if_names: list[str], in_step: int, out_step: int, schema: ?ysche
         return data.to_xml(deterministic=True)
 
     def change(filter: ?gdata.FNode) -> ?xml.Node:
-        old: ?gdata.Node = _tree(if_names, in_octets, out_octets)
-        if filter is not None:
-            old = gdata.filter(old, filter)
-        _advance()
-        new: ?gdata.Node = _tree(if_names, in_octets, out_octets)
-        if filter is not None:
-            new = gdata.filter(new, filter)
+        old: ?gdata.Node = last_old
+        new: ?gdata.Node = last_new
+        if new is not None:
+            if filter is not None:
+                old = gdata.filter(old, filter)
+                new = gdata.filter(new, filter)
         if new is not None:
             d = gdata.diff(old, new)
             if d is not None:
-                patch_seq += 1
-                return ypatch.diff_to_patch(d, "patch{patch_seq}").to_xml()
+                return ypatch.diff_to_patch(d, "patch{change_seq}").to_xml()
         return None
 
 
@@ -138,6 +141,9 @@ class InterfaceCountersBackend(MockBackend):
 
     def __init__(self, if_names: list[str], in_step: int=100, out_step: int=200, schema: ?yschema.DRoot=None):
         self._c = _Counters(if_names, in_step, out_step, schema)
+
+    def advance(self) -> None:
+        self._c.advance()
 
     def prepare_filter(self, subtree_filter: ?list[xml.Node]) -> ?gdata.FNode:
         return self._c.prepare_filter(subtree_filter)

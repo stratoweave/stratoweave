@@ -35,6 +35,11 @@ actor _test_yangpush_periodic(t: testing.EnvT):
 
     backend = mb.InterfaceCountersBackend(["eth0"])
 
+    def _advance_source() -> None:
+        if not done:
+            backend.advance()
+            after 0.02: _advance_source()
+
     def _fail(e: Exception) -> None:
         if not done:
             done = True
@@ -88,6 +93,7 @@ actor _test_yangpush_periodic(t: testing.EnvT):
 
     server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
     service = yn.NetconfSubscriptionService(server, backend, log_handler=t.log_handler)
+    after 0.01: _advance_source()
     client = netconf.Client(None,
                             address="actor-pipe",
                             username="actor-pipe",
@@ -109,6 +115,15 @@ def _counter_merge_edits(p: ypatch.Patch) -> int:
         if e.operation == ypatch.OP_MERGE and (last == "in-octets" or last == "out-octets"):
             n += 1
     return n
+
+
+def _counter_edit_value(p: ypatch.Patch, leaf_name: str) -> ?str:
+    for e in p.edits:
+        if e.target.split("/")[-1] == leaf_name:
+            v = e.value
+            if v is not None:
+                return v.text
+    return None
 
 
 actor _test_yangpush_on_change(t: testing.EnvT):
@@ -177,9 +192,12 @@ actor _test_yangpush_on_change(t: testing.EnvT):
         _fail(ValueError("Unexpected notification: " + notif.encode()))
 
     def _trigger() -> None:
-        # On-change is event-driven: ask the server-side service to emit a delta.
-        if service is not None:
-            service.trigger_change()
+        # On-change is event-driven: advance the source, then ask the server-side
+        # service to emit that delta.
+        backend.advance()
+        sv = service
+        if sv is not None:
+            sv.trigger_change()
 
     def _on_sub(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError) -> None:
         if err is not None:
@@ -247,6 +265,7 @@ actor _test_yangpush_on_change_subtree_filter(t: testing.EnvT):
             s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
 
     def _trigger() -> None:
+        backend.advance()
         sv = service
         if sv is not None:
             sv.trigger_change()
@@ -315,6 +334,113 @@ actor _test_yangpush_on_change_subtree_filter(t: testing.EnvT):
 
     def _on_timeout() -> None:
         _fail(ValueError("Timed out waiting for filtered on-change update"))
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    service = yn.NetconfSubscriptionService(server, backend, log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=_on_connect,
+                            on_notif=_on_notif,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    after 10.0: _on_timeout()
+
+
+actor _test_yangpush_on_change_two_subscriptions_share_source(t: testing.EnvT):
+    """One source advance is fanned out to multiple on-change subscriptions."""
+    log = logging.Logger(t.log_handler)
+    pipes = netconf.actor_pipe_pair()
+
+    var service: ?yn.NetconfSubscriptionService = None
+    var done = False
+    var patches = 0
+    var sub1: ?int = None
+    var sub2: ?int = None
+
+    backend = mb.InterfaceCountersBackend(["eth0"])
+
+    def _fail(e: Exception) -> None:
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _finish(c: netconf.Client) -> None:
+        if not done:
+            done = True
+            c.close(None)
+            log.info("two on-change subscriptions shared one source update")
+            t.success()
+
+    def _on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        if yp.is_subscription_rpc(op.tag):
+            sv = service
+            if sv is not None:
+                sv.handle_rpc(message_id, op)
+        else:
+            s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
+
+    def _trigger() -> None:
+        backend.advance()
+        sv = service
+        if sv is not None:
+            sv.trigger_change()
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if yp.parse_push_update(notif) is not None:
+            _fail(ValueError("unexpected sync-on-start baseline for sync_on_start=false"))
+            return
+
+        pcu = yp.parse_push_change_update(notif)
+        if pcu is not None:
+            yp_node = pcu.yang_patch
+            if yp_node is not None:
+                patch = ypatch.Patch.from_xml(yp_node)
+                val = _counter_edit_value(patch, "in-octets")
+                if val != "100":
+                    _fail(ValueError("expected shared source value 100, got {val} in " + notif.encode()))
+                    return
+                if patch.patch_id != "patch1":
+                    _fail(ValueError("expected shared patch id patch1, got {patch.patch_id}"))
+                    return
+                patches += 1
+                if patches == 2:
+                    _finish(c)
+            else:
+                _fail(ValueError("push-change-update missing yang-patch"))
+            return
+
+        _fail(ValueError("Unexpected notification: " + notif.encode()))
+
+    def _on_sub2(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+        elif sub_id is None:
+            _fail(ValueError("second establish-subscription returned no id"))
+        else:
+            sub2 = sub_id
+            _trigger()
+
+    def _on_sub1(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+        elif sub_id is None:
+            _fail(ValueError("first establish-subscription returned no id"))
+        else:
+            sub1 = sub_id
+            c.establish_subscription(_on_sub2, on_change=True, sync_on_start=False)
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            _fail(ValueError("connect failed: " + str(e)))
+        else:
+            c.establish_subscription(_on_sub1, on_change=True, sync_on_start=False)
+
+    def _on_timeout() -> None:
+        _fail(ValueError("Timed out waiting for two shared-source on-change updates; patches={patches}, sub1={sub1}, sub2={sub2}"))
 
     server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
     service = yn.NetconfSubscriptionService(server, backend, log_handler=t.log_handler)
