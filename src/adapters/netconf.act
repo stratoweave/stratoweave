@@ -4,6 +4,7 @@ import net
 import time
 import testing
 import std.xml as xml
+import uri
 
 import yang.schema as yschema
 import yang.gdata as ygdata
@@ -42,6 +43,10 @@ RUNTIME_SCHEMA_MODULE_SETS = ["no-openconfig"]
 # knowledge is acton-yang/schema metadata: given a namespace, ask the compiled
 # schema for the advertised module prefix and use that when serializing XPath.
 XPATH_PREFERRED_PREFIXES = {
+    "http://cisco.com/ns/yang/Cisco-IOS-XE-cdp-oper": "cdp-ios-xe-oper",
+    "http://cisco.com/ns/yang/Cisco-IOS-XE-interfaces-oper": "interfaces-ios-xe-oper",
+    "http://cisco.com/ns/yang/Cisco-IOS-XE-ip-arp-oper": "ip-arp-ios-xe-oper",
+    "http://cisco.com/ns/yang/Cisco-IOS-XE-ipv6-nd-oper": "ipv6-nd-ios-xe-oper",
     "urn:ietf:params:xml:ns:yang:iana-if-type": "ianaift",
     "urn:ietf:params:xml:ns:yang:ietf-interfaces": "if",
     "urn:ietf:params:xml:ns:yang:ietf-ip": "ip",
@@ -314,6 +319,22 @@ def _test_fnode_to_xpath_filter_prefers_known_prefix():
     testing.assertEqual(res.nsdefs[0].1, ns)
 
 
+def _test_fnode_to_xpath_filter_prefers_ios_xe_prefix():
+    ns = "http://cisco.com/ns/yang/Cisco-IOS-XE-interfaces-oper"
+    res = _fnode_to_xpath_filter(ygdata.FNode(children=[
+        ygdata.FNode(ygdata.Id(ns, "interfaces"), children=[
+            ygdata.FNode(ygdata.Id(ns, "interface"), children=[
+                ygdata.FNode(ygdata.Id(ns, "name"), value_match="GigabitEthernet1"),
+                ygdata.FNode(ygdata.Id(ns, "oper-status")),
+            ])
+        ])
+    ]))
+    testing.assertEqual(res.xpath, "/interfaces-ios-xe-oper:interfaces/interfaces-ios-xe-oper:interface[interfaces-ios-xe-oper:name='GigabitEthernet1']/interfaces-ios-xe-oper:oper-status")
+    testing.assertEqual(len(res.nsdefs), 1)
+    testing.assertEqual(res.nsdefs[0].0, "interfaces-ios-xe-oper")
+    testing.assertEqual(res.nsdefs[0].1, ns)
+
+
 def _test_fnode_to_xpath_filter_rejects_multi_branch():
     ns = "urn:test:system"
     res = _fnode_to_xpath_filter(ygdata.FNode(children=[
@@ -325,6 +346,76 @@ def _test_fnode_to_xpath_filter_rejects_multi_branch():
         ])
     ]))
     testing.assertEqual(res.xpath is None, True)
+
+
+def _normalize_event_notifs_patch_edit(root: yschema.DRoot, e: ypatch.Edit) -> ypatch.Edit:
+    v = e.value
+    if v is None:
+        return e
+
+    target = e.target
+    ns = yxml.xml_node_ns(v!)
+    if ns is not None:
+        module = None
+        if ns!.startswith("http://cisco.com/ns/yang/"):
+            module = ns!.split("/")[-1]
+        if module is not None:
+            parts = target.split("/")
+            first_idx = 0
+            if target.startswith("/"):
+                first_idx = 1
+            if first_idx < len(parts):
+                first = parts[first_idx]
+                first_name = first.split("=")[0]
+                if first_name != "" and ":" not in first_name:
+                    parts[first_idx] = module! + ":" + first
+                    target = "/".join(parts)
+
+    # TODO: Replace this IOS XE-specific value repair with a schema-aware YANG
+    # Patch normalizer. IOS XE sends list-entry patches such as
+    # /interfaces/interface=GigabitEthernet2 with <value><interface>...</interface>
+    # but omits the key leaf from the value fragment. acton-yang's patch replay
+    # currently expects list entries to carry their key leaves, so synthesize the
+    # interface/name key for this interop path until that belongs in acton-yang.
+    value = v!
+    interface_key: ?str = None
+    for raw in target.split("/"):
+        if raw.startswith("interface="):
+            key_parts = raw.split("=")
+            if len(key_parts) >= 2:
+                interface_key = "=".join(key_parts[1:])
+    if interface_key is not None and value.tag == "interface":
+        has_name = False
+        for child in value.children:
+            if child.tag == "name":
+                has_name = True
+        if not has_name:
+            children = [xml.Node("name", text=uri.unquote(interface_key!))] + value.children
+            return ypatch.Edit(e.edit_id, e.operation, target,
+                xml.Node(value.tag, nsdefs=value.nsdefs, prefix=value.prefix,
+                    attributes=value.attributes, children=children, text=value.text,
+                    tail=value.tail),
+                e.point, e.where)
+
+    if target != e.target:
+        return ypatch.Edit(e.edit_id, e.operation, target, e.value, e.point, e.where)
+    return e
+
+
+def _test_normalize_event_notifs_patch_edit_ios_xe_interface():
+    edit = ypatch.Edit("edit1", ypatch.OP_MERGE,
+        "/interfaces/interface=GigabitEthernet2",
+        xml.decode('<interface xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-interfaces-oper"><admin-status>if-state-down</admin-status></interface>'))
+    norm = _normalize_event_notifs_patch_edit(yschema.DRoot(), edit)
+    testing.assertEqual(norm.target, "/Cisco-IOS-XE-interfaces-oper:interfaces/interface=GigabitEthernet2")
+    v = norm.value
+    if v is not None:
+        testing.assertEqual(len(v!.children), 2)
+        testing.assertEqual(v!.children[0].tag, "name")
+        testing.assertEqual(v!.children[0].text, "GigabitEthernet2")
+        testing.assertEqual(v!.children[1].tag, "admin-status")
+    else:
+        testing.error("expected normalized edit value")
 
 
 def _mock_capabilities_from_dmc(new_dmc: DeviceMetaConfig) -> list[str]:
@@ -1598,7 +1689,10 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 patch = ypatch.Patch.from_xml(yp_xml)
                 cur: ?ygdata.Node = st.latest if st.latest is not None else ygdata.Container({})
                 for e in patch.edits:
-                    cur = ygdata.patch(cur, ypatch.edit_to_gdata(root, e))
+                    edit = e
+                    if _yp_event_notifs:
+                        edit = _normalize_event_notifs_patch_edit(root, e)
+                    cur = ygdata.patch(cur, ypatch.edit_to_gdata(root, edit))
                 st.latest = cur
                 subs[spec] = st
                 for owner_id in st.owners:
@@ -1713,8 +1807,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 # sync-on-start makes the device send a full push-update baseline
                 # first, seeding latest; later push-change-updates apply as deltas.
                 yp_pending.add(spec)
+                dampening_period = 0 if _yp_event_notifs else None
                 c.establish_subscription(on_est, on_change=True, sync_on_start=True,
-                    subtree_filter=filt_xml, xpath_filter=xpath_filter,
+                    dampening_period=dampening_period, subtree_filter=filt_xml, xpath_filter=xpath_filter,
                     event_notifs=_yp_event_notifs, xpath_nsdefs=xpath_nsdefs)
             else:
                 period_cs = _period_centiseconds(st.spec.period)
