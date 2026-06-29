@@ -17,6 +17,7 @@ from yp.engine import YangPushBackend
 import device as swdev
 import ietf_yang_library as yl
 import monitoring
+import schema_filter
 from device_schema import DeviceSchema
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig
@@ -30,6 +31,23 @@ from adapters.adapter import \
 MODULE_YANG_PUSH = "ietf-yang-push"
 MODULE_SUBSCRIBED_NOTIFICATIONS = "ietf-subscribed-notifications"
 MODULE_EVENT_NOTIFICATIONS = "ietf-event-notifications"
+RUNTIME_SCHEMA_MODULE_SETS = ["no-openconfig"]
+
+# TODO: Delete this table and read module prefixes from the compiled YANG
+# schema instead. XML namespace prefixes are supposed to be aliases, but IOS XE's
+# event-notifications YANG Push XPath handling currently rejects otherwise
+# equivalent filters when we generate synthetic prefixes such as "ypf0". This
+# hard-coded list is only here to keep the IOS XE interop path working while the
+# adapter is forced to synthesize XPath from FNode. The right place for this
+# knowledge is acton-yang/schema metadata: given a namespace, ask the compiled
+# schema for the advertised module prefix and use that when serializing XPath.
+XPATH_PREFERRED_PREFIXES = {
+    "urn:ietf:params:xml:ns:yang:iana-if-type": "ianaift",
+    "urn:ietf:params:xml:ns:yang:ietf-interfaces": "if",
+    "urn:ietf:params:xml:ns:yang:ietf-ip": "ip",
+    "urn:ietf:params:xml:ns:yang:ietf-system": "sys",
+    "urn:ietf:params:xml:ns:yang:ietf-yang-library": "yanglib",
+}
 
 def extract_txid(conf: ?xml.Node) -> ?str:
     """Attempt to extract a txid from configuration
@@ -126,7 +144,11 @@ def _xpath_name(name: ygdata.Id, prefixes: dict[str, str], nsdefs: list[(?str, s
     if name.q == "":
         return name.name
     if name.q not in prefixes:
-        prefix = "ypf" + str(len(prefixes))
+        preferred = XPATH_PREFERRED_PREFIXES.get(name.q)
+        if preferred is not None:
+            prefix = preferred!
+        else:
+            prefix = "ypf" + str(len(prefixes))
         prefixes[name.q] = prefix
         nsdefs.append((prefix, name.q))
     return prefixes[name.q] + ":" + name.name
@@ -165,6 +187,16 @@ def _fnode_xpath_step(filt: ygdata.FNode, prefixes: dict[str, str], nsdefs: list
 
 
 def _fnode_to_xpath_filter(filt: ygdata.FNode) -> (xpath: ?str, nsdefs: list[(?str, str)]):
+    # TODO: Remove this whole FNode-to-XPath bridge. FNode is the internal
+    # subtree-filter representation, and translating it back into an XPath string
+    # here is a leaky compatibility hack for IOS XE's event-notifications YANG
+    # Push implementation. It only handles a single simple path with equality
+    # predicates, rejects multi-branch filters, cannot preserve arbitrary XPath
+    # expressions, and currently has to paper over IOS XE's prefix sensitivity via
+    # XPATH_PREFERRED_PREFIXES above. The cleaner design is for the filter layer
+    # to carry an adapter-neutral typed filter that can be rendered as either
+    # subtree XML or XPath at the protocol boundary, with prefixes supplied by the
+    # compiled schema rather than by this adapter.
     root = filt
     if root.name is None:
         if root.value_match is not None or len(root.children) != 1:
@@ -206,6 +238,17 @@ def _test_fnode_to_xpath_filter_list_predicate():
     ]))
     testing.assertEqual(res.xpath, "/ypf0:interfaces/ypf0:interface[ypf0:name='eth0']/ypf0:in-octets")
     testing.assertEqual(len(res.nsdefs), 1)
+    testing.assertEqual(res.nsdefs[0].1, ns)
+
+
+def _test_fnode_to_xpath_filter_prefers_known_prefix():
+    ns = "urn:ietf:params:xml:ns:yang:ietf-interfaces"
+    res = _fnode_to_xpath_filter(ygdata.FNode(children=[
+        ygdata.FNode(ygdata.Id(ns, "interfaces-state"))
+    ]))
+    testing.assertEqual(res.xpath, "/if:interfaces-state")
+    testing.assertEqual(len(res.nsdefs), 1)
+    testing.assertEqual(res.nsdefs[0].0, "if")
     testing.assertEqual(res.nsdefs[0].1, ns)
 
 
@@ -717,6 +760,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     continue
                 elif s.identifier == "tailf-rollback" or s.identifier.startswith("cisco-xe-openconfig"):
                     _log.debug("Device._on_connect: skipping broken schema", {"identifier": s.identifier, "reason": "Cisco IOS XE"})
+                    continue
+                elif not schema_filter.should_include_module(s.identifier, RUNTIME_SCHEMA_MODULE_SETS):
+                    _log.debug("Device._on_connect: skipping schema by module set", {"identifier": s.identifier, "module_sets": ",".join(RUNTIME_SCHEMA_MODULE_SETS)})
                     continue
                 elif s.identifier == "openconfig-isis-types" and s.version == "2017-01-13":
                     _log.debug("Device._on_connect: skipping broken schema", {"identifier": s.identifier, "version": s.version, "reason": "incorrect escape in double-quoted string"})
