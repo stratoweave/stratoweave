@@ -119,6 +119,7 @@ actor _test_yangpush_on_change(t: testing.EnvT):
 
     var service: ?yn.NetconfSubscriptionService = None
     var changes = 0
+    var baseline_seen = False
     var done = False
     var sub_id_seen: ?int = None
 
@@ -144,8 +145,17 @@ actor _test_yangpush_on_change(t: testing.EnvT):
             s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
 
     def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        pu = yp.parse_push_update(notif)
+        if pu is not None:
+            baseline_seen = True
+            log.info("on-change sync-on-start push-update id={pu.sub_id}")
+            return
+
         pcu = yp.parse_push_change_update(notif)
         if pcu is not None:
+            if not baseline_seen:
+                _fail(ValueError("push-change-update arrived before sync-on-start"))
+                return
             yp_node = pcu.yang_patch
             if yp_node is not None:
                 patch = ypatch.Patch.from_xml(yp_node)
@@ -188,6 +198,123 @@ actor _test_yangpush_on_change(t: testing.EnvT):
 
     def _on_timeout() -> None:
         _fail(ValueError("Timed out: changes={changes}"))
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    service = yn.NetconfSubscriptionService(server, backend, log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=_on_connect,
+                            on_notif=_on_notif,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    after 10.0: _on_timeout()
+
+
+actor _test_yangpush_on_change_subtree_filter(t: testing.EnvT):
+    """On-change subtree filters constrain sync-on-start and yang-patch edits."""
+    log = logging.Logger(t.log_handler)
+    pipes = netconf.actor_pipe_pair()
+
+    var service: ?yn.NetconfSubscriptionService = None
+    var done = False
+    var baseline_seen = False
+
+    backend = mb.InterfaceCountersBackend(["eth0", "eth1"], schema=mb.build_interfaces_schema())
+    filter_node = xml.decode('<interfaces xmlns="urn:mock:interfaces"><interface><name>eth0</name><in-octets/></interface></interfaces>')
+
+    def _fail(e: Exception) -> None:
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_deleted(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if not done:
+            done = True
+            c.close(None)
+            log.info("on-change filtered push demo ok")
+            t.success()
+
+    def _on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        if yp.is_subscription_rpc(op.tag):
+            sv = service
+            if sv is not None:
+                sv.handle_rpc(message_id, op)
+        else:
+            s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
+
+    def _trigger() -> None:
+        sv = service
+        if sv is not None:
+            sv.trigger_change()
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        pu = yp.parse_push_update(notif)
+        if pu is not None:
+            payload = ""
+            for node in pu.contents:
+                payload = payload + node.encode()
+            if payload.find("eth1") != -1:
+                _fail(ValueError("filtered sync-on-start leaked eth1: " + payload))
+                return
+            if payload.find("eth0") == -1:
+                _fail(ValueError("filtered sync-on-start did not include eth0: " + payload))
+                return
+            if payload.find("out-octets") != -1:
+                _fail(ValueError("filtered sync-on-start leaked unselected out-octets: " + payload))
+                return
+            baseline_seen = True
+            _trigger()
+            return
+
+        pcu = yp.parse_push_change_update(notif)
+        if pcu is not None:
+            if not baseline_seen:
+                _fail(ValueError("push-change-update arrived before filtered sync-on-start"))
+                return
+            yp_node = pcu.yang_patch
+            if yp_node is not None:
+                patch = ypatch.Patch.from_xml(yp_node)
+                saw_eth0 = False
+                for e in patch.edits:
+                    if e.target.find("interface=eth1") != -1:
+                        _fail(ValueError("filtered yang-patch leaked eth1 edit: " + e.target))
+                        return
+                    if e.target.find("interface=eth0") != -1:
+                        saw_eth0 = True
+                    if e.target.find("out-octets") != -1:
+                        _fail(ValueError("filtered yang-patch leaked unselected out-octets edit: " + e.target))
+                        return
+                if not saw_eth0:
+                    _fail(ValueError("filtered yang-patch did not include eth0 edits"))
+                    return
+                sid = pcu.sub_id
+                if sid is not None:
+                    c.delete_subscription(_on_deleted, sid)
+                else:
+                    _fail(ValueError("push-change-update missing subscription id"))
+                return
+            _fail(ValueError("push-change-update missing yang-patch"))
+            return
+        _fail(ValueError("Unexpected notification: " + notif.encode()))
+
+    def _on_sub(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+        elif sub_id is None:
+            _fail(ValueError("establish-subscription returned no id"))
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            _fail(ValueError("connect failed: " + str(e)))
+        else:
+            c.establish_subscription(_on_sub, subtree_filter=[filter_node], on_change=True, sync_on_start=True)
+
+    def _on_timeout() -> None:
+        _fail(ValueError("Timed out waiting for filtered on-change update"))
 
     server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
     service = yn.NetconfSubscriptionService(server, backend, log_handler=t.log_handler)

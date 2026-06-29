@@ -10,20 +10,38 @@ its state as a gdata tree so it can serve every pull from one source: snapshot
 returns the current counters as XML and oper_data the same as a gdata tree (for
 <get>); sample advances them once and returns the new XML (periodic); and change
 advances them once and returns an RFC 8072 yang-patch of the delta (on-change) by
-running gdata.diff over the before/after trees and rendering it with ypatch. The
-mutable state lives in an actor, with a small class in front so the publisher gets
-its values back from a plain call.
+running gdata.diff over the before/after filtered trees and rendering it with
+ypatch. The mutable state lives in an actor, with a small class in front so the
+publisher gets its values back from a plain call.
 """
 
 import std.xml as xml
 
+import yang
 import yang.gdata as gdata
+import yang.schema as yschema
+import yang.xml as yxml
 import yang.ypatch as ypatch
 
 from yp.engine import YangPushBackend
 
 NS_IF: str = "urn:mock:interfaces"
 MOD_IF: str = "mock-interfaces"
+
+INTERFACES_YANG: str = r"""module mock-interfaces {
+  yang-version 1.1;
+  namespace "urn:mock:interfaces";
+  prefix mif;
+  container interfaces {
+    config false;
+    list interface {
+      key name;
+      leaf name { type string; }
+      leaf in-octets { type uint64; }
+      leaf out-octets { type uint64; }
+    }
+  }
+}"""
 
 
 class MockBackend(YangPushBackend):
@@ -56,7 +74,11 @@ def _tree(if_names: list[str], in_octets: dict[str, int], out_octets: dict[str, 
         gdata.Container({gdata.Id(NS_IF, "interface"): iflist}, ns=NS_IF, module=MOD_IF)})
 
 
-actor _Counters(if_names: list[str], in_step: int, out_step: int):
+def build_interfaces_schema() -> yschema.DRoot:
+    return yang.compile([INTERFACES_YANG])
+
+
+actor _Counters(if_names: list[str], in_step: int, out_step: int, schema: ?yschema.DRoot):
     """Holds the mutable per-interface counters and produces snapshots/samples/changes."""
     var in_octets: dict[str, int] = {}
     var out_octets: dict[str, int] = {}
@@ -71,41 +93,63 @@ actor _Counters(if_names: list[str], in_step: int, out_step: int):
             in_octets[n] = in_octets[n] + in_step
             out_octets[n] = out_octets[n] + out_step
 
-    def snapshot() -> list[xml.Node]:
-        return _tree(if_names, in_octets, out_octets).to_xml(deterministic=True)
+    def prepare_filter(subtree_filter: ?list[xml.Node]) -> ?gdata.FNode:
+        if subtree_filter is not None:
+            wrapper = xml.Node("filter", attributes=[("type", "subtree")], children=subtree_filter)
+            return yxml.from_filter_xml(schema!, wrapper)
+        return None
+
+    def snapshot(filter: ?gdata.FNode) -> list[xml.Node]:
+        data = _tree(if_names, in_octets, out_octets)
+        if filter is not None:
+            xml_nodes = gdata.filter(data, filter)?.to_xml(deterministic=True)
+            return xml_nodes if xml_nodes is not None else []
+        return data.to_xml(deterministic=True)
 
     def oper_data() -> gdata.Container:
         return _tree(if_names, in_octets, out_octets)
 
-    def sample() -> list[xml.Node]:
+    def sample(filter: ?gdata.FNode) -> list[xml.Node]:
         _advance()
-        return _tree(if_names, in_octets, out_octets).to_xml(deterministic=True)
+        data = _tree(if_names, in_octets, out_octets)
+        if filter is not None:
+            xml_nodes = gdata.filter(data, filter)?.to_xml(deterministic=True)
+            return xml_nodes if xml_nodes is not None else []
+        return data.to_xml(deterministic=True)
 
-    def change() -> ?xml.Node:
-        old = _tree(if_names, in_octets, out_octets)
+    def change(filter: ?gdata.FNode) -> ?xml.Node:
+        old: ?gdata.Node = _tree(if_names, in_octets, out_octets)
+        if filter is not None:
+            old = gdata.filter(old, filter)
         _advance()
-        new = _tree(if_names, in_octets, out_octets)
-        d = gdata.diff(old, new)
-        if d is not None:
-            patch_seq += 1
-            return ypatch.diff_to_patch(d, "patch" + str(patch_seq)).to_xml()
+        new: ?gdata.Node = _tree(if_names, in_octets, out_octets)
+        if filter is not None:
+            new = gdata.filter(new, filter)
+        if new is not None:
+            d = gdata.diff(old, new)
+            if d is not None:
+                patch_seq += 1
+                return ypatch.diff_to_patch(d, "patch{patch_seq}").to_xml()
         return None
 
 
 class InterfaceCountersBackend(MockBackend):
     """A mock backend whose per-interface octet counters increase on each pull."""
 
-    def __init__(self, if_names: list[str], in_step: int=100, out_step: int=200):
-        self._c = _Counters(if_names, in_step, out_step)
+    def __init__(self, if_names: list[str], in_step: int=100, out_step: int=200, schema: ?yschema.DRoot=None):
+        self._c = _Counters(if_names, in_step, out_step, schema)
 
-    def snapshot(self) -> list[xml.Node]:
-        return self._c.snapshot()
+    def prepare_filter(self, subtree_filter: ?list[xml.Node]) -> ?gdata.FNode:
+        return self._c.prepare_filter(subtree_filter)
+
+    def snapshot(self, filter: ?gdata.FNode) -> list[xml.Node]:
+        return self._c.snapshot(filter)
 
     def oper_data(self) -> gdata.Node:
         return self._c.oper_data()
 
-    def sample(self) -> list[xml.Node]:
-        return self._c.sample()
+    def sample(self, filter: ?gdata.FNode) -> list[xml.Node]:
+        return self._c.sample(filter)
 
-    def change(self) -> ?xml.Node:
-        return self._c.change()
+    def change(self, filter: ?gdata.FNode) -> ?xml.Node:
+        return self._c.change(filter)
