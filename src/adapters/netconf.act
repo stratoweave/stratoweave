@@ -2,6 +2,7 @@ import hash.wyhash as wyhash
 import logging
 import net
 import time
+import testing
 import std.xml as xml
 
 import yang.schema as yschema
@@ -26,6 +27,10 @@ from adapters.adapter import \
     subscription_delay, merge_subscription_tree, \
     SubscriptionStatus, SUBSCRIPTION_YANG_PUSH, SUBSCRIPTION_POLL, SUBSCRIPTION_CONNECTING
 
+MODULE_YANG_PUSH = "ietf-yang-push"
+MODULE_SUBSCRIBED_NOTIFICATIONS = "ietf-subscribed-notifications"
+MODULE_EVENT_NOTIFICATIONS = "ietf-event-notifications"
+
 def extract_txid(conf: ?xml.Node) -> ?str:
     """Attempt to extract a txid from configuration
 
@@ -38,6 +43,74 @@ def extract_txid(conf: ?xml.Node) -> ?str:
             for attr_name, attr_value in configuration_tag.attributes:
                 if attr_name == "junos:commit-seconds":
                     return attr_value
+
+
+def _supports_module(name: str, capabilities: list[str], modules: dict[str, ModCap]) -> bool:
+    # Servers advertise modules either as "<namespace>?module=..." URIs in
+    # <hello> (older style) or via ietf-yang-library, where the module list is in
+    # the discovered module set rather than the hello capabilities.
+    if name in modules:
+        return True
+    for cap in capabilities:
+        if "?module=" not in cap and "&module=" not in cap:
+            continue
+        if parse_cap(cap).name == name:
+            return True
+    return False
+
+
+def _yang_push_event_notifs(capabilities: list[str], modules: dict[str, ModCap]) -> ?bool:
+    """Return the YANG Push RPC dialect, or None when dynamic YANG Push is absent.
+
+    False means the standard RFC 8639/8641 combination: ietf-yang-push over
+    ietf-subscribed-notifications. True means IOS XE's non-standard
+    ietf-yang-push over ietf-event-notifications shape.
+    """
+    if not _supports_module(MODULE_YANG_PUSH, capabilities, modules):
+        return None
+    if _supports_module(MODULE_SUBSCRIBED_NOTIFICATIONS, capabilities, modules):
+        return False
+    if _supports_module(MODULE_EVENT_NOTIFICATIONS, capabilities, modules):
+        return True
+    return None
+
+
+def _test_yang_push_dialect_standard_caps():
+    dialect = _yang_push_event_notifs([
+        "urn:ietf:params:xml:ns:yang:ietf-yang-push?module=ietf-yang-push",
+        "urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications?module=ietf-subscribed-notifications",
+        "urn:ietf:params:xml:ns:yang:ietf-event-notifications?module=ietf-event-notifications",
+    ], {})
+    testing.assertEqual(dialect is not None, True)
+    if dialect is not None:
+        testing.assertEqual(dialect, False)
+
+
+def _test_yang_push_dialect_event_notifs_caps():
+    dialect = _yang_push_event_notifs([
+        "urn:ietf:params:xml:ns:yang:ietf-yang-push?module=ietf-yang-push",
+        "urn:ietf:params:xml:ns:yang:ietf-event-notifications?module=ietf-event-notifications",
+    ], {})
+    testing.assertEqual(dialect is not None, True)
+    if dialect is not None:
+        testing.assertEqual(dialect, True)
+
+
+def _test_yang_push_dialect_requires_subscription_rpc():
+    dialect = _yang_push_event_notifs([
+        "urn:ietf:params:xml:ns:yang:ietf-yang-push?module=ietf-yang-push",
+    ], {})
+    testing.assertEqual(dialect is None, True)
+
+
+def _test_yang_push_dialect_yang_library_modules():
+    dialect = _yang_push_event_notifs([], {
+        MODULE_YANG_PUSH: ModCap(MODULE_YANG_PUSH, "urn:ietf:params:xml:ns:yang:ietf-yang-push"),
+        MODULE_EVENT_NOTIFICATIONS: ModCap(MODULE_EVENT_NOTIFICATIONS, "urn:ietf:params:xml:ns:yang:ietf-event-notifications"),
+    })
+    testing.assertEqual(dialect is not None, True)
+    if dialect is not None:
+        testing.assertEqual(dialect, True)
 
 
 def _mock_capabilities_from_dmc(new_dmc: DeviceMetaConfig) -> list[str]:
@@ -422,11 +495,14 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
     # How we monitor this device, decided from its advertised capabilities at
     # connect time (None until connected): yang-push when supported, else periodic
-    # <get> polling. When using yang-push we establish device-side subscriptions
-    # and route their push-update notifications back to the matching shared spec
-    # via these id maps; yp_pending guards against establishing twice while an
-    # establish-subscription is in flight.
+    # <get> polling. _yp_event_notifs selects IOS XE's event-notifications
+    # RPC dialect; False is the standard subscribed-notifications dialect. When
+    # using yang-push we establish device-side subscriptions and route their
+    # push-update notifications back to the matching shared spec via these id maps;
+    # yp_pending guards against establishing twice while an establish-subscription
+    # is in flight.
     var _yang_push: ?bool = None
+    var _yp_event_notifs = False
     var yp_subid_spec: dict[int, ygdata.SubscriptionSpec] = {}
     var yp_spec_subid: dict[ygdata.SubscriptionSpec, int] = {}
     var yp_pending: set[ygdata.SubscriptionSpec] = set()
@@ -441,24 +517,6 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             m = parse_cap(cap)
             new_modset[m.name] = m
         return new_modset
-
-    def _supports_module(name: str, capabilities: list[str], modules: dict[str, ModCap]) -> bool:
-        # Servers advertise modules either as "<namespace>?module=..." URIs in
-        # <hello> (older style) or via ietf-yang-library, where the module list is
-        # in the discovered module set rather than the hello capabilities.
-        if name in modules:
-            return True
-        for cap in capabilities:
-            if "?module=" not in cap and "&module=" not in cap:
-                continue
-            if parse_cap(cap).name == name:
-                return True
-        return False
-
-    def _supports_yang_push(capabilities: list[str], modules: dict[str, ModCap]) -> bool:
-        # The device supports datastore push subscriptions if it implements
-        # ietf-yang-push.
-        return _supports_module("ietf-yang-push", capabilities, modules)
 
     def _supports_schema_discovery(capabilities: list[str]) -> bool:
         for cap in capabilities:
@@ -500,7 +558,11 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             # Pick the monitoring method from the device's capabilities. A fresh
             # client session invalidates any prior device-side subscriptions, so
             # drop the stale id maps and (re-)establish for this connection.
-            _yang_push = _supports_yang_push(c.get_capabilities(), new_modset)
+            yp_event_notifs = _yang_push_event_notifs(c.get_capabilities(), new_modset)
+            _yang_push = yp_event_notifs is not None
+            _yp_event_notifs = False
+            if yp_event_notifs is not None:
+                _yp_event_notifs = yp_event_notifs
             yp_subid_spec = {}
             yp_spec_subid = {}
             yp_pending = set()
@@ -1323,7 +1385,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 del yp_subid_spec[sid]
             c = client
             if c is not None:
-                c.delete_subscription((lambda cc, err: None), sid)
+                c.delete_subscription((lambda cc, err: None), sid, event_notifs=_yp_event_notifs)
         yp_pending.discard(spec)
 
     def _period_centiseconds(period_ns) -> ?int:
@@ -1398,12 +1460,14 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 # sync-on-start makes the device send a full push-update baseline
                 # first, seeding latest; later push-change-updates apply as deltas.
                 yp_pending.add(spec)
-                c.establish_subscription(on_est, on_change=True, sync_on_start=True, subtree_filter=filt_xml)
+                c.establish_subscription(on_est, on_change=True, sync_on_start=True,
+                    subtree_filter=filt_xml, event_notifs=_yp_event_notifs)
             else:
                 period_cs = _period_centiseconds(st.spec.period)
                 if period_cs is not None:
                     yp_pending.add(spec)
-                    c.establish_subscription(on_est, period=period_cs, subtree_filter=filt_xml)
+                    c.establish_subscription(on_est, period=period_cs, subtree_filter=filt_xml,
+                        event_notifs=_yp_event_notifs)
                 else:
                     err = ValueError("yang-push requires a periodic subscription")
                     for owner_id in st.owners:
