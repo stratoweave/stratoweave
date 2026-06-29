@@ -64,24 +64,32 @@ class _MockPushBackend(YangPushBackend):
     since the last push. The two procs are the server's own methods, so the data is
     read live in the server actor (the class-in-front-of-an-actor pattern)."""
     @property
-    _snap: proc() -> list[xml.Node]
+    _prep: proc(?list[xml.Node]) -> ?ygdata.FNode
     @property
-    _chg: proc() -> ?xml.Node
+    _snap: proc(?ygdata.FNode) -> list[xml.Node]
+    @property
+    _chg: proc(?ygdata.FNode) -> ?xml.Node
 
-    def __init__(self, snap: proc() -> list[xml.Node], chg: proc() -> ?xml.Node):
+    def __init__(self, prep: proc(?list[xml.Node]) -> ?ygdata.FNode,
+                 snap: proc(?ygdata.FNode) -> list[xml.Node],
+                 chg: proc(?ygdata.FNode) -> ?xml.Node):
+        self._prep = prep
         self._snap = snap
         self._chg = chg
 
-    def snapshot(self) -> list[xml.Node]:
-        return self._snap()
+    def prepare_filter(self, subtree_filter: ?list[xml.Node]) -> ?ygdata.FNode:
+        return self._prep(subtree_filter)
 
-    def sample(self) -> list[xml.Node]:
+    def snapshot(self, filter: ?ygdata.FNode) -> list[xml.Node]:
+        return self._snap(filter)
+
+    def sample(self, filter: ?ygdata.FNode) -> list[xml.Node]:
         # The mock's oper data changes only via set_oper_ds, so a periodic sample is
         # the current snapshot (no synthetic advance).
-        return self._snap()
+        return self._snap(filter)
 
-    def change(self) -> ?xml.Node:
-        return self._chg()
+    def change(self, filter: ?ygdata.FNode) -> ?xml.Node:
+        return self._chg(filter)
 
 
 actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[str], bundled_schema: DeviceSchema):
@@ -240,20 +248,35 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
         wrapper = xml.Node("data", children=data_children)
         return yxml.from_xml(conf_schema, wrapper, loose=True)
 
-    def _yp_snapshot() -> list[xml.Node]:
+    def _yp_prepare_filter(subtree_filter: ?list[xml.Node]) -> ?ygdata.FNode:
+        if subtree_filter is not None:
+            wrapper = xml.Node("filter", attributes=[("type", "subtree")], children=subtree_filter)
+            return yxml.from_filter_xml(oper_schema, wrapper)
+        return None
+
+    def _yp_snapshot(filter: ?ygdata.FNode) -> list[xml.Node]:
         # Current operational data as a push baseline, recorded so the next on-change
         # diff is taken from what was last pushed.
         _yp_last = oper_ds
+        if filter is not None:
+            filtered = ygdata.filter(oper_ds, filter)
+            if filtered is not None:
+                return filtered.to_xml(deterministic=True)
+            return []
         return oper_ds.to_xml(deterministic=True)
 
-    def _yp_change() -> ?xml.Node:
+    def _yp_change(filter: ?ygdata.FNode) -> ?xml.Node:
         # A yang-patch of what changed since the last push, or None if unchanged.
-        prev = _yp_last
-        cur = oper_ds
+        prev: ?ygdata.Node = _yp_last
+        cur: ?ygdata.Node = oper_ds
         _yp_last = cur
-        d = ygdata.diff(prev, cur)
-        if d is not None:
-            return ypatch.diff_to_patch(d, "mock-change").to_xml()
+        if filter is not None:
+            prev = ygdata.filter(prev, filter)
+            cur = ygdata.filter(cur, filter)
+        if cur is not None:
+            d = ygdata.diff(prev, cur)
+            if d is not None:
+                return ypatch.diff_to_patch(d, "mock-change").to_xml()
         return None
 
     def on_rpc(s: netconf.Server, message_id: str, op: xml.Node):
@@ -306,7 +329,7 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
             send_error(s, message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
 
     var server: netconf.Server = netconf.Server(pipe=pipe, on_rpc=on_rpc, log_handler=log_handler, capabilities=all_capabilities)
-    yp_service = nyp.NetconfSubscriptionService(server, _MockPushBackend(_yp_snapshot, _yp_change), log_handler)
+    yp_service = nyp.NetconfSubscriptionService(server, _MockPushBackend(_yp_prepare_filter, _yp_snapshot, _yp_change), log_handler)
 
     def set_oper_ds(new_oper_ds: ygdata.Node, schema: ?yschema.DRoot=None):
         """Set the operational datastore (and optionally its schema) for <get>."""

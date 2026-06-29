@@ -25,15 +25,16 @@ ordering, and so RESTCONF has its seam: there establish happens on one request a
 delivery attaches on a later GET to the stream.
 
 The data source is the injected backend, a YangPushBackend the publisher simply
-calls: snapshot returns the current contents and sample advances the source by one
-step and returns the new contents. A concrete backend is a class in front of an
-actor, so reading real datastore state still happens in the actor while the
-publisher gets its value back from a plain call.
+calls: snapshot returns the current contents, sample returns the contents for a
+periodic tick, and change renders the latest source delta. A concrete backend is a
+class in front of an actor, so reading real datastore state still happens in the
+actor while the publisher gets its value back from a plain call.
 """
 
 import logging
 import std.xml as xml
 
+import yang.gdata as gdata
 import yp
 
 
@@ -41,28 +42,32 @@ class YangPushBackend(object):
     """The datastore source the publisher pulls from.
 
     snapshot returns the current contents (a list of top-level data nodes, one per
-    module) without advancing. sample advances the source by one step and returns
-    the new full contents (periodic). change advances the source and returns a
-    ready-built <yang-patch> of what changed since the last call, or None if nothing
-    changed (on-change) — the backend owns the diff and its yang-patch rendering, so
-    the publisher stays content-agnostic. A concrete backend is a class delegating
-    to an actor, which is what lets the publisher read the value back from an
-    ordinary call even when the actor had to do real work to produce it."""
-    snapshot: proc() -> list[xml.Node]
-    sample: proc() -> list[xml.Node]
-    change: proc() -> ?xml.Node
+    module). sample returns the current full contents for a periodic update. change
+    returns a ready-built <yang-patch> of the latest source change, or None if
+    nothing changed (on-change). prepare_filter turns a subscription's raw
+    datastore-subtree-filter XML into a gdata filter once at establish-subscription
+    time; snapshot/sample/change then reuse it. The backend owns that conversion
+    because it has the schema needed to parse the wire filter. A concrete backend is
+    a class delegating to an actor, which is what lets the publisher read the value
+    back from a plain call."""
+    prepare_filter: proc(?list[xml.Node]) -> ?gdata.FNode
+    snapshot: proc(?gdata.FNode) -> list[xml.Node]
+    sample: proc(?gdata.FNode) -> list[xml.Node]
+    change: proc(?gdata.FNode) -> ?xml.Node
 
 
 class SubState(object):
     interval: float     # tick period in seconds
     on_change: bool     # on-change subscription (vs periodic)
     sync_on_start: bool # on-change: emit a full baseline before the first delta
+    filter: ?gdata.FNode
     active: bool
 
-    def __init__(self, interval: float, on_change: bool=False, sync_on_start: bool=False):
+    def __init__(self, interval: float, on_change: bool=False, sync_on_start: bool=False, filter: ?gdata.FNode=None):
         self.interval = interval
         self.on_change = on_change
         self.sync_on_start = sync_on_start
+        self.filter = filter
         self.active = True
 
 
@@ -85,10 +90,13 @@ actor YangPushPublisher(deliver: action(xml.Node) -> None,
         On-change subscriptions are event-driven: nothing is pushed until something
         calls trigger_change - a real source on a datastore change, or the mock
         server on a manual trigger."""
+        if params.xpath_filter is not None:
+            return None
+        filter = backend.prepare_filter(params.subtree_filter)
         if params.on_change:
             sub_id = next_id
             next_id += 1
-            subs[sub_id] = SubState(0.0, on_change=True, sync_on_start=params.sync_on_start)
+            subs[sub_id] = SubState(0.0, on_change=True, sync_on_start=params.sync_on_start, filter=filter)
             _log.info("establish-subscription id={sub_id} mode=on-change")
             return sub_id
         pp = params.periodic_period
@@ -97,7 +105,7 @@ actor YangPushPublisher(deliver: action(xml.Node) -> None,
                 interval = float(pp) / 100.0
                 sub_id = next_id
                 next_id += 1
-                subs[sub_id] = SubState(interval)
+                subs[sub_id] = SubState(interval, filter=filter)
                 _log.info("establish-subscription id={sub_id} mode=periodic period={interval}s")
                 return sub_id
         return None
@@ -112,10 +120,10 @@ actor YangPushPublisher(deliver: action(xml.Node) -> None,
                     # Event-driven: only the optional sync-on-start baseline emits
                     # now; deltas wait for trigger_change.
                     if st.sync_on_start:
-                        snap = backend.snapshot()
+                        snap = backend.snapshot(st.filter)
                         deliver(yp.build_notification(yp.event_time_now(), yp.build_push_update(sub_id, snap)))
                 else:
-                    snap = backend.snapshot()
+                    snap = backend.snapshot(st.filter)
                     deliver(yp.build_notification(yp.event_time_now(), yp.build_push_update(sub_id, snap)))
                     after st.interval: _tick(sub_id)
 
@@ -147,7 +155,7 @@ actor YangPushPublisher(deliver: action(xml.Node) -> None,
         if sub_id in subs:
             st = subs[sub_id]
             if st.active:
-                contents = backend.sample()
+                contents = backend.sample(st.filter)
                 deliver(yp.build_notification(yp.event_time_now(), yp.build_push_update(sub_id, contents)))
                 after st.interval: _tick(sub_id)
 
@@ -155,8 +163,8 @@ actor YangPushPublisher(deliver: action(xml.Node) -> None,
         """Emit a push-change-update to every active on-change subscription from the
         backend's current delta. This is the event-driven entry point: a real
         datastore source calls it on a change, and the mock server wires it to a
-        manual trigger. The delta is computed once and fanned out, so multiple
-        on-change subs on one backend stay consistent."""
+        manual trigger. The backend receives each subscription's filter so
+        it can render the patch in the subscribed view of the datastore."""
         targets: list[int] = []
         for sid, st in subs.items():
             if st.active and st.on_change:
@@ -164,7 +172,8 @@ actor YangPushPublisher(deliver: action(xml.Node) -> None,
         if len(targets) == 0:
             return
         _log.info("on-change trigger: notifying {len(targets)} subscription(s)")
-        patch = backend.change()
-        if patch is not None:
-            for sid in targets:
+        for sid in targets:
+            st = subs[sid]
+            patch = backend.change(st.filter)
+            if patch is not None:
                 deliver(yp.build_notification(yp.event_time_now(), yp.build_push_change_update(sid, patch)))
