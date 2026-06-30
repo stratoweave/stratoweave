@@ -479,9 +479,15 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             return capability in client.get_capabilities()
         return False
 
+    def _is_stale(c: ?netconf.Client) -> bool:
+        cur = client
+        if c is not None and cur is not None:
+            return c is not cur
+        return True
+
     def _on_connect(c: netconf.Client, err):
-        if client is not None and c is not client:
-            _log.debug("Device._on_connect: ignoring connection from old client")
+        if _is_stale(c):
+            _log.debug("Device._on_connect: ignoring callback from stale client")
             return
 
         schemas = []
@@ -506,8 +512,8 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             dev.on_connect(modset, schema_hash)
 
         def list_schemas(c1: netconf.Client, schema_list: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
-            if client is not None and c1 is not client:
-                _log.debug("Device._on_connect: ignoring connection from old client")
+            if _is_stale(c1):
+                _log.debug("Device._on_connect.list_schemas: ignoring callback from stale client")
                 return
 
             if error is not None:
@@ -556,8 +562,8 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             schema_getter.download(schema_download, download_complete, schemas_to_download)
 
         def schema_download(sg, index: int, total: int, schema_id: (identifier: str, version: ?str, format: ?str), schema_data, error):
-            if schema_getter is not None and sg is not schema_getter:
-                _log.debug("Device._on_connect: ignoring connection from old client")
+            if _is_stale(c) or (schema_getter is not None and sg is not schema_getter):
+                _log.debug("Device._on_connect.schema_download: ignoring callback from stale client")
                 return
             if error is not None:
                 _log.error("Device._on_connect: error downloading schema", {"error": str(error), "identifier": schema_id.identifier})
@@ -568,8 +574,8 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 schemas.append(schema_data)
 
         def download_complete(sg, error=None):
-            if schema_getter is not None and sg is not None and sg is not schema_getter:
-                _log.debug("Device._on_connect: ignoring connection from old client")
+            if _is_stale(c) or (schema_getter is not None and sg is not None and sg is not schema_getter):
+                _log.debug("Device._on_connect.download_complete: ignoring callback from stale client")
                 return
             if error is not None:
                 _log.error("Device._on_connect: error downloading schemas", {"error": str(error)})
@@ -603,8 +609,8 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             c.list_schemas(list_schemas)
 
     def _on_notif(c, n):
-        if client is not None and c is not client:
-            _log.debug("Device._on_connect: ignoring connection from old client")
+        if _is_stale(c):
+            _log.debug("Device._on_notif: ignoring callback from stale client")
             return
         # A yang-push push-update is a full datastore snapshot; route it to the
         # subscription whose device-side id it carries and publish like a poll.
@@ -726,9 +732,11 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         """Close the connection to the device
         """
         _log.debug("Device.close")
-        if client is not None:
-            client.close()
+        c = client
+        if c is not None:
+            client = None
             state = DISCONNECTED
+            c.close()
             _log.debug("Device closed")
         else:
             _log.debug("Device.close: No client, nothing to close")
@@ -777,6 +785,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
         def on_junos_txid_data(c: netconf.Client, r: ?xml.Node, error: ?netconf.NetconfError):
             """Process JUNOS config data to extract txid"""
+            if _is_stale(c):
+                done(c, "", None)
+                return
             if error is not None:
                 _log.error("Device.get_txid_junos: error fetching config", {"error": error})
                 # Fall back to generic method on error
@@ -827,6 +838,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         _log.debug("Device.get_txid_generic: fetching full config for hash")
 
         def on_generic_txid_data(c: netconf.Client, r: ?xml.Node, error: ?netconf.NetconfError):
+            if _is_stale(c):
+                done(c, "", None)
+                return
             if error is not None:
                 _log.error("Device.get_txid_generic: error fetching config", {"error": error})
                 # Can't recover from this, return empty txid
@@ -902,8 +916,19 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         # Set transaction state
         state = TRANSACTION
 
+        # Track the NETCONF Client actor used to start the transaction so that
+        # we may detect stale / closed client.
+        tx_client = client
+
+        def _abort_stale_tx():
+            _log.debug("Device.configure: client replaced or closed mid-transaction, aborting")
+            done(NotConnectedError(), None)
+
         def on_locked_running(c: netconf.Client, error: ?netconf.NetconfError):
             """Callback after locking running datastore"""
+            if _is_stale(c):
+                _abort_stale_tx()
+                return
             _log.debug("Device.configure.on_locked_running", {"error": error})
             if error is not None:
                 abort(error)
@@ -919,6 +944,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
         def on_locked_candidate(c: netconf.Client, error: ?netconf.NetconfError):
             """Callback after locking candidate datastore"""
+            if _is_stale(c):
+                _abort_stale_tx()
+                return
             _log.debug("Device.configure.on_locked_candidate", {"error": error})
             if error is not None:
                 # If we had locked running first, unlock it
@@ -932,6 +960,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
         def on_txid_received(c: netconf.Client, current_txid: str, current_conf: ?ygdata.Node):
             """Called after txid has been retrieved from device"""
+            if _is_stale(c):
+                _abort_stale_tx()
+                return
             # Check if txid matches our expected
             expected_txid = old_conf.txid if old_conf is not None else None
 
@@ -962,6 +993,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                         abort(NotConnectedError())
 
         def on_edited(c: netconf.Client, error: ?netconf.NetconfError):
+            if _is_stale(c):
+                _abort_stale_tx()
+                return
             _log.debug("Device.configure.on_edited", {"error": error})
             if error is not None:
                 _log.error("Device.configure: edit-config error", {"error": error})
@@ -975,6 +1009,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     complete(c)
 
         def on_committed(c: netconf.Client, error: ?netconf.NetconfError):
+            if _is_stale(c):
+                _abort_stale_tx()
+                return
             _log.debug("Device.configure.on_committed", {"error": error})
             if error is not None:
                 _log.error("Device.configure: commit error", {"error": error})
@@ -1000,6 +1037,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
             def on_resulting_txid(c: netconf.Client, txid: str, final_conf: ?ygdata.Node):
                 """Called with the new txid after configuration is complete"""
+                if _is_stale(c):
+                    _abort_stale_tx()
+                    return
                 _log.debug("Device.configure: got new txid", {"txid": txid})
                 # If we got a full config, update our running_conf
                 if final_conf is not None:
@@ -1021,6 +1061,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             def finish_with_config(conf):
                 """Finish with unlocking and calling done with the config"""
                 def on_candidate_unlocked(c2: netconf.Client, e: ?netconf.NetconfError):
+                    if _is_stale(c2):
+                        _abort_stale_tx()
+                        return
                     # If we locked running, unlock it after candidate (reverse order of locking)
                     if has_writable_running():
                         c2.unlock(lambda c3, e2: finish(e if e is not None else e2, conf), "running")
@@ -1045,9 +1088,15 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
         def abort(err: Exception):
             """Abort and cleanup the transaction"""
+            if _is_stale(tx_client):
+                _abort_stale_tx()
+                return
             _log.debug("Device.configure: aborting transaction", {"error": err})
 
             def on_abort_candidate_unlocked(c: netconf.Client, e: ?netconf.NetconfError):
+                if _is_stale(c):
+                    _abort_stale_tx()
+                    return
                 # If we locked running, unlock it after candidate (reverse order)
                 if has_writable_running():
                     c.unlock(lambda c2, e2: finish(err), "running")
@@ -1069,6 +1118,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
         def finish(error: ?Exception=None, final_conf: ?ygdata.Node=None):
             """Final cleanup and state reset"""
+            if _is_stale(tx_client):
+                _abort_stale_tx()
+                return
             _log.debug("Device.configure: finishing transaction", {"error": error})
             # Reset state to CONNECTED
             state = CONNECTED
@@ -1181,6 +1233,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
     def fetch_config(done: action(?ygdata.Node, ?Exception) -> None) -> None:
         def on_get_config(c, r, error):
+            if _is_stale(c):
+                done(None, NotConnectedError())
+                return
             if error is not None:
                 _log.error("Device._on_get_config: error", {"error": error.error_message})
                 # TODO: refine this error handling, at least down to transient vs permanent
@@ -1237,6 +1292,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
     def rpc_xml(cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node) -> None:
         def rpc_reply(c, r: ?xml.Node, error: ?netconf.NetconfError):
+            if _is_stale(c):
+                cb(None, NotConnectedError())
+                return
             _log.debug("Device.rpc_xml.rpc_reply", {"r": r, "error": error})
             cb(r, error)
 
@@ -1378,16 +1436,16 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
             def on_est(cc: netconf.Client, sid: ?int, err: ?netconf.NetconfError):
                 yp_pending.discard(spec)
-                c2 = client
-                if c2 is not None and cc is c2:
-                    if err is not None:
-                        _log.error("Device: establish-subscription failed", {"error": str(err)})
-                        if spec in subs:
-                            for owner_id in subs[spec].owners:
-                                _owner_publish(owner_id, err)
-                    elif sid is not None and spec in subs:
-                        yp_subid_spec[sid] = spec
-                        yp_spec_subid[spec] = sid
+                if _is_stale(cc):
+                    return
+                if err is not None:
+                    _log.error("Device: establish-subscription failed", {"error": str(err)})
+                    if spec in subs:
+                        for owner_id in subs[spec].owners:
+                            _owner_publish(owner_id, err)
+                elif sid is not None and spec in subs:
+                    yp_subid_spec[sid] = spec
+                    yp_spec_subid[spec] = sid
 
             if st.spec.on_change:
                 # sync-on-start makes the device send a full push-update baseline
@@ -1431,6 +1489,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 return
             st2 = subs[spec]
             if not st2.active:
+                return
+            if _is_stale(c):
+                _sub_schedule_next(spec)
                 return
             if error is not None:
                 for owner_id in st2.owners:
