@@ -1,0 +1,91 @@
+#
+# In-memory window simulator.
+#
+# Steps time through one window, driving the pure controller in core.act with
+# a configurable gap between estimated and actual upgrade duration. This is how
+# you watch concurrency flex to honour the plan without a device in sight.
+#
+
+import fleet_sched as core
+
+class SimResult(value):
+    launched: int
+    completed: int
+    deferred: int
+    peak: int
+    overran: int
+    final_rung: int
+    log: list[str]
+
+    def __init__(self, launched: int, completed: int, deferred: int, peak: int,
+                 overran: int, final_rung: int, log: list[str]):
+        self.launched = launched
+        self.completed = completed
+        self.deferred = deferred
+        self.peak = peak
+        self.overran = overran
+        self.final_rung = final_rung
+        self.log = log
+
+def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
+                    camp: core.Campaign, rung0: int, tick: int,
+                    sample_every: int, observed0: ?int = None) -> SimResult:
+    t = w.start
+    remaining = n_devices
+    inflight = []
+    observed = est_s
+    o0 = observed0
+    if o0 is not None:
+        observed = o0
+    completed = 0
+    launched = 0
+    peak = 0
+    rung = rung0
+    rung_target = rung0
+    log = []
+    alarmed = False
+    step = 0
+
+    log.append("      time | left  | inflt | req   | allw  | rung  | +new  | done")
+    while t <= w.end:
+        # ---- completions; observed duration is an EWMA seeded from the estimate
+        still = []
+        for f in inflight:
+            if f <= t:
+                completed = completed + 1
+                observed = (observed * 3 + actual_s) // 4
+            else:
+                still.append(f)
+        inflight = still
+
+        # ---- ramp: advance a rung once that many upgrades have landed cleanly
+        if completed >= rung_target and rung < camp.target_concurrency:
+            rung = core.ramp_next(rung, camp.ramp_factor, camp.target_concurrency)
+            rung_target = completed + rung
+
+        t_rem = w.end - t
+        req = core.required_concurrency(remaining, observed, t_rem)
+        allw = core.allowed_concurrency(remaining, observed, t_rem,
+                                        camp.target_concurrency, camp.max_concurrency)
+        n_new = core.launch_count(remaining, len(inflight), observed, t_rem,
+                                  camp.target_concurrency, camp.max_concurrency,
+                                  rung, w.max_concurrency)
+        i = 0
+        while i < n_new:
+            inflight.append(t + actual_s)
+            i = i + 1
+        remaining = remaining - n_new
+        launched = launched + n_new
+        peak = core.imax(peak, len(inflight))
+
+        sf = core.shortfall(remaining, observed, t_rem, camp.max_concurrency)
+        if sf > 0 and not alarmed and remaining > 0:
+            log.append(f"  {core.fmt_ts(t)} | ALARM: {sf} device(s) cannot make this window even at max concurrency -- deferral projected")
+            alarmed = True
+
+        if step % sample_every == 0:
+            log.append(f"  {core.fmt_ts(t)} | {remaining:5d} | {len(inflight):5d} | {req:5d} | {allw:5d} | {rung:5d} | {n_new:5d} | {completed:5d}")
+        step = step + 1
+        t = t + tick
+
+    return SimResult(launched, completed, remaining, peak, len(inflight), rung, log)

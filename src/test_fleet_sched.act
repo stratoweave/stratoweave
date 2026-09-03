@@ -1,0 +1,434 @@
+#
+# Tests for the pure scheduler core. No StratoWeave runtime, no clock, no I/O.
+#
+
+import testing
+
+import fleet_sched as core
+import fleet_sched_sim as sim
+
+HOUR = 3600
+DAY = 86400
+
+def _camp(target: int, maxc: int, pol: str) -> core.Campaign:
+    return core.Campaign("c", ["weekly"], target, maxc, 1, 2, 30 * DAY, pol, 5,
+                    ["c8000v"], [], [], "plan")
+
+def _dev(name: str, groups: list[core.GroupRef]) -> core.DeviceIn:
+    return core.DeviceIn(name, "c8000v", None, groups, [], 20 * 60, True)
+
+def _pols(gname: str, pol: str) -> dict[str, core.GroupPolicy]:
+    return {gname: core.GroupPolicy(gname, pol, None)}
+
+def _gen(n: int) -> core.SimpleWindowGen:
+    return core.SimpleWindowGen("weekly", 30 * DAY + 2 * HOUR, 4 * HOUR, 7 * DAY, 10000, n)
+
+def _win_of(r: core.PlanResult, device: str) -> str:
+    for a in r.assigns:
+        if a.device == device:
+            return a.wkey()
+    return "<unplanned>"
+
+#############################################################################
+# concurrency controller
+#############################################################################
+
+def _test_generations_accounts_for_launch_cutoff():
+    # 4h window, 10min upgrades: the last round must start 1.2*d before the end,
+    # so 23 rounds fit, not the naive 24.
+    testing.assertEqual(core.generations(600, 4 * HOUR), 23, None)
+    # no room for even one round
+    testing.assertEqual(core.generations(600, 600), 0, None)
+
+def _test_on_estimate_sits_at_target():
+    # a window planned full at target needs exactly target concurrency
+    n = 23 * 1000
+    a = core.allowed_concurrency(n, 600, 4 * HOUR, 1000, 2000)
+    testing.assertEqual(a, 1000, "should sit at target when on estimate")
+
+def _test_slow_upgrades_climb_toward_max():
+    n = 23 * 1000
+    a = core.allowed_concurrency(n, 1200, 4 * HOUR, 1000, 2000)
+    testing.assertEqual(a, 2000, "2x duration must spend the headroom")
+
+def _test_never_exceeds_max():
+    n = 100000
+    a = core.allowed_concurrency(n, 3600, 4 * HOUR, 1000, 2000)
+    testing.assertEqual(a, 2000, "max-concurrency is a hard ceiling")
+
+def _test_fast_upgrades_do_not_drop_below_target():
+    n = 1000
+    a = core.allowed_concurrency(n, 300, 4 * HOUR, 1000, 2000)
+    testing.assertEqual(a, 1000, "running ahead of schedule still uses the window")
+
+def _test_launch_cutoff_stops_starting_work_that_cannot_finish():
+    # plenty of demand and headroom, but only 5 minutes of window left
+    n = core.launch_count(500, 0, 600, 300, 1000, 2000, 1000, 10000)
+    testing.assertEqual(n, 0, "must not start an upgrade that overruns the window")
+
+def _test_ramp_binds_before_target_and_releases_after():
+    # mid-ramp: the rung is the ceiling even though schedule pressure is high
+    n = core.launch_count(23000, 0, 1200, 4 * HOUR, 1000, 2000, 8, 10000)
+    testing.assertEqual(n, 8, "ramp beats schedule adherence while ramping")
+    # ramp complete: headroom up to max becomes available
+    n2 = core.launch_count(23000, 0, 1200, 4 * HOUR, 1000, 2000, 1000, 10000)
+    testing.assertEqual(n2, 2000, "a completed ramp stops binding")
+
+def _test_window_ceiling_caps_camp():
+    n = core.launch_count(23000, 0, 1200, 4 * HOUR, 1000, 2000, 1000, 50)
+    testing.assertEqual(n, 50, "the window's own crew limit wins when lower")
+
+def _test_shortfall_is_known_early():
+    # 3x duration against a full window: deferral is projectable at the start
+    sf = core.shortfall(23000, 1800, 4 * HOUR, 2000)
+    testing.assertTrue(sf > 0, "shortfall must be visible before window end")
+    testing.assertEqual(sf, 23000 - 2000 * core.generations(1800, 4 * HOUR), None)
+
+def _test_ramp_progression():
+    testing.assertEqual(core.ramp_next(1, 2, 64), 2, None)
+    testing.assertEqual(core.ramp_next(32, 2, 64), 64, None)
+    testing.assertEqual(core.ramp_next(64, 2, 64), 64, "never past target")
+
+#############################################################################
+# planner
+#############################################################################
+
+def _test_nothing_lands_inside_the_notification_lead_time():
+    camp = _camp(100, 200, core.SPREAD)
+    pols = {}
+    r = core.plan([], [_dev("d1", [])], camp, pols, [_gen(6)], 0, 12)
+    testing.assertEqual(len(r.assigns), 1, None)
+    testing.assertTrue(r.assigns[0].start >= 30 * DAY, "placed inside lead time")
+
+def _test_existing_assignments_do_not_move():
+    camp = _camp(100, 200, core.SPREAD)
+    pols = {}
+    devs = [_dev("d1", []), _dev("d2", [])]
+    r1 = core.plan([], devs, camp, pols, [_gen(6)], 0, 12)
+    devs.append(_dev("d3", []))
+    r2 = core.plan(r1.assigns, devs, camp, pols, [_gen(6)], 0, 12)
+    testing.assertEqual(_win_of(r2, "d1"), _win_of(r1, "d1"), "d1 moved")
+    testing.assertEqual(_win_of(r2, "d2"), _win_of(r1, "d2"), "d2 moved")
+    testing.assertEqual(len(r2.assigns), 3, None)
+
+def _test_redundancy_members_never_share_a_window():
+    camp = _camp(100, 200, core.PACK)
+    pols = {}
+    devs = [_dev("a", [core.GroupRef("pair", 1)]),
+            _dev("b", [core.GroupRef("pair", 2)])]
+    r = core.plan([], devs, camp, pols, [_gen(6)], 0, 12)
+    testing.assertNotEqual(_win_of(r, "a"), _win_of(r, "b"), "pair shares a window")
+
+def _test_pack_puts_a_pair_in_consecutive_windows():
+    camp = _camp(100, 200, core.PACK)
+    pols = {}
+    devs = [_dev("a", [core.GroupRef("pair", 1)]),
+            _dev("b", [core.GroupRef("pair", 2)])]
+    r = core.plan([], devs, camp, pols, [_gen(6)], 0, 12)
+    gap = 0
+    for x in r.assigns:
+        if x.device == "b":
+            gap = x.start
+    for x in r.assigns:
+        if x.device == "a":
+            gap = gap - x.start
+    testing.assertEqual(gap, 7 * DAY, "pack should use the very next window")
+
+def _test_spread_pushes_a_pair_to_the_extremes():
+    camp = _camp(100, 200, core.SPREAD)
+    pols = {}
+    devs = [_dev("a", [core.GroupRef("pair", 1)]),
+            _dev("b", [core.GroupRef("pair", 2)])]
+    r = core.plan([], devs, camp, pols, [_gen(6)], 0, 12)
+    gap = 0
+    for x in r.assigns:
+        if x.device == "b":
+            gap = x.start
+    for x in r.assigns:
+        if x.device == "a":
+            gap = gap - x.start
+    testing.assertEqual(gap, 5 * 7 * DAY, "spread should use first and last window")
+
+def _test_priority_decides_which_member_goes_first():
+    camp = _camp(100, 200, core.PACK)
+    pols = {}
+    devs = [_dev("primary", [core.GroupRef("pair", 9)]),
+            _dev("backup", [core.GroupRef("pair", 1)])]
+    r = core.plan([], devs, camp, pols, [_gen(6)], 0, 12)
+    first = 0
+    second = 0
+    for x in r.assigns:
+        if x.device == "backup":
+            first = x.start
+        if x.device == "primary":
+            second = x.start
+    testing.assertTrue(first < second, "lower priority must be upgraded first")
+
+def _test_contracted_schedule_is_not_a_fallback():
+    # device bound to a schedule that has no windows at all -> unplannable,
+    # never quietly moved onto the campaign default
+    camp = _camp(100, 200, core.SPREAD)
+    pols = {}
+    d = core.DeviceIn("cust", "c8000v", "gold-contract", [], [], 20 * 60, True)
+    r = core.plan([], [d], camp, pols, [_gen(6)], 0, 12)
+    testing.assertEqual(len(r.assigns), 0, None)
+    testing.assertEqual(len(r.alarms), 1, "should raise unplannable")
+
+def _test_devices_already_at_target_consume_nothing():
+    camp = _camp(100, 200, core.SPREAD)
+    pols = {}
+    noop = core.DeviceIn("done", "c8000v", None, [], [], 20 * 60, False)
+    r = core.plan([], [noop, _dev("d1", [])], camp, pols, [_gen(6)], 0, 12)
+    testing.assertEqual(len(r.assigns), 1, "noop devices must not be planned")
+
+def _test_capacity_forces_overflow_into_later_windows():
+    # 4h window, 20min upgrades, target 2 -> 5% margin leaves 22 slots/window
+    camp = _camp(2, 4, core.PACK)
+    pols = {}
+    devs = []
+    i = 0
+    while i < 30:
+        devs.append(_dev(f"d{i:02d}", []))
+        i = i + 1
+    r = core.plan([], devs, camp, pols, [_gen(6)], 0, 12)
+    testing.assertEqual(len(r.assigns), 30, None)
+    first = 0
+    for a in r.assigns:
+        if a.start == 30 * DAY + 2 * HOUR:
+            first = first + 1
+    testing.assertTrue(first < 30, "a single window must not absorb everything")
+
+def _test_group_policy_beats_job_default():
+    # camp default is spread, but this group asks to be packed -- the policy
+    # lives on the group, so there is no A-says-x-B-says-y conflict to resolve
+    camp = _camp(100, 200, core.SPREAD)
+    pols = _pols("pair", core.PACK)
+    devs = [_dev("a", [core.GroupRef("pair", 1)]),
+            _dev("b", [core.GroupRef("pair", 2)])]
+    r = core.plan([], devs, camp, pols, [_gen(6)], 0, 12)
+    gap = 0
+    for x in r.assigns:
+        if x.device == "b":
+            gap = x.start
+    for x in r.assigns:
+        if x.device == "a":
+            gap = gap - x.start
+    testing.assertEqual(gap, 7 * DAY, "group policy should override the campaign default")
+
+def _test_selection_by_tag_and_platform():
+    camp = core.Campaign("c", ["weekly"], 100, 200, 1, 2, 30 * DAY, core.SPREAD, 5,
+                   ["c8000v"], ["pilot"], [], "plan")
+    tagged = core.DeviceIn("a", "c8000v", None, [], ["pilot"], 20 * 60, True)
+    untagged = core.DeviceIn("b", "c8000v", None, [], ["prod"], 20 * 60, True)
+    wrong_plat = core.DeviceIn("c", "xrd", None, [], ["pilot"], 20 * 60, True)
+    r = core.plan([], [tagged, untagged, wrong_plat], camp, {}, [_gen(6)], 0, 12)
+    testing.assertEqual(len(r.assigns), 1, None)
+    testing.assertEqual(r.assigns[0].device, "a", None)
+
+def _test_empty_selection_matches_nothing():
+    camp = core.Campaign("c", ["weekly"], 100, 200, 1, 2, 30 * DAY, core.SPREAD, 5,
+                   [], [], [], "plan")
+    r = core.plan([], [_dev("d1", [])], camp, {}, [_gen(6)], 0, 12)
+    testing.assertEqual(len(r.assigns), 0, "the whole fleet must be opted into")
+
+def _test_explicit_device_list_wins_over_filters():
+    camp = core.Campaign("c", ["weekly"], 100, 200, 1, 2, 30 * DAY, core.SPREAD, 5,
+                   ["xrd"], [], ["d1"], "plan")
+    r = core.plan([], [_dev("d1", [])], camp, {}, [_gen(6)], 0, 12)
+    testing.assertEqual(len(r.assigns), 1, "explicit listing is a union, not a filter")
+
+def _test_pin_places_a_device_in_a_named_window():
+    camp = _camp(100, 200, core.SPREAD)
+    third = 30 * DAY + 2 * HOUR + 14 * DAY
+    pins = {"d1": third}
+    r = core.plan([], [_dev("d1", []), _dev("d2", [])], camp, {}, [_gen(6)], 0, 12, pins)
+    for a in r.assigns:
+        if a.device == "d1":
+            testing.assertEqual(a.start, third, "pin not honoured")
+            testing.assertEqual(a.status, "pinned", None)
+        if a.device == "d2":
+            testing.assertEqual(a.start, 30 * DAY + 2 * HOUR, "d2 should still take the earliest")
+
+def _test_unhonourable_pin_alarms_rather_than_moving():
+    camp = _camp(100, 200, core.SPREAD)
+    pins = {"d1": 12345}      # no such window
+    r = core.plan([], [_dev("d1", [])], camp, {}, [_gen(6)], 0, 12, pins)
+    testing.assertEqual(len(r.assigns), 0, None)
+    testing.assertEqual(len(r.alarms), 1, "a pin that cannot be met must alarm")
+
+def _test_peer_must_be_alive_before_upgrading():
+    peers = {"pair": ["a", "b"]}
+    a = core.DeviceIn("a", "c8000v", None, [core.GroupRef("pair", 1)], [],
+                      20 * 60, True, peers)
+    testing.assertTrue(core.group_peers_alive(a, {"a": True, "b": True}),
+                       "should launch when the peer is up")
+    testing.assertFalse(core.group_peers_alive(a, {"a": True, "b": False}),
+                        "must not take A down while B is already down")
+
+def _test_liveness_subsumes_same_time_exclusion():
+    # while a is upgrading it is unreachable, so b cannot start -- no separate
+    # exclusion rule needed at execution time
+    peers = {"pair": ["a", "b"]}
+    b = core.DeviceIn("b", "c8000v", None, [core.GroupRef("pair", 2)], [],
+                      20 * 60, True, peers)
+    testing.assertFalse(core.group_peers_alive(b, {"a": False, "b": True}), None)
+
+def _test_ungrouped_device_is_never_blocked_by_liveness():
+    solo = core.DeviceIn("solo", "c8000v", None, [], [], 20 * 60, True, {})
+    testing.assertTrue(core.group_peers_alive(solo, {}), None)
+
+#############################################################################
+# end-to-end through the simulator -- regression cover for §5 of the design
+#############################################################################
+
+def _sim_camp(target: int, maxc: int) -> core.Campaign:
+    return core.Campaign("c", ["weekly"], target, maxc, 1, 2, 30 * DAY, core.SPREAD, 5,
+                    ["c8000v"], [], [], "run")
+
+def _test_a_window_on_estimate_defers_nothing():
+    w = core.Window("weekly", 0, 4 * HOUR, 100000)
+    r = sim.simulate_window(22800, 600, 600, w, _sim_camp(1000, 2000), 1000, 60, 10000, None)
+    testing.assertEqual(r.deferred, 0, "a window run on estimate must complete")
+    testing.assertEqual(r.peak, 1000, "and must not exceed target to do it")
+
+def _test_slow_upgrades_spend_the_headroom():
+    w = core.Window("weekly", 0, 4 * HOUR, 100000)
+    r = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 60, 10000, None)
+    testing.assertEqual(r.peak, 2000, "2x duration must drive concurrency to max")
+
+def _test_learned_duration_beats_a_cold_start():
+    # same 2x-slow window, seeded with what the previous window observed
+    w = core.Window("weekly", 0, 4 * HOUR, 100000)
+    cold = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 60, 10000, None)
+    warm = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 60, 10000, 1200)
+    testing.assertTrue(warm.deferred < cold.deferred,
+                       "a learned estimate must defer fewer devices than a cold start")
+
+def _test_max_concurrency_is_never_breached():
+    w = core.Window("weekly", 0, 4 * HOUR, 100000)
+    r = sim.simulate_window(50000, 600, 1800, w, _sim_camp(1000, 2000), 1000, 60, 10000, None)
+    testing.assertTrue(r.peak <= 2000, "blast radius is a hard ceiling")
+
+#############################################################################
+# snapshot tests -- `acton test --accept` records the layouts under
+# snapshots/expected/test_fleet_sched/. The recorded file IS the review
+# artefact: a diff there is a change in what the planner does.
+#############################################################################
+
+def _big_dev(name: str, groups: list[core.GroupRef]) -> core.DeviceIn:
+    """A chassis that takes a full hour to upgrade."""
+    return core.DeviceIn(name, "big-iron", None, groups, [], HOUR, True)
+
+def _big_camp(target: int) -> core.Campaign:
+    return core.Campaign("big-iron", ["weekly"], target, 2 * target, 1, 2,
+                         30 * DAY, core.SPREAD, 5, ["big-iron"], [], [], "plan")
+
+def _n_big(n: int) -> list[core.DeviceIn]:
+    devs = []
+    i = 1
+    while i <= n:
+        devs.append(_big_dev(f"rtr-{i:02d}", []))
+        i = i + 1
+    return devs
+
+def _test_snapshot_handful_of_devices():
+    """Four unconstrained CPEs, one 4h window a week: everything lands in the
+    first window clear of the notification lead time."""
+    camp = _camp(100, 200, core.SPREAD)
+    devs = [_dev("cpe-a", []), _dev("cpe-b", []), _dev("cpe-c", []), _dev("cpe-d", [])]
+    return core.render_plan(camp, core.plan([], devs, camp, {}, [_gen(6)], 0, 12))
+
+def _test_snapshot_redundancy_pair_spread():
+    """cpe-a and cpe-b are redundant: spread puts them as far apart as the
+    campaign span allows."""
+    camp = _camp(100, 200, core.SPREAD)
+    devs = [_dev("cpe-a", [core.GroupRef("pair", 1)]),
+            _dev("cpe-b", [core.GroupRef("pair", 2)]),
+            _dev("cpe-c", []), _dev("cpe-d", [])]
+    return core.render_plan(camp, core.plan([], devs, camp, {}, [_gen(6)], 0, 12))
+
+def _test_snapshot_redundancy_pair_packed():
+    """Same pair, but the group asks to be packed -- the customer watches during
+    their notified maintenance and wants both done close together."""
+    camp = _camp(100, 200, core.SPREAD)
+    devs = [_dev("cpe-a", [core.GroupRef("pair", 1)]),
+            _dev("cpe-b", [core.GroupRef("pair", 2)]),
+            _dev("cpe-c", [])]
+    return core.render_plan(camp, core.plan([], devs, camp, _pols("pair", core.PACK),
+                                            [_gen(6)], 0, 12))
+
+def _test_snapshot_20_big_devices_concurrency_2():
+    """20 chassis at 1h each, 4h weekly windows, concurrency 2: about 7 fit per
+    window, so the campaign spills across three."""
+    camp = _big_camp(2)
+    return core.render_plan(camp, core.plan([], _n_big(20), camp, {}, [_gen(6)], 0, 12))
+
+def _test_snapshot_20_big_devices_concurrency_4():
+    """The same 20 chassis at double concurrency."""
+    camp = _big_camp(4)
+    return core.render_plan(camp, core.plan([], _n_big(20), camp, {}, [_gen(6)], 0, 12))
+
+def _test_snapshot_big_devices_in_redundancy_pairs():
+    """Six chassis as three redundancy pairs: no pair may share a window, and
+    spread pushes every second member to the far end."""
+    camp = _big_camp(2)
+    devs = []
+    i = 1
+    while i <= 3:
+        devs.append(_big_dev(f"rtr-{i}a", [core.GroupRef(f"pair{i}", 1)]))
+        devs.append(_big_dev(f"rtr-{i}b", [core.GroupRef(f"pair{i}", 2)]))
+        i = i + 1
+    return core.render_plan(camp, core.plan([], devs, camp, {}, [_gen(6)], 0, 12))
+
+def _test_snapshot_contracted_window_and_pin():
+    """cpe-gold is bound to its own contracted schedule; cpe-pinned is placed by
+    hand into the third weekly window."""
+    camp = _camp(100, 200, core.SPREAD)
+    gold = core.DeviceIn("cpe-gold", "c8000v", "gold-contract", [], [], 20 * 60, True)
+    devs = [gold, _dev("cpe-a", []), _dev("cpe-pinned", [])]
+    gens = [_gen(6), core.SimpleWindowGen("gold-contract", 45 * DAY + 23 * HOUR,
+                                          2 * HOUR, 28 * DAY, 200, 3)]
+    pins = {"cpe-pinned": 30 * DAY + 2 * HOUR + 14 * DAY}
+    return core.render_plan(camp, core.plan([], devs, camp, {}, gens, 0, 12, pins))
+
+#############################################################################
+# snapshot tests over the window simulator -- the tick table is the record of
+# how the concurrency controller behaves
+#############################################################################
+
+def _sim_text(label: str, r: sim.SimResult) -> str:
+    lines = [label, ""]
+    for l in r.log:
+        lines.append(l)
+    lines.append("")
+    lines.append(f"launched {r.launched}, completed {r.completed}, deferred {r.deferred}, "
+                 + f"peak concurrency {r.peak}")
+    return "\n".join(lines)
+
+def _test_snapshot_window_on_estimate():
+    """A window planned full at target, running exactly on estimate: the
+    controller sits at target and defers nothing."""
+    w = core.Window("weekly", 0, 4 * HOUR, 100000)
+    r = sim.simulate_window(22800, 600, 600, w, _sim_camp(1000, 2000), 1000, 60, 40, None)
+    return _sim_text("22800 devices, 10min estimate, 10min actual, target 1000 / max 2000", r)
+
+def _test_snapshot_window_2x_slow():
+    """The same window when upgrades take twice as long. The window is the
+    commitment, so concurrency climbs toward max rather than deferring."""
+    w = core.Window("weekly", 0, 4 * HOUR, 100000)
+    r = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 60, 40, None)
+    return _sim_text("22800 devices, 10min estimate, 20min actual, target 1000 / max 2000", r)
+
+def _test_snapshot_window_2x_slow_learned():
+    """Same again, but seeded with the duration observed in the previous window:
+    fewer deferrals and an earlier shortfall alarm."""
+    w = core.Window("weekly", 0, 4 * HOUR, 100000)
+    r = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 60, 40, 1200)
+    return _sim_text("22800 devices, duration learned from last window (20min)", r)
+
+def _test_snapshot_ramp():
+    """Ramp up from a single canary to target 64, each rung gated on the
+    previous landing cleanly."""
+    w = core.Window("weekly", 0, 4 * HOUR, 100000)
+    r = sim.simulate_window(400, 600, 600, w, _sim_camp(64, 128), 1, 60, 10)
+    return _sim_text("400 devices, ramp from 1 to target 64", r)
