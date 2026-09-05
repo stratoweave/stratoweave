@@ -314,6 +314,18 @@ call describes the full desired subscription set for that owner.
 The update callback receives one merged gdata tree for the owner, not
 one callback per subscription.
 
+## Northbound On-Change
+
+The northbound NETCONF server serves on-change YANG-Push from a TTT layer,
+for the operational datastore: a `push-update` with the baseline when
+sync-on-start is asked for, then one `push-change-update` per change. Its
+yang-patch is built from the change itself, with no tree diff: a `replace`
+of the changed transform's subtree, so omitted descendants disappear at the
+client, or a `remove` of the node that emptied, so a deleted list entry is
+one edit. Targets are module-qualified from the served schema. A failure
+while serving ends the subscription with `subscription-terminated`. A
+non-zero dampening-period and excluded change types are rejected.
+
 ## Internal Model
 
 `SubscriptionManager` is the declarative owner-facing API. Below it, a TTT
