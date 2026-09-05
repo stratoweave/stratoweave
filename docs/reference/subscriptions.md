@@ -190,11 +190,12 @@ callback `keys.device_name`, `keys.interface_name` and the interface.
 
 The first pass delivers every instance the filter selects, one call each,
 and then calls `synced`. After that each read delivers the instances that
-changed since the last one, whatever the size of the list, so a
-subscriber to a hundred thousand devices is called with one device. The
-filters handed to a rooted destination must lead to its node, and they
-are read on one period. A destination rooted at a container receives
-that container, or `None` when it is gone.
+changed since the last one, and on-change each change delivers the
+instances it touched, whatever the size of the list, so a subscriber to a
+hundred thousand devices is called with one device. The filters handed to
+a rooted destination must lead to its node, and they are read on one
+period or served on-change, not both. A destination rooted at a container
+receives that container, or `None` when it is gone.
 
 `synced` belongs to the declaration, not to one destination: it is
 called once, when every delivery in that `declare` has had its first
@@ -228,9 +229,34 @@ Omitting `period` creates an on-change `SubscriptionSpec`:
 spec = sub.system_state.clock.subscribe(depth=1)
 ```
 
-The generated filter helper supports this directly. The current
-`NetconfDriver` limitation still applies, so on-change subscriptions are
-not yet accepted there.
+On a TTT layer an on-change subscription carries the operational state the
+layer's transforms publish with `update_oper`, and nothing else: no config,
+except the keys of the list entries the state sits under. What a transform
+passes to `update_oper` replaces its whole contribution; `None` removes it.
+
+The delivery contract:
+
+- The first delivery is the complete baseline, and may be `None` when no
+  transform under the filter has published yet. A consumer must accept that.
+- After the baseline every `update_oper` under the filter is delivered as it
+  happens, in the order the layer received them, with the tree rebuilt
+  along the changed path and everything else shared by reference. An update
+  that leaves a transform's filtered slice unchanged is not delivered.
+- On-change and periodic filters of one consumer are delivered as one view.
+  Rooted at a node, each change delivers the instances it touched.
+- A list entry joins the subscription when its transaction commits, never
+  while it is provisional. TTT does not clear a transform's oper when its
+  config is removed: the transform actor does, from its `shutdown`, with
+  `update_oper(None)`, and the entry leaves the tree.
+- Oper is not transactional: a commit that touches several entries can be
+  seen entry by entry, and a config change and an oper push can race.
+- A filter that the tree cannot route, such as a content predicate on a
+  container entry that would span several transforms, is reported once as
+  an error and the subscription is dropped.
+
+TTT decides on-change from `period` alone; the `on_change` flag on
+`SubscriptionSpec` exists for device subscriptions and is ignored here. The
+`NetconfDriver` accepts on-change only against a device that pushes natively.
 
 ## `SubscriptionSpec`
 
@@ -288,13 +314,6 @@ call describes the full desired subscription set for that owner.
 The update callback receives one merged gdata tree for the owner, not
 one callback per subscription.
 
-## Current NETCONF Limitation
-
-The current `NetconfDriver` only implements periodic subscriptions by
-issuing periodic `<get>` operations. On-change subscriptions are not yet
-implemented there, so a `SubscriptionSpec` with `period=None` will be
-rejected by that driver.
-
 ## Internal Model
 
 `SubscriptionManager` is the declarative owner-facing API. Below it, a TTT
@@ -306,12 +325,35 @@ latest trees merged into one view, sent straight to the consumer, by
 reference when there is one read. The Layer keeps only which actor serves
 which consumer.
 
-Each `declare(...)` call is the consumer's complete desired state. The
-actor drops the reads no longer wanted, starts changed ones over, keeps
-the rest with their latest trees, and calls `synced` once every read of
-the declaration has run.
+The consumer's on-change filters fold into one subscription in the tree.
+This is telemetry, apart from the link subscriptions that carry config
+between transforms: nothing in it is transactional or waits. The actor
+walks the layer's tree once to lay it: each node answers with its path,
+its oper slice if it is a producer, and the children to continue with. A
+container transposes the filter and decides predicates on its own keys;
+a list selects entries by exact key or all of them and keeps the
+subscription so entries that commit later join it; a transform keeps it
+and answers its slice. The answers become the actor's shadow of the
+subscribed part of the tree, and the end of the walk is the baseline.
+After that every producer under the subscription pushes its slice to the
+actor as it changes, when it changed; the actor rebuilds the shadow
+along the changed path, shares everything else by reference, and
+delivers the view with the reads' latest trees merged in. A consumer
+that asks for it, the northbound NETCONF server does, gets each change
+alone first: the path of the node that changed with what it held before
+and after. TTT does not clear a transform's oper when its config goes:
+the transform actor does, from its `shutdown`, with `update_oper(None)`,
+and the entry leaves the view. The subscription is laid again only when
+its filter changes.
 
-A consumer rooted at a node has one read, and instead of one view gets,
-after each read, every instance that differs from the last read and
-every instance gone, each as a tree from the top down to that one
-instance.
+Each `declare(...)` call is the consumer's complete desired state. The
+actor drops the reads and the subscription no longer wanted, starts
+changed ones over, keeps the rest with their latest trees, and calls
+`synced` once every read of the declaration has run and its subscription
+has been laid.
+
+A consumer rooted at a node has one read, or one subscription in the
+tree, and instead of one view gets, after each read, every instance that
+differs from the last read and every instance gone, and after each
+change the instances it touched, each as a tree from the top down to
+that one instance.
