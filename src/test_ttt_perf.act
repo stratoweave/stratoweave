@@ -1,0 +1,290 @@
+"""Scaling scenarios for the transaction engine.
+
+    acton test perf --module test_ttt_perf --jobs 1 --record
+
+Each scenario builds a layer stack of its own, drives a fixed number of
+transactions through it and finishes when the last one has committed, so
+`acton test perf` times the whole scenario, and --record keeps the times
+and the heap each one allocated for the next run to be read against.
+
+--jobs 1 matters. The runner otherwise runs several of these at once,
+which inflates the times and mixes up the allocation each is charged
+with, since that is read off one counter for the whole process. Build
+before recording, since compiling the rest of the project alongside the
+first scenario distorts it in the same way.
+
+SCALE below sets how large the scenarios are; raising it needs
+--max-time raised with it, since the test timeout follows from that.
+
+The shapes are what a fleet manager does at scale, with no generated
+adata or devices in the way:
+
+- list: a list of N transforms with no layer below. Node creation,
+  configure fan-out, lock, commit.
+- fanin: the same N transforms feeding one transform below, which then
+  merges N sources, as the device layer of a shard does.
+- reshard: N transforms that each route their entry to
+  /rfs{shard}/device{name} in a second layer, the shape of the top node.
+- links: N publishers and one subscriber linked to every one of them,
+  the shape of an upgrade campaign.
+
+Every shape is measured twice: loading it, and then touching one entry
+at a time, since the cost of one small transaction against a large list
+is what decides whether a fleet can be managed at all.
+"""
+
+import testing
+
+import ttt
+import yang.gdata as gdata
+
+
+NS = "urn:test:ttt-perf"
+
+# How large each scenario is. A scenario has to finish inside the test
+# timeout, which `acton test perf` derives from --max-time and which is
+# 3 seconds by default, so the sizes below are what today's engine
+# manages in about a second.
+#
+# SCALE multiplies all of them, for the closer look a change that only
+# pays off further up the curve needs. The scenarios that touch one
+# entry at a time grow with its square, since both the list and the
+# number of transactions against it grow, so --max-time has to grow
+# faster than SCALE does.
+SCALE = 1
+
+LIST_N = 2000 * SCALE
+LIST_TOUCHES = 100 * SCALE
+
+FANIN_LOAD_N = 2000 * SCALE
+FANIN_N = 400 * SCALE
+FANIN_TOUCHES = 8 * SCALE
+
+RESHARD_N = 1000 * SCALE
+RESHARD_SHARDS = 10
+
+LINKS_N = 200 * SCALE
+LINKS_TOUCH_N = 120 * SCALE
+LINKS_TOUCHES = 3 * SCALE
+
+# Leaves per entry beyond its key, so an entry is a container worth
+# merging and diffing rather than a single leaf.
+LEAVES = 4
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id(NS, name)
+
+
+def pad(i: int, width: int) -> str:
+    s = str(i)
+    while len(s) < width:
+        s = "0" + s
+    return s
+
+
+def dev_name(i: int) -> str:
+    return "dev-" + pad(i, 6)
+
+
+def shard_name(i: int, shards: int) -> str:
+    return "shard-" + pad(i % shards, 3)
+
+
+def elem(i: int, value: int, shards: int) -> gdata.Node:
+    """One list entry: key `name`, a `value`, a `shard` and LEAVES leaves."""
+    children: dict[gdata.Id, gdata.Node] = {
+        q("name"): gdata.Leaf(dev_name(i)),
+        q("value"): gdata.Leaf(value),
+        q("shard"): gdata.Leaf(shard_name(i, shards)),
+    }
+    for j in range(LEAVES):
+        children[q("leaf" + str(j))] = gdata.Leaf("value-" + str(j) + "-" + str(value))
+    return gdata.Container(children)
+
+
+def devices(start: int, count: int, value: int, shards: int) -> gdata.Node:
+    """A /device list of `count` entries starting at index `start`."""
+    elements: list[gdata.Node] = []
+    for i in range(start, start + count):
+        elements.append(elem(i, value, shards))
+    return gdata.Container({q("device"): gdata.List([q("name")], elements)})
+
+
+def touches(n: int, count: int, shards: int) -> list[gdata.Node]:
+    """`count` edits that each set a new value on one entry of `n`."""
+    edits: list[gdata.Node] = []
+    for i in range(count):
+        # Spread over the list so no edit is served by locality alone.
+        edits.append(devices((i * 7919) % n, 1, 2 + i, shards))
+    return edits
+
+
+def campaign(name: str, members: int) -> gdata.Node:
+    """A /campaign entry with `members` member links to /device entries."""
+    elements: list[gdata.Node] = []
+    for i in range(members):
+        elements.append(gdata.Container({q("name"): gdata.Leaf(dev_name(i))}))
+    return gdata.Container({
+        q("campaign"): gdata.List([q("name")], [
+            gdata.Container({
+                q("name"): gdata.Leaf(name),
+                q("member"): gdata.List([q("name")], elements),
+            })
+        ])
+    })
+
+
+class ListOut(ttt.TransformFunction):
+    """Wrap the input entry in a one-entry list under /out.
+
+    N of these feed one transform below, which then merges N sources.
+    """
+    def transform_wrapper(self, cfg, linked, memory, dynstate):
+        return (gdata.Container({q("out"): gdata.List([q("name")], [cfg])}), memory)
+
+
+class Reshard(ttt.TransformFunction):
+    """Route the input entry to /rfs{shard}/device{name} in the layer below."""
+    def transform_wrapper(self, cfg, linked, memory, dynstate):
+        shard = cfg.get_leaf(q("shard")).val
+        out = gdata.Container({
+            q("rfs"): gdata.List([q("name")], [
+                gdata.Container({
+                    q("name"): gdata.Leaf(shard),
+                    q("device"): gdata.List([q("name")], [cfg]),
+                })
+            ])
+        })
+        return (out, memory)
+
+
+def campaign_links(conf: gdata.Node) -> list[ttt.TaggedPath]:
+    """One link per member, naming the publisher /device{name}."""
+    links: list[ttt.TaggedPath] = []
+    members = conf.children.get(q("member"))
+    if isinstance(members, gdata.List):
+        for m in members.elements:
+            name = m.get_leaf(q("name")).val
+            links.append(ttt.TaggedPath("inv", gdata.FNode(q("device"), children=[
+                gdata.FNode(q("name"), value_match=name),
+            ])))
+    return links
+
+
+class CountLinked(ttt.TransformFunction):
+    """Publish how many /device entries are linked, under /campaign{name}."""
+    def transform_wrapper(self, cfg, linked, memory, dynstate):
+        n = 0
+        devs = linked.children.get(q("device"))
+        if isinstance(devs, gdata.List):
+            n = len(devs.elements)
+        out = gdata.Container({
+            q("campaign"): gdata.List([q("name")], [
+                gdata.Container({
+                    q("name"): cfg.get_leaf(q("name")),
+                    q("linked"): gdata.Leaf(n),
+                })
+            ])
+        })
+        return (out, memory)
+
+
+def list_stack() -> ttt.Layer:
+    """A list of transforms with no layer below."""
+    return ttt.Layer("top", ttt.Container({
+        q("device"): ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]),
+    }), None, None)
+
+
+def fanin_stack() -> ttt.Layer:
+    """A list of transforms whose output one transform below merges."""
+    return ttt.Layer("top", ttt.Container({
+        q("device"): ttt.List(ttt.Transform(ListOut), [q("name")]),
+    }), ttt.Sink(), None)
+
+
+def reshard_stack() -> ttt.Layer:
+    """A list of transforms that route their entry into a second layer."""
+    rfs = ttt.Layer("rfs", ttt.Container({
+        q("rfs"): ttt.List(ttt.Container({
+            q("device"): ttt.List(ttt.Transform(ListOut), [q("name")]),
+        }), [q("name")]),
+    }), ttt.Sink(), None)
+    return ttt.Layer("top", ttt.Container({
+        q("device"): ttt.List(ttt.Transform(Reshard), [q("name")]),
+    }), rfs, None)
+
+
+def links_stack() -> ttt.Layer:
+    """Publishers under /device and subscribers under /campaign."""
+    return ttt.Layer("top", ttt.Container({
+        q("device"): ttt.List(ttt.Transform(ListOut), [q("name")]),
+        q("campaign"): ttt.List(ttt.Transform(CountLinked, None, campaign_links), [q("name")]),
+    }), ttt.Sink(), None)
+
+
+actor Scenario(t: testing.AsyncT, stack: ttt.Layer, edits: list[gdata.Node]):
+    """Commit the edits through the stack in order, then pass the test.
+
+    Each edit waits for the one before it to commit, so the scenario
+    measures a series of transactions rather than their concurrency.
+    """
+    var next = 0
+
+    def submit() -> None:
+        if next < len(edits):
+            edit = edits[next]
+            next += 1
+            stack.edit_config(edit, step, None)
+        else:
+            t.success()
+
+    def step(result: value) -> None:
+        if isinstance(result, Exception):
+            t.failure(result)
+            return
+        submit()
+
+    submit()
+
+
+actor list_load(t: testing.AsyncT):
+    """One transaction adding LIST_N transform entries to a list"""
+    Scenario(t, list_stack(), [devices(0, LIST_N, 1, 1)])
+
+
+actor list_touch_one(t: testing.AsyncT):
+    """LIST_TOUCHES transactions that each touch one entry of LIST_N"""
+    Scenario(t, list_stack(), [devices(0, LIST_N, 1, 1)] + touches(LIST_N, LIST_TOUCHES, 1))
+
+
+actor fanin_load(t: testing.AsyncT):
+    """One transaction adding FANIN_LOAD_N sources of one transform below"""
+    Scenario(t, fanin_stack(), [devices(0, FANIN_LOAD_N, 1, 1)])
+
+
+actor fanin_touch_one(t: testing.AsyncT):
+    """FANIN_TOUCHES transactions that each touch one of FANIN_N sources"""
+    Scenario(t, fanin_stack(), [devices(0, FANIN_N, 1, 1)] + touches(FANIN_N, FANIN_TOUCHES, 1))
+
+
+actor reshard_load(t: testing.AsyncT):
+    """One transaction routing RESHARD_N entries into RESHARD_SHARDS shards"""
+    Scenario(t, reshard_stack(), [devices(0, RESHARD_N, 1, RESHARD_SHARDS)])
+
+
+actor links_campaign_add(t: testing.AsyncT):
+    """One transaction linking a subscriber to every one of LINKS_N publishers"""
+    Scenario(t, links_stack(), [
+        devices(0, LINKS_N, 1, 1),
+        campaign("c1", LINKS_N),
+    ])
+
+
+actor links_touch_one(t: testing.AsyncT):
+    """LINKS_TOUCHES transactions that each touch one of LINKS_TOUCH_N linked publishers"""
+    Scenario(t, links_stack(), [
+        devices(0, LINKS_TOUCH_N, 1, 1),
+        campaign("c1", LINKS_TOUCH_N),
+    ] + touches(LINKS_TOUCH_N, LINKS_TOUCHES, 1))
