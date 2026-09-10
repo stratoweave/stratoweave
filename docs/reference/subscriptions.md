@@ -3,6 +3,45 @@
 Subscriptions are declared as a `set[yang.gdata.SubscriptionSpec]` and
 reconciled by `yang.gdata.SubscriptionManager`.
 
+## Monitoring With Local YANG Files
+
+`ncurl monitor --yang-dir DIR` loads a schema from local `.yang` files
+when the server does not serve its schemas, or when you want to supply
+them yourself. It scans the directory and its subdirectories, compiles
+the schema before connecting, and disables schema downloads. The local
+schema is used both to parse updates and to resolve `--filter-subtree`.
+It works with periodic monitoring and with `--on-change`.
+
+For example, from the repository root, monitor a minisys server using
+its CFS models:
+
+```sh
+out/bin/ncurl --port 8830 monitor --yang-dir minisys/gen/yang/cfs
+```
+
+All local modules are selected by default. To select particular roots,
+use `--module` or the existing named `--module-set` groups. Their
+transitive imports and includes are added automatically:
+
+```sh
+out/bin/ncurl --host router monitor --yang-dir schemas --module ietf-system
+```
+
+Explicit modules and module sets are combined. These monitor options
+require `--yang-dir`; they select the schema, while `--filter-subtree`
+selects the data to monitor. The bundled `stratoweave`, `ietf-inet-types`,
+and `ietf-yang-types` modules supply missing imports only. A module found
+on disk takes precedence over its bundled copy.
+
+Repeated identical files are deduplicated. When several revisions are
+available, select `--module name@YYYY-MM-DD`, or let an import/include's
+`revision-date` select the revision. Ambiguous sources, conflicting
+revision requests, missing modules, and unreadable or malformed files
+are errors. Loading errors stop the command before it connects. Parsed
+YANG sources are cached under `~/.cache/ayang`.
+
+## Declaring Subscriptions
+
 `SubscriptionManager` is the owner-scoped declarative API. It binds:
 
 - one `TreeProvider`

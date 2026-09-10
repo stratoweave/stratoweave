@@ -1,0 +1,204 @@
+import file
+import testing
+import std.xml as xml
+import yang
+import yang.gdata as gdata
+import yang.xml as yxml
+
+import swyang
+import yang_dir
+
+
+ROOT = r"""/* module fake { import absent { prefix a; } } */
+module demo { namespace "urn:demo"; prefix d;
+  description "import not-a-dependency; http://example.com";
+  import
+    'demo-types' { prefix t; }
+  include "demo-state";
+}"""
+
+TYPES = r"""module demo-types { namespace "urn:types"; prefix t;
+  revision 2026-01-01;
+  typedef counter { type uint32; }
+}"""
+
+STATE = r"""submodule demo-state { belongs-to demo { prefix d; }
+  import demo-types { prefix t; }
+  container state { config false; leaf count { type t:counter; } }
+}"""
+
+OTHER = r"""module other { namespace "urn:other"; prefix o;
+  leaf ignored { type string; }
+}"""
+
+
+def _expect_error(sources: dict[str, str], message: str, modules: list[str]=[], module_sets: list[str]=[]):
+    try:
+        yang_dir.select_sources(sources, modules, module_sets)
+    except ValueError as e:
+        testing.assertIn(message, str(e))
+        return
+    testing.error("Expected an error containing: {message}")
+
+
+def _test_yang_dir_import_include_closure():
+    sources = {"demo.yang": ROOT, "types.yang": TYPES, "state.yang": STATE, "other.yang": OTHER}
+    selected = yang_dir.select_sources(sources, ["demo"])
+    testing.assertEqual(set(selected), {ROOT, TYPES, STATE})
+    schema = yang.compile(selected)
+    # The included submodule's imported typedef must reach the compiled schema.
+    data = yxml.from_xml(schema, xml.decode('<data><state xmlns="urn:demo"><count>42</count></state></data>'))
+    testing.assertIn("42", data.to_xmlstr())
+
+
+def _test_yang_dir_module_set_union():
+    ietf = OTHER.replace("module other", "module ietf-example")
+    sources = {"demo.yang": ROOT, "types.yang": TYPES, "state.yang": STATE, "ietf.yang": ietf, "other.yang": OTHER}
+    selected = yang_dir.select_sources(sources, ["demo"], ["ietf"])
+    testing.assertEqual(set(selected), {ROOT, TYPES, STATE, ietf})
+    _expect_error(sources, "Unknown module set", ["demo"], ["ietff"])
+    _expect_error({"other.yang": OTHER}, "No YANG modules selected", module_sets=["ietf"])
+
+
+def _test_yang_dir_missing_and_invalid_sources():
+    _expect_error({"demo.yang": ROOT}, "missing module demo-types", ["demo"])
+    _expect_error({"demo.yang": ROOT, "types.yang": TYPES}, "missing submodule demo-state", ["demo"])
+    _expect_error({"other.yang": OTHER}, "Requested module missing", ["other", "missing"])
+    _expect_error({"broken.yang": r"module broken {"}, "Cannot parse broken.yang")
+    _expect_error({"container.yang": "container wrong;"}, "Expected a YANG module")
+    _expect_error({}, "No YANG modules selected")
+    _expect_error({"other.yang": OTHER}, "Invalid module selection", ["other@"])
+    wrong_owner = STATE.replace("belongs-to demo", "belongs-to other")
+    _expect_error({"demo.yang": ROOT, "types.yang": TYPES, "state.yang": wrong_owner}, "does not belong to demo", ["demo"])
+
+
+def _test_yang_dir_revisions_and_duplicates():
+    newer = TYPES.replace("2026-01-01", "2026-02-01")
+    sources = {"types-old.yang": TYPES, "types-new.yang": newer, "copy.yang": TYPES}
+    testing.assertEqual(yang_dir.select_sources(sources, ["demo-types@2026-01-01"]), [TYPES])
+    _expect_error(sources, "Ambiguous module demo-types", ["demo-types"])
+    _expect_error(sources, "missing module demo-types@2025-01-01", ["demo-types@2025-01-01"])
+    # Different contents claiming the same revision must not depend on file order.
+    _expect_error({"a.yang": TYPES, "b.yang": TYPES.replace("uint32", "uint64")}, "Ambiguous module demo-types")
+    pinned_root = ROOT.replace("prefix t;", "prefix t; revision-date 2026-01-01;")
+    sources["demo.yang"] = pinned_root
+    sources["state.yang"] = STATE
+    testing.assertEqual(set(yang_dir.select_sources(sources, ["demo"])), {pinned_root, TYPES, STATE})
+    _expect_error(sources, "but --module selects", ["demo", "demo-types@2026-02-01"])
+
+
+def _test_yang_dir_conflicting_import_revisions():
+    old_root = r"""module a { namespace "urn:a"; prefix a;
+      import demo-types { prefix t; revision-date 2026-01-01; }
+    }"""
+    new_root = old_root.replace("module a", "module b").replace("2026-01-01", "2026-02-01")
+    sources = {"a.yang": old_root, "b.yang": new_root, "old.yang": TYPES,
+               "new.yang": TYPES.replace("2026-01-01", "2026-02-01")}
+    _expect_error(sources, "conflicting with old.yang", ["a", "b"])
+
+
+def _test_yang_dir_revision_resolution_order():
+    unpinned = r"""module a { namespace "urn:a"; prefix a;
+      import demo-types { prefix t; }
+    }"""
+    pinned = r"""module z { namespace "urn:z"; prefix z;
+      import demo-types { prefix t; revision-date 2026-01-01; }
+    }"""
+    sources = {"a.yang": unpinned, "z.yang": pinned, "old.yang": TYPES,
+               "new.yang": TYPES.replace("2026-01-01", "2026-02-01")}
+    # Both the unpinned import and the types root precede the pinned import.
+    selected = yang_dir.select_sources(sources)
+    testing.assertEqual(set(selected), {unpinned, pinned, TYPES})
+    yang.compile(selected)
+
+
+def _test_yang_dir_bundled_imports():
+    root = r"""module demo { namespace "urn:demo"; prefix d;
+      import stratoweave { prefix sw; }
+      import ietf-inet-types { prefix inet; }
+      leaf address { type inet:ip-address; }
+    }"""
+    selected = yang_dir.select_sources({"demo.yang": root})
+    testing.assertEqual(set(selected), {root, swyang.stratoweave, swyang.ietf_inet_types})
+    yang.compile(selected)
+    testing.assertEqual(yang_dir.select_sources({"other.yang": OTHER}), [OTHER])
+    _expect_error({"other.yang": OTHER}, "Requested module stratoweave", ["stratoweave"])
+
+
+def _test_yang_dir_local_import_precedence():
+    root = r"""module demo { namespace "urn:demo"; prefix d;
+      import ietf-inet-types { prefix inet; }
+      leaf address { type inet:address; }
+    }"""
+    local_types = TYPES.replace("demo-types", "ietf-inet-types").replace("counter", "address")
+    sources = {"demo.yang": root, "inet.yang": local_types}
+    selected = yang_dir.select_sources(sources, ["demo"])
+    testing.assertEqual(set(selected), {root, local_types})
+    yang.compile(selected)
+    sources["demo.yang"] = root.replace("prefix inet;", "prefix inet; revision-date 2013-07-15;")
+    _expect_error(sources, "missing module ietf-inet-types@2013-07-15", ["demo"])
+
+
+def _check_load_and_filter(fc: file.FileCap):
+    fs = file.FS(fc)
+    directory = fs.mktmpdir("test_yang_dir_")
+    try:
+        await async fs.mkdir(directory + "/deps")
+        for name, text in {"demo.yang": ROOT, "deps/types.yang": TYPES, "deps/state.yang": STATE,
+                           "ignored.txt": "not YANG"}.items():
+            f = file.WriteFile(file.WriteFileCap(fc), directory + "/" + name)
+            await async f.write(text.encode())
+            await async f.close()
+        schema = yang_dir.load(fc, directory, ["demo"])
+        filt = yxml.from_filter_xml(schema, xml.decode('<filter type="subtree"><state xmlns="urn:demo"><count/></state></filter>'))
+        expected = gdata.FNode(None, children=[
+            gdata.FNode(gdata.Id("urn:demo", "state"), children=[gdata.FNode(gdata.Id("urn:demo", "count"))])
+        ])
+        testing.assertEqual(filt, expected)
+    finally:
+        await async fs.rmtree(directory)
+        await async fs.rmdir(directory)
+
+
+def _check_directory_errors(fc: file.FileCap):
+    fs = file.FS(fc)
+    directory = fs.mktmpdir("test_yang_dir_errors_")
+    try:
+        try:
+            yang_dir.load(fc, directory + "/missing")
+        except ValueError as e:
+            testing.assertIn("Cannot read directory", str(e))
+        else:
+            testing.error("Missing directory must fail")
+        f = file.WriteFile(file.WriteFileCap(fc), directory + "/broken.yang")
+        await async f.write(b"module broken {")
+        await async f.close()
+        try:
+            yang_dir.load(fc, directory)
+        except ValueError as e:
+            testing.assertIn("broken.yang", str(e))
+        else:
+            testing.error("Malformed YANG must fail")
+        f = file.WriteFile(file.WriteFileCap(fc), directory + "/broken.yang")
+        await async f.write(b"\xff")
+        await async f.close()
+        try:
+            yang_dir.load(fc, directory)
+        except ValueError as e:
+            testing.assertIn("Cannot read", str(e))
+            testing.assertIn("broken.yang", str(e))
+        else:
+            testing.error("Undecodable YANG must fail with its filename")
+    finally:
+        await async fs.rmtree(directory)
+        await async fs.rmdir(directory)
+
+
+actor _test_yang_dir_load_and_filter(t: testing.EnvT):
+    _check_load_and_filter(file.FileCap(t.env.cap))
+    t.success()
+
+
+actor _test_yang_dir_directory_errors(t: testing.EnvT):
+    _check_directory_errors(file.FileCap(t.env.cap))
+    t.success()

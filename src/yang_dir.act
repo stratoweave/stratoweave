@@ -1,0 +1,199 @@
+"""Load a local YANG module set and its import/include dependencies."""
+
+import file
+import yang
+import yang.parser as yparser
+import yang.schema as yschema
+
+import schema_filter
+import swyang
+
+
+_FALLBACKS = {
+    "stratoweave": swyang.stratoweave,
+    "ietf-inet-types": swyang.ietf_inet_types,
+    "ietf-yang-types": swyang.ietf_yang_types,
+}
+
+
+class _Source(object):
+    path: str
+    text: str
+    kind: str
+    name: str
+    revision: ?str
+    belongs_to: ?str
+    deps: list[(kind: str, name: str, revision: ?str)]
+
+    def __init__(self, path: str, text: str):
+        self.path = path
+        self.text = text
+        try:
+            stmt = yparser.parse(text)
+        except Exception as e:
+            raise ValueError("Cannot parse {path}: {e}")
+        if stmt.prefix is not None or stmt.kw not in {"module", "submodule"}:
+            raise ValueError("Expected a YANG module or submodule in {path}")
+        self.kind = stmt.kw
+        name = stmt.arg
+        if name is not None:
+            self.name = name
+        else:
+            raise ValueError("Missing module name in {path}")
+        self.revision = None
+        self.belongs_to = None
+        self.deps = []
+        for child in stmt.substatements:
+            arg = child.arg
+            if child.prefix is not None:
+                continue
+            if arg is not None:
+                if child.kw == "revision":
+                    rev = self.revision
+                    if rev is not None:
+                        if arg > rev:
+                            self.revision = arg
+                    else:
+                        self.revision = arg
+                elif child.kw == "belongs-to":
+                    self.belongs_to = arg
+                elif child.kw in {"import", "include"}:
+                    revision: ?str = None
+                    for sub in child.substatements:
+                        if sub.prefix is None and sub.kw == "revision-date":
+                            revision = sub.arg
+                    kind = "module" if child.kw == "import" else "submodule"
+                    self.deps.append((kind=kind, name=arg, revision=revision))
+
+
+def select_sources(sources: dict[str, str], modules: list[str]=[], module_sets: list[str]=[]) -> list[str]:
+    """Select local module roots, then resolve their dependencies.
+
+    Keys in sources are filenames used in diagnostics. Explicit module names
+    may include @revision. Multiple revisions require an explicit selection or
+    an import/include revision-date; incompatible requests fail. Bundled sources
+    supply missing imports only, and never replace a local module.
+    """
+    for name in module_sets:
+        if name not in schema_filter.MODULE_SETS:
+            raise ValueError("Unknown module set: {name}")
+
+    available: dict[(str, str), list[_Source]] = {}
+    for path in sorted(sources.keys()):
+        source = _Source(path, sources[path])
+        key = (source.kind, source.name)
+        copies = available.get_def(key, [])
+        if not any([s.text == source.text for s in copies]):
+            copies.append(source)
+        available[key] = copies
+
+    pins: dict[str, str] = {}
+    roots: list[str] = []
+    for spec in modules:
+        parts = spec.split("@")
+        if parts[0] == "" or len(parts) > 2 or (len(parts) == 2 and parts[1] == ""):
+            raise ValueError("Invalid module selection: {spec}; expected module or module@revision")
+        name = parts[0]
+        if ("module", name) not in available:
+            raise ValueError("Requested module {spec} not found in --yang-dir")
+        if len(parts) == 2:
+            previous = pins.get(name)
+            if previous is not None and previous != parts[1]:
+                raise ValueError("Conflicting revisions requested for module {name}")
+            pins[name] = parts[1]
+        roots.append(name)
+    for kind, name in sorted(available.keys()):
+        if kind == "module" and (len(modules) == 0 and len(module_sets) == 0 or
+                                 len(module_sets) > 0 and schema_filter.should_include_module(name, module_sets)):
+            roots.append(name)
+    if len(roots) == 0:
+        raise ValueError("No YANG modules selected from --yang-dir")
+
+    selected: dict[(str, str), _Source] = {}
+    pending: list[(kind: str, name: str, revision: ?str, required_by: str, owner: ?str, error: str)] = []
+
+    def visit(kind: str, name: str, revision: ?str, required_by: str, owner: ?str=None):
+        pin = pins.get(name) if kind == "module" else None
+        if pin is not None:
+            if revision is not None and revision != pin:
+                raise ValueError("{required_by} requires {name}@{revision}, but --module selects {name}@{pin}")
+            revision = pin
+        key = (kind, name)
+        source = selected.get(key)
+        if source is not None:
+            if revision is not None and source.revision != revision:
+                raise ValueError("{required_by} requires {name}@{revision}, conflicting with {source.path}")
+            if owner is not None and source.belongs_to != owner:
+                raise ValueError("Submodule {name} in {source.path} does not belong to {owner}")
+            return
+
+        candidates = available.get_def(key, [])
+        if len(candidates) == 0 and kind == "module":
+            fallback = _FALLBACKS.get(name)
+            if fallback is not None:
+                candidates = [_Source("bundled {name}", fallback)]
+        if revision is not None:
+            candidates = [s for s in candidates if s.revision == revision]
+        label = name if revision is None else "{name}@{revision}"
+        if len(candidates) == 0:
+            raise ValueError("{required_by} requires missing {kind} {label}")
+        if len(candidates) > 1:
+            paths = ", ".join([s.path for s in candidates])
+            error = "Ambiguous {kind} {label}: {paths}. Select one revision or remove conflicting copies"
+            pending.append((kind=kind, name=name, revision=revision, required_by=required_by, owner=owner, error=error))
+            return
+        chosen = candidates[0]
+        if owner is not None and chosen.belongs_to != owner:
+            raise ValueError("Submodule {name} in {chosen.path} does not belong to {owner}")
+        selected[key] = chosen
+        for dep in chosen.deps:
+            parent = chosen.name if chosen.kind == "module" else chosen.belongs_to
+            visit(dep.kind, dep.name, dep.revision, chosen.path, parent if dep.kind == "submodule" else None)
+
+    for name in sorted(set(roots)):
+        visit("module", name, pins.get(name), "--yang-dir")
+    # A later import may select the revision of an earlier, unpinned root.
+    # Retry ambiguous requests after traversing the other selected modules.
+    while len(pending) > 0:
+        before = len(selected)
+        for _ in range(len(pending)):
+            request = pending.pop(0)
+            visit(request.kind, request.name, request.revision, request.required_by, request.owner)
+        if len(selected) == before and len(pending) > 0:
+            raise ValueError(pending[0].error)
+    return [selected[key].text for key in sorted(selected.keys())]
+
+
+def load(fc: file.FileCap, directory: str, modules: list[str]=[], module_sets: list[str]=[]) -> yschema.DRoot:
+    """Recursively read .yang files and compile the selected schema with caching."""
+    fs = file.FS(fc)
+    rfc = file.ReadFileCap(fc)
+    sources: dict[str, str] = {}
+
+    def read_dir(dirname: str):
+        # FS.walk suppresses filesystem errors; an incomplete schema is an error.
+        entries: list[str] = []
+        try:
+            entries = sorted(fs.listdir(dirname))
+        except OSError as e:
+            raise ValueError("Cannot read directory {dirname}: {e}")
+        for entry in entries:
+            path = file.join_path([dirname, entry])
+            try:
+                stat = fs.lstat(path)
+                if stat.is_dir():
+                    read_dir(path)
+                elif entry.endswith(".yang"):
+                    if not fs.stat(path).is_file():
+                        raise ValueError("Not a regular YANG file: {path}")
+                    rf = file.ReadFile(rfc, path)
+                    try:
+                        sources[path] = rf.read().decode()
+                    finally:
+                        await async rf.close()
+            except Exception as e:
+                raise ValueError("Cannot read {path}: {e}")
+
+    read_dir(directory)
+    texts = select_sources(sources, modules, module_sets)
+    return yang.compile_with_cache(texts, fc=fc)
