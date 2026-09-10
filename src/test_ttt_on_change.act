@@ -1,0 +1,1191 @@
+"""On-change oper subscriptions on a TTT layer.
+
+A subscription without a period is served by the consumer's Subscription
+actor from a route down to the transforms under its filter: the walk that
+registers the route ends with one complete baseline, and after that every
+update_oper reaches the subscriber at once, as the whole tree and, for a
+consumer that asks, as the change alone: the path of the node that changed
+with what it held before and after. Rooted at a node, the consumer gets the
+instances a change touched instead. Config is not part of it: these tests
+push oper into transforms through a Hub and watch what the subscriber
+receives.
+"""
+
+import testing
+
+import ttt as ttt
+import yang.gdata as gdata
+from test_ttt_subscriptions import Noop, Hub, Pusher, pusher_ctor
+
+TEST_NS = "urn:test-on-change"
+
+def q(n: str) -> gdata.Id:
+    return gdata.Id(TEST_NS, n)
+
+
+def service_layer(hub: Hub, name: str="top") -> ttt.Layer:
+    return ttt.Layer(name, ttt.Container({
+        q("service"): ttt.List(ttt.Transform(Noop, pusher_ctor(hub)), [q("name")], ns=TEST_NS, module="test-on-change"),
+    }), None)
+
+def services(names: list[str]) -> gdata.Node:
+    return gdata.Container({
+        q("service"): gdata.List([q("name")], [
+            gdata.Container({q("name"): gdata.Leaf(n), q("enabled"): gdata.Leaf(True)}) for n in names
+        ]),
+    })
+
+def status(s: str) -> gdata.Node:
+    return gdata.Container({q("status"): gdata.Leaf(s)})
+
+def entry(name: str, s: str) -> gdata.Node:
+    return gdata.Container({q("name"): gdata.Leaf(name), q("status"): gdata.Leaf(s)})
+
+def tree(entries: list[gdata.Node]) -> gdata.Node:
+    return gdata.Container({
+        q("service"): gdata.List([q("name")], entries, ns=TEST_NS),
+    })
+
+ON_CHANGE = gdata.SubscriptionSpec(None)
+
+def entry_spec(name: str) -> gdata.SubscriptionSpec:
+    return gdata.SubscriptionSpec(gdata.FNode(q("service"), children=[
+        gdata.FNode(q("name"), value_match=name),
+        gdata.FNode(q("status")),
+    ]))
+
+def prs(data: ?gdata.Node) -> str:
+    return data.prsrc(deterministic=True) if data is not None else "None"
+
+
+actor baseline_then_every_update_in_order(t: testing.AsyncT):
+    """Registration delivers what the producers hold; each push after that is
+    delivered as it comes."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        if len(got) == 1:
+            hub.push("svc-a", status("second"))
+            hub.push("svc-a", status("third"))
+        elif len(got) == 3:
+            expected = [tree([entry("svc-a", "first")]), tree([entry("svc-a", "second")]), tree([entry("svc-a", "third")])]
+            for i in range(0, 3):
+                if got[i] != expected[i]:
+                    fail(ValueError("delivery {i}: expected {prs(expected[i])}, got {prs(got[i])}"))
+                    return
+            done = True
+            t.success()
+
+    def declare(_r: value):
+        hub.push("svc-a", status("first"))
+        after 0.05: layer.declare_subscriptions("test", on_update, {ON_CHANGE})
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+actor filtered_spec_sees_only_its_element(t: testing.AsyncT):
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        if len(got) == 1:
+            hub.push("svc-a", status("a-changed"))          # outside the filter: nothing
+            hub.push("svc-b", status("b-changed"))
+        elif len(got) == 2:
+            expected = tree([entry("svc-b", "b-changed")])
+            if got[1] == expected:
+                done = True
+                t.success()
+            else:
+                fail(ValueError("expected {prs(expected)}, got {prs(got[1])}"))
+
+    def declare(_r: value):
+        hub.push("svc-a", status("a"))
+        hub.push("svc-b", status("b"))
+        after 0.05: layer.declare_subscriptions("test", on_update, {entry_spec("svc-b")})
+
+    layer.edit_config(services(["svc-a", "svc-b"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+actor two_owners_share_and_one_may_leave(t: testing.AsyncT):
+    hub = Hub()
+    layer = service_layer(hub)
+    var first: list[?gdata.Node] = []
+    var second: list[?gdata.Node] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def check():
+        if len(first) == 2 and len(second) == 2:
+            layer.remove_subscriptions("second")
+            hub.push("svc-a", status("third"))
+        elif len(first) == 3:
+            if len(second) != 2:
+                fail(ValueError("the removed owner kept receiving"))
+            elif first[2] == tree([entry("svc-a", "third")]):
+                done = True
+                t.success()
+            else:
+                fail(ValueError("unexpected third delivery {prs(first[2])}"))
+
+    def on_first(data: ?gdata.Node, err: ?Exception):
+        first.append(data)
+        check()
+
+    def on_second(data: ?gdata.Node, err: ?Exception):
+        second.append(data)
+        if len(second) == 1:
+            hub.push("svc-a", status("second"))
+        check()
+
+    def declare(_r: value):
+        hub.push("svc-a", status("first"))
+        after 0.05: layer.declare_subscriptions("first", on_first, {ON_CHANGE})
+        after 0.1: layer.declare_subscriptions("second", on_second, {ON_CHANGE})
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(first)} and {len(second)} deliveries"))
+
+
+actor element_created_after_subscribe_is_delivered(t: testing.AsyncT):
+    """A filtered subscription to an entry that does not exist yet is served
+    once the entry is created and pushes oper."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        if len(got) == 1:
+            if data is not None:
+                fail(ValueError("baseline should be empty, got {prs(data)}"))
+                return
+            layer.edit_config(services(["svc-a", "svc-c"]), None, lambda _r: hub.push("svc-c", status("c")))
+        elif got[1] == tree([entry("svc-c", "c")]):
+            done = True
+            t.success()
+        else:
+            fail(ValueError("unexpected delivery {prs(got[1])}"))
+
+    def declare(_r: value):
+        layer.declare_subscriptions("test", on_update, {entry_spec("svc-c")})
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+actor deleted_element_is_removed(t: testing.AsyncT):
+    """When an entry's config is deleted its actor clears the oper from its
+    shutdown: the tree loses the entry and the change reports it gone, with
+    what it held."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var deltas: list[(ttt.Path, ?gdata.Node, ?gdata.Node)] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_delta(path: ttt.Path, before: ?gdata.Node, now: ?gdata.Node):
+        deltas.append((path, before, now))
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        if len(got) == 1:
+            layer.edit_config(gdata.Container({
+                q("service"): gdata.List([q("name")], [gdata.Absent({q("name"): gdata.Leaf("svc-a")})]),
+            }))
+        elif len(got) == 2:
+            if data != tree([entry("svc-b", "b")]):
+                fail(ValueError("expected svc-b alone, got {prs(data)}"))
+                return
+            (path, before, now) = deltas[0]
+            if now is None and path.name == "svc-a" and before == entry("svc-a", "a"):
+                done = True
+                t.success()
+            else:
+                fail(ValueError("unexpected change at {path}: {prs(before)} -> {prs(now)}"))
+
+    def declare(_r: value):
+        hub.push("svc-a", status("a"))
+        hub.push("svc-b", status("b"))
+        after 0.05: layer.declare_subscriptions("test", on_update, {ON_CHANGE}, delta=on_delta)
+
+    layer.edit_config(services(["svc-a", "svc-b"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+actor owner_with_two_specs_gets_one_tree(t: testing.AsyncT):
+    """Several on-change specs from one owner are one Subscription with the
+    union of their filters."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        if len(got) == 1:
+            hub.push("svc-b", status("b2"))
+        elif len(got) == 2:
+            expected = tree([entry("svc-a", "a"), entry("svc-b", "b2")])
+            if got[1] == expected:
+                done = True
+                t.success()
+            else:
+                fail(ValueError("expected {prs(expected)}, got {prs(got[1])}"))
+
+    def declare(_r: value):
+        hub.push("svc-a", status("a"))
+        hub.push("svc-b", status("b"))
+        hub.push("svc-c", status("c"))
+        after 0.05: layer.declare_subscriptions("test", on_update, {entry_spec("svc-a"), entry_spec("svc-b")})
+
+    layer.edit_config(services(["svc-a", "svc-b", "svc-c"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+actor change_carries_the_producer_path_and_slice(t: testing.AsyncT):
+    """The change alone is the producer's path with what it held before and
+    after; rendering it as a yang-patch is the northbound edge's business."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_delta(path: ttt.Path, before: ?gdata.Node, now: ?gdata.Node):
+        if path.name == "svc-a" and before is None and now == entry("svc-a", "a"):
+            done = True
+            t.success()
+        else:
+            fail(ValueError("unexpected change at {path}: {prs(before)} -> {prs(now)}"))
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+
+    def declare(_r: value):
+        layer.declare_subscriptions("test", on_update, {ON_CHANGE}, delta=on_delta)
+        after 0.05: hub.push("svc-a", status("a"))
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+    after 2: fail(ValueError("timed out"))
+
+
+actor bad_filter_is_reported_once(t: testing.AsyncT):
+    hub = Hub()
+    layer = service_layer(hub)
+    var errors = 0
+    var done = False
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            errors += 1
+
+    def finish():
+        if not done:
+            done = True
+            if errors == 1:
+                t.success()
+            else:
+                t.failure(ValueError("expected one error delivery, got {errors}"))
+
+    def declare(_r: value):
+        layer.declare_subscriptions("test", on_update, {gdata.SubscriptionSpec(gdata.FNode(children=[gdata.FNode(children=[])]))})
+        after 0.3: finish()
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+
+
+actor Relay(update_oper: action(?gdata.Node) -> None, lower: ?gdata.TreeProvider):
+    """An upper-layer transform actor: republishes, as its own oper, whatever
+    it sees in the layer below, through the ordinary gdata subscription API."""
+    _subs = gdata.SubscriptionManager(lower!, "relay")
+
+    def on_lower(tree: ?gdata.Node, err: ?Exception):
+        update_oper(tree)
+
+    def on_conf(conf: gdata.Node, memory: ?gdata.Node):
+        _subs.declare({gdata.Dst(on_lower).deliver({ON_CHANGE})})
+
+    def shutdown(memory: ?gdata.Node):
+        update_oper(None)
+
+
+def relay_ctor(params: ttt.TransformActorParams) -> ttt.TransformActor:
+    r = Relay(params.update_oper, params.lower_tree_provider)
+    return ttt.TransformActor(r.on_conf, r.shutdown)
+
+
+actor oper_crosses_layers_without_timers(t: testing.AsyncT):
+    """A push in the lower layer reaches a subscriber of the upper layer through
+    the upper transform's actor: lower Subscription, update_oper, upper Subscription. No
+    sampling anywhere; the only timers here are the test's own."""
+    hub = Hub()
+    lower = service_layer(hub, "lower")
+    upper = ttt.Layer("upper", ttt.Container({
+        q("relay"): ttt.Transform(Noop, relay_ctor, None, lower),
+    }), lower)
+    seen_x = tree([entry("svc-a", "x")])
+    seen_y = tree([entry("svc-a", "y")])
+    var pushed_y = False
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_top(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+        elif data == gdata.Container({q("relay"): seen_x}) and not pushed_y:
+            pushed_y = True
+            hub.push("svc-a", status("y"))
+        elif data == gdata.Container({q("relay"): seen_y}) and pushed_y:
+            done = True
+            t.success()
+
+    def configured_upper(_r: value):
+        after 0.05: upper.declare_subscriptions("top", on_top, {ON_CHANGE})
+
+    def configured_lower(_r: value):
+        hub.push("svc-a", status("x"))
+        upper.edit_config(gdata.Container({q("relay"): gdata.Container({q("name"): gdata.Leaf("r")})}), None, configured_upper)
+
+    lower.edit_config(services(["svc-a"]), None, configured_lower)
+    after 2: fail(ValueError("timed out (pushed_y={pushed_y})"))
+
+
+actor subscribe_during_commit_is_delivered(t: testing.AsyncT):
+    """An entry that is still provisional when the subscription registers is
+    not in the baseline, and joins the subscription when it commits."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+        elif data == tree([entry("svc-a", "a")]):
+            done = True
+            t.success()
+
+    layer.edit_config(services(["svc-a"]), None, lambda _r: hub.push("svc-a", status("a")))
+    layer.declare_subscriptions("test", on_update, {entry_spec("svc-a")})
+    after 2: fail(ValueError("timed out"))
+
+
+actor unchanged_slice_is_not_resent(t: testing.AsyncT):
+    """A change outside a route's filter does not reach that route's Subscription."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def finish():
+        if not done:
+            done = True
+            if len(got) == 1:
+                t.success()
+            else:
+                t.failure(ValueError("expected one delivery, got {len(got)}"))
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        if len(got) == 1:
+            hub.push("svc-a", gdata.Container({q("status"): gdata.Leaf("a"), q("rx"): gdata.Leaf(u64(7))}))
+            after 0.3: finish()
+
+    def declare(_r: value):
+        hub.push("svc-a", status("a"))
+        after 0.05: layer.declare_subscriptions("test", on_update, {entry_spec("svc-a")})
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+def entry_layer(hub: Hub) -> ttt.Layer:
+    """A list whose entries are containers holding a transform."""
+    return ttt.Layer("top", ttt.Container({
+        q("service"): ttt.List(ttt.Container({
+            q("probe"): ttt.Transform(Noop, pusher_ctor(hub)),
+        }), [q("name")], ns=TEST_NS, module="test-on-change"),
+    }), None)
+
+def probes(names: list[str]) -> gdata.Node:
+    """Config for entry_layer: each entry configures its probe transform."""
+    return gdata.Container({
+        q("service"): gdata.List([q("name")], [
+            gdata.Container({q("name"): gdata.Leaf(n), q("probe"): gdata.Container({q("enabled"): gdata.Leaf(True)})}) for n in names
+        ]),
+    })
+
+
+actor wildcard_key_over_container_entries_prunes(t: testing.AsyncT):
+    """A key predicate on a list of container entries is decided at the entry."""
+    hub = Hub()
+    layer = entry_layer(hub)
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+        elif data is not None:
+            rendered = data.prsrc(deterministic=True)
+            if rendered.find("svc-b") != -1:
+                fail(ValueError("svc-b leaked through a svc-a* key filter: " + rendered))
+            elif rendered.find("up-svc-a") != -1:
+                done = True
+                t.success()
+
+    def declare(_r: value):
+        hub.push("svc-a", status("up-svc-a"))
+        hub.push("svc-b", status("up-svc-b"))
+        filt = gdata.FNode(q("service"), children=[gdata.FNode(q("name"), value_match=gdata.VWildcard("svc-a*"))])
+        after 0.05: layer.declare_subscriptions("test", on_update, {gdata.SubscriptionSpec(filt)})
+
+    layer.edit_config(probes(["svc-a", "svc-b"]), None, declare)
+    after 2: fail(ValueError("timed out"))
+
+
+def counters(s: str) -> gdata.Node:
+    return gdata.Container({q("status"): gdata.Leaf(s), q("rx"): gdata.Leaf(u64(10)), q("tx"): gdata.Leaf(u64(20))})
+
+
+actor predicate_alternatives_stay_separate(t: testing.AsyncT):
+    """Two alternatives for one entry each keep their own predicate: the
+    producer serves the first that matches, and none when none does."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        n = len(got)
+        if n == 1:
+            hub.push("svc-a", counters("up"))
+        elif n == 2:
+            if data == tree([gdata.Container({q("name"): gdata.Leaf("svc-a"), q("rx"): gdata.Leaf(u64(10))})]):
+                hub.push("svc-a", counters("down"))
+            else:
+                fail(ValueError("up: expected rx alone, got {prs(data)}"))
+        elif n == 3:
+            if data == tree([gdata.Container({q("name"): gdata.Leaf("svc-a"), q("tx"): gdata.Leaf(u64(20))})]):
+                hub.push("svc-a", counters("unknown"))
+            else:
+                fail(ValueError("down: expected tx alone, got {prs(data)}"))
+        elif n == 4:
+            if data is None:
+                done = True
+                t.success()
+            else:
+                fail(ValueError("unknown: expected nothing, got {prs(data)}"))
+
+    def declare(_r: value):
+        filt = gdata.FNode(children=[
+            gdata.FNode(q("service"), children=[
+                gdata.FNode(q("name"), value_match="svc-a"),
+                gdata.FNode(q("status"), value_match="up"), gdata.FNode(q("rx")),
+            ]),
+            gdata.FNode(q("service"), children=[
+                gdata.FNode(q("name"), value_match="svc-a"),
+                gdata.FNode(q("status"), value_match="down"), gdata.FNode(q("tx")),
+            ]),
+        ])
+        layer.declare_subscriptions("alternatives", on_update, {gdata.SubscriptionSpec(filt)})
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+actor selecting_only_keys_selects_no_oper(t: testing.AsyncT):
+    """A filter that names nothing but a list key selects no oper at all."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var done = False
+
+    def finish():
+        if not done:
+            done = True
+            if len(got) == 1 and got[0] is None:
+                t.success()
+            else:
+                t.failure(ValueError("expected one empty delivery, got {len(got)}"))
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        got.append(data)
+        if len(got) == 1:
+            hub.push("svc-a", status("must not leak"))
+            after 0.3: finish()
+
+    def declare(_r: value):
+        layer.declare_subscriptions("keys", on_update, {gdata.SubscriptionSpec(gdata.FNode(q("service"), children=[gdata.FNode(q("name"))]))})
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+
+
+actor overlapping_specs_in_one_owner(t: testing.AsyncT):
+    """An unfiltered spec and a filtered one in the same owner fold into one
+    tree; a producer's push replaces its whole contribution."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        n = len(got)
+        if n == 1:
+            hub.push("svc-a", gdata.Container({q("status"): gdata.Leaf("first"), q("old"): gdata.Leaf("must disappear")}))
+        elif n == 2:
+            if data == tree([gdata.Container({q("name"): gdata.Leaf("svc-a"), q("status"): gdata.Leaf("first"), q("old"): gdata.Leaf("must disappear")})]):
+                hub.push("svc-a", status("second"))
+            else:
+                fail(ValueError("expected first with old, got {prs(data)}"))
+        elif n == 3:
+            if data == tree([entry("svc-a", "second")]):
+                done = True
+                t.success()
+            else:
+                fail(ValueError("expected second alone, got {prs(data)}"))
+
+    def declare(_r: value):
+        layer.declare_subscriptions("overlap", on_update, {ON_CHANGE, entry_spec("svc-a")})
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+actor owners_cancel_and_replace_their_declarations(t: testing.AsyncT):
+    """A removed owner hears nothing more; an owner that redeclares with a
+    new callback and filter is served the new way only."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var first: dict[str, int] = {"one": 0, "two": 0}
+    var replacing = False
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_tree(owner: str, data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+        elif replacing:
+            fail(ValueError("cancelled or replaced callback was called for {owner}"))
+        elif data == tree([entry("svc-a", "first")]):
+            first[owner] += 1
+            if first["one"] == 1 and first["two"] == 1:
+                replacing = True
+                layer.remove_subscriptions("one")
+                layer.declare_subscriptions("two", replacement, {entry_spec("svc-b")})
+
+    def replacement(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+        elif data is None:
+            hub.push("svc-a", status("must not arrive"))
+            hub.push("svc-b", status("second"))
+        elif data == tree([entry("svc-b", "second")]):
+            done = True
+            t.success()
+        else:
+            fail(ValueError("unexpected replacement delivery {prs(data)}"))
+
+    def declare(_r: value):
+        layer.declare_subscriptions("one", lambda data, err: self.on_tree("one", data, err), {ON_CHANGE})
+        layer.declare_subscriptions("two", lambda data, err: self.on_tree("two", data, err), {ON_CHANGE})
+        after 0.05: hub.push("svc-a", status("first"))
+
+    layer.edit_config(services(["svc-a", "svc-b"]), None, declare)
+    after 2: fail(ValueError("timed out (replacing={replacing})"))
+
+
+actor entry_deleted_and_recreated_is_delivered_again(t: testing.AsyncT):
+    """An entry created anew after its deletion joins the subscription like
+    any entry committed after registration."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        n = len(got)
+        if n == 1:
+            layer.edit_config(gdata.Container({
+                q("service"): gdata.List([q("name")], [gdata.Absent({q("name"): gdata.Leaf("svc-a")})]),
+            }))
+        elif n == 2:
+            if data is None:
+                layer.edit_config(services(["svc-a"]), None, lambda _r: hub.push("svc-a", status("again")))
+            else:
+                fail(ValueError("expected the entry gone, got {prs(data)}"))
+        elif n == 3:
+            if data == tree([entry("svc-a", "again")]):
+                done = True
+                t.success()
+            else:
+                fail(ValueError("expected the entry again, got {prs(data)}"))
+
+    def declare(_r: value):
+        hub.push("svc-a", status("first"))
+        after 0.05: layer.declare_subscriptions("test", on_update, {ON_CHANGE})
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+def probe_layer(hub: Hub) -> ttt.Layer:
+    """One container transform right below the root."""
+    return ttt.Layer("top", ttt.Container({
+        q("probe"): ttt.Transform(Noop, pusher_ctor(hub)),
+    }), None)
+
+def probe(enabled: bool) -> gdata.Node:
+    if enabled:
+        return gdata.Container({q("probe"): gdata.Container({q("enabled"): gdata.Leaf(True)})})
+    return gdata.Container({q("probe"): gdata.Absent()})
+
+
+actor owner_mixing_periodic_and_on_change_gets_one_tree(t: testing.AsyncT):
+    """An owner's periodic and on-change specs are served apart and merged
+    into the one tree it receives."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var pushed = False
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+        elif not pushed and data == tree([entry("svc-a", "a"), entry("svc-b", "b")]):
+            pushed = True
+            hub.push("svc-a", status("a2"))
+        elif pushed and data == tree([entry("svc-a", "a2"), entry("svc-b", "b")]):
+            done = True
+            t.success()
+
+    def declare(_r: value):
+        hub.push("svc-a", status("a"))
+        hub.push("svc-b", status("b"))
+        sampled = gdata.SubscriptionSpec(entry_spec("svc-b").filt, period=0.02)
+        after 0.05: layer.declare_subscriptions("mixed", on_update, {entry_spec("svc-a"), sampled})
+
+    layer.edit_config(services(["svc-a", "svc-b"]), None, declare)
+    after 2: fail(ValueError("timed out (pushed={pushed})"))
+
+
+actor matching_alternatives_are_unioned(t: testing.AsyncT):
+    """Two alternatives that both match one entry select the union of what
+    they name."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var done = False
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if not done:
+            done = True
+            if err is not None:
+                t.failure(err)
+            elif data == tree([gdata.Container({q("name"): gdata.Leaf("svc-a"), q("rx"): gdata.Leaf(u64(10)), q("tx"): gdata.Leaf(u64(20))})]):
+                t.success()
+            else:
+                t.failure(ValueError("expected rx and tx, got {prs(data)}"))
+
+    def declare(_r: value):
+        filt = gdata.FNode(children=[
+            gdata.FNode(q("service"), children=[gdata.FNode(q("name"), value_match="svc-a"), gdata.FNode(q("status"), value_match="up"), gdata.FNode(q("rx"))]),
+            gdata.FNode(q("service"), children=[gdata.FNode(q("name"), value_match="svc-a"), gdata.FNode(q("status"), value_match="up"), gdata.FNode(q("tx"))]),
+        ])
+        hub.push("svc-a", counters("up"))
+        after 0.05: layer.declare_subscriptions("union", on_update, {gdata.SubscriptionSpec(filt)})
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+    after 2: on_update(None, ValueError("timed out"))
+
+
+actor selecting_a_subtree_keeps_an_empty_container(t: testing.AsyncT):
+    """An empty container is oper too: selecting its subtree delivers it,
+    as an unfiltered subscription does."""
+    hub = Hub()
+    layer = probe_layer(hub)
+    var done = False
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if not done:
+            done = True
+            if err is not None:
+                t.failure(err)
+            elif data == gdata.Container({q("probe"): gdata.Container({})}):
+                t.success()
+            else:
+                t.failure(ValueError("expected the empty probe container, got {prs(data)}"))
+
+    def declare(_r: value):
+        hub.push("probe", gdata.Container({}))
+        after 0.05: layer.declare_subscriptions("presence", on_update, {gdata.SubscriptionSpec(gdata.FNode(q("probe")))})
+
+    layer.edit_config(probe(True), None, declare)
+    after 2: on_update(None, ValueError("timed out"))
+
+
+##################### Rooted at a node #####################
+
+ROOTED_AT_SERVICE = gdata.FNode(q("service"))
+
+def gone(name: str) -> gdata.Node:
+    """The spine of a service entry reported gone."""
+    return tree([gdata.Absent({q("name"): gdata.Leaf(name)})])
+
+def rendered(trees: list[?gdata.Node]) -> list[str]:
+    return sorted([prs(d) for d in trees])
+
+def probe_spine(c: gdata.Node) -> gdata.Node:
+    return gdata.Container({q("probe"): c})
+
+
+actor rooted_at_a_list_on_change(t: testing.AsyncT):
+    """Rooted at the service list: the walk delivers one entry at a time
+    then synced; a push delivers its entry alone; a deletion delivers an
+    Absent with the entry's key. Each delivery is a tree from the top."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var got: list[?gdata.Node] = []
+    var synced = False
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_synced(owner: str):
+        if synced or rendered(got) != rendered([tree([entry("svc-a", "a")]), tree([entry("svc-b", "b")])]):
+            fail(ValueError("synced after {len(got)} deliveries: {rendered(got)}"))
+            return
+        synced = True
+        hub.push("svc-a", status("a2"))
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        n = len(got)
+        if n == 3:
+            if data == tree([entry("svc-a", "a2")]):
+                layer.edit_config(gdata.Container({
+                    q("service"): gdata.List([q("name")], [gdata.Absent({q("name"): gdata.Leaf("svc-b")})]),
+                }))
+            else:
+                fail(ValueError("expected svc-a alone, got {prs(data)}"))
+        elif n == 4:
+            if data == gone("svc-b"):
+                done = True
+                t.success()
+            else:
+                fail(ValueError("expected svc-b gone, got {prs(data)}"))
+
+    def declare(_r: value):
+        hub.push("svc-a", status("a"))
+        hub.push("svc-b", status("b"))
+        after 0.05: layer.declare_subscriptions("rooted", on_update, {gdata.SubscriptionSpec(None, root=ROOTED_AT_SERVICE)}, on_synced)
+
+    layer.edit_config(services(["svc-a", "svc-b"]), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries, synced={synced}"))
+
+
+actor rooted_at_a_container_on_change(t: testing.AsyncT):
+    """Rooted at a container: the container as it is, then the tree without
+    it when its config, and with it its oper, is gone."""
+    hub = Hub()
+    layer = probe_layer(hub)
+    var got: list[?gdata.Node] = []
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_synced(owner: str):
+        if len(got) == 1 and got[0] == probe_spine(status("up")):
+            layer.edit_config(probe(False))
+        else:
+            fail(ValueError("synced after {rendered(got)}"))
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        if len(got) == 2:
+            if data == gdata.Container():
+                done = True
+                t.success()
+            else:
+                fail(ValueError("expected the probe gone, got {prs(data)}"))
+
+    def declare(_r: value):
+        hub.push("probe", status("up"))
+        after 0.05: layer.declare_subscriptions("rooted", on_update, {gdata.SubscriptionSpec(None, root=gdata.FNode(q("probe")))}, on_synced)
+
+    layer.edit_config(probe(True), None, declare)
+    after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+actor two_consumers_rooted_alike_each_get_every_change(t: testing.AsyncT):
+    """Two consumers rooted at the same list each have a route of their
+    own: both get every entry, then synced, then a change."""
+    hub = Hub()
+    layer = service_layer(hub)
+    spec = gdata.SubscriptionSpec(None, root=ROOTED_AT_SERVICE)
+    var changed: dict[str, ?gdata.Node] = {}
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_data(who: str, data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+        elif data == tree([entry("svc-a", "a2")]):
+            changed[who] = data
+            if len(changed) == 2:
+                done = True
+                t.success()
+
+    def first_synced(owner: str):
+        layer.declare_subscriptions("two", lambda d, e: self.on_data("two", d, e), {spec}, second_synced)
+
+    def second_synced(owner: str):
+        hub.push("svc-a", status("a2"))
+
+    def declare(_r: value):
+        hub.push("svc-a", status("a"))
+        hub.push("svc-b", status("b"))
+        after 0.05: layer.declare_subscriptions("one", lambda d, e: self.on_data("one", d, e), {spec}, first_synced)
+
+    layer.edit_config(services(["svc-a", "svc-b"]), None, declare)
+    after 2: fail(ValueError("timed out; the change reached {list(changed.keys())}"))
+
+
+actor rooted_destination_is_served_one_way(t: testing.AsyncT):
+    """A rooted consumer is read on one period or served on-change: a
+    periodic filter cannot join an on-change one."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var done = False
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if not done:
+            done = True
+            if err is not None:
+                t.success()
+            else:
+                t.failure(ValueError("expected an error, got {prs(data)}"))
+
+    layer.declare_subscriptions("rooted", on_update, {
+        gdata.SubscriptionSpec(None, root=ROOTED_AT_SERVICE),
+        gdata.SubscriptionSpec(entry_spec("svc-a").filt, period=0.05, root=ROOTED_AT_SERVICE),
+    })
+    after 2: on_update(None, None)
+
+
+actor synced_follows_the_route_and_every_read(t: testing.AsyncT):
+    """A consumer with an on-change filter and a periodic one hears synced
+    once, after the walk and the first read, with the view holding both."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var latest: ?gdata.Node = None
+    var synced = 0
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+        else:
+            latest = data
+
+    def on_synced(owner: str):
+        synced += 1
+        if latest == tree([entry("svc-a", "a"), entry("svc-b", "b")]):
+            after 0.2: finish()
+        else:
+            fail(ValueError("synced with {prs(latest)}"))
+
+    def finish():
+        if not done:
+            done = True
+            if synced == 1:
+                t.success()
+            else:
+                t.failure(ValueError("synced {synced} times"))
+
+    def declare(_r: value):
+        hub.push("svc-a", status("a"))
+        hub.push("svc-b", status("b"))
+        sampled = gdata.SubscriptionSpec(entry_spec("svc-b").filt, period=0.02)
+        after 0.05: layer.declare_subscriptions("mixed", on_update, {entry_spec("svc-a"), sampled}, on_synced)
+
+    layer.edit_config(services(["svc-a", "svc-b"]), None, declare)
+    after 2: fail(ValueError("timed out (synced={synced})"))
+
+
+actor redeclaring_the_same_on_change_set_installs_the_callbacks_only(t: testing.AsyncT):
+    """A redeclaration of the same on-change set walks nothing again,
+    hears its synced at once, and hands later changes to the new callback."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var second: list[?gdata.Node] = []
+    var synced = 0
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_first(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+        elif data == tree([entry("svc-a", "second")]):
+            fail(ValueError("the replaced callback was called"))
+
+    def first_synced(owner: str):
+        layer.declare_subscriptions("owner", on_second, {ON_CHANGE}, second_synced)
+
+    def on_second(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+        else:
+            second.append(data)
+
+    def second_synced(owner: str):
+        synced += 1
+        if len(second) == 0:
+            hub.push("svc-a", status("second"))
+            after 0.3: finish()
+        else:
+            fail(ValueError("delivered again before synced: {rendered(second)}"))
+
+    def finish():
+        if not done:
+            done = True
+            if synced == 1 and len(second) == 1 and second[0] == tree([entry("svc-a", "second")]):
+                t.success()
+            else:
+                t.failure(ValueError("synced {synced} times, the new callback got {rendered(second)}"))
+
+    def declare(_r: value):
+        hub.push("svc-a", status("first"))
+        after 0.05: layer.declare_subscriptions("owner", on_first, {ON_CHANGE}, first_synced)
+
+    layer.edit_config(services(["svc-a"]), None, declare)
+    after 2: fail(ValueError("timed out"))
+
+
+def item(id: str, v: str) -> gdata.Node:
+    return gdata.Container({q("id"): gdata.Leaf(id), q("v"): gdata.Leaf(v)})
+
+def items(entries: list[gdata.Node]) -> gdata.Node:
+    return gdata.Container({q("items"): gdata.List([q("id")], entries)})
+
+def item_spine(i: gdata.Node) -> gdata.Node:
+    return probe_spine(items([i]))
+
+
+actor change_above_the_root_delivers_the_instances_that_differ(t: testing.AsyncT):
+    """A producer that holds several instances of the root's node delivers,
+    on a change, the instances that differ and those gone."""
+    hub = Hub()
+    layer = probe_layer(hub)
+    var got: list[?gdata.Node] = []
+    var stage = 0
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_synced(owner: str):
+        if rendered(got) == rendered([item_spine(item("one", "x")), item_spine(item("two", "y"))]):
+            stage = 1
+            got = []
+            hub.push("probe", items([item("one", "x2"), item("two", "y")]))
+        else:
+            fail(ValueError("synced after {rendered(got)}"))
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(err)
+            return
+        got.append(data)
+        if stage == 1 and len(got) == 1:
+            if data == item_spine(item("one", "x2")):
+                stage = 2
+                got = []
+                hub.push("probe", items([item("one", "x2")]))
+            else:
+                fail(ValueError("expected item one changed alone, got {prs(data)}"))
+        elif stage == 2 and len(got) == 1:
+            if data == item_spine(gdata.Absent({q("id"): gdata.Leaf("two")})):
+                done = True
+                t.success()
+            else:
+                fail(ValueError("expected item two gone, got {prs(data)}"))
+
+    def declare(_r: value):
+        hub.push("probe", items([item("one", "x"), item("two", "y")]))
+        root = gdata.FNode(q("probe"), children=[gdata.FNode(q("items"))])
+        after 0.05: layer.declare_subscriptions("rooted", on_update, {gdata.SubscriptionSpec(None, root=root)}, on_synced)
+
+    layer.edit_config(probe(True), None, declare)
+    after 2: fail(ValueError("timed out at stage {stage} with {rendered(got)}"))
+
+
+actor failed_walk_still_ends_with_synced(t: testing.AsyncT):
+    """A walk that fails reports the error, then synced."""
+    hub = Hub()
+    layer = entry_layer(hub)
+    var failed = False
+    var done = False
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            failed = True
+        elif not done:
+            done = True
+            t.failure(ValueError("expected an error, got {prs(data)}"))
+
+    def on_synced(owner: str):
+        if not done:
+            done = True
+            if failed:
+                t.success()
+            else:
+                t.failure(ValueError("synced before the error"))
+
+    def declare(_r: value):
+        filt = gdata.FNode(q("service"), children=[gdata.FNode(q("probe"), value_match="x")])
+        layer.declare_subscriptions("test", on_update, {gdata.SubscriptionSpec(filt)}, on_synced)
+
+    layer.edit_config(probes(["svc-a"]), None, declare)
+    after 2: on_update(None, None)

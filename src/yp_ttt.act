@@ -1,24 +1,38 @@
-"""TTT-backed YANG-push for the northbound NETCONF server (periodic).
+"""TTT-backed YANG-push for the northbound NETCONF server.
 
 TttSubscriptionService is the NETCONF binding that serves dynamic YANG-push
 (RFC 8641) subscriptions straight from a ttt.Layer datastore via TTT's native
-subscription mechanism (declare_subscriptions). On establish-subscription it
-declares a TTT subscription; TTT samples the datastore on the spec period and
-pushes the current merged tree to our callback, which we frame as a NETCONF
-push-update notification carrying the datastore-contents.
+subscription mechanism (declare_subscriptions) and frames what TTT delivers as
+NETCONF notifications:
 
-Supported v1 subset, enforced before a subscription is accepted (anything outside
+  - a periodic subscription samples the datastore on the spec period, and each
+    delivery becomes a push-update carrying the datastore-contents;
+  - an on-change subscription is served from the layer's route to the
+    operational state its transforms publish. The first delivery is the
+    complete baseline, sent as a push-update when sync-on-start is asked for;
+    every change after that arrives as the path of the node that changed with
+    what it held before and after, and is sent as a push-change-update whose
+    yang-patch replaces that subtree (so omitted descendants disappear) or
+    removes it. No tree is diffed. Config is not part of an on-change
+    subscription: it carries operational state only, with the keys of the
+    list entries it sits under, and it is served from the operational
+    datastore only. An entry whose config is removed is removed from the
+    subscription. A failure while serving ends the subscription with a
+    subscription-terminated notification.
+
+Supported subset, enforced before a subscription is accepted (anything outside
 it gets an rpc-error rather than being silently served as something else):
 
-  - periodic subscriptions only; on-change is not supported;
   - the running or operational datastore;
   - no filter, a datastore-subtree-filter (RFC 6241 subtree filtering), or a
     datastore-xpath-filter in the subset supported by acton-yang. Filters are
     parsed against the served schema into a gdata filter and handed to TTT,
-    which samples only the selected subtree, so each push carries just the
-    filtered data.
+    which serves only the selected subtree, so each push carries just the
+    filtered data;
+  - no dampening-period and no excluded-change on an on-change subscription:
+    changes are sent as they happen.
 
-Known deviation, still under discussion: TTT subscriptions are
+Known deviation, still under discussion: TTT periodic subscriptions are
 periodic-with-change-suppression, so a subscription only pushes when the datastore
 actually changes (at most once per period), not unconditionally every period.
 
@@ -28,12 +42,14 @@ the transport-only netconf.yp binding so it stays TTT-free.
 
 import logging
 import std.xml as xml
+import uri
 
 import ttt
 import yang.filter_xpath as filter_xpath
 import yang.gdata as gdata
 import yang.schema as yschema
 import yang.xml as yxml
+import yang.ypatch as ypatch
 
 from netconf import Server
 import yp
@@ -50,6 +66,121 @@ def parse_subtree_filter(schema: yschema.DRoot, nodes: list[xml.Node]) -> gdata.
     return yxml.from_filter_xml(schema, wrapper)
 
 
+def _change_target(schema: yschema.DRoot, path: ttt.Path) -> str:
+    """Render a TTT path as an RFC 8040 data-resource path, module-qualified
+    where the namespace changes and the schema knows the module."""
+    if isinstance(path, ttt.PathElem):
+        name = path.name
+        if path.ns != path.parent.namespace():
+            if path.ns not in schema.module_metadata:
+                raise ValueError("no module in the schema for {path.ns} at {name}")
+            name = schema.module_metadata[path.ns].module + ":" + name
+        return _change_target(schema, path.parent) + "/" + name
+    elif isinstance(path, ttt.PathKey):
+        keys = [uri.quote(gdata.yang_str(v.val), safe="")
+                for v in path.keyvals.values() if isinstance(v, gdata.Leaf)]
+        return _change_target(schema, path.parent) + "=" + ",".join(keys)
+    return ""
+
+
+def oper_contents(tree: ?gdata.Node, parent_ns: ?str=None,
+                  keys: list[gdata.Id]=[]) -> list[xml.Node]:
+    """Serialize an oper tree with namespaces taken from its child ids, so a
+    tree assembled from shared TTT nodes renders qualified without being
+    changed. List keys come first."""
+    result: list[xml.Node] = []
+    if tree is not None:
+        for name in keys + [k for k in tree.children if k not in keys]:
+            node = tree.children[name]
+            ns = name.q if name.q else parent_ns
+            decl = ns if ns != parent_ns else None
+            if isinstance(node, gdata.Leaf):
+                result.append(gdata.leaf_xml(name.name, decl, node.val))
+            elif isinstance(node, gdata.LeafList):
+                for entry in node.entries:
+                    result.append(gdata.leaf_xml(name.name, decl, entry.val))
+            else:
+                entries = node.elements if isinstance(node, gdata.List) else [node]
+                for entry in entries:
+                    children = oper_contents(entry, ns, node.keys if isinstance(node, gdata.List) else [])
+                    if children or isinstance(node, gdata.List) or (isinstance(entry, gdata.Container) and entry.presence):
+                        result.append(xml.Node(name.name, nsdefs=[(None, decl)] if decl is not None else [], children=children))
+    return result
+
+
+def change_edits(schema: yschema.DRoot, path: ttt.Path,
+                 before: ?gdata.Node, current: ?gdata.Node) -> list[ypatch.Edit]:
+    """The yang-patch edits for one changed node: replace its subtree, or
+    remove it. Only the layer root and lists are split into their instances,
+    since an edit addresses one data instance; an instance that did not
+    change is left alone. No leaf is ever diffed."""
+    edits: list[ypatch.Edit] = []
+
+    def add(p: ttt.Path, old: ?gdata.Node, new: ?gdata.Node):
+        if isinstance(p, ttt.PathRoot):
+            old_children = old.children if old is not None else {}
+            new_children = new.children if new is not None else {}
+            for name in set(old_children.keys()) | set(new_children.keys()):
+                add(ttt.PathElem(name, p), old_children.get(name), new_children.get(name))
+        elif isinstance(new, gdata.List) or isinstance(old, gdata.List):
+            keys = new.keys if isinstance(new, gdata.List) else old.keys if isinstance(old, gdata.List) else []
+            if not keys:
+                raise ValueError("A top-level keyless list cannot be addressed by YANG Patch")
+            old_entries = {n.key_str(keys): n for n in old.elements} if isinstance(old, gdata.List) else {}
+            new_entries = {n.key_str(keys): n for n in new.elements} if isinstance(new, gdata.List) else {}
+            ordered = (new.user_order if isinstance(new, gdata.List) else False) or (old.user_order if isinstance(old, gdata.List) else False)
+            for key, entry in old_entries.items():
+                if ordered or key not in new_entries:
+                    add(ttt.PathKey(key, p, {k: entry.get_leaf(k) for k in keys}), entry, None)
+            for key, entry in new_entries.items():
+                if not ordered and key in old_entries and old_entries[key] == entry:
+                    continue
+                add(ttt.PathKey(key, p, {k: entry.get_leaf(k) for k in keys}), old_entries.get(key), entry)
+        elif isinstance(new, gdata.LeafList) or isinstance(old, gdata.LeafList):
+            target = _change_target(schema, p)
+            old_values = {gdata.yang_str(e.val): e.val for e in old.entries} if isinstance(old, gdata.LeafList) else {}
+            new_values = {gdata.yang_str(e.val): e.val for e in new.entries} if isinstance(new, gdata.LeafList) else {}
+            ordered = (new.user_order if isinstance(new, gdata.LeafList) else False) or (old.user_order if isinstance(old, gdata.LeafList) else False)
+            for key in old_values:
+                if ordered or key not in new_values:
+                    edits.append(ypatch.Edit(str(len(edits)), ypatch.OP_REMOVE,
+                        target + "=" + uri.quote(key, safe="")))
+            for key, value in new_values.items():
+                edits.append(ypatch.Edit(str(len(edits)), ypatch.OP_REPLACE,
+                    target + "=" + uri.quote(key, safe=""), gdata.leaf_xml(p.name, p.namespace(), value)))
+        else:
+            target = _change_target(schema, p)
+            value: ?xml.Node = None
+            if new is not None:
+                name = p.parent.name if isinstance(p, ttt.PathKey) else p.name
+                if isinstance(new, gdata.Leaf):
+                    value = gdata.leaf_xml(name, p.namespace(), new.val)
+                else:
+                    value = xml.Node(name, nsdefs=[(None, p.namespace()!)],
+                                     children=oper_contents(new, p.namespace(),
+                                         list(p.keyvals.keys()) if isinstance(p, ttt.PathKey) else []))
+            operation = ypatch.OP_REPLACE if new is not None else ypatch.OP_REMOVE
+            edits.append(ypatch.Edit(str(len(edits)), operation, target, value))
+
+    add(path, before, current)
+    return edits
+
+
+class SubState():
+    """How one accepted subscription is framed: a periodic one pushes the
+    whole tree every time; an on-change one sends its baseline once, if
+    asked for, and then a patch per change. A change of state is a new
+    record."""
+    on_change: bool
+    sync: bool                  # a baseline push is still owed
+    seq: int
+
+    def __init__(self, on_change: bool, sync: bool, seq: int=0):
+        self.on_change = on_change
+        self.sync = sync
+        self.seq = seq
+
+
 actor TttSubscriptionService(server: Server, cfs: ttt.Layer, schema: yschema.DRoot,
                              owner_prefix: str="yp",
                              log_handler: ?logging.Handler=None):
@@ -57,13 +188,13 @@ actor TttSubscriptionService(server: Server, cfs: ttt.Layer, schema: yschema.DRo
 
     Route establish-subscription / delete-subscription here from the server's
     on_rpc (gate with yp.is_subscription_rpc); call shutdown when the session
-    closes so TTT stops sampling for it. schema is the served top-level schema;
+    closes so TTT stops serving it. schema is the served top-level schema;
     subtree and XPath filters are parsed against it. owner_prefix must be unique
     per session: TTT keys subscriptions by owner id, so two sessions sharing one
     cfs must not collide."""
 
     _log = logging.Logger(log_handler)
-    var active: set[int] = set()
+    var subs: dict[int, SubState] = {}
     var next_id: int = 1
 
     def _owner_id(sub_id: int) -> str:
@@ -77,33 +208,69 @@ actor TttSubscriptionService(server: Server, cfs: ttt.Layer, schema: yschema.DRo
             return local == "running" or local == "operational"
         return False
 
-    def _has_on_change(op: xml.Node) -> bool:
-        for c in op.children:
-            if c.tag == "on-change":
-                return True
-        return False
-
-    def _contents(tree: ?gdata.Node) -> list[xml.Node]:
+    def _contents(st: SubState, tree: ?gdata.Node) -> list[xml.Node]:
+        if st.on_change:
+            return oper_contents(tree)
         if tree is not None:
             return tree.to_xml(deterministic=True)
         return []
 
-    def _on_tree(sub_id: int, tree: ?gdata.Node, err: ?Exception) -> None:
-        """TTT subscription callback: a fresh merged tree (or an error).
-        Frame it as a push-update, unless the subscription is already gone."""
-        if sub_id in active:
-            if err is not None:
-                _log.error("subscription sample error id={sub_id} error={err}")
-            else:
-                server.send_notification(yp.build_notification(
-                    yp.event_time_now(), yp.build_push_update(sub_id, _contents(tree))))
+    def _push_update(sub_id: int, st: SubState, tree: ?gdata.Node) -> None:
+        server.send_notification(yp.build_notification(
+            yp.event_time_now(), yp.build_push_update(sub_id, _contents(st, tree))))
 
-    def _establish(message_id: str, pp: int, subtree_filter: ?list[xml.Node],
-                   xpath_filter: ?str) -> None:
-        """Declare a periodic TTT subscription and reply with its id.
+    def _fail(sub_id: int, error: Exception) -> None:
+        """End a subscription the layer cannot serve, and say so."""
+        if sub_id in subs:
+            _log.error("subscription failed id={sub_id} error={error}")
+            del subs[sub_id]
+            cfs.remove_subscriptions(_owner_id(sub_id))
+            server.send_notification(yp.build_notification(yp.event_time_now(),
+                xml.Node("subscription-terminated", nsdefs=[(None, yp.NS_SN)], children=[
+                    xml.Node("id", text=str(sub_id)),
+                    xml.Node("reason", nsdefs=[("yp", yp.NS_YP)], text="yp:datastore-not-subscribable"),
+                ])))
+
+    def _on_tree(sub_id: int, tree: ?gdata.Node, err: ?Exception) -> None:
+        """TTT delivered a tree: a periodic sample, or the on-change baseline."""
+        st = subs.get(sub_id)
+        if st is not None:
+            if err is not None:
+                if st.on_change:
+                    _fail(sub_id, err)
+                else:
+                    _log.error("subscription sample error id={sub_id} error={err}")
+            elif not st.on_change:
+                _push_update(sub_id, st, tree)
+            elif st.sync:
+                subs[sub_id] = SubState(st.on_change, False, st.seq)
+                try:
+                    _push_update(sub_id, st, tree)
+                except Exception as error:
+                    _fail(sub_id, error)
+
+    def _on_change(sub_id: int, path: ttt.Path, before: ?gdata.Node, now: ?gdata.Node) -> None:
+        """TTT delivered one change: frame it as a patch."""
+        st = subs.get(sub_id)
+        if st is not None:
+            try:
+                edits = change_edits(schema, path, before, now)
+                if len(edits) > 0:
+                    patch = ypatch.Patch(str(st.seq), edits)
+                    subs[sub_id] = SubState(st.on_change, st.sync, (st.seq + 1) % 4294967296)
+                    server.send_notification(yp.build_notification(
+                        yp.event_time_now(), yp.build_push_change_update(sub_id, patch.to_xml())))
+            except Exception as error:
+                _fail(sub_id, error)
+
+    def _establish(message_id: str, st: SubState, period_s: ?float,
+                   subtree_filter: ?list[xml.Node], xpath_filter: ?str) -> None:
+        """Accept a subscription: allocate an id, answer, then declare it.
 
         A filter that does not parse against the schema fails the RPC with
-        invalid-value, and no id is allocated."""
+        invalid-value, and no id is allocated. The reply carries the id the
+        notifications will reference, so it is sent before the subscription
+        is declared and can push (ordering)."""
         filt: ?gdata.FNode = None
         if subtree_filter is not None and xpath_filter is not None:
             server.send_error(message_id, "invalid-value",
@@ -125,26 +292,72 @@ actor TttSubscriptionService(server: Server, cfs: ttt.Layer, schema: yschema.DRo
                 return
         sub_id = next_id
         next_id += 1
-        active.add(sub_id)
-        period_s = float(pp) / 100.0
+        subs[sub_id] = st
         scope = "filtered" if filt is not None else "full"
-        _log.info("establish-subscription id={sub_id} mode=periodic period={period_s}s scope={scope}")
-        # Reply with the id BEFORE the subscription can push (ordering).
+        mode = "on-change" if period_s is None else "periodic period={period_s}s"
+        _log.info("establish-subscription id={sub_id} mode={mode} scope={scope}")
         server.send_reply(message_id, [yp.build_subscription_id_reply(sub_id)])
-        spec = gdata.SubscriptionSpec(filt, period=period_s)
         cfs.declare_subscriptions(_owner_id(sub_id),
-            (lambda tree, err: _on_tree(sub_id, tree, err)), {spec})
+            (lambda tree, err: _on_tree(sub_id, tree, err)),
+            {gdata.SubscriptionSpec(filt, period=period_s)},
+            delta=(lambda path, before, now: _on_change(sub_id, path, before, now)))
+
+    def _operational(ds: ?str) -> bool:
+        if ds is not None:
+            return ds.split(":")[-1] == "operational"
+        return False
+
+    def _has_child(op: xml.Node, tag: str) -> bool:
+        for child in op.children:
+            if child.tag == tag:
+                return True
+        return False
+
+    def _invalid_dampening(op: xml.Node, dp: ?int) -> bool:
+        """A dampening-period given that is not a non-negative number."""
+        if _on_change_setting(op, "dampening-period") is not None:
+            if dp is not None:
+                return dp < 0
+            return True
+        return False
+
+    def _on_change_setting(op: xml.Node, tag: str) -> ?str:
+        """The text of one <on-change> child, or None when absent."""
+        for child in op.children:
+            if child.tag == "on-change":
+                for setting in child.children:
+                    if setting.tag == tag:
+                        return setting.text if setting.text is not None else ""
+        return None
 
     def handle_rpc(message_id: str, op: xml.Node) -> None:
         """Handle a subscription RPC. Route here when is_subscription_rpc."""
         if op.tag == "establish-subscription":
             params = yp.parse_establish_subscription(op)
             pp = params.periodic_period
-            # Enforce the v1 subset before allocating an id, so unsupported request
-            # shapes fail closed instead of being served as full-tree periodic.
-            if _has_on_change(op):
-                server.send_error(message_id, "operation-not-supported",
-                    "on-change subscriptions are not supported; use a periodic subscription")
+            dp = params.dampening_period
+            # Enforce the supported subset before allocating an id, so unsupported
+            # request shapes fail closed instead of being served as something else.
+            if params.on_change:
+                ds = params.datastore
+                if _has_child(op, "periodic"):
+                    server.send_error(message_id, "invalid-value", "choose periodic or on-change")
+                elif not _operational(ds):
+                    server.send_error(message_id, "operation-not-supported",
+                        "on-change subscriptions serve the operational datastore only")
+                elif _invalid_dampening(op, dp):
+                    server.send_error(message_id, "invalid-value", "invalid dampening-period")
+                elif dp is not None and dp > 0:
+                    server.send_error(message_id, "operation-not-supported",
+                        "<dampening-period> is not supported; changes are sent as they happen")
+                elif _on_change_setting(op, "excluded-change") is not None:
+                    server.send_error(message_id, "operation-not-supported",
+                        "excluded change types are not supported")
+                elif _on_change_setting(op, "sync-on-start") not in [None, "true", "false", "1", "0"]:
+                    server.send_error(message_id, "invalid-value", "invalid sync-on-start boolean")
+                else:
+                    _establish(message_id, SubState(True, params.sync_on_start), None,
+                               params.subtree_filter, params.xpath_filter)
             elif pp is not None:
                 if pp <= 0:
                     server.send_error(message_id, "invalid-value",
@@ -153,18 +366,19 @@ actor TttSubscriptionService(server: Server, cfs: ttt.Layer, schema: yschema.DRo
                     server.send_error(message_id, "invalid-value",
                         "unsupported datastore; this server serves running and operational")
                 else:
-                    _establish(message_id, pp, params.subtree_filter,
-                               params.xpath_filter)
+                    period_s = float(pp) / 100.0
+                    _establish(message_id, SubState(False, False), period_s,
+                               params.subtree_filter, params.xpath_filter)
             else:
                 server.send_error(message_id, "missing-element",
-                    "a periodic <period> is required")
+                    "a periodic <period> or an <on-change> is required")
         elif op.tag == "delete-subscription":
             did = yp.parse_delete_subscription(op)
             ok = False
             if did is not None:
-                if did in active:
+                if did in subs:
                     cfs.remove_subscriptions(_owner_id(did))
-                    active.discard(did)
+                    del subs[did]
                     _log.info("delete-subscription id={did}")
                     ok = True
             if ok:
@@ -176,10 +390,10 @@ actor TttSubscriptionService(server: Server, cfs: ttt.Layer, schema: yschema.DRo
 
     def shutdown() -> None:
         """Release every subscription for this session (call on disconnect) so
-        TTT stops sampling on our behalf."""
-        n = len(active)
-        for sid in active:
+        TTT stops serving on our behalf."""
+        n = len(subs)
+        for sid in subs.keys():
             cfs.remove_subscriptions(_owner_id(sid))
-        active = set()
+        subs = {}
         if n > 0:
             _log.info("stopping all subscriptions (count={n})")

@@ -193,7 +193,7 @@ def CfgError(exception: Exception):
 
 class Path():
     name: str
-    namespace: () -> str
+    namespace: () -> ?str
 
     def __str__(self):
         parts = _format_path(self)
@@ -203,7 +203,7 @@ class PathRoot(Path):
     def __init__(self, name: str):
         self.name = name
     def namespace(self):
-        return ""
+        return None
 
 class PathElem(Path):
     def __init__(self, i: gdata.Id, parent: Path):
@@ -220,6 +220,14 @@ class PathKey(Path):
         self.keyvals = keyvals
     def namespace(self):
         return self.parent.namespace()
+
+def path_chain(p: Path) -> list[Path]:
+    """The path elements from the layer root down to p."""
+    if isinstance(p, PathElem):
+        return path_chain(p.parent) + [p]
+    elif isinstance(p, PathKey):
+        return path_chain(p.parent) + [p]
+    return [p]
 
 def _format_path(p: Path):
     if isinstance(p, PathElem):
@@ -272,6 +280,15 @@ def make_rooted(p: Path, tree: gdata.Node):
     else:
         return tree
 
+def spine(p: Path, tree: gdata.Node) -> gdata.Node:
+    """The tree from the top down to tree at p: make_rooted, with every node
+    on the way stamped as its node stamps it."""
+    if isinstance(p, PathKey):
+        return spine(p.parent, gdata.List(list(p.keyvals.keys()), [_with_path_keys(p, tree)], ns=p.parent.namespace()))
+    elif isinstance(p, PathElem):
+        return spine(p.parent, gdata.Container({gdata.Id(p.ns, p.name): tree}, ns=p.parent.namespace()))
+    return tree
+
 def _with_path_keys(p: Path, tree: gdata.Node) -> gdata.Node:
     if isinstance(p, PathKey) and isinstance(tree, gdata.Container):
         children = dict(tree.children.items())
@@ -294,6 +311,18 @@ def root_filter(filt: ?gdata.FNode) -> ?gdata.FNode:
     if filt is not None and filt.name is not None:
         return gdata.FNode(children=[filt])
     return filt
+
+def _keys_only(f: gdata.FNode, keys: dict[gdata.Id, gdata.Node]) -> bool:
+    """Whether a filter selects nothing but list keys. One that selects
+    nothing at all selects everything, so it is not that."""
+    sel = gdata.filter_selection_children(f)
+    for c in sel:
+        n = c.name
+        if n is not None:
+            if n in keys:
+                continue
+        return False
+    return len(sel) > 0
 
 def routed_filter(filt: ?gdata.FNode) -> ?gdata.FNode:
     """Adapt a routed child filter to the node that already matched it.
@@ -449,29 +478,35 @@ def exact_list_filter_branches(filters: list[gdata.FNode], key_names: list[gdata
 def _delay(period: u64) -> float:
     return float(period) / 1000000000.0
 
+def _union(specs: list[gdata.SubscriptionSpec]) -> ?gdata.FNode:
+    """One filter for the specs: the union of their filters, or None for
+    everything, which a filter that names nothing, or no filter, is."""
+    branches: list[gdata.FNode] = []
+    for spec in specs:
+        f = root_filter(spec.filt)
+        if f is not None and len(f.children) > 0:
+            branches.extend(f.children)
+        else:
+            return None
+    return gdata.FNode(children=gdata.filter_merge_list(branches))
+
 def fold(want: set[gdata.SubscriptionSpec]) -> dict[u64, ?gdata.FNode]:
     """One filter per period: the union of the filters a consumer declared
-    with that period, so one read serves them all. A filter that names
-    nothing, or no filter, is everything."""
-    branches: dict[u64, list[gdata.FNode]] = {}
-    whole: set[u64] = set()
+    with that period, so one read serves them all."""
+    by_period: dict[u64, list[gdata.SubscriptionSpec]] = {}
     for spec in want:
         period = spec.period
         if period is not None:
-            if period not in branches:
-                branches[period] = []
-            f = root_filter(spec.filt)
-            if f is not None and len(f.children) > 0:
-                branches[period].extend(f.children)
-            else:
-                whole.add(period)
-    folded: dict[u64, ?gdata.FNode] = {}
-    for period, bs in branches.items():
-        if period in whole:
-            folded[period] = None
-        else:
-            folded[period] = gdata.FNode(children=gdata.filter_merge_list(bs))
-    return folded
+            if period not in by_period:
+                by_period[period] = []
+            by_period[period].append(spec)
+    return {period: _union(specs) for period, specs in by_period.items()}
+
+def fold_on_change(want: set[gdata.SubscriptionSpec]) -> (bool, ?gdata.FNode):
+    """Whether the consumer declared a spec without a period, and the one
+    filter those specs fold into."""
+    specs = [spec for spec in want if spec.period is None]
+    return (len(specs) > 0, _union(specs))
 
 
 class Read(object):
@@ -492,34 +527,140 @@ class Read(object):
         self.active = True
 
 
+##################### Routes and shadows #####################
+
+class OperListSubscription():
+    """One subscription at a list: which elements it selects, by exact key
+    or by a filter over all of them."""
+    sub: Subscription
+    select: ?dict[str, list[gdata.FNode]]
+    scan: list[gdata.FNode]
+
+    def __init__(self, sub: Subscription, select: ?dict[str, list[gdata.FNode]], scan: list[gdata.FNode]):
+        self.sub = sub
+        self.select = select
+        self.scan = scan
+
+    def selects(self, k: str) -> ?list[gdata.FNode]:
+        """The filters for element k, or nothing when it is not selected."""
+        select = self.select
+        if select is not None:
+            return select.get(k)
+        return self.scan
+
+    def members(self, elems: dict[str, Node]) -> list[(str, list[gdata.FNode])]:
+        """The elements this subscription selects among elems, with their filters:
+        its exact keys when it has them, else all of them."""
+        select = self.select
+        if select is not None:
+            return [(k, filts) for k, filts in select.items() if k in elems]
+        return [(k, self.scan) for k in elems.keys()]
+
+
+class OperSubscription():
+    """One subscription at a producer: where to push, what to select, and
+    what was last sent so an unchanged slice is not resent. A new slice
+    is a new record."""
+    sub: Subscription
+    filts: list[gdata.FNode]
+    last: ?gdata.Node
+
+    def __init__(self, sub: Subscription, filts: list[gdata.FNode], last: ?gdata.Node):
+        self.sub = sub
+        self.filts = filts
+        self.last = last
+
+def _shadow_key(p: Path) -> str:
+    return "{p.ns}:{p.name}" if isinstance(p, PathElem) else p.name
+
+class Shadow(object):
+    """A node of the subscriber's shadow of the tree: a copy of the part of
+    the layer's tree the subscription asked for, built from the latest
+    slice each producer under it pushed on change, and kept in step with
+    the tree by those pushes. It is a cache. built holds a producer's
+    latest slice at a leaf, or the children joined at an inner node,
+    remembered until a push below it changes it, so a push rebuilds the
+    nodes on its own path and every other subtree is shared by reference.
+    It is mutable on purpose: a value would copy every child of every node
+    on the path per push.
+    """
+    path: Path
+    kids: dict[str, Shadow]
+    built: ?gdata.Node
+
+    def __init__(self, path: Path, built: ?gdata.Node=None):
+        self.path = path
+        self.kids = {}
+        self.built = built
+
+    def build(self) -> gdata.Node:
+        built = self.built
+        if built is not None:
+            return built
+        joined = self._join()
+        self.built = joined
+        return joined
+
+    def _join(self) -> gdata.Node:
+        p = self.path
+        ns = p.namespace()
+        for kid in self.kids.values():
+            kp = kid.path
+            if isinstance(kp, PathKey):             # the children are entries: this is a list
+                return gdata.List(list(kp.keyvals.keys()), [k.build() for k in self.kids.values()], ns=ns)
+        children = dict(p.keyvals.items()) if isinstance(p, PathKey) else {}
+        for kid in self.kids.values():
+            kp = kid.path
+            if isinstance(kp, PathElem):
+                children[gdata.Id(kp.ns, kp.name)] = kid.build()
+        return gdata.Container(children, ns=ns)
+
+
 actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) -> None, point: list[gdata.Id]):
     """One consumer's subscriptions, served outside the Layer actor.
 
-    The consumer's filters fold into one read per period. Each read runs
-    on its period, and every delivery is the reads' latest trees merged
-    into one view, sent straight to the consumer. synced is called once per
-    declaration, when every read has run once.
+    The consumer's periodic filters fold into one read per period, and its
+    on-change filters into one subscription in the tree. Each read runs on
+    its period. The subscription is laid by a walk from here: every node answers
+    with its path, its oper slice if it is a producer, and the children to
+    continue with, and the answers become a shadow of the subscribed part
+    of the tree. After the walk every producer under the subscription pushes its
+    slice here as it changes, and the shadow is rebuilt along the changed
+    path with everything else shared by reference. Every delivery is the
+    reads' latest trees and the shadow merged into one view, sent straight
+    to the consumer, and a consumer that asked for it gets each change alone
+    first, as the path of the node that changed with what it held before
+    and after. synced is called once per declaration, when every read has
+    run once and the subscription has been laid.
 
     Rooted at a point, a path of node names from the top, the consumer
     gets the instances of that node instead of one view: after each read,
     every instance that differs from the last read, as a tree from the top
     down to that one instance, and every instance gone, as that tree with
-    an Absent holding its keys where the entry was.
+    an Absent holding its keys where the entry was. On-change, a change
+    delivers the instances it touched the same way.
 
-    The reads and the waiting happen here, never in the Layer actor that
-    runs transactions.
+    The reads, the walk and the waiting happen here, never in the Layer
+    actor that runs transactions.
     """
     var reads: dict[u64, Read] = {}
+    var shadow: ?Shadow = None                  # what the subscription holds of the tree
+    var sub_id = ""                             # the subscription's name in the tree, "" when there is none
+    var change_filt: ?gdata.FNode = None        # the subscription's folded filter
+    var subs = 0
     var cb = cb0
+    var delta: ?proc(Path, ?gdata.Node, ?gdata.Node) -> None = None
     var synced: ?action(str) -> None = None
     var owed = False                            # a synced for the current declaration
     var active = True
 
-    def declare(want: set[gdata.SubscriptionSpec], cb1: proc(?gdata.Node, ?Exception) -> None, synced1: ?action(str) -> None):
+    def declare(want: set[gdata.SubscriptionSpec], cb1: proc(?gdata.Node, ?Exception) -> None, synced1: ?action(str) -> None, delta1: ?proc(Path, ?gdata.Node, ?gdata.Node) -> None):
         """Replace the want set: reads no longer wanted stop, changed ones
-        start over, unchanged ones keep their latest tree."""
+        start over, unchanged ones keep their latest tree. The subscription
+        is laid again only when its filter changed."""
         cb = cb1
         synced = synced1
+        delta = delta1
         folded = fold(want)
         dropped = False
         for period in list(reads.keys()):
@@ -541,6 +682,16 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
                     fresh.held = old.held       # so the next read reports only what changed
                 reads[period] = fresh
                 _read(fresh, period)
+        (on_change, cfilt) = fold_on_change(want)
+        if sub_id != "":
+            if not on_change:
+                _unsubscribe()
+                dropped = True
+            elif change_filt != cfilt:
+                _unsubscribe()
+                _subscribe(cfilt)
+        elif on_change:
+            _subscribe(cfilt)
         if dropped and len(point) == 0:
             _deliver(None)                      # the narrowed view
         owed = True
@@ -577,10 +728,10 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
         r.held = now
 
     def _deliver(err: ?Exception):
-        """The reads' latest trees as one view, by reference for one read."""
+        """The reads' latest trees and the shadow as one view, by reference
+        when there is one."""
         merged: ?gdata.Node = None
-        for period in sorted(reads.keys()):
-            t = reads[period].latest
+        for t in [reads[period].latest for period in sorted(reads.keys())] + [_tree()]:
             if t is not None:
                 m = merged
                 if m is not None:
@@ -601,7 +752,200 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
 
     def stop():
         active = False
+        _unsubscribe()
 
+    # The subscription in the tree
+
+    def _subscribe(f: ?gdata.FNode):
+        """Lay the subscription below node; the walk's result is the baseline."""
+        change_filt = f
+        sub_id = actorid() + ":" + str(subs)
+        subs += 1
+        filts: list[gdata.FNode] = []
+        if f is not None:
+            filts = [f]
+        try:
+            shadow = _walk(node, filts)
+        except Exception as e:
+            _failed(e)
+            return
+        if len(point) == 0:
+            _deliver(None)
+        else:
+            for i in gdata.instances(_tree(), point):
+                cb(i.1, None)
+
+    def _unsubscribe():
+        """Take the subscription out of the tree. The tree hears this after any
+        walk still in progress, so it undoes all that the walk laid."""
+        if sub_id != "":
+            node.unsubscribe_oper(sub_id)
+            shadow = None
+            sub_id = ""
+
+    def _failed(e: Exception):
+        """The subscription cannot be served: report it once and drop it."""
+        _unsubscribe()
+        if len(point) == 0:
+            _deliver(e)
+        else:
+            cb(None, e)
+
+    def fail(r: str, e: Exception):
+        """A producer could not serve the subscription."""
+        if active and r == sub_id:
+            _failed(e)
+
+    def update(r: str, path: Path, slice: ?gdata.Node):
+        """A producer under the subscription pushed its slice, or cleared it."""
+        if active and r == sub_id:
+            if slice is not None:
+                _graft(Shadow(path, slice))
+            else:
+                gone = _remove(path)
+                if gone is not None:
+                    _changed(gone.path, gone.build(), None)
+
+    def attach(r: str, at: Node, filts: list[gdata.FNode]):
+        """A list element committed after the walk joins the subscription."""
+        if active and r == sub_id:
+            try:
+                m = _walk(at, filts)
+                if m is not None:
+                    _graft(m)
+            except Exception as e:
+                _failed(e)
+
+    def _graft(m: Shadow):
+        """Put m at its path in place of what was there, and deliver the change."""
+        before = _built(_at(m.path))
+        _place(m)
+        _changed(m.path, before, m.build())
+
+    def _changed(path: Path, before: ?gdata.Node, now: ?gdata.Node):
+        """Deliver a change at path: the change alone to a consumer that
+        asked for it, then the view or, rooted, each instance of the point
+        that the change touched."""
+        if len(point) == 0:
+            d = delta
+            if d is not None:
+                d(path, before, now)
+            _deliver(None)
+        else:
+            try:
+                _changed_rooted(path, before)
+            except Exception as e:
+                cb(None, e)
+
+    def _changed_rooted(path: Path, before: ?gdata.Node):
+        """The instances of the point that a change at path left different,
+        and those it left gone: the change lies in one instance, or holds
+        several."""
+        ip = _instance_path(path)
+        was: dict[str, (gdata.Node, gdata.Node)] = {}
+        if before is not None:
+            for i in gdata.instances(spine(path, before), point):
+                was[i.0] = (i.1, i.2)
+        present: set[str] = set()
+        now = _built(_at(ip))
+        if now is not None:
+            for i in gdata.instances(spine(ip, now), point):
+                present.add(i.0)
+                if i.0 not in was or was[i.0].1 != i.2:
+                    cb(i.1, None)
+        for k, w in was.items():
+            if k not in present:
+                cb(gdata.gone(w.0, point), None)
+
+    def _instance_path(path: Path) -> Path:
+        """The path a change at path is delivered under: the instance of the
+        point it lies in, else path itself, at or above the point or outside."""
+        chain = path_chain(path)
+        i = 0
+        for j in range(1, len(chain)):
+            p = chain[j]
+            if i == len(point):                     # below the point's node
+                return p if isinstance(p, PathKey) else chain[j - 1]
+            if isinstance(p, PathElem):
+                if gdata.Id(p.ns, p.name) != point[i]:
+                    break
+                i += 1
+        return path
+
+    def _at(path: Path) -> ?Shadow:
+        """The shadow node at path, if there is one."""
+        down = _down(path, False)
+        if len(down) > 0:
+            return down[len(down) - 1]
+        return None
+
+    def _built(m: ?Shadow) -> ?gdata.Node:
+        if m is not None:
+            return m.build()
+        return None
+
+    def _tree() -> ?gdata.Node:
+        return _built(shadow)
+
+    def _walk(at: Node, filts: list[gdata.FNode]) -> ?Shadow:
+        (path, slice, below) = at.subscribe_oper(sub_id, self, filts)
+        m = Shadow(path, slice)
+        for hop in below:
+            kid = _walk(hop.0, hop.1)
+            if kid is not None:
+                m.kids[_shadow_key(kid.path)] = kid
+        return m if slice is not None or len(m.kids) > 0 else None
+
+    def _down(path: Path, create: bool) -> list[Shadow]:
+        """The shadow nodes from the root down to path, made on the way with
+        create, else empty when one is missing."""
+        chain = path_chain(path)
+        root = Shadow(chain[0])
+        s = shadow
+        if s is not None:
+            root = s
+        elif not create:
+            return []
+        shadow = root
+        down = [root]
+        for p in chain[1:]:
+            at = down[len(down) - 1]
+            k = _shadow_key(p)
+            if k not in at.kids:
+                if not create:
+                    return []
+                at.kids[k] = Shadow(p)
+            down.append(at.kids[k])
+        return down
+
+    def _place(m: Shadow):
+        """Put m at its path, making the way down to it, in place of what was there."""
+        chain = path_chain(m.path)
+        if len(chain) == 1:
+            shadow = m
+        else:
+            down = _down(chain[len(chain) - 2], True)
+            for a in down:
+                a.built = None
+            down[len(down) - 1].kids[_shadow_key(m.path)] = m
+
+    def _remove(path: Path) -> ?Shadow:
+        """Drop the node at path and every ancestor it leaves empty. Return the
+        topmost node dropped, still holding what it held, or nothing when there
+        was nothing at path."""
+        down = _down(path, False)
+        if len(down) == 0:
+            return None
+        i = len(down) - 1
+        while i > 0 and len(down[i - 1].kids) == 1:
+            i -= 1
+        if i == 0:
+            shadow = None
+        else:
+            del down[i - 1].kids[_shadow_key(down[i].path)]
+            for a in down[0:i]:
+                a.built = None
+        return down[i]
 
 def _db_path(path: Path) -> list[value]:
     if isinstance(path, PathElem):
@@ -652,6 +996,26 @@ actor Node(impl: _Node):
     def get_data(filt: ?gdata.FNode=None):
         return impl.get_data(filt)
 
+    def subscribe_oper(sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
+        """Subscribe `sub` to the oper below this node, one step of the way
+        down. This is telemetry, apart from the link subscriptions that carry
+        config between transforms: nothing here is transactional or waits.
+
+        `sub_id` names the subscription in the tree. The subscriber's actor
+        lays it with a walk that calls this on the root and then on each
+        child answered, the way a read carries a filter down with get_data. A
+        container or list transposes `filts` into one filter per child and
+        answers the children they select; a list also keeps the subscription,
+        so an entry that commits later joins it. A transform keeps it and
+        `sub`, so its later update_oper pushes reach the subscriber, and
+        answers its oper slice. The answer is this node's path, that slice,
+        and the children to continue with, each with its filters."""
+        return impl.subscribe_oper(sub_id, sub, filts)
+
+    def unsubscribe_oper(sub_id: str):
+        """Take an oper subscription out of this node and everything below it."""
+        impl.unsubscribe_oper(sub_id)
+
     def bind_db(db: ?swdb.Store):
         """Attach DB handle to this node (and its children)
 
@@ -673,6 +1037,12 @@ class _Node(object):
     get: proc() -> gdata.Node
     def get_data(self, filt: ?gdata.FNode=None) -> ?gdata.Node:
         return gdata.filter(self.get(), filt)
+    def subscribe_oper(self, sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
+        """A node with no producer and no children below it: nothing to
+        answer, nothing to continue with."""
+        return (self.path, None, [])
+    def unsubscribe_oper(self, sub_id: str) -> None:
+        pass
     def bind_db(self, db: ?swdb.Store) -> None:
         pass
     restore_from_db: proc(swdb.Reader, swdb.KeyCodec, RestoreWindow, action(?Exception) -> None) -> None
@@ -709,6 +1079,12 @@ actor Transaction(impl: _Transaction):
     def get_data(filt: ?gdata.FNode=None):
         return impl.get_data(filt)
 
+    def subscribe_oper(sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
+        return impl.subscribe_oper(sub_id, sub, filts)
+
+    def unsubscribe_oper(sub_id: str):
+        impl.unsubscribe_oper(sub_id)
+
     def bind_db(db: ?swdb.Store):
         impl.bind_db(db)
 
@@ -740,6 +1116,12 @@ class _Transaction(object):
     get: proc() -> gdata.Node
     def get_data(self, filt: ?gdata.FNode=None) -> ?gdata.Node:
         return gdata.filter(self.get(), filt)
+
+    proc def subscribe_oper(self, sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
+        return (self.path, None, [])
+
+    proc def unsubscribe_oper(self, sub_id: str) -> None:
+        pass
 
     def bind_db(self, db: ?swdb.Store) -> None:
         pass
@@ -884,39 +1266,46 @@ actor Layer(name: str, rootgen: proc(Path, ?Layer)->Node, lower: ?Layer, db_arg:
     def tree_provider() -> gdata.TreeProvider:
         return LayerTreeProvider(self)
 
-    def declare_subscriptions(owner_id: str, cb: proc(?gdata.Node, ?Exception) -> None, want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None):
+    def declare_subscriptions(owner_id: str, cb: proc(?gdata.Node, ?Exception) -> None, want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None, delta: ?proc(Path, ?gdata.Node, ?gdata.Node) -> None=None):
         """Replace one consumer's want set. A Subscription actor of the
         consumer's own serves it and calls `synced` with the owner id once
-        every read of the declaration has run. A layer serves periodic
-        specs. Specs rooted at a node share one root, and one period."""
+        every read of the declaration has run. A spec with a period is
+        read on that period. A spec without one is served on-change: the
+        operational state under its filter reaches the consumer as the
+        transforms publish it with update_oper, and a consumer that gives
+        `delta` also gets each change alone, as the path of the node that
+        changed with what it held before and after. Specs rooted at a node
+        share one root, and are read on one period or served on-change."""
         point: list[gdata.Id] = []
         root_of: ?gdata.FNode = None
         first = True
         try:
             for spec in want:
-                if spec.period is None:
-                    raise ValueError("TTT layer TreeProvider only supports periodic subscriptions")
                 if first:
                     root_of = spec.root
                     first = False
                 elif root_of != spec.root:
                     raise ValueError("a consumer's filters share one root")
             point = gdata.root_names(root_of)
-            if len(point) > 0 and len(fold(want)) > 1:
-                raise ValueError("a rooted destination is read on one period")
+            if len(point) > 0:
+                ways = len(fold(want))
+                if fold_on_change(want).0:
+                    ways += 1
+                if ways > 1:
+                    raise ValueError("a rooted destination is read on one period or served on-change")
         except Exception as e:
             cb(None, e)
             return
         sub = subscribers.get(owner_id)
         if sub is not None:
             if roots[owner_id] == root_of:
-                sub.declare(want, cb, synced)
+                sub.declare(want, cb, synced, delta)
                 return
             sub.stop()                              # a new root is a new actor
         fresh = Subscription(owner_id, root, cb, point)
         subscribers[owner_id] = fresh
         roots[owner_id] = root_of
-        fresh.declare(want, cb, synced)
+        fresh.declare(want, cb, synced, delta)
 
     def remove_subscriptions(owner_id: str):
         """Drop a consumer and stop its reads."""
@@ -1217,6 +1606,49 @@ class _Container(_Node):
             return None
         return gdata.Container(res, ns=self.ns, module=self.module)
 
+    def subscribe_oper(self, sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
+        """Transpose the filters into one per child and answer the children
+        they select. A predicate on one of this entry's keys is decided here;
+        any other predicate at this level would span producers, so it is
+        refused."""
+        path = self.path
+        keys = path_key_data(path)
+        branches: dict[gdata.Id, list[gdata.FNode]] = {}
+        whole = len(filts) == 0
+        for f in filts:
+            preds: list[gdata.FNode] = []
+            rest: list[gdata.FNode] = []
+            for c in f.children:
+                n = c.name
+                if n is not None and n in keys.children and c.value_match is not None:
+                    preds.append(c)
+                elif c.value_match is not None:
+                    raise ValueError("a content predicate at {_format_path(path)} would span producers; put it under one transform")
+                else:
+                    rest.append(c)
+            if len(preds) > 0 and gdata.filter(keys, gdata.FNode(children=preds)) is None:
+                continue                                    # this alternative does not select this entry
+            b = filter_transpose(gdata.FNode(children=rest))
+            if b is not None:
+                for tag, cf in b.items():
+                    if tag in branches:
+                        branches[tag].append(cf)
+                    else:
+                        branches[tag] = [cf]
+            else:
+                whole = True
+        below: list[(Node, list[gdata.FNode])] = []
+        for tag, node in self.elems.items():
+            if whole:
+                below.append((node, []))
+            elif tag in branches:
+                below.append((node, branches[tag]))
+        return (self.path, None, below)
+
+    def unsubscribe_oper(self, sub_id: str) -> None:
+        for node in self.elems.values():
+            node.unsubscribe_oper(sub_id)
+
     def bind_db(self, db: ?swdb.Store) -> None:
         for node in self.elems.values():
             node.bind_db(db)
@@ -1466,6 +1898,20 @@ class _List(_Node):
             return None
         return gdata.List(self.key_names, res, ns=self.ns, module=self.module)
 
+    def subscribe_oper(self, sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
+        """Select the entries by exact key when every filter names one, else
+        every entry with the filters over all of them, and hand the
+        subscription to the list state, so an entry that commits later joins it."""
+        alts: list[gdata.FNode] = []
+        for f in filts:
+            alts += list_filters(f)
+        select = exact_list_filter_branches(alts, self.key_names)
+        scan = list_element_filters(alts)
+        return (self.path, None, self.liststate.subscribe_oper(sub_id, sub, select, scan))
+
+    def unsubscribe_oper(self, sub_id: str) -> None:
+        self.liststate.unsubscribe_oper(sub_id)
+
     def bind_db(self, db: ?swdb.Store) -> None:
         self.liststate.bind_db(db)
 
@@ -1557,11 +2003,33 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, ns: ?str, module: ?s
     var active = {}
     var provisional = set()
     var db = None
+    var oper_subscriptions: dict[str, OperListSubscription] = {}
 
     def bind_db(db1: ?swdb.Store) -> None:
         db = db1
         for node in elems.values():
             node.bind_db(db1)
+
+    def subscribe_oper(sub_id: str, sub: Subscription, select: ?dict[str, list[gdata.FNode]], scan: list[gdata.FNode]) -> list[(Node, list[gdata.FNode])]:
+        """Remember an oper subscription so that elements committed later join
+        it, and answer the committed elements it selects now."""
+        o = OperListSubscription(sub, select, scan)
+        oper_subscriptions[sub_id] = o
+        return [(elems[m.0], m.1) for m in o.members(elems) if m.0 not in provisional]
+
+    def unsubscribe_oper(sub_id: str):
+        if sub_id in oper_subscriptions:
+            o = oper_subscriptions[sub_id]
+            del oper_subscriptions[sub_id]
+            for m in o.members(elems):
+                elems[m.0].unsubscribe_oper(sub_id)
+
+    def _attach(k: str):
+        """Subscribe a committed element to every oper subscription that selects it."""
+        for sid, o in oper_subscriptions.items():
+            filts = o.selects(k)
+            if filts is not None:
+                o.sub.attach(sid, elems[k], filts)
 
     def acquire(tid: str, keys: ?dict[str, dict[gdata.Id, gdata.Leaf]], full: ?set[str]) -> dict[str, Node]:
         if keys is not None:
@@ -1593,6 +2061,10 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, ns: ?str, module: ?s
     def release(tid: str, ok: bool, deletes: set[str]):
         #print('====', tid, path, 'release', ok, 'deletes:', deletes, 'provisional:', provisional, err=True)
         if ok:
+            # An element joins the oper subscriptions when it is committed, not
+            # when it is created: a provisional element is not part of running.
+            for k in active[tid] & provisional:
+                _attach(k)
             provisional -= active[tid]
             provisional |= deletes
         del active[tid]
@@ -1641,6 +2113,7 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, ns: ?str, module: ?s
         node = template(PathKey(key, path, leaves), lower)
         node.bind_db(db)
         elems[key] = node
+        _attach(key)
         return node
 
 class _ListTransaction(_Transaction):
@@ -1979,6 +2452,12 @@ class _TransformBase(_Node):
     def get_data(self, filt: ?gdata.FNode=None):
         return self.transaction.get_data(filt)
 
+    def subscribe_oper(self, sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
+        return self.transaction.subscribe_oper(sub_id, sub, filts)
+
+    def unsubscribe_oper(self, sub_id: str) -> None:
+        self.transaction.unsubscribe_oper(sub_id)
+
     def bind_db(self, db: ?swdb.Store) -> None:
         self.transaction.bind_db(db)
 
@@ -2016,6 +2495,7 @@ class _TransformTransactionBase(_Transaction):
 
     me: str
     db: ?swdb.Store
+    oper_subscriptions: dict[str, OperSubscription]          # Telemetry: on-change subscribers served with this node's oper
 
     compute : proc(tid: str, merged: gdata.Node, linked: gdata.Node, out: ?Session) -> (gdata.Node, ?gdata.Node)
     clear : proc(tid: str, out: ?Session) -> None
@@ -2035,6 +2515,7 @@ class _TransformTransactionBase(_Transaction):
         self.oper = None
         self.locker = None
         self.pending = []
+        self.oper_subscriptions = {}
         self.linked = gdata.Container()
         self.candidate_link_updates = {}
         self.subscriptions = []
@@ -2305,8 +2786,62 @@ class _TransformTransactionBase(_Transaction):
             return _with_path_keys(self.path, filtered)
         return None
 
+    def _slice(self, filts: list[gdata.FNode]) -> ?gdata.Node:
+        """This node's oper with its keys, narrowed to the union of the
+        filters that match, or all of it when there is no filter. A filter
+        that selects nothing but keys selects no oper."""
+        oper = self.oper
+        if oper is not None:
+            path = self.path
+            keyed = _with_path_keys(path, oper)
+            if len(filts) == 0:
+                return keyed
+            out: ?gdata.Node = None
+            for f in filts:
+                if not _keys_only(f, path_key_data(path).children):
+                    r = gdata.filter(keyed, f)
+                    if r is not None:
+                        o = out
+                        if o is not None:
+                            out = gdata.merge(o, r)
+                        else:
+                            out = r
+            if out is not None:
+                return _with_path_keys(path, out)
+        return None
+
+    proc def subscribe_oper(self, sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
+        """Keep the subscription and its filters, so every later update_oper
+        pushes the subscriber the slice they select, and answer that slice
+        now. An oper subscription is telemetry, apart from the link
+        subscriptions that carry config between transforms."""
+        fs = [routed_filter(f)! for f in filts]
+        o = OperSubscription(sub, fs, self._slice(fs))
+        self.oper_subscriptions[sub_id] = o
+        return (self.path, o.last, [])
+
+    proc def unsubscribe_oper(self, sub_id: str) -> None:
+        if sub_id in self.oper_subscriptions:
+            del self.oper_subscriptions[sub_id]
+
     proc def update_oper(self, oper):
+        """Replace this node's oper and push each oper subscription the slice it selects,
+        when that changed. TTT never clears the oper by itself: a transform
+        actor whose config went away does that from its shutdown, with None."""
         self.oper = oper
+        sent: list[(str, OperSubscription)] = []
+        for sid, o in self.oper_subscriptions.items():
+            s: ?gdata.Node = None
+            try:
+                s = self._slice(o.filts)
+            except Exception as e:
+                o.sub.fail(sid, e)
+                continue
+            if s != o.last:
+                sent.append((sid, OperSubscription(o.sub, o.filts, s)))
+                o.sub.update(sid, self.path, s)
+        for sid, o in sent:
+            self.oper_subscriptions[sid] = o
 
 class TransformActorParams:
     def __init__(self, path: Path, update_dynstate: action(?gdata.Node) -> None, update_oper: action(?gdata.Node) -> None, dev: ?swdev.DeviceMgr, lower: ?Layer=None):

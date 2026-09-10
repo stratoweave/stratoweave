@@ -1,0 +1,409 @@
+"""Operational on-change delivery and replay over the northbound NETCONF pipe."""
+
+import logging
+import testing
+import std.xml as xml
+
+import netconf
+import netconf_server
+import ttt
+import yang
+import yang.gdata as gdata
+import yang.xml as yxml
+import yang.ypatch as ypatch
+import yp
+import yp_ttt
+
+
+NS = "urn:test-telemetry"
+MODEL = r"""module telemetry {
+  yang-version "1.1";
+  namespace "urn:test-telemetry";
+  prefix t;
+  list device {
+    key name;
+    leaf name { type string; }
+    leaf target { type string; }
+    container state {
+      config false;
+      leaf status { type string; }
+      leaf extra { type string; }
+    }
+  }
+  leaf-list labels { config false; type string; }
+}"""
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id(NS, name)
+
+
+def _oper(status: str, extra: bool=False) -> gdata.Node:
+    children: dict[gdata.Id, gdata.Node] = {q("status"): gdata.Leaf(status)}
+    if extra:
+        children[q("extra")] = gdata.Leaf("old")
+    return gdata.Container({q("state"): gdata.Container(children)})
+
+
+def _entry(name: str, status: str, extra: bool=False) -> gdata.Node:
+    children = dict(_oper(status, extra).children.items())
+    children[q("name")] = gdata.Leaf(name)
+    return gdata.Container(children)
+
+
+def _test_change_edits_replace_keyed_subtree():
+    schema = yang.compile([MODEL])
+    path = ttt.PathKey("a/b,=", ttt.PathElem(q("device"), ttt.PathRoot("top")),
+                       {q("name"): gdata.Leaf("a/b,=")})
+    first = yp_ttt.change_edits(schema, path, None, _entry("a/b,=", "one", True))
+    testing.assertEqual(len(first), 1)
+    testing.assertEqual(first[0].target, "/telemetry:device=a%2Fb%2C%3D")
+    testing.assertEqual(first[0].operation, ypatch.OP_REPLACE)
+    current = gdata.patch(None, ypatch.edit_to_gdata(schema, first[0]))
+    second = yp_ttt.change_edits(schema, path, _entry("a/b,=", "one", True), _entry("a/b,=", "two"))
+    current = gdata.patch(current, ypatch.edit_to_gdata(schema, second[0]))
+    state = current!.get_list(q("device")).elements[0].children[q("state")]
+    testing.assertEqual(state.get_str(q("status")), "two")
+    testing.assertTrue(state.get_opt_str(q("extra")) is None)
+    removed = yp_ttt.change_edits(schema, path, _entry("a/b,=", "two"), None)
+    testing.assertEqual(removed[0].operation, ypatch.OP_REMOVE)
+    testing.assertTrue(removed[0].value is None)
+
+
+def _test_change_edits_root_list_instances():
+    schema = yang.compile([MODEL])
+    old = gdata.Container({q("device"): gdata.List([q("name")], [
+        _entry("a", "one"), _entry("b", "two"),
+    ])})
+    new = gdata.Container({q("device"): gdata.List([q("name")], [
+        _entry("b", "three"), _entry("c", "four"),
+    ])})
+    edits = yp_ttt.change_edits(schema, ttt.PathRoot("top"), old, new)
+    testing.assertEqual({e.target: e.operation for e in edits}, {
+        "/telemetry:device=a": ypatch.OP_REMOVE,
+        "/telemetry:device=b": ypatch.OP_REPLACE,
+        "/telemetry:device=c": ypatch.OP_REPLACE,
+    })
+
+
+def _test_oper_contents_snapshot_namespaces():
+    schema = yang.compile([MODEL])
+    tree = gdata.Container({q("device"): gdata.List([q("name")], [_entry("a", "up")])})
+    data = xml.Node("data", children=yp_ttt.oper_contents(tree))
+    parsed = yxml.from_xml(schema, xml.decode(data.encode()))
+    entry = parsed.get_list(q("device")).elements[0]
+    testing.assertEqual(entry.get_str(q("name")), "a")
+    testing.assertEqual(entry.children[q("state")].get_str(q("status")), "up")
+
+
+def _test_change_edits_root_leaf_list():
+    schema = yang.compile([MODEL])
+    old = gdata.Container({q("labels"): gdata.LeafList([
+        gdata.LeafListEntryMerge("a/b"), gdata.LeafListEntryMerge("b"),
+    ])})
+    new = gdata.Container({q("labels"): gdata.LeafList([
+        gdata.LeafListEntryMerge("b"), gdata.LeafListEntryMerge("c"),
+    ])})
+    edits = yp_ttt.change_edits(schema, ttt.PathRoot("top"), old, new)
+    current: ?gdata.Node = old
+    for edit in edits:
+        current = gdata.patch(current, ypatch.edit_to_gdata(schema, edit))
+    testing.assertEqual(set(current!.get_strs(q("labels"))), {"b", "c"})
+
+
+def _test_change_edits_preserve_user_order():
+    model = MODEL.replace("key name;", "key name; ordered-by user;").replace(
+        r"leaf-list labels { config false;", r"leaf-list labels { config false; ordered-by user;")
+    schema = yang.compile([model])
+    old = gdata.Container({
+        q("device"): gdata.List([q("name")], [_entry("a", "up"), _entry("b", "up")], user_order=True),
+        q("labels"): gdata.LeafList([gdata.LeafListEntryMerge("a"), gdata.LeafListEntryMerge("b")], user_order=True),
+    })
+    new = gdata.Container({
+        q("device"): gdata.List([q("name")], [_entry("b", "up"), _entry("a", "up")], user_order=True),
+        q("labels"): gdata.LeafList([gdata.LeafListEntryMerge("b"), gdata.LeafListEntryMerge("a")], user_order=True),
+    })
+    current: ?gdata.Node = old
+    for edit in yp_ttt.change_edits(schema, ttt.PathRoot("top"), old, new):
+        current = gdata.patch(current, ypatch.edit_to_gdata(schema, edit))
+    testing.assertEqual([e.get_str(q("name")) for e in current!.get_list(q("device")).elements], ["b", "a"])
+    testing.assertEqual(current!.get_strs(q("labels")), ["b", "a"])
+
+
+def _test_change_edits_reject_top_level_keyless_list():
+    schema = yang.compile([MODEL])
+    tree = gdata.Container({q("device"): gdata.List([], [_oper("one"), _oper("two")])})
+    try:
+        yp_ttt.change_edits(schema, ttt.PathRoot("top"), None, tree)
+    except ValueError:
+        return
+    testing.assertTrue(False)
+
+
+class _Transform(ttt.TransformFunction):
+    def transform_wrapper(self, cfg: gdata.Node, linked: gdata.Node,
+                          memory: ?gdata.Node, dynstate: ?gdata.Node):
+        return gdata.Container(), None
+
+
+actor _Source():
+    var publishers: dict[str, action(?gdata.Node) -> None] = {}
+
+    def attach(name: str, publish: action(?gdata.Node) -> None):
+        publishers[name] = publish
+
+    def publish(name: str, status: ?str, extra: bool=False):
+        publishers[name](_oper(status, extra) if status is not None else None)
+
+
+actor _Publisher(source: _Source, params: ttt.TransformActorParams):
+    def on_conf(cfg: gdata.Node, memory: ?gdata.Node):
+        source.attach(cfg.get_str(q("name")), params.update_oper)
+
+    def shutdown(memory: ?gdata.Node):
+        params.update_oper(None)
+
+
+def _publisher(source: _Source, params: ttt.TransformActorParams) -> ttt.TransformActor:
+    publisher = _Publisher(source, params)
+    return ttt.TransformActor(publisher.on_conf, publisher.shutdown)
+
+
+actor _test_rejected_on_change_requests_do_not_allocate_ids(t: testing.AsyncT):
+    schema = yang.compile([MODEL])
+    layer = ttt.Layer("top", ttt.Container({}), None)
+    pipes = netconf.actor_pipe_pair()
+    lh = logging.Handler("yp-ttt-test")
+    server = netconf_server.NetconfSession(pipes.server, lh, schema, layer)
+    requests = [
+        yp.build_establish_subscription(datastore="running", on_change=True),
+        yp.build_establish_subscription(on_change=True, dampening_period=1),
+    ]
+    for setting in [xml.Node("excluded-change", text="replace"), xml.Node("sync-on-start", text="bad"),
+                    xml.Node("dampening-period", text="-1"), xml.Node("dampening-period", text="soon")]:
+        requests.append(xml.Node("establish-subscription", nsdefs=[(None, yp.NS_SN)], children=[
+            xml.Node("datastore", nsdefs=[(None, yp.NS_YP), ("ds", yp.NS_DATASTORES)], text="ds:operational"),
+            xml.Node("on-change", nsdefs=[(None, yp.NS_YP)], children=[setting]),
+        ]))
+    requests.append(xml.Node("establish-subscription", nsdefs=[(None, yp.NS_SN)], children=[
+        xml.Node("datastore", nsdefs=[(None, yp.NS_YP), ("ds", yp.NS_DATASTORES)], text="ds:operational"),
+        xml.Node("periodic", nsdefs=[(None, yp.NS_YP)]),
+        xml.Node("on-change", nsdefs=[(None, yp.NS_YP)]),
+    ]))
+    var index = 0
+    var done = False
+
+    def fail(error: Exception):
+        if not done:
+            done = True
+            t.failure(error)
+
+    def _accepted(c: netconf.Client, sid: ?int, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+        elif sid != 1:
+            fail(ValueError("rejected requests allocated subscription ids"))
+        elif not done:
+            done = True
+            c.close(None)
+            t.success()
+
+    def _rejected(c: netconf.Client, reply: ?xml.Node, err: ?netconf.NetconfError):
+        if err is None:
+            fail(ValueError("unsupported on-change request was accepted"))
+        else:
+            index += 1
+            if index < len(requests):
+                c.rpc(requests[index], _rejected)
+            else:
+                c.establish_subscription(_accepted, on_change=True, sync_on_start=False)
+
+    def _connect(c: netconf.Client, err: ?Exception):
+        if err is not None:
+            fail(err)
+        else:
+            c.rpc(requests[0], _rejected)
+
+    client = netconf.Client(None, "mock", 0, "admin", "admin", None, _connect,
+                            None, True, lh, pipe=pipes.client)
+    after 5.0: fail(ValueError("timed out waiting for policy rejection"))
+
+
+actor _test_on_change_routing_failure_terminates_subscription(t: testing.AsyncT):
+    schema = yang.compile([MODEL])
+    layer = ttt.Layer("top", ttt.Container({}), None)
+    pipes = netconf.actor_pipe_pair()
+    lh = logging.Handler("yp-ttt-test")
+    server = netconf_server.NetconfSession(pipes.server, lh, schema, layer)
+    var done = False
+    var subscription_id: ?int = None
+
+    def fail(error: Exception):
+        if not done:
+            done = True
+            t.failure(error)
+
+    def _deleted(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is None:
+            fail(ValueError("failed subscription was not released"))
+        elif not done:
+            done = True
+            c.close(None)
+            t.success()
+
+    def _notification(c: netconf.Client, notification: xml.Node):
+        try:
+            payload = yp.notification_payload(notification)!
+            testing.assertEqual(payload.tag, "subscription-terminated")
+            testing.assertTrue(subscription_id is not None)
+            testing.assertEqual(payload.one("id", None).text, str(subscription_id!))
+            testing.assertEqual(payload.one("reason", None).text, "yp:datastore-not-subscribable")
+            c.delete_subscription(_deleted, subscription_id!)
+        except Exception as error:
+            fail(error)
+
+    def _accepted(c: netconf.Client, sid: ?int, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+        else:
+            subscription_id = sid
+
+    def _connect(c: netconf.Client, err: ?Exception):
+        if err is not None:
+            fail(err)
+        else:
+            # Schema-valid selection whose content predicate cannot be routed
+            # across TTT actors; failure follows the accepted RPC asynchronously.
+            filt = xml.decode('<labels xmlns="urn:test-telemetry">a</labels>')
+            c.establish_subscription(_accepted, on_change=True, subtree_filter=[filt])
+
+    client = netconf.Client(None, "mock", 0, "admin", "admin", None, _connect,
+                            _notification, True, lh, pipe=pipes.client)
+    after 5.0: fail(ValueError("timed out waiting for subscription termination"))
+
+
+actor _test_operational_on_change_replay(t: testing.AsyncT):
+    """Filtered subtree replacement, removals, cleanup, and sync disabled.
+
+    Every patch is replayed through the same YANG Patch decoder a client uses.
+    The second subtree omits a leaf to distinguish replacement from merging.
+    """
+    schema = yang.compile([MODEL])
+    source = _Source()
+    layer = ttt.Layer("top", ttt.Container({q("device"): ttt.List(
+        ttt.Transform(_Transform, lambda params: _publisher(source, params)), [q("name")]),
+    }), None)
+    pipes = netconf.actor_pipe_pair()
+    lh = logging.Handler("yp-ttt-test")
+    server = netconf_server.NetconfSession(pipes.server, lh, schema, layer)
+    var done = False
+    var accepted = False
+    var synced = False
+    var phase = 0
+    var subscription_id: ?int = None
+    var current: ?gdata.Node = None
+
+    def fail(error: Exception):
+        if not done:
+            done = True
+            t.failure(error)
+
+    def _on_delta_only(c: netconf.Client, sid: ?int, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+        else:
+            subscription_id = sid
+            # The existing value must not be sent with sync-on-start disabled.
+            after 0.05: source.publish("a", "delta-only")
+
+    def _subscribe_delta_only(c: netconf.Client):
+        phase = 4
+        c.establish_subscription(_on_delta_only, on_change=True, sync_on_start=False,
+            xpath_filter="/t:device[t:name='a']/t:state", xpath_nsdefs=[("t", NS)])
+
+    def _on_deleted(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+        else:
+            source.publish("a", "after-delete")
+            after 0.05: _subscribe_delta_only(c)
+
+    def _on_notif(c: netconf.Client, notification: xml.Node):
+        if done:
+            return
+        try:
+            pu = yp.parse_push_update(notification)
+            if pu is not None:
+                testing.assertTrue(accepted)
+                testing.assertEqual(phase, 0)
+                testing.assertFalse(synced)
+                testing.assertFalse(any(["target" in n.encode() for n in pu.contents]))
+                synced = True
+                source.publish("b", "unselected")
+                source.publish("a", "one", True)
+                return
+            pcu = yp.parse_push_change_update(notification)
+            testing.assertTrue(pcu is not None)
+            testing.assertTrue(synced)
+            testing.assertEqual(pcu!.sub_id, subscription_id)
+            patch = ypatch.Patch.from_xml(pcu!.yang_patch!)
+            testing.assertEqual(len(patch.edits), 1)
+            edit = patch.edits[0]
+            testing.assertEqual(edit.target, "/telemetry:device=a")
+            testing.assertEqual(patch.patch_id, "0" if phase == 4 else str(phase))
+            current = gdata.patch(current, ypatch.edit_to_gdata(schema, edit))
+            if phase == 0 or phase == 1 or phase == 4:
+                testing.assertEqual(edit.operation, ypatch.OP_REPLACE)
+                entry = current!.get_list(q("device")).elements[0]
+                testing.assertTrue(entry.get_opt_str(q("target")) is None)
+                state = entry.children[q("state")]
+                if phase == 0:
+                    testing.assertEqual(state.get_str(q("status")), "one")
+                    testing.assertEqual(state.get_opt_str(q("extra")), "old")
+                    phase = 1
+                    source.publish("a", "two")
+                elif phase == 1:
+                    testing.assertEqual(state.get_str(q("status")), "two")
+                    testing.assertTrue(state.get_opt_str(q("extra")) is None)
+                    phase = 2
+                    source.publish("a", None)
+                else:
+                    testing.assertEqual(state.get_str(q("status")), "delta-only")
+                    done = True
+                    c.close(None)
+                    t.success()
+            elif phase == 2:
+                testing.assertEqual(edit.operation, ypatch.OP_REMOVE)
+                phase = 3
+                c.delete_subscription(_on_deleted, subscription_id!)
+            else:
+                fail(ValueError("notification after deletion"))
+        except Exception as error:
+            fail(error)
+
+    def _on_sub(c: netconf.Client, sid: ?int, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+        else:
+            accepted = True
+            subscription_id = sid
+
+    def _on_seed(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+        else:
+            filt = xml.decode('<device xmlns="urn:test-telemetry"><name>a</name><state/></device>')
+            c.establish_subscription(_on_sub, on_change=True, subtree_filter=[filt])
+
+    def _on_connect(c: netconf.Client, err: ?Exception):
+        if err is not None:
+            fail(err)
+        else:
+            c.edit_config([
+                xml.decode('<device xmlns="urn:test-telemetry"><name>a</name><target>config</target></device>'),
+                xml.decode('<device xmlns="urn:test-telemetry"><name>b</name><target>config</target></device>'),
+            ], _on_seed)
+
+    client = netconf.Client(None, "mock", 0, "admin", "admin", None, _on_connect,
+                            _on_notif, True, lh, pipe=pipes.client)
+    after 5.0: fail(ValueError("timed out waiting for operational changes"))
