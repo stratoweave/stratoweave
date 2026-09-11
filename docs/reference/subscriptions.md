@@ -228,13 +228,12 @@ a destination at `devices.device.interfaces.interface` hands its
 callback `keys.device_name`, `keys.interface_name` and the interface.
 
 The first pass delivers every instance the filter selects, one call each,
-and then calls `synced`. After that each read delivers the instances that
-changed since the last one, and on-change each change delivers the
-instances it touched, whatever the size of the list, so a subscriber to a
-hundred thousand devices is called with one device. The filters handed to
-a rooted destination must lead to its node, and they are read on one
-period or served on-change, not both. A destination rooted at a container
-receives that container, or `None` when it is gone.
+and then calls `synced`. Every periodic read delivers all selected instances
+and reports instances removed since the last read.
+On-change, each change delivers the instances it touched, one per callback.
+The filters handed to a rooted destination must lead to its node, and they
+are read on one period or served on-change, not both. A destination rooted
+at a container receives that container, or `None` when it is gone.
 
 `synced` belongs to the declaration, not to one destination: it is
 called once, when every delivery in that `declare` has had its first
@@ -296,6 +295,19 @@ The delivery contract:
 TTT decides on-change from `period` alone; the `on_change` flag on
 `SubscriptionSpec` exists for device subscriptions and is ignored here. The
 `NetconfDriver` accepts on-change only against a device that pushes natively.
+
+### Periodic Subscriptions
+
+Every successful periodic read delivers the subscribed data tree to the
+callback. Device subscriptions deliver each periodic YANG-Push snapshot.
+A transform actor can use these callbacks to track when a sample was
+received.
+
+With several periods, each completed read delivers its tree merged with
+the latest trees from the other reads and any on-change subscription.
+Only the completed read has been refreshed; the other parts keep their
+previous samples. A read error is reported through the callback's error
+argument, so it can be distinguished from a fresh sample.
 
 ## `SubscriptionSpec`
 
@@ -371,10 +383,10 @@ non-zero dampening-period and excluded change types are rejected.
 layer serves each consumer from a `Subscription` actor of the consumer's
 own, outside the Layer actor. The consumer's filters fold into one read
 per period: the union of the filters declared with that period, read in
-one pass. Each read runs on its period, and every delivery is the reads'
-latest trees merged into one view, sent straight to the consumer, by
-reference when there is one read. The Layer keeps only which actor serves
-which consumer.
+one pass. Each read runs on its period and delivers the subscribed view.
+Every delivery is the reads' latest trees merged into one view, sent
+straight to the consumer, by reference when there is one read. The Layer
+keeps only which actor serves which consumer.
 
 The consumer's on-change filters fold into one subscription in the tree.
 This is telemetry, apart from the link subscriptions that carry config
@@ -404,7 +416,7 @@ changed ones over, keeps the rest with their latest trees, and calls
 has been laid.
 
 A consumer rooted at a node has one read, or one subscription in the
-tree, and instead of one view gets, after each read, every instance that
-differs from the last read and every instance gone, and after each
-change the instances it touched, each as a tree from the top down to
-that one instance.
+tree. Each read delivers every selected instance and reports instances
+removed since the last read. Each on-change update delivers the instances
+it touched. Every instance is delivered as a tree from the top down to
+that instance.

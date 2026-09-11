@@ -1,11 +1,10 @@
 """Periodic subscriptions on a TTT layer, served by a Subscription actor per consumer.
 
-A consumer's filters fold into one read per period, each read delivers
-the merged view when it differs from the last, and synced follows the
-first run of every read of a declaration. A consumer rooted at a node
-gets the instances of that node instead, each as a tree from the top
-down to it. These tests push oper into transforms through a Hub and
-watch what the consumer receives.
+A consumer's filters fold into one read per period. Each read delivers
+the merged view, and synced follows the first run of every read in a
+declaration. A consumer rooted at a node receives one tree per instance,
+from the top down to that instance. These tests push oper into transforms
+through a Hub and watch what the consumer receives.
 """
 
 import testing
@@ -128,9 +127,8 @@ def rendered(trees: list[?gdata.Node]) -> list[str]:
     return sorted([prs(d) for d in trees])
 
 
-actor every_read_that_differs_is_delivered(t: testing.AsyncT):
-    """The first read is delivered, then every read that differs from the
-    last, as the whole subscribed tree."""
+actor every_read_is_delivered(t: testing.AsyncT):
+    """Each periodic read delivers the whole subscribed tree."""
     hub = Hub()
     layer = service_layer(hub)
     var got: list[?gdata.Node] = []
@@ -142,22 +140,24 @@ actor every_read_that_differs_is_delivered(t: testing.AsyncT):
             t.failure(e)
 
     def on_update(data: ?gdata.Node, err: ?Exception):
+        if done:
+            return
         if err is not None:
             fail(err)
             return
         got.append(data)
         n = len(got)
-        if n == 1:
-            if data == tree([entry("svc-a", "first")]):
+        if n <= 3:
+            if data != tree([entry("svc-a", "first")]):
+                fail(ValueError("expected first on read {n}, got {prs(data)}"))
+            elif n == 3:
                 hub.push("svc-a", status("second"))
-            else:
-                fail(ValueError("expected first, got {prs(data)}"))
-        elif n == 2:
-            if data == tree([entry("svc-a", "second")]):
-                done = True
-                t.success()
-            else:
-                fail(ValueError("expected second, got {prs(data)}"))
+        elif data == tree([entry("svc-a", "second")]):
+            done = True
+            layer.remove_subscriptions("test")
+            t.success()
+        elif data != tree([entry("svc-a", "first")]):
+            fail(ValueError("unexpected read {prs(data)}"))
 
     def declare(_r: value):
         hub.push("svc-a", status("first"))
@@ -165,6 +165,41 @@ actor every_read_that_differs_is_delivered(t: testing.AsyncT):
 
     layer.edit_config(services(["svc-a"]), None, declare)
     after 2: fail(ValueError("timed out with {len(got)} deliveries"))
+
+
+actor empty_reads_are_delivered(t: testing.AsyncT):
+    """A read with no matching data delivers None."""
+    layer = service_layer(Hub())
+    var updates = 0
+    var synced = False
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail(err)
+        elif data is not None:
+            fail(ValueError("expected no matching data, got {prs(data)}"))
+        else:
+            updates += 1
+            if updates >= 3 and synced:
+                done = True
+                layer.remove_subscriptions("empty")
+                t.success()
+
+    def on_synced(owner: str):
+        if updates != 1 or synced:
+            fail(ValueError("synced after {updates} empty reads"))
+        synced = True
+
+    layer.declare_subscriptions("empty", on_update, {entry_spec("missing")}, on_synced)
+    after 2: fail(ValueError("timed out with {updates} empty reads"))
 
 
 actor filters_with_one_period_fold_into_one_read(t: testing.AsyncT):
@@ -309,8 +344,8 @@ actor synced_waits_for_a_read_added_by_a_redeclaration(t: testing.AsyncT):
 
 
 actor redeclaring_the_same_set_installs_the_callbacks_only(t: testing.AsyncT):
-    """A redeclaration of the same set delivers nothing again, hears its
-    synced at once, and hands later deliveries to the new callback."""
+    """A redeclaration does not trigger a read, hears its synced at once,
+    and hands later periodic deliveries to the new callback."""
     hub = Hub()
     layer = service_layer(hub)
     var second: list[?gdata.Node] = []
@@ -348,7 +383,7 @@ actor redeclaring_the_same_set_installs_the_callbacks_only(t: testing.AsyncT):
     def finish():
         if not done:
             done = True
-            if synced == 1 and len(second) == 1 and second[0] == tree([entry("svc-a", "second")]):
+            if synced == 1 and len(second) >= 2 and second[-1] == tree([entry("svc-a", "second")]):
                 t.success()
             else:
                 t.failure(ValueError("synced {synced} times, the new callback got {rendered(second)}"))
@@ -429,44 +464,53 @@ actor failed_first_read_still_ends_with_synced(t: testing.AsyncT):
     after 2: on_update(None, None)
 
 
-actor read_error_keeps_the_last_good_view(t: testing.AsyncT):
-    """A read that fails reports the error with the last good view."""
+actor read_error_keeps_the_view_and_delivers_recovery(t: testing.AsyncT):
+    """A failed read reports the last good view with the error. The callback
+    receives the current view when a subsequent read succeeds."""
     hub = Hub()
     layer = service_layer(hub)
     good = tree([gdata.Container({q("name"): gdata.Leaf("svc-a"), q("detail"): gdata.Container({q("x"): gdata.Leaf("1")})})])
+    good_oper = gdata.Container({q("detail"): gdata.Container({q("x"): gdata.Leaf("1")})})
+    var injected = False
+    var failed = False
     var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
 
     def on_update(data: ?gdata.Node, err: ?Exception):
         if done:
             return
-        if err is not None:
+        if data != good:
+            fail(ValueError("expected the last good view, got {prs(data)}"))
+        elif err is not None:
+            failed = True
+            hub.push("svc-a", good_oper)
+        elif failed:
             done = True
-            if data == good:
-                t.success()
-            else:
-                t.failure(ValueError("expected the last good view with the error, got {prs(data)}"))
-        elif data == good:
+            layer.remove_subscriptions("first")
+            t.success()
+        elif not injected:
+            injected = True
             hub.push("svc-a", gdata.Container({q("detail"): gdata.Leaf("now a leaf")}))     # the filter no longer applies
-        else:
-            done = True
-            t.failure(ValueError("unexpected delivery {prs(data)}"))
 
     def declare(_r: value):
-        hub.push("svc-a", gdata.Container({q("detail"): gdata.Container({q("x"): gdata.Leaf("1")})}))
+        hub.push("svc-a", good_oper)
         after 0.05: layer.declare_subscriptions("first", on_update, {detail_spec()})
 
     layer.edit_config(services(["svc-a"]), None, declare)
-    after 2: on_update(None, ValueError("timed out"))
+    after 2: fail(ValueError("timed out waiting for recovery (failed={failed})"))
 
 
 actor rooted_at_a_list(t: testing.AsyncT):
-    """Rooted at the service list: the first read is one delivery per entry
-    then synced; a change delivers its entry alone; a deletion delivers an
-    Absent with the entry's key. Each delivery is a tree from the top."""
+    """Each read delivers one tree per selected service entry. The first read
+    is followed by synced. A deletion reports an Absent with the entry's key once."""
     hub = Hub()
     layer = service_layer(hub)
     var got: list[?gdata.Node] = []
-    var synced = False
+    var stage = 0
     var done = False
 
     def fail(e: Exception):
@@ -475,31 +519,48 @@ actor rooted_at_a_list(t: testing.AsyncT):
             t.failure(e)
 
     def on_synced(owner: str):
-        if synced or rendered(got) != rendered([tree([entry("svc-a", "a")]), tree([entry("svc-b", "b")])]):
+        if stage != 0 or rendered(got) != rendered([tree([entry("svc-a", "a")]), tree([entry("svc-b", "b")])]):
             fail(ValueError("synced after {len(got)} deliveries: {rendered(got)}"))
             return
-        synced = True
-        hub.push("svc-a", status("a2"))
+        stage = 1
+        got = []
 
     def on_update(data: ?gdata.Node, err: ?Exception):
+        if done:
+            return
         if err is not None:
             fail(err)
             return
         got.append(data)
-        n = len(got)
-        if n == 3:
-            if data == tree([entry("svc-a", "a2")]):
+        if stage == 1 and len(got) == 2:
+            if rendered(got) == rendered([tree([entry("svc-a", "a")]), tree([entry("svc-b", "b")])]):
+                stage = 2
+                hub.push("svc-a", status("a2"))
+            else:
+                fail(ValueError("expected both service entries, got {rendered(got)}"))
+            got = []
+        elif stage == 2 and len(got) == 2:
+            if rendered(got) == rendered([tree([entry("svc-a", "a2")]), tree([entry("svc-b", "b")])]):
+                stage = 3
                 layer.edit_config(gdata.Container({
                     q("service"): gdata.List([q("name")], [gdata.Absent({q("name"): gdata.Leaf("svc-b")})]),
                 }))
-            else:
-                fail(ValueError("expected svc-a alone, got {prs(data)}"))
-        elif n == 4:
-            if data == gone("svc-b"):
+            elif rendered(got) != rendered([tree([entry("svc-a", "a")]), tree([entry("svc-b", "b")])]):
+                fail(ValueError("unexpected entries after change: {rendered(got)}"))
+            got = []
+        elif stage == 3 and len(got) == 2:
+            if rendered(got) == rendered([tree([entry("svc-a", "a2")]), gone("svc-b")]):
+                stage = 4
+            elif rendered(got) != rendered([tree([entry("svc-a", "a2")]), tree([entry("svc-b", "b")])]):
+                fail(ValueError("unexpected entries after deletion: {rendered(got)}"))
+            got = []
+        elif stage == 4:
+            if data != tree([entry("svc-a", "a2")]):
+                fail(ValueError("expected the surviving entry, got {prs(data)}"))
+            elif len(got) == 2:
                 done = True
+                layer.remove_subscriptions("rooted")
                 t.success()
-            else:
-                fail(ValueError("expected svc-b gone, got {prs(data)}"))
 
     def declare(_r: value):
         hub.push("svc-a", status("a"))
@@ -507,7 +568,7 @@ actor rooted_at_a_list(t: testing.AsyncT):
         after 0.05: layer.declare_subscriptions("rooted", on_update, {whole(root=ROOTED_AT_SERVICE)}, on_synced)
 
     layer.edit_config(services(["svc-a", "svc-b"]), None, declare)
-    after 2: fail(ValueError("timed out with {len(got)} deliveries, synced={synced}"))
+    after 2: fail(ValueError("timed out at stage {stage} with {rendered(got)}"))
 
 
 actor rooted_at_a_container(t: testing.AsyncT):
@@ -530,16 +591,19 @@ actor rooted_at_a_container(t: testing.AsyncT):
             fail(ValueError("synced after {rendered(got)}"))
 
     def on_update(data: ?gdata.Node, err: ?Exception):
+        if done:
+            return
         if err is not None:
             fail(err)
             return
         got.append(data)
-        if len(got) == 2:
+        if len(got) > 1:
             if data == probe_spine(gdata.Container()):
                 done = True
+                layer.remove_subscriptions("rooted")
                 t.success()
-            else:
-                fail(ValueError("expected the probe empty, got {prs(data)}"))
+            elif data != got[0]:
+                fail(ValueError("unexpected probe while awaiting deletion: {prs(data)}"))
 
     def declare(_r: value):
         hub.push("probe", status("up"))
@@ -624,9 +688,9 @@ def item_spine(i: gdata.Node) -> gdata.Node:
     return probe_spine(items([i]))
 
 
-actor change_above_the_root_delivers_the_instances_that_differ(t: testing.AsyncT):
+actor read_above_the_root_delivers_all_instances(t: testing.AsyncT):
     """A producer that holds several instances of the root's node delivers,
-    on a read, the instances that differ and those gone."""
+    on every read, all instances and reports those gone."""
     hub = Hub()
     layer = probe_layer(hub)
     var got: list[?gdata.Node] = []
@@ -651,19 +715,21 @@ actor change_above_the_root_delivers_the_instances_that_differ(t: testing.AsyncT
             fail(err)
             return
         got.append(data)
-        if stage == 1 and len(got) == 1:
-            if data == item_spine(item("one", "x2")):
+        if stage == 1 and len(got) == 2:
+            if rendered(got) == rendered([item_spine(item("one", "x2")), item_spine(item("two", "y"))]):
                 stage = 2
-                got = []
                 hub.push("probe", items([item("one", "x2")]))
-            else:
-                fail(ValueError("expected item one changed alone, got {prs(data)}"))
-        elif stage == 2 and len(got) == 1:
-            if data == item_spine(gdata.Absent({q("id"): gdata.Leaf("two")})):
+            elif rendered(got) != rendered([item_spine(item("one", "x")), item_spine(item("two", "y"))]):
+                fail(ValueError("expected both items, got {rendered(got)}"))
+            got = []
+        elif stage == 2 and len(got) == 2:
+            if rendered(got) == rendered([item_spine(item("one", "x2")), item_spine(gdata.Absent({q("id"): gdata.Leaf("two")}))]):
                 done = True
+                layer.remove_subscriptions("rooted")
                 t.success()
-            else:
-                fail(ValueError("expected item two gone, got {prs(data)}"))
+            elif rendered(got) != rendered([item_spine(item("one", "x2")), item_spine(item("two", "y"))]):
+                fail(ValueError("expected item one and item two gone, got {rendered(got)}"))
+            got = []
 
     def declare(_r: value):
         hub.push("probe", items([item("one", "x"), item("two", "y")]))
