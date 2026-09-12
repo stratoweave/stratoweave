@@ -1,20 +1,17 @@
 """Scaling scenarios for the transaction engine.
 
-    acton test perf --module test_ttt_perf --jobs 1 --record
+    acton test perf  --module test_ttt_perf
+    acton test scale --module test_ttt_perf --name list_touch --end-scale 100000
 
-Each scenario builds a layer stack of its own, drives a fixed number of
-transactions through it and finishes when the last one has committed, so
-`acton test perf` times the whole scenario, and --record keeps the times
-and the heap each one allocated for the next run to be read against.
-
---jobs 1 matters. The runner otherwise runs several of these at once,
-which inflates the times and mixes up the allocation each is charged
-with, since that is read off one counter for the whole process. Build
-before recording, since compiling the rest of the project alongside the
-first scenario distorts it in the same way.
-
-SCALE below sets how large the scenarios are; raising it needs
---max-time raised with it, since the test timeout follows from that.
+Scale is the number of list entries. Each scenario builds its layer
+stack and loads the entries before the loop, from t.scale(), and each
+loop body then commits a fixed number of transactions against that
+list, or reads it a fixed number of times. So a body's growth is the
+growth of one transaction with the size of the list it runs against:
+flat when a small transaction costs the same whatever the list holds,
+linear when it pays for the whole list. The load scenarios are the
+exception: their body is the load itself, so linear is the best they
+can do.
 
 The shapes are what a fleet manager does at scale, with no generated
 adata or devices in the way:
@@ -25,47 +22,44 @@ adata or devices in the way:
   merges N sources, as the device layer of a shard does.
 - reshard: N transforms that each route their entry to
   /rfs{shard}/device{name} in a second layer, the shape of the top node.
+- shard: N transforms routed into SHARDS transforms of a second layer,
+  each of which merges its N/SHARDS sources, as the flotilla's device
+  config at the top node merges every device the flotilla manages.
 - links: N publishers and one subscriber linked to every one of them,
   the shape of an upgrade campaign.
+- db: the list shape with an LMDB store under the layer, so every
+  transaction is also written through persistence.
 
-Every shape is measured twice: loading it, and then touching one entry
-at a time, since the cost of one small transaction against a large list
-is what decides whether a fleet can be managed at all.
+Every transaction waits for the one before it to complete, not merely
+to report done: done fires before a commit has reached every node, and
+a read or a transaction that follows it straight away can see entries
+that are still provisional. An ordinary `acton test` run measures one
+entry, enough to keep the shapes honest but nothing about scale.
 """
 
+import file
 import testing
 
+import db as swdb
+import db.lmdb as swlmdb
 import ttt
 import yang.gdata as gdata
 
 
 NS = "urn:test:ttt-perf"
 
-# How large each scenario is. A scenario has to finish inside the test
-# timeout, which `acton test perf` derives from --max-time and which is
-# 3 seconds by default, so the sizes below are what today's engine
-# manages in about a second.
-#
-# SCALE multiplies all of them, for the closer look a change that only
-# pays off further up the curve needs. The scenarios that touch one
-# entry at a time grow with its square, since both the list and the
-# number of transactions against it grow, so --max-time has to grow
-# faster than SCALE does.
-SCALE = 1
+# Transactions or reads per loop body. Fixed, so that a body's growth
+# is the growth of one of them with the size of the list.
+TOUCHES = 16
+READS = 64
 
-LIST_N = 2000 * SCALE
-LIST_TOUCHES = 100 * SCALE
-
-FANIN_LOAD_N = 2000 * SCALE
-FANIN_N = 400 * SCALE
-FANIN_TOUCHES = 8 * SCALE
-
-RESHARD_N = 1000 * SCALE
+# Shards the reshard and shard scenarios spread their entries over.
+# Fixed, so that scale stays the number of entries and the fan-in of one
+# shard grows with it.
 RESHARD_SHARDS = 10
 
-LINKS_N = 200 * SCALE
-LINKS_TOUCH_N = 120 * SCALE
-LINKS_TOUCHES = 3 * SCALE
+# Members of the campaign that stays small while the fleet grows.
+FIXED_CAMPAIGN = 64
 
 # Leaves per entry beyond its key, so an entry is a container worth
 # merging and diffing rather than a single leaf.
@@ -84,7 +78,7 @@ def pad(i: int, width: int) -> str:
 
 
 def dev_name(i: int) -> str:
-    return "dev-" + pad(i, 6)
+    return "dev-" + pad(i, 9)
 
 
 def shard_name(i: int, shards: int) -> str:
@@ -111,13 +105,33 @@ def devices(start: int, count: int, value: int, shards: int) -> gdata.Node:
     return gdata.Container({q("device"): gdata.List([q("name")], elements)})
 
 
-def touches(n: int, count: int, shards: int) -> list[gdata.Node]:
+def devices_absent(start: int, count: int) -> gdata.Node:
+    """A diff deleting `count` /device entries starting at index `start`."""
+    elements: list[gdata.Node] = []
+    for i in range(start, start + count):
+        elements.append(gdata.Absent({q("name"): gdata.Leaf(dev_name(i))}))
+    return gdata.Container({q("device"): gdata.List([q("name")], elements)})
+
+
+def spread(i: int, n: int) -> int:
+    """Entry i of a walk over `n` entries that does not favour locality."""
+    return (i * 7919) % n
+
+
+def touches(n: int, count: int, round: int, shards: int) -> list[gdata.Node]:
     """`count` edits that each set a new value on one entry of `n`."""
     edits: list[gdata.Node] = []
     for i in range(count):
-        # Spread over the list so no edit is served by locality alone.
-        edits.append(devices((i * 7919) % n, 1, 2 + i, shards))
+        edits.append(devices(spread(i + count * round, n), 1, 2 + round, shards))
     return edits
+
+
+def entry_filter(i: int, top: str="device") -> gdata.FNode:
+    """Select /device{name} for entry i, as a read of one device does.
+
+    Below a fan-in of ListOut transforms the entries sit under /out.
+    """
+    return gdata.FNode(q(top), children=[gdata.FNode(q("name"), value_match=dev_name(i))])
 
 
 def campaign(name: str, members: int) -> gdata.Node:
@@ -132,6 +146,12 @@ def campaign(name: str, members: int) -> gdata.Node:
                 q("member"): gdata.List([q("name")], elements),
             })
         ])
+    })
+
+
+def campaign_absent(name: str) -> gdata.Node:
+    return gdata.Container({
+        q("campaign"): gdata.List([q("name")], [gdata.Absent({q("name"): gdata.Leaf(name)})])
     })
 
 
@@ -216,75 +236,397 @@ def reshard_stack() -> ttt.Layer:
     }), rfs, None)
 
 
-def links_stack() -> ttt.Layer:
-    """Publishers under /device and subscribers under /campaign."""
-    return ttt.Layer("top", ttt.Container({
-        q("device"): ttt.List(ttt.Transform(ListOut), [q("name")]),
-        q("campaign"): ttt.List(ttt.Transform(CountLinked, None, campaign_links), [q("name")]),
-    }), ttt.Sink(), None)
+def shard_stack() -> ttt.Layer:
+    """Transforms routed into shard transforms that each merge their share.
 
-
-actor Scenario(t: testing.AsyncT, stack: ttt.Layer, edits: list[gdata.Node]):
-    """Commit the edits through the stack in order, then pass the test.
-
-    Each edit waits for the one before it to commit, so the scenario
-    measures a series of transactions rather than their concurrency.
+    The second layer's /rfs entries are transforms, so each merges the
+    sources routed to its shard: the top node's per flotilla device
+    config, where one flotilla holds a thousand devices. Nothing lies
+    below them, as nothing lies below a device config.
     """
-    var next = 0
+    rfs = ttt.Layer("rfs", ttt.Container({
+        q("rfs"): ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]),
+    }), None, None)
+    return ttt.Layer("top", ttt.Container({
+        q("device"): ttt.List(ttt.Transform(Reshard), [q("name")]),
+    }), rfs, None)
+
+
+def links_stack() -> ttt.Layer:
+    """Publishers under /device and subscribers under /campaign.
+
+    No layer below: with one, every touch also pays a fan-in merge of
+    every publisher there, which the fanin scenarios measure and which
+    would hide what the links themselves cost.
+    """
+    return ttt.Layer("top", ttt.Container({
+        q("device"): ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]),
+        q("campaign"): ttt.List(ttt.Transform(CountLinked, None, campaign_links), [q("name")]),
+    }), None, None)
+
+
+# Setup edits, committed once before the loop.
+
+def no_setup(n: int) -> list[gdata.Node]:
+    return []
+
+
+def load(n: int) -> list[gdata.Node]:
+    return [devices(0, n, 1, 1)]
+
+
+def load_reshard(n: int) -> list[gdata.Node]:
+    return [devices(0, n, 1, RESHARD_SHARDS)]
+
+
+def load_campaign(n: int) -> list[gdata.Node]:
+    return load(n) + [campaign("c1", n)]
+
+
+def load_fixed_campaign(n: int) -> list[gdata.Node]:
+    members = FIXED_CAMPAIGN if n > FIXED_CAMPAIGN else n
+    return load(n) + [campaign("c1", members)]
+
+
+# Body edits, committed in order once per loop body; `round` counts
+# the bodies so each changes something.
+
+def body_load(n: int, round: int) -> list[gdata.Node]:
+    """The whole list in one transaction, changed each round."""
+    return [devices(0, n, 1 + round, 1)]
+
+
+def body_load_reshard(n: int, round: int) -> list[gdata.Node]:
+    return [devices(0, n, 1 + round, RESHARD_SHARDS)]
+
+
+def body_touch(n: int, round: int) -> list[gdata.Node]:
+    """TOUCHES transactions, each naming one entry."""
+    return touches(n, TOUCHES, round, 1)
+
+
+def body_touch_reshard(n: int, round: int) -> list[gdata.Node]:
+    return touches(n, TOUCHES, round, RESHARD_SHARDS)
+
+
+def body_modify_all(n: int, round: int) -> list[gdata.Node]:
+    """One transaction changing every entry."""
+    return [devices(0, n, 2 + round, 1)]
+
+
+def body_delete_add(n: int, round: int) -> list[gdata.Node]:
+    """TOUCHES transactions deleting one entry each, then one adding them back."""
+    edits: list[gdata.Node] = []
+    for i in range(TOUCHES):
+        edits.append(devices_absent(spread(i + TOUCHES * round, n), 1))
+    for i in range(TOUCHES):
+        edits.append(devices(spread(i + TOUCHES * round, n), 1, 1, 1))
+    return edits
+
+
+def body_delete_all_load(n: int, round: int) -> list[gdata.Node]:
+    """One transaction deleting every entry, then one loading them again."""
+    return [devices_absent(0, n), devices(0, n, 1, 1)]
+
+
+def body_campaign_add_delete(n: int, round: int) -> list[gdata.Node]:
+    """A campaign linked to every entry added, then deleted."""
+    return [campaign("c" + str(round), n), campaign_absent("c" + str(round))]
+
+
+actor Scenario(
+    t: testing.AsyncT,
+    make_stack: proc() -> ttt.Layer,
+    setup_edits: proc(int) -> list[gdata.Node],
+    body_edits: proc(int, int) -> list[gdata.Node]
+):
+    """Commit the setup edits, then per loop body the body edits in order.
+
+    A transaction is committed only once the one before it has
+    completed. The loop is driven by hand because the work finishes in
+    a callback: each body ends when its last edit has completed.
+    """
+    scale = t.scale()
+    stack = make_stack()
+    iterations = t.loop()
+    var edits: list[gdata.Node] = setup_edits(scale)
+    var next_edit = 0
+    var round = 0
+    var in_setup = True
+    # An actor variable, not a local: a local bound inside try and read
+    # after the except fails the compiler's back pass.
+    var n = 0
 
     def submit() -> None:
-        if next < len(edits):
-            edit = edits[next]
-            next += 1
-            stack.edit_config(edit, step, None)
+        if next_edit < len(edits):
+            edit = edits[next_edit]
+            next_edit += 1
+            stack.edit_config(edit, None, completed)
+        elif in_setup:
+            in_setup = False
+            body()
         else:
-            t.success()
+            round += 1
+            body()
 
-    def step(result: value) -> None:
+    def completed(result: value) -> None:
         if isinstance(result, Exception):
             t.failure(result)
             return
         submit()
 
+    def body() -> None:
+        try:
+            n = next(iterations)
+        except StopIteration:
+            t.success()
+            return
+        edits = body_edits(n, round)
+        next_edit = 0
+        submit()
+
     submit()
 
 
+actor Burst(t: testing.AsyncT):
+    """Load N entries, then per body touch every one of them at once.
+
+    What a fleet sees when many clients change one device each without
+    waiting for one another: the transactions contend for the same list
+    and queue on its lock. Both the list and the number of concurrent
+    transactions grow with scale.
+    """
+    scale = t.scale()
+    stack = list_stack()
+    iterations = t.loop()
+    var pending = 0
+    var failed = False
+    var round = 0
+    var n = 0
+
+    def loaded(result: value) -> None:
+        if isinstance(result, Exception):
+            t.failure(result)
+            return
+        body()
+
+    def body() -> None:
+        try:
+            n = next(iterations)
+        except StopIteration:
+            t.success()
+            return
+        edits = touches(n, n, round, 1)
+        round += 1
+        failed = False
+        pending = len(edits)
+        for edit in edits:
+            stack.edit_config(edit, None, completed)
+
+    def completed(result: value) -> None:
+        if isinstance(result, Exception) and not failed:
+            failed = True
+            t.failure(result)
+            return
+        pending -= 1
+        if pending == 0 and not failed:
+            body()
+
+    stack.edit_config(devices(0, scale, 1, 1), None, loaded)
+
+
+actor Reader(t: testing.AsyncT, make_stack: proc() -> ttt.Layer, read_below: bool):
+    """Load N entries, then per body read READS of them alone through a filter.
+
+    A read of one device out of a fleet, as a RESTCONF GET does. With
+    `read_below` the reads go to the layer below, through the transform
+    that merges every entry.
+    """
+    scale = t.scale()
+    stack = make_stack()
+    iterations = t.loop()
+    var round = 0
+    var n = 0
+
+    def loaded(result: value) -> None:
+        if isinstance(result, Exception):
+            t.failure(result)
+            return
+        body()
+
+    def body() -> None:
+        try:
+            n = next(iterations)
+        except StopIteration:
+            t.success()
+            return
+        layer = stack.below() if read_below else stack
+        top = "out" if read_below else "device"
+        found = 0
+        for i in range(READS):
+            got = layer.get_data(entry_filter(spread(i + READS * round, n), top))
+            if got is not None:
+                found += 1
+        round += 1
+        if found != READS:
+            t.failure(ValueError("read {found} of {READS} entries"))
+            return
+        body()
+
+    stack.edit_config(devices(0, scale, 1, 1), None, loaded)
+
+
+actor DbScenario(t: testing.EnvT):
+    """The list touch scenario over a layer with an LMDB store.
+
+    The store lives in a directory of its own, opened before the loop
+    and removed after it.
+    """
+    scale = t.scale()
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    db_path = fs.mktmpdir("test_ttt_perf_db_")
+    # The map size the application uses; the LMDB default fills at a
+    # few thousand entries.
+    store = swlmdb.LmdbStore(file.WriteFileCap(fc), db_path, 1 << 40)
+    stack = ttt.Layer("top", ttt.Container({
+        q("device"): ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]),
+    }), None, store)
+    iterations = t.loop()
+    var edits: list[gdata.Node] = []
+    var next_edit = 0
+    var round = 0
+    var n = 0
+
+    def loaded(result: value) -> None:
+        if isinstance(result, Exception):
+            t.failure(result)
+            return
+        body()
+
+    def body() -> None:
+        try:
+            n = next(iterations)
+        except StopIteration:
+            store.close(closed)
+            return
+        edits = body_touch(n, round)
+        round += 1
+        next_edit = 0
+        submit()
+
+    def submit() -> None:
+        if next_edit < len(edits):
+            edit = edits[next_edit]
+            next_edit += 1
+            stack.edit_config(edit, None, completed)
+        else:
+            body()
+
+    def completed(result: value) -> None:
+        if isinstance(result, Exception):
+            t.failure(result)
+            return
+        submit()
+
+    def closed(error: ?Exception) -> None:
+        if error is not None:
+            t.failure(error)
+            return
+        await async fs.rmtree(db_path)
+        await async fs.rmdir(db_path)
+        t.success()
+
+    stack.edit_config(devices(0, scale, 1, 1), None, loaded)
+
+
+# Loads: the body is the load, so linear is the best case.
+
 actor list_load(t: testing.AsyncT):
-    """One transaction adding LIST_N transform entries to a list"""
-    Scenario(t, list_stack(), [devices(0, LIST_N, 1, 1)])
-
-
-actor list_touch_one(t: testing.AsyncT):
-    """LIST_TOUCHES transactions that each touch one entry of LIST_N"""
-    Scenario(t, list_stack(), [devices(0, LIST_N, 1, 1)] + touches(LIST_N, LIST_TOUCHES, 1))
+    """Add N transform entries to a list in one transaction"""
+    Scenario(t, list_stack, no_setup, body_load)
 
 
 actor fanin_load(t: testing.AsyncT):
-    """One transaction adding FANIN_LOAD_N sources of one transform below"""
-    Scenario(t, fanin_stack(), [devices(0, FANIN_LOAD_N, 1, 1)])
-
-
-actor fanin_touch_one(t: testing.AsyncT):
-    """FANIN_TOUCHES transactions that each touch one of FANIN_N sources"""
-    Scenario(t, fanin_stack(), [devices(0, FANIN_N, 1, 1)] + touches(FANIN_N, FANIN_TOUCHES, 1))
+    """Add N sources of one transform below in one transaction"""
+    Scenario(t, fanin_stack, no_setup, body_load)
 
 
 actor reshard_load(t: testing.AsyncT):
-    """One transaction routing RESHARD_N entries into RESHARD_SHARDS shards"""
-    Scenario(t, reshard_stack(), [devices(0, RESHARD_N, 1, RESHARD_SHARDS)])
+    """Route N entries into RESHARD_SHARDS shards of a second layer"""
+    Scenario(t, reshard_stack, no_setup, body_load_reshard)
 
 
-actor links_campaign_add(t: testing.AsyncT):
-    """One transaction linking a subscriber to every one of LINKS_N publishers"""
-    Scenario(t, links_stack(), [
-        devices(0, LINKS_N, 1, 1),
-        campaign("c1", LINKS_N),
-    ])
+actor shard_load(t: testing.AsyncT):
+    """Route N entries into RESHARD_SHARDS shard transforms"""
+    Scenario(t, shard_stack, no_setup, body_load_reshard)
 
 
-actor links_touch_one(t: testing.AsyncT):
-    """LINKS_TOUCHES transactions that each touch one of LINKS_TOUCH_N linked publishers"""
-    Scenario(t, links_stack(), [
-        devices(0, LINKS_TOUCH_N, 1, 1),
-        campaign("c1", LINKS_TOUCH_N),
-    ] + touches(LINKS_TOUCH_N, LINKS_TOUCHES, 1))
+actor list_modify_all(t: testing.AsyncT):
+    """With N entries loaded, change every one of them in one transaction"""
+    Scenario(t, list_stack, load, body_modify_all)
+
+
+actor list_delete_all(t: testing.AsyncT):
+    """With N entries loaded, delete all of them in one transaction, then load again"""
+    Scenario(t, list_stack, load, body_delete_all_load)
+
+
+actor links_campaign(t: testing.AsyncT):
+    """With N publishers loaded, add a campaign linked to every one, then delete it"""
+    Scenario(t, links_stack, load, body_campaign_add_delete)
+
+
+# Touches: the body is TOUCHES single-entry transactions against the
+# loaded list, so flat is the good case and linear the bad one.
+
+actor list_touch(t: testing.AsyncT):
+    """With N entries loaded, touch TOUCHES of them one transaction each"""
+    Scenario(t, list_stack, load, body_touch)
+
+
+actor list_delete_each(t: testing.AsyncT):
+    """With N entries loaded, delete TOUCHES of them one transaction each, then add them back"""
+    Scenario(t, list_stack, load, body_delete_add)
+
+
+actor fanin_touch(t: testing.AsyncT):
+    """With N sources loaded, touch TOUCHES of them one transaction each"""
+    Scenario(t, fanin_stack, load, body_touch)
+
+
+actor shard_touch(t: testing.AsyncT):
+    """With N entries loaded into shards, touch TOUCHES of them one transaction each"""
+    Scenario(t, shard_stack, load_reshard, body_touch_reshard)
+
+
+actor links_touch(t: testing.AsyncT):
+    """With N publishers linked to a campaign, touch TOUCHES of them one transaction each"""
+    Scenario(t, links_stack, load_campaign, body_touch)
+
+
+actor links_fixed_touch(t: testing.AsyncT):
+    """With a FIXED_CAMPAIGN member campaign over N publishers, touch TOUCHES of them"""
+    Scenario(t, links_stack, load_fixed_campaign, body_touch)
+
+
+actor list_burst(t: testing.AsyncT):
+    """With N entries loaded, touch every one of them in N transactions at once"""
+    Burst(t)
+
+
+actor list_touch_db(t: testing.EnvT):
+    """With N entries loaded into a persisted list, touch TOUCHES of them one transaction each"""
+    DbScenario(t)
+
+
+# Reads: READS single-entry reads per body.
+
+actor list_get_one(t: testing.AsyncT):
+    """With N entries loaded, read READS of them alone through a filter"""
+    Reader(t, list_stack, False)
+
+
+actor fanin_get_one(t: testing.AsyncT):
+    """With N sources loaded, read READS of them alone from below the fan-in transform"""
+    Reader(t, fanin_stack, True)

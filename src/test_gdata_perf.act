@@ -1,0 +1,432 @@
+"""Scaling scenarios for the acton-yang operations the engine leans on.
+
+    acton test perf  --module test_gdata_perf
+    acton test scale --module test_gdata_perf --name filter_each --end-scale 100000
+
+This mirrors test_gdata_scale in acton-yang, so that what a node pays
+per transaction and per message is visible from this repository. Scale
+is the number of list entries. Every scenario builds its inputs before
+the loop, from t.scale(), so a body measures the operation alone. The
+scenarios named `_each` run an operation that names one entry a fixed
+EACH times per body, so their growth is the growth of one such call
+with the size of the list: flat when the call costs the entry, linear
+when it pays for the whole list, which is then what the transaction
+engine pays on every transaction that calls it. The other scenarios
+run a whole-list operation once per body and are linear at best.
+
+The operations are the ones a node runs per transaction and per
+message: merge, diff, patch, filter and prune of trees; equality and
+key_str of list entries; adata encoding and decoding, which is every
+transform's output and input; XML and JSON encoding and decoding, which
+is every NETCONF and RESTCONF message; and yang-patch conversion, which
+is every RESTCONF edit and every diff pushed to a device.
+"""
+
+import testing
+import std.xml as xml
+
+import yang
+import yang.adata as yadata
+import yang.gdata as ygdata
+import yang.schema as yschema
+import yang.xml as yxml
+import yang.ypatch as ypatch
+
+NS = "urn:test:gdata-perf"
+MODULE = "gdata-perf"
+LEAVES = 4
+
+# One-entry operations per body.
+EACH = 64
+
+
+def _q(name: str) -> ygdata.Id:
+    return ygdata.Id(NS, name)
+
+
+KEY = _q("name")
+KEYS: list[ygdata.Id] = [KEY]
+DEVICE = _q("device")
+
+
+def _dev_name(i: int) -> str:
+    return "dev-" + str(1000000000 + i)[1:]
+
+
+def _elem(i: int, value: int) -> ygdata.Node:
+    """One entry: key `name`, a `value` and LEAVES more leaves."""
+    # Namespace and module on lists and leaves, none on list entries: what
+    # the adata encoder produces, and what the XML and yang-patch
+    # encoders need to qualify names.
+    pairs: list[(ygdata.Id, ygdata.Node)] = [
+        (KEY, ygdata.Leaf(_dev_name(i), ns=NS, module=MODULE)),
+        (_q("value"), ygdata.Leaf(value, ns=NS, module=MODULE)),
+    ]
+    leaves: list[(ygdata.Id, ygdata.Node)] = [(_q("leaf" + str(j)), ygdata.Leaf("value-" + str(j) + "-" + str(value), ns=NS, module=MODULE)) for j in range(LEAVES)]
+    return ygdata.Container(dict(pairs + leaves))
+
+
+def _elements(start: int, count: int, value: int) -> list[ygdata.Node]:
+    return [_elem(i, value) for i in range(start, start + count)]
+
+
+def _tree(elements: list[ygdata.Node]) -> ygdata.Container:
+    return ygdata.Container({DEVICE: ygdata.List(KEYS, elements, ns=NS, module=MODULE)})
+
+
+def _devices(start: int, count: int, value: int) -> ygdata.Container:
+    return _tree(_elements(start, count, value))
+
+
+def _shuffled(elements: list[ygdata.Node]) -> list[ygdata.Node]:
+    """The same elements in a different (stride permuted) order."""
+    n = len(elements)
+    return [elements[(i * 7919) % n] for i in range(n)]
+
+
+def _spread(i: int, n: int) -> int:
+    """Entry i of a walk over `n` entries that does not favour locality."""
+    return (i * 7919) % n
+
+
+def _device_list(tree: ?ygdata.Node) -> ygdata.List:
+    if tree is not None:
+        l = tree.children.get(DEVICE)
+        if isinstance(l, ygdata.List):
+            return l
+    raise ValueError("expected a /device list")
+
+
+def _key_pred(i: int) -> ygdata.FNode:
+    """A root filter selecting /device[name=...] for entry i."""
+    return ygdata.FNode(children=[ygdata.FNode(DEVICE, children=[ygdata.FNode(KEY, value_match=_dev_name(i))])])
+
+
+def _count(tree: ?ygdata.Node, expected: int) -> None:
+    n = len(_device_list(tree).elements)
+    if n != expected:
+        raise ValueError("expected {expected} entries, got {n}")
+
+
+def _one_changed(elements: list[ygdata.Node], i: int) -> ygdata.Container:
+    """The list with entry i given a new value."""
+    b = list(elements)
+    b[i] = _elem(i, 2)
+    return _tree(b)
+
+
+# The schema of the list, as ayangc would compile it.
+
+YANG = r"""module gdata-perf {
+  namespace "urn:test:gdata-perf";
+  prefix gp;
+  list device {
+    key name;
+    leaf name { type string; }
+    leaf value { type int32; }
+    leaf leaf0 { type string; }
+    leaf leaf1 { type string; }
+    leaf leaf2 { type string; }
+    leaf leaf3 { type string; }
+  }
+}"""
+
+
+def _schema() -> yschema.DRoot:
+    return yang.compile([YANG])
+
+
+# Whole-list operations: one per body, linear at best.
+
+def _test_key_str_all(t: testing.SyncT):
+    """key_str of every entry"""
+    elements = _elements(0, t.scale(), 1)
+    for n in t.loop():
+        count = 0
+        for e in elements:
+            if len(e.key_str(KEYS)) > 0:
+                count += 1
+        assert count == n
+
+
+def _test_merge_disjoint(t: testing.SyncT):
+    """merge of two lists with disjoint keys"""
+    a = _devices(0, t.scale(), 1)
+    b = _devices(t.scale(), t.scale(), 1)
+    for n in t.loop():
+        _count(ygdata.merge(a, b), 2 * n)
+
+
+def _test_merge_same(t: testing.SyncT):
+    """merge of two lists with the same keys and values"""
+    a = _devices(0, t.scale(), 1)
+    b = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        _count(ygdata.merge(a, b), n)
+
+
+def _test_diff_one(t: testing.SyncT):
+    """diff of two lists differing in one entry"""
+    a = _elements(0, t.scale(), 1)
+    ta = _tree(a)
+    tb = _one_changed(a, 0)
+    for n in t.loop():
+        _count(ygdata.diff(ta, tb), 1)
+
+
+def _test_diff_equal(t: testing.SyncT):
+    """diff of two equal lists"""
+    a = _devices(0, t.scale(), 1)
+    b = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        assert ygdata.diff(a, b) is None
+
+
+def _test_eq_same_order(t: testing.SyncT):
+    """equality of two equal lists in the same order"""
+    a = _devices(0, t.scale(), 1)
+    b = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        assert a == b
+
+
+def _test_eq_shuffled(t: testing.SyncT):
+    """equality of two equal lists in different orders"""
+    a = _elements(0, t.scale(), 1)
+    ta = _tree(a)
+    tb = _tree(_shuffled(a))
+    for n in t.loop():
+        assert ta == tb
+
+
+def _test_to_xmlstr(t: testing.SyncT):
+    """XML encoding of a list to a string"""
+    a = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        assert len(a.to_xmlstr(pretty=False)) > n
+
+
+def _test_xml_roundtrip(t: testing.SyncT):
+    """XML encoding of a list and its schema-aware decoding, as a NETCONF message"""
+    schema = _schema()
+    a = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        wrapper = xml.Node("data", children=a.to_xml())
+        _count(yxml.from_xml(schema, wrapper, loose=True), n)
+
+
+def _test_to_json_str(t: testing.SyncT):
+    """JSON encoding of a list"""
+    a = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        assert len(a.to_json_str(pretty=False)) > n
+
+
+def _test_to_yang_jsonstr(t: testing.SyncT):
+    """YANG JSON encoding of a list, as a RESTCONF reply"""
+    a = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        assert len(a.to_yang_jsonstr(pretty=False)) > n
+
+
+def _test_json_roundtrip(t: testing.SyncT):
+    """JSON encoding and decoding of a list, as a persisted node"""
+    a = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        _count(ygdata.Node.from_json_str(a.to_json_str(pretty=False)), n)
+
+
+def _test_patch_edits_all(t: testing.SyncT):
+    """yang-patch edits for a diff changing every entry, and back to gdata"""
+    schema = _schema()
+    d = ygdata.diff(_devices(0, t.scale(), 1), _devices(0, t.scale(), 2))
+    for n in t.loop():
+        p = ypatch.diff_to_patch(d, "p")
+        count = 0
+        for e in p.edits:
+            ypatch.edit_to_gdata(schema, e)
+            count += 1
+        assert count >= n
+
+
+# Operations naming one entry, EACH per body against the loaded list.
+
+def _test_filter_each(t: testing.SyncT):
+    """filter selecting one entry"""
+    tree = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        for i in range(EACH):
+            _count(ygdata.filter(tree, _key_pred(_spread(i, n))), 1)
+
+
+def _test_prune_each(t: testing.SyncT):
+    """prune removing one entry"""
+    tree = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        for i in range(EACH):
+            res = ygdata.prune(tree, _key_pred(_spread(i, n)))
+            if n > 1:
+                _count(res, n - 1)
+
+
+def _test_patch_each(t: testing.SyncT):
+    """patch changing one entry"""
+    tree = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        for i in range(EACH):
+            _count(ygdata.patch(tree, _devices(_spread(i, n), 1, 2)), n)
+
+
+def _test_merge_each(t: testing.SyncT):
+    """merge of the list with a one entry list"""
+    tree = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        for i in range(EACH):
+            _count(ygdata.merge(tree, _devices(_spread(i, n), 1, 1)), n)
+
+
+def _test_diff_each(t: testing.SyncT):
+    """diff against the list with one entry changed"""
+    a = _elements(0, t.scale(), 1)
+    tree = _tree(a)
+    changed: list[ygdata.Node] = []
+    for i in range(EACH):
+        changed.append(_one_changed(a, _spread(i, t.scale())))
+    for n in t.loop():
+        for tb in changed:
+            _count(ygdata.diff(tree, tb), 1)
+
+
+def _test_patch_edits_each(t: testing.SyncT):
+    """yang-patch edits for a one entry diff, and back to gdata"""
+    schema = _schema()
+    a = _elements(0, t.scale(), 1)
+    tree = _tree(a)
+    diffs: list[?ygdata.Node] = []
+    for i in range(EACH):
+        diffs.append(ygdata.diff(tree, _one_changed(a, _spread(i, t.scale()))))
+    for n in t.loop():
+        for d in diffs:
+            p = ypatch.diff_to_patch(d, "p")
+            for e in p.edits:
+                ypatch.edit_to_gdata(schema, e)
+
+
+# adata: a hand written equivalent of what ayangc generates for the
+# schema above, so the encoder and decoder run without a generated
+# module.
+
+class _device_entry(yadata.MNode):
+    name: str
+    value: ?int
+    leaf0: ?str
+    leaf1: ?str
+    leaf2: ?str
+    leaf3: ?str
+
+    mut def __init__(self, name: str, value: ?int=None, leaf0: ?str=None, leaf1: ?str=None, leaf2: ?str=None, leaf3: ?str=None) -> None:
+        self.name = name
+        self.value = value
+        self.leaf0 = leaf0
+        self.leaf1 = leaf1
+        self.leaf2 = leaf2
+        self.leaf3 = leaf3
+
+    mut def to_gdata(self) -> ygdata.Node:
+        raise NotImplementedError("to_gdata")
+
+    @staticmethod
+    mut def from_gdata(n: ygdata.Node) -> _device_entry:
+        return _device_entry(name=n.get_str(_q("name")), value=n.get_opt_int(_q("value")), leaf0=n.get_opt_str(_q("leaf0")), leaf1=n.get_opt_str(_q("leaf1")), leaf2=n.get_opt_str(_q("leaf2")), leaf3=n.get_opt_str(_q("leaf3")))
+
+    mut def copy(self) -> _device_entry:
+        return _device_entry(self.name, self.value, self.leaf0, self.leaf1, self.leaf2, self.leaf3)
+
+
+class _device(yadata.MKeyedList[str, _device_entry]):
+    mut def __init__(self, elements: list[_device_entry]=[]) -> None:
+        yadata.MKeyedList.__init__(self, lambda e: e.name, elements)
+
+    mut def create(self, key: str, value: ?int=None) -> _device_entry:
+        e = self.get(key)
+        if e is not None:
+            if value is not None:
+                e.value = value
+            return e
+        res = _device_entry(name=key, value=value)
+        self._append(res)
+        return res
+
+    @staticmethod
+    mut def from_gdata(n: ?ygdata.List) -> list[_device_entry]:
+        if n is not None:
+            return [_device_entry.from_gdata(e) for e in n.elements]
+        return []
+
+    mut def copy(self) -> _device:
+        copied_elements = []
+        for e in self._elements:
+            copied_elements.append(e.copy())
+        return _device(copied_elements)
+
+
+class _root(yadata.MNode):
+    device: _device
+
+    mut def __init__(self, device: ?_device=None) -> None:
+        self.device = device if device is not None else _device()
+
+    mut def to_gdata(self) -> ygdata.Node:
+        raise NotImplementedError("to_gdata")
+
+    mut def encode(self, schema: yschema.DRoot) -> ygdata.Node:
+        return yadata.from_adata(schema, self, loose=False, root_path=[])
+
+    @staticmethod
+    mut def from_gdata(n: ygdata.Node) -> _root:
+        return _root(device=_device(_device.from_gdata(n.get_opt_list(DEVICE))))
+
+    mut def copy(self) -> _root:
+        return _root(device=self.device.copy())
+
+
+def _test_adata_create(t: testing.SyncT):
+    """build an adata keyed list through create()"""
+    for n in t.loop():
+        r = _root()
+        for i in range(n):
+            r.device.create(_dev_name(i), value=1)
+        assert len(r.device) == n
+
+
+def _test_adata_decode(t: testing.SyncT):
+    """from_gdata of a list, as a transform decodes its input"""
+    tree = _devices(0, t.scale(), 1)
+    for n in t.loop():
+        assert len(_root.from_gdata(tree).device) == n
+
+
+def _test_adata_encode(t: testing.SyncT):
+    """from_adata of a list, as a transform encodes its output"""
+    schema = _schema()
+    r = _root.from_gdata(_devices(0, t.scale(), 1))
+    for n in t.loop():
+        _count(r.encode(schema), n)
+
+
+def _test_adata_copy(t: testing.SyncT):
+    """copy() of an adata list, as generated copy() methods do"""
+    r = _root.from_gdata(_devices(0, t.scale(), 1))
+    for n in t.loop():
+        assert len(r.copy().device) == n
+
+
+def _test_adata_get_each(t: testing.SyncT):
+    """get() of EACH keys of an adata keyed list"""
+    r = _root.from_gdata(_devices(0, t.scale(), 1))
+    for n in t.loop():
+        found = 0
+        for i in range(EACH):
+            if r.device.get(_dev_name(_spread(i, n))) is not None:
+                found += 1
+        assert found == EACH
