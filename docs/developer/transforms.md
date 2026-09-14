@@ -7,9 +7,9 @@ Once the system specification includes the necessary transform definitions,
 it is up to a service developer to implement the `transform()` method
 and/or `Transform` Actor.
 
-## The transform method
+## The transform function
 Each transform is implemented as a class that inherits from a generated base
-class and implements a `transform()` method which is a pure function that
+class and implements a `transform()` function which is a pure function that
 takes input data and returns output data.
 
 * The **input data** is typed according to YANG schema for the node
@@ -17,22 +17,22 @@ takes input data and returns output data.
 * The **output data** should be typed according to the YANG schema for the next
   layer's input.
 
-The `transform()` method cannot have side effects, access other system
+The `transform()` function cannot have side effects, access other system
 information, subscribe to any data or persist state.
 If you need to do any of those things, you should implement a `Transform`
 Actor instead, which can manage subscriptions and maintain state. See the
 [Transform Actor](#the-transform-actor) section for more details on that
 pattern.
 
-The transform method should always produce the same output for a given input.
+The transform function should always produce the same output for a given input.
 You should not perform any non-deterministic operations such as generating
-random numbers or allocating new IDs in the transform method.
+random numbers or allocating new IDs in the transform function.
 
-Because the `#!acton transform()` method is a **pure function**, the StratoWeave transaction
+Because the `#!acton transform()` function is a **pure function**, the StratoWeave transaction
 engine can call it at any time, e.g. when the input data changes or when the system
 is restarted and needs to recompute the desired device configuration.
 
-In its simplest form, the `transform()` method can just return an empty output
+In its simplest form, the `transform()` function can just return an empty output
 object:
 ```acton
 class Router(base.Router):
@@ -42,14 +42,14 @@ class Router(base.Router):
         return o
 ```
 
-!!! tip "No-op transform methods"
+!!! tip "No-op transform functions"
     The only way for a StratoWeave system to persist input (e.g. configuration)
     received on its northbound interfaces is to write it to a part of the YANG
     schema that is located inside of a transform. If you want to persist some
-    input data but not use it (yet), a no-op transform method that returns an
+    input data but not use it (yet), a no-op transform function that returns an
     empty output root object is a valid way to do that.
 
-### Accessing transform input
+### Accessing transform function input
 The input data is available as the first argument to the `transform()` method,
 usually named `i`. The input is typed according to the YANG schema for the
 node on which the transform is defined.
@@ -65,14 +65,12 @@ list fridge {
   leaf name {
     type string;
   }
-  container manufacturer {
-    leaf name {
-      type enum {
-        enum "Fridgetech";
-        enum "FrostCorp";
-        enum "ChillMasters";
-        enum "IceBox Inc.";
-      }
+  leaf manufacturer {
+    type enum {
+      enum "Fridgetech";
+      enum "FrostCorp";
+      enum "ChillMasters";
+      enum "IceBox Inc.";
     }
   }
   list shelf {
@@ -82,25 +80,30 @@ list fridge {
     }
     leaf capacity {
       type uint32;
+      mandatory true;
     }
   }
 ```
 
-In the `transform()` method, the input `i` will provide access to the
-`name`, `manufacturer/name`, and `shelf` nodes according to that schema:
+In the `transform()` function, the input `i` will provide access to the
+`name`, `manufacturer`, and `shelf` nodes according to that schema:
 ```acton title="src/dummy/foo.act"
 class Fridge(base.Fridge):
     def transform(self, i):
+        o = base.o_root()
+
         print(i.name.upper())
         manufacturer = i.manufacturer
         if manufacturer is not None:
             print(manufacturer.upper())
         for shelf in i.shelf:
             print("Shelf {shelf.id} has capacity {shelf.capacity}")
+
+        return o
 ```
 
 !!! info "Accessing optional input"
-    In this example, the `manufacturer/name` leaf is optional, in many cases
+    In this example, the `manufacturer` leaf is optional, in many cases
     you must perform a ` is not None` check before using it.
     See the [optional types](acton.md#optional-types) section for more details on how
     to work with optional input data.
@@ -113,24 +116,24 @@ from the input or derived values.
 
 If the next layer's YANG schema also has a list of fridges and we wanted to
 simply copy the input fridge to an output fridge with some minor modifications,
-the transform method might look like this:
+the transform function might look like this:
 ```acton title="src/dummy/foo.act"
 class Fridge(base.Fridge):
     def transform(self, i):
         o = base.o_root()
-        o.fridge.create(
+        fridge = o.fridge.create(
             i.name.upper(),  # use the same name but uppercase it
             manufacturer=i.manufacturer,
         )
         for shelf in i.shelf:
-            o.fridge.shelf.create(
+            fridge.shelf.create(
                 shelf.id + 500,  # assign new id to shelf
                 capacity=shelf.capacity,
             )
         return o
 ```
 
-### The RFS transform method
+### The RFS transform function
 The RFS layer in a StratoWeave system has a specific pattern, as outlined in the
 [system specification](system-spec.md#defining-rfs-transforms) documentation.
 
@@ -139,7 +142,7 @@ which the transform is defined, but the transform can also use the `di` argument
 to access information about the device such as its capabilities, modules, and other metadata.
 ```acton title="src/sorespo/rfs.act"
 class IbgpNeighbor(base.IbgpNeighbor):
-    def transform(self, i, di):
+    def transform_function(self, i, di):
         if "Cisco-IOS-XR-um-hostname-cfg" in di.modules:
             dev = xr25.root()
             bgp_as = dev.um_router_bgp_cfg_router.bgp.as_.create(i.asn)
