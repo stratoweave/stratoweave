@@ -1090,6 +1090,9 @@ actor Transaction(impl: _Transaction):
     def restore(attr: str, qualifier: ?str, raw: bytes):
         impl.restore(attr, qualifier, raw)
 
+    def restored():
+        impl.restored()
+
     def is_empty():
         return impl.is_empty()
 
@@ -1126,6 +1129,9 @@ class _Transaction(object):
         pass
 
     def restore(self, attr: str, qualifier: ?str, raw: bytes) -> None:
+        pass
+
+    def restored(self) -> None:
         pass
 
     def is_empty(self) -> bool:
@@ -2399,7 +2405,8 @@ actor TransformRestore(
     A transform has no children, so any subtree below its path is an
     error. Its state is all in its attributes: running config per source,
     output, memory and dynamic state. Each attribute record is applied to
-    the transform.
+    the transform. The merged running tree is built once all attributes
+    have been loaded.
     """
 
     db_path = _db_path(path)
@@ -2419,13 +2426,24 @@ actor TransformRestore(
         except Exception as e:
             proceed(e)
 
+    def attrs_done(error: ?Exception) -> None:
+        if error is not None:
+            done(error)
+            return
+        try:
+            await async transaction.restored()
+        except Exception as e:
+            done(e)
+            return
+        done(None)
+
     def children_done(error: ?Exception) -> None:
         if error is not None:
             done(error)
             return
         try:
             attr_range = swdb.attrs_range(db_path, codec)
-            swdb.RangeReader(reader, attr_range.start, attr_range.end, each_attr, done)
+            swdb.RangeReader(reader, attr_range.start, attr_range.end, each_attr, attrs_done)
         except Exception as e:
             done(e)
 
@@ -2469,9 +2487,10 @@ class _TransformBase(_Node):
 
 class _TransformTransactionBase(_Transaction):
     diffs: dict[str, dict[str, gdata.Node]]
-    candidates: dict[str, dict[str, gdata.Node]]
+    candidates: dict[str, (dict[str, gdata.Node], ?gdata.Node)]
     essays: dict[str, (?gdata.Node, ?gdata.Node)]
     running: dict[str, gdata.Node]
+    merged_running: gdata.Node
     memory: ?gdata.Node
     dynstate: ?gdata.Node
     node: ?Node
@@ -2506,6 +2525,7 @@ class _TransformTransactionBase(_Transaction):
         self.essays = {}
         self.path = path
         self.running = {}
+        self.merged_running = gdata.Container()
         self.memory = None
         self.dynstate = None
         self.node = None
@@ -2537,7 +2557,7 @@ class _TransformTransactionBase(_Transaction):
         accdiff = self.diffs[tid]
         accdiff.update(diff.items())
         newconf = patch(self.running, accdiff)
-        self.candidates[tid] = newconf
+        self.candidates[tid] = (newconf, None)
 
         #print('   #', tid, '(Transform)', _format_path(self.path), 'NEW DIFF\n' + per_src(diff), err=True)
         #print('   #', tid, '(Transform)', _format_path(self.path), 'ACCUMULATED DIFF\n' + per_src(accdiff), err=True)
@@ -2555,6 +2575,7 @@ class _TransformTransactionBase(_Transaction):
         else:
             try:
                 merged = assert_complete(merge(newconf))
+                self.candidates[tid] = (newconf, merged)
                 #print('   #', tid, '(Transform)', _format_path(self.path), 'MERGED\n       ', merged.prsrc(indent=4), err=True)
 #                assert self.validate(merged)
                 req = self.link_requests(tid, merged)
@@ -2646,8 +2667,7 @@ class _TransformTransactionBase(_Transaction):
                 # candidate/essay state is in place before commit.
                 upd = []
                 if new_subscribers:
-                    merged_now = merge(self.running) if self.running else gdata.Container()
-                    rooted = make_rooted(self.path, merged_now)
+                    rooted = make_rooted(self.path, self.merged_running)
                     for s in new_subscribers:
                         upd.append(LinkUpdate(s.tag, self.filter_fpath, s.path, rooted))
                 return CfgOk(empty = not self.running, updates=upd)
@@ -2675,7 +2695,7 @@ class _TransformTransactionBase(_Transaction):
             done(res)
         else:
             #print('   #', tid, '(Transform)', _format_path(self.path), 'LOCKED', err=True)
-            done(CfgOk(empty = not self.candidates[tid]))
+            done(CfgOk(empty = not self.candidates[tid].0))
 
     def lock_cont (self, actself, res):
         pass
@@ -2696,7 +2716,7 @@ class _TransformTransactionBase(_Transaction):
         return
 
     mut def db_ops(self, tid: str, essay) -> list[swdb.BufferOp]:
-        candidate = self.candidates.get_def(tid, {})
+        candidate = self.candidates.get_def(tid, ({}, None)).0
         old_sources = set(self.running.keys())
         return [
             swdb.put_op(_db_path(self.path), swdb.ATTR_RUNNING, candidate[src], src)
@@ -2712,7 +2732,7 @@ class _TransformTransactionBase(_Transaction):
         # subscription bookkeeping has no config state for the transaction if
         # it is aborted before its lock-time re-configure runs.
         self.diffs.pop_def(tid, {})
-        candidate = self.candidates.pop_def(tid, {})
+        candidate, merged = self.candidates.pop_def(tid, ({}, None))
         essay = self.essays.pop_def(tid, (None, None))
         linked = self.linked_for(tid)
         self.candidate_link_updates.pop_def(tid, [])
@@ -2721,6 +2741,7 @@ class _TransformTransactionBase(_Transaction):
         if tid == self.locker:
             if ok:
                 self.running = candidate
+                self.merged_running = merged! if candidate else gdata.Container()
                 self.output = essay.0 if essay is not None else None
                 if candidate == {}:
                     self.oper = None
@@ -2758,6 +2779,9 @@ class _TransformTransactionBase(_Transaction):
             return
         raise ValueError("Unexpected persisted transform attribute {attr} at {_format_path(self.path)}")
 
+    def restored(self) -> None:
+        self.merged_running = merge(self.running) if self.running else gdata.Container()
+
     def is_empty(self) -> bool:
         return self.running == {} and self.output is None
 
@@ -2772,10 +2796,7 @@ class _TransformTransactionBase(_Transaction):
         pass
 
     def get(self):
-        if self.running:
-            return merge(self.running)
-        else:
-            return gdata.Container()
+        return self.merged_running
 
     def get_data(self, filt: ?gdata.FNode=None):
         data = self.get()
