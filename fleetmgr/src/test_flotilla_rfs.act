@@ -4,9 +4,34 @@ import stratoweave
 
 import flotilla.layers.y_0 as rfs
 import flotilla.layers.y_0_oper as rfs_oper
+import flotilla.devices.iosxe_oper as iosxe_oper
+import flotilla.rfs as health
 import flotilla.sysspec as sysspec
 from flotilla.layers.y_0 import \
     stratoweave_rfs__device__credentials as Credentials
+
+
+def _neighbor(root: iosxe_oper.root, address: str, state: str, sent: int, received: int) -> None:
+    n = root.bgp_state_data.neighbors.neighbor.create(
+        (afi_safi="ipv4-unicast", vrf_name="default", neighbor_id=address),
+        session_state=state)
+    n.prefix_activity.sent.current_prefixes = u64(sent)
+    n.prefix_activity.received.current_prefixes = u64(received)
+
+
+def _test_read_neighbors():
+    """A down peer is reported, not dropped."""
+    root = iosxe_oper.root()
+    _neighbor(root, "10.0.1.1", "fsm-idle", 0, 0)
+    _neighbor(root, "10.0.2.1", "fsm-established", 3, 1)
+    got = health.read_neighbors(root)
+    testing.assertEqual(2, len(got))
+    testing.assertEqual("fsm-idle", got[0].session_state)
+    testing.assertEqual("fsm-established", got[1].session_state)
+    testing.assertEqual(3, got[1].advertised)
+    testing.assertEqual(1, got[1].received)
+    testing.assertEqual("10.0.1.1 fsm-idle", health.down(got))
+    testing.assertEqual(0, len(health.read_neighbors(None)))
 
 
 actor _test_direct_device_config(t: testing.AsyncT):
@@ -42,7 +67,9 @@ actor _test_direct_device_config(t: testing.AsyncT):
 
 
 actor _test_iosxe_software_upgrade(t: testing.AsyncT):
-    """Run the production IOS XE workflow against flotilla's device mock."""
+    """Run the production IOS XE workflow against flotilla's device mock, with
+    the device-health checks gating it. The mock serves no BGP state, so both
+    checks pass on an empty reading."""
     root = rfs.root()
     dev = root.device.create(
         "xe-1",
@@ -50,6 +77,9 @@ actor _test_iosxe_software_upgrade(t: testing.AsyncT):
         credentials=Credentials(username="admin", password="admin"),
     )
     dev.mock.enabled = True
+    # The post-check waits for a sample taken after the reload, so the poll
+    # period bounds the test time.
+    root.rfs.create("xe-1").device_health.poll_period = u64(1)
 
     tr = stratoweave.test_main(sysspec.SYSSPEC, t.log_handler)
     var attempts = 0
@@ -66,22 +96,25 @@ actor _test_iosxe_software_upgrade(t: testing.AsyncT):
         oper = rfs_oper.root.from_gdata(tr.cfs.newsession().get_data())
         out = oper.device.get("xe-1")
         if out is not None:
-            status = out!.software.state.status
+            state = out!.software.state
+            status = state.status
             if status == "in-progress":
                 saw_in_progress = True
             elif status == "failed":
-                fail("IOS XE software upgrade failed")
+                fail("IOS XE software upgrade failed: {state.precheck.detail}")
                 return
             elif status == "succeeded":
                 if not saw_in_progress:
                     fail("IOS XE upgrade skipped the observable in-progress state")
-                elif out!.software.state.running_release != "17.18.3a":
+                elif state.running_release != "17.18.3a":
                     fail("IOS XE running release was not published")
+                elif state.precheck.verdict != "pass" or state.postcheck.verdict != "pass":
+                    fail("the device-health checks did not both pass")
                 else:
                     finished = True
                     t.success()
                 return
-        if attempts >= 500:
+        if attempts >= 1000:
             fail("timed out waiting for IOS XE software upgrade")
         else:
             after 0.01: poll_status()

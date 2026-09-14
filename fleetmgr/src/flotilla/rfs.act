@@ -1,0 +1,191 @@
+"""Device-health RFS service: BGP session state and prefix counts read off
+the device, used as the device's software upgrade pre-check and post-check.
+"""
+
+import yang.gdata as ygdata
+
+import stratoweave.device as swdev
+import stratoweave.ttt as ttt
+
+import flotilla.layers.base_0 as base
+import flotilla.layers.y_0 as y_0
+import flotilla.devices.iosxe as iosxe
+import flotilla.devices.iosxe_oper as iosxe_oper
+# TODO: required by the compiler, see acton issue #2390
+import yang.identityref
+
+REGISTRANT = "rfs-device-health"
+# How long a check waits for a sample it can pass on. Both sit inside the
+# manager's own deadlines (60 s before install, 15 min after), so the check
+# answers with what it saw instead of being recorded as silent. The post-check
+# gets longer because BGP reconverges well after the device answers NETCONF
+# again.
+PRECHECK_BUDGET = 45.0
+POSTCHECK_BUDGET = 600.0
+
+
+def read_neighbors(root: ?iosxe_oper.root) -> list[(address: str, session_state: str, advertised: int, received: int)]:
+    """Per-peer health out of a device oper tree."""
+    out: list[(address: str, session_state: str, advertised: int, received: int)] = []
+    if root is not None:
+        for n in root.bgp_state_data.neighbors.neighbor:
+            state = n.session_state
+            sent = n.prefix_activity.sent.current_prefixes
+            received = n.prefix_activity.received.current_prefixes
+            out.append((address=n.neighbor_id,
+                        session_state=state if state is not None else "",
+                        advertised=int(sent!) if sent is not None else 0,
+                        received=int(received!) if received is not None else 0))
+    return out
+
+
+def down(ns: list[(address: str, session_state: str, advertised: int, received: int)]) -> str:
+    """The neighbors that are not established, for a verdict detail."""
+    parts: list[str] = []
+    for n in ns:
+        if n.session_state != "fsm-established":
+            parts.append("{n.address} {n.session_state}")
+    return ", ".join(parts)
+
+
+class DeviceHealth(base.DeviceHealth):
+    def transform(self, i, di, dynstate):
+        # No device configuration.
+        return iosxe.root()
+
+
+actor DeviceHealthTransform(
+    path: ttt.Path,
+    update_dynstate: proc(?y_0.stratoweave_rfs__rfs__device_health__dynstate) -> None,
+    dev: swdev.DeviceMgr,
+):
+    """Gates the device's software upgrade on its BGP state.
+
+    update_dynstate is never called: the model's empty dynstate container
+    exists only so the generator gives this transform an actor."""
+    var subscriptions: ?ygdata.SubscriptionManager = None
+    var destination: ?ygdata.Dst = None
+    var registered = False
+    var period = 2.0
+
+    # Taken by the pre-check; the post-check compares against it.
+    var baseline: ?(established: int, advertised: int) = None
+
+    # The check in progress: its kind, the manager's done action, and what
+    # the last sample showed. The id retires the budget timer of an answered
+    # check. The device is subscribed to only while a check runs; a periodic
+    # subscription delivers on every successful read, so each delivery is a
+    # fresh sample to decide on.
+    var kind = ""
+    var check = 0
+    var done: ?action(bool, str) -> None = None
+    var last_seen = ""
+
+    def on_state(root: ?iosxe_oper.root, error: ?Exception) -> None:
+        if kind == "":
+            return
+        if error is not None:
+            # Expected around a reload; the next read gets its turn.
+            last_seen = "could not read the device: {error}"
+            return
+        decide(read_neighbors(root))
+
+    def decide(ns: list[(address: str, session_state: str, advertised: int, received: int)]) -> None:
+        """Decide the waiting check from the sample just delivered; if it does
+        not decide, the next delivery gets its turn."""
+        total = len(ns)
+        est = 0
+        adv = 0
+        for n in ns:
+            if n.session_state == "fsm-established":
+                est += 1
+            adv += n.advertised
+        d = down(ns)
+        if kind == "precheck":
+            if total > 0 and est == 0:
+                # Nothing to compare against afterwards.
+                last_seen = "no established BGP session: {d}"
+                return
+            baseline = (established=est, advertised=adv)
+            if total == 0:
+                answer(True, "no BGP neighbors")
+            elif est < total:
+                answer(True, "{est}/{total} sessions established (down: {d}), {adv} routes advertised")
+            else:
+                answer(True, "{est}/{total} sessions established, {adv} routes advertised")
+            return
+        b = baseline
+        if b is None:
+            answer(False, "no pre-upgrade baseline")
+            return
+        got = "{est}/{b!.established} sessions, {adv}/{b!.advertised} routes"
+        if est < b!.established or adv < b!.advertised:
+            last_seen = "not back to the baseline: {got}" + (", down: {d}" if est < total else "")
+            return
+        answer(True, "recovered: {got}")
+
+    def answer(ok: bool, detail: str) -> None:
+        d = done
+        k = kind
+        kind = ""
+        done = None
+        subscriptions!.declare(set())
+        if ok:
+            print("device-health {path}: {k} pass: {detail}")
+        else:
+            print("device-health {path}: {k} refused: {detail}")
+        if d is not None:
+            d(ok, detail)
+
+    def start(k: str, cb: action(bool, str) -> None, budget: float) -> None:
+        kind = k
+        done = cb
+        last_seen = "no reading from the device"
+        check += 1
+        after budget: expire(check, budget)
+        # The whole neighbors container; the parser keeps only what the
+        # pruned model has.
+        bgp = iosxe_oper.subs.bgp_state_data.neighbors
+        subscriptions!.declare({destination!.deliver({bgp.subscribe(period=period)})})
+
+    def expire(c: int, budget: float) -> None:
+        if c != check or kind == "":
+            return
+        answer(False, "{last_seen} after {int(budget)}s")
+
+    def precheck(cb: action(bool, str) -> None) -> None:
+        start("precheck", cb, PRECHECK_BUDGET)
+
+    def postcheck(cb: action(bool, str) -> None) -> None:
+        start("postcheck", cb, POSTCHECK_BUDGET)
+
+    def register() -> None:
+        if not registered:
+            registered = True
+            swmgr = dev.get_swmgr()
+            swmgr.add_precheck(REGISTRANT, precheck)
+            swmgr.add_postcheck(REGISTRANT, postcheck)
+
+    def unregister() -> None:
+        if registered:
+            registered = False
+            swmgr = dev.get_swmgr()
+            swmgr.remove_precheck(REGISTRANT)
+            swmgr.remove_postcheck(REGISTRANT)
+
+    def on_conf(conf: y_0.stratoweave_rfs__rfs__device_health) -> None:
+        if subscriptions is None:
+            subscriptions = ygdata.SubscriptionManager(dev.tree_provider(), str(path))
+            destination = iosxe_oper.dst(on_state)
+        period = float(conf.poll_period)
+        if conf.enabled:
+            register()
+        else:
+            unregister()
+            subscriptions!.declare(set())
+
+    def shutdown() -> None:
+        unregister()
+        s = subscriptions
+        if s is not None:
+            s.close()

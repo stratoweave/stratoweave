@@ -25,6 +25,10 @@ an IOS XE device.
     fleetmgr RFS /device{cpe}/software/state, no shard
         -> fleetmgr CFS /software/upgrade-campaign/state
 
+    flotilla RFS /rfs{cpe}/device-health
+        -> a periodic BGP state subscription while a check runs
+        -> the device's software upgrade pre-check and post-check
+
 There is no range expansion. A flotilla assigned 500 devices receives 500
 complete `/device` entries, including addresses, credentials, SSH options, policy,
 mock and debug settings, feature flags, and software intent.
@@ -191,8 +195,33 @@ For a device without a shard, the top's own device manager publishes
 `/device/software/state`. Campaign transforms subscribe to both and aggregate
 their own members.
 
-`flotilla` supplies only one modeled layer, the standard RFS. StratoWeave adds
-the implicit device layer beneath it.
+`flotilla` supplies one modeled layer, the standard RFS plus the
+`flotilla-rfs` augment below. StratoWeave adds the implicit device layer
+beneath it.
+
+## Upgrade checks
+
+Every device the top places on a flotilla also gets `/rfs{cpe}/device-health`
+there. Its transform registers the software upgrade pre-check and post-check
+with the device's software manager and subscribes to the device's BGP state
+(`Cisco-IOS-XE-bgp-oper`) only while a check runs, every `poll-period`
+seconds, default 2.
+
+A check judges the readings delivered after it started, so a post-check
+cannot pass on numbers read before the reload; a periodic subscription
+delivers every successful read, so the first one is at most a poll period
+away. The pre-check passes once a reading shows an established neighbor, or
+no BGP neighbors at all, and records the established-session and
+advertised-prefix counts as the baseline. While every neighbor is down it
+keeps waiting and refuses after 45 s; the device is then left on the old
+release. The post-check passes once the device is back at the baseline and
+refuses after 10 minutes, which aborts the activation.
+
+Nothing is read from the device between checks and nothing is published
+but the verdicts, under `/device{cpe}/software/state/precheck` and
+`postcheck`. The top does not carry either up to the campaign yet. The mock
+IOS XE device serves no BGP state, so in the demo every device passes with
+"no BGP neighbors".
 
 ## Tests
 
@@ -201,6 +230,7 @@ the implicit device layer beneath it.
 The focused tests cover node creation, per-device sharding, precise campaign
 links, campaign aggregation, the parent RFS-to-flotilla render, direct
 `/device` configuration at the RFS-only bottom, the mock leaves reaching the
-flotilla, and a complete mock IOS XE software upgrade. The root tests also cover IOS XE adapter behavior and ensure
-that a software-intent change preserves the existing NETCONF adapter and
-session.
+flotilla, reading the BGP neighbors, and a complete mock IOS XE software
+upgrade gated by the device-health checks. The root tests also cover IOS XE
+adapter behavior and ensure that a software-intent change preserves the
+existing NETCONF adapter and session.
