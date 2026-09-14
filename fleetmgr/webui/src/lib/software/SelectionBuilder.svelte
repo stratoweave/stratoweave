@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Device, MatrixEntry } from '$lib/software/model';
+  import type { Device } from '$lib/software/model';
   import {
     emptySelection,
     expandSelection,
@@ -10,19 +10,15 @@
   interface Props {
     inventory: Device[];
     owners: Map<string, string>;
-    matrix: MatrixEntry[];
     error?: string;
     onchange?: (names: string[]) => void;
   }
 
-  let { inventory, owners, matrix, error = '', onchange }: Props = $props();
+  let { inventory, owners, error = '', onchange }: Props = $props();
 
   let selection = $state<Selection>(emptySelection());
   let types = $derived([...new Set(inventory.map((d) => d.type))].sort());
-  let hardwareModels = $derived(
-    [...new Set(inventory.map((d) => d.hardwareModel).filter((m) => m))].sort()
-  );
-  let context = $derived<SelectionContext>({ owners, matrix });
+  let context = $derived<SelectionContext>({ owners });
   let expansion = $derived(expandSelection(selection, inventory, context));
 
   $effect(() => {
@@ -39,11 +35,6 @@
 
   let bars = $derived.by(() => {
     const rows = Object.entries(expansion.byType).sort();
-    const max = Math.max(1, ...rows.map(([, n]) => n));
-    return rows.map(([name, n]) => ({ name, n, w: (n / max) * 100 }));
-  });
-  let hwBars = $derived.by(() => {
-    const rows = Object.entries(expansion.byHardware).sort();
     const max = Math.max(1, ...rows.map(([, n]) => n));
     return rows.map(([name, n]) => ({ name, n, w: (n / max) * 100 }));
   });
@@ -102,28 +93,6 @@
           oninput={(e) => patch({ descriptionContains: e.currentTarget.value })}
         />
       </div>
-      {#if hardwareModels.length > 0}
-        <div class="andr">AND</div>
-        <div class="frow">
-          <span class="flabel">Hardware model</span>
-          <span class="fop">is any of</span>
-          <span class="fvalue tokens">
-            {#each hardwareModels as m (m)}
-              <button
-                class="tok"
-                class:on={selection.hardwareModels.includes(m)}
-                type="button"
-                onclick={() => patch({ hardwareModels: toggle(selection.hardwareModels, m) })}
-              >
-                {m}
-              </button>
-            {/each}
-            {#if selection.hardwareModels.length === 0}
-              <span class="hint">all</span>
-            {/if}
-          </span>
-        </div>
-      {/if}
       <div class="andr">AND</div>
       <div class="frow">
         <span class="flabel">Requires approval</span>
@@ -187,18 +156,6 @@
           {/each}
         </div>
       {/if}
-      {#if hwBars.length > 0}
-        <div>
-          <div class="kick" style:margin-bottom="10px">Matched by hardware</div>
-          {#each hwBars as b (b.name)}
-            <div class="bar-row">
-              <span class="mono bar-name">{b.name}</span>
-              <span class="bar-track"><span class="bar-fill hw" style:width={`${b.w}%`}></span></span>
-              <span class="mono tn bar-n">{b.n.toLocaleString()}</span>
-            </div>
-          {/each}
-        </div>
-      {/if}
     </div>
   </div>
 
@@ -225,7 +182,6 @@
             <tr>
               <td class="mono sname">{d.name}</td>
               <td class="mono stype">{d.type}</td>
-              <td class="mono tn shw">{d.hardwareModel || '—'}</td>
             </tr>
           {/each}
         </tbody>
@@ -382,8 +338,7 @@
 
   .dists {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 32px;
+    grid-template-columns: 1fr;
   }
 
   .bar-row {
@@ -416,10 +371,6 @@
     height: 100%;
     border-radius: 4px;
     background: var(--sw-primary);
-  }
-
-  .bar-fill.hw {
-    background: #8b5cf6;
   }
 
   .bar-n {
@@ -485,11 +436,6 @@
 
   .stype {
     color: var(--sw-text-muted);
-  }
-
-  .shw {
-    text-align: right;
-    color: var(--sw-text-secondary);
   }
 
   .hint {

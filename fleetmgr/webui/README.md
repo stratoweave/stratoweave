@@ -19,6 +19,7 @@ a real install takes minutes.
     npm install
     STRATOWEAVE_API_ORIGIN=http://127.0.0.1:18200 npm run dev
     # -> http://localhost:3000
+    # or, from ../: just webui
 
 Production build: `npm run build`, then
 `STRATOWEAVE_API_ORIGIN=... node build`. Type check: `npm run check`.

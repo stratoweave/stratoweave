@@ -44,9 +44,6 @@
       <h2>{device.name}</h2>
       <p class="meta">
         type <span class="mono">{device.type}</span>
-        {#if device.hardwareModel}
-          · hardware <span class="mono">{device.hardwareModel}{device.hardwareRevision ? ` ${device.hardwareRevision}` : ''}</span>
-        {/if}
         {#if device.address}
           · OOB <span class="mono">{device.address}</span>
         {/if}
@@ -102,8 +99,8 @@
       </div>
     {/if}
     <p class="hint">
-      Job steps, pre/post-check verdicts and the adapter log are modelled southbound but not
-      published yet — this page grows as they land.
+      The flotilla publishes the pre- and post-check verdicts per device; the top carries only
+      status and running release up, so that is what this page shows.
     </p>
   </section>
 {/if}

@@ -1,4 +1,4 @@
-import type { Device, MatrixEntry } from '$lib/software/model';
+import type { Device } from '$lib/software/model';
 
 // Campaign members are leafrefs into the fleet, so every selection ends
 // as an explicit, inventory-verified name list ("no range expansion" is
@@ -16,8 +16,6 @@ export interface Selection {
   requiresApproval: '' | 'yes' | 'no';
   /** '' = don't care; 'no' excludes devices another campaign owns */
   ownedByCampaign: '' | 'yes' | 'no';
-  /** is any of; empty = all */
-  hardwareModels: string[];
   /** explicit names, newline/comma-separated; when non-empty it is the
    * base set instead of the whole inventory */
   pasted: string;
@@ -35,7 +33,6 @@ export interface Expansion {
    * (the leafref would reject them) */
   unknown: string[];
   byType: Record<string, number>;
-  byHardware: Record<string, number>;
   excluded: ExclusionRow[];
   sample: Device[];
 }
@@ -43,7 +40,6 @@ export interface Expansion {
 export interface SelectionContext {
   /** device name -> owning campaign name, from every campaign's members */
   owners: Map<string, string>;
-  matrix: MatrixEntry[];
 }
 
 export function emptySelection(): Selection {
@@ -53,7 +49,6 @@ export function emptySelection(): Selection {
     descriptionContains: '',
     requiresApproval: '',
     ownedByCampaign: 'no',
-    hardwareModels: [],
     pasted: ''
   };
 }
@@ -68,24 +63,6 @@ export function nameMatches(name: string, pattern: string): boolean {
     return rx.test(name);
   }
   return name.toLowerCase().includes(pattern.toLowerCase());
-}
-
-/** A matrix row that forbids the pairing: explicitly excluded, or a row
- * for this hardware with no upgrade path. Devices without hardware-model
- * or without a row are unconstrained. */
-function matrixBlocks(device: Device, matrix: MatrixEntry[]): MatrixEntry | null {
-  if (!device.hardwareModel) return null;
-  for (const row of matrix) {
-    if (row.model !== device.hardwareModel) continue;
-    // revision column may hold one revision; empty matches all
-    if (row.revision && device.hardwareRevision && row.revision !== device.hardwareRevision) {
-      continue;
-    }
-    if (row.approval === 'excluded' || row.targetVersion === '') {
-      return row;
-    }
-  }
-  return null;
 }
 
 export function expandSelection(
@@ -124,8 +101,7 @@ export function expandSelection(
     (d) =>
       (sel.types.length === 0 || sel.types.includes(d.type)) &&
       nameMatches(d.name, pattern) &&
-      (!description || d.description.toLowerCase().includes(description)) &&
-      (sel.hardwareModels.length === 0 || sel.hardwareModels.includes(d.hardwareModel))
+      (!description || d.description.toLowerCase().includes(description))
   );
 
   // The remaining criteria are exclusions worth accounting for, not
@@ -134,8 +110,6 @@ export function expandSelection(
   let ownedOut = 0;
   const ownedBy = new Set<string>();
   let approvalOut = 0;
-  let matrixOut = 0;
-  const matrixReasons = new Set<string>();
   for (const d of candidates) {
     const owner = context.owners.get(d.name);
     if (sel.ownedByCampaign === 'no' && owner !== undefined) {
@@ -153,33 +127,16 @@ export function expandSelection(
     if (sel.requiresApproval === 'yes' && !d.approvalRequired) {
       continue;
     }
-    const blocked = matrixBlocks(d, context.matrix);
-    if (blocked !== null) {
-      matrixOut += 1;
-      matrixReasons.add(`${blocked.model} ${blocked.exclusion || 'no upgrade path'}`);
-      continue;
-    }
     selected.push(d);
   }
   selected.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   const byType: Record<string, number> = {};
-  const byHardware: Record<string, number> = {};
   for (const d of selected) {
     byType[d.type] = (byType[d.type] ?? 0) + 1;
-    if (d.hardwareModel) {
-      byHardware[d.hardwareModel] = (byHardware[d.hardwareModel] ?? 0) + 1;
-    }
   }
 
   const excluded: ExclusionRow[] = [];
-  if (matrixOut > 0) {
-    excluded.push({
-      n: matrixOut,
-      what: 'blocked by the hardware matrix',
-      path: [...matrixReasons].slice(0, 2).join(' · ')
-    });
-  }
   if (ownedOut > 0) {
     excluded.push({
       n: ownedOut,
@@ -206,7 +163,6 @@ export function expandSelection(
     names: selected.map((d) => d.name),
     unknown,
     byType,
-    byHardware,
     excluded,
     sample: selected.slice(0, 6)
   };

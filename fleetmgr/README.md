@@ -89,6 +89,16 @@ The submission and observation steps are also available separately:
 
 Set `FLEETMGR_API` to point these targets at a top node on another address.
 
+## Web UI
+
+`webui/` is a SvelteKit UI for the same northbound: fleet inventory and
+upgrade campaigns over RESTCONF, through its own server-side proxy. It
+needs Node; run `npm install` in `webui/` once, then
+
+    just webui
+
+starts the dev server on :3000 against `FLEETMGR_API`. See `webui/README.md`.
+
 ## Lab with real devices
 
 `test/lab` is a containerlab lab: three c8000v CEs peering eBGP with an FRR

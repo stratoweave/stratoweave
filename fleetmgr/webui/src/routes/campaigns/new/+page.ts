@@ -1,5 +1,5 @@
 import { restconfGetJson } from '$lib/core/restconf/client';
-import { FLEET_ROOT, SOFTWARE_ROOT, parseCampaigns, parseCatalog, parseFleet } from '$lib/software/model';
+import { FLEET_ROOT, SOFTWARE_ROOT, parseCampaigns, parseFleet } from '$lib/software/model';
 
 import type { PageLoad } from './$types';
 
@@ -21,16 +21,13 @@ export const load: PageLoad = async ({ fetch }) => {
       getOrNull(SOFTWARE_ROOT, fetch),
       getOrNull(FLEET_ROOT, fetch)
     ]);
-    const { images, matrix } = parseCatalog(software);
     return {
       devices: parseFleet(fleet).devices,
       campaigns: parseCampaigns(software),
-      images,
-      matrix,
       loadError: ''
     };
   } catch (loadError) {
     const message = loadError instanceof Error ? loadError.message : 'Failed to load inventory.';
-    return { devices: [], campaigns: [], images: [], matrix: [], loadError: message };
+    return { devices: [], campaigns: [], loadError: message };
   }
 };

@@ -25,8 +25,6 @@ export interface DeviceJson {
   type?: string;
   shard?: string;
   description?: string;
-  'hardware-model'?: string;
-  'hardware-revision'?: string;
   address?: AddressJson[];
   credentials?: { username?: string; password?: string };
   mock?: { enabled?: boolean };
@@ -75,7 +73,6 @@ export interface DataTreeJson {
   };
   'software:software'?: {
     'upgrade-campaign'?: CampaignJson[];
-    catalog?: CatalogJson;
   };
 }
 
@@ -91,45 +88,9 @@ export interface FleetPatchJson {
   };
 }
 
-export interface MatrixEntryJson {
-  model: string;
-  revision: string;
-  'target-version'?: string;
-  'min-flash'?: number;
-  'min-free'?: number;
-  'install-mode-support'?: string;
-  approval?: string;
-  exclusion?: string;
-}
-
-export interface ImageRestrictionJson {
-  id: string;
-  description?: string;
-}
-
-export interface ImageJson {
-  version: string;
-  'file-name'?: string;
-  'file-size'?: number;
-  checksum?: string;
-  url?: string;
-  'rommon-min'?: string;
-  'rollback-to'?: string;
-  'storage-min-flash'?: number;
-  'storage-min-free'?: number;
-  approval?: { state?: string; by?: string; at?: string; 'change-ref'?: string };
-  restriction?: ImageRestrictionJson[];
-}
-
-export interface CatalogJson {
-  image?: ImageJson[];
-  'hardware-matrix'?: { entry?: MatrixEntryJson[] };
-}
-
 export interface SoftwarePatchJson {
   'software:software': {
     'upgrade-campaign'?: (Partial<CampaignJson> & { name: string })[];
-    catalog?: CatalogJson;
   };
 }
 
@@ -174,8 +135,6 @@ export interface Device {
   name: string;
   type: string;
   shard: string;
-  hardwareModel: string;
-  hardwareRevision: string;
   description: string;
   approvalRequired: boolean;
   /** First address entry as `host[:port]`; empty for a mock. */
@@ -224,8 +183,6 @@ function parseDevice(entry: DeviceJson & { 'approval-required'?: boolean }): Dev
     name: entry.name,
     type: entry.type ?? '',
     shard: entry.shard ?? '',
-    hardwareModel: entry['hardware-model'] ?? '',
-    hardwareRevision: entry['hardware-revision'] ?? '',
     description: entry.description ?? '',
     approvalRequired: entry['approval-required'] === true,
     address: firstAddress(entry)
@@ -297,71 +254,6 @@ export function parseCampaigns(json: unknown): Campaign[] {
   return (tree?.['upgrade-campaign'] ?? []).map(parseCampaign);
 }
 
-// ── Catalogue view types ──
-
-export interface CatalogImage {
-  version: string;
-  fileName: string;
-  fileSize: number | null;
-  checksum: string;
-  url: string;
-  rommonMin: string;
-  rollbackTo: string;
-  storageMinFlash: number | null;
-  storageMinFree: number | null;
-  approvalState: string;
-  approvedBy: string;
-  approvedAt: string;
-  changeRef: string;
-  restrictions: { id: string; description: string }[];
-}
-
-export interface MatrixEntry {
-  model: string;
-  revision: string;
-  targetVersion: string;
-  minFlash: number | null;
-  minFree: number | null;
-  installModeSupport: string;
-  approval: string;
-  exclusion: string;
-}
-
-/** Parse the catalog subtree out of a software:software GET. */
-export function parseCatalog(json: unknown): { images: CatalogImage[]; matrix: MatrixEntry[] } {
-  const catalog = (json as DataTreeJson)?.['software:software']?.catalog;
-  return {
-    images: (catalog?.image ?? []).map((i) => ({
-      version: i.version,
-      fileName: i['file-name'] ?? '',
-      fileSize: typeof i['file-size'] === 'number' ? i['file-size'] : null,
-      checksum: i.checksum ?? '',
-      url: i.url ?? '',
-      rommonMin: i['rommon-min'] ?? '',
-      rollbackTo: i['rollback-to'] ?? '',
-      storageMinFlash: typeof i['storage-min-flash'] === 'number' ? i['storage-min-flash'] : null,
-      storageMinFree: typeof i['storage-min-free'] === 'number' ? i['storage-min-free'] : null,
-      // GET does not materialize the YANG default (draft).
-      approvalState: i.approval?.state ?? 'draft',
-      approvedBy: i.approval?.by ?? '',
-      approvedAt: i.approval?.at ?? '',
-      changeRef: i.approval?.['change-ref'] ?? '',
-      restrictions: (i.restriction ?? []).map((r) => ({ id: r.id, description: r.description ?? '' }))
-    })),
-    matrix: (catalog?.['hardware-matrix']?.entry ?? []).map((e) => ({
-      model: e.model,
-      revision: e.revision,
-      targetVersion: e['target-version'] ?? '',
-      minFlash: typeof e['min-flash'] === 'number' ? e['min-flash'] : null,
-      minFree: typeof e['min-free'] === 'number' ? e['min-free'] : null,
-      installModeSupport: e['install-mode-support'] ?? '',
-      // GET does not materialize the YANG default (conditional).
-      approval: e.approval ?? 'conditional',
-      exclusion: e.exclusion ?? ''
-    }))
-  };
-}
-
 export function parseCampaignEntry(json: unknown): Campaign | null {
   const entries = (json as CampaignEntryJson)?.['software:upgrade-campaign'];
   return entries && entries.length > 0 ? parseCampaign(entries[0]) : null;
@@ -388,94 +280,6 @@ export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
   if (imageUrl) entry['image-url'] = imageUrl;
   if (input.allowStaging) entry['allow-staging'] = true;
   return { 'software:software': { 'upgrade-campaign': [entry] } };
-}
-
-export const CATALOG_IMAGE_ROOT = 'data/software:software/catalog/image';
-export const CATALOG_MATRIX_ROOT = 'data/software:software/catalog/hardware-matrix/entry';
-
-export interface NewImage {
-  version: string;
-  fileName: string;
-  fileSize: string;
-  checksum: string;
-  url: string;
-  rommonMin: string;
-  rollbackTo: string;
-  storageMinFlash: string;
-  storageMinFree: string;
-  /** one per line: `id: description` */
-  restrictions: string;
-}
-
-export function imagePatch(input: NewImage): SoftwarePatchJson {
-  const entry: ImageJson = { version: input.version.trim() };
-  const set = (key: keyof ImageJson, value: string): void => {
-    if (value.trim()) (entry as unknown as Record<string, unknown>)[key] = value.trim();
-  };
-  set('file-name', input.fileName);
-  set('checksum', input.checksum);
-  set('url', input.url);
-  set('rommon-min', input.rommonMin);
-  set('rollback-to', input.rollbackTo);
-  if (input.fileSize.trim()) entry['file-size'] = Number(input.fileSize);
-  if (input.storageMinFlash.trim()) entry['storage-min-flash'] = Number(input.storageMinFlash);
-  if (input.storageMinFree.trim()) entry['storage-min-free'] = Number(input.storageMinFree);
-  const restrictions = input.restrictions
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => {
-      const i = line.indexOf(':');
-      return i > 0
-        ? { id: line.slice(0, i).trim(), description: line.slice(i + 1).trim() }
-        : { id: line, description: '' };
-    });
-  if (restrictions.length > 0) entry.restriction = restrictions;
-  return { 'software:software': { catalog: { image: [entry] } } };
-}
-
-export function imageApprovalPatch(
-  version: string,
-  state: 'approved' | 'withdrawn' | 'draft',
-  by: string,
-  changeRef: string
-): SoftwarePatchJson {
-  const approval: NonNullable<ImageJson['approval']> = { state, at: new Date().toISOString() };
-  if (by.trim()) approval.by = by.trim();
-  if (changeRef.trim()) approval['change-ref'] = changeRef.trim();
-  return { 'software:software': { catalog: { image: [{ version, approval }] } } };
-}
-
-export interface NewMatrixEntry {
-  model: string;
-  revision: string;
-  targetVersion: string;
-  minFlash: string;
-  minFree: string;
-  installModeSupport: string;
-  approval: string;
-  exclusion: string;
-}
-
-export function matrixEntryPatch(input: NewMatrixEntry): SoftwarePatchJson {
-  const entry: MatrixEntryJson = {
-    model: input.model.trim(),
-    revision: input.revision.trim()
-  };
-  if (input.targetVersion.trim()) entry['target-version'] = input.targetVersion.trim();
-  if (input.minFlash.trim()) entry['min-flash'] = Number(input.minFlash);
-  if (input.minFree.trim()) entry['min-free'] = Number(input.minFree);
-  if (input.installModeSupport.trim()) entry['install-mode-support'] = input.installModeSupport.trim();
-  if (input.approval.trim()) entry.approval = input.approval.trim();
-  if (input.exclusion.trim()) entry.exclusion = input.exclusion.trim();
-  return { 'software:software': { catalog: { 'hardware-matrix': { entry: [entry] } } } };
-}
-
-export function formatBytes(n: number | null): string {
-  if (n === null) return '—';
-  if (n >= 1e9) return `${(n / 1e9).toFixed(2)} GB`;
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
-  return `${n} B`;
 }
 
 /** PATCH merges: sending only {name, admin-state} flips one leaf and

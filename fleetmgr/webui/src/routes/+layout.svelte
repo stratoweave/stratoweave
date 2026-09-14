@@ -15,8 +15,7 @@
   const PAGE_LABELS: Record<string, string> = {
     '/devices': 'Devices',
     '/campaigns': 'Campaigns',
-    '/campaigns/new': 'New campaign',
-    '/images': 'Images & matrix'
+    '/campaigns/new': 'New campaign'
   };
 
   let currentPathname = $derived(page.url.pathname);
@@ -57,14 +56,6 @@
         >
           <span class="nav-icon">⬆</span>
           Campaigns
-        </a>
-        <a
-          class="nav-item"
-          class:active={currentPathname.startsWith('/images')}
-          href="/images"
-        >
-          <span class="nav-icon">▤</span>
-          Images &amp; matrix
         </a>
       </div>
       <div class="nav-section">
