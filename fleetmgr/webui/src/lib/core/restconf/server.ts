@@ -47,16 +47,17 @@ export async function proxyRequest(request: Request, targetPath: string, search 
     const responseHeaders = new Headers(upstream.headers);
     responseHeaders.delete('connection');
     responseHeaders.delete('content-length');
+    // fetch has already decompressed/de-chunked the body it hands us.
+    responseHeaders.delete('content-encoding');
+    responseHeaders.delete('transfer-encoding');
 
     const bodylessStatus = upstream.status === 204 || upstream.status === 304;
     if (bodylessStatus) {
-      // Strip body-related headers the upstream may still send on 204
-      // (some servers leave Content-Type / Transfer-Encoding set even
-      // with no body). Set Content-Length: 0 explicitly — without it
-      // the browser keeps the keep-alive connection open waiting for a
-      // delimiter and `response.text()` never resolves.
+      // Strip the Content-Type some servers still send with no body, and set
+      // Content-Length: 0 explicitly. Without it the browser keeps the
+      // keep-alive connection open waiting for a delimiter and
+      // `response.text()` never resolves.
       responseHeaders.delete('content-type');
-      responseHeaders.delete('transfer-encoding');
       responseHeaders.set('content-length', '0');
       return new Response(null, {
         status: upstream.status,

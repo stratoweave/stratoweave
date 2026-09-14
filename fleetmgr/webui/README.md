@@ -4,10 +4,11 @@ A SvelteKit UI for the fleetmgr contract (see ../README.md): fleet
 inventory and software upgrade campaigns over RESTCONF.
 
 The backend serves no CORS headers, so the browser never talks to it
-directly: the UI's own server proxies `/api/restconf/*` to
-`STRATOWEAVE_API_ORIGIN`. Writes send `async: true` so a PATCH returns
-when the transaction commits instead of after devices finish applying —
-a real install takes minutes.
+directly: `src/hooks.server.ts` proxies `/api/*` to `STRATOWEAVE_API_ORIGIN`,
+forwarding the raw percent-encoded path so encoded list keys reach the
+backend intact. Writes send `async: true` so a PATCH returns when the
+transaction commits instead of after devices finish applying — a real
+install takes minutes.
 
 ## Run
 
