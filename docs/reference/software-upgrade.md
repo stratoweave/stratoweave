@@ -6,9 +6,9 @@ still needed before software upgrades are safe to run without manual recovery.
 The current implementation supports an IOS XE upgrade with four NETCONF RPCs:
 copy the image to bootflash, add it, activate it with a 30 minute auto-abort
 timer, and commit it once the post-checks pass. It checks the running release
-before starting, waits for the device to return on the requested release,
-aborts when a post-check fails, publishes basic operational state, and resyncs
-the device schema.
+before starting, runs the registered pre-checks before activating, waits for
+the device to return on the requested release, aborts when a post-check fails,
+publishes basic operational state, and resyncs the device schema.
 
 CI runs the same path against an in-process NETCONF mock. A live-device run is
 still required before release because the mock cannot reproduce IOS XE reload,
@@ -28,17 +28,16 @@ The current manager implements:
 ```text
 check -> already running? -> up-to-date
   |
-  +-> prepare -> install -> post-checks -> commit -> check -> resync -> succeeded
-          |          |           |            |
-          |          |           +------------+-> rollback -> check -> rolled-back
-          |          |                                |
-          +----------+--------------------------------+-> failed
+  +-> prepare -> pre-checks -> install -> post-checks -> commit -> check -> resync -> succeeded
+          |          |            |           |            |
+          |          |            |           +------------+-> rollback -> check -> rolled-back
+          |          |            |                              |
+          +----------+------------+------------------------------+-> failed
 ```
 
 The following parts of the model and API are not implemented yet:
 
 - early staging controlled by `allow-staging`;
-- pre-install checks;
 - cleanup;
 - per-job progress and timestamps;
 - retry and recovery after a process restart;
@@ -63,25 +62,29 @@ The current reconcile rules are:
    `up-to-date` and stop.
 5. If the read fails, log the error and continue. A failed read is not treated
    as evidence that the device is already up to date.
-6. Publish `in-progress`, call `prepare`, then call `install`.
-7. After `install` succeeds, ask the adapter for the `commit_window`: seconds
+6. Publish `in-progress` and call `prepare`.
+7. Run every registered pre-check. Each gets a `done(ok, reason)` action. A
+   refusal, or a pre-check that has not answered within `PRECHECK_TIMEOUT`
+   (60 seconds), publishes `failed` with nothing activated. With no
+   pre-checks registered, or all passing, call `install`.
+8. After `install` succeeds, ask the adapter for the `commit_window`: seconds
    left before the platform reverts on its own. With less than `COMMIT_MARGIN`
    (2 minutes) left, roll back at once. Otherwise the post-check deadline is
    the smaller of `POSTCHECK_TIMEOUT` (15 minutes) and what is left minus the
    margin.
-8. Run every registered post-check. Each gets a `done(ok, reason)` action.
-   With no post-checks registered, go straight to `commit`.
-9. When all post-checks pass, call `commit`, then read the release again. If
-   the device does not run the target, it reverted before the commit took:
-   publish `failed`. Otherwise resync the device and publish `succeeded`.
-10. When a post-check fails, a post-check has not answered within the
+9. Run every registered post-check, the same way. With no post-checks
+   registered, go straight to `commit`.
+10. When all post-checks pass, call `commit`, then read the release again. If
+    the device does not run the target, it reverted before the commit took:
+    publish `failed`. Otherwise resync the device and publish `succeeded`.
+11. When a post-check fails, a post-check has not answered within the
     deadline, or `commit` fails, call `rollback` with the release read in
     step 3, read the release again, and publish `rolled-back`.
-11. A `prepare`, `install`, or `rollback` error publishes `failed`.
+12. A `prepare`, `install`, or `rollback` error publishes `failed`.
 
-Every decision bumps an attempt counter. A post-check reply or timer that
-belongs to an earlier step is ignored. Post-checks registered during a run
-count from the next run.
+Every decision bumps an attempt counter. A check reply or timer that belongs
+to an earlier step is ignored. Checks registered during a run count from the
+next run. A check removed during its round no longer holds the round up.
 
 The manager sets `busy` before the initial read and clears it after the final
 read or an error. Repeated configuration while a run is active does not start a
@@ -142,10 +145,11 @@ stratoweave-rfs:device=<name>/software/state
 ```
 
 `SoftwareManager` sends a `SoftwareState` copy to `DeviceMgr` whenever `status`
-or `running-release` changes. `DeviceMgr` merges it into the device entry's
-operational tree and calls the TTT device node's `update_oper`. Registration
-replays the current state, so a device node created after a state change still
-gets the latest value.
+or `running-release` changes, and whenever a round of checks reaches a
+verdict. `DeviceMgr` merges it into the device entry's operational tree and
+calls the TTT device node's `update_oper`. Registration replays the current
+state, so a device node created after a state change still gets the latest
+value.
 
 The manager currently populates:
 
@@ -153,9 +157,13 @@ The manager currently populates:
 |---|---|
 | `status` | `unknown`, `up-to-date`, `in-progress`, `succeeded`, `rolled-back`, or `failed` |
 | `running-release` | last release returned by `check`, using the device's spelling |
+| `precheck`, `postcheck` | one `check-result` each: `verdict` is `not-run`, `pass`, or `fail`; `detail` names the first refusing registrant and its reason, the registrants that did not answer, or each passing registrant with its reason; `at` is when the verdict was reached |
 
-The YANG model also contains `upgrade-needed`, `job`, `precheck`, and
-`postcheck`. The current manager does not publish those values.
+Both verdicts return to `not-run` when a new run starts. The results are one
+aggregate per round, not one per registrant.
+
+The YANG model also contains `upgrade-needed` and `job`. The current manager
+does not publish those values.
 
 Operational reads return the current state. `update_oper` does not trigger a
 TTT recompute, so a northbound subscription does not receive these changes yet.
@@ -457,9 +465,10 @@ Current coverage includes:
 - publication of software status and running release as operational data.
 
 `src/test_swmgr.act` covers the manager against the in-memory adapter:
-post-checks gate the commit, a failed or silent post-check rolls back, a late
-reply is ignored, a removed post-check is not consulted, and a failed commit or
-rollback ends as designed.
+pre-checks gate the install, a refused or silent pre-check ends `failed` with
+nothing installed, post-checks gate the commit, a failed or silent post-check
+rolls back, a late reply is ignored, a removed check is not consulted, both
+verdicts are published, and a failed commit or rollback ends as designed.
 
 The mock does not reproduce memory pressure, SSH and NETCONF startup timing,
 vendor bugs, or all RPC error details. Run at least one real upgrade with the
@@ -511,9 +520,11 @@ the immediately preceding `xcopy` is still valid.
 
 ### 8.3 Checks and cleanup
 
-Implement the registered pre-check callbacks with the same deadline and fencing
-as the post-checks. Post-checks get no device evidence from the manager; a
-registrant that needs it must read the device itself.
+Checks get no device evidence from the manager; a registrant that needs it
+must read the device itself. A check that answers from a subscription must
+judge a sample taken after the check began, or a post-check passes on numbers
+read before the reload. Periodic subscriptions deliver every sample, so
+counting deliveries is enough.
 
 The manager needs to know whether a platform supports rollback so it does not
 report recovery that the adapter cannot provide.
@@ -523,8 +534,8 @@ manual recovery.
 
 ### 8.4 Operational detail
 
-Populate the modeled `job`, `precheck`, and `postcheck` nodes. Decide whether
-check results are aggregate or keyed by registrant. Make `update_oper` notify
+Populate the modeled `job` node. Decide whether check results stay one
+aggregate per round or become keyed by registrant. Make `update_oper` notify
 northbound subscribers as well as serving current values to reads.
 
 Report why an operation reverted, not only that it did.
