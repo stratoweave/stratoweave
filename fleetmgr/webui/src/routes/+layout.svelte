@@ -1,9 +1,12 @@
 <script lang="ts">
+  import '$lib/fonts.css';
   import '../app.css';
 
   import { invalidateAll } from '$app/navigation';
   import { page } from '$app/state';
   import type { Snippet } from 'svelte';
+
+  import logoUrl from '$lib/assets/stratoweave-logo.svg';
 
   let { children }: { children?: Snippet } = $props();
 
@@ -39,10 +42,10 @@
       <a class="logo-link" href="/campaigns" aria-label="fleetmgr — go to campaigns">
         <img
           class="logo-img"
-          src="/stratoweave-logo.png"
-          alt="fleetmgr"
-          width="286"
-          height="53"
+          src={logoUrl}
+          alt="StratoWeave fleetmgr"
+          width="1732"
+          height="397"
         />
       </a>
     </div>

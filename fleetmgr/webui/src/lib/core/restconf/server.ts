@@ -11,7 +11,7 @@ async function readProxyBody(request: Request): Promise<ArrayBuffer | undefined>
   return body.byteLength > 0 ? body : undefined;
 }
 
-export function getApiOrigin(): string | null {
+function getApiOrigin(): string | null {
   return process.env.STRATOWEAVE_API_ORIGIN || null;
 }
 
@@ -27,13 +27,22 @@ export async function proxyRequest(request: Request, targetPath: string, search 
     );
   }
 
+  // Only ever proxy to a path under the configured origin. A leading "//"
+  // would otherwise be read by `new URL` as a protocol-relative host and turn
+  // the proxy into an open relay.
+  const pathname = targetPath.startsWith('/') ? targetPath : `/${targetPath}`;
+  if (pathname.startsWith('//') || pathname.includes('\\')) {
+    return Response.json({ message: 'Invalid proxy path' }, { status: 400 });
+  }
+
   const headers = new Headers(request.headers);
   headers.delete('connection');
   headers.delete('content-length');
   headers.delete('host');
 
   const body = await readProxyBody(request);
-  const targetUrl = new URL(targetPath.startsWith('/') ? targetPath : `/${targetPath}`, origin);
+  const targetUrl = new URL(origin);
+  targetUrl.pathname = pathname;
   targetUrl.search = search;
 
   try {
