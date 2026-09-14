@@ -72,4 +72,4 @@ do not seem to add value, it may be a sign that the YANG model should be
 updated to make that node mandatory or give it a default value.
 Particularly for lower-layer transforms, it's often better to have a more
 strictly defined input schema to avoid having to write defensive code in the
-transform method.
+[transform function](transforms.md#the-transform-function).

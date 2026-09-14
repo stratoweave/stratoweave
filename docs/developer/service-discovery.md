@@ -47,7 +47,7 @@ SORESPO ships two discovery entry points that mirror this picture:
 
 ## A discovery function is a pure function
 
-Like a [transform method](transforms.md#the-transform-method), a discovery
+Like a [transform function](transforms.md#the-transform-function), a discovery
 function is a **pure function**: it takes parsed device configuration and
 returns service-layer data, with no side effects, no I/O, and no device access.
 
@@ -227,7 +227,7 @@ not yet covered.
     the device type inside the RFS discovery functions and keep all
     vendor-specific reads there. CFS discovery should only ever consume the
     normalized RFS data. This is the same separation of concerns that the
-    [RFS transform](transforms.md#the-rfs-transform-method) layer enforces in the
+    [RFS transform](transforms.md#the-rfs-transform-function) layer enforces in the
     forward direction.
 
 ## Testing service discovery
