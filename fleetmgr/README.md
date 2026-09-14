@@ -49,6 +49,19 @@ processes use these ports:
 For bottom-node development, `just flotilla` still starts one standalone
 instance on the first flotilla's ports. Do not run it alongside `just demo`.
 
+Mock devices take three leaves under `mock/software`. `upgrade-duration` is how many
+seconds a whole software upgrade takes; the mock spreads it over the
+operations as measured on a lab c8000v (the numbers are in
+`docs/reference/software-upgrade.md`), and absent or 0 completes each
+operation at once. `failure`
+names one IOS XE failure to reproduce: `download-failed`, `add-failed`,
+`activate-refused`, `commit-failed` or `reverts`. `running-release` is the
+release the device runs before any upgrade. In the demo, `cpe-02` takes 40 s
+and fails its commit, so the campaign aborts it and it ends `rolled-back`;
+`cpe-03` already runs the target and ends `up-to-date`. The leaves are read
+when the device is created; change them by deleting and re-creating the
+device.
+
 Inspect the top CFS and the bottom RFS independently:
 
     curl -H "Accept: application/yang-data+json" \
@@ -114,7 +127,7 @@ the implicit device layer beneath it.
 
 The focused tests cover node creation, per-device sharding, precise campaign
 links, campaign aggregation, the parent RFS-to-flotilla render, direct
-`/device` configuration at the RFS-only bottom, and a complete mock IOS XE
-software upgrade. The root tests also cover IOS XE adapter behavior and ensure
+`/device` configuration at the RFS-only bottom, the mock leaves reaching the
+flotilla, and a complete mock IOS XE software upgrade. The root tests also cover IOS XE adapter behavior and ensure
 that a software-intent change preserves the existing NETCONF adapter and
 session.
