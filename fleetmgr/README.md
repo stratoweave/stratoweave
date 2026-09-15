@@ -89,6 +89,13 @@ The submission and observation steps are also available separately:
 
 Set `FLEETMGR_API` to point these targets at a top node on another address.
 
+## Lab with real devices
+
+`test/lab` is a containerlab lab: three c8000v CEs peering eBGP with an FRR
+PE, plus an image server the devices pull software from over SCP. It runs
+real upgrades and downgrades through campaigns against real IOS XE, and the
+BGP sessions give the devices real routing state. See `test/lab/README.md`.
+
 ## Models and transforms
 
 The `fleetmgr` CFS has two inventory lists:
