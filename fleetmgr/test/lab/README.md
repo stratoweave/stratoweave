@@ -58,6 +58,13 @@ In another terminal, from `../..`:
 Then:
 
     just add-devices                            # onboard ce1-ce3 into flotilla-1 as c8000v-ce1 and so on
+    just verdicts                               # software status and check verdicts per CE
+
+The verdict detail carries what the check saw, "1/1 sessions established,
+3 routes advertised"; the device is only read while a check runs.
+`just break-link ce1` takes ce1's WAN down and the session drops within
+15 s, so a campaign started now is refused by the pre-check, with the
+neighbor in the detail; `just heal-link ce1` brings it back.
 
 ## Upgrading
 
@@ -67,13 +74,15 @@ Create and run a campaign with the URL `just image-url` prints, or headless:
     just CES=ce3 upgrade                        # one device
     just RELEASE=17.16.01a CES=ce3 upgrade      # a downgrade is the same run with a lower release
     just state                                  # campaign state from the top
+    just verdicts                               # verdicts from the flotilla
     just upgrade-clear                          # delete the campaign
 
 Knobs like `CES`, `RELEASE` and `CAMPAIGN` go before the recipe, as above,
 or in the environment; the top of the Justfile lists them all.
 
 Staging takes about two minutes for a ~1 GB image and the reload another
-four; a run ends after about eight.
+four. The post-check then waits for a BGP sample taken after the reload that
+is back at the pre-check's baseline before the commit goes out.
 
 ## The demo fleets in the running lab
 
@@ -136,8 +145,10 @@ root has none, so everything has to be present before `just start`.
 
 `pe-01` is FRR from the public `quay.io/frrouting/frr` image with its
 config, daemons list and device setup script bound in from `configs/`.
-Sessions are up about 20 s after the CEs are. `just pe` shows them;
-`docker exec <lab>-pe-01 vtysh` gives the CLI.
+Sessions are up about 20 s after the CEs are. The PE sets a 15 s hold time,
+which the CEs accept, so a broken link takes a session down within 15 s
+instead of three minutes. `just pe` shows them; `docker exec <lab>-pe-01
+vtysh` gives the CLI.
 
 With `as-override` FRR also sends a site's own prefixes back to it, AS path
 rewritten: a CE receives 7 routes in vrf-a and 4 in vrf-b, not just the
