@@ -1,0 +1,205 @@
+import testing
+
+import ttt
+import test_ttt_merge as plain
+import yang.gdata as gdata
+
+
+def _test_node_identity():
+    a: gdata.Node = gdata.Container()
+    b: gdata.Node = gdata.Container()
+    testing.assertTrue(ttt.same_node(a, a))
+    testing.assertFalse(ttt.same_node(a, b))
+
+
+def sources(n: int, value: int=1) -> dict[str, gdata.Node]:
+    return {"s{i}": plain.cont({plain.q("v{i}"): gdata.Leaf(value)}) for i in range(n)}
+
+
+def ordered_merge(cfg: dict[str, gdata.Node]) -> gdata.Node:
+    return ttt.merge({src: cfg[src] for src in sorted(cfg.keys())})
+
+
+def _test_matches_plain_merge():
+    for name, cfg in plain.cases():
+        memo = {}
+        expected = ordered_merge(cfg)
+        result = ttt.mmerge(cfg, memo)
+        testing.assertEqual(result, expected, name)
+        testing.assertTrue(ttt.same_node(result, ttt.mmerge(cfg, memo)), name)
+
+
+def _test_source_counts():
+    memo = {}
+    for n in range(1, 18):
+        cfg = sources(n)
+        result = ttt.mmerge(cfg, memo)
+        testing.assertEqual(result, ordered_merge(cfg))
+        testing.assertEqual(len(memo), n - 1)
+        if n == 1:
+            testing.assertTrue(ttt.same_node(result, cfg["s0"]))
+    try:
+        ttt.mmerge({}, memo)
+        raise AssertionError("Empty merge did not raise")
+    except ValueError:
+        pass
+    testing.assertEqual(len(memo), 0)
+
+
+def _test_reordered_dict_reuses_result():
+    cfg = sources(9)
+    memo = {}
+    result = ttt.mmerge(cfg, memo)
+    backwards = {src: cfg[src] for src in reversed(list(cfg.keys()))}
+    testing.assertTrue(ttt.same_node(result, ttt.mmerge(backwards, memo)))
+
+
+def _test_patch_reuses_untouched_pairs():
+    cfg = sources(8)
+    memo = {}
+    original = ttt.mmerge(cfg, memo)
+    before = dict(memo.items())
+    # patch() puts the changed source first, so dict order also changes.
+    changed = ttt.patch(cfg, {"s3": plain.cont({plain.q("v3"): gdata.Leaf(2)})})
+    testing.assertTrue(ttt.same_node(cfg["s0"], changed["s0"]))
+    testing.assertFalse(ttt.same_node(cfg["s3"], changed["s3"]))
+    result = ttt.mmerge(changed, memo)
+    testing.assertEqual(result, ordered_merge(changed))
+    testing.assertEqual(original, ordered_merge(cfg))
+    reused = sum([1 for key, pair in memo.items() if ttt.same_node(pair.result, before[key].result)])
+    # Eight sources make seven merges; only three contain the changed source.
+    testing.assertEqual(reused, 4)
+
+
+def _test_both_input_pointers_are_checked():
+    cfg = sources(2)
+    memo = {}
+    ttt.mmerge(cfg, memo)
+    for src in ["s0", "s1"]:
+        cfg[src] = plain.cont({plain.q("v" + src[1:]): gdata.Leaf(2)})
+        testing.assertEqual(ttt.mmerge(cfg, memo), ordered_merge(cfg))
+
+
+def _test_equal_replacement_is_a_cache_miss():
+    cfg: dict[str, gdata.Node] = {
+        "a": gdata.Container({plain.q("a"): gdata.Leaf(1)}, module="old"),
+        "b": plain.cont({plain.q("b"): gdata.Leaf(2)}),
+    }
+    memo = {}
+    original = ttt.mmerge(cfg, memo)
+    replacement = gdata.Container({plain.q("a"): gdata.Leaf(1)}, module="new")
+    # Node equality ignores module metadata. Pointer checks must still miss.
+    testing.assertEqual(cfg["a"], replacement)
+    cfg["a"] = replacement
+    result = ttt.mmerge(cfg, memo)
+    testing.assertFalse(ttt.same_node(original, result))
+    testing.assertEqual(result.module, "new")
+
+
+def _test_shared_input_still_contributes_twice():
+    tree = plain.cont({plain.q("ll"): plain.llist([1, 2])})
+    cfg = {"a": tree, "b": tree}
+    memo = {}
+    expected = plain.cont({plain.q("ll"): plain.llist([1, 1, 2, 2])})
+    testing.assertEqual(ttt.mmerge(cfg, memo), expected)
+    testing.assertEqual(ttt.mmerge(cfg, memo), expected)
+
+
+def _test_source_churn_drops_old_pairs():
+    cfg = sources(9)
+    memo = {}
+    ttt.mmerge(cfg, memo)
+    for i in range(30):
+        cfg["new{i}"] = plain.cont({plain.q("added{i}"): gdata.Leaf(i)})
+        testing.assertEqual(ttt.mmerge(cfg, memo), ordered_merge(cfg))
+        testing.assertEqual(len(memo), len(cfg) - 1)
+        del cfg["new{i}"]
+        testing.assertEqual(ttt.mmerge(cfg, memo), ordered_merge(cfg))
+        testing.assertEqual(len(memo), len(cfg) - 1)
+    for src in list(cfg.keys())[:-1]:
+        del cfg[src]
+        testing.assertEqual(ttt.mmerge(cfg, memo), ordered_merge(cfg))
+        testing.assertEqual(len(memo), len(cfg) - 1)
+
+
+def _test_failure_preserves_previous_memo():
+    cfg = sources(4)
+    memo = {}
+    original = ttt.mmerge(cfg, memo)
+    for bad in [
+        plain.cont({plain.q("v0"): gdata.Leaf(2)}),
+        plain.klist([]),
+        gdata.Container(presence=True),
+    ]:
+        before = dict(memo.items())
+        changed = dict(cfg.items())
+        changed["s3"] = bad
+        try:
+            ttt.mmerge(changed, memo)
+            raise AssertionError("Conflicting merge did not raise")
+        except ValueError:
+            pass
+        testing.assertEqual(sorted(memo.keys()), sorted(before.keys()))
+        for key, pair in before.items():
+            testing.assertTrue(ttt.same_node(pair.left, memo[key].left))
+            testing.assertTrue(ttt.same_node(pair.right, memo[key].right))
+            testing.assertTrue(ttt.same_node(pair.result, memo[key].result))
+        testing.assertTrue(ttt.same_node(original, ttt.mmerge(cfg, memo)))
+
+
+def _test_interleaved_candidates_validate_actual_inputs():
+    running = sources(9)
+    first = ttt.patch(running, {"s2": plain.cont({plain.q("v2"): gdata.Leaf(2)})})
+    second = ttt.patch(running, {"s5": plain.cont({plain.q("v5"): gdata.Leaf(3)})})
+    rebased = ttt.patch(first, {"s5": plain.cont({plain.q("v5"): gdata.Leaf(3)})})
+    memo = {}
+    for cfg in [running, first, second, running, rebased, first, rebased]:
+        testing.assertEqual(ttt.mmerge(cfg, memo), ordered_merge(cfg))
+
+
+actor fanin_commit_rebase_and_abort(t: testing.AsyncT):
+    router = ttt.Transform(ttt.PassThrough)(ttt.PathRoot("memo:"), None)
+    txn = router.newtrans()
+    initial = sources(9)
+    first_edit = {"s2": plain.cont({plain.q("v2"): gdata.Leaf(2)})}
+    second_edit = {"s5": plain.cont({plain.q("v5"): gdata.Leaf(3)})}
+    first = ttt.patch(initial, first_edit)
+    both = ttt.patch(first, second_edit)
+    last_edit = {"s1": plain.cont({plain.q("v1"): gdata.Leaf(6)})}
+
+    def loaded(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        txn.commit("load", True)
+        testing.assertEqual(txn.get(), ordered_merge(initial))
+        txn.configure("first", first_edit, None)
+        txn.configure("second", second_edit, None)
+        txn.lock("first", None, first_locked)
+
+    def first_locked(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        txn.commit("first", True)
+        testing.assertEqual(txn.get(), ordered_merge(first))
+        txn.lock("second", None, second_locked)
+
+    def second_locked(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        txn.commit("second", True)
+        testing.assertEqual(txn.get(), ordered_merge(both))
+        txn.configure("abort", {"s8": plain.cont({plain.q("v8"): gdata.Leaf(4)})}, None)
+        txn.lock("abort", None, abort_locked)
+
+    def abort_locked(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        txn.commit("abort", False)
+        testing.assertEqual(txn.get(), ordered_merge(both))
+        txn.configure("last", last_edit, None)
+        txn.lock("last", None, last_locked)
+
+    def last_locked(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        txn.commit("last", True)
+        testing.assertEqual(txn.get(), ordered_merge(ttt.patch(both, last_edit)))
+        t.success()
+
+    txn.configure("load", initial, None)
+    txn.lock("load", None, loaded)

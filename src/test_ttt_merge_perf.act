@@ -1,0 +1,114 @@
+"""Merge large source trees with growing fan-in.
+
+    acton test scale --release --module test_ttt_merge_perf --end-scale 1024
+
+Scale counts sources. Each source contributes 64 keyed entries, with a
+nested container of eight payload leaves in every entry. Setup and the
+initial cache fill happen before t.loop(); each body measures one merge.
+The plain and memo variants use the same trees and edits. A single-source
+edit moves around the fan-in, and full edits replace every source tree.
+Cold measures the first merge with an empty memo. Normal tests use one
+source; large measurements are opt-in through acton test scale.
+"""
+
+import testing
+
+import ttt
+import yang.gdata as gdata
+
+
+ENTRIES = 64
+LEAVES = 8
+NS = "urn:test:merge-perf"
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id(NS, name)
+
+
+NAME = q("name")
+DEVICE = q("device")
+CONFIG = q("config")
+VALUE = q("value")
+
+
+def source_name(i: int) -> str:
+    return "source-" + str(1000000000 + i)[1:]
+
+
+def tree(i: int, value: int) -> gdata.Node:
+    entries: list[gdata.Node] = []
+    for j in range(ENTRIES):
+        payload: dict[gdata.Id, gdata.Node] = {VALUE: gdata.Leaf(value)}
+        for k in range(LEAVES):
+            payload[q("leaf{k}")] = gdata.Leaf("payload-{i}-{j}-{k}")
+        entries.append(gdata.Container({
+            NAME: gdata.Leaf("entry-" + str(1000000000 + i * ENTRIES + j)[1:]),
+            CONFIG: gdata.Container(payload),
+        }))
+    return gdata.Container({DEVICE: gdata.List([NAME], entries)})
+
+
+def check(result: gdata.Node, n: int, index: int, value: int):
+    devices = result.get_list(DEVICE)
+    assert len(devices.elements) == n * ENTRIES
+    assert devices.elements[index * ENTRIES].get_cnt(CONFIG).get_int(VALUE) == value
+
+
+def bench(t: testing.SyncT, cached: bool, mode: str):
+    n = t.scale()
+    cfg = {source_name(i): tree(i, 1) for i in range(n)}
+    originals = dict(cfg.items())
+    replacements = {source_name(i): tree(i, 2) for i in range(n)} if mode in ["one", "all"] else {}
+    memo = {}
+    if cached and mode != "cold":
+        check(ttt.mmerge(cfg, memo), n, 0, 1)
+    round = 0
+    for scale in t.loop():
+        index = 0
+        value = 1
+        if mode == "one":
+            index = (round * 7919) % n
+            src = source_name(index)
+            value = 2 if ttt.same_node(cfg[src], originals[src]) else 1
+            cfg[src] = replacements[src] if value == 2 else originals[src]
+        elif mode == "all":
+            value = 2 if round % 2 == 0 else 1
+            cfg = replacements if value == 2 else originals
+        elif mode == "cold":
+            memo = {}
+        result = ttt.mmerge(cfg, memo) if cached else ttt.merge(cfg)
+        check(result, scale, index, value)
+        round += 1
+
+
+def _test_plain_unchanged(t: testing.SyncT):
+    bench(t, False, "unchanged")
+
+
+def _test_memo_unchanged(t: testing.SyncT):
+    bench(t, True, "unchanged")
+
+
+def _test_plain_one(t: testing.SyncT):
+    bench(t, False, "one")
+
+
+def _test_memo_one(t: testing.SyncT):
+    bench(t, True, "one")
+
+
+def _test_plain_all(t: testing.SyncT):
+    bench(t, False, "all")
+
+
+def _test_memo_all(t: testing.SyncT):
+    bench(t, True, "all")
+
+
+def _test_plain_cold(t: testing.SyncT):
+    bench(t, False, "cold")
+
+
+def _test_memo_cold(t: testing.SyncT):
+    bench(t, True, "cold")
