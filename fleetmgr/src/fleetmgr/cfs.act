@@ -1,6 +1,9 @@
+import time
 import yang.adata as yadata
 import yang.gdata as ygdata
 import stratoweave.ttt as ttt
+
+import stratoweave.fleet_sched as fs
 
 import fleetmgr.layers.base_0 as base
 import fleetmgr.layers.y_0 as y_0
@@ -138,22 +141,144 @@ class Device(base.Device):
         return o
 
 
+# Mock installs take 1-4s; the planner sizes window concurrency from this.
+EST_S = 4
+
+
+def _plan_campaign(i: y_0.software__software__upgrade_campaign_entry) -> (list[(int, int, list[(str, int)])], list[str]):
+    """Plan the campaign into its windows at the rate the deadline demands.
+
+    The deadline cuts off the window supply: only window time before it
+    counts. The required rate is computed backwards from what remains,
+    raised to target-rate when the operator wants a faster steady pace, and
+    capped at max-rate; a deadline that cannot be met within the cap raises
+    an alarm rather than exceeding it. Rates are devices per hour; the
+    core's concurrency is derived as rate times estimated duration.
+
+    Returns the materialized layout: one (start-offset, end-offset, devices)
+    entry per window, each device with its estimated start offset, all in
+    seconds from campaign launch, plus the placement alarms. Devices that do
+    not fit are absent from the layout and present in the alarms.
+
+    The transform actuates the placed membership; the companion actor
+    publishes the same layout as the plan, so both views come from one
+    computation.
+    """
+    devices = []
+    for member in i.device:
+        devices.append(fs.DeviceIn(member.name, "cpe", None, [], [], EST_S, True))
+    n = len(devices)
+    if n == 0:
+        return ([], [])
+    sel = [d.name for d in devices]
+    alarms: list[str] = []
+
+    deadline = 0
+    dl = i.deadline
+    if dl is not None:
+        deadline = int(dl)
+
+    target = int(i.target_rate)
+    cap = int(i.max_rate)
+
+    wins: list[(int, int)] = []
+    for w in i.window:
+        wstart = int(w.start)
+        wend = wstart + int(w.duration)
+        if deadline > 0:
+            # The deadline cuts off the window iterator.
+            if wstart >= deadline:
+                continue
+            if wend > deadline:
+                wend = deadline
+        wins.append((wstart, wend))
+
+    if len(wins) == 0 and deadline == 0:
+        # No windows and no deadline: proceed at the preferred pace, in one
+        # synthetic window sized so every device fits at that rate.
+        rate = target if target > 0 else n * 3600
+        if cap > 0 and rate > cap:
+            rate = cap
+        span = imax(60, fs.ceil_div(n * 3600 * 100, rate * 95) + EST_S)
+        wins.append((0, span))
+        needed = 0
+    else:
+        available = 0
+        for we in wins:
+            available += we.1 - we.0
+        # The planner keeps a margin; plan the rate against what it will use.
+        usable = available * 95 // 100
+        needed = 0
+        if deadline > 0 and usable > 0:
+            needed = fs.ceil_div(n * 3600, usable)
+        rate = needed
+        if target > rate:
+            rate = target
+        if cap > 0 and rate > cap:
+            rate = cap
+            if needed > cap:
+                alarms.append("deadline needs {needed} devices/hour but max-rate "
+                              + "is {cap}; not all devices will be placed in time")
+        if rate == 0:
+            rate = fs.ceil_div(n * 3600, usable) if usable > 0 else n * 3600
+
+    conc = imax(1, fs.ceil_div(rate * EST_S, 3600))
+
+    fwins = []
+    for we in wins:
+        fwins.append(fs.Window("win", we.0, we.1, conc))
+    camp = fs.Campaign(i.name, ["win"], conc, conc, conc, 2, 0, "spread",
+                       sel_device=sel, admin_state="run")
+    r = fs.plan([], devices, camp, {}, [fs.ScriptedWindowGen(fwins)], 0, len(fwins))
+    for a in r.alarms:
+        alarms.append(a)
+
+    layout: list[(int, int, list[(str, int)])] = []
+    for we in wins:
+        placed: list[str] = []
+        for a in r.assigns:
+            if a.status != "unplannable" and a.start == we.0:
+                placed.append(a.device)
+        if len(placed) > 0:
+            wdur = we.1 - we.0
+            devs: list[(str, int)] = []
+            idx = 0
+            for d in placed:
+                devs.append((d, we.0 + idx * wdur // len(placed)))
+                idx += 1
+            layout.append((we.0, we.1, devs))
+    return (layout, alarms)
+
+
 class UpgradeCampaign(base.UpgradeCampaign):
     def transform(self, i, linked):
+        """Route the campaign through the fleet scheduling core.
+
+        Every planned assignment is routed to its shard and actuated at
+        once. Pacing and dependency-gated release are deliberately not done
+        here: redundancy constraints need completion feedback, not
+        timestamps, so releasing devices over time belongs to the
+        controller re-running the planner, which therefore has to stay
+        cheap. The published plan under state shows the intended layout.
+        """
         o = base.o_root()
         if i.admin_state == "run":
             inventory = y_0.root.from_gdata(linked)
-            for member in i.device:
-                d = member.name
-                fleet_device = inventory.fleet.device.get(d)
-                if fleet_device is None:
-                    continue
-                dev = o.rfs.create(fleet_device!.shard).device.create(d)
-                dev.software.target_release = i.target_release
-                dev.software.upgrade_campaign = i.name
-                dev.software.image_url = i.image_url
-                dev.software.allow_staging = i.allow_staging
+            layout, alarms = _plan_campaign(i)
+            for win in layout:
+                for entry in win.2:
+                    fleet_device = inventory.fleet.device.get(entry.0)
+                    if fleet_device is not None:
+                        dev = o.rfs.create(fleet_device.shard).device.create(entry.0)
+                        dev.software.target_release = i.target_release
+                        dev.software.upgrade_campaign = i.name
+                        dev.software.image_url = i.image_url
+                        dev.software.allow_staging = i.allow_staging
         return o
+
+
+def imax(a: int, b: int) -> int:
+    return a if a > b else b
 
 
 actor UpgradeCampaignTransform(path: ttt.Path,
@@ -164,6 +289,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var latest: ?y1_oper.root = None
     var subscriptions: ?ygdata.SubscriptionManager = None
     var destination: ?ygdata.Dst = None
+    var plan_layout: list[(int, int, list[(str, int)])] = []
+    var plan_alarms: list[str] = []
+    var anchor: int = 0
+    var was_running = False
 
     def publish() -> None:
         oper = base.UpgradeCampaign.new_state(path)
@@ -197,6 +326,20 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         st.in_progress = u64(in_progress)
         st.succeeded = u64(succeeded)
         st.failed = u64(failed)
+
+        # The materialized plan: the same computation the transform actuates,
+        # published so the layout is inspectable before and during the run.
+        # Times are estimates anchored at the last plan or launch.
+        for pw in plan_layout:
+            win = st.plan.window.create(u64(anchor + pw.0))
+            win.end = u64(anchor + pw.1)
+            win.schedule = "window"
+            for entry in pw.2:
+                pd = win.device.create(entry.0)
+                pd.estimated_start = u64(anchor + entry.1)
+                pd.estimated_duration = u64(EST_S)
+        for alarm in plan_alarms:
+            st.plan.alarm.append(alarm)
         update_oper(oper)
 
     def on_rfs(root: ?y1_oper.root, error: ?Exception) -> None:
@@ -216,6 +359,16 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         for member in conf.device:
             ms.append(member.name)
         members = ms
+
+        layout, alarms = _plan_campaign(conf)
+        plan_layout = layout
+        plan_alarms = alarms
+        running = conf.admin_state == "run"
+        if anchor == 0 or (running and not was_running):
+            # Estimates re-anchor when the campaign starts running, since
+            # that is when the window actually opens.
+            anchor = time.time().unix_s()
+        was_running = running
         publish()
 
         if lower_tree_provider is not None and subscriptions is None:

@@ -1,0 +1,605 @@
+#
+# Fleet upgrade scheduler -- pure core.
+#
+# No I/O, no clock, no persistence. Every function takes `now` (unix seconds)
+# plus plain data and returns plain data, so the whole thing is testable
+# without a running StratoWeave system.
+#
+# See docs/developer/fleet-upgrade-design.md
+#
+
+SPREAD = "spread"
+PACK = "pack"
+
+#############################################################################
+# small helpers
+#############################################################################
+
+def imin(a: int, b: int) -> int:
+    if a < b:
+        return a
+    return b
+
+def imax(a: int, b: int) -> int:
+    if a > b:
+        return a
+    return b
+
+def clamp(v: int, lo: int, hi: int) -> int:
+    return imin(imax(v, lo), hi)
+
+def ceil_div(a: int, b: int) -> int:
+    if b <= 0:
+        return 0
+    return (a + b - 1) // b
+
+def fmt_ts(ts: int) -> str:
+    """Render a timestamp as day + wall clock. Demos use t=0 as campaign start."""
+    d = ts // 86400
+    hh = (ts % 86400) // 3600
+    mm = (ts % 3600) // 60
+    return f"d{d:02d} {hh:02d}:{mm:02d}"
+
+def fmt_dur(s: int) -> str:
+    if s >= 86400:
+        return f"{s // 86400}d{(s % 86400) // 3600}h"
+    if s >= 3600:
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+    return f"{s // 60}m"
+
+#############################################################################
+# data
+#############################################################################
+
+class GroupRef(value):
+    """Membership of a redundancy group, with this device's order within it."""
+    name: str
+    priority: int
+
+    def __init__(self, name: str, priority: int):
+        self.name = name
+        self.priority = priority
+
+class Window(value):
+    """One concrete occurrence of a maintenance schedule."""
+    schedule: str
+    start: int
+    end: int
+    max_concurrency: int
+
+    def __init__(self, schedule: str, start: int, end: int, max_concurrency: int):
+        self.schedule = schedule
+        self.start = start
+        self.end = end
+        self.max_concurrency = max_concurrency
+
+    def duration(self) -> int:
+        return self.end - self.start
+
+    def key(self) -> str:
+        return f"{self.schedule}@{self.start}"
+
+    def __str__(self) -> str:
+        return f"{self.schedule} {fmt_ts(self.start)}-{fmt_ts(self.end)}"
+
+class DeviceIn(value):
+    """Everything the scheduler needs to know about one device."""
+    name: str
+    device_type: str
+    schedule: ?str           # device/maintenance-schedule; None -> camp default
+    groups: list[GroupRef]              # device/redundancy-group membership
+    group_peers: dict[str, list[str]]   # group name -> members, for §3.4.1
+    tags: list[str]                     # device/tag -- general device metadata,
+                                        # not part of the software container
+    est_s: int               # estimated upgrade duration
+    needs_upgrade: bool
+
+    def __init__(self, name: str, device_type: str, schedule: ?str,
+                 groups: list[GroupRef], tags: list[str], est_s: int,
+                 needs_upgrade: bool,
+                 group_peers: dict[str, list[str]] = {}):
+        self.name = name
+        self.device_type = device_type
+        self.schedule = schedule
+        self.groups = groups
+        self.group_peers = group_peers
+        self.tags = tags
+        self.est_s = est_s
+        self.needs_upgrade = needs_upgrade
+
+    def priority(self) -> int:
+        """Lowest group priority wins; ungrouped devices sort last."""
+        p = 1000
+        for g in self.groups:
+            p = imin(p, g.priority)
+        return p
+
+
+
+class GroupPolicy(value):
+    """Separation policy for one redundancy group (top-level list, general --
+    not owned by the software-upgrade feature).
+
+    Separation describes a *relation*, so it is configured on the group, not on
+    each device -- asking two devices for a policy raises a question ("A says
+    spread, B says pack, now what?") that has no principled answer.
+    """
+    name: str
+    sep_policy: str
+    min_sep_s: ?int
+
+    def __init__(self, name: str, sep_policy: str, min_sep_s: ?int = None):
+        self.name = name
+        self.sep_policy = sep_policy
+        self.min_sep_s = min_sep_s
+
+def group_policy(pols: dict[str, GroupPolicy], gname: str, camp: Campaign) -> str:
+    """A group with no entry uses the camp default."""
+    p = pols.get(gname)
+    if p is not None:
+        return p.sep_policy
+    return camp.default_sep_policy
+
+class Campaign(value):
+    name: str
+    schedules: list[str]         # default schedule set
+    sel_device_type: list[str]
+    sel_tag: list[str]
+    sel_device: list[str]
+    admin_state: str             # plan | run | pause
+    target_concurrency: int
+    max_concurrency: int
+    ramp_start: int
+    ramp_factor: int
+    lead_time_s: int
+    default_sep_policy: str
+    plan_margin_pct: int
+
+    def __init__(self, name: str, schedules: list[str], target_concurrency: int,
+                 max_concurrency: int, ramp_start: int, ramp_factor: int,
+                 lead_time_s: int, default_sep_policy: str,
+                 plan_margin_pct: int = 5,
+                 sel_device_type: list[str] = [], sel_tag: list[str] = [],
+                 sel_device: list[str] = [], admin_state: str = "plan"):
+        self.name = name
+        self.schedules = schedules
+        self.sel_device_type = sel_device_type
+        self.sel_tag = sel_tag
+        self.sel_device = sel_device
+        self.admin_state = admin_state
+        self.target_concurrency = target_concurrency
+        self.max_concurrency = max_concurrency
+        self.ramp_start = ramp_start
+        self.ramp_factor = ramp_factor
+        self.lead_time_s = lead_time_s
+        self.default_sep_policy = default_sep_policy
+        self.plan_margin_pct = plan_margin_pct
+
+class Assign(value):
+    device: str
+    schedule: str
+    start: int
+    status: str
+
+    def __init__(self, device: str, schedule: str, start: int, status: str):
+        self.device = device
+        self.schedule = schedule
+        self.start = start
+        self.status = status
+
+    def wkey(self) -> str:
+        return f"{self.schedule}@{self.start}"
+
+class PlanResult(value):
+    assigns: list[Assign]
+    alarms: list[str]
+
+    def __init__(self, assigns: list[Assign], alarms: list[str]):
+        self.assigns = assigns
+        self.alarms = alarms
+
+#############################################################################
+# window generators
+#############################################################################
+
+class WindowGen(object):
+    """Yields windows in ascending start order; None when exhausted.
+
+    The planner never expands a horizon -- it pulls windows until every device
+    is placed. Swapping in a DST-aware or holiday-aware generator later touches
+    nothing else.
+    """
+    def next(self) -> ?Window:
+        return None
+
+class SimpleWindowGen(WindowGen):
+    """Recurring window at a fixed UTC interval."""
+    schedule: str
+    cur: int
+    dur: int
+    interval: int
+    maxc: int
+    left: int
+
+    def __init__(self, schedule: str, first_start: int, dur: int, interval: int,
+                 maxc: int, limit: int):
+        self.schedule = schedule
+        self.cur = first_start
+        self.dur = dur
+        self.interval = interval
+        self.maxc = maxc
+        self.left = limit
+
+    def next(self) -> ?Window:
+        if self.left <= 0:
+            return None
+        self.left = self.left - 1
+        w = Window(self.schedule, self.cur, self.cur + self.dur, self.maxc)
+        self.cur = self.cur + self.interval
+        return w
+
+class ScriptedWindowGen(WindowGen):
+    """Test generator yielding a fixed list."""
+    wins: list[Window]
+    i: int
+
+    def __init__(self, wins: list[Window]):
+        self.wins = wins
+        self.i = 0
+
+    def next(self) -> ?Window:
+        if self.i >= len(self.wins):
+            return None
+        w = self.wins[self.i]
+        self.i = self.i + 1
+        return w
+
+#############################################################################
+# planner
+#############################################################################
+
+class WinSlot(object):
+    """A window plus what has been placed in it during planning."""
+    w: Window
+    budget: int              # device-seconds still available
+    groups: set[str]
+    devices: set[str]
+
+    def __init__(self, w: Window, budget: int):
+        self.w = w
+        self.budget = budget
+        self.groups = set([])
+        self.devices = set([])
+
+    def fits(self, d: DeviceIn) -> bool:
+        if self.budget < d.est_s:
+            return False
+        for g in d.groups:
+            if g.name in self.groups:
+                return False
+        return True
+
+    def place(self, d: DeviceIn):
+        self.budget = self.budget - d.est_s
+        self.devices.add(d.name)
+        for g in d.groups:
+            self.groups.add(g.name)
+
+    def unplace(self, d: DeviceIn):
+        self.budget = self.budget + d.est_s
+        self.devices.discard(d.name)
+        for g in d.groups:
+            self.groups.discard(g.name)
+
+def _sort_devices(ds: list[DeviceIn]) -> list[DeviceIn]:
+    """Stable order: redundancy priority first, then name. Deterministic by design."""
+    keyed = []
+    idx = {}
+    for d in ds:
+        keyed.append((d.priority(), d.name))
+        idx[d.name] = d
+    out = []
+    for k in sorted(keyed):
+        out.append(idx[k.1])
+    return out
+
+def _eligible(d: DeviceIn, camp: Campaign, sched: str) -> bool:
+    """Device schedule wins; campaign list is only the default for devices
+    that have none. A contracted window is a commitment, never a fallback."""
+    own = d.schedule
+    if own is not None:
+        return own == sched
+    return sched in camp.schedules
+
+def selects(camp: Campaign, d: DeviceIn) -> bool:
+    """Explicit list OR (device-type filter AND tag filter).
+
+    An empty selection matches nothing: selecting the whole fleet should have to
+    be said out loud.
+    """
+    if d.name in camp.sel_device:
+        return True
+    if len(camp.sel_device_type) == 0 and len(camp.sel_tag) == 0:
+        return False
+    if len(camp.sel_device_type) > 0 and d.device_type not in camp.sel_device_type:
+        return False
+    if len(camp.sel_tag) > 0:
+        hit = False
+        for t in d.tags:
+            if t in camp.sel_tag:
+                hit = True
+        if not hit:
+            return False
+    return True
+
+def plan(cur: list[Assign], devices: list[DeviceIn], camp: Campaign,
+         pols: dict[str, GroupPolicy], gens: list[WindowGen], now: int,
+         max_windows: int, pins: dict[str, int] = {}) -> PlanResult:
+    alarms = []
+
+    pending = []
+    by_name = {}
+    for d in devices:
+        if d.needs_upgrade and selects(camp, d):
+            pending.append(d)
+            by_name[d.name] = d
+
+    # ---- pull windows, dropping anything inside the notification lead time
+    earliest = now + camp.lead_time_s
+    raw = []
+    order = []
+    for g in gens:
+        n = 0
+        while n < max_windows:
+            w = g.next()
+            if w is not None:
+                n = n + 1
+                if w.start >= earliest:
+                    order.append((w.start, len(raw)))
+                    raw.append(w)
+            else:
+                n = max_windows
+    slots = []
+    for kv in sorted(order):
+        w = raw[kv.1]
+        usable = w.duration() * (100 - camp.plan_margin_pct) // 100
+        slots.append(WinSlot(w, camp.target_concurrency * usable))
+
+    slot_by_key = {}
+    for s in slots:
+        slot_by_key[s.w.key()] = s
+
+    # ---- stickiness: keep every existing assignment that is still valid
+    kept = {}
+    for a in cur:
+        if a.device in by_name:
+            k = a.wkey()
+            if k in slot_by_key:
+                s = slot_by_key[k]
+                d = by_name[a.device]
+                if s.fits(d):
+                    s.place(d)
+                    kept[a.device] = a
+
+    # ---- pinned devices first: an explicit placement is not a preference
+    placed_in = {}
+    for d in _sort_devices(pending):
+        if d.name in kept:
+            continue
+        want = pins.get(d.name)
+        if want is not None:
+            hit = False
+            for s in slots:
+                if not hit and s.w.start == want and s.fits(d):
+                    s.place(d)
+                    placed_in[d.name] = s
+                    kept[d.name] = Assign(d.name, s.w.schedule, s.w.start, "pinned")
+                    hit = True
+            if not hit:
+                alarms.append(f"unplannable: {d.name} pinned to a window that cannot take it")
+                kept[d.name] = Assign(d.name, "", 0, "unplannable")
+
+    # ---- place the rest, earliest-fit in priority order
+    for d in _sort_devices(pending):
+        if d.name in kept:
+            continue
+        done = False
+        for s in slots:
+            if done:
+                continue
+            if not _eligible(d, camp, s.w.schedule):
+                continue
+            if not s.fits(d):
+                continue
+            s.place(d)
+            placed_in[d.name] = s
+            done = True
+        if not done:
+            alarms.append(f"unplannable: {d.name} (no window with capacity within {len(slots)} windows)")
+
+    # ---- spread pass: push later members of spread groups as late as possible
+    _spread(slots, pending, camp, pols, placed_in, kept, by_name)
+
+    out = []
+    for s in slots:
+        for n in sorted(list(s.devices)):
+            st = "scheduled"
+            if n in kept and kept[n].status == "pinned":
+                st = "pinned"
+            out.append(Assign(n, s.w.schedule, s.w.start, st))
+    return PlanResult(out, alarms)
+
+def _spread(slots: list[WinSlot], pending: list[DeviceIn], camp: Campaign,
+            pols: dict[str, GroupPolicy], placed_in: dict[str, WinSlot],
+            kept: dict[str, Assign], by_name: dict[str, DeviceIn]):
+    """Maximize distance between members of `spread` groups.
+
+    Pack needs no pass: greedy earliest-fit already packs, and the
+    same-window exclusion keeps members from overlapping.
+    """
+    members = {}
+    for d in pending:
+        for g in d.groups:
+            if group_policy(pols, g.name, camp) == SPREAD:
+                if g.name not in members:
+                    members[g.name] = []
+                members[g.name].append((g.priority, d.name))
+
+    for gname in sorted(list(members.keys())):
+        ms = sorted(members[gname])
+        if len(ms) < 2:
+            continue
+        # walk from the last member backwards, pushing each as late as it can go
+        upper = len(slots)
+        i = len(ms) - 1
+        while i >= 1:
+            dn = ms[i].1
+            d = by_name[dn]
+            src = placed_in.get(d.name)
+            if src is not None and d.name not in kept:
+                cur_idx = _index_of(slots, src)
+                best = -1
+                j = upper - 1
+                while j > cur_idx:
+                    s = slots[j]
+                    if best < 0 and _eligible(d, camp, s.w.schedule) and s.fits(d):
+                        best = j
+                    j = j - 1
+                if best >= 0:
+                    src.unplace(d)
+                    slots[best].place(d)
+                    placed_in[d.name] = slots[best]
+                    upper = best
+                else:
+                    upper = cur_idx
+            i = i - 1
+
+def _index_of(slots: list[WinSlot], s: WinSlot) -> int:
+    i = 0
+    while i < len(slots):
+        if slots[i].w.key() == s.w.key():
+            return i
+        i = i + 1
+    return -1
+
+def render_plan(camp: Campaign, r: PlanResult) -> str:
+    """Render a plan as an operator would read it -- one line per window, with
+    how much of the window each one uses. Snapshot tests capture this, so the
+    reviewable artefact is the layout itself."""
+    lines = []
+    lines.append(f"campaign {camp.name}: concurrency {camp.target_concurrency}/{camp.max_concurrency}"
+                 + f", lead time {camp.lead_time_s // 86400}d, default {camp.default_sep_policy}")
+    lines.append("")
+    for l in render(r):
+        lines.append(l)
+    if len(r.alarms) > 0:
+        lines.append("")
+        for a in r.alarms:
+            lines.append(f"ALARM {a}")
+    return "\n".join(lines)
+
+def render(r: PlanResult) -> list[str]:
+    """One line per window, devices in order."""
+    keys = []
+    for a in r.assigns:
+        if a.wkey() not in keys:
+            keys.append(a.wkey())
+    out = []
+    for k in keys:
+        names = []
+        w = ""
+        for a in r.assigns:
+            if a.wkey() == k:
+                names.append(a.device)
+                w = f"{fmt_ts(a.start)} {a.schedule}"
+        joined = ""
+        for n in sorted(names):
+            if joined != "":
+                joined = joined + " "
+            joined = joined + n
+        out.append(f"{w}: {joined}")
+    return out
+
+#############################################################################
+# concurrency controller
+#
+# The window is the commitment; concurrency is the actuator that flexes to
+# honour it. Launches are closed-loop -- never a clock.
+#############################################################################
+
+def generations(observed_s: int, t_remaining: int) -> int:
+    """How many back-to-back rounds of upgrades still fit.
+
+    The controller has to model its own launch cutoff: the last round can only
+    start while `t_remaining >= 1.2 * observed`, so the naive `r*d/T` understates
+    what is needed and quietly defers a whole round.
+    """
+    if observed_s <= 0:
+        return 0
+    usable = t_remaining - (observed_s * 12) // 10
+    if usable < 0:
+        return 0
+    return usable // observed_s + 1
+
+def required_concurrency(remaining: int, observed_s: int, t_remaining: int) -> int:
+    """How many must be in flight to finish `remaining` devices by window end."""
+    if remaining <= 0:
+        return 0
+    gens = generations(observed_s, t_remaining)
+    if gens <= 0:
+        return remaining
+    return ceil_div(remaining, gens)
+
+def allowed_concurrency(remaining: int, observed_s: int, t_remaining: int,
+                        target: int, maxc: int) -> int:
+    """Sit at target when on schedule; climb toward max only when behind."""
+    return clamp(required_concurrency(remaining, observed_s, t_remaining), target, maxc)
+
+def launch_cutoff_ok(observed_s: int, t_remaining: int) -> bool:
+    """Never start what cannot finish: the window binds at both ends."""
+    return t_remaining * 10 >= observed_s * 12
+
+def group_peers_alive(d: DeviceIn, reachable: dict[str, bool]) -> bool:
+    """For A to be upgraded, every other member of A's redundancy groups must be up.
+
+    A redundancy group says these devices are redundant to each other. The scheduling
+    consequence is "not both at once", but the real safety property is the
+    stronger one: A's outage is only tolerable because its peers are carrying
+    the traffic. Basic reachability (what DeviceMgr already knows) is enough.
+
+    Note what this subsumes: while A is upgrading it is unreachable, so its peers
+    fail this check and cannot start -- exclusion is enforced at execution time
+    without a separate rule. Likewise a peer left down by a failed upgrade blocks
+    the rest of its group automatically.
+    """
+    for g in d.groups:
+        for peer in d.group_peers.get_def(g.name, []):
+            if peer != d.name and not reachable.get_def(peer, False):
+                return False
+    return True
+
+def ramp_cap(rung: int, target: int, maxc: int) -> int:
+    """While ramping, the rung is the ceiling and it beats schedule adherence.
+    Once the ramp has reached target, it stops binding -- the headroom up to
+    max-concurrency exists precisely to be spent under schedule pressure."""
+    if rung >= target:
+        return maxc
+    return rung
+
+def launch_count(remaining: int, inflight: int, observed_s: int, t_remaining: int,
+                 target: int, maxc: int, rung: int, window_maxc: int) -> int:
+    if remaining <= 0:
+        return 0
+    if not launch_cutoff_ok(observed_s, t_remaining):
+        return 0
+    allowed = allowed_concurrency(remaining, observed_s, t_remaining, target, maxc)
+    ceiling = imin(imin(allowed, ramp_cap(rung, target, maxc)), window_maxc)
+    return imax(0, imin(ceiling - inflight, remaining))
+
+def ramp_next(rung: int, factor: int, target: int) -> int:
+    return imin(rung * factor, target)
+
+def shortfall(remaining: int, observed_s: int, t_remaining: int, maxc: int) -> int:
+    """Devices that cannot make it even at max concurrency -- knowable early,
+    so operators hear about it while the window is still open."""
+    return imax(0, remaining - maxc * generations(observed_s, t_remaining))
