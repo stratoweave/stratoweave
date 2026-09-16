@@ -2,16 +2,21 @@
 
     acton test perf  --module test_ttt_perf
     acton test scale --module test_ttt_perf --name list_touch --end-scale 100000
+    acton test scale --module test_ttt_perf --name 'shard_grow.*' --end-scale 10000
 
-Scale is the number of list entries. Each scenario builds its layer
-stack and loads the entries before the loop, from t.scale(), and each
-loop body then commits a fixed number of transactions against that
-list, or reads it a fixed number of times. So a body's growth is the
-growth of one transaction with the size of the list it runs against:
-flat when a small transaction costs the same whatever the list holds,
-linear when it pays for the whole list. The load scenarios are the
-exception: their body is the load itself, so linear is the best they
-can do.
+Scale is the number of list entries. The touch and read scenarios build
+their layer stack and load the entries before the loop, from t.scale().
+Each loop body then commits a fixed number of transactions against that
+list, or reads it a fixed number of times. A body's growth is the growth
+of one operation with the size of the list it runs against: flat when a
+small transaction costs the same whatever the list holds, linear when
+it pays for the whole list.
+
+The load scenarios submit all N entries in one transaction per body,
+retaining their stack between bodies. The grow scenarios start with a
+fresh stack each body and add N new entries through sequential batches.
+They include stack creation and entry construction in the measurement.
+shard_grow adds ten devices per transaction; shard_grow_one adds one.
 
 The shapes are what a fleet manager does at scale, with no generated
 adata or devices in the way:
@@ -102,6 +107,25 @@ def devices(start: int, count: int, value: int, shards: int) -> gdata.Node:
     elements: list[gdata.Node] = []
     for i in range(start, start + count):
         elements.append(elem(i, value, shards))
+    return gdata.Container({q("device"): gdata.List([q("name")], elements)})
+
+
+def fleet_devices(start: int, count: int) -> gdata.Node:
+    """Entries shaped like FleetMgr's device creation workload."""
+    elements: list[gdata.Node] = []
+    for i in range(start, start + count):
+        name = dev_name(i)
+        elements.append(gdata.Container({
+            q("name"): gdata.Leaf(name),
+            q("type"): gdata.Leaf("iosxe"),
+            q("description"): gdata.Leaf("Scale {name}"),
+            q("shard"): gdata.Leaf(shard_name(i, RESHARD_SHARDS)),
+            q("credentials"): gdata.Container({
+                q("username"): gdata.Leaf("admin"),
+                q("password"): gdata.Leaf("admin"),
+            }),
+            q("mock"): gdata.Container({q("enabled"): gdata.Leaf(True)}),
+        }))
     return gdata.Container({q("device"): gdata.List([q("name")], elements)})
 
 
@@ -388,6 +412,50 @@ actor Scenario(
     submit()
 
 
+actor GrowingShards(n: int, batch_size: int, done: action(?Exception) -> None):
+    """One fresh inventory, growing until all N devices have committed."""
+    stack = shard_stack()
+    var index = 0
+
+    def completed(result: value) -> None:
+        if isinstance(result, Exception):
+            done(result)
+        else:
+            submit()
+
+    def submit() -> None:
+        if index == n:
+            done(None)
+            return
+        count = min([batch_size, n - index])
+        edit = fleet_devices(index, count)
+        index += count
+        stack.edit_config(edit, None, completed)
+
+    submit()
+
+
+actor Grow(t: testing.AsyncT, batch_size: int):
+    iterations = t.loop()
+    var n = 0
+
+    def completed(error: ?Exception) -> None:
+        if error is not None:
+            t.failure(error)
+        else:
+            body()
+
+    def body() -> None:
+        try:
+            n = next(iterations)
+        except StopIteration:
+            t.success()
+            return
+        GrowingShards(n, batch_size, completed)
+
+    body()
+
+
 actor Burst(t: testing.AsyncT):
     """Load N entries, then per body touch every one of them at once.
 
@@ -560,6 +628,16 @@ actor reshard_load(t: testing.AsyncT):
 actor shard_load(t: testing.AsyncT):
     """Route N entries into RESHARD_SHARDS shard transforms"""
     Scenario(t, shard_stack, no_setup, body_load_reshard)
+
+
+actor shard_grow(t: testing.AsyncT):
+    """Grow ten shards from empty to N devices, ten per transaction."""
+    Grow(t, 10)
+
+
+actor shard_grow_one(t: testing.AsyncT):
+    """Grow ten shards from empty to N devices, one per transaction."""
+    Grow(t, 1)
 
 
 actor list_modify_all(t: testing.AsyncT):

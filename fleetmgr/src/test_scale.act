@@ -1,0 +1,368 @@
+"""Full FleetMgr workloads through RESTCONF and real flotilla processes.
+
+Each t.loop() body starts an empty deployment, adds N devices in synchronous
+batches of 10 and stops the deployment. Scale is the total device count; the
+last batch may contain fewer devices. The upgrade-campaign test also upgrades
+all N devices and waits for the campaign to succeed. Wall time covers that
+whole lifecycle. Allocation and CPU counters describe only the test driver.
+
+Build and run from fleetmgr/:
+    acton build --release
+    acton test scale --release --module test_scale --name add_devices --tag fleetmgr-system --start-scale 10 --end-scale 10000 --max-time 5m
+    acton test scale --release --module test_scale --name upgrade_campaign --tag fleetmgr-system --start-scale 10 --end-scale 10000 --max-time 5m
+    acton test scale --report out/perf_scaling/<recording>.jsonl
+
+For a smoke test, use acton test --jobs 1 with the same module/tag and
+--max-time 60000. Scale studies already run the tests sequentially.
+The test uses the demo's ports (HTTP 18200..18210, NETCONF 12900..12910), so
+run it sequentially with no demo running. It uses the POSIX pgrep/pkill tools
+to stop FleetMgr's children before stopping FleetMgr. The scale runner owns
+the complete process group and also stops it when its time limit expires.
+"""
+
+import http
+import json
+import net
+import process
+import testing
+
+import fleetmgr.supervisor as supervisor
+
+
+FLOTILLAS = supervisor.FLOTILLA_COUNT
+BATCH_SIZE = 10
+HTTP_PORT = 18200
+NETCONF_PORT = 12900
+
+
+def device_name(index: int) -> str:
+    return "device-{index}"
+
+
+def status_error(response: http.Response, expected: int) -> Exception:
+    return ValueError("expected HTTP {expected}, got {response.status}: " + response.body.decode())
+
+
+actor AddDevices(size: int, client: http.Client, done: action(?Exception) -> None):
+    var index = 0
+
+    def added(client: http.Client, response: http.Response) -> None:
+        if response.status == 201:
+            index = min([index + BATCH_SIZE, size])
+            add_batch()
+        else:
+            done(status_error(response, 201))
+
+    def add_batch() -> None:
+        if index == size:
+            done(None)
+            return
+        devices = []
+        for i in range(index, min([index + BATCH_SIZE, size])):
+            name = device_name(i)
+            devices.append({
+                "name": name,
+                "type": "iosxe",
+                "description": "Scale {name}",
+                "shard": "flotilla-{i % FLOTILLAS + 1}",
+                "credentials": {"username": "admin", "password": "admin"},
+                "mock": {"enabled": True},
+            })
+        payload = json.encode({"fleetmgr:fleet": {"device": devices}}).encode()
+        client.post("/restconf/data", payload, added,
+                    {"Content-Type": "application/yang-data+json"})
+
+    add_batch()
+
+
+actor UpgradeCampaign(size: int, client: http.Client, done: action(?Exception) -> None):
+    path = "/restconf/data/software:software/upgrade-campaign=scale-upgrade"
+
+    def status(client: http.Client, response: http.Response) -> None:
+        if response.status != 200:
+            done(status_error(response, 200))
+            return
+        try:
+            data = json.decode(response.body.decode())
+            if isinstance(data, dict):
+                campaigns = data.get("software:upgrade-campaign")
+                if isinstance(campaigns, list) and len(campaigns) == 1:
+                    campaign = campaigns[0]
+                    if isinstance(campaign, dict):
+                        state = campaign.get("state")
+                        if isinstance(state, dict):
+                            failed = state.get("failed")
+                            succeeded = state.get("succeeded")
+                            if isinstance(failed, int) and failed > 0:
+                                raise ValueError("upgrade campaign failed: {response.body.decode()}")
+                            if isinstance(succeeded, int) and succeeded == size:
+                                done(None)
+                                return
+                        after 0.1: poll()
+                        return
+            raise ValueError("invalid campaign status: {response.body.decode()}")
+        except Exception as exc:
+            done(exc)
+            return
+
+    def poll() -> None:
+        client.get(path, status, {"Accept": "application/yang-data+json"})
+
+    def started(client: http.Client, response: http.Response) -> None:
+        if response.status == 201:
+            poll()
+        else:
+            done(status_error(response, 201))
+
+    def devices_added(error: ?Exception) -> None:
+        if error is not None:
+            done(error)
+            return
+        payload = json.encode({"software:upgrade-campaign": [{
+            "name": "scale-upgrade",
+            "target-release": "17.18.03a",
+            "image-url": "scp://admin:admin@127.0.0.1:/images/c8000v-universalk9.17.18.03a.SPA.bin",
+            "device": [{"name": device_name(i)} for i in range(size)],
+            "admin-state": "run",
+        }]}).encode()
+        client.put(path, payload, started, {"Content-Type": "application/yang-data+json"})
+
+    AddDevices(size, client, devices_added)
+
+
+actor FleetMgrTest(t: testing.EnvT,
+                  workload: action(int, http.Client, action(?Exception) -> None) -> None):
+    """Run each measured workload in a fresh FleetMgr deployment."""
+    pcap = process.ProcessCap(t.env.cap)
+    cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+    iterations = t.loop()
+    var deployment: ?process.Process = None
+    var clients: list[http.Client] = []
+    var errors = ""
+    var failure: ?Exception = None
+    var stopping = False
+    var exited = False
+    var stdout_closed = False
+    var stderr_closed = False
+    var size = 0
+    var node_index = 0
+    http_base = supervisor.BASE_HTTP_PORT
+    netconf_base = supervisor.BASE_NETCONF_PORT
+    var generation = 0
+    var deployment_pid = 0
+    var ready = False
+    var stop_attempts = 0
+    ports = ([HTTP_PORT, NETCONF_PORT]
+             + list(range(http_base, http_base + FLOTILLAS))
+             + list(range(netconf_base, netconf_base + FLOTILLAS)))
+    var port_index = 0
+
+    def children_stopped(p: process.Process, code: int, signal: int, out: bytes, err: bytes) -> None:
+        if code == 1 and signal == 0:
+            # pgrep found no children. FleetMgr has reaped its flotillas.
+            deployment!.stop()
+        elif code == 0 and signal == 0:
+            stop_attempts += 1
+            if stop_attempts == 100:
+                signal_children("-KILL")
+            elif stop_attempts == 200:
+                failure = ValueError("flotillas did not stop")
+                deployment!.stop()
+            else:
+                after 0.01: check_children()
+        else:
+            cleanup_error(p, "pgrep failed: {err.decode()}")
+
+    def check_children() -> None:
+        process.RunProcess(pcap, ["pgrep", "-P", str(deployment_pid)],
+                           children_stopped, cleanup_error, None, None)
+
+    def children_signalled(p: process.Process, code: int, signal: int, out: bytes, err: bytes) -> None:
+        if code in {0, 1} and signal == 0:
+            check_children()
+        else:
+            cleanup_error(p, "pkill failed: {err.decode()}")
+
+    def signal_children(signal: str) -> None:
+        process.RunProcess(pcap, ["pkill", signal, "-P", str(deployment_pid)],
+                           children_signalled, cleanup_error, None, None)
+
+    def cleanup_error(p: process.Process, error: str) -> None:
+        failure = ValueError(error)
+        if deployment is not None:
+            deployment!.stop()
+
+    def stop(error: ?Exception = None) -> None:
+        if stopping:
+            return
+        stopping = True
+        failure = error
+        for client in clients:
+            client.close()
+        clients = []
+        if deployment is not None and deployment_pid > 0:
+            signal_children("-TERM")
+
+    def timed_out(current: int) -> None:
+        if generation == current and not stopping:
+            stop(ValueError("FleetMgr deployment exceeded 600 seconds"))
+
+    def http_error(client: http.Client, error: str) -> None:
+        stop(ValueError("HTTP failed: {error}"))
+
+    def node_added(client: http.Client, response: http.Response) -> None:
+        if stopping:
+            return
+        if response.status == 201:
+            node_index += 1
+            add_node(client)
+        else:
+            stop(status_error(response, 201))
+
+    def add_node(client: http.Client) -> None:
+        if node_index == FLOTILLAS:
+            workload(size, client, stop)
+            return
+        name = "flotilla-{node_index + 1}"
+        payload = json.encode({"fleetmgr:node": [{
+            "name": name,
+            "address": [{"name": "primary", "address": "127.0.0.1", "port": netconf_base + node_index}],
+            "credentials": {"username": "admin", "password": "admin"},
+        }]}).encode()
+        # Empty flotillas have no downstream device config to acknowledge yet.
+        # Device batches use the default synchronous completion path.
+        client.put("/restconf/data/fleetmgr:fleet/node={name}", payload, node_added,
+                   {"Content-Type": "application/yang-data+json", "async": "true"})
+
+    def connected(client: http.Client) -> None:
+        if stopping or len(clients) == 0 or client is not clients[0]:
+            client.close()
+            return
+        ready = True
+        add_node(client)
+
+    def connect_error(client: http.Client, error: str) -> None:
+        if stopping or len(clients) == 0 or client is not clients[0]:
+            return
+        if ready:
+            http_error(client, error)
+        else:
+            client.close()
+            clients = []
+            if not stopping:
+                after 0.01: connect_top(generation)
+
+    def connect_top(current: int) -> None:
+        if generation == current and not stopping:
+            clients.append(http.Client(cap, "127.0.0.1", connected, connect_error,
+                                       scheme="http", port=HTTP_PORT))
+
+    def on_stdout(p: process.Process, data: ?bytes) -> None:
+        if data is not None:
+            errors = (errors + data.decode())[-65536:]
+        else:
+            stdout_closed = True
+            deployment_finished()
+
+    def on_stderr(p: process.Process, data: ?bytes) -> None:
+        if data is not None:
+            errors = (errors + data.decode())[-65536:]
+        else:
+            stderr_closed = True
+            deployment_finished()
+
+    def on_exit(p: process.Process, code: int, signal: int) -> None:
+        if not stopping:
+            failure = ValueError("deployment exited code={code} signal={signal}")
+            stopping = True
+        exited = True
+        deployment_finished()
+
+    def deployment_finished() -> None:
+        if not (exited and stdout_closed and stderr_closed):
+            return
+        deployment = None
+        if failure is not None:
+            for client in clients:
+                client.close()
+            t.failure(ValueError("{failure}\n{errors}"))
+        else:
+            body()
+
+    def on_error(p: process.Process, error: str) -> None:
+        stop(ValueError(error))
+        t.failure(ValueError(error))
+
+    def body() -> None:
+        try:
+            size = next(iterations)
+        except StopIteration:
+            t.success()
+            return
+        stopping = False
+        ready = False
+        exited = False
+        stdout_closed = False
+        stderr_closed = False
+        failure = None
+        errors = ""
+        node_index = 0
+        stop_attempts = 0
+        deployment_pid = 0
+        generation += 1
+        deployment = process.Process(pcap, ["out/bin/fleetmgr", "--rts-wthreads", "4",
+                                           "--http.port", str(HTTP_PORT), "--netconf.port", str(NETCONF_PORT)],
+                                     on_stdout, on_stderr, on_exit, on_error, env={})
+        pid = deployment!.pid()
+        if pid is None:
+            t.failure(ValueError("FleetMgr did not start; run acton build --release first"))
+            return
+        deployment_pid = pid!
+        connect_top(generation)
+        after 600.0: timed_out(generation)
+
+    def ignore_data(conn: net.TCPConnection, data: bytes) -> None:
+        pass
+
+    def check_port() -> None:
+        current = port_index
+
+        def port_busy(conn: net.TCPConnection) -> None:
+            def closed(c: net.TCPConnection) -> None:
+                t.failure(ValueError("FleetMgr test port {ports[current]} is already in use"))
+            conn.close(closed)
+
+        def port_error(conn: net.TCPConnection, error: str) -> None:
+            if current != port_index:
+                return
+            def closed(c: net.TCPConnection) -> None:
+                if "connection refused" not in error.lower():
+                    t.failure(ValueError("Cannot check port {ports[current]}: {error}"))
+                    return
+                port_index += 1
+                if port_index == len(ports):
+                    body()
+                else:
+                    check_port()
+            conn.close(closed)
+
+        net.TCPConnection(cap, "127.0.0.1", ports[current], port_busy,
+                          ignore_data, port_error, None, connect_timeout=1.0)
+
+    check_port()
+
+
+actor _test_add_devices(t: testing.EnvT):
+    """Create N devices in synchronous transactions of up to ten devices."""
+    t.require("fleetmgr-system")
+    def run(size: int, client: http.Client, done: action(?Exception) -> None) -> None:
+        AddDevices(size, client, done)
+    FleetMgrTest(t, run)
+
+
+actor _test_upgrade_campaign(t: testing.EnvT):
+    """Create N devices and run an upgrade campaign through FleetMgr."""
+    t.require("fleetmgr-system")
+    def run(size: int, client: http.Client, done: action(?Exception) -> None) -> None:
+        UpgradeCampaign(size, client, done)
+    FleetMgrTest(t, run)
