@@ -31,7 +31,7 @@
     'up-to-date': '#1d2c49',
     'upgrade-needed': '#3f3080',
     'in-progress': '#22d3ee',
-    succeeded: '#2563eb',
+    succeeded: '#16a34a',
     failed: '#ef4444',
     'rolled-back': '#94a3b8'
   };
