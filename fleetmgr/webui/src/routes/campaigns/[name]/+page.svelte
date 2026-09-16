@@ -10,6 +10,7 @@
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
   import { RateTracker, formatEta } from '$lib/software/rate';
+  import { formatClock, formatDuration } from '$lib/software/time';
   import { nameMatches } from '$lib/software/selection';
   import {
     CAMPAIGN_LIST_ROOT,
@@ -24,6 +25,7 @@
 
   const PAGE_SIZE = 100;
   const FAILED_LIMIT = 200;
+  const PLAN_DEVICE_LIMIT = 200;
 
   let {
     data
@@ -39,6 +41,8 @@
   let filterStatus = $state<KnownStatus | ''>('');
   let searchText = $state('');
   let page = $state(1);
+  /** Plan window (by start) whose device list is unfolded. */
+  let openWindow = $state<number | null>(null);
 
   // Two tiers: fresh counters every 1.5 s for campaigns up to
   // FAST_ENTRY_LIMIT members; the loader snapshot refreshes on open, every
@@ -85,6 +89,22 @@
 
   let counters = $derived(liveCounters ?? data.campaign?.counters ?? null);
 
+  let windowsText = $derived.by(() => {
+    const c = data.campaign;
+    if (!c || c.windows.length === 0) return 'none — one window sized for the pace';
+    return c.windows
+      .map((w) => `${w.start === 0 ? 'at launch' : `+${formatDuration(w.start)}`} for ${formatDuration(w.duration)}`)
+      .join(' · ');
+  });
+
+  let paceText = $derived.by(() => {
+    const c = data.campaign;
+    if (!c) return '';
+    const target = c.targetRate === 0 ? 'no preference' : `${c.targetRate}/h`;
+    const cap = c.maxRate === 0 ? 'no cap' : `${c.maxRate}/h`;
+    return `target ${target} · max ${cap}`;
+  });
+
   let failedRows = $derived(
     (data.campaign?.deviceStatus ?? []).filter(
       (r) => r.status === 'failed' || r.status === 'rolled-back'
@@ -117,7 +137,16 @@
   let summary = $derived.by(() => {
     const c = data.campaign;
     if (!c) return '';
-    if (c.adminState === 'plan') return 'Planned — inert until run.';
+    if (c.adminState === 'plan') {
+      const plan = c.plan;
+      if (plan !== null && (plan.windows.length > 0 || plan.unplaced.length > 0)) {
+        const placed = c.devices.length - plan.unplaced.length;
+        const windows = `${plan.windows.length} window${plan.windows.length === 1 ? '' : 's'}`;
+        const missing = plan.unplaced.length > 0 ? `, ${plan.unplaced.length} not placed` : '';
+        return `Planned — inert until run. ${placed} of ${c.devices.length} placed in ${windows}${missing}.`;
+      }
+      return 'Planned — inert until run.';
+    }
     if (counters === null) return 'Running — no state reported yet.';
     if (counters.inProgress > 0)
       return `Running — ${counters.inProgress} of ${counters.total} installing.`;
@@ -147,8 +176,14 @@
   let confirmMessage = $derived.by(() => {
     const c = data.campaign;
     if (!c || !confirmAction) return '';
-    if (confirmAction === 'run')
-      return `Start upgrading ${c.devices.length} device(s) to ${c.targetRelease}? All members fire at once; real installs reload devices and take several minutes.`;
+    if (confirmAction === 'run') {
+      const unplaced = c.plan?.unplaced.length ?? 0;
+      const placed = c.devices.length - unplaced;
+      return (
+        `Start upgrading ${placed} device(s) to ${c.targetRelease}? Every placed device is actuated at once; real installs reload devices and take several minutes.` +
+        (unplaced > 0 ? ` ${unplaced} device(s) do not fit the windows and are left alone.` : '')
+      );
+    }
     if (confirmAction === 'plan')
       return 'Withdraw the software targets? Device statuses revert to live state.';
     return `Delete campaign ${c.name}? Its targets are withdrawn from the devices.`;
@@ -244,8 +279,107 @@
         <span class="fact-label">Image URL</span>
         <span class="mono">{campaign.imageUrl ? maskUrlCredentials(campaign.imageUrl) : '—'}</span>
       </div>
+      <div class="fact">
+        <span class="fact-label">Windows</span>
+        <span class="mono">{windowsText}</span>
+      </div>
+      <div class="fact">
+        <span class="fact-label">Deadline</span>
+        <span class="mono">
+          {campaign.deadline === null ? '—' : `${formatDuration(campaign.deadline)} after launch`}
+        </span>
+      </div>
+      <div class="fact">
+        <span class="fact-label">Pace</span>
+        <span class="mono">{paceText}</span>
+      </div>
     </div>
   </section>
+
+  {#if campaign.plan !== null && (campaign.plan.windows.length > 0 || campaign.plan.alarms.length > 0)}
+    {@const plan = campaign.plan}
+    <section class="card">
+      <div class="grids-head">
+        <h3 class="panel-title">Plan</h3>
+        <span class="hint">
+          estimates, re-anchored when the campaign starts running · run actuates every placed
+          device at once
+        </span>
+      </div>
+      {#if plan.alarms.length > 0}
+        <ul class="alarms">
+          {#each plan.alarms as alarm, i (i)}
+            <li>{alarm}</li>
+          {/each}
+        </ul>
+      {/if}
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Window</th>
+              <th>Opens</th>
+              <th>Closes</th>
+              <th class="right">Devices</th>
+              <th>Estimated starts</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each plan.windows as w (w.start)}
+              {@const first = w.devices[0]}
+              {@const last = w.devices[w.devices.length - 1]}
+              <tr>
+                <td>
+                  <button
+                    class="fold small"
+                    type="button"
+                    onclick={() => (openWindow = openWindow === w.start ? null : w.start)}
+                  >
+                    {openWindow === w.start ? '▾' : '▸'} {w.schedule || 'window'}
+                  </button>
+                </td>
+                <td class="mono tn">{formatClock(w.start)}</td>
+                <td class="mono tn">{formatClock(w.end)}</td>
+                <td class="tn right">{w.devices.length.toLocaleString()}</td>
+                <td class="mono tn">
+                  {#if first && last}
+                    {formatClock(first.estimatedStart)}{w.devices.length > 1
+                      ? ` … ${formatClock(last.estimatedStart)}`
+                      : ''}
+                  {:else}
+                    —
+                  {/if}
+                </td>
+              </tr>
+              {#if openWindow === w.start}
+                <tr>
+                  <td colspan="5">
+                    <div class="plan-devices">
+                      {#each w.devices.slice(0, PLAN_DEVICE_LIMIT) as d (d.name)}
+                        <span class="plan-device">
+                          <span class="device-name">{d.name}</span>
+                          <span class="mono tn dim">{formatClock(d.estimatedStart)}</span>
+                        </span>
+                      {/each}
+                      {#if w.devices.length > PLAN_DEVICE_LIMIT}
+                        <span class="dim">showing {PLAN_DEVICE_LIMIT} of {w.devices.length}</span>
+                      {/if}
+                    </div>
+                  </td>
+                </tr>
+              {/if}
+            {/each}
+          </tbody>
+        </table>
+      </div>
+      {#if plan.unplaced.length > 0}
+        <p class="rate">
+          not placed ({plan.unplaced.length}): {plan.unplaced.slice(0, 20).join(', ')}
+          {plan.unplaced.length > 20 ? '…' : ''}
+        </p>
+      {/if}
+    </section>
+  {/if}
 
   {#if counters !== null}
     <section class="card">
@@ -480,6 +614,39 @@
     font-weight: 600;
     cursor: pointer;
     padding: 0;
+  }
+
+  .fold.small {
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .alarms {
+    margin: 0 0 12px;
+    padding: 10px 14px 10px 30px;
+    border-radius: var(--sw-radius-md);
+    border: 1px solid rgba(251, 191, 36, 0.28);
+    background: var(--sw-warning-dim);
+    color: var(--sw-warning);
+    font-size: 13px;
+  }
+
+  .plan-devices {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 16px;
+    padding: 4px 0 4px 18px;
+    font-size: 12px;
+  }
+
+  .plan-device {
+    display: inline-flex;
+    gap: 6px;
+    align-items: baseline;
+  }
+
+  .dim {
+    color: var(--sw-text-muted);
   }
 
   .filter-row {

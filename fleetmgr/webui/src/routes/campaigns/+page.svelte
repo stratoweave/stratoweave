@@ -69,8 +69,8 @@
     <h2>Upgrade campaigns</h2>
     <p>
       A campaign owns each of its devices exclusively, which is what stops
-      two campaigns scheduling the same device. Run fires all members at
-      once.
+      two campaigns scheduling the same device. The planner fits the members
+      into the campaign's windows; run actuates every placed device at once.
     </p>
   </div>
   <a class="btn btn-primary" href="/campaigns/new">New campaign</a>
@@ -111,6 +111,7 @@
             <th>Target release</th>
             <th>admin-state</th>
             <th class="right">Devices</th>
+            <th>Plan</th>
             <th class="state-col">State</th>
             <th class="right">Succeeded</th>
             <th class="right">Failed</th>
@@ -132,6 +133,21 @@
                 </span>
               </td>
               <td class="tn right">{campaign.devices.length.toLocaleString()}</td>
+              <td class="plan-cell">
+                {#if campaign.plan !== null && campaign.plan.windows.length > 0}
+                  <span class="dim">
+                    {campaign.plan.windows.length} window{campaign.plan.windows.length === 1 ? '' : 's'}
+                  </span>
+                {:else}
+                  <span class="dim">—</span>
+                {/if}
+                {#if campaign.plan !== null && campaign.plan.alarms.length > 0}
+                  <span class="pill warning" title={campaign.plan.alarms.join('\n')}>
+                    <span class="dot"></span>
+                    {campaign.plan.alarms.length} alarm{campaign.plan.alarms.length === 1 ? '' : 's'}
+                  </span>
+                {/if}
+              </td>
               <td class="state-col">
                 {#if campaign.counters !== null}
                   <CampaignProgress counters={campaign.counters} compact={true} />
@@ -246,6 +262,14 @@
   .dim {
     color: var(--sw-text-muted);
     font-size: 11.5px;
+  }
+
+  .plan-cell {
+    white-space: nowrap;
+  }
+
+  .plan-cell .pill {
+    margin-left: 8px;
   }
 
   .failed-cell {

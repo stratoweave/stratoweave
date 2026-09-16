@@ -45,6 +45,30 @@ export interface DeviceStatusJson {
   'running-release'?: string;
 }
 
+/** A maintenance window occurrence, as offsets in seconds from launch. */
+export interface WindowJson {
+  start: number;
+  duration: number;
+}
+
+export interface PlanDeviceJson {
+  name: string;
+  'estimated-start'?: number | string;
+  'estimated-duration'?: number | string;
+}
+
+export interface PlanWindowJson {
+  start: number | string;
+  end?: number | string;
+  schedule?: string;
+  device?: PlanDeviceJson[];
+}
+
+export interface PlanJson {
+  window?: PlanWindowJson[];
+  alarm?: string[];
+}
+
 /** Counters are optional and do not sum to total: pending, unknown and
  * up-to-date devices fall into no counter. */
 export interface CampaignStateJson {
@@ -52,6 +76,7 @@ export interface CampaignStateJson {
   'in-progress'?: number;
   succeeded?: number;
   failed?: number;
+  plan?: PlanJson;
   'device-status'?: DeviceStatusJson[];
 }
 
@@ -62,6 +87,10 @@ export interface CampaignJson {
   'allow-staging'?: boolean;
   device?: CampaignMemberJson[];
   'admin-state'?: AdminState;
+  window?: WindowJson[];
+  deadline?: number;
+  'target-rate'?: number;
+  'max-rate'?: number;
   state?: CampaignStateJson;
 }
 
@@ -158,13 +187,52 @@ export interface CampaignCounters {
   remainder: number;
 }
 
+/** YANG defaults; a GET omits leaves left at their default. */
+export const DEFAULT_TARGET_RATE = 100;
+export const DEFAULT_MAX_RATE = 500;
+
+export interface MaintenanceWindow {
+  /** Seconds after launch. */
+  start: number;
+  duration: number;
+}
+
+export interface PlanDevice {
+  name: string;
+  /** Seconds since the Unix epoch; an estimate. */
+  estimatedStart: number;
+  estimatedDuration: number;
+}
+
+export interface PlanWindow {
+  start: number;
+  end: number;
+  schedule: string;
+  devices: PlanDevice[];
+}
+
+/** The planner's layout, published under state in plan and in run alike.
+ * Members in no window are not actuated. */
+export interface CampaignPlan {
+  windows: PlanWindow[];
+  alarms: string[];
+  unplaced: string[];
+}
+
 export interface Campaign {
   name: string;
   targetRelease: string;
   devices: string[];
   imageUrl: string;
   adminState: AdminState;
+  windows: MaintenanceWindow[];
+  /** Seconds after launch; null when the campaign has none. */
+  deadline: number | null;
+  /** Devices per hour; 0 means no preference / no cap. */
+  targetRate: number;
+  maxRate: number;
   counters: CampaignCounters | null;
+  plan: CampaignPlan | null;
   deviceStatus: DeviceStatusRow[];
 }
 
@@ -206,8 +274,42 @@ function parseCounters(state: CampaignStateJson | undefined): CampaignCounters |
   };
 }
 
+/** RFC 7951 encodes uint64 as a string; this backend sends numbers. */
+function num(value: unknown): number {
+  const n = typeof value === 'string' ? Number(value) : value;
+  return typeof n === 'number' && Number.isFinite(n) ? n : 0;
+}
+
+function parsePlan(state: CampaignStateJson | undefined, members: string[]): CampaignPlan | null {
+  if (!state) {
+    return null;
+  }
+  const windows = (state.plan?.window ?? []).map((w) => ({
+    start: num(w.start),
+    end: num(w.end),
+    schedule: w.schedule ?? '',
+    devices: (w.device ?? []).map((d) => ({
+      name: d.name,
+      estimatedStart: num(d['estimated-start']),
+      estimatedDuration: num(d['estimated-duration'])
+    }))
+  }));
+  windows.sort((a, b) => a.start - b.start);
+  const placed = new Set(windows.flatMap((w) => w.devices.map((d) => d.name)));
+  return {
+    windows,
+    alarms: state.plan?.alarm ?? [],
+    unplaced: members.filter((m) => !placed.has(m))
+  };
+}
+
 function parseCampaign(entry: CampaignJson): Campaign {
   const members = (entry.device ?? []).map((m) => m.name);
+  const windows = (entry.window ?? []).map((w) => ({
+    start: num(w.start),
+    duration: num(w.duration)
+  }));
+  windows.sort((a, b) => a.start - b.start);
   const reported = new Map<string, DeviceStatusJson>();
   for (const row of entry.state?.['device-status'] ?? []) {
     reported.set(row.device, row);
@@ -224,7 +326,12 @@ function parseCampaign(entry: CampaignJson): Campaign {
     devices: members,
     imageUrl: entry['image-url'] ?? '',
     adminState: entry['admin-state'] === 'run' ? 'run' : 'plan',
+    windows,
+    deadline: typeof entry.deadline === 'number' ? entry.deadline : null,
+    targetRate: entry['target-rate'] ?? DEFAULT_TARGET_RATE,
+    maxRate: entry['max-rate'] ?? DEFAULT_MAX_RATE,
     counters: parseCounters(entry.state),
+    plan: parsePlan(entry.state, members),
     deviceStatus: names.map((device) => {
       const row = reported.get(device);
       const raw = row?.status ?? 'unknown';
@@ -267,6 +374,12 @@ export interface NewCampaign {
   imageUrl: string;
   devices: string[];
   allowStaging?: boolean;
+  windows?: MaintenanceWindow[];
+  /** Seconds after launch. */
+  deadline?: number | null;
+  /** Devices per hour; null leaves the model default. */
+  targetRate?: number | null;
+  maxRate?: number | null;
 }
 
 export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
@@ -279,6 +392,12 @@ export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
   const imageUrl = input.imageUrl.trim();
   if (imageUrl) entry['image-url'] = imageUrl;
   if (input.allowStaging) entry['allow-staging'] = true;
+  if (input.windows && input.windows.length > 0) {
+    entry.window = input.windows.map((w) => ({ start: w.start, duration: w.duration }));
+  }
+  if (input.deadline != null) entry.deadline = input.deadline;
+  if (input.targetRate != null) entry['target-rate'] = input.targetRate;
+  if (input.maxRate != null) entry['max-rate'] = input.maxRate;
   return { 'software:software': { 'upgrade-campaign': [entry] } };
 }
 

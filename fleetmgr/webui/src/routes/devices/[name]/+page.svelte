@@ -5,6 +5,7 @@
   import StatusPill from '$lib/software/StatusPill.svelte';
   import { createPoller } from '$lib/core/polling/poller';
   import type { Campaign, Device } from '$lib/software/model';
+  import { formatClock } from '$lib/software/time';
 
   let {
     data
@@ -25,6 +26,17 @@
 
   function campaignHref(campaign: Campaign): string {
     return `/campaigns/${encodeURIComponent(campaign.name)}`;
+  }
+
+  /** The planner's estimate for this device, or "not placed" when the plan
+   * has the campaign but no window for it. */
+  function plannedStart(campaign: Campaign): string {
+    if (campaign.plan === null) return '—';
+    for (const w of campaign.plan.windows) {
+      const d = w.devices.find((x) => x.name === data.name);
+      if (d) return formatClock(d.estimatedStart);
+    }
+    return campaign.plan.unplaced.includes(data.name) ? 'not placed' : '—';
   }
 </script>
 
@@ -66,6 +78,7 @@
               <th>Campaign</th>
               <th>Target release</th>
               <th>admin-state</th>
+              <th>Planned start</th>
               <th>Status</th>
               <th>Running release</th>
             </tr>
@@ -84,6 +97,7 @@
                     {campaign.adminState}
                   </span>
                 </td>
+                <td class="mono tn">{plannedStart(campaign)}</td>
                 <td>
                   {#if row}
                     <StatusPill status={row.status} raw={row.raw} />
