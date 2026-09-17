@@ -39,8 +39,10 @@ Start the top:
 
 The top starts ten `flotilla` subprocesses and waits for every NETCONF listener
 before starting its own runtime. The demo declares `flotilla-1` through
-`flotilla-10` and assigns two complete mock IOS XE entries to each. The
-processes use these ports:
+`flotilla-10` and assigns two complete mock IOS XE entries to each.
+`demo-campaign.xml` adds `xe-upgrade-fleet`, a planned campaign over
+`cpe-04` to `cpe-20` with two one-hour windows, so the web UI has a plan to
+show; it does nothing until set to `run`. The processes use these ports:
 
     process          HTTP          NETCONF
     fleetmgr         18200         12900
@@ -88,6 +90,20 @@ The submission and observation steps are also available separately:
     just campaign-status      # print one current snapshot
 
 Set `FLEETMGR_API` to point these targets at a top node on another address.
+
+## Web UI
+
+`webui/` is a SvelteKit UI for the same northbound: fleet inventory and
+upgrade campaigns over RESTCONF. The top serves it itself: the static build
+is embedded in the `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so
+with `just demo` running the UI is at http://127.0.0.1:18200/. After a UI
+change, `just gen-webui` rebuilds the UI and regenerates that module (needs
+Node), then `just build` picks it up. For UI work,
+
+    just webui
+
+starts the Vite dev server on :3000 and proxies `/restconf` to
+`FLEETMGR_API`. See `webui/README.md`.
 
 ## Lab with real devices
 
