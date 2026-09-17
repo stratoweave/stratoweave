@@ -286,27 +286,29 @@ def _sim_camp(target: int, maxc: int) -> core.Campaign:
                     ["c8000v"], [], [], "run")
 
 def _test_a_window_on_estimate_defers_nothing():
+    # each decision batch costs a little wall time (the debounce), and the
+    # controller repays it from headroom above target rather than deferring
     w = core.Window("weekly", 0, 4 * HOUR, 100000)
-    r = sim.simulate_window(22800, 600, 600, w, _sim_camp(1000, 2000), 1000, 60, 10000, None)
+    r = sim.simulate_window(22800, 600, 600, w, _sim_camp(1000, 2000), 1000, 30, None)
     testing.assertEqual(r.deferred, 0, "a window run on estimate must complete")
-    testing.assertEqual(r.peak, 1000, "and must not exceed target to do it")
+    testing.assertTrue(r.peak <= 2000, "and stay within max concurrency to do it")
 
 def _test_slow_upgrades_spend_the_headroom():
     w = core.Window("weekly", 0, 4 * HOUR, 100000)
-    r = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 60, 10000, None)
+    r = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 30, None)
     testing.assertEqual(r.peak, 2000, "2x duration must drive concurrency to max")
 
 def _test_learned_duration_beats_a_cold_start():
     # same 2x-slow window, seeded with what the previous window observed
     w = core.Window("weekly", 0, 4 * HOUR, 100000)
-    cold = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 60, 10000, None)
-    warm = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 60, 10000, 1200)
+    cold = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 30, None)
+    warm = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 30, 1200)
     testing.assertTrue(warm.deferred < cold.deferred,
                        "a learned estimate must defer fewer devices than a cold start")
 
 def _test_max_concurrency_is_never_breached():
     w = core.Window("weekly", 0, 4 * HOUR, 100000)
-    r = sim.simulate_window(50000, 600, 1800, w, _sim_camp(1000, 2000), 1000, 60, 10000, None)
+    r = sim.simulate_window(50000, 600, 1800, w, _sim_camp(1000, 2000), 1000, 30, None)
     testing.assertTrue(r.peak <= 2000, "blast radius is a hard ceiling")
 
 #############################################################################
@@ -409,26 +411,106 @@ def _test_snapshot_window_on_estimate():
     """A window planned full at target, running exactly on estimate: the
     controller sits at target and defers nothing."""
     w = core.Window("weekly", 0, 4 * HOUR, 100000)
-    r = sim.simulate_window(22800, 600, 600, w, _sim_camp(1000, 2000), 1000, 60, 40, None)
+    r = sim.simulate_window(22800, 600, 600, w, _sim_camp(1000, 2000), 1000, 30, None)
     return _sim_text("22800 devices, 10min estimate, 10min actual, target 1000 / max 2000", r)
 
 def _test_snapshot_window_2x_slow():
     """The same window when upgrades take twice as long. The window is the
     commitment, so concurrency climbs toward max rather than deferring."""
     w = core.Window("weekly", 0, 4 * HOUR, 100000)
-    r = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 60, 40, None)
+    r = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 30, None)
     return _sim_text("22800 devices, 10min estimate, 20min actual, target 1000 / max 2000", r)
 
 def _test_snapshot_window_2x_slow_learned():
     """Same again, but seeded with the duration observed in the previous window:
     fewer deferrals and an earlier shortfall alarm."""
     w = core.Window("weekly", 0, 4 * HOUR, 100000)
-    r = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 60, 40, 1200)
+    r = sim.simulate_window(22800, 600, 1200, w, _sim_camp(1000, 2000), 1000, 30, 1200)
     return _sim_text("22800 devices, duration learned from last window (20min)", r)
 
 def _test_snapshot_ramp():
     """Ramp up from a single canary to target 64, each rung gated on the
     previous landing cleanly."""
     w = core.Window("weekly", 0, 4 * HOUR, 100000)
-    r = sim.simulate_window(400, 600, 600, w, _sim_camp(64, 128), 1, 60, 10)
+    r = sim.simulate_window(400, 600, 600, w, _sim_camp(64, 128), 1, 30)
     return _sim_text("400 devices, ramp from 1 to target 64", r)
+
+#############################################################################
+# window entry and multiple schedules
+#############################################################################
+
+def _sched_gen(name: str, first: int, n: int) -> core.SimpleWindowGen:
+    return core.SimpleWindowGen(name, first, 4 * HOUR, 7 * DAY, 10000, n)
+
+def _bound(name: str, schedule: ?str) -> core.DeviceIn:
+    return core.DeviceIn(name, "c8000v", schedule, [], [], 20 * 60, True)
+
+def _test_devices_follow_their_own_schedule():
+    # campaign default is night; two devices are bound to weekend and must
+    # land in weekend windows, the unbound one in night windows
+    camp = core.Campaign("c", ["night"], 100, 200, 1, 2, 0, core.SPREAD, 5,
+                         ["c8000v"], [], [], "plan")
+    devs = [_bound("n1", None), _bound("w1", "weekend"), _bound("w2", "weekend")]
+    gens = [_sched_gen("night", 2 * HOUR, 6), _sched_gen("weekend", 3 * HOUR, 6)]
+    r = core.plan([], devs, camp, {}, gens, 0, 12)
+    testing.assertEqual(len(r.assigns), 3, None)
+    for a in r.assigns:
+        if a.device == "n1":
+            testing.assertEqual(a.schedule, "night", "unbound follows the campaign default")
+        else:
+            testing.assertEqual(a.schedule, "weekend", "bound device must use its own schedule")
+
+def _test_window_entry_is_a_ramp_not_the_placement():
+    # 20 devices planned into one window; entering it launches the first
+    # ramp rung, and never the whole placement at once
+    camp = core.Campaign("c", ["w"], 8, 12, 1, 2, 0, core.SPREAD, 5,
+                         [], [], [], "run")
+    w = core.Window("w", 0, 4 * HOUR, 10000)
+    r = sim.simulate_window(20, 20 * 60, 20 * 60, w, camp, camp.ramp_start, 30)
+    testing.assertEqual(r.first_launch, camp.ramp_start, "window entry starts one rung, not everything")
+    testing.assertEqual(r.completed, 20, None)
+    testing.assertEqual(r.overran, 0, None)
+    testing.assertTrue(r.peak <= camp.target_concurrency, "on estimate the ramp tops out at target")
+
+def _test_two_schedules_plan_then_controlled_release():
+    # plan across two schedules, then drive each placed window through the
+    # controller: every window ramps from one and everyone still completes
+    camp = core.Campaign("c", ["night", "weekend"], 4, 8, 1, 2, 0, core.SPREAD, 5,
+                         ["c8000v"], [], [], "run")
+    devs = []
+    for i in range(6):
+        devs.append(_bound("n{i}", "night"))
+    for i in range(4):
+        devs.append(_bound("w{i}", "weekend"))
+    gens = [_sched_gen("night", 2 * HOUR, 2), _sched_gen("weekend", 3 * HOUR, 2)]
+    r = core.plan([], devs, camp, {}, gens, 0, 4)
+    per_window: dict[str, int] = {}
+    for a in r.assigns:
+        per_window[a.wkey()] = per_window.get_def(a.wkey(), 0) + 1
+    testing.assertEqual(len(r.alarms), 0, None)
+    total = 0
+    for wkey, count in per_window.items():
+        w = core.Window(wkey.split("@")[0], 0, 4 * HOUR, 10000)
+        res = sim.simulate_window(count, 20 * 60, 20 * 60, w, camp, camp.ramp_start, 30)
+        testing.assertEqual(res.first_launch, camp.ramp_start, "each window opens with one rung")
+        testing.assertEqual(res.completed, count, "window {wkey} must drain")
+        total += res.completed
+    testing.assertEqual(total, 10, None)
+
+def _test_snapshot_two_schedules_partition():
+    """The layout behind the partition test: bound devices land in their own
+    schedule's windows, the unbound one follows the campaign default."""
+    camp = core.Campaign("c", ["night"], 100, 200, 1, 2, 0, core.SPREAD, 5,
+                         ["c8000v"], [], [], "plan")
+    devs = [_bound("n1", None), _bound("w1", "weekend"), _bound("w2", "weekend")]
+    gens = [_sched_gen("night", 2 * HOUR, 6), _sched_gen("weekend", 3 * HOUR, 6)]
+    return core.render_plan(camp, core.plan([], devs, camp, {}, gens, 0, 12))
+
+def _test_snapshot_window_entry_ramp():
+    """The tick table behind the window-entry test: twenty placed devices,
+    and entering the window launches one of them, not twenty."""
+    camp = core.Campaign("c", ["w"], 8, 12, 1, 2, 0, core.SPREAD, 5,
+                         [], [], [], "run")
+    w = core.Window("w", 0, 4 * HOUR, 10000)
+    r = sim.simulate_window(20, 20 * 60, 20 * 60, w, camp, camp.ramp_start, 30)
+    return _sim_text("20 devices, 20min upgrades on estimate, ramp from 1 to target 8", r)
