@@ -286,9 +286,9 @@
   }
 
   .tok.on {
-    background: rgba(37, 99, 235, 0.14);
-    border: 1px solid rgba(37, 99, 235, 0.4);
-    color: #93b4fc;
+    background: var(--sw-accent-glow);
+    border: 1px solid var(--sw-accent-glow-strong);
+    color: var(--sw-accent-bright);
   }
 
   .andr {
@@ -318,7 +318,7 @@
     gap: 26px;
     padding: 12px 0;
     border-top: 1px solid var(--sw-border-subtle);
-    border-bottom: 1px solid rgba(226, 232, 240, 0.07);
+    border-bottom: 1px solid var(--sw-border-subtle);
   }
 
   .count {
@@ -361,7 +361,7 @@
     flex: 1;
     height: 7px;
     border-radius: 4px;
-    background: rgba(226, 232, 240, 0.08);
+    background: var(--sw-bg-hover);
     overflow: hidden;
     display: block;
   }
@@ -396,7 +396,7 @@
     display: flex;
     gap: 14px;
     padding: 10px 0;
-    border-bottom: 1px solid rgba(226, 232, 240, 0.07);
+    border-bottom: 1px solid var(--sw-border-subtle);
   }
 
   .excl-n {
@@ -427,11 +427,11 @@
 
   .sample td {
     padding: 6px 0;
-    border-bottom: 1px solid rgba(226, 232, 240, 0.07);
+    border-bottom: 1px solid var(--sw-border-subtle);
   }
 
   .sname {
-    color: #93b4fc;
+    color: var(--sw-accent-bright);
   }
 
   .stype {

@@ -543,8 +543,8 @@
   .success-banner {
     padding: 10px 14px;
     border-radius: var(--sw-radius-md);
-    border: 1px solid rgba(37, 99, 235, 0.35);
-    background: rgba(37, 99, 235, 0.08);
+    border: 1px solid rgb(var(--sw-accent-rgb) / 0.35);
+    background: var(--sw-accent-glow);
     color: var(--sw-text-primary);
     font-size: 13px;
   }
@@ -625,7 +625,7 @@
     margin: 0 0 12px;
     padding: 10px 14px 10px 30px;
     border-radius: var(--sw-radius-md);
-    border: 1px solid rgba(251, 191, 36, 0.28);
+    border: 1px solid rgb(var(--sw-warning-rgb) / 0.3);
     background: var(--sw-warning-dim);
     color: var(--sw-warning);
     font-size: 13px;

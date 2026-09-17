@@ -393,8 +393,8 @@
   .success-banner {
     padding: 10px 14px;
     border-radius: var(--sw-radius-md);
-    border: 1px solid rgba(37, 99, 235, 0.35);
-    background: rgba(37, 99, 235, 0.08);
+    border: 1px solid rgb(var(--sw-accent-rgb) / 0.35);
+    background: var(--sw-accent-glow);
     color: var(--sw-text-primary);
     font-size: 13px;
   }
@@ -479,7 +479,7 @@
 
   .device-name {
     font-weight: 600;
-    color: #93b4fc;
+    color: var(--sw-accent-bright);
     text-decoration: none;
   }
 

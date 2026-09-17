@@ -385,7 +385,7 @@
     line-height: 1.6;
     color: var(--sw-warning);
     background: var(--sw-warning-dim);
-    border: 1px solid rgba(251, 191, 36, 0.28);
+    border: 1px solid rgb(var(--sw-warning-rgb) / 0.3);
     border-radius: 6px;
     padding: 9px 11px;
   }

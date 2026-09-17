@@ -164,7 +164,7 @@
 
   td {
     padding: 11px 10px;
-    border-bottom: 1px solid rgba(226, 232, 240, 0.07);
+    border-bottom: 1px solid var(--sw-border-subtle);
     vertical-align: middle;
   }
 
@@ -173,7 +173,7 @@
   }
 
   .campaign-name {
-    color: #93b4fc;
+    color: var(--sw-accent-bright);
     text-decoration: none;
   }
 

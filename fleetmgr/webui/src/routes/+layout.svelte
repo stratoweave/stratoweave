@@ -6,6 +6,7 @@
   import { page } from '$app/state';
   import type { Snippet } from 'svelte';
 
+  import NavIcon from '$lib/core/ui/NavIcon.svelte';
   import logoUrl from '$lib/assets/stratoweave-logo.svg';
 
   let { children }: { children?: Snippet } = $props();
@@ -57,7 +58,7 @@
           class:active={currentPathname.startsWith('/campaigns')}
           href="/campaigns"
         >
-          <span class="nav-icon">⬆</span>
+          <span class="nav-icon"><NavIcon name="campaigns" /></span>
           Campaigns
         </a>
       </div>
@@ -68,7 +69,7 @@
           class:active={currentPathname.startsWith('/devices')}
           href="/devices"
         >
-          <span class="nav-icon">⬡</span>
+          <span class="nav-icon"><NavIcon name="devices" /></span>
           Devices
         </a>
       </div>
@@ -81,20 +82,24 @@
       <nav class="yang-path" aria-label="Breadcrumb">
         {#if campaignName !== null}
           <a class="segment" href="/campaigns">Campaigns</a>
-          <span class="separator">/</span>
+          <span class="separator">›</span>
         {/if}
         <span class="segment current" aria-current="page">{currentLabel}</span>
       </nav>
 
       <div class="header-actions">
         <button class="btn btn-ghost btn-sm" type="button" onclick={handleRefresh}>
-          ⟳ Refresh
+          <NavIcon name="refresh" size={16} /> Refresh
         </button>
       </div>
     </header>
 
     <main class="app-content">
-      {@render children?.()}
+      {#key currentPathname}
+        <div class="page-enter">
+          {@render children?.()}
+        </div>
+      {/key}
     </main>
   </div>
 </div>
