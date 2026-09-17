@@ -876,6 +876,97 @@ actor transform_dynstate(t: testing.AsyncT):
     s1.edit_config(gdata.Container({q("leaf"): gdata.Leaf(39)}))
 
 ########################
+
+class DynstateEchoTransform(ttt.TransformFunction):
+    def transform_wrapper(self, cfg: gdata.Node, linked: gdata.Node, memory: ?gdata.Node, dynstate: ?gdata.Node):
+        # The output follows dynstate, so each recompute commit is visible
+        # below. The config and memory pass through unchanged.
+        out = cfg
+        if dynstate is not None:
+            out = dynstate
+        return (out, memory)
+
+actor DynstateStormActor(update_dynstate: action(?gdata.Node) -> None, report: action(int) -> None):
+    var on_confs = 0
+
+    def tick(i: int):
+        update_dynstate(gdata.Leaf(i))
+        if i < 6:
+            after 0.03: tick(i + 1)
+
+    def on_conf(conf: gdata.Node, memory: ?gdata.Node):
+        on_confs += 1
+        if conf == gdata.Leaf(99):
+            report(on_confs)
+        elif on_confs == 1:
+            tick(1)
+
+    def shutdown(memory: ?gdata.Node):
+        pass
+
+# Dynstate recomputes that leave the config and memory unchanged must not
+# re-deliver on_conf: the actor ticks update_dynstate in a loop and must not
+# get its own ticks back as an on_conf storm. A real config change after the
+# storm must be delivered, so the count at that delivery is exactly 2.
+actor transform_dynstate_unchanged_skips_onconf(t: testing.AsyncT):
+    def final_count(n: int):
+        testing.assertEqual(n, 2)
+        t.success()
+
+    def Ctor(params: ttt.TransformActorParams) -> ttt.TransformActor:
+        act = DynstateStormActor(params.update_dynstate, final_count)
+        return ttt.TransformActor(act.on_conf, act.shutdown)
+
+    stack = ttt.Layer("top:", ttt.Container({q("leaf"): ttt.Transform(DynstateEchoTransform, Ctor)}), ttt.Sink())
+    sess = stack.newsession()
+
+    def edit2():
+        sess2 = stack.newsession()
+        sess2.edit_config(gdata.Container({q("leaf"): gdata.Leaf(99)}))
+
+    def check():
+        if sess.below().get() == gdata.Leaf(6):
+            # The last tick's recompute has committed. Settle to let queued
+            # recomputes commit, then make the real config change.
+            after 0.2: edit2()
+        else:
+            after 0.05: check()
+
+    sess.edit_config(gdata.Container({q("leaf"): gdata.Leaf(0)}))
+    after 0.05: check()
+
+########################
+
+class DynstateMemoryTransform(ttt.TransformFunction):
+    def transform_wrapper(self, cfg: gdata.Node, linked: gdata.Node, memory: ?gdata.Node, dynstate: ?gdata.Node):
+        # The memory follows dynstate. The config passes through unchanged.
+        mem = gdata.Leaf(0)
+        if dynstate is not None:
+            mem = dynstate
+        return (cfg, mem)
+
+actor DynstateMemoryActor(update_dynstate: action(?gdata.Node) -> None, t: testing.AsyncT):
+    def on_conf(conf: gdata.Node, memory: ?gdata.Node):
+        if memory is not None and memory == gdata.Leaf(1):
+            t.success()
+        elif memory is not None and memory == gdata.Leaf(0):
+            update_dynstate(gdata.Leaf(1))
+
+    def shutdown(memory: ?gdata.Node):
+        pass
+
+# A dynstate recompute that changes the memory must still deliver on_conf
+# even though the config is unchanged (the transform_dynstate contract).
+actor transform_dynstate_memory_change_delivers_onconf(t: testing.AsyncT):
+    def Ctor(params: ttt.TransformActorParams) -> ttt.TransformActor:
+        act = DynstateMemoryActor(params.update_dynstate, t)
+        return ttt.TransformActor(act.on_conf, act.shutdown)
+
+    stack = ttt.Layer("top:", ttt.Container({q("leaf"): ttt.Transform(DynstateMemoryTransform, Ctor)}), None)
+    sess = stack.newsession()
+    sess.edit_config(gdata.Container({q("leaf"): gdata.Leaf(5)}))
+
+########################
 # Link regression tests
 ########################
 
