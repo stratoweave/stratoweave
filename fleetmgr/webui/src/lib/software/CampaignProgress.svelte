@@ -19,6 +19,8 @@
     pulse?: boolean;
   }
 
+  // The legend lists every entry, zero or not, so it does not shift as a
+  // count crosses zero; the bar only draws the non-empty ones.
   let segments = $derived.by((): Segment[] => {
     if (counters === null) return [];
     return [
@@ -26,8 +28,9 @@
       { name: 'in progress', n: counters.inProgress, color: 'var(--sw-accent)', pulse: true },
       { name: 'failed', n: counters.failed, color: 'var(--sw-danger)' },
       { name: 'waiting', n: counters.remainder, color: 'var(--sw-bar-rest)', hint: REMAINDER_HINT }
-    ].filter((s) => s.n > 0);
+    ];
   });
+  let bars = $derived(segments.filter((s) => s.n > 0));
 
   function pct(n: number, total: number): string {
     return total > 0 ? `${((n / total) * 100).toFixed(1)}%` : '0%';
@@ -47,11 +50,11 @@
       role="img"
       aria-label={`${counters.succeeded} of ${total} succeeded, ${counters.failed} failed, ${counters.inProgress} in progress`}
     >
-      {#each segments as s, i (s.name)}
+      {#each bars as s, i (s.name)}
         <div
           class="seg"
           class:pulse={s.pulse}
-          class:separated={i < segments.length - 1}
+          class:separated={i < bars.length - 1}
           style:width={width(s.n, total)}
           style:background={s.color}
           title={s.hint}
@@ -61,7 +64,7 @@
     {#if !compact}
       <div class="legend">
         {#each segments as s (s.name)}
-          <div class="entry" title={s.hint}>
+          <div class="entry" class:empty={s.n === 0} title={s.hint}>
             <span class="swatch" style:background={s.color}></span>
             <span class="name">{s.name}</span>
             <span class="n tn">{s.n.toLocaleString()}</span>
@@ -122,6 +125,10 @@
     height: 9px;
     border-radius: 2px;
     align-self: center;
+  }
+
+  .entry.empty {
+    opacity: 0.55;
   }
 
   .name {
