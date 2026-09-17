@@ -1,6 +1,8 @@
-import type { RestconfRequestOptions } from '$lib/core/restconf/proxy-types';
+import type { RestconfRequestOptions } from '$lib/core/restconf/types';
 
-const RESTCONF_BASE = '/api/restconf';
+// Same origin: the fleetmgr top serves the UI next to its RESTCONF API, and
+// `vite dev` proxies this prefix to a running top.
+const RESTCONF_BASE = '/restconf';
 // Async writes return when the transaction commits. A synchronous write waits
 // for southbound application, which during a real install takes minutes.
 const ASYNC_WRITE_HEADERS = { async: 'true' } as const;
@@ -12,8 +14,7 @@ function normalizePath(path: string): string {
 }
 
 function encodeListKeyPart(value: string): string {
-  // The /api proxy forwards the raw request path, so list keys need exactly
-  // the single percent-encoding RFC 8040 prescribes.
+  // List keys take exactly the single percent-encoding RFC 8040 prescribes.
   return encodeURIComponent(value.trim());
 }
 

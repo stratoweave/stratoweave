@@ -3,27 +3,29 @@
 A SvelteKit UI for the fleetmgr contract (see ../README.md): fleet
 inventory and software upgrade campaigns over RESTCONF.
 
-The backend serves no CORS headers, so the browser never talks to it
-directly: `src/hooks.server.ts` proxies `/api/*` to `STRATOWEAVE_API_ORIGIN`,
-forwarding the raw percent-encoded path so encoded list keys reach the
-backend intact. Writes send `async: true` so a PATCH returns when the
-transaction commits instead of after devices finish applying — a real
-install takes minutes.
+It is a static SPA served by the fleetmgr top itself, next to its RESTCONF
+API on the same origin, so there is no proxy and no CORS: `just gen-webui`
+(from ../) builds it and writes the build into `src/fleetmgr/webui_assets.act`
+as embedded assets, which the top serves with an `index.html` fallback for
+client-routed pages. That module is committed; the build is byte-deterministic
+(see `svelte.config.js`) so it only changes with the UI. Fonts and the logo
+are inlined as data URIs because the server sends text bodies only. Writes
+send `async: true` so a PATCH returns when the transaction commits instead of
+after devices finish applying — a real install takes minutes.
 
 ## Run
 
     # backend, from ../
     just build
     just demo
+    # -> http://127.0.0.1:18200/ serves the embedded UI
 
-    # UI
-    npm install
-    STRATOWEAVE_API_ORIGIN=http://127.0.0.1:18200 npm run dev
-    # -> http://localhost:3000
-    # or, from ../: just webui
+    # UI development, from ../
+    just webui
+    # -> http://localhost:3000, /restconf proxied to FLEETMGR_API
 
-Production build: `npm run build`, then
-`STRATOWEAVE_API_ORIGIN=... node build`. Type check: `npm run check`.
+Type check: `npm run check`. After UI changes: `just gen-webui`, then
+`just build` and commit the regenerated module.
 
 ## How it reads and writes
 

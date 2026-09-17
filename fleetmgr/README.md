@@ -92,12 +92,16 @@ Set `FLEETMGR_API` to point these targets at a top node on another address.
 ## Web UI
 
 `webui/` is a SvelteKit UI for the same northbound: fleet inventory and
-upgrade campaigns over RESTCONF, through its own server-side proxy. It
-needs Node; run `npm install` in `webui/` once, then
+upgrade campaigns over RESTCONF. The top serves it itself: the static build
+is embedded in the `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so
+with `just demo` running the UI is at http://127.0.0.1:18200/. After a UI
+change, `just gen-webui` rebuilds the UI and regenerates that module (needs
+Node), then `just build` picks it up. For UI work,
 
     just webui
 
-starts the dev server on :3000 against `FLEETMGR_API`. See `webui/README.md`.
+starts the Vite dev server on :3000 and proxies `/restconf` to
+`FLEETMGR_API`. See `webui/README.md`.
 
 ## Lab with real devices
 
