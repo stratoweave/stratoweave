@@ -18,7 +18,7 @@ of competitive interests.
   directly, or reach out through [GitHub issues](https://github.com/stratoweave/stratoweave/issues)
   if you want to report a problem or discuss an approach first.
 - **Larger functional changes:** we recommend thoroughly reviewing the [platform
-  architecture and design guidelines](docs/reference/index.md)
+  architecture and design guidelines](https://stratoweave.guide/reference/)
   and joining a Technical Steering Committee (TSC) 
   [meeting](https://lf-networking.atlassian.net/wiki/spaces/StratoWeave/pages/1005813812)
   to discuss your proposal before substantial implementation work. Open an issue describing
@@ -46,7 +46,7 @@ pull requests, or meeting minutes so others can participate.
 - New code contributions must be submitted under the
   [BSD-3-Clause license](LICENSES/BSD-3-Clause.txt).
 - Documentation contributions are received and distributed under the
-  [Creative Commons Zero v1.0 Universal license](LICENSES/CC-1.0.txt).
+  [Creative Commons Zero v1.0 Universal license](LICENSES/CC0-1.0.txt).
 - Contributed files should carry accurate copyright and license information,
   including SPDX identifiers. Preserve applicable third-party notices and comply
   with upstream and dependency licenses.
@@ -108,4 +108,4 @@ architecture and a demonstrated track record of contributions to the Project.
 | [klambrec](https://github.com/klambrec) | Kris Lambrechts |
 | [mzagozen](https://github.com/mzagozen)| Marko Zagožen |
 | [nordlander](https://github.com/nordlander) | Johan Nordlander |
-| [sydow](https://github.com/sydow) | |
+| [sydow](https://github.com/sydow) | Björn von Sydow |
