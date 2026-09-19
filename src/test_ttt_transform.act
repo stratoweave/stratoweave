@@ -994,18 +994,51 @@ class NoOutput(ttt.TransformFunction):
     def transform_wrapper(self, cfg, linked, memory, dynstate):
         return gdata.Container(), None
 
+actor LinkedAsnActor(report: action(int, int) -> None):
+    """Companion actor: reports each on_conf with the asn seen in linked."""
+    var deliveries = 0
+
+    def on_conf(conf: gdata.Node, linked: gdata.Node, memory: ?gdata.Node):
+        deliveries += 1
+        asn = 0
+        network_node = linked.get_opt_cnt(q("network"))
+        if network_node is not None:
+            gs_node = network_node.get_opt_cnt(q("global-settings"))
+            if gs_node is not None:
+                asn_leaf = gs_node.get_opt_leaf(q("asn"))
+                if asn_leaf is not None:
+                    v = asn_leaf.val
+                    if isinstance(v, int):
+                        asn = v
+        report(deliveries, asn)
+
+    def shutdown(memory: ?gdata.Node):
+        pass
+
 # When the subscriber lives in a list and a later tx touches only the
 # publisher, the list element transactions are not configured in that tx.
 # Linkage still has to reach the existing list entry and the resulting
-# commit must release the ListState cleanly. The compound key (string + int)
-# also covers per-type and multi-key value_match rendering in one shot.
+# commit must release the ListState cleanly. The changed linked input is
+# new intent, so the companion actor hears each change through on_conf
+# with the fresh linked tree, and a publisher re-edit that changes nothing
+# delivers nothing. The compound key (string + int) also covers per-type
+# and multi-key value_match rendering in one shot.
 actor link_subscriber_in_list_re_runs_on_publisher_update(t: testing.AsyncT):
+    var deliveries: list[(int, int)] = []
+
+    def report(n: int, asn: int):
+        deliveries.append((n, asn))
+
+    def Ctor(_params: ttt.TransformActorParams) -> ttt.TransformActor:
+        act = LinkedAsnActor(report)
+        return ttt.TransformActor(act.on_conf, act.shutdown)
+
     stack = ttt.Layer("top",
         ttt.Container({
             q("network"): ttt.Container({
                 q("global-settings"): ttt.Transform(NoOutput),
                 q("router"): ttt.List(
-                    ttt.Transform(LinkedAsnSubscriber, None, _link_to_global_settings),
+                    ttt.Transform(LinkedAsnSubscriber, Ctor, _link_to_global_settings),
                     [q("name"), q("id")],
                 ),
             }),
@@ -1037,12 +1070,28 @@ actor link_subscriber_in_list_re_runs_on_publisher_update(t: testing.AsyncT):
 
     sess1 = stack.newsession()
 
+    def finish():
+        testing.assertEqual(deliveries, [(1, 11), (2, 22)])
+        t.success()
+
+    def cont3(_r: value):
+        # The identical re-edit resends the publisher state; give a stray
+        # delivery time to arrive before asserting none did.
+        after 0.3: finish()
+
+    def check_delivered():
+        if deliveries == [(1, 11), (2, 22)]:
+            sess3 = stack.newsession()
+            sess3.edit_config(cfg_bump_asn, complete=cont3)
+        else:
+            after 0.05: check_delivered()
+
     def cont2(_r: value):
         testing.assertEqual(
             sess1.below().get().prsrc(deterministic=True),
             expected_after_bump.prsrc(deterministic=True),
         )
-        t.success()
+        check_delivered()
 
     def cont1(_r: value):
         sess2 = stack.newsession()
