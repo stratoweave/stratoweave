@@ -1,12 +1,16 @@
 #
 # In-memory window simulator.
 #
-# Steps time through one window, driving the pure controller in core.act with
-# a configurable gap between estimated and actual upgrade duration. This is how
-# you watch concurrency flex to honour the plan without a device in sight.
+# Drives the pure controller in core.act through one window with a
+# configurable gap between estimated and actual upgrade duration. Decisions
+# are event-driven, like the controller design: the window opening decides
+# at once, a completion arms a debounce timer, updates landing while it is
+# armed join the same batch, and the timer firing recomputes. When the
+# window drains there is nothing left to decide, so the log ends.
 #
 
 import fleet_sched as core
+from fleet_sched import imax
 
 class SimResult(value):
     launched: int
@@ -15,22 +19,23 @@ class SimResult(value):
     peak: int
     overran: int
     final_rung: int
+    first_launch: int
     log: list[str]
 
     def __init__(self, launched: int, completed: int, deferred: int, peak: int,
-                 overran: int, final_rung: int, log: list[str]):
+                 overran: int, final_rung: int, first_launch: int, log: list[str]):
         self.launched = launched
         self.completed = completed
         self.deferred = deferred
         self.peak = peak
         self.overran = overran
         self.final_rung = final_rung
+        self.first_launch = first_launch
         self.log = log
 
 def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
-                    camp: core.Campaign, rung0: int, tick: int,
-                    sample_every: int, observed0: ?int = None) -> SimResult:
-    t = w.start
+                    camp: core.Campaign, rung0: int, debounce_s: int,
+                    observed0: ?int = None) -> SimResult:
     remaining = n_devices
     inflight = []
     observed = est_s
@@ -39,16 +44,19 @@ def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
         observed = o0
     completed = 0
     launched = 0
+    first_launch = -1
     peak = 0
     rung = rung0
     rung_target = rung0
     log = []
     alarmed = False
-    step = 0
 
     log.append("      time | left  | inflt | req   | allw  | rung  | +new  | done")
-    while t <= w.end:
-        # ---- completions; observed duration is an EWMA seeded from the estimate
+    t = w.start
+    while True:
+        # ---- one decision, at the window opening or a debounce timer firing.
+        # Completions that landed up to now are the batch; observed duration
+        # is an EWMA seeded from the estimate.
         still = []
         for f in inflight:
             if f <= t:
@@ -76,6 +84,8 @@ def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
             i = i + 1
         remaining = remaining - n_new
         launched = launched + n_new
+        if first_launch < 0 and n_new > 0:
+            first_launch = n_new
         peak = core.imax(peak, len(inflight))
 
         sf = core.shortfall(remaining, observed, t_rem, camp.max_concurrency)
@@ -83,9 +93,51 @@ def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
             log.append(f"  {core.fmt_ts(t)} | ALARM: {sf} device(s) cannot make this window even at max concurrency -- deferral projected")
             alarmed = True
 
-        if step % sample_every == 0:
-            log.append(f"  {core.fmt_ts(t)} | {remaining:5d} | {len(inflight):5d} | {req:5d} | {allw:5d} | {rung:5d} | {n_new:5d} | {completed:5d}")
-        step = step + 1
-        t = t + tick
+        log.append(f"  {core.fmt_ts(t)} | {remaining:5d} | {len(inflight):5d} | {req:5d} | {allw:5d} | {rung:5d} | {n_new:5d} | {completed:5d}")
 
-    return SimResult(launched, completed, remaining, peak, len(inflight), rung, log)
+        if remaining == 0 and len(inflight) == 0:
+            # Drained: nothing left to decide, nothing more to log.
+            break
+        if len(inflight) == 0:
+            # Nothing running and nothing launched: no completion will ever
+            # arm another timer, so the rest defers.
+            break
+        # ---- the earliest completion arms the debounce timer; later ones
+        # land inside the same batch.
+        soonest = inflight[0]
+        for f in inflight:
+            if f < soonest:
+                soonest = f
+        nxt = soonest + debounce_s
+        if not alarmed and remaining > 0:
+            # The shortfall crossing is plain arithmetic in time, so arm an
+            # alarm timer for the projected moment instead of waiting for
+            # the next completion to reveal it.
+            g_need = core.ceil_div(remaining, camp.max_concurrency)
+            t_need = (g_need - 1) * observed + (observed * 12) // 10
+            t_x = w.end - t_need + 1
+            if t_x <= t:
+                t_x = t + 1
+            if t_x <= w.end:
+                if t_x < nxt or nxt > w.end:
+                    sf_x = core.shortfall(remaining, observed, w.end - t_x,
+                                          camp.max_concurrency)
+                    if sf_x > 0:
+                        log.append(f"  {core.fmt_ts(t_x)} | ALARM: {sf_x} device(s) cannot make this window even at max concurrency -- deferral projected")
+                        alarmed = True
+        if nxt > w.end:
+            break
+        t = nxt
+
+    # The window closes: whatever completes by the end still counts, the
+    # rest overran; unlaunched devices defer.
+    still = []
+    for f in inflight:
+        if f <= w.end:
+            completed = completed + 1
+        else:
+            still.append(f)
+    inflight = still
+
+    return SimResult(launched, completed, remaining, peak, len(inflight), rung,
+                     imax(first_launch, 0), log)
