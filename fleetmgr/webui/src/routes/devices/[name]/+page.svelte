@@ -5,7 +5,7 @@
   import StatusPill from '$lib/software/StatusPill.svelte';
   import { createPoller } from '$lib/core/polling/poller';
   import type { Campaign, Device } from '$lib/software/model';
-  import { formatClock } from '$lib/software/time';
+  import { formatOffset } from '$lib/software/time';
 
   let {
     data
@@ -34,7 +34,7 @@
     if (campaign.plan === null) return '—';
     for (const w of campaign.plan.windows) {
       const d = w.devices.find((x) => x.name === data.name);
-      if (d) return formatClock(d.estimatedStart);
+      if (d) return formatOffset(d.estimatedStart);
     }
     return campaign.plan.unplaced.includes(data.name) ? 'not placed' : '—';
   }

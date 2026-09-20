@@ -1,0 +1,210 @@
+"""Controller pacing through a real FleetMgr deployment.
+
+Reuses the deployment harness from test_scale: FleetMgr runs as a
+subprocess with real flotilla processes and everything happens over
+RESTCONF. The test adds slow-upgrading mock devices, creates a campaign
+in plan, checks that the plan places everyone and nothing starts, flips
+it to run, and then watches the rollout: the first release is small,
+releases arrive in several steps, devices in flight never exceed what
+max-rate allows, and everyone succeeds.
+
+Run from fleetmgr/:
+    acton test --module test_fleetmgr_pacing --tag fleetmgr-system
+"""
+
+import http
+import json
+import testing
+
+import test_scale
+
+
+actor PacingRollout(size: int, client: http.Client, done: action(?Exception) -> None):
+    path = "/restconf/data/software:software/upgrade-campaign=pacing"
+    # Pacing is a behavior test, not a scale test: ten slow devices show
+    # the ramp, whatever scale the runner asks for.
+    n = 10
+    var first = 0
+    var prev = 0
+    var steps = 0
+    var max_ip = 0
+    var polls = 0
+    var plan_tries = 0
+
+    def parse_status(body: str) -> ?(int, int, int, int, int):
+        """(in-progress, succeeded, failed, placed, alarms), or None."""
+        data = json.decode(body)
+        if isinstance(data, dict):
+            campaigns = data.get("software:upgrade-campaign")
+            if isinstance(campaigns, list) and len(campaigns) == 1:
+                campaign = campaigns[0]
+                if isinstance(campaign, dict):
+                    state = campaign.get("state")
+                    if isinstance(state, dict):
+                        ip = 0
+                        ok = 0
+                        bad = 0
+                        v = state.get("in-progress")
+                        if isinstance(v, int):
+                            ip = v
+                        v = state.get("succeeded")
+                        if isinstance(v, int):
+                            ok = v
+                        v = state.get("failed")
+                        if isinstance(v, int):
+                            bad = v
+                        placed = 0
+                        alarms = 0
+                        plan = state.get("plan")
+                        if isinstance(plan, dict):
+                            windows = plan.get("window")
+                            if isinstance(windows, list):
+                                for w in windows:
+                                    if isinstance(w, dict):
+                                        devices = w.get("device")
+                                        if isinstance(devices, list):
+                                            placed += len(devices)
+                            al = plan.get("alarm")
+                            if isinstance(al, list):
+                                alarms = len(al)
+                        return (ip, ok, bad, placed, alarms)
+        return None
+
+    def campaign_payload(admin: str) -> bytes:
+        return json.encode({"software:upgrade-campaign": [{
+            "name": "pacing",
+            "target-release": "17.18.03a",
+            "image-url": "scp://admin:admin@127.0.0.1:/images/c8000v-universalk9.17.18.03a.SPA.bin",
+            "target-rate": 3600,
+            "max-rate": 7200,
+            "device": [{"name": test_scale.device_name(i)} for i in range(n)],
+            "admin-state": admin,
+        }]}).encode()
+
+    def watched(client: http.Client, response: http.Response) -> None:
+        if response.status != 200:
+            done(test_scale.status_error(response, 200))
+            return
+        parsed = parse_status(response.body.decode())
+        if parsed is not None:
+            ip = parsed.0
+            ok = parsed.1
+            bad = parsed.2
+            if bad > 0:
+                done(ValueError("{bad} device(s) failed"))
+                return
+            started = ip + ok
+            if ip > max_ip:
+                max_ip = ip
+            if started > prev:
+                if first == 0:
+                    first = started
+                steps += 1
+                print("pacing: started={started} in-progress={ip} succeeded={ok}")
+                prev = started
+            if ok == n:
+                if first > 2:
+                    done(ValueError("first release was {first} devices at once - not a ramp"))
+                elif steps < 3:
+                    done(ValueError("devices arrived in {steps} step(s) - looks like all at once"))
+                elif max_ip > 8:
+                    done(ValueError("in-progress peaked at {max_ip}, above what max-rate allows"))
+                else:
+                    print("pacing: ramped from {first}, {steps} release steps, peak in-flight {max_ip}, {ok} of {n} succeeded")
+                    done(None)
+                return
+            polls += 1
+            if polls > 360:
+                done(ValueError("rollout did not complete: started={started} of {n}"))
+                return
+            after 0.5: watch()
+        else:
+            done(ValueError("invalid campaign status: " + response.body.decode()))
+
+    def watch() -> None:
+        client.get(path, watched, {"Accept": "application/yang-data+json"})
+
+    def running(client: http.Client, response: http.Response) -> None:
+        # The flip is asked for asynchronously: the controller's first
+        # dynstate write lands inside the transaction window otherwise,
+        # and the campaign state is what an operator watches anyway.
+        if response.status not in {200, 201, 204}:
+            done(test_scale.status_error(response, 204))
+            return
+        watch()
+
+    def run_campaign() -> None:
+        client.put(path, campaign_payload("run"), running,
+                   {"Content-Type": "application/yang-data+json", "async": "true"})
+
+    def planned(client: http.Client, response: http.Response) -> None:
+        # The actor publishes the plan just after the create answers, so
+        # give it a moment rather than asserting on the first read.
+        if response.status != 200:
+            done(test_scale.status_error(response, 200))
+            return
+        parsed = parse_status(response.body.decode())
+        if parsed is not None:
+            started = parsed.0 + parsed.1 + parsed.2
+            placed = parsed.3
+            if placed == n and parsed.4 == 0 and started == 0:
+                print("pacing: plan ok, {n} placed in the open window, nothing started")
+                run_campaign()
+                return
+            if started != 0:
+                done(ValueError("{started} device(s) started while still in plan"))
+                return
+            plan_tries += 1
+            if plan_tries > 20:
+                done(ValueError("plan placed {placed} of {n} with {parsed.4} alarm(s)"))
+                return
+            after 0.25: check_plan()
+        else:
+            plan_tries += 1
+            if plan_tries > 20:
+                done(ValueError("invalid campaign status: " + response.body.decode()))
+                return
+            after 0.25: check_plan()
+
+    def check_plan() -> None:
+        client.get(path, planned, {"Accept": "application/yang-data+json"})
+
+    def created(client: http.Client, response: http.Response) -> None:
+        if response.status == 201:
+            check_plan()
+        else:
+            done(test_scale.status_error(response, 201))
+
+    def devices_added(client: http.Client, response: http.Response) -> None:
+        if response.status != 201:
+            done(test_scale.status_error(response, 201))
+            return
+        client.put(path, campaign_payload("plan"), created,
+                   {"Content-Type": "application/yang-data+json"})
+
+    def add_devices() -> None:
+        devices = []
+        for i in range(n):
+            name = test_scale.device_name(i)
+            devices.append({
+                "name": name,
+                "type": "iosxe",
+                "description": "Pacing {name}",
+                "shard": "flotilla-{i % test_scale.FLOTILLAS + 1}",
+                "credentials": {"username": "admin", "password": "admin"},
+                # Slow installs, so the ramp is observable in the counters.
+                "mock": {"enabled": True, "software": {"upgrade-duration": 8}},
+            })
+        payload = json.encode({"fleetmgr:fleet": {"device": devices}}).encode()
+        client.post("/restconf/data", payload, devices_added,
+                    {"Content-Type": "application/yang-data+json"})
+
+    add_devices()
+
+
+actor _test_controller_pacing(t: testing.EnvT):
+    """Devices are released a few at a time, never the whole plan at once."""
+    t.require("fleetmgr-system")
+    def run(size: int, client: http.Client, done: action(?Exception) -> None) -> None:
+        PacingRollout(size, client, done)
+    test_scale.FleetMgrTest(t, run)

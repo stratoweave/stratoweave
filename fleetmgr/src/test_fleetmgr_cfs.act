@@ -172,8 +172,9 @@ actor _test_campaign_transform(t: testing.AsyncT):
     campaign.device.create("cpe-1")
 
     transform: cfs.UpgradeCampaign = cfs.UpgradeCampaign()
+    decision = y_0.software__software__upgrade_campaign__dynstate(released=["cpe-1"])
     o: y_1.root = y_1.root.from_gdata(
-        transform.transform(campaign, inventory.to_gdata()).to_gdata()
+        transform.transform(campaign, inventory.to_gdata(), decision).to_gdata()
     )
     dev = o.rfs.get("flotilla-1")!.device.get("cpe-1")!
 
@@ -207,17 +208,32 @@ actor _test_campaign_link_routes_existing_inventory(t: testing.AsyncT):
             done = True
             t.failure(ValueError(message))
 
+    def check(attempts: int) -> None:
+        # The controller releases the device on its first tick, so the
+        # augmented output appears shortly after the edit, not within it.
+        if done:
+            return
+        lower = y_1.root.from_gdata(tr.cfs.below().newsession().get_data())
+        found = False
+        shard = lower.rfs.get("flotilla-1")
+        if shard is not None:
+            out = shard.device.get("cpe-1")
+            if out is not None:
+                if out.software.target_release == "17.18.03a":
+                    found = True
+        if found:
+            done = True
+            t.success()
+        elif attempts > 0:
+            after 0.25: check(attempts - 1)
+        else:
+            fail("linked campaign did not augment the existing inventory device")
+
     def on_campaign(result) -> None:
         if isinstance(result, Exception):
             fail("campaign edit failed: {result}")
             return
-        lower = y_1.root.from_gdata(tr.cfs.below().newsession().get_data())
-        out = lower.rfs.get("flotilla-1")!.device.get("cpe-1")!
-        if out.software.target_release != "17.18.03a":
-            fail("linked campaign did not augment the existing inventory device")
-        elif not done:
-            done = True
-            t.success()
+        check(20)
 
     def on_inventory(result) -> None:
         if isinstance(result, Exception):
@@ -233,7 +249,7 @@ actor _test_campaign_link_routes_existing_inventory(t: testing.AsyncT):
         tr.edit_config(root.to_gdata(), on_campaign)
 
     tr.edit_config(root.to_gdata(), on_inventory)
-    after 2.0: fail("timed out waiting for linked campaign")
+    after 8.0: fail("timed out waiting for linked campaign")
 
 
 actor _test_device_transform(t: testing.AsyncT):
@@ -321,3 +337,131 @@ actor _test_device_transform(t: testing.AsyncT):
         t.failure(ValueError("debug or feature flags were not preserved"))
     else:
         t.success()
+
+
+def _paced_campaign(names: list[str]) -> InputCampaign:
+    campaign = InputCampaign(
+        name="paced",
+        target_release="17.18.03a",
+        image_url="https://images.example/xe.bin",
+        admin_state="run",
+    )
+    campaign.window.create(u64(0), duration=u64(600))
+    for name in names:
+        campaign.device.create(name)
+    return campaign
+
+
+def _flat_inventory(names: list[str]) -> y_0.root:
+    linked = y_0.root()
+    for name in names:
+        linked.fleet.device.create(
+            name,
+            type="iosxe",
+            shard="flotilla-1",
+            credentials=InputCredentials(username="admin"),
+        )
+    return linked
+
+
+def _window_names(layout: list[(str, int, int, list[(str, int)])], window: str) -> list[str]:
+    names = []
+    for win in layout:
+        if win.0 == window:
+            for entry in win.3:
+                names.append(entry.0)
+    return sorted(names)
+
+
+actor _test_campaign_without_windows_gets_default_window(t: testing.AsyncT):
+    """No windows defined: one synthetic open window takes everyone, and
+    nothing starts before the controller releases it."""
+    linked = _flat_inventory(["cpe-1"])
+    campaign = InputCampaign(
+        name="now",
+        target_release="17.18.03a",
+        image_url="https://images.example/xe.bin",
+        admin_state="run",
+    )
+    campaign.device.create("cpe-1")
+    layout, alarms = cfs.plan_campaign(campaign)
+    testing.assertEqual(_window_names(layout, "default"), ["cpe-1"], None)
+    out = cfs.UpgradeCampaign().transform(campaign, linked.to_gdata(), None)
+    o: y_1.root = y_1.root.from_gdata(out.to_gdata())
+    shards = 0
+    for _s in o.rfs:
+        shards += 1
+    testing.assertEqual(shards, 0, "an unreleased device must not start")
+    decision = y_0.software__software__upgrade_campaign__dynstate(released=["cpe-1"])
+    out2 = cfs.UpgradeCampaign().transform(campaign, linked.to_gdata(), decision)
+    o2: y_1.root = y_1.root.from_gdata(out2.to_gdata())
+    shards2 = 0
+    for _s2 in o2.rfs:
+        shards2 += 1
+    testing.assertEqual(shards2, 1, "a released device starts")
+    t.success()
+
+
+actor _test_campaign_deadline_without_windows_plans(t: testing.AsyncT):
+    """A deadline alone closes the synthetic window; devices still plan."""
+    campaign = InputCampaign(
+        name="dl",
+        target_release="17.18.03a",
+        image_url="https://images.example/xe.bin",
+        admin_state="plan",
+        deadline=u64(3600),
+    )
+    for name in ["d1", "d2"]:
+        campaign.device.create(name)
+    layout, alarms = cfs.plan_campaign(campaign)
+    testing.assertEqual(_window_names(layout, "default"), ["d1", "d2"], None)
+    testing.assertEqual(len(alarms), 0, "a meetable deadline must not alarm")
+    for win in layout:
+        testing.assertEqual(win.2 <= 3600, True, "the deadline closes the window")
+    t.success()
+
+
+actor _test_campaign_plan_state_plans_without_actuating(t: testing.AsyncT):
+    """In plan admin-state the layout exists and nothing is emitted."""
+    campaign = _paced_campaign(["cpe-1", "cpe-2"])
+    campaign.admin_state = "plan"
+    layout, alarms = cfs.plan_campaign(campaign)
+    testing.assertEqual(_window_names(layout, "window"), ["cpe-1", "cpe-2"], None)
+    out = cfs.UpgradeCampaign().transform(campaign, _flat_inventory(["cpe-1", "cpe-2"]).to_gdata(), None)
+    o: y_1.root = y_1.root.from_gdata(out.to_gdata())
+    shards = 0
+    for _s in o.rfs:
+        shards += 1
+    testing.assertEqual(shards, 0, "plan state must not actuate")
+    t.success()
+
+
+actor _test_campaign_actuates_only_released(t: testing.AsyncT):
+    """The transform actuates exactly the controller's released set."""
+    campaign = _paced_campaign(["cpe-1", "cpe-2", "cpe-3"])
+    decision = y_0.software__software__upgrade_campaign__dynstate(released=["cpe-2"])
+    out = cfs.UpgradeCampaign().transform(
+        campaign, _flat_inventory(["cpe-1", "cpe-2", "cpe-3"]).to_gdata(), decision)
+    o: y_1.root = y_1.root.from_gdata(out.to_gdata())
+    names = []
+    for shard in o.rfs:
+        for d in shard.device:
+            names.append(d.name)
+    testing.assertEqual(sorted(names), ["cpe-2"], "only the released device actuates")
+    t.success()
+
+
+actor _test_campaign_full_release_actuates_all(t: testing.AsyncT):
+    """A decision covering the whole plan actuates the whole plan."""
+    campaign = _paced_campaign(["cpe-1", "cpe-2", "cpe-3"])
+    decision = y_0.software__software__upgrade_campaign__dynstate(
+        released=["cpe-1", "cpe-2", "cpe-3"])
+    out = cfs.UpgradeCampaign().transform(
+        campaign, _flat_inventory(["cpe-1", "cpe-2", "cpe-3"]).to_gdata(), decision)
+    o: y_1.root = y_1.root.from_gdata(out.to_gdata())
+    actuated = 0
+    for shard in o.rfs:
+        for _d in shard.device:
+            actuated += 1
+    testing.assertEqual(actuated, 3, None)
+    t.success()

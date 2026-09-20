@@ -104,9 +104,6 @@
       const d = parseDuration(deadline);
       if (d === null || d === 0) {
         e['deadline'] = 'An offset like 4h or 1d.';
-      } else if (windows.length === 0) {
-        // The planner only cuts windows at the deadline; with none, nothing is placed.
-        e['deadline'] = 'A deadline needs at least one window.';
       }
     }
     for (const [key, text] of [

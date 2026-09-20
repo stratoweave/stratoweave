@@ -70,7 +70,9 @@
     <p>
       A campaign owns each of its devices exclusively, which is what stops
       two campaigns scheduling the same device. The planner fits the members
-      into the campaign's windows; run actuates every placed device at once.
+      into the campaign's windows; run releases devices through the
+      controller as their windows open - a few at a time, growing as
+      completions come in.
     </p>
   </div>
   <a class="btn btn-primary" href="/campaigns/new">New campaign</a>
