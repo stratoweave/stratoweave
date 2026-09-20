@@ -10,7 +10,7 @@
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
   import { RateTracker, formatEta } from '$lib/software/rate';
-  import { formatClock, formatDuration } from '$lib/software/time';
+  import { formatDuration, formatOffset } from '$lib/software/time';
   import { nameMatches } from '$lib/software/selection';
   import {
     CAMPAIGN_LIST_ROOT,
@@ -180,7 +180,7 @@
       const unplaced = c.plan?.unplaced.length ?? 0;
       const placed = c.devices.length - unplaced;
       return (
-        `Start upgrading ${placed} device(s) to ${c.targetRelease}? Every placed device is actuated at once; real installs reload devices and take several minutes.` +
+        `Start upgrading ${placed} device(s) to ${c.targetRelease}? Devices are released a few at a time as their windows open and completions come in. Real installs reload devices and take several minutes.` +
         (unplaced > 0 ? ` ${unplaced} device(s) do not fit the windows and are left alone.` : '')
       );
     }
@@ -302,8 +302,8 @@
       <div class="grids-head">
         <h3 class="panel-title">Plan</h3>
         <span class="hint">
-          estimates, re-anchored when the campaign starts running · run actuates every placed
-          device at once
+          estimates as offsets from launch · devices are released by the
+          controller as their window opens
         </span>
       </div>
       {#if plan.alarms.length > 0}
@@ -325,7 +325,7 @@
             </tr>
           </thead>
           <tbody>
-            {#each plan.windows as w (w.start)}
+            {#each plan.windows as w (`${w.schedule}:${w.start}`)}
               {@const first = w.devices[0]}
               {@const last = w.devices[w.devices.length - 1]}
               <tr>
@@ -338,13 +338,13 @@
                     {openWindow === w.start ? '▾' : '▸'} {w.schedule || 'window'}
                   </button>
                 </td>
-                <td class="mono tn">{formatClock(w.start)}</td>
-                <td class="mono tn">{formatClock(w.end)}</td>
+                <td class="mono tn">{formatOffset(w.start)}</td>
+                <td class="mono tn">{w.end === null ? 'open' : formatOffset(w.end)}</td>
                 <td class="tn right">{w.devices.length.toLocaleString()}</td>
                 <td class="mono tn">
                   {#if first && last}
-                    {formatClock(first.estimatedStart)}{w.devices.length > 1
-                      ? ` … ${formatClock(last.estimatedStart)}`
+                    {formatOffset(first.estimatedStart)}{w.devices.length > 1
+                      ? ` … ${formatOffset(last.estimatedStart)}`
                       : ''}
                   {:else}
                     —
@@ -358,7 +358,7 @@
                       {#each w.devices.slice(0, PLAN_DEVICE_LIMIT) as d (d.name)}
                         <span class="plan-device">
                           <span class="device-name">{d.name}</span>
-                          <span class="mono tn dim">{formatClock(d.estimatedStart)}</span>
+                          <span class="mono tn dim">{formatOffset(d.estimatedStart)}</span>
                         </span>
                       {/each}
                       {#if w.devices.length > PLAN_DEVICE_LIMIT}

@@ -199,14 +199,16 @@ export interface MaintenanceWindow {
 
 export interface PlanDevice {
   name: string;
-  /** Seconds since the Unix epoch; an estimate. */
+  /** Seconds after launch; an estimate. */
   estimatedStart: number;
   estimatedDuration: number;
 }
 
 export interface PlanWindow {
   start: number;
-  end: number;
+  /** null: the window never closes (a campaign without windows runs
+   * through one synthetic open window, unless a deadline closes it). */
+  end: number | null;
   schedule: string;
   devices: PlanDevice[];
 }
@@ -286,7 +288,7 @@ function parsePlan(state: CampaignStateJson | undefined, members: string[]): Cam
   }
   const windows = (state.plan?.window ?? []).map((w) => ({
     start: num(w.start),
-    end: num(w.end),
+    end: w.end == null ? null : num(w.end),
     schedule: w.schedule ?? '',
     devices: (w.device ?? []).map((d) => ({
       name: d.name,
