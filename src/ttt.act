@@ -108,6 +108,60 @@ def merge(cfg_per_src: dict[str,gdata.Node]):
     raise ValueError("Nothing to merge")
 
 
+def same_node(a: value, b: value) -> bool:
+    """Compare object pointers without inspecting either value."""
+    NotImplemented
+
+
+mut def mmerge(cfg_per_src: dict[str, gdata.Node], memo: dict[(str, str), (left: gdata.Node, right: gdata.Node, result: gdata.Node)]) -> gdata.Node:
+    """Merge balanced pairs, reusing results whose input pointers match.
+
+    Sort source names to keep the pairs stable when patch() changes dict
+    order. Each group keeps its first source name; the names of its two
+    child groups identify a cached pair. The names locate the entry, but
+    both input pointers must match before its result can be reused.
+
+    Retained trees, including their children, must stay unchanged. TTT
+    replaces patched source trees and shares the untouched sources.
+    Pointer checks validate every reuse, so transactions can share this
+    memo even when they compute against different running configurations.
+
+    A failed pair merge leaves the previous memo intact.
+    Successful calls drop removed sources and keep at most S-1 pairs for S sources.
+    Adding or removing a source can change the pairings. Updating a source
+    only re-merges its ancestors, including the merge of the complete tree.
+    """
+    if len(cfg_per_src) <= 1:
+        for key in list(memo.keys()):
+            del memo[key]
+        return merge(cfg_per_src)
+    work = [(src, cfg_per_src[src]) for src in sorted(cfg_per_src.keys())]
+    pairs: dict[(str, str), (left: gdata.Node, right: gdata.Node, result: gdata.Node)] = {}
+    while len(work) > 1:
+        paired: list[(str, gdata.Node)] = []
+        i = 0
+        while i + 1 < len(work):
+            lsrc, left = work[i]
+            rsrc, right = work[i+1]
+            key = (lsrc, rsrc)
+            prev = memo.get(key)
+            if prev is not None and same_node(prev.left, left) and same_node(prev.right, right):
+                pair = prev
+            else:
+                pair = (left=left, right=right, result=gdata.merge(left, right))
+            pairs[key] = pair
+            paired.append((lsrc, pair.result))
+            i += 2
+        if i < len(work):
+            paired.append(work[i])
+        work = paired
+    for key in list(memo.keys()):
+        if key not in pairs:
+            del memo[key]
+    memo.update(pairs.items())
+    return work[0].1
+
+
 def prune(data: gdata.Node, filt: gdata.FNode) -> gdata.Node:
     res =  gdata.prune(data, gdata.FNode(children=[filt]))
     return res if res is not None else gdata.Container()
@@ -2503,6 +2557,7 @@ class _TransformTransactionBase(_Transaction):
     essays: dict[str, (?gdata.Node, ?gdata.Node)]
     running: dict[str, gdata.Node]
     merged_running: gdata.Node
+    merge_memo: dict[(str, str), (left: gdata.Node, right: gdata.Node, result: gdata.Node)]
     memory: ?gdata.Node
     dynstate: ?gdata.Node
     node: ?Node
@@ -2538,6 +2593,7 @@ class _TransformTransactionBase(_Transaction):
         self.path = path
         self.running = {}
         self.merged_running = gdata.Container()
+        self.merge_memo = {}
         self.memory = None
         self.dynstate = None
         self.node = None
@@ -2577,6 +2633,7 @@ class _TransformTransactionBase(_Transaction):
         #print('   #', tid, '(Transform)', _format_path(self.path), 'NEWCONF\n' + per_src(newconf), err=True)
 
         if newconf == {}:
+            self.merge_memo = {}
             self.essays[tid] = (None, None) # TODO: do we want to keep memory?
             #print('   #', tid, '(Transform)', _format_path(self.path), 'EMPTY CONFIG', err=True)
             self.clear(tid, out)
@@ -2586,7 +2643,7 @@ class _TransformTransactionBase(_Transaction):
             return CfgOk(empty=True, requests=req, updates=upd)
         else:
             try:
-                merged = assert_complete(merge(newconf))
+                merged = assert_complete(mmerge(newconf, self.merge_memo))
                 self.candidates[tid] = (newconf, merged)
                 #print('   #', tid, '(Transform)', _format_path(self.path), 'MERGED\n       ', merged.prsrc(indent=4), err=True)
 #                assert self.validate(merged)
@@ -2792,7 +2849,8 @@ class _TransformTransactionBase(_Transaction):
         raise ValueError("Unexpected persisted transform attribute {attr} at {_format_path(self.path)}")
 
     def restored(self) -> None:
-        self.merged_running = merge(self.running) if self.running else gdata.Container()
+        self.merge_memo = {}
+        self.merged_running = mmerge(self.running, self.merge_memo) if self.running else gdata.Container()
 
     def is_empty(self) -> bool:
         return self.running == {} and self.output is None
