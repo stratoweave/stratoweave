@@ -26,7 +26,7 @@ from device_meta_config import \
 from adapters.adapter import \
     DeviceAdapter, ModCap, DISCONNECTED, CONNECTING, CONNECTED, TRANSACTION, \
     NotConnectedError, BusyError, LockedError, TxidMismatchError, ConfigError, \
-    SharedSubscription, SubscriptionOwner, parse_cap, ssh_transport_config, \
+    DeviceStream, Subscription, parse_cap, ssh_transport_config, \
     subscription_delay, merge_subscription_tree, \
     SubscriptionStatus, SUBSCRIPTION_YANG_PUSH, SUBSCRIPTION_POLL, SUBSCRIPTION_CONNECTING
 
@@ -316,6 +316,7 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
     # Callback for every RPC the mock server does not implement itself,
     # installed with set_rpc_cb(...).
     var rpc_cb: ?action(xml.Node, action(children: ?list[xml.Node], tag: ?str, message: ?str) -> None) -> None = None
+    var rpc_overrides: set[str] = set()
     # Raw operation XML observed by the mock when a test enables recording.
     # Normal mock devices do not retain an unbounded RPC history.
     var rpc_history: ?list[str] = None
@@ -477,6 +478,9 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
         if history is not None:
             history!.append(op.encode())
 
+        if op.tag in rpc_overrides:
+            _custom_rpc(s, message_id, op)
+            return
         if yp.is_subscription_rpc(op.tag):
             if yp_service is not None:
                 yp_service.handle_rpc(message_id, op)
@@ -520,20 +524,27 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
         elif op.tag == "commit" or op.tag == "discard-changes" or op.tag == "lock" or op.tag == "unlock":
             s.send_ok(message_id)
         else:
-            h = rpc_cb
-            if h is not None:
-                def respond(children: ?list[xml.Node], tag: ?str, message: ?str) -> None:
-                    if tag is not None:
-                        s.send_error(message_id, tag,
-                                     message if message is not None else tag)
-                    else:
-                        s.send_reply(message_id, children if children is not None else [])
-                h(op, respond)
-            else:
-                s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
+            _custom_rpc(s, message_id, op)
+
+    def _custom_rpc(s: netconf.Server, message_id: str, op: xml.Node):
+        h = rpc_cb
+        if h is not None:
+            def respond(children: ?list[xml.Node], tag: ?str, message: ?str) -> None:
+                if tag is not None:
+                    s.send_error(message_id, tag,
+                                 message if message is not None else tag)
+                else:
+                    s.send_reply(message_id, children if children is not None else [])
+            h(op, respond)
+        else:
+            s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
 
     var server: netconf.Server = netconf.Server(pipe=pipe, on_rpc=on_rpc, log_handler=log_handler, capabilities=all_capabilities)
     yp_service = nyp.NetconfSubscriptionService(server, _MockPushBackend(_yp_prepare_filter, _yp_snapshot, _yp_change), log_handler)
+
+    def send_notification(notification: xml.Node):
+        """Send raw notification XML, including malformed updates in client tests."""
+        server.send_notification(notification)
 
     def set_oper_ds(new_oper_ds: ygdata.Node, schema: ?yschema.DRoot=None):
         """Set the operational datastore (and optionally its schema) for <get>."""
@@ -563,7 +574,7 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
             return list(history!)
         return []
 
-    def set_rpc_cb(cb: action(xml.Node, action(children: ?list[xml.Node], tag: ?str, message: ?str) -> None) -> None):
+    def set_rpc_cb(cb: action(xml.Node, action(children: ?list[xml.Node], tag: ?str, message: ?str) -> None) -> None, overrides: set[str]=set()):
         """Install the callback for every RPC the mock server does not implement.
 
         The mock server answers the datastore RPCs itself: get, get-config,
@@ -596,8 +607,13 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
         XML, and only XML can express a malformed reply for testing how the
         client copes. Where a typed reply reads better, build it as gdata and
         convert with to_xml(deterministic=True).
+
+        `overrides` also routes the named built-in operations to the callback,
+        for example to refuse establishment before allowing a retry. An empty
+        set restores the built-in handlers.
         """
         rpc_cb = cb
+        rpc_overrides = set(overrides)
 
 
 actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc: DeviceMetaConfig, schema_registry: swdev.SchemaRegistry, log_handler: logging.Handler, connect_cap: ?net.TCPConnectCap):
@@ -672,8 +688,8 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
     var modset: dict[str, ModCap] = {}
     var schema_hash = None
 
-    var subs: dict[ygdata.SubscriptionSpec, SharedSubscription] = {}
-    var sub_owners: dict[str, SubscriptionOwner] = {}
+    var streams: dict[ygdata.SubscriptionSpec, DeviceStream] = {}
+    var subscribers: dict[str, Subscription] = {}
 
     # How we monitor this device, decided from its advertised modules at connect
     # time (None until connected): yang-push when usable, else periodic <get>
@@ -753,8 +769,8 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             yp_spec_subid = {}
             yp_pending = set()
             if _yang_push:
-                for spec in subs.keys():
-                    if subs[spec].active:
+                for spec in list(streams.keys()):
+                    if streams[spec].active:
                         _yp_ensure(spec)
             dev.on_connect(modset, schema_hash)
 
@@ -869,11 +885,11 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             sid = pu.sub_id
             if sid is not None and sid in yp_subid_spec:
                 spec = yp_subid_spec[sid]
-                if spec in subs and subs[spec].active:
-                    # A push we cannot parse against the device schema must not
-                    # overwrite the last good value with nothing: surface an error
-                    # and keep the previous value. A push with no contents is a
-                    # valid sample, the filter matched nothing.
+                if spec in streams and streams[spec].active:
+                    # An unparseable snapshot is an error, not an empty sample.
+                    # Periodic streams can recover on their next snapshot;
+                    # on-change streams need a new baseline. No contents is a
+                    # valid sample when the filter matched nothing.
                     parsed: ?ygdata.Node = ygdata.Container({})
                     if len(pu.contents) > 0:
                         try:
@@ -881,20 +897,23 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                         except Exception:
                             parsed = None
                     if parsed is not None:
-                        _sub_snapshot(spec, parsed)
+                        _stream_snapshot(spec, parsed)
                     else:
                         err = ValueError("unparseable push-update for subscription id={sid} (no usable device schema?)")
-                        _sub_error(spec, err)
+                        if spec.period is None:
+                            _stream_failed(spec, err)
+                        else:
+                            _stream_error(spec, err)
             return
         # A push-change-update is an on-change yang-patch delta; apply it onto the
-        # subscription's last-known tree (seeded by the sync-on-start baseline) so
-        # on-change renders the same full tree a periodic push would.
+        # retained selected state, seeded by the sync-on-start baseline. Rooted
+        # destinations receive complete changed instances; others receive the tree.
         pcu = yp.parse_push_change_update(n)
         if pcu is not None:
             csid = pcu.sub_id
             if csid is not None and csid in yp_subid_spec:
                 cspec = yp_subid_spec[csid]
-                if cspec in subs and subs[cspec].active:
+                if cspec in streams and streams[cspec].active:
                     _apply_push_change(cspec, csid, pcu)
             return
         _log.debug("Notification from device (no matching push-update subscription)")
@@ -1462,7 +1481,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         if m is None:
             return SubscriptionStatus(SUBSCRIPTION_CONNECTING)
         periodic = True
-        for spec, _st in subs.items():
+        for spec, _st in streams.items():
             if spec.period is None:
                 periodic = False
         if m:
@@ -1713,7 +1732,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         ))
 
     def _owner_synced(owner_id: str):
-        owner = sub_owners.get(owner_id)
+        owner = subscribers.get(owner_id)
         if owner is not None and owner.owed and len(owner.pending) == 0:
             owner.owed = False
             s = owner.synced
@@ -1721,17 +1740,17 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 s(owner_id)
 
     def _owner_publish(owner_id: str, err: ?Exception=None):
-        owner = sub_owners.get(owner_id)
+        owner = subscribers.get(owner_id)
         if owner is not None:
-            owner.cb(merge_subscription_tree(owner.want, subs), err)
+            owner.cb(merge_subscription_tree(owner.want, streams), err)
 
-    def _sub_error(spec: ygdata.SubscriptionSpec, err: Exception):
-        st = subs.get(spec)
+    def _stream_error(spec: ygdata.SubscriptionSpec, err: Exception):
+        st = streams.get(spec)
         if st is not None:
             st.done = True
             st.error = err
             for owner_id in list(st.owners):
-                owner = sub_owners.get(owner_id)
+                owner = subscribers.get(owner_id)
                 if owner is not None:
                     if st.instances is not None:
                         owner.cb(None, err)
@@ -1740,7 +1759,15 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     owner.pending.discard(spec)
                     _owner_synced(owner_id)
 
-    def _rooted_publish(owner: SubscriptionOwner, st: SharedSubscription, trees: list[ygdata.Node]):
+    def _stream_failed(spec: ygdata.SubscriptionSpec, err: Exception):
+        """Report a terminal failure and require a new stream and baseline.
+
+        Periodic read errors use _stream_error alone: the next snapshot can
+        recover. An on-change stream cannot recover from a missed update."""
+        _stream_error(spec, err)
+        _stream_cancel(spec)
+
+    def _rooted_publish(owner: Subscription, st: DeviceStream, trees: list[ygdata.Node]):
         for tree in trees:
             owner.cb(tree, None)
         # A direct redeclaration may narrow the selection on the same owner.
@@ -1754,9 +1781,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                         owner.cb(ygdata.gone(i.1, point), None)
             owner.previous = []
 
-    def _sub_snapshot(spec: ygdata.SubscriptionSpec, tree: ?ygdata.Node):
+    def _stream_snapshot(spec: ygdata.SubscriptionSpec, tree: ?ygdata.Node):
         try:
-            st = subs[spec]
+            st = streams[spec]
             first = not st.done or st.error is not None
             rooted = st.instances
             deliveries: list[ygdata.Node] = []
@@ -1783,7 +1810,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             st.done = True
             st.error = None
             for owner_id in list(st.owners):
-                owner = sub_owners.get(owner_id)
+                owner = subscribers.get(owner_id)
                 if owner is not None:
                     if rooted is not None:
                         _rooted_publish(owner, st, deliveries)
@@ -1792,15 +1819,14 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     owner.pending.discard(spec)
                     _owner_synced(owner_id)
         except Exception as err:
-            _sub_error(spec, err)
-            _sub_cancel(spec)
+            _stream_failed(spec, err)
 
     def _apply_push_change(spec: ygdata.SubscriptionSpec, sid: int, pcu: yp.PushChangeUpdate):
-        st = subs[spec]
+        st = streams[spec]
         yp_xml = pcu.yang_patch
         root = _oper_schema()
         if yp_xml is None or root is None:
-            _sub_error(spec, ValueError("push-change-update id={sid} with no yang-patch or no device schema"))
+            _stream_failed(spec, ValueError("push-change-update id={sid} with no yang-patch or no device schema"))
             return
         try:
             patch = ypatch.Patch.from_xml(yp_xml!)
@@ -1812,7 +1838,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     changes.extend(rooted.patch(edit))
                 deliveries = subscriptions.changed_instances(changes, rooted.point)
                 for owner_id in list(st.owners):
-                    owner = sub_owners.get(owner_id)
+                    owner = subscribers.get(owner_id)
                     if owner is not None:
                         _rooted_publish(owner, st, deliveries)
             else:
@@ -1824,15 +1850,12 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     for owner_id in list(st.owners):
                         _owner_publish(owner_id)
         except Exception as ex:
-            _sub_error(spec, ValueError("unapplicable push-change-update id={sid}: {ex}"))
-            # A failed patch cannot leave a partially updated stream running.
-            # A fresh declaration must obtain a new baseline.
-            _sub_cancel(spec)
+            _stream_failed(spec, ValueError("unapplicable push-change-update id={sid}: {ex}"))
 
-    def _sub_cancel(spec: ygdata.SubscriptionSpec):
-        if spec in subs:
-            subs[spec].active = False
-            del subs[spec]
+    def _stream_cancel(spec: ygdata.SubscriptionSpec):
+        if spec in streams:
+            streams[spec].active = False
+            del streams[spec]
         # If this spec was served by a device-side yang-push subscription, tear it
         # down on the device too.
         if spec in yp_spec_subid:
@@ -1855,16 +1878,16 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             return cs
         return None
 
-    def _sub_start(st: SharedSubscription):
+    def _stream_start(st: DeviceStream):
         # Start a shared subscription using whichever method the device supports.
         # Until the device is connected and the method is known, retry on the
-        # spec's period (finish_connect also (re-)establishes yang-push subs).
+        # spec's period (finish_connect also (re-)establishes yang-push streams).
         if not st.active:
             return
         spec = st.spec
         method = _yang_push
         if client is None or method is None:
-            after subscription_delay(st.spec): _sub_start(st)
+            after subscription_delay(st.spec): _stream_start(st)
             return
         if method:
             _yp_ensure(spec)
@@ -1872,19 +1895,18 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             # on-change can only be realized by a device that pushes natively; there
             # is no poll emulation for it, so fail rather than silently degrade.
             err = ValueError("on-change subscription requires device yang-push support")
-            _sub_error(spec, err)
-            _sub_cancel(spec)
+            _stream_failed(spec, err)
         else:
-            _sub_tick(st)
+            _stream_tick(st)
 
     def _yp_ensure(spec: ygdata.SubscriptionSpec):
         # Establish a device-side yang-push subscription for spec, unless one is
         # already established or in flight on the current connection.
         if spec in yp_spec_subid or spec in yp_pending:
             return
-        if spec not in subs:
+        if spec not in streams:
             return
-        st = subs[spec]
+        st = streams[spec]
         if not st.active:
             return
         c = client
@@ -1899,7 +1921,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     xpath = _fnode_to_xpath_filter(filt)
                     if xpath.xpath is None:
                         err = ValueError("event-notifications yang-push only supports simple subscription filters")
-                        _sub_error(spec, err)
+                        _stream_failed(spec, err)
                         return
                     xpath_filter = xpath.xpath
                     xpath_nsdefs = xpath.nsdefs
@@ -1919,14 +1941,14 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 yp_pending.discard(spec)
                 if err is not None:
                     _log.error("Device: establish-subscription failed", {"error": str(err)})
-                    _sub_error(spec, err)
-                elif sid is not None and spec in subs:
+                    _stream_failed(spec, err)
+                elif sid is not None and spec in streams:
                     yp_subid_spec[sid] = spec
                     yp_spec_subid[spec] = sid
 
             if st.spec.period is None:
                 # sync-on-start makes the device send a full push-update baseline
-                # first, seeding latest; later push-change-updates apply as deltas.
+                # first, seeding retained state; later push-change-updates apply as deltas.
                 yp_pending.add(spec)
                 c.establish_subscription(on_est, on_change=True, sync_on_start=True,
                     subtree_filter=filt_xml, xpath_filter=xpath_filter,
@@ -1940,40 +1962,40 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                         xpath_nsdefs=xpath_nsdefs)
                 else:
                     err = ValueError("yang-push requires a periodic subscription")
-                    _sub_error(spec, err)
+                    _stream_failed(spec, err)
 
-    def _sub_schedule_next(st: SharedSubscription):
+    def _stream_schedule_next(st: DeviceStream):
         if not st.active:
             return
         delay = subscription_delay(st.spec)
-        after delay: _sub_tick(st)
+        after delay: _stream_tick(st)
 
-    def _sub_tick(st: SharedSubscription):
+    def _stream_tick(st: DeviceStream):
         if not st.active:
             return
         spec = st.spec
         if st.spec.period is None:
             err = ValueError("NetconfDriver only supports periodic subscriptions")
-            _sub_error(spec, err)
-            _sub_cancel(spec)
+            _stream_failed(spec, err)
             return
 
         def on_get(c: netconf.Client, r: ?xml.Node, error: ?netconf.NetconfError):
             if not st.active:
                 return
             if _is_stale(c):
-                _sub_schedule_next(st)
+                _stream_schedule_next(st)
                 return
             if error is not None:
-                _sub_error(spec, error)
+                _stream_error(spec, error)
             else:
-                parsed = _parse_get_reply(r)
-                if parsed is None:
-                    err = ValueError("Unexpected rpc-reply for periodic get")
-                    _sub_error(spec, err)
-                else:
-                    _sub_snapshot(spec, parsed)
-            _sub_schedule_next(st)
+                try:
+                    parsed = _parse_get_reply(r)
+                    if parsed is None:
+                        raise ValueError("Unexpected rpc-reply for periodic get")
+                    _stream_snapshot(spec, parsed)
+                except Exception as err:
+                    _stream_error(spec, err)
+            _stream_schedule_next(st)
 
         filt_xml = None
         filt = st.spec.filt
@@ -1982,18 +2004,18 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         if client is not None:
             client.get(on_get, filt_xml)
         else:
-            _sub_schedule_next(st)
+            _stream_schedule_next(st)
 
     def _add_owner_spec(owner_id: str, spec: ygdata.SubscriptionSpec):
-        fresh = spec not in subs
+        fresh = spec not in streams
         if fresh:
-            subs[spec] = SharedSubscription(spec)
-        st = subs[spec]
+            streams[spec] = DeviceStream(spec)
+        st = streams[spec]
         st.owners.add(owner_id)
         if fresh:
-            _sub_start(st)
+            _stream_start(st)
         elif st.done:
-            owner = sub_owners[owner_id]
+            owner = subscribers[owner_id]
             if st.error is not None:
                 if st.instances is not None:
                     owner.cb(None, st.error)
@@ -2007,14 +2029,14 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             _owner_synced(owner_id)
 
     def _remove_owner_spec(owner_id: str, spec: ygdata.SubscriptionSpec):
-        if spec not in subs:
+        if spec not in streams:
             return
-        st = subs[spec]
+        st = streams[spec]
         st.owners.discard(owner_id)
         if len(st.owners) == 0:
-            _sub_cancel(spec)
+            _stream_cancel(spec)
         else:
-            subs[spec] = st
+            streams[spec] = st
 
     def declare_subscriptions(owner_id: str, cb: proc(?ygdata.Node, ?Exception) -> None, want: set[ygdata.SubscriptionSpec], synced: ?action(str) -> None):
         root: ?ygdata.FNode = None
@@ -2033,35 +2055,35 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 synced(owner_id)
             return
 
-        old = sub_owners.get(owner_id)
+        old = subscribers.get(owner_id)
         old_want = old.want if old is not None else set()
         same_root = all([spec.root == root for spec in old_want])
-        owner = SubscriptionOwner(cb, folded, synced)
+        owner = Subscription(cb, folded, synced)
         if old is not None and same_root:
             owner.previous = old.previous
         if old is not None and same_root and folded != old_want and len(point) > 0:
             for spec in old_want:
-                st = subs.get(spec)
+                st = streams.get(spec)
                 if st is not None and st.instances is not None and spec.root == root:
                     owner.previous.extend(st.instances!.spines())
-        sub_owners[owner_id] = owner
+        subscribers[owner_id] = owner
         for spec in old_want:
             if spec not in folded:
                 _remove_owner_spec(owner_id, spec)
         for spec in folded:
-            if spec not in old_want or spec not in subs:
+            if spec not in old_want or spec not in streams or owner_id not in streams[spec].owners:
                 _add_owner_spec(owner_id, spec)
-            elif subs[spec].done:
+            elif streams[spec].done:
                 owner.pending.discard(spec)
         if same_root and len(old_want - folded) > 0 and len(point) == 0:
             _owner_publish(owner_id)
         _owner_synced(owner_id)
 
     def remove_subscriptions(owner_id: str):
-        if owner_id not in sub_owners:
+        if owner_id not in subscribers:
             return
-        old_want = sub_owners[owner_id].want
-        del sub_owners[owner_id]
+        old_want = subscribers[owner_id].want
+        del subscribers[owner_id]
         for spec in old_want:
             _remove_owner_spec(owner_id, spec)
 

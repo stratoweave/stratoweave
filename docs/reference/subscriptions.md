@@ -245,6 +245,11 @@ again and `synced` fires at once, since there is nothing to wait for.
 TTT layers and device providers serve the same rooted destinations and
 complete the first pass even when the selected tree is empty.
 
+When a provider declaration keeps its owner id and delivery root, its new
+baseline also reports removals for instances that leave the selection.
+This holds when the filter, period or mode changes. The public manager
+assigns a new child owner when a delivery's subscription set changes.
+
 At the gdata level the root is an `FNode` path with one child per level
 and no predicates, carried by `Dst(deliver, root=...)`; the destination
 stamps it on the specs it delivers, so two destinations with the same
@@ -425,6 +430,12 @@ that instance.
 
 ### Device Providers
 
+Both providers use `Subscription` for one destination's callbacks and
+declaration state. A device `DeviceStream` is one folded read or native
+stream shared across destinations. TTT's `Read` serves a periodic filter;
+its on-change route retains producer slices in a `Shadow`. Devices retain
+rooted state in an `InstanceTree` and apply incoming patches to it.
+
 Device providers fold a destination's filters into one read per period
 and one on-change stream, using the same selection and root validation as
 TTT. Equal folded subscriptions share their device stream. Every successful
@@ -441,9 +452,17 @@ that ancestor. No whole feed is assembled for rooted delivery.
 
 The first result of every folded read, including errors and empty
 snapshots, completes the declaration's first pass. A new consumer of an
-existing stream receives its retained baseline before `synced`. An equal
-redeclaration replaces callbacks without replaying data. Closing one
-consumer keeps a shared stream alive for the others.
+existing stream receives its retained baseline before `synced`. Redeclaring
+an unchanged active stream replaces callbacks without replaying data.
+Closing one consumer keeps a shared stream alive for the others.
+
+An establishment failure drops the device stream, so the same provider
+declaration can retry it. An on-change update that cannot be parsed or
+applied also drops the stream: later changes cannot repair a missed update.
+Every consumer receives the error and must treat its retained state as
+invalid. Redeclaring starts or joins a new stream and obtains a complete
+baseline before changes resume. A periodic read error keeps the stream;
+its next successful snapshot delivers the selected state again.
 
 Transport capabilities determine how device reads run: periodic YANG-Push
 when supported, otherwise periodic NETCONF reads; native YANG-Push for

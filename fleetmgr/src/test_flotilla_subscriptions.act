@@ -6,6 +6,10 @@ import yang.gdata as gdata
 import stratoweave.device as swdev
 import stratoweave.adapters.netconf as netconf
 import stratoweave.swyang as swyang
+import stratoweave.ttt as ttt
+import fleetmgr.layers.t_1 as t_1
+import fleetmgr.layers.y_1 as y_1
+import fleetmgr.layers.y_1_oper as y1_oper
 import fleetmgr.devices.flotilla_oper as oper
 
 from stratoweave.device_meta_config import \
@@ -23,7 +27,7 @@ mut def telemetry(states: list[(str, str)]) -> gdata.Node:
     return root.to_gdata()
 
 
-actor GeneratedOperDelivery(t: testing.EnvT, on_change: bool):
+def new_device(t: testing.EnvT, name: str, on_change: bool) -> swdev.DeviceMgr:
     # The generated model already includes the inet-types and yang-types
     # imports. Add YANG-Push only for the native on-change test.
     push_models = [swyang.ietf_datastores, swyang.ietf_yang_push,
@@ -34,9 +38,14 @@ actor GeneratedOperDelivery(t: testing.EnvT, on_change: bool):
     schema = yang.compile(oper.src_yang() + (push_models if on_change else []))
     dev = swdev.DeviceMgr({"flotilla": swdev.DeviceType(
         name="flotilla", adapter_type=netconf.NetconfAdapter, src_dnode=schema,
-    )}, None, "generated-oper", t.log_handler, lambda name: None, swdev.SchemaRegistry())
-    dev.set_dmc(DeviceMetaConfig("generated-oper", Credentials("admin", "admin"),
+    )}, None, name, t.log_handler, lambda name: None, swdev.SchemaRegistry())
+    dev.set_dmc(DeviceMetaConfig(name, Credentials("admin", "admin"),
                                 type="flotilla", mock=Mock(enabled=True)))
+    return dev
+
+
+actor GeneratedOperDelivery(t: testing.EnvT, on_change: bool):
+    dev = new_device(t, "generated-oper", on_change)
     manager = gdata.SubscriptionManager(dev.tree_provider(), "generated-oper")
     var server: ?netconf.NetconfMockServer = None
     var phase = 0
@@ -143,3 +152,160 @@ actor _test_generated_oper_poll(t: testing.EnvT):
 
 actor _test_generated_oper_on_change(t: testing.EnvT):
     GeneratedOperDelivery(t, True)
+
+
+actor _test_flotilla_collector_instances(t: testing.EnvT):
+    """The real collector keeps siblings, clears removed leaves and instances,
+    and closes its stream on disable and shutdown. Its initial publication
+    contains the whole replay, and unrelated job updates produce no output."""
+    dev = new_device(t, "collector", True)
+    var server: ?netconf.NetconfMockServer = None
+    var collector: ?ttt.TransformActor = None
+    var phase = 0
+    var done = False
+
+    def fail(message: str):
+        if not done:
+            done = True
+            if collector is not None:
+                collector!.shutdown(None)
+            t.failure(ValueError(message))
+
+    def source(job_status: str) -> gdata.Node:
+        tree = oper.root.from_gdata(telemetry([("a", "succeeded"), ("b", "in-progress")]))
+        tree.device["a"].software.state.running_release = None
+        tree.device.create("jobs-only").software.state.job.create("install", state=job_status)
+        return tree.to_gdata()
+
+    def remove_first():
+        if not done and phase == 2:
+            phase = 3
+            server!.set_oper_ds(telemetry([("b", "in-progress")]))
+
+    def restart():
+        if not done and phase == 6:
+            phase = 7
+            conf = y_1.stratoweave_rfs__rfs__flotilla_status(enabled=True).to_gdata()
+            collector!.on_conf(conf, gdata.Container(), None)
+            collector!.on_conf(conf, gdata.Container(), None)
+
+    def finish():
+        if not done and phase == 9:
+            done = True
+            t.success()
+
+    def on_oper(data: ?gdata.Node):
+        if done:
+            return
+        state = y1_oper.stratoweave_rfs__rfs__flotilla_status.from_gdata(data) if data is not None else None
+        got: dict[str, (?str, ?str)] = {}
+        if state is not None:
+            got = {d.name: (d.status, d.running_release) for d in state.state.device}
+        if phase == 0:
+            if state is None or got != {"a": ("in-progress", "1.0"), "b": ("in-progress", "1.0")}:
+                fail("initial publication preceded the complete replay: {got}")
+                return
+            phase = 1
+            server!.set_oper_ds(source("running"))
+        elif phase == 1:
+            if state is None or got != {"a": ("succeeded", None), "b": ("in-progress", "1.0")}:
+                fail("instance update lost its sibling or retained a removed leaf: {got}")
+                return
+            phase = 2
+            server!.set_oper_ds(source("done"))
+            after 0.1: remove_first()
+        elif phase == 3:
+            if state is None or got != {"b": ("in-progress", "1.0")}:
+                fail("instance removal lost its sibling: {got}")
+                return
+            phase = 4
+            server!.set_oper_ds(telemetry([]))
+        elif phase == 4:
+            if state is None or got != {}:
+                fail("last instance removal left stale state: {got}")
+                return
+            phase = 5
+            conf = y_1.stratoweave_rfs__rfs__flotilla_status(enabled=False).to_gdata()
+            collector!.on_conf(conf, gdata.Container(), None)
+        elif phase == 5:
+            if state is not None:
+                fail("disabling the collector did not clear its contribution")
+                return
+            phase = 6
+            server!.set_oper_ds(telemetry([("c", "succeeded")]))
+            after 0.1: restart()
+        elif phase == 7:
+            if state is None or got != {"c": ("succeeded", "1.0")}:
+                fail("re-enabling did not start from the current baseline: {got}")
+                return
+            phase = 8
+            collector!.shutdown(None)
+        elif phase == 8:
+            if state is not None:
+                fail("shutdown did not clear the contribution")
+                return
+            phase = 9
+            server!.set_oper_ds(telemetry([("d", "in-progress")]))
+            after 0.1: finish()
+        else:
+            fail("unexpected publication in phase {phase}: {got}")
+
+    def start():
+        adapter = dev.get_adapter()
+        if isinstance(adapter, netconf.NetconfAdapter):
+            server = adapter.get_mock_server()
+            server!.set_oper_ds(telemetry([("a", "in-progress"), ("b", "in-progress")]))
+            params = ttt.TransformActorParams(ttt.PathRoot("rfs"), lambda state: None, on_oper, dev)
+            collector = t_1.FlotillaStatusTransformCtor(params)
+            conf = y_1.stratoweave_rfs__rfs__flotilla_status(enabled=True).to_gdata()
+            collector!.on_conf(conf, gdata.Container(), None)
+        else:
+            fail("no NETCONF adapter")
+
+    def timeout():
+        fail("collector timed out in phase {phase}")
+
+    start()
+    after 3: timeout()
+
+
+actor EmptyCollector(t: testing.EnvT, push: bool):
+    """An empty baseline or a failed first read still publishes empty state."""
+    dev = new_device(t, "empty-collector", push)
+    var collector: ?ttt.TransformActor = None
+    var done = False
+
+    def on_oper(data: ?gdata.Node):
+        if not done:
+            done = True
+            collector!.shutdown(None)
+            state = y1_oper.stratoweave_rfs__rfs__flotilla_status.from_gdata(data) if data is not None else None
+            if state is not None and len(list(state.state.device)) == 0:
+                t.success()
+            else:
+                t.failure(ValueError("empty first pass did not publish empty state"))
+
+    def timeout():
+        if not done:
+            done = True
+            collector!.shutdown(None)
+            t.failure(ValueError("empty collector timed out"))
+
+    adapter = dev.get_adapter()
+    if isinstance(adapter, netconf.NetconfAdapter):
+        adapter.get_mock_server()!.set_oper_ds(telemetry([]))
+        params = ttt.TransformActorParams(ttt.PathRoot("rfs"), lambda state: None, on_oper, dev)
+        collector = t_1.FlotillaStatusTransformCtor(params)
+        conf = y_1.stratoweave_rfs__rfs__flotilla_status(enabled=True).to_gdata()
+        collector!.on_conf(conf, gdata.Container(), None)
+        after 2: timeout()
+    else:
+        t.failure(ValueError("no NETCONF adapter"))
+
+
+actor _test_flotilla_collector_empty_baseline(t: testing.EnvT):
+    EmptyCollector(t, True)
+
+
+actor _test_flotilla_collector_failed_first_read(t: testing.EnvT):
+    EmptyCollector(t, False)

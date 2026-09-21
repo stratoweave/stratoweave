@@ -132,7 +132,7 @@ actor filtered_spec_sees_only_its_element(t: testing.AsyncT):
     after 2: fail(ValueError("timed out with {len(got)} deliveries"))
 
 
-actor two_owners_share_and_one_may_leave(t: testing.AsyncT):
+actor two_owners_receive_updates_and_one_may_leave(t: testing.AsyncT):
     hub = Hub()
     layer = service_layer(hub)
     var first: list[?gdata.Node] = []
@@ -851,6 +851,87 @@ def rendered(trees: list[?gdata.Node]) -> list[str]:
 
 def probe_spine(c: gdata.Node) -> gdata.Node:
     return gdata.Container({q("probe"): c})
+
+
+actor RootedRedeclaration(t: testing.AsyncT, first_period: ?float, next_period: ?float):
+    """The destination retains removals across filter, period and mode changes,
+    including instances added since its first baseline."""
+    hub = Hub()
+    layer = service_layer(hub)
+    var phase = 0
+    var received: dict[str, ?str] = {}
+    var done = False
+
+    def fail(message: str):
+        if not done:
+            done = True
+            layer.remove_subscriptions("rooted")
+            t.failure(ValueError(message))
+
+    def declare(period: ?float, name: ?str=None):
+        children = [gdata.FNode(q("status"))]
+        if name is not None:
+            children.append(gdata.FNode(q("name"), value_match=name))
+        want = {gdata.SubscriptionSpec(gdata.FNode(q("service"), children=children),
+                                      period=period, root=ROOTED_AT_SERVICE)}
+        layer.declare_subscriptions("rooted", on_update, want, on_synced)
+
+    def on_update(data: ?gdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail(str(err))
+            return
+        instances = gdata.instances(data, [q("service")])
+        if len(instances) != 1:
+            fail("expected one service instance: {prs(data)}")
+            return
+        entry = instances[0].2
+        name = entry.get_str(q("name"))
+        state = None if isinstance(entry, gdata.Absent) else entry.get_str(q("status"))
+        received[name] = state
+        if phase == 1 and name == "svc-b" and state == "updated":
+            phase = 2
+            received = {}
+            declare(next_period, "svc-a")
+
+    def on_synced(owner: str):
+        if done:
+            return
+        if phase == 0:
+            if received != {"svc-a": "a"}:
+                fail("incomplete baseline: {received}")
+                return
+            phase = 1
+            layer.edit_config(services(["svc-b"]), None,
+                              lambda r: hub.push("svc-b", status("updated")))
+        elif phase == 2:
+            if received != {"svc-a": "a", "svc-b": None}:
+                fail("narrowed baseline lost a removal: {received}")
+                return
+            done = True
+            layer.remove_subscriptions("rooted")
+            t.success()
+
+    def start(_r: value):
+        hub.push("svc-a", status("a"))
+        after 0.05: declare(first_period)
+
+    layer.edit_config(services(["svc-a"]), None, start)
+    after 3: fail("timed out in phase {phase}: {received}")
+
+
+actor rooted_redeclaration_narrows_on_change(t: testing.AsyncT):
+    RootedRedeclaration(t, None, None)
+
+actor rooted_redeclaration_changes_period(t: testing.AsyncT):
+    RootedRedeclaration(t, 0.1, 0.2)
+
+actor rooted_redeclaration_changes_to_periodic(t: testing.AsyncT):
+    RootedRedeclaration(t, None, 0.1)
+
+actor rooted_redeclaration_changes_to_on_change(t: testing.AsyncT):
+    RootedRedeclaration(t, 0.1, None)
 
 
 actor rooted_at_a_list_on_change(t: testing.AsyncT):

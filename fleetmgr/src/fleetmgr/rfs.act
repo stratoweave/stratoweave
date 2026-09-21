@@ -24,43 +24,74 @@ actor FlotillaStatusTransform(
     update_oper: proc(?y1_oper.stratoweave_rfs__rfs__flotilla_status) -> None,
     dev: swdev.DeviceMgr,
 ):
-    """Normalize one filtered software-state feed from a flotilla."""
+    """Normalize complete software-state instances from one flotilla."""
     var subscriptions: ?ygdata.SubscriptionManager = None
-    var destination: ?ygdata.Dst = None
+    var latest: dict[str, (status: ?str, running_release: ?str)] = {}
+    var enabled = False
+    var synced = False
+    var generation = 0
 
-    def publish(root: ?flotilla_oper.root) -> None:
+    def publish() -> None:
+        # update_oper replaces our whole contribution. Retain the other
+        # devices when publishing a changed or removed instance.
         oper = base.FlotillaStatus.new_state(path)
-        if root is not None:
-            for remote in root!.device:
-                state = remote.software.state
-                if state.status is not None or state.running_release is not None:
-                    out = oper.state.device.create(remote.name)
-                    out.status = state.status
-                    out.running_release = state.running_release
+        for name, state in latest.items():
+            oper.state.device.create(name, status=state.status,
+                                     running_release=state.running_release)
         update_oper(oper)
 
-    def on_state(root: ?flotilla_oper.root, error: ?Exception) -> None:
+    def on_state(gen: int, keys: ?(device_name: str),
+                 state: ?flotilla_oper.stratoweave_rfs__device__software__state,
+                 error: ?Exception) -> None:
+        # A callback from an earlier declaration may already be queued.
+        if not enabled or gen != generation:
+            return
         if error is not None:
             print("flotilla status subscription failed at {path}: {error}", err=True)
-            publish(None)
-        else:
-            publish(root)
+            latest = {}
+        elif keys is not None:
+            value: ?(status: ?str, running_release: ?str) = None
+            if state is not None and (state.status is not None or state.running_release is not None):
+                value = (status=state.status, running_release=state.running_release)
+            if latest.get(keys.device_name) == value:
+                return
+            if value is not None:
+                latest[keys.device_name] = value
+            else:
+                del latest[keys.device_name]
+        if synced:
+            publish()
+
+    def on_synced(gen: int) -> None:
+        if enabled and gen == generation:
+            synced = True
+            # The initial replay may contain thousands of instances. Publish
+            # their combined state once, after the replay is complete.
+            publish()
 
     def shutdown() -> None:
-        # Releasing the subscriptions here is a separate change.
-        pass
+        enabled = False
+        generation += 1
+        synced = False
+        latest = {}
+        if subscriptions is not None:
+            subscriptions!.close()
+            subscriptions = None
+        update_oper(None)
 
     def on_conf(conf: y_1.stratoweave_rfs__rfs__flotilla_status) -> None:
-        if subscriptions is None:
+        if conf.enabled == False:
+            shutdown()
+        elif not enabled:
+            enabled = True
+            generation += 1
+            gen = generation
             subscriptions = ygdata.SubscriptionManager(dev.tree_provider(), str(path))
-            destination = flotilla_oper.dst(on_state)
-
-        want: set[ygdata.Delivery] = set()
-        if conf.enabled != False:
-            want.add(destination!.deliver({
-                flotilla_oper.subs.device.software.state.subscribe(),
-            }))
-        subscriptions!.declare(want)
+            state = flotilla_oper.subs.device.software.state
+            destination = state.dst(lambda keys, value, error: on_state(gen, keys, value, error))
+            subscriptions!.declare({destination.deliver({
+                state.subscribe(),
+            })}, synced=lambda: on_synced(gen))
 
 
 class Device(base.Device):

@@ -549,18 +549,15 @@ def _delay(period: u64) -> float:
 
 class Read(object):
     """One read of a consumer's actor: a folded filter, read on its period,
-    and what it gave last: the tree, or rooted, the instances' spines by key
-    so the next read can report removals."""
+    and the latest tree for a destination rooted at the top."""
     filt: ?gdata.FNode
     latest: ?gdata.Node
-    held: dict[str, gdata.Node]
     done: bool                  # has run at least once
     active: bool                # False once replaced or dropped, so its timer ends
 
     def __init__(self, filt: ?gdata.FNode):
         self.filt = filt
         self.latest = None
-        self.held = {}
         self.done = False
         self.active = True
 
@@ -655,7 +652,7 @@ class Shadow(object):
 
 
 actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) -> None, point: list[gdata.Id]):
-    """One consumer's subscriptions, served outside the Layer actor.
+    """One destination's subscriptions, served outside the Layer actor.
 
     The consumer's periodic filters fold into one read per period, and its
     on-change filters into one subscription in the tree. Each read runs on
@@ -682,6 +679,7 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
     actor that runs transactions.
     """
     var reads: dict[u64, Read] = {}
+    var held: dict[str, gdata.Node] = {}        # last delivered instances, across reads and routes
     var shadow: ?Shadow = None                  # what the subscription holds of the tree
     var sub_id = ""                             # the subscription's name in the tree, "" when there is none
     var change_filt: ?gdata.FNode = None        # the subscription's folded filter
@@ -716,8 +714,6 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
                     old.active = False
             if replace:
                 fresh = Read(filt)
-                if old is not None:
-                    fresh.held = old.held       # so the next read reports instances no longer selected
                 reads[period] = fresh
                 _read(fresh, period)
         (on_change, cfilt) = subscriptions.fold_on_change(want)
@@ -739,12 +735,16 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
         if active and r.active:
             try:
                 tree = node.get_data(r.filt)
+                if not active or not r.active:
+                    return
                 if len(point) > 0:
-                    _read_rooted(r, tree)
+                    _snapshot_rooted(tree)
                 else:
                     r.latest = tree
                     _deliver(None)
             except Exception as e:
+                if not active or not r.active:
+                    return
                 if len(point) > 0:
                     cb(None, e)
                 else:
@@ -753,16 +753,17 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
             _synced_if_done()
             after _delay(period): _read(r, period)
 
-    def _read_rooted(r: Read, tree: ?gdata.Node):
-        """Deliver every selected instance, and report those gone since the last read."""
+    def _snapshot_rooted(tree: ?gdata.Node):
+        """Deliver a baseline or periodic snapshot, including removals since the
+        destination's previous delivery, even after its filter or cadence changed."""
         now: dict[str, gdata.Node] = {}
         for i in gdata.instances(tree, point):
             now[i.0] = i.1
             cb(i.1, None)
-        for k, h in r.held.items():
+        for k, h in held.items():
             if k not in now:
                 cb(gdata.gone(h, point), None)
-        r.held = now
+        held = now
 
     def _deliver(err: ?Exception):
         """The reads' latest trees and the shadow as one view, by reference
@@ -809,8 +810,7 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
         if len(point) == 0:
             _deliver(None)
         else:
-            for i in gdata.instances(_tree(), point):
-                cb(i.1, None)
+            _snapshot_rooted(_tree())
 
     def _unsubscribe():
         """Take the subscription out of the tree. The tree hears this after any
@@ -889,9 +889,12 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
             for i in gdata.instances(spine(ip, now), point):
                 present.add(i.0)
                 if i.0 not in was or was[i.0].1 != i.2:
+                    held[i.0] = i.1
                     cb(i.1, None)
         for k, w in was.items():
             if k not in present:
+                if k in held:
+                    del held[k]
                 cb(gdata.gone(w.0, point), None)
 
     def _instance_path(path: Path) -> Path:

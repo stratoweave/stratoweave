@@ -135,11 +135,15 @@ resolving each member's shard before merging all software intent into the same
 RFS device entry.
 
 The RFS transform renders that entry directly into the flotilla's standard
-`/device` schema. A second RFS transform maintains one periodic subtree-filtered
-subscription to `/device/software/state` on each flotilla. It normalizes that
-state locally; campaign transforms then select and aggregate only their own
-members. This avoids both full-datastore pushes and one southbound subscription
-per device or campaign.
+`/device` schema. A second RFS transform maintains one on-change subscription
+to `/device/software/state` on each flotilla. The device provider delivers each
+changed device's complete software state to the collector. The collector keeps
+the status and running release and publishes its complete normalized state,
+once after the initial replay and whenever either value changes or a device
+disappears. Disabling or removing the collector closes its subscription and
+clears its state. Campaign transforms receive individual normalized device
+statuses and aggregate their own members. This uses one southbound stream per
+flotilla.
 
 `flotilla` supplies only one modeled layer, the standard RFS. StratoWeave adds
 the implicit device layer beneath it.
