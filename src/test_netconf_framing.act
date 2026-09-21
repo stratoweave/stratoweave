@@ -1,0 +1,104 @@
+"""NETCONF framing integration tests."""
+
+import testing
+import std.xml as xml
+
+from pipe import Pipe
+import netconf
+
+
+class FragmentingPipe(Pipe):
+    """Split every write into fixed-size reads before forwarding it."""
+    pipe: Pipe
+    chunk_size: int
+
+    def __init__(self, pipe: Pipe, chunk_size: int):
+        if chunk_size <= 0:
+            raise ValueError("Fragment size must be positive")
+        self.pipe = pipe
+        self.chunk_size = chunk_size
+
+    proc def write(self, data: bytes) -> None:
+        for start in range(0, len(data), self.chunk_size):
+            self.pipe.write(data[start:start + self.chunk_size])
+
+    proc def read_cb(self, cb: action(?Exception, ?bytes) -> None) -> None:
+        self.pipe.read_cb(cb)
+
+    proc def close(self, on_close: ?action() -> None) -> None:
+        self.pipe.close(on_close)
+
+    proc def restart(self) -> None:
+        self.pipe.restart()
+
+
+def data_reply(value: str) -> list[xml.Node]:
+    return [xml.Node("data", [(None, netconf.NS_NC_1_0)], children=[
+        xml.Node("value", text=value)
+    ])]
+
+
+def reply_value(result: ?xml.Node) -> ?str:
+    if result is not None:
+        for rpc_child in result.children:
+            if rpc_child.tag == "data":
+                for data_child in rpc_child.children:
+                    if data_child.tag == "value":
+                        return data_child.text
+    return None
+
+
+actor _test_client_server_actor_pipe_fragmented_get(t: testing.EnvT):
+    """Legacy hello and chunked RPC framing survive one-byte transport reads."""
+    pipes = netconf.actor_pipe_pair()
+    client_pipe = FragmentingPipe(pipes.client, 1)
+    server_pipe = FragmentingPipe(pipes.server, 1)
+    var done = False
+
+    def finish(error: ?Exception) -> None:
+        if done:
+            return
+        done = True
+        if error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    def on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        if op.tag != "get":
+            finish(ValueError("Unexpected fragmented RPC operation: {op.tag}"))
+            return
+        s.send_reply(message_id, data_reply("fragmented"))
+
+    def on_get(c: netconf.Client, result: ?xml.Node,
+               error: ?netconf.NetconfError) -> None:
+        if error is not None:
+            finish(error)
+        elif reply_value(result) != "fragmented":
+            finish(ValueError("Unexpected fragmented rpc-reply"))
+        else:
+            c.close(None)
+            finish(None)
+
+    def on_connect(c: netconf.Client, error: ?Exception) -> None:
+        if error is not None:
+            finish(error)
+        else:
+            c.get(on_get)
+
+    def on_timeout() -> None:
+        finish(ValueError("Timed out waiting for fragmented NETCONF <get>"))
+
+    after 2.0: on_timeout()
+    server = netconf.Server(pipe=server_pipe, on_rpc=on_server_rpc,
+                            log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="fragmented-actor-pipe",
+                            username="fragmented-actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=on_connect,
+                            on_notif=None,
+                            log_handler=t.log_handler,
+                            pipe=client_pipe)
