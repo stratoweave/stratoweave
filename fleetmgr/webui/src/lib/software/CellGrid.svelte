@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { DeviceStatusRow, KnownStatus } from '$lib/software/model';
+  import type { DeviceStatusRow } from '$lib/software/model';
+  import { CELL_BG, CELL_COLOR, gutter } from '$lib/software/cells';
 
   interface Props {
     rows: DeviceStatusRow[];
@@ -23,26 +24,10 @@
   const MAX_HEIGHT = 300;
   // Until the container is measured (server render, first paint).
   const FALLBACK_WIDTH = 960;
-  const BG = '#0f1a30';
-
-  const COLOR: Record<KnownStatus, string> = {
-    pending: '#1d2c49',
-    unknown: '#1d2c49',
-    'up-to-date': '#1d2c49',
-    'upgrade-needed': '#3f3080',
-    'in-progress': '#22d3ee',
-    succeeded: '#16a34a',
-    failed: '#ef4444',
-    'rolled-back': '#94a3b8'
-  };
 
   const uid = `gut-${Math.random().toString(36).slice(2, 9)}`;
 
   let width = $state(0);
-
-  function gutter(size: number): number {
-    return Math.max(1, Math.round(size / 8));
-  }
 
   let layout = $derived.by(() => {
     const n = rows.length;
@@ -81,9 +66,9 @@
       while (c < cols) {
         const i = r * cols + c;
         if (i >= n) break;
-        const color = COLOR[rows[i].status];
+        const color = CELL_COLOR[rows[i].status];
         let len = 1;
-        while (c + len < cols && r * cols + c + len < n && COLOR[rows[r * cols + c + len].status] === color) {
+        while (c + len < cols && r * cols + c + len < n && CELL_COLOR[rows[r * cols + c + len].status] === color) {
           len++;
         }
         rects.push({ x: c * pitch, y: r * pitch, w: (len - 1) * pitch + size, fill: color });
@@ -136,8 +121,8 @@
       <title></title>
       <defs>
         <pattern id={uid} width={layout.pitch} height={layout.pitch} patternUnits="userSpaceOnUse">
-          <rect x={layout.size} y="0" width={layout.pitch - layout.size} height={layout.pitch} fill={BG} />
-          <rect x="0" y={layout.size} width={layout.pitch} height={layout.pitch - layout.size} fill={BG} />
+          <rect x={layout.size} y="0" width={layout.pitch - layout.size} height={layout.pitch} fill={CELL_BG} />
+          <rect x="0" y={layout.size} width={layout.pitch} height={layout.pitch - layout.size} fill={CELL_BG} />
         </pattern>
       </defs>
       <g>

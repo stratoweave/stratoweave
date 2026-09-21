@@ -94,11 +94,15 @@ Set `FLEETMGR_API` to point these targets at a top node on another address.
 ## Web UI
 
 `webui/` is a SvelteKit UI for the same northbound: fleet inventory and
-upgrade campaigns over RESTCONF. The top serves it itself: the static build
-is embedded in the `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so
-with `just demo` running the UI is at http://127.0.0.1:18200/. After a UI
-change, `just gen-webui` rebuilds the UI and regenerates that module (needs
-Node), then `just build` picks it up. For UI work,
+upgrade campaigns over RESTCONF. A campaign page draws the plan as a
+timeline: each window is a band as wide as its duration, with one cell per
+device at its estimated start on the wall clock; a marker shows now, and
+once the campaign runs the cells take the devices' live status. The top
+serves the UI itself: the static build is embedded in the `fleetmgr` binary
+as `src/fleetmgr/webui_assets.act`, so with `just demo` running the UI is at
+http://127.0.0.1:18200/. After a UI change, `just gen-webui` rebuilds the UI
+and regenerates that module (needs Node), then `just build` picks it up. For
+UI work,
 
     just webui
 

@@ -62,3 +62,10 @@ export function formatLocalTime(at: number, utcOffsetMinutes: number): string {
   const tz = `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
   return `${pad2(Math.floor(at / 3600))}:${pad2(Math.floor((at % 3600) / 60))}${tz}`;
 }
+
+/** Epoch seconds -> "13:59:59" on the local clock: every part always
+ * present, so a ticking display keeps its width. */
+export function formatClockSeconds(epochSeconds: number): string {
+  const d = new Date(epochSeconds * 1000);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
