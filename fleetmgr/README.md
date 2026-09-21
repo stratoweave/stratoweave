@@ -39,10 +39,15 @@ Start the top:
 
 The top starts ten `flotilla` subprocesses and waits for every NETCONF listener
 before starting its own runtime. The demo declares `flotilla-1` through
-`flotilla-10` and assigns two complete mock IOS XE entries to each.
-`demo-campaign.xml` adds `xe-upgrade-fleet`, a planned campaign over
-`cpe-04` to `cpe-20` with two one-hour windows, so the web UI has a plan to
-show; it does nothing until set to `run`. The processes use these ports:
+`flotilla-10` and assigns ten complete mock IOS XE entries to each, `cpe-001`
+to `cpe-100`. Every device takes 120 to 150 s to upgrade, ten of them,
+picked at random when the file was generated so the grids show no pattern,
+fail in one of the mock's five ways, two per kind, and `cpe-003` already
+runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
+campaign over the 97 devices `upgrade.xml` does not use, bound to a
+`nightly` schedule with a one-hour window at midnight UTC, so the web UI
+has a plan to show; it does nothing until set to `run`, and then waits
+for the window. The processes use these ports:
 
     process          HTTP          NETCONF
     fleetmgr         18200         12900
@@ -58,11 +63,12 @@ operations as measured on a lab c8000v (the numbers are in
 operation at once. `failure`
 names one IOS XE failure to reproduce: `download-failed`, `add-failed`,
 `activate-refused`, `commit-failed` or `reverts`. `running-release` is the
-release the device runs before any upgrade. In the demo, `cpe-02` takes 40 s
-and fails its commit, so the campaign aborts it and it ends `rolled-back`;
-`cpe-03` already runs the target and ends `up-to-date`. The leaves are read
-when the device is created; change them by deleting and re-creating the
-device.
+release the device runs before any upgrade. In the demo ten devices each
+reproduce one of the five failures: `cpe-034` fails its commit, so the
+campaign aborts it and it ends `rolled-back`, while `cpe-007` fails its
+download and ends `failed`. `cpe-003` already runs the target and ends
+`up-to-date`. The leaves are read when the device is
+created; change them by deleting and re-creating the device.
 
 Inspect the top CFS and the bottom RFS independently:
 
@@ -75,13 +81,16 @@ Inspect the top CFS and the bottom RFS independently:
 The second response should contain the two `stratoweave-rfs:device` entries
 assigned to `flotilla-1` and rendered by the top.
 
-Run the two-device IOS XE campaign and follow its state from the top:
+Run the three-device IOS XE campaign over `cpe-001`, `cpe-003` and `cpe-007`
+and follow its state from the top:
 
     just upgrade-and-watch
 
-The watcher starts before the intent is submitted, so it catches the mock's
-short `in-progress` state and stops when both devices have either succeeded or
-failed. `running_release` changes from `17.18.02` to `17.18.3a` on success.
+The watcher starts before the intent is submitted and stops when every device
+has settled, after about three minutes: the controller releases the two
+devices that need work one after the other, so `cpe-001` ends `succeeded`
+with `running_release` `17.18.3a` first, `cpe-003` is `up-to-date` at once,
+and `cpe-007` ends `failed` last.
 
 The submission and observation steps are also available separately:
 
