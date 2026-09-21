@@ -315,6 +315,9 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
     # Callback for every RPC the mock server does not implement itself,
     # installed with set_rpc_cb(...).
     var rpc_cb: ?action(xml.Node, action(children: ?list[xml.Node], tag: ?str, message: ?str) -> None) -> None = None
+    # Raw operation XML observed by the mock when a test enables recording.
+    # Normal mock devices do not retain an unbounded RPC history.
+    var rpc_history: ?list[str] = None
     # YANG-push: the last operational tree pushed, to diff against for on-change.
     var _yp_last: ?ygdata.Node = None
     var yp_service: ?nyp.NetconfSubscriptionService = None
@@ -466,6 +469,9 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
 
     def on_rpc(s: netconf.Server, message_id: str, op: xml.Node):
         _log.debug("NetconfMockServer received rpc", {"message_id": message_id, "op": op.tag, "rpc_xml": op.encode()})
+        history = rpc_history
+        if history is not None:
+            history!.append(op.encode())
 
         if yp.is_subscription_rpc(op.tag):
             if yp_service is not None:
@@ -542,6 +548,15 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
         if schema is not None:
             conf_schema = schema
             yl_view = monitoring.build_yl_view([conf_schema, oper_schema])
+
+    def clear_rpc_history() -> None:
+        rpc_history = []
+
+    def get_rpc_history() -> list[str]:
+        history = rpc_history
+        if history is not None:
+            return list(history!)
+        return []
 
     def set_rpc_cb(cb: action(xml.Node, action(children: ?list[xml.Node], tag: ?str, message: ?str) -> None) -> None):
         """Install the callback for every RPC the mock server does not implement.
@@ -634,6 +649,11 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
     # The currently running configuration on the device (which in NMDA lingo is
     # the "intended configuration" of the device)
     var running_conf: ?ygdata.Node = None
+
+    # An unchecked transaction advances running_conf optimistically. Before a
+    # later checked transaction may use that view for its diff, DeviceMgr must
+    # fetch the device configuration again.
+    var unchecked_since_sync = False
 
     # The device's meta configuration, like address, credentials, etc.
     var dmc: DeviceMetaConfig = init_dmc
@@ -1142,11 +1162,17 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
         This starts a multi-step transaction process:
         1. Lock the datastore
-        2. Fetch current config from device
-        3. Compute diff between current and target
+        2. Fetch current config from device (when sync-check is enabled)
+        3. Compute diff between current and target (already done by DeviceMgr)
         4. Send diff via edit-config
         5. Commit (if using candidate datastore)
         6. Unlock datastore
+
+        With sync-check disabled, skip step 2 and the final txid refresh, trust
+        the cached running view, and advance it after the transaction succeeds.
+
+        Datastore selection is independent: both modes use edit-config against
+        the selected target and commit when that target is candidate.
         """
         _log.debug("Device.configure: received new configuration")
 
@@ -1158,6 +1184,14 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             else:
                 _log.debug("Device.configure: Already in transaction, cannot send configuration")
                 done(BusyError(), None)
+            return
+
+        # Switching sync checks back on after unchecked writes requires a fresh
+        # DeviceMgr baseline. Report the same transient condition as detected
+        # drift so DeviceMgr resyncs and retries through its normal path.
+        sync_check = dmc.sync_check
+        if sync_check and unchecked_since_sync:
+            done(TxidMismatchError("Device configuration must be resynchronized before applying a checked edit"), None)
             return
 
         # Set transaction state
@@ -1185,9 +1219,8 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     _log.debug("Device.configure: locking candidate datastore")
                     c.lock(on_locked_candidate, "candidate")
                 else:
-                    # Just running is enough, get the txid
-                    _log.debug("Device.configure: getting txid")
-                    get_txid(on_txid_received)
+                    # Just running is enough; begin the configured sync policy.
+                    start_config(c)
 
         def on_locked_candidate(c: netconf.Client, error: ?netconf.NetconfError):
             """Callback after locking candidate datastore"""
@@ -1202,8 +1235,28 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 else:
                     abort(error)
             else:
-                _log.debug("Device.configure: getting txid before configuration")
+                start_config(c)
+
+        def send_edit(c: netconf.Client):
+            """Apply the DeviceMgr-computed diff using the selected datastore."""
+            if _is_stale(c):
+                _abort_stale_tx()
+                return
+            xml_diff = new_diff.to_xml()
+            if len(xml_diff) > 0:
+                _log.debug("Device.configure: sending diff", {"diff": xml.encode_nodes(xml_diff)})
+                c.edit_config(xml_diff, on_edited, target_datastore())
+            else:
+                _log.debug("Device.configure: no changes needed")
+                complete(c)
+
+        def start_config(c: netconf.Client):
+            if sync_check:
+                _log.debug("Device.configure: checking device configuration before edit")
                 get_txid(on_txid_received)
+            else:
+                _log.debug("Device.configure: sync check disabled, applying edit without checking device configuration")
+                send_edit(c)
 
         def on_txid_received(c: netconf.Client, current_txid: str, current_conf: ?ygdata.Node):
             """Called after txid has been retrieved from device"""
@@ -1226,18 +1279,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     _log.debug("Device.configure: using updated running_conf from get_txid_generic")
                     running_conf = current_conf
 
-                # Use the diff provided by DeviceMgr
-                xml_diff = new_diff.to_xml()
-                if len(xml_diff) > 0:
-                    _log.debug("Device.configure: sending diff", {"diff": xml.encode_nodes(xml_diff)})
-                    if client is not None:
-                        client.edit_config(xml_diff, on_edited, target_datastore())
-                else:
-                    _log.debug("Device.configure: no changes needed")
-                    if client is not None:
-                        complete(client)
-                    else:
-                        abort(NotConnectedError())
+                send_edit(c)
 
         def on_edited(c: netconf.Client, error: ?netconf.NetconfError):
             if _is_stale(c):
@@ -1278,8 +1320,40 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 _log.debug("Device.configure: commit successful")
                 complete(c)
 
+        def finish_with_config(c: netconf.Client, conf: ygdata.Node):
+            """Unlock any transaction datastores and finish with conf."""
+            def on_candidate_unlocked(c2: netconf.Client, e: ?netconf.NetconfError):
+                if _is_stale(c2):
+                    _abort_stale_tx()
+                    return
+                # If we locked running, unlock it after candidate (reverse order of locking)
+                if has_writable_running():
+                    c2.unlock(lambda c3, e2: finish(e if e is not None else e2, conf), "running")
+                else:
+                    finish(e, conf)
+
+            if use_locks():
+                if target_datastore() == "candidate":
+                    # Unlock candidate first
+                    c.unlock(on_candidate_unlocked, "candidate")
+                elif has_writable_running():
+                    # Just unlock running (we were using writable-running)
+                    c.unlock(lambda c3, e: finish(e, conf), "running")
+                else:
+                    # Shouldn't happen, but handle gracefully
+                    finish(None, conf)
+            else:
+                finish(None, conf)
+
         def complete(c: netconf.Client):
-            """Successfully complete the transaction"""
+            """Successfully complete the selected transaction process."""
+            if not sync_check:
+                _log.debug("Device.configure: transaction complete without sync check")
+                running_conf = new_conf
+                unchecked_since_sync = True
+                finish_with_config(c, new_conf)
+                return
+
             _log.debug("Device.configure: transaction complete, fetching new txid")
 
             def on_resulting_txid(c: netconf.Client, txid: str, final_conf: ?ygdata.Node):
@@ -1291,7 +1365,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 # If we got a full config, update our running_conf
                 if final_conf is not None:
                     running_conf = final_conf
-                    finish_with_config(final_conf)
+                    finish_with_config(c, final_conf)
                 else:
                     # For JUNOS, we only got the txid, so create a config with
                     # the new txid based on the target config we just applied.
@@ -1303,32 +1377,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     # e.g. platform-specific config mutations.
                     new_conf_with_txid = attach_txid(new_conf, txid)
                     running_conf = new_conf_with_txid
-                    finish_with_config(new_conf_with_txid)
-
-            def finish_with_config(conf):
-                """Finish with unlocking and calling done with the config"""
-                def on_candidate_unlocked(c2: netconf.Client, e: ?netconf.NetconfError):
-                    if _is_stale(c2):
-                        _abort_stale_tx()
-                        return
-                    # If we locked running, unlock it after candidate (reverse order of locking)
-                    if has_writable_running():
-                        c2.unlock(lambda c3, e2: finish(e if e is not None else e2, conf), "running")
-                    else:
-                        finish(e, conf)
-
-                if use_locks():
-                    if target_datastore() == "candidate":
-                        # Unlock candidate first
-                        c.unlock(on_candidate_unlocked, "candidate")
-                    elif has_writable_running():
-                        # Just unlock running (we were using writable-running)
-                        c.unlock(lambda c3, e: finish(e, conf), "running")
-                    else:
-                        # Shouldn't happen, but handle gracefully
-                        finish(None, conf)
-                else:
-                    finish(None, conf)
+                    finish_with_config(c, new_conf_with_txid)
 
             # Get the new txid after configuration
             get_txid(on_resulting_txid)
@@ -1395,8 +1444,8 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     _log.error("Device.configure: No lockable datastore available")
                     abort(ValueError("No lockable datastore available"))
             else:
-                _log.debug("Device.configure: Not using locks, getting txid")
-                get_txid(on_txid_received)
+                _log.debug("Device.configure: not using locks")
+                start_config(client)
 
 
     def get_capabilities():
@@ -1522,6 +1571,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
                         # Save our own (in Adapter) view of the device's running configuration
                         running_conf = new_conf
+                        unchecked_since_sync = False
                         done(running_conf, None)
                     else:
                         running_conf = None
