@@ -224,7 +224,7 @@
 <section class="card">
   <Section
     title="When"
-    description="Maintenance windows and pace. Offsets count from the moment the campaign is set to run."
+    description="Maintenance windows and pace. Offsets count from the moment the campaign is set to run; the windows are saved as a shared schedule named after the campaign."
     yangPath="software:software/upgrade-campaign/window"
   >
     {#if windows.length === 0}

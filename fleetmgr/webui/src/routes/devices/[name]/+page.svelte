@@ -62,6 +62,9 @@
         {#if device.description}
           · {device.description}
         {/if}
+        {#if device.schedule}
+          · schedule <span class="mono">{device.schedule}</span>
+        {/if}
       </p>
     </div>
   </div>

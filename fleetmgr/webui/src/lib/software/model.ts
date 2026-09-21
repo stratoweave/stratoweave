@@ -5,6 +5,7 @@ import type { ValidationResult } from '$lib/core/validation/types';
 // so creation merges into `data` under the module-qualified wrappers.
 export const DATA_ROOT = 'data';
 export const SOFTWARE_ROOT = 'data/software:software';
+export const SCHEDULES_ROOT = 'data/maintenance:schedules';
 export const CAMPAIGN_LIST_ROOT = 'data/software:software/upgrade-campaign';
 export const FLEET_ROOT = 'data/fleetmgr:fleet';
 export const FLEET_DEVICE_LIST_ROOT = 'data/fleetmgr:fleet/device';
@@ -25,6 +26,7 @@ export interface DeviceJson {
   type?: string;
   shard?: string;
   description?: string;
+  schedule?: string;
   address?: AddressJson[];
   credentials?: { username?: string; password?: string };
   mock?: { enabled?: boolean };
@@ -49,6 +51,13 @@ export interface DeviceStatusJson {
 export interface WindowJson {
   start: number;
   duration: number;
+}
+
+/** A shared /maintenance:schedules object; devices and campaign defaults
+ * reference one by name. */
+export interface ScheduleJson {
+  name: string;
+  window?: WindowJson[];
 }
 
 export interface PlanDeviceJson {
@@ -87,7 +96,7 @@ export interface CampaignJson {
   'allow-staging'?: boolean;
   device?: CampaignMemberJson[];
   'admin-state'?: AdminState;
-  window?: WindowJson[];
+  'default-schedule'?: string;
   deadline?: number;
   'target-rate'?: number;
   'max-rate'?: number;
@@ -102,6 +111,9 @@ export interface DataTreeJson {
   };
   'software:software'?: {
     'upgrade-campaign'?: CampaignJson[];
+  };
+  'maintenance:schedules'?: {
+    schedule?: ScheduleJson[];
   };
 }
 
@@ -165,6 +177,8 @@ export interface Device {
   type: string;
   shard: string;
   description: string;
+  /** Maintenance schedule binding, by name; empty when unbound. */
+  schedule: string;
   approvalRequired: boolean;
   /** First address entry as `host[:port]`; empty for a mock. */
   address: string;
@@ -197,6 +211,12 @@ export interface MaintenanceWindow {
   duration: number;
 }
 
+/** A parsed shared schedule object. */
+export interface Schedule {
+  name: string;
+  windows: MaintenanceWindow[];
+}
+
 export interface PlanDevice {
   name: string;
   /** Seconds after launch; an estimate. */
@@ -227,7 +247,10 @@ export interface Campaign {
   devices: string[];
   imageUrl: string;
   adminState: AdminState;
-  windows: MaintenanceWindow[];
+  /** Name of the shared schedule for members whose device has no binding
+   * of its own; empty when the campaign runs through its one synthetic
+   * open-ended window. */
+  defaultSchedule: string;
   /** Seconds after launch; null when the campaign has none. */
   deadline: number | null;
   /** Devices per hour; 0 means no preference / no cap. */
@@ -254,6 +277,7 @@ function parseDevice(entry: DeviceJson & { 'approval-required'?: boolean }): Dev
     type: entry.type ?? '',
     shard: entry.shard ?? '',
     description: entry.description ?? '',
+    schedule: entry.schedule ?? '',
     approvalRequired: entry['approval-required'] === true,
     address: firstAddress(entry)
   };
@@ -307,11 +331,6 @@ function parsePlan(state: CampaignStateJson | undefined, members: string[]): Cam
 
 function parseCampaign(entry: CampaignJson): Campaign {
   const members = (entry.device ?? []).map((m) => m.name);
-  const windows = (entry.window ?? []).map((w) => ({
-    start: num(w.start),
-    duration: num(w.duration)
-  }));
-  windows.sort((a, b) => a.start - b.start);
   const reported = new Map<string, DeviceStatusJson>();
   for (const row of entry.state?.['device-status'] ?? []) {
     reported.set(row.device, row);
@@ -328,7 +347,7 @@ function parseCampaign(entry: CampaignJson): Campaign {
     devices: members,
     imageUrl: entry['image-url'] ?? '',
     adminState: entry['admin-state'] === 'run' ? 'run' : 'plan',
-    windows,
+    defaultSchedule: entry['default-schedule'] ?? '',
     deadline: typeof entry.deadline === 'number' ? entry.deadline : null,
     targetRate: entry['target-rate'] ?? DEFAULT_TARGET_RATE,
     maxRate: entry['max-rate'] ?? DEFAULT_MAX_RATE,
@@ -363,6 +382,21 @@ export function parseCampaigns(json: unknown): Campaign[] {
   return (tree?.['upgrade-campaign'] ?? []).map(parseCampaign);
 }
 
+/** Parse a GET of data/maintenance:schedules. */
+export function parseSchedules(json: unknown): Schedule[] {
+  const tree = (json as DataTreeJson)?.['maintenance:schedules'];
+  const schedules = (tree?.schedule ?? []).map((s) => {
+    const windows = (s.window ?? []).map((w) => ({
+      start: num(w.start),
+      duration: num(w.duration)
+    }));
+    windows.sort((a, b) => a.start - b.start);
+    return { name: s.name, windows };
+  });
+  schedules.sort((a, b) => a.name.localeCompare(b.name));
+  return schedules;
+}
+
 export function parseCampaignEntry(json: unknown): Campaign | null {
   const entries = (json as CampaignEntryJson)?.['software:upgrade-campaign'];
   return entries && entries.length > 0 ? parseCampaign(entries[0]) : null;
@@ -376,6 +410,8 @@ export interface NewCampaign {
   imageUrl: string;
   devices: string[];
   allowStaging?: boolean;
+  /** Saved as a shared schedule object named after the campaign, set as
+   * the campaign's default. */
   windows?: MaintenanceWindow[];
   /** Seconds after launch. */
   deadline?: number | null;
@@ -384,23 +420,42 @@ export interface NewCampaign {
   maxRate?: number | null;
 }
 
-export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
+export interface CampaignCreatePatchJson extends SoftwarePatchJson {
+  'maintenance:schedules'?: { schedule: ScheduleJson[] };
+}
+
+export function campaignCreatePatch(input: NewCampaign): CampaignCreatePatchJson {
+  const name = input.name.trim();
   const entry: Partial<CampaignJson> & { name: string } = {
-    name: input.name.trim(),
+    name,
     'target-release': input.targetRelease.trim(),
-    device: input.devices.map((name) => ({ name })),
+    device: input.devices.map((device) => ({ name: device })),
     'admin-state': 'plan'
+  };
+  const patch: CampaignCreatePatchJson = {
+    'software:software': { 'upgrade-campaign': [entry] }
   };
   const imageUrl = input.imageUrl.trim();
   if (imageUrl) entry['image-url'] = imageUrl;
   if (input.allowStaging) entry['allow-staging'] = true;
   if (input.windows && input.windows.length > 0) {
-    entry.window = input.windows.map((w) => ({ start: w.start, duration: w.duration }));
+    // One transaction creates the schedule object and the campaign that
+    // references it. Named after the campaign, so no shared object is
+    // quietly extended by a PATCH merge.
+    patch['maintenance:schedules'] = {
+      schedule: [
+        {
+          name,
+          window: input.windows.map((w) => ({ start: w.start, duration: w.duration }))
+        }
+      ]
+    };
+    entry['default-schedule'] = name;
   }
   if (input.deadline != null) entry.deadline = input.deadline;
   if (input.targetRate != null) entry['target-rate'] = input.targetRate;
   if (input.maxRate != null) entry['max-rate'] = input.maxRate;
-  return { 'software:software': { 'upgrade-campaign': [entry] } };
+  return patch;
 }
 
 /** PATCH merges: sending only {name, admin-state} flips one leaf and
