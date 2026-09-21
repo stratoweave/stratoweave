@@ -2,60 +2,99 @@ import testing
 
 
 class Buffer(object):
+    """A rewindable byte stream backed by immutable transport chunks.
+
+    Reads and skips move a speculative cursor. consume() commits that cursor;
+    rewind() restores it to the last commit. Consumed storage is compacted only
+    after at least half of the retained list or first chunk is dead, keeping
+    repeated consume operations amortized linear rather than quadratic.
+    """
+
     parts: list[bytes]
-    i: int
-    j: int
+    start_part: int
+    start_offset: int
+    cursor_part: int
+    cursor_offset: int
     total_bytes: int
     unread_bytes: int
     _cached_pattern: ?bytes
-    _cached_search_i: int
-    _cached_search_j: int
+    _cached_first: bytes
+    _cached_search_part: int
+    _cached_search_offset: int
     _cached_search_index: int
 
     def __init__(self):
         self.parts = []
-        self.i = 0
-        self.j = 0
+        self.start_part = 0
+        self.start_offset = 0
+        self.cursor_part = 0
+        self.cursor_offset = 0
         self.total_bytes = 0
         self.unread_bytes = 0
         self._cached_pattern = None
-        self._cached_search_i = 0
-        self._cached_search_j = 0
+        self._cached_first = b""
+        self._cached_search_part = 0
+        self._cached_search_offset = 0
         self._cached_search_index = 0
 
-    def write_bytes(self, data: bytes):
+    def _invalidate_search(self) -> None:
+        self._cached_pattern = None
+
+    def write_bytes(self, data: bytes) -> None:
         l = len(data)
+        if l == 0:
+            return
         self.parts.append(data)
         self.total_bytes += l
         self.unread_bytes += l
 
-    def write_str(self, data: str):
+    def write_str(self, data: str) -> None:
         self.write_bytes(data.encode())
 
-    def consume(self):
-        #print("CONSUME!", self.i, self.j)
-        if self.i > 0:
-            # TODO: use a queue rather then list, i.e. parts: queue[bytes] to avoid copying/moving all elements in list
-            self.parts = self.parts[self.i:]
-            self.i = 0
-        if self.j > 0:
-            if len(self.parts) > 0:
-                #self.parts[0] = self.parts[0][self.j:]
-                parts: list[bytes] = self.parts # Workaround type-checker bug?
-                parts[0] = parts[0][self.j:]
-            self.j = 0
-        self.total_bytes = self.unread_bytes
-        # Invalidate cache after consume
-        self._cached_pattern = None
-        #print("CONSUMED!", self.parts)
+    def consume(self) -> None:
+        """Commit bytes passed by the speculative cursor.
 
-    def rewind(self):
-        #print("REWIND!")
-        self.i = 0
-        self.j = 0
+        Storage is cleared when empty. Otherwise dead storage is reclaimed
+        geometrically, so a stream containing many messages does not copy the
+        complete unread suffix after every message.
+        """
+        self.start_part = self.cursor_part
+        self.start_offset = self.cursor_offset
+        self.total_bytes = self.unread_bytes
+        self._invalidate_search()
+
+        if self.total_bytes == 0:
+            self.parts = []
+            self.start_part = 0
+            self.start_offset = 0
+            self.cursor_part = 0
+            self.cursor_offset = 0
+            return
+
+        # Drop complete chunks only when at least half the retained list is
+        # dead. Repeated compactions therefore copy O(n) chunk references in
+        # total, not O(n^2).
+        if self.start_part > 0 and self.start_part * 2 >= len(self.parts):
+            dropped = self.start_part
+            self.parts = self.parts[dropped:]
+            self.start_part = 0
+            self.cursor_part -= dropped
+
+        # Apply the same geometric rule inside a partially consumed chunk.
+        # This bounds retained byte storage without copying on every commit.
+        if self.start_offset > 0:
+            parts: list[bytes] = self.parts
+            part = parts[self.start_part]
+            if self.start_offset * 2 >= len(part):
+                parts[self.start_part] = part[self.start_offset:]
+                self.start_offset = 0
+                self.cursor_offset = 0
+
+    def rewind(self) -> None:
+        self.cursor_part = self.start_part
+        self.cursor_offset = self.start_offset
         self.unread_bytes = self.total_bytes
-        # Invalidate cache after rewind
-        self._cached_pattern = None
+        self._invalidate_search()
 
     def read_bytes_count(self) -> int:
         return self.total_bytes - self.unread_bytes
@@ -64,60 +103,101 @@ class Buffer(object):
         return self.unread_bytes > 0
 
     def read_bytes(self, count: int) -> ?bytes:
-        #print("READ", count)
-        #print("READ0!", self.i, self.j)
+        if count < 0:
+            raise ValueError("Buffer read count cannot be negative")
         if count > self.unread_bytes:
             return None
+        if count == 0:
+            return b""
+
+        parts: list[bytes] = self.parts
+        part = parts[self.cursor_part]
+        part_remaining = len(part) - self.cursor_offset
+
+        # The common case needs one slice at most, and an aligned whole-chunk
+        # read can return the immutable bytes object directly.
+        if count <= part_remaining:
+            start = self.cursor_offset
+            end = start + count
+            if start == 0 and end == len(part):
+                result = part
+            else:
+                result = part[start:end]
+            if end == len(part):
+                self.cursor_part += 1
+                self.cursor_offset = 0
+            else:
+                self.cursor_offset = end
+            self.unread_bytes -= count
+            self._invalidate_search()
+            return result
+
         remaining = count
-        acc = []
-        parts: list[bytes] = self.parts # Workaround type-checker bug?
+        acc: list[bytes] = []
         while remaining > 0:
-            #part = self.parts[self.i]
-            part = parts[self.i]
-            next_j = self.j + remaining
-            chunk = part[self.j:next_j]
-            chunk_len = len(chunk)
-            remaining -= chunk_len
-            if next_j >= len(part):
-                self.i += 1
-                next_j = 0
-            self.j = next_j
-            acc.append(chunk)
+            part = parts[self.cursor_part]
+            part_remaining = len(part) - self.cursor_offset
+            if remaining < part_remaining:
+                acc.append(part[self.cursor_offset:self.cursor_offset + remaining])
+                self.cursor_offset += remaining
+                remaining = 0
+            else:
+                acc.append(part if self.cursor_offset == 0 else part[self.cursor_offset:])
+                remaining -= part_remaining
+                self.cursor_part += 1
+                self.cursor_offset = 0
         self.unread_bytes -= count
-        #print("READ1!", self.i, self.j)
-        # Invalidate cache after read since buffer position has changed
-        self._cached_pattern = None
-        return bytes([]).join(acc)
+        self._invalidate_search()
+        return b"".join(acc)
 
     def read_all_bytes(self) -> bytes:
         b = self.read_bytes(self.unread_bytes)
         if b is not None:
             return b
         else:
-            return bytes([])
+            return b""
 
     def skip_bytes(self, count: int) -> ?bool:
-        #print("SKIP", count)
-        #print("SKIP0!", self.i, self.j)
+        if count < 0:
+            raise ValueError("Buffer skip count cannot be negative")
         if count > self.unread_bytes:
             return None
         remaining = count
-        parts: list[bytes] = self.parts # Workaround type-checker bug?
+        parts: list[bytes] = self.parts
         while remaining > 0:
-            #part = self.parts[self.i]
-            part = parts[self.i]
-            part_len = len(part)
-            part_remain = part_len - self.j
-            if remaining < part_remain:
-                self.j += remaining
+            part = parts[self.cursor_part]
+            part_remaining = len(part) - self.cursor_offset
+            if remaining < part_remaining:
+                self.cursor_offset += remaining
+                remaining = 0
                 break
-            remaining -= part_remain
-            self.i += 1
-            self.j = 0
+            remaining -= part_remaining
+            self.cursor_part += 1
+            self.cursor_offset = 0
         self.unread_bytes -= count
-        #print("SKIP0!", self.i, self.j)
-        # Invalidate cache after skip since buffer position has changed
-        self._cached_pattern = None
+        self._invalidate_search()
+        return True
+
+    def _matches_at(self, pattern: bytes,
+                    part_index: int,
+                    part_offset: int) -> bool:
+        """Return whether pattern starts at a known readable position."""
+        pattern_len = len(pattern)
+        part = self.parts[part_index]
+        if part_offset + pattern_len <= len(part):
+            return part.find(pattern,
+                             part_offset,
+                             part_offset + pattern_len) == part_offset
+
+        scan_part = part_index
+        scan_offset = part_offset
+        for pattern_index in range(pattern_len):
+            if scan_offset == len(self.parts[scan_part]):
+                scan_part += 1
+                scan_offset = 0
+            if self.parts[scan_part][scan_offset] != pattern[pattern_index]:
+                return False
+            scan_offset += 1
         return True
 
     def find_bytes(self, pattern: bytes) -> ?int:
@@ -127,70 +207,64 @@ class Buffer(object):
         elif pattern_len > self.unread_bytes:
             return None
 
-        # Check if we have any parts to search
-        if len(self.parts) == 0:
-            return None
-
         if self._cached_pattern == pattern:
             index = self._cached_search_index
-            _i = self._cached_search_i
-            _j = self._cached_search_j
+            search_part = self._cached_search_part
+            search_offset = self._cached_search_offset
+            first = self._cached_first
         else:
             index = 0   # tracks absolute position in buffer
-            _i = self.i # current part (index of self.parts)
-            _j = self.j # current position in current part
+            search_part = self.cursor_part
+            search_offset = self.cursor_offset
             self._cached_pattern = pattern
+            first = pattern[:1]
+            self._cached_first = first
 
-        while index <= self.unread_bytes - pattern_len:
-            pos = self.parts[_i].find(chr(pattern[0]).encode(), _j)
+        last_start = self.unread_bytes - pattern_len
+        while index <= last_start:
+            part = self.parts[search_part]
+            pos = part.find(first, search_offset)
 
             if pos >= 0:
-                # Found first byte, update index to this position
-                index += pos - _j
-
-                # Scan the rest of the pattern byte-by-byte because the pattern
-                # may be split across parts
-                scan_i = _i
-                scan_j = pos + 1
-                for pattern_index in range(1, pattern_len):
-                    if scan_j >= len(self.parts[scan_i]):
-                        # Advance to next part
-                        scan_j = 0
-                        scan_i += 1
-                        if scan_i >= len(self.parts):
-                            # Exhausted all parts
-                            break
-                    if self.parts[scan_i][scan_j] != pattern[pattern_index]:
-                        break
-                    scan_j += 1
-                else:
+                index += pos - search_offset
+                search_offset = pos
+                # Keep the first possible delimiter prefix in the incomplete
+                # suffix. A later write may turn it into a full match.
+                if index > last_start:
+                    break
+                if self._matches_at(pattern, search_part, pos):
+                    self._invalidate_search()
                     return index
-
-                # No match, advance position by 1 and continue
-                _j = pos + 1
+                search_offset += 1
                 index += 1
             else:
-                # First byte not found in rest of this part
-                index += len(self.parts[_i]) - _j
-                _i += 1
-                _j = 0
-                if _i >= len(self.parts):
-                    # Exhausted all parts
-                    break
+                index += len(part) - search_offset
+                search_offset = len(part)
 
-        # Cache current position for next search
-        self._cached_search_i = _i
-        self._cached_search_j = _j
+            if search_offset == len(part):
+                search_part += 1
+                search_offset = 0
+
+        # Cache either the end of scanned data or the first delimiter prefix
+        # in the incomplete suffix. Both positions are safe to resume after a
+        # write, so repeated searches stay linear without missing split data.
+        self._cached_search_part = search_part
+        self._cached_search_offset = search_offset
         self._cached_search_index = index
 
         return None
 
     def match_bytes(self, pattern: bytes) -> ?bool:
-        b = self.read_bytes(len(pattern))
-        if b is not None:
-            return b == pattern
-        else:
+        pattern_len = len(pattern)
+        if pattern_len > self.unread_bytes:
             return None
+        if pattern_len == 0:
+            return True
+        matches = self._matches_at(pattern,
+                                   self.cursor_part,
+                                   self.cursor_offset)
+        self.skip_bytes(pattern_len)
+        return matches
 
 def _test_buffer_find_bytes_start():
     """Test finding 'hello' at beginning of buffer"""
@@ -390,6 +464,142 @@ def _test_buffer_find_bytes_after_consume():
             testing.assertTrue(pos2 is not None, "Should return int for found pattern")
             if pos2 is not None:
                 testing.assertEqual(pos2, 6, "Should find second separator at position 6 after consume")
+
+
+def _test_buffer_find_bytes_after_partial_match():
+    """A failed search must reconsider a partial separator after more data arrives."""
+    separator = b"]]>]]>"
+    for split in range(1, len(separator)):
+        buf = Buffer()
+        buf.write_bytes(b"prefix" + separator[:split])
+        testing.assertNone(buf.find_bytes(separator))
+        buf.write_bytes(separator[split:])
+        testing.assertEqual(buf.find_bytes(separator), 6)
+
+
+def _test_buffer_read_rewind_and_consume():
+    """Speculative reads rewind, while consumed reads stay discarded."""
+    buf = Buffer()
+    buf.write_bytes(b"ab")
+    buf.write_bytes(b"")
+    buf.write_bytes(b"cdef")
+
+    testing.assertEqual(buf.total_bytes, 6)
+    testing.assertEqual(buf.unread_bytes, 6)
+    testing.assertEqual(buf.read_bytes(3), b"abc")
+    testing.assertEqual(buf.read_bytes_count(), 3)
+    testing.assertNone(buf.read_bytes(4))
+    testing.assertEqual(buf.unread_bytes, 3, "Incomplete read must not move the cursor")
+
+    buf.rewind()
+    testing.assertEqual(buf.read_bytes(2), b"ab")
+    buf.consume()
+    testing.assertEqual(buf.total_bytes, 4)
+    testing.assertEqual(buf.read_bytes_count(), 0)
+
+    testing.assertEqual(buf.read_bytes(2), b"cd")
+    buf.rewind()
+    testing.assertEqual(buf.read_all_bytes(), b"cdef")
+    buf.consume()
+    testing.assertEqual(buf.total_bytes, 0)
+    testing.assertEqual(len(buf.parts), 0)
+
+    buf.write_bytes(b"reused")
+    testing.assertEqual(buf.read_all_bytes(), b"reused")
+
+
+def _test_buffer_fragmented_read_and_skip():
+    """Reads and skips work at every chunk boundary."""
+    buf = Buffer()
+    for part in [b"a", b"bc", b"def", b"ghij"]:
+        buf.write_bytes(part)
+
+    testing.assertEqual(buf.read_bytes(4), b"abcd")
+    testing.assertEqual(buf.skip_bytes(3), True)
+    testing.assertEqual(buf.read_all_bytes(), b"hij")
+    testing.assertEqual(buf.unread_bytes, 0)
+
+
+def _test_buffer_match_bytes_contract():
+    """Incomplete matches do not move; complete matches always consume."""
+    buf = Buffer()
+    buf.write_bytes(b"\n")
+    testing.assertNone(buf.match_bytes(b"\n#"))
+    testing.assertEqual(buf.unread_bytes, 1)
+    buf.write_bytes(b"#tail")
+    testing.assertEqual(buf.match_bytes(b"\n#"), True)
+    buf.consume()
+    testing.assertEqual(buf.match_bytes(b"no"), False)
+    testing.assertEqual(buf.read_all_bytes(), b"il")
+
+
+def _test_buffer_rejects_negative_counts():
+    """Invalid counts fail without corrupting buffer accounting."""
+    buf = Buffer()
+    buf.write_bytes(b"abc")
+    try:
+        buf.read_bytes(-1)
+        raise AssertionError("Negative read did not raise")
+    except ValueError:
+        pass
+    try:
+        buf.skip_bytes(-1)
+        raise AssertionError("Negative skip did not raise")
+    except ValueError:
+        pass
+    testing.assertEqual(buf.total_bytes, 3)
+    testing.assertEqual(buf.unread_bytes, 3)
+    testing.assertEqual(buf.read_all_bytes(), b"abc")
+
+
+def _test_buffer_find_bytes_matches_contiguous_search():
+    """Fragmentation and speculative cursor position do not change find()."""
+    data = b"aba-x-ababa-]]>]]>-tail"
+    patterns = [b"", b"a", b"aba", b"ababa", b"]]>]]>", b"tail", b"missing"]
+    for chunk_size in range(1, 8):
+        for offset in range(len(data) + 1):
+            for pattern in patterns:
+                buf = Buffer()
+                for start in range(0, len(data), chunk_size):
+                    buf.write_bytes(data[start:start + chunk_size])
+                buf.skip_bytes(offset)
+                expected = data.find(pattern, offset)
+                actual = buf.find_bytes(pattern)
+                if expected < 0:
+                    testing.assertNone(actual)
+                else:
+                    testing.assertEqual(actual, expected - offset)
+
+
+def _test_buffer_consume_many_messages():
+    """Repeated commits remain correct across geometric compactions."""
+    separator = b"]]>]]>"
+    messages = 257
+    buf = Buffer()
+    buf.write_bytes(b"x]]>]]>" * messages)
+    for i in range(messages):
+        testing.assertEqual(buf.find_bytes(separator), 1)
+        testing.assertEqual(buf.read_bytes(1), b"x")
+        testing.assertEqual(buf.skip_bytes(len(separator)), True)
+        buf.consume()
+    testing.assertEqual(buf.total_bytes, 0)
+    testing.assertEqual(buf.unread_bytes, 0)
+    testing.assertEqual(len(buf.parts), 0)
+
+
+def _test_buffer_consume_many_parts():
+    """Complete dead chunks can be compacted without changing the cursor."""
+    separator = b"]]>]]>"
+    messages = 64
+    buf = Buffer()
+    for i in range(messages):
+        buf.write_bytes(b"x]]>]]>")
+    for i in range(messages):
+        testing.assertEqual(buf.find_bytes(separator), 1)
+        testing.assertEqual(buf.skip_bytes(1 + len(separator)), True)
+        buf.consume()
+    testing.assertEqual(buf.total_bytes, 0)
+    testing.assertEqual(len(buf.parts), 0)
 
 
 def _test_buffer_find_bytes_performance():
