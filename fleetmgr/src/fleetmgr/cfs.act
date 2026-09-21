@@ -296,10 +296,15 @@ def imax(a: int, b: int) -> int:
     return a if a > b else b
 
 
-# How often the controller reconsiders releases. A code constant for now;
-# the intent is to make this event-driven with a debounce, since every
-# decision write costs a recompute.
-CONTROL_TICK_S = 1.0
+# A completion arms the debounce timer; telemetry landing while it is armed
+# joins the same batch, and the timer firing decides once. Every decision
+# write costs a recompute, so batching is what keeps a running campaign
+# cheap.
+DEBOUNCE_S = 2.0
+
+# Liveness backstop: with no completions there are no events, and a stuck
+# device must still be reconsidered now and then.
+GUARD_S = 30.0
 
 
 actor UpgradeCampaignTransform(path: ttt.Path,
@@ -309,11 +314,13 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     """Aggregate flotilla telemetry and control the release of the plan.
 
     The actor plans for itself from the campaign and runs the core
-    controller on the layout and the telemetry: windows open by the
-    clock, releases start small and double as upgrades complete,
-    concurrency follows the window pressure, and the decision is written
-    as dynstate for the transform to actuate. Every campaign is paced
-    this way; one without windows runs through its synthetic window.
+    controller on the layout and the telemetry, driven by events rather
+    than a tick: on-change telemetry arms a debounce timer and the timer
+    firing decides once for the whole batch; window openings and the
+    projected shortfall crossing get exact timers of their own, and a
+    slow guard covers devices that stop producing events. Releases start
+    small and double as upgrades complete, and the decision is written
+    as dynstate for the transform to actuate.
     """
     var members: list[str] = []
     var latest: ?y1_oper.root = None
@@ -322,7 +329,13 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var plan_layout: list[(str, int, int, list[(str, int)])] = []
     var plan_alarms: list[str] = []
     var running = False
-    var ticking = False
+    var active = False
+    var generation = 0
+    var debounce_armed = False
+    var edge_armed_for = -1
+    var alarm_armed_for = -1
+    var alarmed = False
+    var controller_alarms: list[str] = []
     var anchor: ?time.Instant = None
     var released: set[str] = set()
     var released_at: dict[str, int] = {}
@@ -378,6 +391,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 pd.estimated_duration = u64(EST_S)
         for alarm in plan_alarms:
             st.plan.alarm.append(alarm)
+        for alarm in controller_alarms:
+            st.plan.alarm.append(alarm)
         update_oper(oper)
 
     def on_rfs(root: ?y1_oper.root, error: ?Exception) -> None:
@@ -387,6 +402,36 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         else:
             latest = root
         publish()
+        # Telemetry arms the debounce timer; updates landing while it is
+        # armed join the same batch.
+        if active and not debounce_armed:
+            debounce_armed = True
+            gen = generation
+            after DEBOUNCE_S: _debounce_fired(gen)
+
+    def _debounce_fired(gen: int) -> None:
+        debounce_armed = False
+        if gen == generation and active:
+            _decide()
+
+    def _edge_fired(gen: int) -> None:
+        if gen == generation and active:
+            edge_armed_for = -1
+            _decide()
+
+    def _guard(gen: int) -> None:
+        if gen == generation and active:
+            _decide()
+            after GUARD_S: _guard(gen)
+
+    def _kickoff(gen: int) -> None:
+        if gen == generation and active:
+            _decide()
+            after GUARD_S: _guard(gen)
+
+    def _alarm_fired(gen: int) -> None:
+        if gen == generation and active and not alarmed:
+            _decide()
 
     def shutdown() -> None:
         # Releasing the subscriptions here is a separate change.
@@ -427,12 +472,12 @@ actor UpgradeCampaignTransform(path: ttt.Path,
 
         grew = False
         placed_total = 0
+        next_edge = -1
+        crossings: list[(int, int)] = []
         for win in plan_layout:
             wstart = win.1
             wend = win.2
             placed_total += len(win.3)
-            if t < wstart or t >= wend:
-                continue
             inflight = 0
             waiting = []
             for entry in win.3:
@@ -441,6 +486,15 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                         inflight += 1
                 else:
                     waiting.append(entry.0)
+            if len(waiting) > 0 and wend != OPEN_END and t < wend:
+                crossings.append((wend, len(waiting)))
+            if wstart > t and len(waiting) > 0:
+                # A window opening is plain arithmetic in time: arm a
+                # timer for it instead of polling toward it.
+                if next_edge < 0 or wstart < next_edge:
+                    next_edge = wstart
+            if t < wstart or t >= wend:
+                continue
             n_new = fs.launch_count(len(waiting), inflight, observed_s, wend - t,
                                     target_c, max_c, rung, 1000000)
             idx = 0
@@ -453,14 +507,38 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         if grew:
             update_dynstate(y_0.software__software__upgrade_campaign__dynstate(
                 released=sorted(list(released))))
+        if next_edge >= 0 and next_edge != edge_armed_for:
+            edge_armed_for = next_edge
+            gen = generation
+            delay = float(next_edge - t)
+            after delay: _edge_fired(gen)
+        if not alarmed:
+            # So is the moment a window stops being makeable: arm the
+            # alarm for the projected crossing rather than waiting for
+            # the next completion to reveal it.
+            t_alarm = -1
+            sf_now = 0
+            for c in crossings:
+                g_need = fs.ceil_div(c.1, max_c)
+                t_need = (g_need - 1) * observed_s + (observed_s * 12) // 10
+                t_x = c.0 - t_need + 1
+                if t_x <= t:
+                    sf_now += fs.shortfall(c.1, observed_s, c.0 - t, max_c)
+                elif t_alarm < 0 or t_x < t_alarm:
+                    t_alarm = t_x
+            if sf_now > 0:
+                alarmed = True
+                controller_alarms.append("{sf_now} device(s) cannot make their "
+                                         + "window even at max concurrency - deferral projected")
+                publish()
+            elif t_alarm >= 0 and t_alarm != alarm_armed_for:
+                alarm_armed_for = t_alarm
+                gen = generation
+                delay = float(t_alarm - t)
+                after delay: _alarm_fired(gen)
         if placed_total > 0 and len(done_at) >= placed_total:
-            ticking = False
-
-    def _tick() -> None:
-        if not ticking:
-            return
-        _decide()
-        after CONTROL_TICK_S: _tick()
+            active = False
+            generation += 1
 
     def on_conf(conf: y_0.software__software__upgrade_campaign_entry, linked: ygdata.Node) -> None:
         ms = []
@@ -489,13 +567,21 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             observed_s = EST_S
             rung = 1
             rung_target = 1
+            alarmed = False
+            controller_alarms = []
         running = run_now
+        # New intent invalidates every armed timer; the kickoff re-arms
+        # what the fresh layout needs.
+        generation += 1
+        debounce_armed = False
+        edge_armed_for = -1
+        alarm_armed_for = -1
         if running and paced:
-            if not ticking:
-                ticking = True
-                after 0.0: _tick()
+            active = True
+            gen = generation
+            after 0.0: _kickoff(gen)
         else:
-            ticking = False
+            active = False
         publish()
 
         if lower_tree_provider is not None and subscriptions is None:
@@ -509,6 +595,6 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             want: set[ygdata.Delivery] = set()
             if len(members) > 0:
                 want.add(destination!.deliver({
-                    ygdata.SubscriptionSpec(None, period=0.25),
+                    ygdata.SubscriptionSpec(None, on_change=True),
                 }))
             subscriptions!.declare(want)
