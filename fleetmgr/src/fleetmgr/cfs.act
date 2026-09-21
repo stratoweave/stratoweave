@@ -4,6 +4,7 @@ import yang.gdata as ygdata
 import stratoweave.ttt as ttt
 
 import stratoweave.fleet_sched as fs
+import stratoweave.fleet_sched_sim as fsim
 
 import fleetmgr.layers.base_0 as base
 import fleetmgr.layers.y_0 as y_0
@@ -148,6 +149,16 @@ EST_S = 4
 # beyond any campaign, still well inside uint32.
 OPEN_END = 315360000
 
+# A completion arms the debounce timer; telemetry landing while it is armed
+# joins the same batch, and the timer firing decides once. Every decision
+# write costs a recompute, so batching is what keeps a running campaign
+# cheap.
+DEBOUNCE_S = 2.0
+
+# Liveness backstop: with no completions there are no events, and a stuck
+# device must still be reconsidered now and then.
+GUARD_S = 30.0
+
 
 def plan_campaign(i: y_0.software__software__upgrade_campaign_entry) -> (list[(str, int, int, list[(str, int)])], list[str]):
     """Plan the campaign into its windows at the rate the deadline demands.
@@ -236,6 +247,15 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry) -> (list[(s
     for a in r.alarms:
         alarms.append(a)
 
+    # Estimated starts come from the controller's own logic: simulate each
+    # window on estimate, with target and max concurrency derived exactly
+    # as the live controller derives them. Prediction and execution then
+    # disagree only where reality disagrees with the estimate.
+    tr = int(i.target_rate)
+    pred_target = imax(1, fs.ceil_div(tr * EST_S, 3600)) if tr > 0 else 1
+    mr = int(i.max_rate)
+    pred_max = imax(pred_target, fs.ceil_div(mr * EST_S, 3600)) if mr > 0 else 1000000
+
     layout: list[(str, int, int, list[(str, int)])] = []
     for we in wins:
         placed: list[str] = []
@@ -244,17 +264,20 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry) -> (list[(s
                 if a.schedule == we.0 and a.start == we.1:
                     placed.append(a.device)
         if len(placed) > 0:
-            wdur = we.2 - we.1
-            # An open window has no duration to spread estimates over;
-            # space them at the planned rate instead.
-            spacing = 3600 // rate if rate > 0 else EST_S
+            pcamp = fs.Campaign(i.name, [we.0], pred_target, pred_max, 1, 2, 0,
+                                "spread", admin_state="run")
+            pred = fsim.simulate_window(len(placed), EST_S, EST_S,
+                                        fs.Window(we.0, we.1, we.2, 1000000),
+                                        pcamp, 1, int(DEBOUNCE_S))
             devs: list[(str, int)] = []
             idx = 0
             for d in placed:
-                if we.2 == OPEN_END:
-                    devs.append((d, we.1 + idx * spacing))
+                if idx < len(pred.launch_offsets):
+                    devs.append((d, pred.launch_offsets[idx]))
                 else:
-                    devs.append((d, we.1 + idx * wdur // len(placed)))
+                    # The core placed it, but the ramp cannot reach it
+                    # before the window closes: show it at the close.
+                    devs.append((d, we.2))
                 idx += 1
             layout.append((we.0, we.1, we.2, devs))
     return (layout, alarms)
@@ -295,16 +318,6 @@ class UpgradeCampaign(base.UpgradeCampaign):
 def imax(a: int, b: int) -> int:
     return a if a > b else b
 
-
-# A completion arms the debounce timer; telemetry landing while it is armed
-# joins the same batch, and the timer firing decides once. Every decision
-# write costs a recompute, so batching is what keeps a running campaign
-# cheap.
-DEBOUNCE_S = 2.0
-
-# Liveness backstop: with no completions there are no events, and a stuck
-# device must still be reconsidered now and then.
-GUARD_S = 30.0
 
 
 actor UpgradeCampaignTransform(path: ttt.Path,
