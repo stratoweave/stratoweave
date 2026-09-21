@@ -174,9 +174,9 @@ def estimated_duration(i: y_0.software__software__upgrade_campaign_entry,
     # Estimates are at least a second each, so the average is too.
     return fs.ceil_div(total, n) if n > 0 else 1
 
-# End offset of a window that never closes. Ten years in seconds: far
-# beyond any campaign, still well inside uint32.
-OPEN_END = 315360000
+# End of a window that never closes: the year 2100 as seconds since the
+# Unix epoch, far beyond any campaign.
+OPEN_END = 4102444800
 
 def campaign_debounce_s(devices: int) -> float:
     # Keep demos quick while limiting full campaign publishes at scale.
@@ -188,8 +188,45 @@ def campaign_debounce_s(devices: int) -> float:
     return debounce
 
 
+_DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
+
+# How far ahead the planner generates window occurrences. Nine days
+# covers a weekly rule with margin; longer recurrences come later.
+HORIZON_DAYS = 9
+
+
+def occurrences(sched: y_0.maintenance__schedules__schedule_entry, now: int) -> list[(int, int)]:
+    """The schedule's absolute window occurrences over the horizon, as
+    seconds since the Unix epoch: each rule opens at its local time of
+    day on its listed weekdays, every day when none are listed. A window
+    already open now is included; a closed one is not."""
+    out: list[(int, int)] = []
+    off = int(sched.utc_offset) * 60
+    local_now = now + off
+    day0 = local_now - local_now % 86400
+    for w in sched.window:
+        at = int(w.at)
+        dur = int(w.duration)
+        days: list[int] = []
+        for d in w.day:
+            if d in _DAYS:
+                days.append(_DAYS[d])
+        for k in range(HORIZON_DAYS):
+            local_day = day0 + k * 86400
+            if len(days) > 0:
+                # 1970-01-01 was a Thursday; monday is day zero here.
+                wd = (local_day // 86400 + 3) % 7
+                if wd not in days:
+                    continue
+            start = local_day + at - off
+            if start + dur <= now:
+                continue
+            out.append((start, start + dur))
+    return sorted(out)
+
+
 def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
-                  inventory: y_0.root) -> (list[(str, int, int, list[(str, int, int)])], list[str]):
+                  inventory: y_0.root, now: int) -> (list[(str, int, int, list[(str, int, int)])], list[str]):
     """Plan the campaign into its windows at the rate the deadline demands.
 
     A campaign without windows gets one synthetic window that opens at
@@ -253,9 +290,9 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
     for sname in referenced:
         sched = inventory.schedules.schedule.get(sname)
         if sched is not None:
-            for w in sched.window:
-                wstart = int(w.start)
-                wend = wstart + int(w.duration)
+            for we in occurrences(sched, now):
+                wstart = we.0
+                wend = we.1
                 if deadline > 0:
                     # The deadline cuts off the window supply.
                     if wstart >= deadline:
@@ -272,7 +309,7 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
 
     available = 0
     for we in wins:
-        available += we.2 - we.1
+        available += we.2 - imax(we.1, now)
     # The planner keeps a margin; plan the rate against what it will use.
     usable = available * 95 // 100
     needed = 0
@@ -281,7 +318,7 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
         # The rate the deadline demands, with the ramp-up inverted rather
         # than assumed away: the smallest concurrency whose waves finish
         # the fleet within the windows, converted back to a rate.
-        spans = [(we.2 - we.1) * 95 // 100 for we in wins]
+        spans = [(we.2 - imax(we.1, now)) * 95 // 100 for we in wins]
         needed_c = fs.needed_concurrency(spans, n, estimate, int(campaign_debounce_s(n)))
         needed = fs.ceil_div(needed_c * 3600, estimate)
     rate = needed
@@ -330,8 +367,10 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
             pcamp = fs.Campaign(i.name, [we.0], pred_target, pred_max, 1, 2, 0,
                                 "spread", admin_state="run")
             durations = [est_of.get_def(d, estimate) for d in placed]
+            # A window already open predicts from now, not from its past
+            # opening.
             pred = fsim.simulate_window(len(placed), estimate, estimate,
-                                        fs.Window(we.0, we.1, we.2, 1000000),
+                                        fs.Window(we.0, imax(we.1, now), we.2, 1000000),
                                         pcamp, 1, int(campaign_debounce_s(n)),
                                         durations=durations,
                                         target_rate=tr, max_rate=mr)
@@ -374,13 +413,14 @@ class Schedules(base.Schedules):
 
 class UpgradeCampaign(base.UpgradeCampaign):
     def transform(self, i, linked, dynstate):
-        """Plan through the scheduling core and actuate the released layout.
+        """Actuate exactly the released set.
 
-        Every campaign is paced: the companion actor decides which planned
-        devices are released and writes the decision as dynstate, and this
-        function actuates exactly that set - a device never starts before
-        the controller says so. The actor publishes the same layout under
-        state as the plan.
+        Every campaign is paced: the companion actor plans against the
+        clock, decides which placed devices are released, and writes the
+        decision as dynstate. The released list is the whole decision,
+        so this function stays pure and needs no clock: it actuates the
+        released members and nothing else - a device never starts before
+        the controller says so.
         """
         o = base.o_root()
         released: set[str] = set()
@@ -389,18 +429,16 @@ class UpgradeCampaign(base.UpgradeCampaign):
                 released.add(name)
         if i.admin_state == "run":
             inventory = y_0.root.from_gdata(linked)
-            layout, alarms = plan_campaign(i, inventory)
-            for win in layout:
-                for entry in win.3:
-                    if entry.0 not in released:
-                        continue
-                    fleet_device = inventory.fleet.device.get(entry.0)
-                    if fleet_device is not None:
-                        dev = o.rfs.create(fleet_device.shard).device.create(entry.0)
-                        dev.software.target_release = i.target_release
-                        dev.software.upgrade_campaign = i.name
-                        dev.software.image_url = i.image_url
-                        dev.software.allow_staging = i.allow_staging
+            for member in i.device:
+                if member.name not in released:
+                    continue
+                fleet_device = inventory.fleet.device.get(member.name)
+                if fleet_device is not None:
+                    dev = o.rfs.create(fleet_device.shard).device.create(member.name)
+                    dev.software.target_release = i.target_release
+                    dev.software.upgrade_campaign = i.name
+                    dev.software.image_url = i.image_url
+                    dev.software.allow_staging = i.allow_staging
         return o
 
 
@@ -436,7 +474,6 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var debounce_s = campaign_debounce_s(0)
     var alarmed = False
     var controller_alarms: list[str] = []
-    var anchor: ?time.Instant = None
     var released: set[str] = set()
     var released_at: dict[str, int] = {}
     var done_at: dict[str, int] = {}
@@ -534,13 +571,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         """Note completions, release what fits, and arm the next event."""
         if gen != generation or not active:
             return
-        a = anchor
-        if a is None:
-            return
         debounce_armed = False
         generation += 1
         next_gen = generation
-        t = int(time.monotonic().since(a!).to_float())
+        t = time.time().unix_s()
 
         for name in released:
             if name not in done_at:
@@ -639,7 +673,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         debounce_s = campaign_debounce_s(len(members))
 
         inventory = y_0.root.from_gdata(linked)
-        layout, alarms = plan_campaign(conf, inventory)
+        layout, alarms = plan_campaign(conf, inventory, time.time().unix_s())
         plan_layout = layout
         plan_alarms = alarms
 
@@ -651,8 +685,6 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         paced = len(plan_layout) > 0
         run_now = conf.admin_state == "run"
         if run_now and not running:
-            # The window clock starts when the campaign starts.
-            anchor = time.monotonic()
             released = set()
             released_at = {}
             done_at = {}
