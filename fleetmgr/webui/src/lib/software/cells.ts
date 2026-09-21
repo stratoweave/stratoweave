@@ -3,6 +3,8 @@
 
 import type { KnownStatus } from './model';
 
+// Grey is kept free for devices that were unreachable from the start, a
+// status the model does not carry yet.
 export const CELL_COLOR: Record<KnownStatus, string> = {
   pending: '#1d2c49',
   unknown: '#1d2c49',
@@ -11,7 +13,7 @@ export const CELL_COLOR: Record<KnownStatus, string> = {
   'in-progress': '#22d3ee',
   succeeded: '#16a34a',
   failed: '#ef4444',
-  'rolled-back': '#94a3b8'
+  'rolled-back': '#991b1b'
 };
 
 /** The gutter between cells; also the grid background. */
