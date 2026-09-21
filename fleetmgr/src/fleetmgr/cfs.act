@@ -3,6 +3,8 @@ import yang.adata as yadata
 import yang.gdata as ygdata
 import stratoweave.ttt as ttt
 
+import stratoweave.adapters.software_iosxe as sw_iosxe
+import stratoweave.adapters.software_mock as sw_mock
 import stratoweave.fleet_sched as fs
 import stratoweave.fleet_sched_sim as fsim
 
@@ -144,8 +146,33 @@ class Device(base.Device):
         return o
 
 
-# Mock installs take 1-4s; the planner sizes window concurrency from this.
-EST_S = 4
+def device_estimate(dev: ?y_0.fleetmgr__fleet__device_entry) -> int:
+    """Estimated upgrade duration for one device, from the adapter that
+    will run it: the configured mock duration when the device is mocked,
+    the adapter's nominal figure otherwise. Controllers correct this
+    from observation; planning starts here."""
+    if dev is not None:
+        if dev.mock.enabled:
+            dur = dev.mock.software.upgrade_duration
+            if dur is not None and int(dur) > 0:
+                return int(dur)
+            return sw_mock.MockSoftwareAdapter.plan_estimate()
+    # The IOS XE adapter is the only real one today.
+    return sw_iosxe.IosXeSoftwareAdapter.plan_estimate()
+
+
+def estimated_duration(i: y_0.software__software__upgrade_campaign_entry,
+                       inventory: y_0.root) -> int:
+    """The average estimated upgrade duration over the campaign's
+    members, in seconds. The rates convert to concurrency through it,
+    and the observed duration starts from it."""
+    total = 0
+    n = 0
+    for member in i.device:
+        total += device_estimate(inventory.fleet.device.get(member.name))
+        n += 1
+    # Estimates are at least a second each, so the average is too.
+    return fs.ceil_div(total, n) if n > 0 else 1
 
 # End offset of a window that never closes. Ten years in seconds: far
 # beyond any campaign, still well inside uint32.
@@ -161,7 +188,8 @@ def campaign_debounce_s(devices: int) -> float:
     return debounce
 
 
-def plan_campaign(i: y_0.software__software__upgrade_campaign_entry) -> (list[(str, int, int, list[(str, int)])], list[str]):
+def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
+                  inventory: y_0.root) -> (list[(str, int, int, list[(str, int, int)])], list[str]):
     """Plan the campaign into its windows at the rate the deadline demands.
 
     A campaign without windows gets one synthetic window that opens at
@@ -182,8 +210,12 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry) -> (list[(s
     the same layout as the plan, so both views come from one computation.
     """
     devices = []
+    est_of: dict[str, int] = {}
     for member in i.device:
-        devices.append(fs.DeviceIn(member.name, "cpe", None, [], [], EST_S, True))
+        est = device_estimate(inventory.fleet.device.get(member.name))
+        est_of[member.name] = est
+        devices.append(fs.DeviceIn(member.name, "cpe", None, [], [], est, True))
+    estimate = estimated_duration(i, inventory)
     n = len(devices)
     if n == 0:
         return ([], [])
@@ -223,20 +255,29 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry) -> (list[(s
     # The planner keeps a margin; plan the rate against what it will use.
     usable = available * 95 // 100
     needed = 0
-    if deadline > 0 and usable > 0:
-        needed = fs.ceil_div(n * 3600, usable)
+    needed_c = 0
+    if deadline > 0:
+        # The rate the deadline demands, with the ramp-up inverted rather
+        # than assumed away: the smallest concurrency whose waves finish
+        # the fleet within the windows, converted back to a rate.
+        spans = [(we.2 - we.1) * 95 // 100 for we in wins]
+        needed_c = fs.needed_concurrency(spans, n, estimate, int(campaign_debounce_s(n)))
+        needed = fs.ceil_div(needed_c * 3600, estimate)
     rate = needed
     if target > rate:
         rate = target
     if cap > 0 and rate > cap:
         rate = cap
-        if needed > cap:
+        # Rates quantize to whole devices in flight, so the shortfall
+        # test happens in concurrency, not in rates.
+        max_c = imax(1, fs.ceil_div(cap * estimate, 3600))
+        if needed_c > max_c:
             alarms.append("deadline needs {needed} devices/hour but max-rate "
                           + "is {cap}; not all devices will be placed in time")
     if rate == 0:
         rate = fs.ceil_div(n * 3600, usable) if usable > 0 else n * 3600
 
-    conc = imax(1, fs.ceil_div(rate * EST_S, 3600))
+    conc = imax(1, fs.ceil_div(rate * estimate, 3600))
 
     ordered = sorted([(we.1, we.0, we.2) for we in wins])
     fwins = []
@@ -253,11 +294,11 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry) -> (list[(s
     # as the live controller derives them. Prediction and execution then
     # disagree only where reality disagrees with the estimate.
     tr = int(i.target_rate)
-    pred_target = imax(1, fs.ceil_div(tr * EST_S, 3600)) if tr > 0 else 1
+    pred_target = imax(1, fs.ceil_div(tr * estimate, 3600)) if tr > 0 else 1
     mr = int(i.max_rate)
-    pred_max = imax(pred_target, fs.ceil_div(mr * EST_S, 3600)) if mr > 0 else 1000000
+    pred_max = imax(pred_target, fs.ceil_div(mr * estimate, 3600)) if mr > 0 else 1000000
 
-    layout: list[(str, int, int, list[(str, int)])] = []
+    layout: list[(str, int, int, list[(str, int, int)])] = []
     for we in wins:
         placed: list[str] = []
         for a in r.assigns:
@@ -267,20 +308,34 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry) -> (list[(s
         if len(placed) > 0:
             pcamp = fs.Campaign(i.name, [we.0], pred_target, pred_max, 1, 2, 0,
                                 "spread", admin_state="run")
-            pred = fsim.simulate_window(len(placed), EST_S, EST_S,
+            durations = [est_of.get_def(d, estimate) for d in placed]
+            pred = fsim.simulate_window(len(placed), estimate, estimate,
                                         fs.Window(we.0, we.1, we.2, 1000000),
-                                        pcamp, 1, int(campaign_debounce_s(n)))
-            devs: list[(str, int)] = []
+                                        pcamp, 1, int(campaign_debounce_s(n)),
+                                        durations=durations)
+            devs: list[(str, int, int)] = []
             idx = 0
             for d in placed:
                 if idx < len(pred.launch_offsets):
-                    devs.append((d, pred.launch_offsets[idx]))
+                    devs.append((d, pred.launch_offsets[idx], est_of.get_def(d, estimate)))
                 else:
                     # The core placed it, but the ramp cannot reach it
                     # before the window closes: show it at the close.
-                    devs.append((d, we.2))
+                    devs.append((d, we.2, est_of.get_def(d, estimate)))
                 idx += 1
             layout.append((we.0, we.1, we.2, devs))
+
+    # Devices the core placed but the ramp cannot reach before their
+    # window closes are shown at the close; say so out loud too.
+    overflow = 0
+    for win in layout:
+        if win.2 != OPEN_END:
+            for entry in win.3:
+                if entry.1 >= win.2:
+                    overflow += 1
+    if overflow > 0:
+        alarms.append("{overflow} device(s) will not complete before their "
+                      + "window closes at the planned rate")
     return (layout, alarms)
 
 
@@ -301,7 +356,7 @@ class UpgradeCampaign(base.UpgradeCampaign):
                 released.add(name)
         if i.admin_state == "run":
             inventory = y_0.root.from_gdata(linked)
-            layout, alarms = plan_campaign(i)
+            layout, alarms = plan_campaign(i, inventory)
             for win in layout:
                 for entry in win.3:
                     if entry.0 not in released:
@@ -339,7 +394,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var latest: dict[str, (rfs_name: str, state: FlotillaDeviceStatus)] = {}
     var subscriptions: ?ygdata.SubscriptionManager = None
     var subscriptions_synced = False
-    var plan_layout: list[(str, int, int, list[(str, int)])] = []
+    var plan_layout: list[(str, int, int, list[(str, int, int)])] = []
     var plan_alarms: list[str] = []
     var running = False
     var active = False
@@ -352,7 +407,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var released: set[str] = set()
     var released_at: dict[str, int] = {}
     var done_at: dict[str, int] = {}
-    var observed_s: int = EST_S
+    var observed_s: int = 1
     var rung: int = 1
     var rung_target: int = 1
     var target_c: int = 1
@@ -398,7 +453,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             for entry in pw.3:
                 pd = win.device.create(entry.0)
                 pd.estimated_start = u64(entry.1)
-                pd.estimated_duration = u64(EST_S)
+                pd.estimated_duration = u64(entry.2)
         for alarm in plan_alarms:
             st.plan.alarm.append(alarm)
         for alarm in controller_alarms:
@@ -544,15 +599,18 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         member_names = names
         debounce_s = campaign_debounce_s(len(members))
 
-        layout, alarms = plan_campaign(conf)
+        inventory = y_0.root.from_gdata(linked)
+        layout, alarms = plan_campaign(conf, inventory)
         plan_layout = layout
         plan_alarms = alarms
 
-        # Concurrency the controller may spend, derived from the rates.
+        # Concurrency the controller may spend: the rates convert through
+        # the same estimate the plan was made with.
+        estimate = estimated_duration(conf, inventory)
         tr = int(conf.target_rate)
-        target_c = imax(1, fs.ceil_div(tr * EST_S, 3600)) if tr > 0 else 1
+        target_c = imax(1, fs.ceil_div(tr * estimate, 3600)) if tr > 0 else 1
         mr = int(conf.max_rate)
-        max_c = imax(target_c, fs.ceil_div(mr * EST_S, 3600)) if mr > 0 else 1000000
+        max_c = imax(target_c, fs.ceil_div(mr * estimate, 3600)) if mr > 0 else 1000000
 
         paced = len(plan_layout) > 0
         run_now = conf.admin_state == "run"
@@ -562,7 +620,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             released = set()
             released_at = {}
             done_at = {}
-            observed_s = EST_S
+            observed_s = estimated_duration(conf, y_0.root.from_gdata(linked))
             rung = 1
             rung_target = 1
             alarmed = False

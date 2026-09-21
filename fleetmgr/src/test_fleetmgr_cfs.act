@@ -352,19 +352,22 @@ def _paced_campaign(names: list[str]) -> InputCampaign:
     return campaign
 
 
-def _flat_inventory(names: list[str]) -> y_0.root:
+def _flat_inventory(names: list[str], upgrade_duration: ?int = None) -> y_0.root:
     linked = y_0.root()
     for name in names:
-        linked.fleet.device.create(
+        dev = linked.fleet.device.create(
             name,
             type="iosxe",
             shard="flotilla-1",
             credentials=InputCredentials(username="admin"),
         )
+        dev.mock.enabled = True
+        if upgrade_duration is not None:
+            dev.mock.software.upgrade_duration = u64(upgrade_duration)
     return linked
 
 
-def _window_names(layout: list[(str, int, int, list[(str, int)])], window: str) -> list[str]:
+def _window_names(layout: list[(str, int, int, list[(str, int, int)])], window: str) -> list[str]:
     names = []
     for win in layout:
         if win.0 == window:
@@ -384,7 +387,7 @@ actor _test_campaign_without_windows_gets_default_window(t: testing.AsyncT):
         admin_state="run",
     )
     campaign.device.create("cpe-1")
-    layout, alarms = cfs.plan_campaign(campaign)
+    layout, alarms = cfs.plan_campaign(campaign, linked)
     testing.assertEqual(_window_names(layout, "default"), ["cpe-1"], None)
     out = cfs.UpgradeCampaign().transform(campaign, linked.to_gdata(), None)
     o: y_1.root = y_1.root.from_gdata(out.to_gdata())
@@ -413,7 +416,7 @@ actor _test_campaign_deadline_without_windows_plans(t: testing.AsyncT):
     )
     for name in ["d1", "d2"]:
         campaign.device.create(name)
-    layout, alarms = cfs.plan_campaign(campaign)
+    layout, alarms = cfs.plan_campaign(campaign, _flat_inventory(["d1", "d2"]))
     testing.assertEqual(_window_names(layout, "default"), ["d1", "d2"], None)
     testing.assertEqual(len(alarms), 0, "a meetable deadline must not alarm")
     for win in layout:
@@ -425,7 +428,7 @@ actor _test_campaign_plan_state_plans_without_actuating(t: testing.AsyncT):
     """In plan admin-state the layout exists and nothing is emitted."""
     campaign = _paced_campaign(["cpe-1", "cpe-2"])
     campaign.admin_state = "plan"
-    layout, alarms = cfs.plan_campaign(campaign)
+    layout, alarms = cfs.plan_campaign(campaign, _flat_inventory(["cpe-1", "cpe-2"]))
     testing.assertEqual(_window_names(layout, "window"), ["cpe-1", "cpe-2"], None)
     out = cfs.UpgradeCampaign().transform(campaign, _flat_inventory(["cpe-1", "cpe-2"]).to_gdata(), None)
     o: y_1.root = y_1.root.from_gdata(out.to_gdata())
@@ -467,7 +470,7 @@ actor _test_campaign_full_release_actuates_all(t: testing.AsyncT):
     t.success()
 
 
-def _render_layout(header: str, layout: list[(str, int, int, list[(str, int)])],
+def _render_layout(header: str, layout: list[(str, int, int, list[(str, int, int)])],
                    alarms: list[str]) -> str:
     """The materialized layout as the review artefact: per window, each
     device with its estimated start offset."""
@@ -476,6 +479,15 @@ def _render_layout(header: str, layout: list[(str, int, int, list[(str, int)])],
         wend = "open" if win.2 == cfs.OPEN_END else "+{win.2}s"
         lines.append("")
         lines.append("window {win.0}: +{win.1}s to {wend}")
+        counts: dict[int, int] = {}
+        for entry in win.3:
+            counts[entry.2] = counts.get_def(entry.2, 0) + 1
+        mode = 0
+        best = 0
+        for dur, cnt in counts.items():
+            if cnt > best:
+                best = cnt
+                mode = dur
         offset = -1
         names: list[str] = []
         for entry in win.3:
@@ -483,7 +495,9 @@ def _render_layout(header: str, layout: list[(str, int, int, list[(str, int)])],
                 lines.append("  +{offset:4d}s " + " ".join(names))
                 names = []
             offset = entry.1
-            names.append(entry.0)
+            # A device whose duration differs from the window's usual one
+            # is marked, so a mixed fleet is visible in the record.
+            names.append(entry.0 if entry.2 == mode else "{entry.0}({entry.2}s)")
         if len(names) > 0:
             lines.append("  +{offset:4d}s " + " ".join(names))
     for alarm in alarms:
@@ -503,13 +517,14 @@ def _test_snapshot_plan_estimates():
         target_rate=u64(3600),
         max_rate=u64(7200),
     )
+    names = []
     for i in range(10):
         campaign.device.create("dev-{i}")
-    layout, alarms = cfs.plan_campaign(campaign)
-    return _render_layout("10 devices, no windows, target 3600/h, max 7200/h: "
-                          + "4s estimates, 0.1s debounce, ramp to 4 in flight",
+        names.append("dev-{i}")
+    layout, alarms = cfs.plan_campaign(campaign, _flat_inventory(names))
+    return _render_layout("10 mock devices, no windows, target 3600/h, max 7200/h: "
+                          + "4s nominal estimates, ramp to 4 in flight",
                           layout, alarms)
-
 
 def _test_campaign_debounce_scales_with_members():
     testing.assertEqual(cfs.campaign_debounce_s(10), 0.1)
@@ -517,3 +532,110 @@ def _test_campaign_debounce_scales_with_members():
     testing.assertEqual(cfs.campaign_debounce_s(1000), 1.0)
     testing.assertEqual(cfs.campaign_debounce_s(10000), 10.0)
     testing.assertEqual(cfs.campaign_debounce_s(100000), 30.0)
+
+
+def _test_snapshot_plan_estimates_slow_devices():
+    """The same fleet with a configured 8s mock upgrade duration: the
+    estimate comes from the device config, so the rates buy twice the
+    concurrency and the waves stretch to match."""
+    campaign = InputCampaign(
+        name="ramped",
+        target_release="17.18.03a",
+        image_url="https://images.example/xe.bin",
+        admin_state="plan",
+        target_rate=u64(3600),
+        max_rate=u64(7200),
+    )
+    names = []
+    for i in range(10):
+        campaign.device.create("dev-{i}")
+        names.append("dev-{i}")
+    layout, alarms = cfs.plan_campaign(campaign, _flat_inventory(names, upgrade_duration=8))
+    return _render_layout("10 mock devices at a configured 8s duration, "
+                          + "target 3600/h, max 7200/h",
+                          layout, alarms)
+
+
+def _test_snapshot_plan_estimates_mixed_fleet():
+    """Nine quick mocks and one real device: the prediction runs the
+    controller over the true mixture, so the ramp advances on the mock
+    completions and the slow device rides a late wave, marked with its
+    own duration."""
+    campaign = InputCampaign(
+        name="mixed",
+        target_release="17.18.03a",
+        image_url="https://images.example/xe.bin",
+        admin_state="plan",
+        target_rate=u64(3600),
+        max_rate=u64(7200),
+    )
+    linked = _flat_inventory(["dev-{i}" for i in range(9)])
+    real = linked.fleet.device.create(
+        "dev-real", type="iosxe", shard="flotilla-1",
+        credentials=InputCredentials(username="admin"))
+    for i in range(9):
+        campaign.device.create("dev-{i}")
+    campaign.device.create("dev-real")
+    layout, alarms = cfs.plan_campaign(campaign, linked)
+    return _render_layout("nine 4s mocks and one real device at the adapter's "
+                          + "395s nominal, target 3600/h, max 7200/h",
+                          layout, alarms)
+
+
+actor _test_campaign_deadline_honors_ramp_up(t: testing.AsyncT):
+    """A deadline the steady-state division calls makeable but the ramp
+    cannot make: the ramp-aware math alarms, the even-spread math did
+    not."""
+    names = []
+    for i in range(10):
+        names.append("r{i}")
+    campaign = InputCampaign(
+        name="tight",
+        target_release="17.18.03a",
+        image_url="https://images.example/xe.bin",
+        admin_state="plan",
+        deadline=u64(40),
+        max_rate=u64(1350),
+    )
+    for name in names:
+        campaign.device.create(name)
+    layout, alarms = cfs.plan_campaign(campaign, _flat_inventory(names, upgrade_duration=8))
+    found = False
+    for alarm in alarms:
+        if "deadline needs" in alarm:
+            found = True
+    testing.assertEqual(found, True,
+                        "the ramp makes this deadline unmakeable; the plan must say so")
+    t.success()
+
+
+actor _test_campaign_estimate_from_the_adapter(t: testing.AsyncT):
+    """A device without mock config plans at the IOS XE adapter's nominal
+    duration; a mocked one at its configured duration."""
+    linked = y_0.root()
+    real = linked.fleet.device.create(
+        "real-1", type="iosxe", shard="flotilla-1",
+        credentials=InputCredentials(username="admin"))
+    mocked = linked.fleet.device.create(
+        "mock-1", type="iosxe", shard="flotilla-1",
+        credentials=InputCredentials(username="admin"))
+    mocked.mock.enabled = True
+    mocked.mock.software.upgrade_duration = u64(120)
+    campaign = InputCampaign(
+        name="mixed",
+        target_release="17.18.03a",
+        image_url="https://images.example/xe.bin",
+        admin_state="plan",
+    )
+    campaign.device.create("real-1")
+    campaign.device.create("mock-1")
+    layout, alarms = cfs.plan_campaign(campaign, linked)
+    ests: dict[str, int] = {}
+    for win in layout:
+        for entry in win.3:
+            ests[entry.0] = entry.2
+    testing.assertEqual(ests.get_def("real-1", 0), 395,
+                        "a real device plans at the adapter's nominal duration")
+    testing.assertEqual(ests.get_def("mock-1", 0), 120,
+                        "a mocked device plans at its configured duration")
+    t.success()
