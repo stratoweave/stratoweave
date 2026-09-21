@@ -10,7 +10,7 @@
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
   import { RateTracker, formatEta } from '$lib/software/rate';
-  import { formatDuration, formatOffset } from '$lib/software/time';
+  import { formatClock, formatDuration, formatLocalTime } from '$lib/software/time';
   import { nameMatches } from '$lib/software/selection';
   import {
     CAMPAIGN_LIST_ROOT,
@@ -98,8 +98,11 @@
     const schedule = data.schedules.find((s) => s.name === c.defaultSchedule);
     if (!schedule) return `${c.defaultSchedule} (no such schedule)`;
     const windows = schedule.windows
-      .map((w) => `${formatOffset(w.start)} for ${formatDuration(w.duration)}`)
-      .join(', ');
+      .map(
+        (w) =>
+          `${w.days.length > 0 ? w.days.join(',') + ' ' : 'daily '}${formatLocalTime(w.at, schedule.utcOffset)} for ${formatDuration(w.duration)}`
+      )
+      .join(' · ');
     return `${schedule.name}: ${windows || 'no windows'}`;
   });
 
@@ -308,7 +311,7 @@
       <div class="grids-head">
         <h3 class="panel-title">Plan</h3>
         <span class="hint">
-          estimates as offsets from launch · devices are released by the
+          estimates in your local time · devices are released by the
           controller as their window opens
         </span>
       </div>
@@ -345,13 +348,13 @@
                     {openWindow === `${w.schedule}:${w.start}` ? '▾' : '▸'} {w.schedule || 'window'}
                   </button>
                 </td>
-                <td class="mono tn">{formatOffset(w.start)}</td>
-                <td class="mono tn">{w.end === null ? 'open' : formatOffset(w.end)}</td>
+                <td class="mono tn">{formatClock(w.start)}</td>
+                <td class="mono tn">{w.end === null ? 'open' : formatClock(w.end)}</td>
                 <td class="tn right">{w.devices.length.toLocaleString()}</td>
                 <td class="mono tn">
                   {#if first && last}
-                    {formatOffset(first.estimatedStart)}{w.devices.length > 1
-                      ? ` … ${formatOffset(last.estimatedStart)}`
+                    {formatClock(first.estimatedStart)}{w.devices.length > 1
+                      ? ` … ${formatClock(last.estimatedStart)}`
                       : ''}
                   {:else}
                     —
@@ -365,7 +368,7 @@
                       {#each w.devices.slice(0, PLAN_DEVICE_LIMIT) as d (d.name)}
                         <span class="plan-device">
                           <span class="device-name">{d.name}</span>
-                          <span class="mono tn dim">{formatOffset(d.estimatedStart)}</span>
+                          <span class="mono tn dim">{formatClock(d.estimatedStart)}</span>
                         </span>
                       {/each}
                       {#if w.devices.length > PLAN_DEVICE_LIMIT}

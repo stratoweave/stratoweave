@@ -47,16 +47,18 @@ export interface DeviceStatusJson {
   'running-release'?: string;
 }
 
-/** A maintenance window occurrence, as offsets in seconds from launch. */
+/** One recurrence rule of a schedule: a local time of day. */
 export interface WindowJson {
-  start: number;
+  at: number;
   duration: number;
+  day?: string[];
 }
 
 /** A shared /maintenance:schedules object; devices and campaign defaults
  * reference one by name. */
 export interface ScheduleJson {
   name: string;
+  'utc-offset'?: number;
   window?: WindowJson[];
 }
 
@@ -103,7 +105,7 @@ export interface CampaignJson {
   state?: CampaignStateJson;
 }
 
-/** GET data merges every module; this UI reads two of them. */
+/** GET data merges every module; this UI reads three of them. */
 export interface DataTreeJson {
   'fleetmgr:fleet'?: {
     node?: NodeJson[];
@@ -206,28 +208,33 @@ export const DEFAULT_TARGET_RATE = 100;
 export const DEFAULT_MAX_RATE = 500;
 
 export interface MaintenanceWindow {
-  /** Seconds after launch. */
-  start: number;
+  /** Local time of day the window opens, seconds after midnight. */
+  at: number;
   duration: number;
+  /** Weekday names; empty means every day. */
+  days: string[];
 }
 
 /** A parsed shared schedule object. */
 export interface Schedule {
   name: string;
+  /** Minutes east of UTC. */
+  utcOffset: number;
   windows: MaintenanceWindow[];
 }
 
 export interface PlanDevice {
   name: string;
-  /** Seconds after launch; an estimate. */
+  /** Seconds since the Unix epoch; an estimate. */
   estimatedStart: number;
   estimatedDuration: number;
 }
 
 export interface PlanWindow {
   start: number;
-  /** null: the window never closes (a campaign without windows runs
-   * through one synthetic open window, unless a deadline closes it). */
+  /** null: the window never closes (a campaign without schedules runs
+   * through one synthetic always-open window, unless a deadline closes
+   * it). */
   end: number | null;
   schedule: string;
   devices: PlanDevice[];
@@ -251,7 +258,7 @@ export interface Campaign {
    * of its own; empty when the campaign runs through its one synthetic
    * open-ended window. */
   defaultSchedule: string;
-  /** Seconds after launch; null when the campaign has none. */
+  /** Seconds since the Unix epoch; null when the campaign has none. */
   deadline: number | null;
   /** Devices per hour; 0 means no preference / no cap. */
   targetRate: number;
@@ -387,11 +394,12 @@ export function parseSchedules(json: unknown): Schedule[] {
   const tree = (json as DataTreeJson)?.['maintenance:schedules'];
   const schedules = (tree?.schedule ?? []).map((s) => {
     const windows = (s.window ?? []).map((w) => ({
-      start: num(w.start),
-      duration: num(w.duration)
+      at: num(w.at),
+      duration: num(w.duration),
+      days: w.day ?? []
     }));
-    windows.sort((a, b) => a.start - b.start);
-    return { name: s.name, windows };
+    windows.sort((a, b) => a.at - b.at);
+    return { name: s.name, utcOffset: num(s['utc-offset'] ?? 0), windows };
   });
   schedules.sort((a, b) => a.name.localeCompare(b.name));
   return schedules;
@@ -410,10 +418,9 @@ export interface NewCampaign {
   imageUrl: string;
   devices: string[];
   allowStaging?: boolean;
-  /** Saved as a shared schedule object named after the campaign, set as
-   * the campaign's default. */
-  windows?: MaintenanceWindow[];
-  /** Seconds after launch. */
+  /** Name of an existing shared schedule. */
+  defaultSchedule?: string;
+  /** Seconds since the Unix epoch. */
   deadline?: number | null;
   /** Devices per hour; null leaves the model default. */
   targetRate?: number | null;
@@ -438,20 +445,7 @@ export function campaignCreatePatch(input: NewCampaign): CampaignCreatePatchJson
   const imageUrl = input.imageUrl.trim();
   if (imageUrl) entry['image-url'] = imageUrl;
   if (input.allowStaging) entry['allow-staging'] = true;
-  if (input.windows && input.windows.length > 0) {
-    // One transaction creates the schedule object and the campaign that
-    // references it. Named after the campaign, so no shared object is
-    // quietly extended by a PATCH merge.
-    patch['maintenance:schedules'] = {
-      schedule: [
-        {
-          name,
-          window: input.windows.map((w) => ({ start: w.start, duration: w.duration }))
-        }
-      ]
-    };
-    entry['default-schedule'] = name;
-  }
+  if (input.defaultSchedule) entry['default-schedule'] = input.defaultSchedule;
   if (input.deadline != null) entry.deadline = input.deadline;
   if (input.targetRate != null) entry['target-rate'] = input.targetRate;
   if (input.maxRate != null) entry['max-rate'] = input.maxRate;
