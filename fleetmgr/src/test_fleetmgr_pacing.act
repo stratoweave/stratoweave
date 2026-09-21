@@ -208,3 +208,194 @@ actor _test_controller_pacing(t: testing.EnvT):
     def run(size: int, client: http.Client, done: action(?Exception) -> None) -> None:
         PacingRollout(size, client, done)
     test_scale.FleetMgrTest(t, run)
+
+
+actor ScheduledRollout(size: int, client: http.Client, done: action(?Exception) -> None):
+    """Two schedules: half the fleet is bound to a window that opens
+    thirty seconds after launch, and must not start before it does."""
+    path = "/restconf/data/software:software/upgrade-campaign=windows"
+    n = 10
+    later_from = 30
+    var polls = 0
+    var plan_tries = 0
+    var later_started_at = -1.0
+    var first_started = 0
+
+    def parse_rows(body: str) -> ?(int, int, list[str]):
+        """(succeeded, failed, names of devices seen started)."""
+        data = json.decode(body)
+        if isinstance(data, dict):
+            campaigns = data.get("software:upgrade-campaign")
+            if isinstance(campaigns, list) and len(campaigns) == 1:
+                campaign = campaigns[0]
+                if isinstance(campaign, dict):
+                    state = campaign.get("state")
+                    if isinstance(state, dict):
+                        ok = 0
+                        bad = 0
+                        v = state.get("succeeded")
+                        if isinstance(v, int):
+                            ok = v
+                        v = state.get("failed")
+                        if isinstance(v, int):
+                            bad = v
+                        started: list[str] = []
+                        rows = state.get("device-status")
+                        if isinstance(rows, list):
+                            for row in rows:
+                                if isinstance(row, dict):
+                                    st = row.get("status")
+                                    name = row.get("device")
+                                    if isinstance(st, str) and isinstance(name, str):
+                                        if st == "in-progress" or st == "succeeded":
+                                            started.append(name)
+                        return (ok, bad, started)
+        return None
+
+    def is_later(name: str) -> bool:
+        # device-5 through device-9 are bound to the later schedule.
+        for i in range(5, 10):
+            if name == test_scale.device_name(i):
+                return True
+        return False
+
+    def watched(client: http.Client, response: http.Response) -> None:
+        if response.status != 200:
+            done(test_scale.status_error(response, 200))
+            return
+        parsed = parse_rows(response.body.decode())
+        if parsed is not None:
+            ok = parsed.0
+            bad = parsed.1
+            if bad > 0:
+                done(ValueError("{bad} device(s) failed"))
+                return
+            t = float(polls) * 0.5
+            for name in parsed.2:
+                if is_later(name):
+                    if later_started_at < 0.0:
+                        later_started_at = t
+                elif first_started == 0:
+                    first_started = len(parsed.2)
+            if later_started_at >= 0.0 and later_started_at < float(later_from) - 5.0:
+                done(ValueError("a bound device started {later_started_at}s after "
+                                + "launch, before its window at {later_from}s"))
+                return
+            if ok == n:
+                if later_started_at < 0.0:
+                    done(ValueError("the later window's devices never started"))
+                elif first_started > 2:
+                    done(ValueError("first release was {first_started} devices at once"))
+                else:
+                    print("schedules: later window opened at {later_started_at}s "
+                          + "(bound at {later_from}s), {ok} of {n} succeeded")
+                    done(None)
+                return
+            polls += 1
+            if polls > 360:
+                done(ValueError("rollout did not complete: {ok} of {n}"))
+                return
+            after 0.5: watch()
+        else:
+            done(ValueError("invalid campaign status: " + response.body.decode()))
+
+    def watch() -> None:
+        client.get(path, watched, {"Accept": "application/yang-data+json"})
+
+    def running(client: http.Client, response: http.Response) -> None:
+        if response.status not in {200, 201, 204}:
+            done(test_scale.status_error(response, 204))
+            return
+        watch()
+
+    def campaign_payload(admin: str) -> bytes:
+        return json.encode({"software:upgrade-campaign": [{
+            "name": "windows",
+            "target-release": "17.18.03a",
+            "image-url": "scp://admin:admin@127.0.0.1:/images/c8000v-universalk9.17.18.03a.SPA.bin",
+            "target-rate": 3600,
+            "max-rate": 7200,
+            "default-schedule": "first",
+            "device": [{"name": test_scale.device_name(i)} for i in range(n)],
+            "admin-state": admin,
+        }]}).encode()
+
+    def run_campaign() -> None:
+        client.put(path, campaign_payload("run"), running,
+                   {"Content-Type": "application/yang-data+json", "async": "true"})
+
+    def planned(client: http.Client, response: http.Response) -> None:
+        if response.status != 200:
+            done(test_scale.status_error(response, 200))
+            return
+        parsed = parse_rows(response.body.decode())
+        if parsed is not None and len(parsed.2) == 0:
+            print("schedules: plan ok, nothing started")
+            run_campaign()
+            return
+        plan_tries += 1
+        if plan_tries > 20:
+            done(ValueError("devices started while still in plan"))
+            return
+        after 0.25: check_plan()
+
+    def check_plan() -> None:
+        client.get(path, planned, {"Accept": "application/yang-data+json"})
+
+    def created(client: http.Client, response: http.Response) -> None:
+        if response.status == 201:
+            check_plan()
+        else:
+            done(test_scale.status_error(response, 201))
+
+    def devices_added(client: http.Client, response: http.Response) -> None:
+        if response.status != 201:
+            done(test_scale.status_error(response, 201))
+            return
+        client.put(path, campaign_payload("plan"), created,
+                   {"Content-Type": "application/yang-data+json"})
+
+    def schedules_added(client: http.Client, response: http.Response) -> None:
+        if response.status not in {200, 201, 204}:
+            done(test_scale.status_error(response, 201))
+            return
+        devices = []
+        for i in range(n):
+            name = test_scale.device_name(i)
+            entry = {
+                "name": name,
+                "type": "iosxe",
+                "description": "Windows {name}",
+                "shard": "flotilla-{i % test_scale.FLOTILLAS + 1}",
+                "credentials": {"username": "admin", "password": "admin"},
+                "mock": {"enabled": True, "software": {"upgrade-duration": 8}},
+            }
+            if i >= 5:
+                entry["schedule"] = "later"
+            devices.append(entry)
+        payload = json.encode({"fleetmgr:fleet": {"device": devices}}).encode()
+        client.post("/restconf/data", payload, devices_added,
+                    {"Content-Type": "application/yang-data+json"})
+
+    def add_schedules() -> None:
+        # Asked for asynchronously: the schedules container is linked by
+        # campaigns and its transaction can apply without answering, the
+        # same open engine bug the run flip works around. The engine
+        # serializes transactions, so the devices that reference the
+        # schedules still commit after them.
+        payload = json.encode({"maintenance:schedules": {"schedule": [
+            {"name": "first", "window": [{"start": 0, "duration": 3600}]},
+            {"name": "later", "window": [{"start": later_from, "duration": 3600}]},
+        ]}}).encode()
+        client.put("/restconf/data/maintenance:schedules", payload, schedules_added,
+                   {"Content-Type": "application/yang-data+json", "async": "true"})
+
+    add_schedules()
+
+
+actor _test_schedule_windows(t: testing.EnvT):
+    """Nothing starts before its schedule's window opens."""
+    t.require("fleetmgr-system")
+    def run(size: int, client: http.Client, done: action(?Exception) -> None) -> None:
+        ScheduledRollout(size, client, done)
+    test_scale.FleetMgrTest(t, run)
