@@ -41,10 +41,17 @@ class SimResult(value):
 
 def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
                     camp: core.Campaign, rung0: int, debounce_s: int,
-                    observed0: ?int = None, durations: ?list[int] = None) -> SimResult:
+                    observed0: ?int = None, durations: ?list[int] = None,
+                    target_rate: ?int = None, max_rate: ?int = None) -> SimResult:
     """With `durations`, each launch takes its own device's duration, in
     launch order, and the observed EWMA follows the mixture - the same
-    thing the controller sees. Without it, every launch takes actual_s."""
+    thing the controller sees. Without it, every launch takes actual_s.
+
+    With target_rate and max_rate, in devices per hour, the target and
+    max concurrency are rederived from the observed duration at each
+    decision, the way the controller holds a rate when upgrades run
+    slower or faster than believed. Without them the campaign's fixed
+    concurrencies apply."""
     remaining = n_devices
     inflight: list[(int, int)] = []
     observed = est_s
@@ -77,16 +84,26 @@ def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
         inflight = still
 
         # ---- ramp: advance a rung once that many upgrades have landed cleanly
-        if completed >= rung_target and rung < camp.target_concurrency:
-            rung = core.ramp_next(rung, camp.ramp_factor, camp.target_concurrency)
+        # The rates convert through the current observed duration.
+        tgt = camp.target_concurrency
+        mx = camp.max_concurrency
+        trr = target_rate
+        if trr is not None and trr > 0:
+            tgt = imax(1, core.ceil_div(trr * observed, 3600))
+        mrr = max_rate
+        if mrr is not None and mrr > 0:
+            mx = imax(tgt, core.ceil_div(mrr * observed, 3600))
+
+        if completed >= rung_target and rung < tgt:
+            rung = core.ramp_next(rung, camp.ramp_factor, tgt)
             rung_target = completed + rung
 
         t_rem = w.end - t
         req = core.required_concurrency(remaining, observed, t_rem)
         allw = core.allowed_concurrency(remaining, observed, t_rem,
-                                        camp.target_concurrency, camp.max_concurrency)
+                                        tgt, mx)
         n_new = core.launch_count(remaining, len(inflight), observed, t_rem,
-                                  camp.target_concurrency, camp.max_concurrency,
+                                  tgt, mx,
                                   rung, w.max_concurrency)
         i = 0
         while i < n_new:
@@ -103,7 +120,7 @@ def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
             first_launch = n_new
         peak = core.imax(peak, len(inflight))
 
-        sf = core.shortfall(remaining, observed, t_rem, camp.max_concurrency)
+        sf = core.shortfall(remaining, observed, t_rem, mx)
         if sf > 0 and not alarmed and remaining > 0:
             log.append(f"  {core.fmt_ts(t)} | ALARM: {sf} device(s) cannot make this window even at max concurrency -- deferral projected")
             alarmed = True
@@ -128,7 +145,7 @@ def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
             # The shortfall crossing is plain arithmetic in time, so arm an
             # alarm timer for the projected moment instead of waiting for
             # the next completion to reveal it.
-            g_need = core.ceil_div(remaining, camp.max_concurrency)
+            g_need = core.ceil_div(remaining, mx)
             t_need = (g_need - 1) * observed + (observed * 12) // 10
             t_x = w.end - t_need + 1
             if t_x <= t:
@@ -136,7 +153,7 @@ def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
             if t_x <= w.end:
                 if t_x < nxt or nxt > w.end:
                     sf_x = core.shortfall(remaining, observed, w.end - t_x,
-                                          camp.max_concurrency)
+                                          mx)
                     if sf_x > 0:
                         log.append(f"  {core.fmt_ts(t_x)} | ALARM: {sf_x} device(s) cannot make this window even at max concurrency -- deferral projected")
                         alarmed = True
