@@ -1,0 +1,355 @@
+"""The layer subscription contract through the NETCONF device provider."""
+
+import testing
+import yang
+import yang.gdata as gdata
+import device as swdev
+import adapters.netconf as swna
+import test_devicemgr_netconf as fixture
+
+NS = "urn:test:device-subscriptions"
+MODEL = r"""module device-subscriptions {
+  yang-version 1.1;
+  namespace "urn:test:device-subscriptions";
+  prefix ds;
+  container devices {
+    config false;
+    list device {
+      key name;
+      leaf name { type string; }
+      container state {
+        leaf status { type string; }
+        leaf release { type string; }
+      }
+    }
+  }
+}"""
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id(NS, name)
+
+POINT = [q("devices"), q("device")]
+ROOT = gdata.FNode(q("devices"), children=[gdata.FNode(q("device"))])
+
+def data(states: list[(str, str)]) -> gdata.Node:
+    return gdata.Container({q("devices"): gdata.Container({q("device"): gdata.List([q("name")], [
+        gdata.Container({q("name"): gdata.Leaf(name), q("state"): gdata.Container({
+            q("status"): gdata.Leaf(status), q("release"): gdata.Leaf("1.0"),
+        })}) for name, status in states
+    ])}, ns=NS, module="device-subscriptions")})
+
+def selected(leaf: str, period: ?float=None) -> gdata.SubscriptionSpec:
+    return gdata.SubscriptionSpec(gdata.FNode(q("devices"), children=[gdata.FNode(q("device"), children=[
+        gdata.FNode(q("state"), children=[gdata.FNode(q(leaf))]),
+    ])]), period=period)
+
+def device(t: testing.EnvT, name: str, push: bool) -> swdev.DeviceMgr:
+    schema = yang.compile([MODEL] + (fixture.YP_CLOSURE if push else []))
+    dev = swdev.DeviceMgr({"netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter, src_dnode=schema)},
+                         None, name, t.log_handler, lambda name: None, swdev.SchemaRegistry())
+    dev.set_dmc(fixture.make_netconf_mock_dmc(name))
+    return dev
+
+
+actor RootedDelivery(t: testing.EnvT, push: bool, periodic: bool):
+    """Two folded filters produce complete instances. A change to a sends
+    only a on-change; a periodic read also samples b. Removing b reports
+    its key. A second consumer replays the retained baseline and closing
+    it leaves the first consumer's shared stream alive."""
+    dev = device(t, "rooted-{push}-{periodic}", push)
+    manager = gdata.SubscriptionManager(dev.tree_provider(), "first")
+    second = gdata.SubscriptionManager(dev.tree_provider(), "second")
+    var server: ?swna.NetconfMockServer = None
+    var phase = 0
+    var got: dict[str, str] = {}
+    var replay: dict[str, str] = {}
+    var first_calls = 0
+    var synced = 0
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            manager.close()
+            second.close()
+            t.failure(ValueError(msg))
+
+    def state(n: ?gdata.Node, err: ?Exception) -> (str, ?str):
+        if err is not None:
+            raise err
+        instances = gdata.instances(n, POINT)
+        if len(instances) != 1:
+            raise ValueError("expected one device instance")
+        entry = instances[0].2
+        name = entry.get_str(q("name"))
+        if isinstance(entry, gdata.Absent):
+            return (name, None)
+        st = entry.get_cnt(q("state"))
+        if st.get_str(q("release")) != "1.0":
+            raise ValueError("folded filter lost release")
+        return (name, st.get_str(q("status")))
+
+    def on_state(n: ?gdata.Node, err: ?Exception):
+        if done:
+            return
+        name = ""
+        status: ?str = None
+        try:
+            name, status = state(n, err)
+        except Exception as e:
+            fail(str(e))
+            return
+        first_calls += 1
+        if phase == 0:
+            if status != "old" or name in got:
+                fail("bad or repeated baseline {name}: {status}")
+            else:
+                got[name] = status!
+        elif phase == 1:
+            if name == "a" and status == "new":
+                phase = 2
+                server!.set_oper_ds(data([("a", "new")]))
+            elif not periodic:
+                fail("unaffected instance delivered: {name}: {status}")
+        elif phase == 2:
+            if name == "b" and status is None:
+                phase = 3
+                second.declare({gdata.Dst(on_replay, root=ROOT).deliver(want())}, synced=on_replayed)
+            elif not periodic:
+                fail("unexpected delivery while removing b: {name}: {status}")
+        elif phase == 4 and name == "a" and status == "final":
+            done = True
+            manager.close()
+            t.success()
+
+    def on_replay(n: ?gdata.Node, err: ?Exception):
+        if done:
+            return
+        try:
+            name, status = state(n, err)
+            if status is None:
+                fail("replayed a removed instance")
+            else:
+                replay[name] = status!
+        except Exception as e:
+            fail(str(e))
+
+    def on_replayed():
+        if replay != {"a": "new"}:
+            fail("synced preceded retained baseline: {replay}")
+            return
+        second.close()
+        phase = 4
+        server!.set_oper_ds(data([("a", "final")]))
+
+    def want() -> set[gdata.SubscriptionSpec]:
+        period = 0.05 if periodic else None
+        return {selected("status", period), selected("release", period)}
+
+    def on_synced():
+        synced += 1
+        if synced != 1 or got != {"a": "old", "b": "old"}:
+            fail("synced preceded complete baseline: {got}, calls={synced}")
+            return
+        phase = 1
+        server!.set_oper_ds(data([("a", "new"), ("b", "old")]))
+
+    def start():
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            server = adapter.get_mock_server()
+            server!.set_oper_ds(data([("a", "old"), ("b", "old")]))
+            manager.declare({gdata.Dst(on_state, root=ROOT).deliver(want())}, synced=on_synced)
+        else:
+            fail("no NETCONF adapter")
+
+    start()
+    after 5: fail("timed out in phase {phase}, calls={first_calls}")
+
+actor _test_rooted_poll(t: testing.EnvT):
+    RootedDelivery(t, False, True)
+
+actor _test_rooted_periodic_push(t: testing.EnvT):
+    RootedDelivery(t, True, True)
+
+actor _test_rooted_on_change(t: testing.EnvT):
+    RootedDelivery(t, True, False)
+
+
+actor _test_empty_baseline_and_unsupported_on_change_sync(t: testing.EnvT):
+    dev = device(t, "empty-and-unsupported", False)
+    empty = gdata.SubscriptionManager(dev.tree_provider(), "empty")
+    unsupported = gdata.SubscriptionManager(dev.tree_provider(), "unsupported")
+    var errors = 0
+    var passes = 0
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            empty.close()
+            unsupported.close()
+            t.failure(ValueError(msg))
+
+    def on_empty(n: ?gdata.Node, err: ?Exception):
+        fail("an empty rooted read delivered data or error")
+
+    def on_error(n: ?gdata.Node, err: ?Exception):
+        if err is None:
+            fail("unsupported on-change delivered data")
+        else:
+            errors += 1
+
+    def on_synced():
+        passes += 1
+        if passes == 2:
+            if errors != 1:
+                fail("first-pass error missing")
+            else:
+                done = True
+                empty.close()
+                unsupported.close()
+                t.success()
+
+    empty.declare({gdata.Dst(on_empty, root=ROOT).deliver({selected("status", 0.05)})}, synced=on_synced)
+    unsupported.declare({gdata.Dst(on_error, root=ROOT).deliver({selected("status")})}, synced=on_synced)
+    after 5: fail("timed out with {passes} synced callbacks and {errors} errors")
+
+
+actor _test_multiple_periods_sync_and_callback_replacement(t: testing.EnvT):
+    dev = device(t, "multiple-periods", False)
+    manager = gdata.SubscriptionManager(dev.tree_provider(), "mixed")
+    want = {selected("status", 0.4), selected("release", 0.6)}
+    var latest: ?gdata.Node = None
+    var calls = 0
+    var quiet_checked = False
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            manager.close()
+            t.failure(ValueError(msg))
+
+    def complete(n: ?gdata.Node) -> bool:
+        entries = gdata.instances(n, POINT)
+        if len(entries) != 1:
+            return False
+        st = entries[0].2.get_cnt(q("state"))
+        return st.get_opt_str(q("status")) == "old" and st.get_opt_str(q("release")) == "1.0"
+
+    def on_replacement(n: ?gdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None or not complete(n):
+            fail("replacement callback lost the merged view")
+        elif not quiet_checked:
+            fail("equal declaration replayed before the next read")
+        else:
+            done = True
+            manager.close()
+            t.success()
+
+    def on_update(n: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            fail(str(err))
+        else:
+            calls += 1
+            latest = n
+
+    def checked():
+        quiet_checked = True
+
+    def on_synced():
+        if calls != 2 or not complete(latest):
+            fail("synced before both periods completed: calls={calls}")
+            return
+        manager.declare({gdata.Dst(on_replacement).deliver(want)})
+        after 0.1: checked()
+
+    def start():
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            adapter.get_mock_server()!.set_oper_ds(data([("a", "old")]))
+            manager.declare({gdata.Dst(on_update).deliver(want)}, synced=on_synced)
+        else:
+            fail("no NETCONF adapter")
+
+    start()
+    after 5: fail("timed out with {calls} initial reads")
+
+
+actor _test_rooted_redeclaration_and_root_change(t: testing.EnvT):
+    dev = device(t, "narrowed-root", False)
+    provider = dev.tree_provider()
+    var received: dict[str, bool] = {}
+    var phase = 0
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            provider.remove_subscriptions("direct")
+            t.failure(ValueError(msg))
+
+    def on_update(n: ?gdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail(str(err))
+            return
+        instances = gdata.instances(n, POINT)
+        expected = 2 if phase == 2 else 1
+        if len(instances) != expected:
+            fail("expected {expected} instances, got {len(instances)}")
+            return
+        for i in instances:
+            entry = i.2
+            name = entry.get_str(q("name"))
+            if name in received:
+                fail("repeated instance before synced: {name}")
+            received[name] = not isinstance(entry, gdata.Absent)
+
+    def on_synced(owner: str):
+        if done:
+            return
+        if phase == 0:
+            if received != {"a": True, "b": True}:
+                fail("missing initial instances: {received}")
+                return
+            phase = 1
+            received = {}
+            filt = gdata.FNode(q("devices"), children=[gdata.FNode(q("device"), children=[
+                gdata.FNode(q("name"), value_match="a"), gdata.FNode(q("state")),
+            ])])
+            provider.declare_subscriptions("direct", on_update, {
+                gdata.SubscriptionSpec(filt, period=0.1, root=ROOT),
+            }, on_synced)
+        elif phase == 1:
+            if received != {"a": True, "b": False}:
+                fail("narrowed selection did not remove b: {received}")
+                return
+            phase = 2
+            received = {}
+            provider.declare_subscriptions("direct", on_update, {
+                gdata.SubscriptionSpec(None, period=0.1),
+            }, on_synced)
+        elif received != {"a": True, "b": True}:
+            fail("new root did not receive a fresh baseline: {received}")
+        else:
+            done = True
+            provider.remove_subscriptions("direct")
+            t.success()
+
+    def start():
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            adapter.get_mock_server()!.set_oper_ds(data([("a", "old"), ("b", "old")]))
+            provider.declare_subscriptions("direct", on_update, {
+                gdata.SubscriptionSpec(None, period=0.1, root=ROOT),
+            }, on_synced)
+        else:
+            fail("no NETCONF adapter")
+
+    start()
+    after 5: fail("timed out in phase {phase}: {received}")

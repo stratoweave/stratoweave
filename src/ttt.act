@@ -1,5 +1,6 @@
 import yang.adata as yadata
 import yang.gdata as gdata
+import subscriptions
 import db as swdb
 import device as swdev
 import adapters.adapter as swadapt
@@ -544,35 +545,6 @@ def exact_list_filter_branches(filters: list[gdata.FNode], key_names: list[gdata
 def _delay(period: u64) -> float:
     return float(period) / 1000000000.0
 
-def _union(specs: list[gdata.SubscriptionSpec]) -> ?gdata.FNode:
-    """One filter for the specs: the union of their filters, or None for
-    everything, which a filter that names nothing, or no filter, is."""
-    branches: list[gdata.FNode] = []
-    for spec in specs:
-        f = root_filter(spec.filt)
-        if f is not None and len(f.children) > 0:
-            branches.extend(f.children)
-        else:
-            return None
-    return gdata.FNode(children=gdata.filter_merge_list(branches))
-
-def fold(want: set[gdata.SubscriptionSpec]) -> dict[u64, ?gdata.FNode]:
-    """One filter per period: the union of the filters a consumer declared
-    with that period, so one read serves them all."""
-    by_period: dict[u64, list[gdata.SubscriptionSpec]] = {}
-    for spec in want:
-        period = spec.period
-        if period is not None:
-            if period not in by_period:
-                by_period[period] = []
-            by_period[period].append(spec)
-    return {period: _union(specs) for period, specs in by_period.items()}
-
-def fold_on_change(want: set[gdata.SubscriptionSpec]) -> (bool, ?gdata.FNode):
-    """Whether the consumer declared a spec without a period, and the one
-    filter those specs fold into."""
-    specs = [spec for spec in want if spec.period is None]
-    return (len(specs) > 0, _union(specs))
 
 
 class Read(object):
@@ -727,7 +699,7 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
         cb = cb1
         synced = synced1
         delta = delta1
-        folded = fold(want)
+        folded = subscriptions.fold(want)
         dropped = False
         for period in list(reads.keys()):
             if period not in folded:
@@ -748,7 +720,7 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
                     fresh.held = old.held       # so the next read reports instances no longer selected
                 reads[period] = fresh
                 _read(fresh, period)
-        (on_change, cfilt) = fold_on_change(want)
+        (on_change, cfilt) = subscriptions.fold_on_change(want)
         if sub_id != "":
             if not on_change:
                 _unsubscribe()
@@ -1347,25 +1319,14 @@ actor Layer(name: str, rootgen: proc(Path, ?Layer)->Node, lower: ?Layer, db_arg:
         `delta` also gets each change alone, as the path of the node that
         changed with what it held before and after. Specs rooted at a node
         share one root, and are read on one period or served on-change."""
-        point: list[gdata.Id] = []
         root_of: ?gdata.FNode = None
-        first = True
+        point: list[gdata.Id] = []
         try:
-            for spec in want:
-                if first:
-                    root_of = spec.root
-                    first = False
-                elif root_of != spec.root:
-                    raise ValueError("a consumer's filters share one root")
-            point = gdata.root_names(root_of)
-            if len(point) > 0:
-                ways = len(fold(want))
-                if fold_on_change(want).0:
-                    ways += 1
-                if ways > 1:
-                    raise ValueError("a rooted destination is read on one period or served on-change")
+            root_of, point = subscriptions.delivery_root(want)
         except Exception as e:
             cb(None, e)
+            if synced is not None:
+                synced(owner_id)
             return
         sub = subscribers.get(owner_id)
         if sub is not None:

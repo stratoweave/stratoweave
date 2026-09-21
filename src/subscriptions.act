@@ -1,0 +1,192 @@
+"""Subscription selection and delivery shared by layers and device providers."""
+
+import yang.gdata as gdata
+
+
+def _union(specs: list[gdata.SubscriptionSpec]) -> ?gdata.FNode:
+    branches: list[gdata.FNode] = []
+    for spec in specs:
+        f = spec.filt
+        if f is None:
+            return None
+        elif f!.name is not None:
+            branches.append(f!)
+        elif len(f!.children) > 0:
+            branches.extend(f!.children)
+        else:
+            return None
+    return gdata.FNode(children=gdata.filter_merge_list(branches))
+
+
+def fold(want: set[gdata.SubscriptionSpec]) -> dict[u64, ?gdata.FNode]:
+    """One filter per period: the union of the filters read on that period."""
+    by_period: dict[u64, list[gdata.SubscriptionSpec]] = {}
+    for spec in want:
+        period = spec.period
+        if period is not None:
+            if period not in by_period:
+                by_period[period] = []
+            by_period[period].append(spec)
+    return {period: _union(specs) for period, specs in by_period.items()}
+
+
+def fold_on_change(want: set[gdata.SubscriptionSpec]) -> (bool, ?gdata.FNode):
+    """Whether there is an on-change subscription, and its union filter."""
+    specs = [spec for spec in want if spec.period is None]
+    return (len(specs) > 0, _union(specs))
+
+
+def delivery_root(want: set[gdata.SubscriptionSpec]) -> (?gdata.FNode, list[gdata.Id]):
+    """Validate one destination's root and cadence, for either provider."""
+    root: ?gdata.FNode = None
+    first = True
+    for spec in want:
+        if first:
+            root = spec.root
+            first = False
+        elif root != spec.root:
+            raise ValueError("a consumer's filters share one root")
+    point = gdata.root_names(root)
+    if len(point) > 0:
+        for spec in want:
+            gdata.check_rooted(spec.filt, point)
+        ways = len(fold(want)) + (1 if fold_on_change(want).0 else 0)
+        if ways > 1:
+            raise ValueError("a rooted destination is read on one period or served on-change")
+    return (root, point)
+
+
+class InstanceTree(object):
+    """A device's selected tree, indexed along the path to its delivery root.
+
+    Lists above and at the root retain entries by key. Below the root we
+    retain complete immutable gdata instances. A patch walks only its own
+    path and uses gdata.patch within the affected instance. Replacing an
+    ancestor visits its descendants; changing one entry never joins or
+    scans its siblings. Delivered spines are immutable snapshots.
+    """
+    point: list[gdata.Id]
+    keys: list[gdata.Id]
+    node: ?gdata.Node
+    entries: dict[str, InstanceTree]
+    child: ?InstanceTree
+
+    def __init__(self, tree: ?gdata.Node, point: list[gdata.Id], keys: list[gdata.Id]=[]):
+        self.point = point
+        self.keys = keys
+        self.node = None
+        self.entries = {}
+        self.child = None
+        self.replace(tree)
+
+    def replace(self, tree: ?gdata.Node):
+        self.node = tree
+        self.entries = {}
+        self.child = None
+        if isinstance(tree, gdata.List):
+            if len(tree.keys) == 0:
+                raise ValueError("a destination cannot be rooted at or below a keyless list")
+            self.node = gdata.List(tree.keys, [], tree.user_order, ns=tree.ns, module=tree.module)
+            for entry in tree.elements:
+                self.entries[entry.key_str(tree.keys)] = InstanceTree(entry, self.point, tree.keys)
+        elif isinstance(tree, gdata.Container) and len(self.point) > 0:
+            self.node = gdata.Container({k: tree.children[k] for k in self.keys if k in tree.children},
+                                       presence=tree.presence, ns=tree.ns, module=tree.module)
+            self.child = InstanceTree(tree.children.get(self.point[0]), self.point[1:])
+
+    def _wrap(self, n: ?gdata.Node) -> ?gdata.Node:
+        if n is None:
+            return None
+        node = self.node
+        if isinstance(node, gdata.List):
+            return gdata.List(node.keys, [n!], node.user_order, ns=node.ns, module=node.module)
+        elif isinstance(node, gdata.Container):
+            children = dict(node.children.items())
+            children[self.point[0]] = n!
+            return gdata.Container(children, presence=node.presence, ns=node.ns, module=node.module)
+        return None
+
+    def spines(self) -> list[gdata.Node]:
+        node = self.node
+        child = self.child
+        if isinstance(node, gdata.List):
+            return [self._wrap(n)! for entry in self.entries.values() for n in entry.spines()]
+        elif child is not None:
+            return [self._wrap(n)! for n in child.spines()]
+        elif node is not None and len(self.point) == 0:
+            return [node]
+        return []
+
+    def build(self) -> ?gdata.Node:
+        """Materialize only when an edit replaces/removes this whole branch."""
+        node = self.node
+        child = self.child
+        if isinstance(node, gdata.List):
+            elements: list[gdata.Node] = []
+            for entry in self.entries.values():
+                n = entry.build()
+                if n is not None:
+                    elements.append(n)
+            return gdata.List(node.keys, elements, node.user_order, ns=node.ns, module=node.module)
+        elif child is not None and isinstance(node, gdata.Container):
+            children = dict(node.children.items())
+            n = child.build()
+            if n is not None:
+                children[self.point[0]] = n!
+            return gdata.Container(children, presence=node.presence, ns=node.ns, module=node.module)
+        return node
+
+    def patch(self, patch: gdata.Node) -> list[(?gdata.Node, ?gdata.Node)]:
+        """Apply one edit and return the before/after spines it touched."""
+        node = self.node
+        child = self.child
+        changes: list[(?gdata.Node, ?gdata.Node)] = []
+        if isinstance(node, gdata.List) and isinstance(patch, gdata.List):
+            if node.keys != patch.keys:
+                raise ValueError("subscription patch changed list keys")
+            for p in patch.elements:
+                key = p.key_str(node.keys)
+                entry = self.entries.get(key)
+                if entry is None:
+                    entry = InstanceTree(None, self.point, node.keys)
+                    self.entries[key] = entry!
+                for before, now in entry!.patch(p):
+                    changes.append((self._wrap(before), self._wrap(now)))
+                if entry!.node is None:
+                    del self.entries[key]
+        elif child is not None and isinstance(patch, gdata.Container):
+            p = patch.children.get(self.point[0])
+            if p is not None:
+                for before, now in child.patch(p):
+                    changes.append((self._wrap(before), self._wrap(now)))
+        else:
+            before = self.build()
+            now = gdata.patch(before, patch)
+            if before != now:
+                self.replace(now)
+                changes.append((before, now))
+        return changes
+
+
+def changed_instances(changes: list[(?gdata.Node, ?gdata.Node)], point: list[gdata.Id]) -> list[gdata.Node]:
+    """Coalesce a notification's edits and report complete instances or removals."""
+    before: dict[str, ?gdata.Node] = {}
+    now: dict[str, ?gdata.Node] = {}
+    for old, new in changes:
+        was = {i.0: i.1 for i in gdata.instances(old, point)}
+        present = {i.0: i.1 for i in gdata.instances(new, point)}
+        for key in set(was.keys()) | set(present.keys()):
+            if key not in before:
+                before[key] = was.get(key)
+            now[key] = present.get(key)
+    deliveries: list[gdata.Node] = []
+    for key, n in now.items():
+        old = before[key]
+        if n != old:
+            if n is not None:
+                deliveries.append(n)
+            elif old is not None:
+                gone = gdata.gone(old, point)
+                if gone is not None:
+                    deliveries.append(gone)
+    return deliveries

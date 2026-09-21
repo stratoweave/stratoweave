@@ -7,6 +7,7 @@ import std.xml as xml
 
 import yang.adata as yadata
 import yang.gdata as ygdata
+import subscriptions
 
 from device_schema import DeviceSchema
 
@@ -178,36 +179,49 @@ def parse_cap(tcap: str) -> ModCap:
 
 
 class SharedSubscription(object):
-    """Runtime state for one device subscription spec."""
+    """One folded device read or native stream, shared by equal declarations.
+
+    A rooted stream keeps indexed instances instead of a merged feed.
+    done includes an unsuccessful first read; error keeps that result for
+    consumers joining before the next successful read.
+    """
     spec: ygdata.SubscriptionSpec
     latest: ?ygdata.Node
+    instances: ?subscriptions.InstanceTree
     owners: set[str]
     active: bool
+    done: bool
+    error: ?Exception
 
     def __init__(self, spec: ygdata.SubscriptionSpec):
-        self.spec = ygdata.SubscriptionSpec(spec.filt, period=spec.period, on_change=spec.on_change)
+        self.spec = spec
         self.latest = None
+        point = ygdata.root_names(spec.root)
+        self.instances = subscriptions.InstanceTree(None, point) if len(point) > 0 else None
         self.owners = set()
         self.active = True
+        self.done = False
+        self.error = None
 
 
 class SubscriptionOwner(object):
-    """One logical subscriber and its merged delivery state. `synced` is
-    called with the owner id after its first delivery, once."""
+    """One destination; synced follows the first pass of every folded read."""
     @property
     cb: proc(?ygdata.Node, ?Exception) -> None
     @property
     synced: ?action(str) -> None
     want: set[ygdata.SubscriptionSpec]
-    last_merged: ?ygdata.Node
-    synced_done: bool
+    pending: set[ygdata.SubscriptionSpec]
+    owed: bool
+    previous: list[ygdata.Node]
 
-    def __init__(self, cb: proc(?ygdata.Node, ?Exception) -> None, want: set[ygdata.SubscriptionSpec], last_merged: ?ygdata.Node=None, synced: ?action(str) -> None=None, synced_done: bool=False):
+    def __init__(self, cb: proc(?ygdata.Node, ?Exception) -> None, want: set[ygdata.SubscriptionSpec], synced: ?action(str) -> None=None):
         self.cb = cb
         self.synced = synced
         self.want = set(want)
-        self.last_merged = last_merged
-        self.synced_done = synced_done
+        self.pending = set(want)
+        self.owed = True
+        self.previous = []
 
 
 # subscription_method() / SubscriptionStatus.method values: the transport used to
@@ -255,13 +269,21 @@ def subscription_delay(spec: ygdata.SubscriptionSpec) -> float:
 
 
 def merge_subscription_tree(want: set[ygdata.SubscriptionSpec], subs: dict[ygdata.SubscriptionSpec, SharedSubscription]) -> ?ygdata.Node:
+    """Merge folded reads in cadence order, with on-change state last."""
     merged = None
+    periodic: dict[u64, ygdata.SubscriptionSpec] = {}
+    change: list[ygdata.SubscriptionSpec] = []
     for spec in want:
+        period = spec.period
+        if period is not None:
+            periodic[period] = spec
+        else:
+            change.append(spec)
+    for spec in [periodic[p] for p in sorted(periodic.keys())] + change:
         if spec in subs:
             sub = subs[spec]
             if sub.latest is not None:
-                base = merged if merged is not None else ygdata.Container({})
-                merged = ygdata.patch(base, sub.latest)
+                merged = ygdata.patch(merged, sub.latest) if merged is not None else sub.latest
     return merged
 
 

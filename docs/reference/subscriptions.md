@@ -1,7 +1,8 @@
 # Subscriptions
 
-Subscriptions are declared as a `set[yang.gdata.SubscriptionSpec]` and
-reconciled by `yang.gdata.SubscriptionManager`.
+A subscription declaration pairs a `set[yang.gdata.SubscriptionSpec]`
+with a destination using `dst.deliver(want)`. A
+`yang.gdata.SubscriptionManager` reconciles the resulting set of deliveries.
 
 ## Monitoring With Local YANG Files
 
@@ -46,10 +47,10 @@ YANG sources are cached under `~/.cache/ayang`.
 
 - one `TreeProvider`
 - one stable owner id
-- one update callback
+- a set of destinations, each with its own callback
 
-The callback receives one merged gdata tree for that owner or, for a
-destination rooted at a node, one instance of that node per call.
+Each destination receives one merged gdata tree or, when rooted at a node,
+one instance of that node per call.
 
 The public shape is intentionally small:
 
@@ -60,14 +61,14 @@ import mini.devices.ietf_oper as ietf_oper
 subs = gdata.SubscriptionManager(
     dev.tree_provider(),
     "base-config",
-    on_state,
 )
+dst = ietf_oper.dst(on_state)
 
 want = set([
     ietf_oper.subs.system_state.clock.subscribe(depth=1, period=0.05)
 ])
 
-subs.declare(want)
+subs.declare({dst.deliver(want)})
 ```
 
 ## Generated Subscription Helpers
@@ -184,7 +185,7 @@ want = set([
     iface.subscribe(select=[iface.statistics, iface.ipv4], period=1.0),
 ])
 
-subs.declare(want)
+subs.declare({dst.deliver(want)})
 ```
 
 ### Where A Destination Is Rooted
@@ -240,9 +241,9 @@ called once, when every delivery in that `declare` has had its first
 pass, the first read of each spec. A first read that ends in an error
 still counts: the error, then `synced`. A declaration that adds nothing
 new installs the new callbacks and nothing more: nothing is delivered
-again and `synced` fires at once, since there is nothing to wait for. A
-rooted destination is served by a TTT layer; a device provider answers it
-with an error, and counts its first read as its first pass.
+again and `synced` fires at once, since there is nothing to wait for.
+TTT layers and device providers serve the same rooted destinations and
+complete the first pass even when the selected tree is empty.
 
 At the gdata level the root is an `FNode` path with one child per level
 and no predicates, carried by `Dst(deliver, root=...)`; the destination
@@ -292,9 +293,10 @@ The delivery contract:
   container entry that would span several transforms, is reported once as
   an error and the subscription is dropped.
 
-TTT decides on-change from `period` alone; the `on_change` flag on
-`SubscriptionSpec` exists for device subscriptions and is ignored here. The
-`NetconfDriver` accepts on-change only against a device that pushes natively.
+Both TTT and device providers decide on-change from `period` alone. The
+legacy `on_change` field on `SubscriptionSpec` does not select the mode.
+The `NetconfDriver` accepts on-change only against a device that pushes
+natively; a device without YANG-Push reports an error instead of polling.
 
 ### Periodic Subscriptions
 
@@ -362,8 +364,8 @@ call describes the full desired subscription set for that owner.
 - removed subscriptions are removed automatically
 - added subscriptions are created automatically
 
-The update callback receives one merged gdata tree for the owner, not
-one callback per subscription.
+Each destination receives the view selected by its subscriptions: a merged
+tree at the top, or complete individual instances at its delivery root.
 
 ## Northbound On-Change
 
@@ -420,3 +422,31 @@ tree. Each read delivers every selected instance and reports instances
 removed since the last read. Each on-change update delivers the instances
 it touched. Every instance is delivered as a tree from the top down to
 that instance.
+
+### Device Providers
+
+Device providers fold a destination's filters into one read per period
+and one on-change stream, using the same selection and root validation as
+TTT. Equal folded subscriptions share their device stream. Every successful
+periodic snapshot is delivered. A destination at the top receives the
+latest reads merged in period order, followed by the on-change state;
+with one read, its tree is passed directly.
+
+A rooted device stream retains instances indexed by the keys on the path
+to its root. Its initial snapshot and periodic reads deliver each selected
+instance, followed by removals. A native on-change patch updates only the
+branches it names and delivers each changed instance's complete selected
+state once. Replacing or removing an ancestor visits the instances under
+that ancestor. No whole feed is assembled for rooted delivery.
+
+The first result of every folded read, including errors and empty
+snapshots, completes the declaration's first pass. A new consumer of an
+existing stream receives its retained baseline before `synced`. An equal
+redeclaration replaces callbacks without replaying data. Closing one
+consumer keeps a shared stream alive for the others.
+
+Transport capabilities determine how device reads run: periodic YANG-Push
+when supported, otherwise periodic NETCONF reads; native YANG-Push for
+on-change. Native YANG-Push periods are rounded down to whole centiseconds
+with a minimum of one centisecond. Delivery roots are local to the provider and
+do not require one wire subscription per instance.
