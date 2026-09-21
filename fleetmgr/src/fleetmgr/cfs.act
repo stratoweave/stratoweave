@@ -9,6 +9,8 @@ import stratoweave.fleet_sched_sim as fsim
 import fleetmgr.layers.base_0 as base
 import fleetmgr.layers.y_0 as y_0
 import fleetmgr.layers.y_1_oper as y1_oper
+from fleetmgr.layers.y_1_oper import \
+    stratoweave_rfs__rfs__flotilla_status__state__device_entry as FlotillaDeviceStatus
 # TODO: required by the compiler, see acton issue #2390
 import yang.identityref
 import fleetmgr.layers.y_0_oper as y0_oper
@@ -319,7 +321,6 @@ def imax(a: int, b: int) -> int:
     return a if a > b else b
 
 
-
 actor UpgradeCampaignTransform(path: ttt.Path,
                                update_dynstate: proc(?y_0.software__software__upgrade_campaign__dynstate) -> None,
                                update_oper: proc(?y0_oper.software__software__upgrade_campaign_entry) -> None,
@@ -336,9 +337,9 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     as dynstate for the transform to actuate.
     """
     var members: list[str] = []
-    var latest: ?y1_oper.root = None
+    var latest: dict[str, (rfs_name: str, state: FlotillaDeviceStatus)] = {}
     var subscriptions: ?ygdata.SubscriptionManager = None
-    var destination: ?ygdata.Dst = None
+    var subscriptions_synced = False
     var plan_layout: list[(str, int, int, list[(str, int)])] = []
     var plan_alarms: list[str] = []
     var running = False
@@ -369,12 +370,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         for d in members:
             status: ?str = None
             running_release: ?str = None
-            if latest is not None:
-                for shard in latest!.rfs:
-                    observed = shard.flotilla_status.state.device.get(d)
-                    if observed is not None:
-                        status = observed!.status
-                        running_release = observed!.running_release
+            observed = latest.get(d)
+            if observed is not None:
+                status = observed.state.status
+                running_release = observed.state.running_release
 
             ds = st.device_status.create(d)
             ds.status = status if status is not None else "pending"
@@ -408,12 +407,32 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             st.plan.alarm.append(alarm)
         update_oper(oper)
 
-    def on_rfs(root: ?y1_oper.root, error: ?Exception) -> None:
+    def on_rfs(
+        keys: ?(rfs_name: str, device_name: str),
+        state: ?FlotillaDeviceStatus,
+        error: ?Exception,
+    ) -> None:
         if error is not None:
             print("campaign status subscription failed at {path}: {error}", err=True)
-            latest = None
-        else:
-            latest = root
+            latest = {}
+        elif keys is not None:
+            if state is not None:
+                latest[keys.device_name] = (
+                    rfs_name=keys.rfs_name,
+                    state=state,
+                )
+            else:
+                previous = latest.get(keys.device_name)
+                if previous is not None and previous.rfs_name == keys.rfs_name:
+                    del latest[keys.device_name]
+        if subscriptions_synced:
+            _status_changed()
+
+    def on_subscriptions_synced() -> None:
+        subscriptions_synced = True
+        _status_changed()
+
+    def _status_changed() -> None:
         publish()
         # Telemetry arms the debounce timer; updates landing while it is
         # armed join the same batch.
@@ -451,12 +470,9 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         pass
 
     def _status_of(name: str) -> ?str:
-        lt = latest
-        if lt is not None:
-            for shard in lt.rfs:
-                observed = shard.flotilla_status.state.device.get(name)
-                if observed is not None:
-                    return observed.status
+        observed = latest.get(name)
+        if observed is not None:
+            return observed.state.status
         return None
 
     def _is_done(name: str) -> bool:
@@ -602,12 +618,17 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 lower_tree_provider!,
                 "campaign-status:{path}",
             )
-            destination = y1_oper.dst(on_rfs)
 
         if subscriptions is not None:
             want: set[ygdata.Delivery] = set()
             if len(members) > 0:
-                want.add(destination!.deliver({
-                    ygdata.SubscriptionSpec(None, on_change=True),
+                statuses = y1_oper.subs.rfs.flotilla_status.state.device
+                want.add(statuses.dst(on_rfs).deliver({
+                    statuses.subscribe(),
                 }))
-            subscriptions!.declare(want)
+            else:
+                # A later subscription starts with a fresh rooted replay. Do
+                # not retain entries that may disappear while unsubscribed.
+                latest = {}
+            subscriptions_synced = False
+            subscriptions!.declare(want, synced=on_subscriptions_synced)
