@@ -1,0 +1,112 @@
+"""Tests for linked subscription changes across transactions.
+
+A subscription added by an aborted transaction must not become active.
+Removing one tag must leave the subscriber's other tags in place.
+Deleting a subscriber must clear its links so recreating it requests
+fresh publisher state.
+"""
+
+import testing
+
+import ttt
+import yang.gdata as gdata
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id("urn:test:linked", name)
+
+
+def device(name: str, children: dict[gdata.Id, gdata.Node]={}) -> gdata.Node:
+    fields: dict[gdata.Id, gdata.Node] = {q("name"): gdata.Leaf(name), q("id"): gdata.Leaf(7)}
+    fields.update(children.items())
+    return gdata.Container(fields)
+
+
+def devices(entries: list[gdata.Node]) -> gdata.Node:
+    return gdata.Container({q("device"): gdata.List([q("name"), q("id")], entries)})
+
+
+def address(name: str, children: list[gdata.FNode]=[]) -> gdata.FNode:
+    return gdata.FNode(q("device"), children=[
+        gdata.FNode(q("name"), value_match=name),
+        gdata.FNode(q("id"), value_match=7),
+    ] + children)
+
+
+def update(name: str, children: dict[gdata.Id, gdata.Node], tag: str="peer") -> ttt.LinkUpdate:
+    return ttt.LinkUpdate(tag, address(name), gdata.FNode(), devices([device(name, children)]))
+
+
+def subscriptions(names: list[str]) -> list[ttt.TaggedPath]:
+    return [ttt.TaggedPath("peer", address(name)) for name in names]
+
+
+class CheckRecreatedSubscriber(ttt.TransformFunction):
+    def transform_wrapper(self, cfg, linked, memory, dynstate):
+        step = cfg.get_leaf(q("step")).val
+        if isinstance(step, int) and step == 1:
+            testing.assertEqual(linked, gdata.Container())
+        return linked, None
+
+
+actor removed_subscriber_discards_linked_sources(t: testing.AsyncT):
+    links = subscriptions(["a"])
+    tx = ttt.TransformTransaction(ttt.PathRoot("subscriber"), CheckRecreatedSubscriber, lambda cfg: links, None, None)
+
+    def loaded(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        tx.commit("load", True)
+        result = tx.configure("remove", {"test": gdata.Absent()}, None)
+        testing.assertEqual(len(result.requests), 1)
+        testing.assertFalse(result.requests[0].status)
+        tx.lock("remove", None, removed)
+
+    def removed(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        tx.commit("remove", True)
+        result = tx.configure("recreate", {"test": gdata.Container({q("step"): gdata.Leaf(1)})}, None)
+        testing.assertEqual(len(result.requests), 1)
+        testing.assertTrue(result.requests[0].status)
+        # The publisher has not replied yet. Its old tree must be gone.
+        result = tx.linkage("recreate", [], [], None)
+        testing.assertEqual(len(result.errors), 0)
+        tx.lock("recreate", None, recreated)
+
+    def recreated(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        tx.commit("recreate", True)
+        tx.wait_complete("recreate", lambda result: t.success())
+
+    tx.configure("load", {"test": gdata.Container({q("step"): gdata.Leaf(0)})}, None)
+    tx.linkage("load", [], [update("a", {q("old"): gdata.Leaf(1)})], None)
+    tx.lock("load", None, loaded)
+
+
+actor publisher_keeps_other_tags_and_discards_aborted_subscriptions(t: testing.AsyncT):
+    publisher = gdata.FNode(q("publisher"))
+    subscriber = gdata.FNode(q("subscriber"))
+    tx = ttt.TransformTransaction(ttt.PathRoot("publisher"), ttt.TransformFunction, None, None, None)
+    cfg: dict[str, gdata.Node] = {"test": gdata.Container({q("value"): gdata.Leaf(1)})}
+
+    def loaded(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        tx.commit("load", True)
+        tx.linkage("abort", [ttt.LinkRequest("aborted", publisher, subscriber, True)], [], None)
+        tx.commit("abort", False)
+        result = tx.configure("probe", cfg, None)
+        testing.assertEqual(sorted([update.tag for update in result.updates]), ["other", "peer"])
+        tx.commit("probe", False)
+        tx.linkage("remove", [ttt.LinkRequest("peer", publisher, subscriber, False)], [], None)
+        tx.lock("remove", None, removed)
+
+    def removed(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        tx.commit("remove", True)
+        result = tx.configure("edit", cfg, None)
+        testing.assertEqual([update.tag for update in result.updates], ["other"])
+        tx.commit("edit", False)
+        tx.wait_complete("edit", lambda result: t.success())
+
+    tx.configure("load", cfg, None)
+    tx.linkage("load", [ttt.LinkRequest(tag, publisher, subscriber, True) for tag in ["peer", "other"]], [], None)
+    tx.lock("load", None, loaded)
