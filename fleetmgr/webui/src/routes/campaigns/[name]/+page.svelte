@@ -10,7 +10,7 @@
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
   import { RateTracker, formatEta } from '$lib/software/rate';
-  import { formatDuration, formatOffset } from '$lib/software/time';
+  import { formatClock, formatDuration, formatLocalTime } from '$lib/software/time';
   import { nameMatches } from '$lib/software/selection';
   import {
     CAMPAIGN_LIST_ROOT,
@@ -20,6 +20,7 @@
     maskUrlCredentials,
     type Campaign,
     type CampaignCounters,
+    type Schedule,
     type KnownStatus
   } from '$lib/software/model';
 
@@ -29,7 +30,9 @@
 
   let {
     data
-  }: { data: { name: string; campaign: Campaign | null; loadError: string } } = $props();
+  }: {
+    data: { name: string; campaign: Campaign | null; schedules: Schedule[]; loadError: string };
+  } = $props();
 
   let busy = $state(false);
   let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(
@@ -41,8 +44,8 @@
   let filterStatus = $state<KnownStatus | ''>('');
   let searchText = $state('');
   let page = $state(1);
-  /** Plan window (by start) whose device list is unfolded. */
-  let openWindow = $state<number | null>(null);
+  /** Plan window (by schedule and start) whose device list is unfolded. */
+  let openWindow = $state<string | null>(null);
 
   // Two tiers: fresh counters every 1.5 s for campaigns up to
   // FAST_ENTRY_LIMIT members; the loader snapshot refreshes on open, every
@@ -89,12 +92,18 @@
 
   let counters = $derived(liveCounters ?? data.campaign?.counters ?? null);
 
-  let windowsText = $derived.by(() => {
+  let scheduleText = $derived.by(() => {
     const c = data.campaign;
-    if (!c || c.windows.length === 0) return 'none — one window sized for the pace';
-    return c.windows
-      .map((w) => `${w.start === 0 ? 'at launch' : `+${formatDuration(w.start)}`} for ${formatDuration(w.duration)}`)
+    if (!c || !c.defaultSchedule) return 'none — one open window from launch';
+    const schedule = data.schedules.find((s) => s.name === c.defaultSchedule);
+    if (!schedule) return `${c.defaultSchedule} (no such schedule)`;
+    const windows = schedule.windows
+      .map(
+        (w) =>
+          `${w.days.length > 0 ? w.days.join(',') + ' ' : 'daily '}${formatLocalTime(w.at, schedule.utcOffset)} for ${formatDuration(w.duration)}`
+      )
       .join(' · ');
+    return `${schedule.name}: ${windows || 'no windows'}`;
   });
 
   let paceText = $derived.by(() => {
@@ -280,8 +289,8 @@
         <span class="mono">{campaign.imageUrl ? maskUrlCredentials(campaign.imageUrl) : '—'}</span>
       </div>
       <div class="fact">
-        <span class="fact-label">Windows</span>
-        <span class="mono">{windowsText}</span>
+        <span class="fact-label">Default schedule</span>
+        <span class="mono">{scheduleText}</span>
       </div>
       <div class="fact">
         <span class="fact-label">Deadline</span>
@@ -302,7 +311,7 @@
       <div class="grids-head">
         <h3 class="panel-title">Plan</h3>
         <span class="hint">
-          estimates as offsets from launch · devices are released by the
+          estimates in your local time · devices are released by the
           controller as their window opens
         </span>
       </div>
@@ -333,32 +342,33 @@
                   <button
                     class="fold small"
                     type="button"
-                    onclick={() => (openWindow = openWindow === w.start ? null : w.start)}
+                    onclick={() =>
+                      (openWindow = openWindow === `${w.schedule}:${w.start}` ? null : `${w.schedule}:${w.start}`)}
                   >
-                    {openWindow === w.start ? '▾' : '▸'} {w.schedule || 'window'}
+                    {openWindow === `${w.schedule}:${w.start}` ? '▾' : '▸'} {w.schedule || 'window'}
                   </button>
                 </td>
-                <td class="mono tn">{formatOffset(w.start)}</td>
-                <td class="mono tn">{w.end === null ? 'open' : formatOffset(w.end)}</td>
+                <td class="mono tn">{formatClock(w.start)}</td>
+                <td class="mono tn">{w.end === null ? 'open' : formatClock(w.end)}</td>
                 <td class="tn right">{w.devices.length.toLocaleString()}</td>
                 <td class="mono tn">
                   {#if first && last}
-                    {formatOffset(first.estimatedStart)}{w.devices.length > 1
-                      ? ` … ${formatOffset(last.estimatedStart)}`
+                    {formatClock(first.estimatedStart)}{w.devices.length > 1
+                      ? ` … ${formatClock(last.estimatedStart)}`
                       : ''}
                   {:else}
                     —
                   {/if}
                 </td>
               </tr>
-              {#if openWindow === w.start}
+              {#if openWindow === `${w.schedule}:${w.start}`}
                 <tr>
                   <td colspan="5">
                     <div class="plan-devices">
                       {#each w.devices.slice(0, PLAN_DEVICE_LIMIT) as d (d.name)}
                         <span class="plan-device">
                           <span class="device-name">{d.name}</span>
-                          <span class="mono tn dim">{formatOffset(d.estimatedStart)}</span>
+                          <span class="mono tn dim">{formatClock(d.estimatedStart)}</span>
                         </span>
                       {/each}
                       {#if w.devices.length > PLAN_DEVICE_LIMIT}

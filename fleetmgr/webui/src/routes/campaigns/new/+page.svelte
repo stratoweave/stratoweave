@@ -14,8 +14,10 @@
     campaignCreatePatch,
     type Campaign,
     type Device
+  ,
+    type Schedule
   } from '$lib/software/model';
-  import { formatDuration, parseDuration } from '$lib/software/time';
+  import { formatDuration, formatLocalTime } from '$lib/software/time';
 
   let {
     data
@@ -23,53 +25,38 @@
     data: {
       devices: Device[];
       campaigns: Campaign[];
+      schedules: Schedule[];
       loadError: string;
     };
   } = $props();
 
-  interface WindowDraft {
-    id: number;
-    start: string;
-    duration: string;
-  }
 
   let name = $state('');
   let targetRelease = $state('');
   let imageUrl = $state('');
   let allowStaging = $state(false);
   let members = $state<string[]>([]);
-  let windows = $state<WindowDraft[]>([]);
+  let defaultSchedule = $state('');
   let deadline = $state('');
   let targetRate = $state('');
   let maxRate = $state('');
   let nextWindowId = 0;
+
+  function scheduleRules(s: Schedule): string {
+    if (s.windows.length === 0) return 'no windows';
+    return s.windows
+      .map(
+        (w) =>
+          `${w.days.length > 0 ? w.days.join(',') + ' ' : 'daily '}${formatLocalTime(w.at, s.utcOffset)} for ${formatDuration(w.duration)}`
+      )
+      .join(' · ');
+  }
 
   let touched = $state(false);
   let validationKey = $state(0);
   let creating = $state(false);
   let statusMessage = $state<string>(untrack(() => data.loadError));
 
-  function addWindow(): void {
-    // A new window opens when the previous one closes.
-    const last = windows[windows.length - 1];
-    const lastEnd = last ? (parseDuration(last.start) ?? 0) + (parseDuration(last.duration) ?? 0) : 0;
-    windows = [
-      ...windows,
-      {
-        id: nextWindowId++,
-        start: lastEnd > 0 ? formatDuration(lastEnd) : '0',
-        duration: last?.duration ?? '1h'
-      }
-    ];
-  }
-
-  function removeWindow(id: number): void {
-    windows = windows.filter((w) => w.id !== id);
-  }
-
-  function patchWindow(id: number, partial: Partial<WindowDraft>): void {
-    windows = windows.map((w) => (w.id === id ? { ...w, ...partial } : w));
-  }
 
   let errors = $derived.by(() => {
     const e: Record<string, string> = {};
@@ -86,24 +73,12 @@
       e['device'] = 'Select at least one device.';
     }
     const starts = new Set<number>();
-    for (const w of windows) {
-      const start = parseDuration(w.start);
-      const duration = parseDuration(w.duration);
-      if (start === null) {
-        e[`window-${w.id}-start`] = 'An offset like 0, 30m or 2h.';
-      } else if (starts.has(start)) {
-        e[`window-${w.id}-start`] = 'Two windows open at the same offset.';
-      } else {
-        starts.add(start);
-      }
-      if (duration === null || duration === 0) {
-        e[`window-${w.id}-duration`] = 'A duration like 30m or 2h.';
-      }
-    }
     if (deadline.trim()) {
-      const d = parseDuration(deadline);
-      if (d === null || d === 0) {
-        e['deadline'] = 'An offset like 4h or 1d.';
+      const d = Date.parse(deadline);
+      if (Number.isNaN(d)) {
+        e['deadline'] = 'A date and time.';
+      } else if (d <= Date.now()) {
+        e['deadline'] = 'The deadline is in the past.';
       }
     }
     for (const [key, text] of [
@@ -136,11 +111,8 @@
           imageUrl,
           devices: members,
           allowStaging,
-          windows: windows.map((w) => ({
-            start: parseDuration(w.start) ?? 0,
-            duration: parseDuration(w.duration) ?? 0
-          })),
-          deadline: deadline.trim() ? parseDuration(deadline) : null,
+          defaultSchedule: defaultSchedule || undefined,
+          deadline: deadline.trim() ? Math.floor(Date.parse(deadline) / 1000) : null,
           targetRate: targetRate.trim() ? Number(targetRate) : null,
           maxRate: maxRate.trim() ? Number(maxRate) : null
         })
@@ -224,67 +196,31 @@
 <section class="card">
   <Section
     title="When"
-    description="Maintenance windows and pace. Offsets count from the moment the campaign is set to run."
-    yangPath="software:software/upgrade-campaign/window"
+    description="The shared maintenance schedule for members without a binding of their own, and the pace. Bound devices always follow their own schedule."
+    yangPath="software:software/upgrade-campaign/default-schedule"
   >
-    {#if windows.length === 0}
-      <p class="note">
-        No windows: the planner uses one window sized for the target rate and places every
-        device in it.
-      </p>
-    {/if}
-    {#each windows as w (w.id)}
-      <div class="window-row">
-        <FieldText
-          label="Opens after"
-          required={true}
-          value={w.start}
-          error={visibleErrors[`window-${w.id}-start`]}
-          {validationKey}
-          yangType="uint32"
-          mono={true}
-          placeholder="0, 30m, 2h"
-          onchange={(v) => patchWindow(w.id, { start: v })}
-          ontouch={() => (touched = true)}
-        />
-        <FieldText
-          label="Lasts"
-          required={true}
-          value={w.duration}
-          error={visibleErrors[`window-${w.id}-duration`]}
-          {validationKey}
-          yangType="uint32"
-          mono={true}
-          placeholder="1h"
-          onchange={(v) => patchWindow(w.id, { duration: v })}
-          ontouch={() => (touched = true)}
-        />
-        <button
-          class="btn btn-ghost btn-sm remove"
-          type="button"
-          aria-label="Remove window"
-          onclick={() => removeWindow(w.id)}
-        >
-          ✕
-        </button>
-      </div>
-    {/each}
-    <div>
-      <button class="btn btn-secondary btn-sm" type="button" onclick={addWindow}>Add window</button>
-    </div>
+    <label class="field">
+      <span class="field-label">Default schedule</span>
+      <select class="input" bind:value={defaultSchedule} onchange={() => (touched = true)}>
+        <option value="">none — one always-open window</option>
+        {#each data.schedules as s (s.name)}
+          <option value={s.name}>{s.name} — {scheduleRules(s)}</option>
+        {/each}
+      </select>
+    </label>
     <div class="grid-3">
-      <FieldText
-        label="Deadline"
-        value={deadline}
-        error={visibleErrors['deadline']}
-        {validationKey}
-        yangType="uint32"
-        mono={true}
-        placeholder="none"
-        help="Finish by this offset. Windows are cut at it and the needed rate is computed backwards from it."
-        onchange={(v) => (deadline = v)}
-        ontouch={() => (touched = true)}
-      />
+      <label class="field">
+        <span class="field-label">Deadline</span>
+        <input
+          class="input mono"
+          type="datetime-local"
+          bind:value={deadline}
+          onchange={() => (touched = true)}
+        />
+        {#if visibleErrors['deadline']}
+          <span class="field-error">{visibleErrors['deadline']}</span>
+        {/if}
+      </label>
       <FieldText
         label="Target rate"
         value={targetRate}
@@ -359,17 +295,7 @@
     gap: 12px;
   }
 
-  .window-row {
-    display: grid;
-    grid-template-columns: minmax(140px, 1fr) minmax(140px, 1fr) auto;
-    gap: 12px;
-    align-items: start;
-  }
 
-  .remove {
-    /* Line up with the inputs under the field labels. */
-    margin-top: 24px;
-  }
 
   .note {
     margin: 0;
