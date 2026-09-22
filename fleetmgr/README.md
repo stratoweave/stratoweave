@@ -53,6 +53,27 @@ for the window. The processes use these ports:
     fleetmgr         18200         12900
     flotilla-1..10   18201..18210  12901..12910
 
+`just demo-fleet` is the same demo with a generated fleet, a hundred devices
+by default or `just demo-fleet 1000` for more: `cpe-0001` onwards, spread
+round-robin over the flotillas with quick eight-second installs, three
+regional schedules, europe, americas and asia, whose one-hour windows open
+half a minute, a minute and a half and two and a half minutes after the top
+starts, and `fleet-upgrade`, a planned campaign over all of them. The
+positional knobs are the device count, the target and maximum rate in
+devices per hour, the failing share in percent, the install duration in
+seconds or a range, the window length in seconds, and which schedules open
+soon rather than at their local midnight. `just demo-big` is `just
+demo-fleet 1000 250 500 10 120-150 14400 europe`: a thousand devices with
+`demo.xml`'s knobs, 120 to 150 s installs and a tenth failing one of the
+five ways, picked by a fixed shuffle so the grids show no pattern, in
+four-hour windows at a quarter of the fleet per hour, where only europe
+opens right away and americas and asia wait for their midnight, as a real
+fleet's windows would. The files land in `out/`; a thousand devices come up
+in about half a minute and take about a gigabyte of memory. `just
+demo-reschedule` reopens a running demo's windows shortly; give it the same
+window length and schedule list, `just demo-reschedule 14400 europe` for the
+big demo.
+
 For bottom-node development, `just flotilla` still starts one standalone
 instance on the first flotilla's ports. Do not run it alongside `just demo`.
 
