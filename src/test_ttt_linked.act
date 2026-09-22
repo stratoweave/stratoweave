@@ -1,9 +1,13 @@
-"""Tests for linked subscription changes across transactions.
+"""Tests for how updates from linked transforms change a subscriber's input.
 
-A subscription added by an aborted transaction must not become active.
-Removing one tag must leave the subscriber's other tags in place.
-Deleting a subscriber must clear its links so recreating it requests
-fresh publisher state.
+Each publisher sends its complete current state. The subscriber replaces
+the state it previously received from that publisher, removing any leaves
+omitted from the update. For example, if an update includes a device name
+but no longer includes its address, the old address must disappear from
+the subscriber's linked input.
+
+The tests cover repeated updates, empty publisher state, and changes to
+the subscriber's set of links.
 """
 
 import testing
@@ -39,6 +43,225 @@ def update(name: str, children: dict[gdata.Id, gdata.Node], tag: str="peer") -> 
 
 def subscriptions(names: list[str]) -> list[ttt.TaggedPath]:
     return [ttt.TaggedPath("peer", address(name)) for name in names]
+
+
+class LinkedOutput(ttt.TransformFunction):
+    def transform_wrapper(self, cfg, linked, memory, dynstate):
+        return linked, None
+
+
+actor Scenario(t: testing.AsyncT, steps: list[(subscriptions: list[ttt.TaggedPath], updates: list[ttt.LinkUpdate], expected: gdata.Node)]):
+    sink_node = ttt.Transform(ttt.TransformFunction)(ttt.PathRoot("sink"), None)
+    sink = sink_node.newtrans()
+    out = ttt.Session("out", sink_node, None, None)
+    var step = 0
+
+    def build_links(cfg: gdata.Node) -> list[ttt.TaggedPath]:
+        index = cfg.get_leaf(q("step")).val
+        if isinstance(index, int):
+            return steps[index].subscriptions
+        raise ValueError("Missing scenario step")
+
+    tx = ttt.TransformTransaction(ttt.PathRoot("subscriber"), LinkedOutput, build_links, None, None)
+
+    def committed(_result: value):
+        testing.assertEqual(sink.get(), steps[step].expected)
+        step += 1
+        if step == len(steps):
+            t.success()
+        else:
+            run()
+
+    def sink_locked(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        tx.commit(str(step), True)
+        sink.commit(str(step), True)
+        sink.wait_complete(str(step), committed)
+
+    def locked(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        await async out.apply(str(step))
+        sink.lock(str(step), None, sink_locked)
+
+    def run():
+        case = steps[step]
+        result = tx.configure(str(step), {"test": gdata.Container({q("step"): gdata.Leaf(step)})}, out)
+        testing.assertEqual(len(result.errors), 0)
+        result = tx.linkage(str(step), [], case.updates, out)
+        testing.assertEqual(len(result.errors), 0)
+        tx.lock(str(step), out, locked)
+
+    run()
+
+
+actor updates_replace_complete_subtrees(t: testing.AsyncT):
+    links = subscriptions(["a", "b", "c"])
+    Scenario(t, [
+        (subscriptions=links, updates=[
+            update("a", {q("old"): gdata.Leaf(1)}),
+            update("b", {q("value"): gdata.Leaf(2)}),
+            update("c", {q("keep"): gdata.Leaf(3)}),
+        ], expected=devices([
+            device("a", {q("old"): gdata.Leaf(1)}),
+            device("b", {q("value"): gdata.Leaf(2)}),
+            device("c", {q("keep"): gdata.Leaf(3)}),
+        ])),
+        (subscriptions=links, updates=[
+            update("a", {q("intermediate"): gdata.Leaf(10)}),
+            update("b", {q("value"): gdata.Leaf(20)}),
+            update("a", {q("latest"): gdata.Leaf(30)}),
+        ], expected=devices([
+            device("a", {q("latest"): gdata.Leaf(30)}),
+            device("b", {q("value"): gdata.Leaf(20)}),
+            device("c", {q("keep"): gdata.Leaf(3)}),
+        ])),
+    ])
+
+
+actor only_candidate_subscriptions_contribute(t: testing.AsyncT):
+    Scenario(t, [
+        (subscriptions=subscriptions(["a", "b"]), updates=[update("a", {}), update("b", {})],
+         expected=devices([device("a"), device("b")])),
+        (subscriptions=subscriptions(["b"]), updates=[
+            update("a", {q("removed"): gdata.Leaf(1)}),
+            update("b", {q("value"): gdata.Leaf(2)}),
+            update("b", {q("wrong-tag"): gdata.Leaf(3)}, tag="other"),
+            update("c", {q("unsubscribed"): gdata.Leaf(4)}),
+        ], expected=devices([device("b", {q("value"): gdata.Leaf(2)})])),
+        (subscriptions=[], updates=[], expected=gdata.Container()),
+    ])
+
+
+actor empty_update_removes_previous_state(t: testing.AsyncT):
+    path = gdata.FNode(q("settings"))
+    links = [ttt.TaggedPath("peer", path)]
+    initial = gdata.Container({q("settings"): gdata.Container({q("asn"): gdata.Leaf(1)})})
+    Scenario(t, [
+        (subscriptions=links, updates=[ttt.LinkUpdate("peer", path, gdata.FNode(), initial)], expected=initial),
+        (subscriptions=links, updates=[ttt.LinkUpdate("peer", path, gdata.FNode(), gdata.Container())], expected=gdata.Container()),
+    ])
+
+
+actor tags_share_one_publisher_contribution(t: testing.AsyncT):
+    peer = ttt.TaggedPath("peer", address("a"))
+    other = ttt.TaggedPath("other", address("a"))
+    fields: dict[gdata.Id, gdata.Node] = {q("values"): gdata.LeafList([gdata.LeafListEntryMerge(1), gdata.LeafListEntryMerge(2)])}
+    expected = devices([device("a", fields)])
+    Scenario(t, [
+        (subscriptions=[peer, other], updates=[update("a", fields), update("a", fields, "other")], expected=expected),
+        # Removing one tag must retain the publisher even without a new update.
+        (subscriptions=[other], updates=[], expected=expected),
+        (subscriptions=[], updates=[], expected=gdata.Container()),
+    ])
+
+
+actor publisher_removal_and_readdition_rebuilds_pairs(t: testing.AsyncT):
+    Scenario(t, [
+        (subscriptions=subscriptions(["a", "b", "c", "d"]),
+         updates=[update(name, {}) for name in ["a", "b", "c", "d"]],
+         expected=devices([device(name) for name in ["a", "b", "c", "d"]])),
+        # C and D now occupy the cached positions previously used by A and B.
+        (subscriptions=subscriptions(["c", "d"]), updates=[],
+         expected=devices([device("c"), device("d")])),
+        (subscriptions=subscriptions(["a", "c", "d"]),
+         updates=[update("a", {q("new"): gdata.Leaf(1)})],
+         expected=devices([device("a", {q("new"): gdata.Leaf(1)}), device("c"), device("d")])),
+    ])
+
+
+class CheckLinkedReuse(ttt.TransformFunction):
+    previous: ?gdata.Node
+
+    def __init__(self, log_handler=None):
+        ttt.TransformFunction.__init__(self, log_handler)
+        self.previous = None
+
+    def transform_wrapper(self, cfg, linked, memory, dynstate):
+        previous = self.previous
+        if previous is not None:
+            testing.assertTrue(ttt.same_node(previous, linked))
+        self.previous = linked
+        return linked, None
+
+
+actor unchanged_publishers_reuse_merged_input(t: testing.AsyncT):
+    links = subscriptions(["a", "b", "c"])
+    tx = ttt.TransformTransaction(ttt.PathRoot("subscriber"), CheckLinkedReuse, lambda cfg: links, None, None)
+
+    def loaded(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        tx.commit("load", True)
+        # Changing only ordinary config must reuse the linked tree, including
+        # the result retained by commit after the previous computation.
+        result = tx.configure("edit", {"test": gdata.Container({q("step"): gdata.Leaf(1)})}, None)
+        testing.assertEqual(len(result.errors), 0)
+        tx.lock("edit", None, edited)
+
+    def edited(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        tx.commit("edit", True)
+        tx.wait_complete("edit", lambda result: t.success())
+
+    tx.configure("load", {"test": gdata.Container({q("step"): gdata.Leaf(0)})}, None)
+    result = tx.linkage("load", [], [update("a", {}), update("b", {}), update("c", {})], None)
+    testing.assertEqual(len(result.errors), 0)
+    tx.lock("load", None, loaded)
+
+
+actor linked_commit_rebases_pending_updates_and_discards_aborts(t: testing.AsyncT):
+    links = subscriptions(["a", "b", "c"])
+    a0 = device("a", {q("value"): gdata.Leaf(0)})
+    a1 = device("a", {q("value"): gdata.Leaf(1)})
+    b0 = device("b", {q("value"): gdata.Leaf(0)})
+    b2 = device("b", {q("value"): gdata.Leaf(2)})
+    c0 = device("c", {q("value"): gdata.Leaf(0)})
+    sink_node = ttt.Transform(ttt.TransformFunction)(ttt.PathRoot("sink"), None)
+    sink = sink_node.newtrans()
+    outs = {tid: ttt.Session(tid, sink_node, None, None) for tid in ["load", "first", "second", "abort", "last"]}
+    tx = ttt.TransformTransaction(ttt.PathRoot("subscriber"), LinkedOutput, lambda cfg: links, None, None)
+
+    def sink_locked(tid: str, result: ttt.CfgResult, done: action(value) -> None):
+        testing.assertEqual(len(result.errors), 0)
+        tx.commit(tid, True)
+        sink.commit(tid, True)
+        sink.wait_complete(tid, done)
+
+    def flush(tid: str, result: ttt.CfgResult, done: action(value) -> None):
+        testing.assertEqual(len(result.errors), 0)
+        await async outs[tid].apply(tid)
+        sink.lock(tid, None, lambda result: sink_locked(tid, result, done))
+
+    def loaded(result: value):
+        testing.assertEqual(sink.get().prsrc(True), devices([a0, b0, c0]).prsrc(True), "load")
+        # Both transactions compute against the initial publisher map.
+        tx.linkage("first", [], [update("a", {q("value"): gdata.Leaf(1)})], outs["first"])
+        tx.linkage("second", [], [update("b", {q("value"): gdata.Leaf(2)})], outs["second"])
+        tx.lock("first", outs["first"], lambda result: flush("first", result, first_committed))
+
+    def first_committed(result: value):
+        testing.assertEqual(sink.get().prsrc(True), devices([a1, b0, c0]).prsrc(True), "first")
+        # The second lock must combine its B update with committed A.
+        tx.lock("second", outs["second"], lambda result: flush("second", result, second_committed))
+
+    def second_committed(result: value):
+        testing.assertEqual(sink.get().prsrc(True), devices([a1, b2, c0]).prsrc(True), "second")
+        tx.linkage("abort", [], [update("c", {q("value"): gdata.Leaf(99)})], outs["abort"])
+        tx.lock("abort", outs["abort"], abort_locked)
+
+    def abort_locked(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        tx.commit("abort", False)
+        # A later config edit exposes any accidentally retained aborted update.
+        tx.configure("last", {"test": gdata.Container({q("step"): gdata.Leaf(1)})}, outs["last"])
+        tx.lock("last", outs["last"], lambda result: flush("last", result, last_committed))
+
+    def last_committed(result: value):
+        testing.assertEqual(sink.get().prsrc(True), devices([a1, b2, c0]).prsrc(True), "after abort")
+        t.success()
+
+    tx.configure("load", {"test": gdata.Container({q("step"): gdata.Leaf(0)})}, outs["load"])
+    tx.linkage("load", [], [update(name, {q("value"): gdata.Leaf(0)}) for name in ["a", "b", "c"]], outs["load"])
+    tx.lock("load", outs["load"], lambda result: flush("load", result, loaded))
 
 
 class CheckRecreatedSubscriber(ttt.TransformFunction):
