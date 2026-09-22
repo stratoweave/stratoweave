@@ -137,9 +137,19 @@ mut def mmerge(cfg_per_src: dict[str, gdata.Node], memo: dict[(str, str), (left:
             del memo[key]
         return merge(cfg_per_src)
     work = [(src, cfg_per_src[src]) for src in sorted(cfg_per_src.keys())]
-    pairs: dict[(str, str), (left: gdata.Node, right: gdata.Node, result: gdata.Node)] = {}
+    return merge_pairs(work, memo)
+
+
+mut def merge_pairs[S(Hashable)](work: list[(S, gdata.Node)], memo: dict[(S, S), (left: gdata.Node, right: gdata.Node, result: gdata.Node)]) -> gdata.Node:
+    """Merge a nonempty list of trees using the supplied keys for cached pairs.
+
+    Configuration uses source names; linked input uses positions in its
+    retained publisher map. Both input pointers must match before reuse,
+    so changing which sources occupy a pair cannot reuse a stale result.
+    """
+    pairs: dict[(S, S), (left: gdata.Node, right: gdata.Node, result: gdata.Node)] = {}
     while len(work) > 1:
-        paired: list[(str, gdata.Node)] = []
+        paired: list[(S, gdata.Node)] = []
         i = 0
         while i + 1 < len(work):
             lsrc, left = work[i]
@@ -162,10 +172,6 @@ mut def mmerge(cfg_per_src: dict[str, gdata.Node], memo: dict[(str, str), (left:
     memo.update(pairs.items())
     return work[0].1
 
-
-def prune(data: gdata.Node, filt: gdata.FNode) -> gdata.Node:
-    res =  gdata.prune(data, gdata.FNode(children=[filt]))
-    return res if res is not None else gdata.Container()
 
 class TaggedPath():
     def __init__(self, tag: str, path: gdata.FNode):
@@ -201,6 +207,12 @@ class LinkRequest():
                "\n            status=" + str(self.status) + ")"
 
 class LinkUpdate():
+    """A publisher's complete configuration for one tagged subscription.
+
+    The configuration is rooted at the publisher's path within the layer.
+    It replaces that publisher's previous contribution; data omitted from
+    the new configuration disappears from the subscriber's linked input.
+    """
     def __init__(self, tag: str, publisher: gdata.FNode, subscriber: gdata.FNode, config: gdata.Node):
         self.tag = tag
         self.publisher = publisher
@@ -326,7 +338,7 @@ def path_route(p: Path, tails: list[gdata.FNode]=[]) -> gdata.FNode:
 # the convention used by build_target_links, gdata.filter and gdata.prune,
 # which reject the unnamed-entry form (they require named children). A transform
 # advertises itself as a link publisher with this (filter_fpath) so it matches
-# the subscriber's generated demand and can be pruned from the linked tree.
+# the subscriber's generated demand and identifies its retained contribution.
 # Sibling path_route() renders the same Path in routing form.
 def path_filter(p: Path, tails: list[gdata.FNode]=[]) -> gdata.FNode:
     if isinstance(p, PathElem):
@@ -2539,7 +2551,10 @@ class _TransformTransactionBase(_Transaction):
     locker: ?str
     pending: list[(Transaction, str, ?Session, action(CfgResult)->None, ?swdb.Buffer)]
 
-    linked: gdata.Node                                          # Active linked cfg tree per link tag
+    linked: dict[gdata.FNode, gdata.Node]                       # Committed configuration per publisher path
+    merged_linked: gdata.Node                                  # Combined input delivered to the transform
+    linked_merge_memo: dict[(int, int), (left: gdata.Node, right: gdata.Node, result: gdata.Node)]
+    candidate_linked: dict[str, (dict[gdata.FNode, gdata.Node], gdata.Node)]
     candidate_link_updates: dict[str, list[LinkUpdate]]         # Link updates received, per ongoing transaction
     subscriptions: set[TaggedPath]                              # Active linked data publishers (with tag)
     candidate_subscriptions: dict[str, set[TaggedPath]]         # As above, per ongoing transaction
@@ -2575,7 +2590,10 @@ class _TransformTransactionBase(_Transaction):
         self.locker = None
         self.pending = []
         self.oper_subscriptions = {}
-        self.linked = gdata.Container()
+        self.linked = {}
+        self.merged_linked = gdata.Container()
+        self.linked_merge_memo = {}
+        self.candidate_linked = {}
         self.candidate_link_updates = {}
         self.subscriptions = set()
         self.candidate_subscriptions = {}
@@ -2606,11 +2624,18 @@ class _TransformTransactionBase(_Transaction):
 
         if newconf == {}:
             self.merge_memo = {}
+            self.linked_merge_memo = {}
+            self.candidate_linked[tid] = ({}, gdata.Container())
             self.essays[tid] = (None, None) # TODO: do we want to keep memory?
             #print('   #', tid, '(Transform)', _format_path(self.path), 'EMPTY CONFIG', err=True)
             self.clear(tid, out)
             self.stage_db_state(tid, dbuf)
-            req = [ LinkRequest(s.tag,s.path,self.route_fpath,False) for s in self.subscriptions ]
+            subscriptions = self.candidate_subscriptions.get_def(tid, self.subscriptions)
+            req = [ LinkRequest(s.tag,s.path,self.route_fpath,False) for s in subscriptions ]
+            # An update can arrive before the commit that establishes its
+            # subscription. Leave an unknown subscription view unset.
+            if subscriptions:
+                self.candidate_subscriptions[tid] = set()
             upd = self.link_updates(tid, gdata.Container())
             return CfgOk(empty=True, requests=req, updates=upd)
         else:
@@ -2621,8 +2646,9 @@ class _TransformTransactionBase(_Transaction):
 #                assert self.validate(merged)
                 req = self.link_requests(tid, merged)
                 upd = self.link_updates(tid, merged)
+                linked_sources, linked = self.linked_for(tid)
+                self.candidate_linked[tid] = (linked_sources, linked)
                 if not req:
-                    linked = self.linked_for(tid)
                     outmem = self.compute(tid, merged, linked, out)
                     self.essays[tid] = outmem
                     newout = outmem.0
@@ -2646,30 +2672,47 @@ class _TransformTransactionBase(_Transaction):
                     req.append(LinkRequest(s.tag, s.path, self.route_fpath, True))
                 for s in cand_subs - latest_subs:
                     req.append(LinkRequest(s.tag, s.path, self.route_fpath, False))
-            self.candidate_subscriptions[tid] = latest_subs
+                self.candidate_subscriptions[tid] = latest_subs
+            else:
+                self.candidate_subscriptions[tid] = cand_subs
         #print('####', tid, '(Transform)', _format_path(self.path), 'link_requests:', len(req), err=True)
         return req
 
-    # The linked tree a transaction computes with is derived on use from the
-    # committed base: subscriptions dropped by the transaction are pruned, and
-    # the updates it has received are applied on top, each one replacing the
-    # publisher's subtree since a publisher resends its full state on every
-    # change. Updates from publishers outside the transaction's subscription
-    # view are ignored. Deriving late rather than snapshotting keeps a
-    # transaction correct when a concurrent commit replaces the committed base
-    # after updates were received: the lock-time re-configure then recomputes
-    # against the new base with the received updates still in effect.
     def linked_for(self, tid):
+        """Build a publisher map and its merged input for this transaction.
+
+        Each update is the publisher's complete rooted configuration, so it
+        replaces one map entry. Retain a publisher while any current link
+        tag refers to it. Merge each publisher once, regardless of how many
+        tags refer to it, and reuse cached pairs of unchanged trees.
+
+        Start from the current committed map on every call. Another
+        transaction may have committed since these updates arrived; the
+        lock-time recomputation must preserve that transaction's changes
+        to other publishers.
+        """
         subscriptions = self.candidate_subscriptions.get_def(tid, self.subscriptions)
-        linked = self.linked
-        if subscriptions != self.subscriptions:
-            for s in self.subscriptions:
-                if s not in subscriptions:
-                    linked = prune(linked, s.path)
-        for u in self.candidate_link_updates.get_def(tid, []):
-            if TaggedPath(u.tag, u.publisher) in subscriptions:
-                linked = gdata.merge(prune(linked, u.publisher), u.config)
-        return linked
+        updates = self.candidate_link_updates.get_def(tid, [])
+        # link_requests retains the subscription set when membership is
+        # unchanged. Avoid scanning publisher paths in that common case.
+        if same_node(subscriptions, self.subscriptions):
+            if not updates:
+                return self.linked, self.merged_linked
+            linked = dict(self.linked.items())
+        else:
+            publishers = {subscription.path for subscription in subscriptions}
+            linked = {path: tree for path, tree in self.linked.items() if path in publishers}
+        for update in updates:
+            if TaggedPath(update.tag, update.publisher) in subscriptions:
+                linked[update.publisher] = update.config
+        if not linked:
+            self.linked_merge_memo = {}
+            return linked, gdata.Container()
+        # Replacing entries preserves publisher order. Use their positions
+        # to locate cached pairs; pointer checks also cover source removals
+        # and insertions that change which publishers occupy those positions.
+        merged = merge_pairs(list(enumerate(linked.values())), self.linked_merge_memo)
+        return linked, merged
 
     def link_updates(self, tid, merged):
         cand_subscribers = self.candidate_subscribers.get_def(tid, self.subscribers)
@@ -2685,7 +2728,7 @@ class _TransformTransactionBase(_Transaction):
     def linkage(self, tid, requests, updates, out, dbuf):
         #print('####', tid, '(Transform)', _format_path(self.path), 'linkage:', len(requests), len(updates), err=True)
         if requests:
-            subscribers = self.candidate_subscribers.get_def(tid, self.subscribers)
+            subscribers = list(self.candidate_subscribers.get_def(tid, self.subscribers))
             new_subscribers = []
             for r in requests:
                 if r.status:
@@ -2693,7 +2736,8 @@ class _TransformTransactionBase(_Transaction):
                     subscribers.append(new_subscriber)
                     new_subscribers.append(new_subscriber)
                 else:
-                    subscribers = list(filter(lambda s: s.path != r.subscriber, subscribers))
+                    removed = TaggedPath(r.tag, r.subscriber)
+                    subscribers = [s for s in subscribers if s != removed]
             self.candidate_subscribers[tid] = subscribers
             if not updates and tid not in self.diffs:
                 # This publisher is untouched in this transaction: only its
@@ -2775,7 +2819,7 @@ class _TransformTransactionBase(_Transaction):
         self.diffs.pop_def(tid, {})
         candidate, merged = self.candidates.pop_def(tid, ({}, None))
         essay = self.essays.pop_def(tid, (None, None))
-        linked = self.linked_for(tid)
+        linked, merged_linked = self.candidate_linked.pop_def(tid, (self.linked, self.merged_linked))
         self.candidate_link_updates.pop_def(tid, [])
         subscriptions = self.candidate_subscriptions.pop_def(tid, self.subscriptions)
         subscribers = self.candidate_subscribers.pop_def(tid, self.subscribers)
@@ -2788,12 +2832,14 @@ class _TransformTransactionBase(_Transaction):
                     self.oper = None
                 self.memory = essay.1 if essay is not None else None
                 self.linked = linked
+                self.merged_linked = merged_linked
                 self.subscriptions = subscriptions
                 self.subscribers = subscribers
                 #print('   #', tid, '(Transform)', _format_path(self.path), 'COMMITTING\n' + per_src(candidate), err=True)
                 if self.candidates:
                     #print('   #', tid, '(Transform)', _format_path(self.path), 'INVALIDATING', set(self.candidates.keys()), err=True)
                     self.candidates = {}
+                    self.candidate_linked = {}
                 self.finalize(tid)
             else:
                 #print('   #', tid, '(Transform)', _format_path(self.path), 'ABORTING', err=True)
@@ -3012,11 +3058,11 @@ class _TransformTransaction(_TransformTransactionBase):
         # state so a re-add of the same config is delivered again.
         if self.running:
             conf = self.get()
-            if conf != self.delivered_conf or self.linked != self.delivered_linked or self.memory != self.delivered_memory:
+            if conf != self.delivered_conf or self.merged_linked != self.delivered_linked or self.memory != self.delivered_memory:
                 self.delivered_conf = conf
-                self.delivered_linked = self.linked
+                self.delivered_linked = self.merged_linked
                 self.delivered_memory = self.memory
-                self.function.on_conf(conf, self.linked, self.memory)
+                self.function.on_conf(conf, self.merged_linked, self.memory)
         else:
             self.delivered_conf = None
             self.delivered_linked = None
@@ -3200,7 +3246,7 @@ class _RFSTransaction(_TransformTransactionBase):
             if conf != self.delivered_conf or self.memory != self.delivered_memory:
                 self.delivered_conf = conf
                 self.delivered_memory = self.memory
-                self.function.on_conf(conf, self.linked, self.memory)
+                self.function.on_conf(conf, self.merged_linked, self.memory)
         else:
             self.delivered_conf = None
             self.delivered_memory = None
