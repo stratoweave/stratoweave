@@ -16,6 +16,8 @@ from stratoweave.device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
     stratoweave_rfs__device__credentials as Credentials, \
     stratoweave_rfs__device__mock as Mock
+from fleetmgr.layers.y_1 import \
+    stratoweave_rfs__rfs__device__credentials as InputCredentials
 
 
 mut def telemetry(states: list[(str, str)]) -> gdata.Node:
@@ -154,98 +156,122 @@ actor _test_generated_oper_on_change(t: testing.EnvT):
     GeneratedOperDelivery(t, True)
 
 
-actor _test_flotilla_collector_instances(t: testing.EnvT):
-    """The real collector keeps siblings, clears removed leaves and instances,
-    and closes its stream on disable and shutdown. Its initial publication
-    contains the whole replay, and unrelated job updates produce no output."""
-    dev = new_device(t, "collector", True)
+def device_path(flotilla: str, name: str) -> ttt.Path:
+    """Return the path of one device entry under /rfs, as TTT builds it."""
+    rfs = ttt.PathElem(gdata.Id(y1_oper.NS_stratoweave_rfs, "rfs"), ttt.PathRoot("root"))
+    shard = ttt.PathKey(flotilla, rfs, {gdata.Id(y1_oper.NS_stratoweave_rfs, "name"): gdata.Leaf(flotilla)})
+    device = ttt.PathElem(gdata.Id(y1_oper.NS_fleetmgr_rfs, "device"), shard)
+    return ttt.PathKey(name, device, {gdata.Id(y1_oper.NS_fleetmgr_rfs, "name"): gdata.Leaf(name)})
+
+
+mut def device_conf(name: str) -> gdata.Node:
+    return y_1.stratoweave_rfs__rfs__device_entry(
+        name=name, type="iosxe", credentials=InputCredentials(username="admin")).to_gdata()
+
+
+mut def software(states: list[(str, ?str, ?str)]) -> gdata.Node:
+    """Build the flotilla oper tree: one (name, status, running release) per device."""
+    root = oper.root()
+    for name, status, release in states:
+        device = root.device.create(name, description="not selected")
+        device.software.state.status = status
+        device.software.state.running_release = release
+    return root.to_gdata()
+
+
+mut def published(data: ?gdata.Node) -> str:
+    """Describe one publication of the device actor: the device name, status
+    and running release, or "cleared"."""
+    if data is not None:
+        entry = y1_oper.stratoweave_rfs__rfs__device_entry.from_gdata(data)
+        if entry.type is not None or entry.description is not None:
+            return "config of {entry.name}"
+        state = entry.software.state
+        return "{entry.name} {state.status} {state.running_release}"
+    return "cleared"
+
+
+actor _test_device_status_instance(t: testing.EnvT):
+    """The device actor publishes the state of its own device and nothing else.
+    It clears the state when the device loses it and when the actor shuts down.
+    A new configuration after shutdown starts from the current state."""
+    dev = new_device(t, "device-status", True)
     var server: ?netconf.NetconfMockServer = None
-    var collector: ?ttt.TransformActor = None
+    var device: ?ttt.TransformActor = None
     var phase = 0
     var done = False
 
     def fail(message: str):
         if not done:
             done = True
-            if collector is not None:
-                collector!.shutdown(None)
+            d = device
+            if d is not None:
+                d.shutdown(None)
             t.failure(ValueError(message))
 
-    def source(job_status: str) -> gdata.Node:
-        tree = oper.root.from_gdata(telemetry([("a", "succeeded"), ("b", "in-progress")]))
-        tree.device["a"].software.state.running_release = None
-        tree.device.create("jobs-only").software.state.job.create("install", state=job_status)
-        return tree.to_gdata()
-
-    def remove_first():
-        if not done and phase == 2:
-            phase = 3
-            server!.set_oper_ds(telemetry([("b", "in-progress")]))
+    def change_a():
+        if not done and phase == 1:
+            phase = 2
+            tree = oper.root.from_gdata(software([("a", "succeeded", None), ("b", "succeeded", "1.0")]))
+            tree.device["a"].software.state.job.create("install", state="done")
+            server!.set_oper_ds(tree.to_gdata())
 
     def restart():
         if not done and phase == 6:
             phase = 7
-            conf = y_1.stratoweave_rfs__rfs__flotilla_status(enabled=True).to_gdata()
-            collector!.on_conf(conf, gdata.Container(), None)
-            collector!.on_conf(conf, gdata.Container(), None)
+            device!.on_conf(device_conf("a"), gdata.Container(), None)
+            device!.on_conf(device_conf("a"), gdata.Container(), None)
 
     def finish():
-        if not done and phase == 9:
+        if not done and phase == 8:
             done = True
+            device!.shutdown(None)
             t.success()
 
     def on_oper(data: ?gdata.Node):
         if done:
             return
-        state = y1_oper.stratoweave_rfs__rfs__flotilla_status.from_gdata(data) if data is not None else None
-        got: dict[str, (?str, ?str)] = {}
-        if state is not None:
-            got = {d.name: (d.status, d.running_release) for d in state.state.device}
+        got = published(data)
         if phase == 0:
-            if state is None or got != {"a": ("in-progress", "1.0"), "b": ("in-progress", "1.0")}:
-                fail("initial publication preceded the complete replay: {got}")
+            if got != "a in-progress 1.0":
+                fail("first publication is not the current state: {got}")
                 return
             phase = 1
-            server!.set_oper_ds(source("running"))
-        elif phase == 1:
-            if state is None or got != {"a": ("succeeded", None), "b": ("in-progress", "1.0")}:
-                fail("instance update lost its sibling or retained a removed leaf: {got}")
+            # Change the other device, and a job of this one: no publication.
+            tree = oper.root.from_gdata(software([("a", "in-progress", "1.0"), ("b", "succeeded", "1.0")]))
+            tree.device["a"].software.state.job.create("install", state="running")
+            server!.set_oper_ds(tree.to_gdata())
+            after 0.1: change_a()
+        elif phase == 2:
+            if got != "a succeeded None":
+                fail("change did not publish the new state: {got}")
                 return
-            phase = 2
-            server!.set_oper_ds(source("done"))
-            after 0.1: remove_first()
+            phase = 3
+            server!.set_oper_ds(software([("b", "succeeded", "1.0")]))
         elif phase == 3:
-            if state is None or got != {"b": ("in-progress", "1.0")}:
-                fail("instance removal lost its sibling: {got}")
+            if got != "cleared":
+                fail("removal on the flotilla did not clear the state: {got}")
                 return
             phase = 4
-            server!.set_oper_ds(telemetry([]))
+            server!.set_oper_ds(software([("a", "in-progress", "2.0"), ("b", "succeeded", "1.0")]))
         elif phase == 4:
-            if state is None or got != {}:
-                fail("last instance removal left stale state: {got}")
+            if got != "a in-progress 2.0":
+                fail("device did not come back: {got}")
                 return
             phase = 5
-            conf = y_1.stratoweave_rfs__rfs__flotilla_status(enabled=False).to_gdata()
-            collector!.on_conf(conf, gdata.Container(), None)
+            device!.shutdown(None)
         elif phase == 5:
-            if state is not None:
-                fail("disabling the collector did not clear its contribution")
+            if got != "cleared":
+                fail("shutdown did not clear the state: {got}")
                 return
             phase = 6
-            server!.set_oper_ds(telemetry([("c", "succeeded")]))
+            server!.set_oper_ds(software([("a", "succeeded", "2.0")]))
             after 0.1: restart()
         elif phase == 7:
-            if state is None or got != {"c": ("succeeded", "1.0")}:
-                fail("re-enabling did not start from the current baseline: {got}")
+            if got != "a succeeded 2.0":
+                fail("restart did not start from the current state: {got}")
                 return
             phase = 8
-            collector!.shutdown(None)
-        elif phase == 8:
-            if state is not None:
-                fail("shutdown did not clear the contribution")
-                return
-            phase = 9
-            server!.set_oper_ds(telemetry([("d", "in-progress")]))
             after 0.1: finish()
         else:
             fail("unexpected publication in phase {phase}: {got}")
@@ -254,58 +280,66 @@ actor _test_flotilla_collector_instances(t: testing.EnvT):
         adapter = dev.get_adapter()
         if isinstance(adapter, netconf.NetconfAdapter):
             server = adapter.get_mock_server()
-            server!.set_oper_ds(telemetry([("a", "in-progress"), ("b", "in-progress")]))
-            params = ttt.TransformActorParams(ttt.PathRoot("rfs"), lambda state: None, on_oper, dev)
-            collector = t_1.FlotillaStatusTransformCtor(params)
-            conf = y_1.stratoweave_rfs__rfs__flotilla_status(enabled=True).to_gdata()
-            collector!.on_conf(conf, gdata.Container(), None)
+            server!.set_oper_ds(software([("a", "in-progress", "1.0"), ("b", "in-progress", "1.0")]))
+            params = ttt.TransformActorParams(device_path("flotilla-1", "a"), lambda state: None, on_oper, dev)
+            device = t_1.DeviceTransformCtor(params)
+            device!.on_conf(device_conf("a"), gdata.Container(), None)
         else:
             fail("no NETCONF adapter")
 
     def timeout():
-        fail("collector timed out in phase {phase}")
+        fail("device actor timed out in phase {phase}")
 
     start()
     after 3: timeout()
 
 
-actor EmptyCollector(t: testing.EnvT, push: bool):
-    """An empty baseline or a failed first read still publishes empty state."""
-    dev = new_device(t, "empty-collector", push)
-    var collector: ?ttt.TransformActor = None
+actor _test_device_status_absent(t: testing.EnvT):
+    """The device actor publishes nothing until the flotilla has state for the
+    device."""
+    dev = new_device(t, "device-absent", True)
+    var server: ?netconf.NetconfMockServer = None
+    var device: ?ttt.TransformActor = None
+    var waiting = True
     var done = False
 
+    def fail(message: str):
+        if not done:
+            done = True
+            d = device
+            if d is not None:
+                d.shutdown(None)
+            t.failure(ValueError(message))
+
+    def appear():
+        if not done:
+            waiting = False
+            server!.set_oper_ds(software([("a", "in-progress", "1.0"), ("b", "in-progress", "1.0")]))
+
     def on_oper(data: ?gdata.Node):
-        if not done:
+        if done:
+            return
+        got = published(data)
+        if waiting:
+            fail("published before the device had state: {got}")
+        elif got != "a in-progress 1.0":
+            fail("device state did not arrive: {got}")
+        else:
             done = True
-            collector!.shutdown(None)
-            state = y1_oper.stratoweave_rfs__rfs__flotilla_status.from_gdata(data) if data is not None else None
-            if state is not None and len(list(state.state.device)) == 0:
-                t.success()
-            else:
-                t.failure(ValueError("empty first pass did not publish empty state"))
+            device!.shutdown(None)
+            t.success()
 
-    def timeout():
-        if not done:
-            done = True
-            collector!.shutdown(None)
-            t.failure(ValueError("empty collector timed out"))
+    def start():
+        adapter = dev.get_adapter()
+        if isinstance(adapter, netconf.NetconfAdapter):
+            server = adapter.get_mock_server()
+            server!.set_oper_ds(software([("b", "in-progress", "1.0")]))
+            params = ttt.TransformActorParams(device_path("flotilla-1", "a"), lambda state: None, on_oper, dev)
+            device = t_1.DeviceTransformCtor(params)
+            device!.on_conf(device_conf("a"), gdata.Container(), None)
+            after 0.2: appear()
+        else:
+            fail("no NETCONF adapter")
 
-    adapter = dev.get_adapter()
-    if isinstance(adapter, netconf.NetconfAdapter):
-        adapter.get_mock_server()!.set_oper_ds(telemetry([]))
-        params = ttt.TransformActorParams(ttt.PathRoot("rfs"), lambda state: None, on_oper, dev)
-        collector = t_1.FlotillaStatusTransformCtor(params)
-        conf = y_1.stratoweave_rfs__rfs__flotilla_status(enabled=True).to_gdata()
-        collector!.on_conf(conf, gdata.Container(), None)
-        after 2: timeout()
-    else:
-        t.failure(ValueError("no NETCONF adapter"))
-
-
-actor _test_flotilla_collector_empty_baseline(t: testing.EnvT):
-    EmptyCollector(t, True)
-
-
-actor _test_flotilla_collector_failed_first_read(t: testing.EnvT):
-    EmptyCollector(t, False)
+    start()
+    after 3: fail("device actor timed out")

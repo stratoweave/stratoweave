@@ -13,9 +13,9 @@ an IOS XE device.
         -> NETCONF -> flotilla RFS /device{cpe}
         -> IOS XE adapter -> physical or mock IOS XE device
 
-    flotilla operational datastore
-        -> one periodic /device/software/state subscription per flotilla
-        -> fleetmgr RFS /rfs{flotilla-1}/flotilla-status
+    flotilla operational datastore /device{cpe}/software/state
+        -> one on-change subscription per device
+        -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}/software/state
         -> fleetmgr CFS /software/upgrade-campaign/state
 
 There is no range expansion. A flotilla assigned 500 devices receives 500
@@ -151,8 +151,7 @@ BGP sessions give the devices real routing state. See `test/lab/README.md`.
 The `fleetmgr` CFS has two inventory lists:
 
 - `/fleet/node`: connection configuration for a flotilla. Its transform creates
-  the top's managed `/device` entry with device type `flotilla` and enables its
-  operational collector.
+  the top's managed `/device` entry with device type `flotilla`.
 - `/fleet/device`: complete device configuration plus a string `shard` and an
   explicit device `type`. Its
   transform writes the entry under `/rfs{shard}/device`.
@@ -169,15 +168,11 @@ resolving each member's shard before merging all software intent into the same
 RFS device entry.
 
 The RFS transform renders that entry directly into the flotilla's standard
-`/device` schema. A second RFS transform maintains one on-change subscription
-to `/device/software/state` on each flotilla. The device provider delivers each
-changed device's complete software state to the collector. The collector keeps
-the status and running release and publishes its complete normalized state,
-once after the initial replay and whenever either value changes or a device
-disappears. Disabling or removing the collector closes its subscription and
-clears its state. Campaign transforms receive individual normalized device
-statuses and aggregate their own members. This uses one southbound stream per
-flotilla.
+`/device` schema. Its actor keeps one on-change subscription to the device's
+`/device/software/state` on the flotilla, and publishes the status and running
+release as the entry's own `software/state`. A change on one device publishes
+one entry. Removing the entry closes the subscription and clears the state.
+Campaign transforms subscribe to these entries and aggregate their own members.
 
 `flotilla` supplies only one modeled layer, the standard RFS. StratoWeave adds
 the implicit device layer beneath it.
