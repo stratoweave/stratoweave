@@ -25,6 +25,11 @@ IETF_SYSTEM_YANG = r"""module ietf-system {
   yang-version "1.1";
   namespace "urn:ietf:params:xml:ns:yang:ietf-system";
   prefix sys;
+  container system {
+    leaf hostname {
+      type string;
+    }
+  }
   container system-state {
     config false;
     container clock {
@@ -78,6 +83,13 @@ def _mock_oper_ds(current_datetime: str, boot_datetime: str) -> ygdata.Node:
         }, ns=IETF_SYSTEM_NS, module=IETF_SYSTEM_MODULE)
     })
 
+def _system_config(hostname: str) -> ygdata.Node:
+    return ygdata.Container({
+        _q("system"): ygdata.Container({
+            _q("hostname"): ygdata.Leaf(hostname, ns=IETF_SYSTEM_NS, module=IETF_SYSTEM_MODULE)
+        }, ns=IETF_SYSTEM_NS, module=IETF_SYSTEM_MODULE)
+    })
+
 def _current_datetime_filter() -> ygdata.FNode:
     """Filter matching only system-state/clock/current-datetime."""
     return ygdata.FNode(None, None, [
@@ -120,16 +132,17 @@ def _has_boot_datetime(n: ?ygdata.Node) -> bool:
                 return clock.get_opt_leaf(_q("boot-datetime")) is not None
     return False
 
-def make_netconf_mock_dmc(name: str) -> DeviceMetaConfig:
+def make_netconf_mock_dmc(name: str, sync_check: bool=True) -> DeviceMetaConfig:
     return DeviceMetaConfig(
         name=name,
         credentials=Credentials("admin", "admin"),
         type="netconf",
         address=[Address(name="primary", address="127.0.0.1", port=u64(830))],
+        sync_check=sync_check,
         mock=Mock(enabled=True)
     )
 
-def new_netconf_mock_device_mgr(t: testing.EnvT, name: str, on_reconf: action(str) -> None, extra_models: list[str]=[]) -> swdev.DeviceMgr:
+def new_netconf_mock_device_mgr(t: testing.EnvT, name: str, on_reconf: action(str) -> None, extra_models: list[str]=[], sync_check: bool=True) -> swdev.DeviceMgr:
     schema = yang.compile([IETF_SYSTEM_YANG] + extra_models)
     dev_types = {
         "netconf": swdev.DeviceType(
@@ -141,12 +154,167 @@ def new_netconf_mock_device_mgr(t: testing.EnvT, name: str, on_reconf: action(st
 
     schema_registry = swdev.SchemaRegistry()
     dev = swdev.DeviceMgr(dev_types, net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))), name, t.log_handler, on_reconf, schema_registry)
-    dev.set_dmc(make_netconf_mock_dmc(name))
+    dev.set_dmc(make_netconf_mock_dmc(name, sync_check=sync_check))
     return dev
 
 #################################################################################
 ## Tests
 #################################################################################
+actor _test_configure_without_sync_check_skips_config_reads(t: testing.EnvT):
+    """Unchecked configuration uses the normal datastore transaction without
+    reading configuration before or after it."""
+    def noop_on_reconf(name: str):
+        pass
+
+    dev: swdev.DeviceMgr = new_netconf_mock_device_mgr(
+        t,
+        "dev-unchecked-config",
+        noop_on_reconf,
+        sync_check=False,
+    )
+    var done = False
+    var mock_server: ?swna.NetconfMockServer = None
+
+    def fail(msg: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_configured(result: value) -> None:
+        if done:
+            return
+        if isinstance(result, Exception):
+            fail("Unchecked configuration failed: {result}")
+            return
+        ms = mock_server
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        history = ms!.get_rpc_history()
+        if len(history) != 1:
+            fail("Expected one NETCONF RPC, got {history}")
+        elif "edit-config" not in history[0] or "<running" not in history[0]:
+            fail("Expected edit-config to running, got {history[0]}")
+        else:
+            running = dev.get_running_conf()
+            if running != _system_config("edge-1"):
+                fail("Unchecked configuration did not advance the cached running config")
+            else:
+                done = True
+                t.success()
+
+    def start() -> None:
+        if done:
+            return
+        modules, modset_id = dev.get_modules()
+        if IETF_SYSTEM_MODULE not in modules or modset_id is None or dev.get_running_conf() is None:
+            after 0.01: start()
+            return
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            ms = adapter.get_mock_server()
+            if ms is None:
+                fail("Expected NetconfMockServer from NetconfAdapter")
+                return
+            mock_server = ms
+            ms!.clear_rpc_history()
+            dev.configure(_system_config("edge-1"), modset_id, "unchecked")
+            dev.wait_complete("unchecked", on_configured)
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    start()
+    after 2.0: fail("Timed out applying unchecked configuration")
+
+
+actor _test_reenabling_sync_check_resyncs_before_edit(t: testing.EnvT):
+    """A checked edit after an unchecked one rebuilds the verified baseline
+    before applying the next DeviceMgr-computed diff."""
+    def noop_on_reconf(name: str):
+        pass
+
+    dev: swdev.DeviceMgr = new_netconf_mock_device_mgr(
+        t,
+        "dev-reenable-sync-check",
+        noop_on_reconf,
+        sync_check=False,
+    )
+    var done = False
+    var mock_server: ?swna.NetconfMockServer = None
+
+    def fail(msg: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_checked(result: value) -> None:
+        if done:
+            return
+        if isinstance(result, Exception):
+            fail("Checked configuration failed after resync: {result}")
+            return
+        ms = mock_server
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        history = ms!.get_rpc_history()
+        edit_index = -1
+        for i in range(len(history)):
+            if "edit-config" in history[i]:
+                edit_index = i
+                break
+        if edit_index <= 0:
+            fail("Expected a configuration read before the checked edit, got {history}")
+        elif "get-config" not in history[0]:
+            fail("Expected resync before the checked edit, got {history}")
+        elif ygdata.diff(dev.get_running_conf(), _system_config("edge-2")) is not None:
+            fail("Checked configuration did not reach the target")
+        else:
+            done = True
+            t.success()
+
+    def on_unchecked(result: value) -> None:
+        if done:
+            return
+        if isinstance(result, Exception):
+            fail("Initial unchecked configuration failed: {result}")
+            return
+        ms = mock_server
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        dev.set_dmc(make_netconf_mock_dmc("dev-reenable-sync-check", sync_check=True))
+        ms!.clear_rpc_history()
+        modules, modset_id = dev.get_modules()
+        if modset_id is None:
+            fail("Missing module-set id")
+            return
+        dev.configure(_system_config("edge-2"), modset_id, "checked")
+        dev.wait_complete("checked", on_checked)
+
+    def start() -> None:
+        if done:
+            return
+        modules, modset_id = dev.get_modules()
+        if IETF_SYSTEM_MODULE not in modules or modset_id is None or dev.get_running_conf() is None:
+            after 0.01: start()
+            return
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            ms = adapter.get_mock_server()
+            if ms is None:
+                fail("Expected NetconfMockServer from NetconfAdapter")
+                return
+            mock_server = ms
+            dev.configure(_system_config("edge-1"), modset_id, "unchecked")
+            dev.wait_complete("unchecked", on_unchecked)
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    start()
+    after 3.0: fail("Timed out re-enabling sync checks")
+
+
 actor _test_software_dmc_preserves_system_mock_adapter(t: testing.EnvT):
     """Software intent must not replace the device transport adapter."""
     old_datetime = "2026-02-21T10:11:12Z"
