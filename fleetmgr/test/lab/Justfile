@@ -1,0 +1,205 @@
+# Recipes for the lab in lab.clab.yml; README.md explains the lab. `just`
+# alone lists them.
+#
+# The uppercase names are knobs: each is read from the environment
+# (`CES=ce3 just upgrade`) or overridden before the recipe on the command
+# line (`just CES=ce3 upgrade`). The exported ones are also what
+# lab.clab.yml substitutes; containerlab runs under sudo -E.
+
+export TESTENV := env_var_or_default("TESTENV", "fleetmgr-lab-" + `id -un`)
+HTTP_PORT := env_var_or_default("HTTP_PORT", "18200")
+CES := env_var_or_default("CES", "ce1 ce2 ce3")
+SHARD := env_var_or_default("SHARD", "flotilla-1")
+CAMPAIGN := env_var_or_default("CAMPAIGN", "lab")
+RELEASE := env_var_or_default("RELEASE", "17.18.03a")
+# vrnetlab build of the c8000v: Cisco software, a private package.
+export C8000V_IMAGE := env_var_or_default("C8000V_IMAGE", "ghcr.io/stratoweave/vr-c8000v:17.18.02")
+# One OCI artifact per release, one .SPA.bin each, pinned in images.txt.
+IMAGES_REPO := env_var_or_default("IMAGES_REPO", "ghcr.io/stratoweave/iosxe-image/c8000v")
+IMAGES_LIST := env_var_or_default("IMAGES_LIST", "images.txt")
+# nginx and sshd, no software inside, public.
+export IMAGE_SERVER := env_var_or_default("IMAGE_SERVER", "ghcr.io/stratoweave/lab-image-server:1")
+# ORAS from its container, as you, with your Docker login. ORAS_FLAGS takes
+# e.g. --plain-http for a local registry.
+ORAS_IMAGE := env_var_or_default("ORAS_IMAGE", "ghcr.io/oras-project/oras:v1.3.0")
+ORAS_FLAGS := env_var_or_default("ORAS_FLAGS", "")
+
+api := "http://localhost:" + HTTP_PORT + "/restconf"
+image_dir := "/usr/share/nginx/html/images"
+# Set in image-server/Dockerfile.
+scp_password := "admin"
+# Followed by `-v <dir>:/work -w /work {{ORAS_IMAGE}}` and the oras command.
+oras := 'docker run --rm --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$HOME/.docker/config.json:/tmp/.docker/config.json:ro"'
+ssh := "sshpass -p admin ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
+json := '-H "Content-Type: application/yang-data+json" -H "Accept: application/yang-data+json"'
+# Container addresses are assigned by docker at deploy time and are not
+# stable across a redeploy, so every recipe resolves them at call time:
+# `{{docker_ip}} {{TESTENV}}-<node>`.
+docker_ip := "docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}'"
+
+_default:
+	@just --list --unsorted
+
+# Fetch what a deploy needs, with your registry login: both containers and the artifacts images.txt lists.
+pull:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	mkdir -p image-server/images
+	docker image inspect {{C8000V_IMAGE}} >/dev/null 2>&1 || docker pull {{C8000V_IMAGE}}
+	docker image inspect {{IMAGE_SERVER}} >/dev/null 2>&1 || docker pull {{IMAGE_SERVER}}
+	while read -r ref || [ -n "$ref" ]; do
+	  case $ref in ''|'#'*) continue ;; esac
+	  echo "pull $ref"
+	  {{oras}} -v "$PWD/image-server/images:/work" -w /work {{ORAS_IMAGE}} pull {{ORAS_FLAGS}} "$ref" -o /work >/dev/null
+	done < {{IMAGES_LIST}}
+	ls image-server/images
+
+# Publish one artifact per .SPA.bin in DIR and pin them in images.txt.
+software-push dir:
+	#!/usr/bin/env bash
+	# Rewrites the pushed releases' lines in images.txt with the digest.
+	set -euo pipefail
+	src=$(cd "{{invocation_directory()}}" && realpath -- "{{dir}}")
+	for f in "$src"/*.SPA.bin; do
+	  [ -e "$f" ] || { echo "no .SPA.bin files in $src" >&2; exit 1; }
+	  name=$(basename "$f"); platform=${name%%-*}
+	  version=$(echo "$name" | sed -E 's/^.*\.([0-9]+\.[0-9]+\.[0-9]+[a-z]?)\.SPA\.bin$/\1/')
+	  ref={{IMAGES_REPO}}:$version; echo "push $name -> $ref"
+	  out=$({{oras}} -v "$src:/work" -w /work {{ORAS_IMAGE}} push {{ORAS_FLAGS}} --artifact-type application/vnd.cisco.iosxe.image \
+	    -a org.opencontainers.image.version=$version -a io.stratoweave.platform=$platform \
+	    "$ref" "$name:application/octet-stream") || { echo "$out"; exit 1; }
+	  digest=$(echo "$out" | sed -n 's/^Digest: //p')
+	  { grep -vF -- "$ref" {{IMAGES_LIST}} 2>/dev/null || true; echo "$ref@$digest"; } > {{IMAGES_LIST}}.new
+	  mv {{IMAGES_LIST}}.new {{IMAGES_LIST}}
+	done
+	echo "pinned in {{IMAGES_LIST}}:"; grep -v '^#' {{IMAGES_LIST}}
+
+# Retag a local vrnetlab c8000v build as C8000V_IMAGE and push it.
+c8000v-push image:
+	docker tag {{image}} {{C8000V_IMAGE}}
+	docker push {{C8000V_IMAGE}}
+
+# Build the image server container.
+server-build:
+	docker build -t {{IMAGE_SERVER}} image-server
+
+# Publish the image server; it holds nothing private.
+server-push:
+	docker push {{IMAGE_SERVER}}
+
+# Deploy the lab; the CEs boot in about six minutes.
+start:
+	@ls image-server/images/*.SPA.bin >/dev/null 2>&1 || { echo "no software images staged; run just pull" >&2; exit 1; }
+	@docker image inspect {{IMAGE_SERVER}} >/dev/null 2>&1 || { echo "{{IMAGE_SERVER}} not found; run just pull, or just server-build" >&2; exit 1; }
+	@docker image inspect {{C8000V_IMAGE}} >/dev/null 2>&1 || { echo "{{C8000V_IMAGE}} not found; pull or build it, or set C8000V_IMAGE" >&2; exit 1; }
+	sudo -E containerlab deploy -t lab.clab.yml
+
+# Destroy the lab.
+stop:
+	sudo -E containerlab destroy -t lab.clab.yml
+
+# Stop, then start.
+redeploy: stop start
+
+# Poll until every CE's NETCONF on 830 answers.
+wait:
+	#!/usr/bin/env bash
+	# ssh-keyscan sends the client banner first, which IOS XE waits for, and
+	# needs no login. A c8000v boots in about six minutes; the NETCONF data
+	# model can take another ten to sync on first boot.
+	set -euo pipefail
+	for ce in {{CES}}; do
+	  addr=$({{docker_ip}} {{TESTENV}}-$ce)
+	  printf 'waiting for %s (%s) NETCONF ' "$ce" "$addr"
+	  for i in $(seq 1 90); do
+	    if [ -n "$(ssh-keyscan -p 830 -T 5 "$addr" 2>/dev/null)" ]; then break; fi
+	    printf .; sleep 20
+	    if [ "$i" = 90 ]; then echo " TIMEOUT"; exit 1; fi
+	  done
+	  echo " up"
+	done
+
+# Show the BGP summary of every CE, ground truth straight from the devices.
+bgp:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	for ce in {{CES}}; do
+	  addr=$({{docker_ip}} {{TESTENV}}-$ce)
+	  echo "=== $ce ($addr) ==="
+	  out=$({{ssh}} admin@$addr 'show ip bgp summary | begin Neighbor' 2>/dev/null) && head -5 <<<"$out" || echo "no answer"
+	done
+
+# Show the PE's view of the BGP sessions.
+pe:
+	@docker exec {{TESTENV}}-pe-01 vtysh -c "show bgp vrf all summary" 2>/dev/null || echo "PE not ready"
+
+# Print a lab container's management address, e.g. `ssh admin@$(just ip ce1)`.
+ip node:
+	@{{docker_ip}} {{TESTENV}}-{{node}}
+
+# Start the top with the ten flotillas lab.xml declares; `just build` in ../.. first.
+run:
+	cd ../.. && out/bin/fleetmgr --http.port {{HTTP_PORT}} --netconf.port 12900 test/lab/lab.xml
+
+# Onboard the CEs into flotilla SHARD.
+add-devices:
+	#!/usr/bin/env bash
+	# Async: the response returns at commit; a synchronous write waits for
+	# southbound application.
+	set -euo pipefail
+	for ce in {{CES}}; do
+	  addr=$({{docker_ip}} {{TESTENV}}-$ce)
+	  case $ce in ce3) vrf=vrf-b ;; *) vrf=vrf-a ;; esac
+	  echo "$ce -> $addr (shard {{SHARD}}, $vrf)"
+	  curl -sf -X PATCH {{json}} -H "Async: true" --data-binary @- {{api}}/data <<EOF || echo "  FAILED"
+	{"fleetmgr:fleet": {"device": [{"name": "$ce", "type": "iosxe", "shard": "{{SHARD}}",
+	  "description": "c8000v CE in $vrf",
+	  "address": [{"name": "oob", "address": "$addr", "port": 830}],
+	  "credentials": {"username": "admin", "password": "admin"}}]}}
+	EOF
+	done
+
+# Remove the CEs from the fleet.
+remove-devices:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	for ce in {{CES}}; do
+	  curl -sf -X DELETE {{json}} "{{api}}/data/fleetmgr:fleet/device=$ce" && echo "removed $ce" || echo "$ce FAILED"
+	done
+
+# Print the image URL for a campaign: the staged file for RELEASE on the image server.
+image-url:
+	#!/usr/bin/env bash
+	# The device pulls from the image server's management address.
+	set -euo pipefail
+	set -- image-server/images/*.{{RELEASE}}.SPA.bin
+	[ -e "$1" ] || { echo "no image-server/images/*.{{RELEASE}}.SPA.bin staged; run just pull" >&2; exit 1; }
+	echo "scp://root:{{scp_password}}@$({{docker_ip}} {{TESTENV}}-image-server):{{image_dir}}/${1##*/}"
+
+# Create campaign CAMPAIGN and run it: CES to RELEASE; a RELEASE below the running one is a downgrade.
+upgrade:
+	#!/usr/bin/env bash
+	set -euo pipefail
+	set -- image-server/images/*.{{RELEASE}}.SPA.bin
+	[ -e "$1" ] || { echo "no image-server/images/*.{{RELEASE}}.SPA.bin staged; run just pull" >&2; exit 1; }
+	url="scp://root:{{scp_password}}@$({{docker_ip}} {{TESTENV}}-image-server):{{image_dir}}/${1##*/}"
+	devs=$(printf '{"name": "%s"},' {{CES}}); devs=${devs%,}
+	echo "campaign {{CAMPAIGN}}: {{CES}} -> {{RELEASE}} from $url"
+	curl -sf -X PATCH {{json}} -H "Async: true" --data-binary @- {{api}}/data <<EOF && echo "  accepted"
+	{"software:software": {"upgrade-campaign": [{"name": "{{CAMPAIGN}}", "target-release": "{{RELEASE}}",
+	  "image-url": "$url", "device": [$devs], "admin-state": "run"}]}}
+	EOF
+
+# Delete campaign CAMPAIGN.
+upgrade-clear:
+	@curl -sf -X DELETE {{json}} "{{api}}/data/software:software/upgrade-campaign={{CAMPAIGN}}" && echo "cleared" || echo "FAILED"
+
+# Show campaign CAMPAIGN's state from the top.
+state:
+	@out=$(curl -sf {{json}} "{{api}}/data/software:software/upgrade-campaign={{CAMPAIGN}}") \
+	  && echo "$out" | jq '.["software:upgrade-campaign"][0].state // "no state yet"' \
+	  || echo "no campaign {{CAMPAIGN}}"
+
+# Remove the staged software images.
+clean:
+	rm -rf image-server/images
