@@ -32,7 +32,7 @@ originates one prefix into each VRF so every CE receives at least one route.
 ## Prerequisites
 
 - containerlab, docker, sshpass, jq, just
-- pull access to the private packages `make pull` fetches with your
+- pull access to the private packages `just pull` fetches with your
   registry login (`docker login ghcr.io` once): the vrnetlab c8000v image
   `ghcr.io/stratoweave/vr-c8000v:17.18.02`, override with `C8000V_IMAGE`,
   and the software image artifacts `ghcr.io/stratoweave/iosxe-image/c8000v`.
@@ -41,30 +41,36 @@ originates one prefix into each VRF so every CE receives at least one route.
 
 ## Run book
 
-    make pull                                   # c8000v, image server and software images, with your registry login
-    make start                                  # deploys; CEs boot in ~6 min
-    make wait                                   # poll NETCONF on all CEs
-    make bgp                                    # ground truth from the devices
-    make pe                                     # the PE's view of the sessions
+From this directory; `just` alone lists the recipes.
+
+    just pull                                   # c8000v, image server and software images, with your registry login
+    just start                                  # deploys; CEs boot in ~6 min
+    just wait                                   # poll NETCONF on all CEs
+    just bgp                                    # ground truth from the devices
+    just pe                                     # the PE's view of the sessions
+    just ip ce1                                 # a container's management address, e.g. for ssh
 
 In another terminal, from `../..`:
 
     just build
-    make -C test/lab run                        # the top plus ten flotillas, :18200
+    just test/lab/run                           # the top plus ten flotillas, :18200
 
 Then:
 
-    make add-devices                            # onboard ce1-ce3 into flotilla-1
+    just add-devices                            # onboard ce1-ce3 into flotilla-1
 
 ## Upgrading
 
-Create and run a campaign with the URL `make image-url` prints, or headless:
+Create and run a campaign with the URL `just image-url` prints, or headless:
 
-    make upgrade                                # campaign "lab" -> 17.18.03a on all CEs
-    make upgrade CES=ce3                        # one device
-    make upgrade RELEASE=17.16.01a CES=ce3      # a downgrade is the same run with a lower release
-    make state                                  # campaign state from the top
-    make upgrade-clear                          # delete the campaign
+    just upgrade                                # campaign "lab" -> 17.18.03a on all CEs
+    just CES=ce3 upgrade                        # one device
+    just RELEASE=17.16.01a CES=ce3 upgrade      # a downgrade is the same run with a lower release
+    just state                                  # campaign state from the top
+    just upgrade-clear                          # delete the campaign
+
+Knobs like `CES`, `RELEASE` and `CAMPAIGN` go before the recipe, as above,
+or in the environment; the top of the Justfile lists them all.
 
 Staging takes about two minutes for a ~1 GB image and the reload another
 four; a run ends after about eight.
@@ -79,10 +85,10 @@ production.
 The software images are separate: one OCI artifact per release under
 `ghcr.io/stratoweave/iosxe-image/c8000v`, holding one `.SPA.bin` as a plain
 blob, so the blob digest is the file's own sha256. `images.txt` lists the
-releases the lab serves, pinned by digest. `make pull` fetches them with
+releases the lab serves, pinned by digest. `just pull` fetches them with
 ORAS into `image-server/images/`, verified against those digests. The lab
 bind-mounts that directory read-only into the image server, and
-`make image-url` and `make upgrade` take the staged file whose name carries
+`just image-url` and `just upgrade` take the staged file whose name carries
 `RELEASE`. Two releases, 17.16.01a and 17.18.03a, so a device on the lab's
 17.18.02 base can go either way and an upgraded one can come back down.
 
@@ -93,22 +99,22 @@ binary and log in with it instead.
 
 To publish a new release, the image server, or a c8000v build:
 
-    make software-push IMAGES_SRC=<dir with .SPA.bin files>   # one artifact per file, pins them in images.txt
-    make server-build                                  # the image server, locally in seconds
-    make server-push                                   # publish it; it holds nothing private
-    make c8000v-push C8000V_SRC=<local vrnetlab image>  # retag a local c8000v build and publish it, private
+    just software-push <dir with .SPA.bin files>   # one artifact per file, pins them in images.txt
+    just server-build                              # the image server, locally in seconds
+    just server-push                               # publish it; it holds nothing private
+    just c8000v-push <local vrnetlab image>        # retag a local c8000v build and publish it, private
 
-`make software-push` rewrites the lines of the releases it pushed with
+`just software-push` rewrites the lines of the releases it pushed with
 their digests; commit `images.txt` after it. Keep the artifact package
-private with the team's access; the image server can be public. `make pull`
+private with the team's access; the image server can be public. `just pull`
 runs as you, with your registry login; containerlab runs under `sudo`, and
-root has none, so everything has to be present before `make start`.
+root has none, so everything has to be present before `just start`.
 
 ## The PE
 
 `pe-01` is FRR from the public `quay.io/frrouting/frr` image with its
 config, daemons list and device setup script bound in from `configs/`.
-Sessions are up about 20 s after the CEs are. `make pe` shows them;
+Sessions are up about 20 s after the CEs are. `just pe` shows them;
 `docker exec <lab>-pe-01 vtysh` gives the CLI.
 
 With `as-override` FRR also sends a site's own prefixes back to it, AS path
