@@ -1,5 +1,6 @@
 import yang.adata as yadata
 import yang.gdata as gdata
+import subscriptions
 import db as swdb
 import device as swdev
 import adapters.adapter as swadapt
@@ -544,51 +545,19 @@ def exact_list_filter_branches(filters: list[gdata.FNode], key_names: list[gdata
 def _delay(period: u64) -> float:
     return float(period) / 1000000000.0
 
-def _union(specs: list[gdata.SubscriptionSpec]) -> ?gdata.FNode:
-    """One filter for the specs: the union of their filters, or None for
-    everything, which a filter that names nothing, or no filter, is."""
-    branches: list[gdata.FNode] = []
-    for spec in specs:
-        f = root_filter(spec.filt)
-        if f is not None and len(f.children) > 0:
-            branches.extend(f.children)
-        else:
-            return None
-    return gdata.FNode(children=gdata.filter_merge_list(branches))
-
-def fold(want: set[gdata.SubscriptionSpec]) -> dict[u64, ?gdata.FNode]:
-    """One filter per period: the union of the filters a consumer declared
-    with that period, so one read serves them all."""
-    by_period: dict[u64, list[gdata.SubscriptionSpec]] = {}
-    for spec in want:
-        period = spec.period
-        if period is not None:
-            if period not in by_period:
-                by_period[period] = []
-            by_period[period].append(spec)
-    return {period: _union(specs) for period, specs in by_period.items()}
-
-def fold_on_change(want: set[gdata.SubscriptionSpec]) -> (bool, ?gdata.FNode):
-    """Whether the consumer declared a spec without a period, and the one
-    filter those specs fold into."""
-    specs = [spec for spec in want if spec.period is None]
-    return (len(specs) > 0, _union(specs))
 
 
 class Read(object):
     """One read of a consumer's actor: a folded filter, read on its period,
-    and what it gave last: the tree, or rooted, the instances' spines by key
-    so the next read can report removals."""
+    and the latest tree for a destination rooted at the top."""
     filt: ?gdata.FNode
     latest: ?gdata.Node
-    held: dict[str, gdata.Node]
     done: bool                  # has run at least once
     active: bool                # False once replaced or dropped, so its timer ends
 
     def __init__(self, filt: ?gdata.FNode):
         self.filt = filt
         self.latest = None
-        self.held = {}
         self.done = False
         self.active = True
 
@@ -683,7 +652,7 @@ class Shadow(object):
 
 
 actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) -> None, point: list[gdata.Id]):
-    """One consumer's subscriptions, served outside the Layer actor.
+    """One destination's subscriptions, served outside the Layer actor.
 
     The consumer's periodic filters fold into one read per period, and its
     on-change filters into one subscription in the tree. Each read runs on
@@ -710,6 +679,7 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
     actor that runs transactions.
     """
     var reads: dict[u64, Read] = {}
+    var held: dict[str, gdata.Node] = {}        # last delivered instances, across reads and routes
     var shadow: ?Shadow = None                  # what the subscription holds of the tree
     var sub_id = ""                             # the subscription's name in the tree, "" when there is none
     var change_filt: ?gdata.FNode = None        # the subscription's folded filter
@@ -727,7 +697,7 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
         cb = cb1
         synced = synced1
         delta = delta1
-        folded = fold(want)
+        folded = subscriptions.fold(want)
         dropped = False
         for period in list(reads.keys()):
             if period not in folded:
@@ -744,11 +714,9 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
                     old.active = False
             if replace:
                 fresh = Read(filt)
-                if old is not None:
-                    fresh.held = old.held       # so the next read reports instances no longer selected
                 reads[period] = fresh
                 _read(fresh, period)
-        (on_change, cfilt) = fold_on_change(want)
+        (on_change, cfilt) = subscriptions.fold_on_change(want)
         if sub_id != "":
             if not on_change:
                 _unsubscribe()
@@ -767,12 +735,16 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
         if active and r.active:
             try:
                 tree = node.get_data(r.filt)
+                if not active or not r.active:
+                    return
                 if len(point) > 0:
-                    _read_rooted(r, tree)
+                    _snapshot_rooted(tree)
                 else:
                     r.latest = tree
                     _deliver(None)
             except Exception as e:
+                if not active or not r.active:
+                    return
                 if len(point) > 0:
                     cb(None, e)
                 else:
@@ -781,16 +753,17 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
             _synced_if_done()
             after _delay(period): _read(r, period)
 
-    def _read_rooted(r: Read, tree: ?gdata.Node):
-        """Deliver every selected instance, and report those gone since the last read."""
+    def _snapshot_rooted(tree: ?gdata.Node):
+        """Deliver a baseline or periodic snapshot, including removals since the
+        destination's previous delivery, even after its filter or cadence changed."""
         now: dict[str, gdata.Node] = {}
         for i in gdata.instances(tree, point):
             now[i.0] = i.1
             cb(i.1, None)
-        for k, h in r.held.items():
+        for k, h in held.items():
             if k not in now:
                 cb(gdata.gone(h, point), None)
-        r.held = now
+        held = now
 
     def _deliver(err: ?Exception):
         """The reads' latest trees and the shadow as one view, by reference
@@ -837,8 +810,7 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
         if len(point) == 0:
             _deliver(None)
         else:
-            for i in gdata.instances(_tree(), point):
-                cb(i.1, None)
+            _snapshot_rooted(_tree())
 
     def _unsubscribe():
         """Take the subscription out of the tree. The tree hears this after any
@@ -917,9 +889,12 @@ actor Subscription(owner: str, node: Node, cb0: proc(?gdata.Node, ?Exception) ->
             for i in gdata.instances(spine(ip, now), point):
                 present.add(i.0)
                 if i.0 not in was or was[i.0].1 != i.2:
+                    held[i.0] = i.1
                     cb(i.1, None)
         for k, w in was.items():
             if k not in present:
+                if k in held:
+                    del held[k]
                 cb(gdata.gone(w.0, point), None)
 
     def _instance_path(path: Path) -> Path:
@@ -1347,25 +1322,14 @@ actor Layer(name: str, rootgen: proc(Path, ?Layer)->Node, lower: ?Layer, db_arg:
         `delta` also gets each change alone, as the path of the node that
         changed with what it held before and after. Specs rooted at a node
         share one root, and are read on one period or served on-change."""
-        point: list[gdata.Id] = []
         root_of: ?gdata.FNode = None
-        first = True
+        point: list[gdata.Id] = []
         try:
-            for spec in want:
-                if first:
-                    root_of = spec.root
-                    first = False
-                elif root_of != spec.root:
-                    raise ValueError("a consumer's filters share one root")
-            point = gdata.root_names(root_of)
-            if len(point) > 0:
-                ways = len(fold(want))
-                if fold_on_change(want).0:
-                    ways += 1
-                if ways > 1:
-                    raise ValueError("a rooted destination is read on one period or served on-change")
+            root_of, point = subscriptions.delivery_root(want)
         except Exception as e:
             cb(None, e)
+            if synced is not None:
+                synced(owner_id)
             return
         sub = subscribers.get(owner_id)
         if sub is not None:

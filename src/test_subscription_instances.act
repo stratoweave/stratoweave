@@ -1,0 +1,122 @@
+"""Rooted device delivery and its cost as the surrounding feed grows."""
+
+import testing
+import subscriptions
+import yang.gdata as gdata
+
+NS = "urn:test:subscription-instances"
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id(NS, name)
+
+POINT = [q("device")]
+
+def entry(name: str, status: str) -> gdata.Node:
+    return gdata.Container({q("name"): gdata.Leaf(name), q("state"): gdata.Container({
+        q("status"): gdata.Leaf(status), q("release"): gdata.Leaf("1.0"),
+    })})
+
+def devices(entries: list[gdata.Node]) -> gdata.Node:
+    return gdata.Container({q("device"): gdata.List([q("name")], entries)})
+
+def change(name: str, status: str) -> gdata.Node:
+    return devices([gdata.Container({q("name"): gdata.Leaf(name), q("state"): gdata.Container({
+        q("status"): gdata.Leaf(status),
+    })})])
+
+def removed(name: str) -> gdata.Node:
+    return devices([gdata.Absent({q("name"): gdata.Leaf(name)})])
+
+def rendered(trees: list[gdata.Node]) -> list[str]:
+    return sorted([n.prsrc(deterministic=True) for n in trees])
+
+def _test_instance_patch_keeps_siblings_and_complete_state():
+    tree = subscriptions.InstanceTree(devices([entry("a", "old"), entry("b", "old")]), POINT)
+    changes = tree.patch(change("a", "new"))
+    assert subscriptions.changed_instances(changes, POINT) == [devices([entry("a", "new")])]
+    assert tree.build() == devices([entry("a", "new"), entry("b", "old")])
+    assert tree.patch(change("a", "new")) == []
+    assert subscriptions.changed_instances(tree.patch(removed("b")), POINT) == [removed("b")]
+    assert tree.build() == devices([entry("a", "new")])
+    assert subscriptions.changed_instances(tree.patch(change("c", "new")), POINT) == [change("c", "new")]
+
+def _test_notification_delivers_final_state_once():
+    tree = subscriptions.InstanceTree(devices([entry("a", "old")]), POINT)
+    edits = tree.patch(change("a", "middle")) + tree.patch(change("a", "new"))
+    assert subscriptions.changed_instances(edits, POINT) == [devices([entry("a", "new")])]
+    edits = tree.patch(change("a", "middle")) + tree.patch(change("a", "new"))
+    assert subscriptions.changed_instances(edits, POINT) == []
+    edits = tree.patch(removed("a")) + tree.patch(devices([entry("a", "new")]))
+    assert subscriptions.changed_instances(edits, POINT) == []
+
+def group(name: str, entries: list[gdata.Node]) -> gdata.Node:
+    return gdata.Container({q("group"): gdata.List([q("name")], [
+        gdata.Container({q("name"): gdata.Leaf(name), q("device"): gdata.List([q("name")], entries)})
+    ])})
+
+def _test_nested_root_and_ancestor_removal():
+    point = [q("group"), q("device"), q("state")]
+    initial = gdata.merge(group("g1", [entry("a", "old"), entry("b", "old")]), group("g2", [entry("a", "old")]))
+    tree = subscriptions.InstanceTree(initial, point)
+    gone = gdata.Container({q("group"): gdata.List([q("name")], [gdata.Absent({q("name"): gdata.Leaf("g1")})])})
+    deliveries = subscriptions.changed_instances(tree.patch(gone), point)
+    expected = [gdata.gone(i.1, point)! for i in gdata.instances(group("g1", [entry("a", "old"), entry("b", "old")]), point)]
+    assert rendered(deliveries) == rendered(expected)
+    assert tree.build() == group("g2", [entry("a", "old")])
+
+def _test_ancestor_replace_reports_omitted_instances():
+    point = [q("box"), q("device")]
+    initial = gdata.Container({q("box"): devices([entry("a", "old"), entry("b", "old")])})
+    tree = subscriptions.InstanceTree(initial, point)
+    patch = gdata.Container({q("box"): gdata.Replace(devices([entry("a", "new")]).children)})
+    deliveries = subscriptions.changed_instances(tree.patch(patch), point)
+    assert rendered(deliveries) == rendered([
+        gdata.Container({q("box"): devices([entry("a", "new")])}),
+        gdata.Container({q("box"): removed("b")}),
+    ])
+
+def _test_container_root_disappears_and_returns():
+    point = [q("device"), q("state")]
+    tree = subscriptions.InstanceTree(devices([entry("a", "old")]), point)
+    gone = devices([gdata.Container({q("name"): gdata.Leaf("a"), q("state"): gdata.Absent()})])
+    expected = gdata.gone(devices([entry("a", "old")]), point)
+    assert subscriptions.changed_instances(tree.patch(gone), point) == [expected!]
+    assert subscriptions.changed_instances(tree.patch(devices([entry("a", "new")])), point) == [devices([entry("a", "new")])]
+
+def _test_empty_presence_root_is_an_instance():
+    point = [q("box")]
+    empty = gdata.Container({q("box"): gdata.Container(presence=True)})
+    tree = subscriptions.InstanceTree(empty, point)
+    assert tree.spines() == [empty]
+    assert subscriptions.changed_instances(tree.patch(gdata.Container({q("box"): gdata.Absent()})), point) == [gdata.Container()]
+
+def _test_folded_selection_and_root_validation():
+    a = gdata.SubscriptionSpec(gdata.FNode(q("device"), children=[gdata.FNode(q("state"))]), period=0.1)
+    b = gdata.SubscriptionSpec(gdata.FNode(q("device"), children=[gdata.FNode(q("name"))]), period=0.1)
+    assert len(subscriptions.fold({a, b})) == 1
+    assert subscriptions.fold({a, gdata.SubscriptionSpec(gdata.FNode(), period=0.1)}) == {u64(100000000): None}
+    assert subscriptions.fold_on_change({gdata.SubscriptionSpec(None)}) == (True, None)
+    root = gdata.FNode(q("device"))
+    try:
+        subscriptions.delivery_root({gdata.SubscriptionSpec(None, period=0.1, root=root), gdata.SubscriptionSpec(None, root=root)})
+        assert False, "mixed rooted cadences accepted"
+    except ValueError:
+        pass
+
+def _test_one_instance_change(t: testing.SyncT):
+    """Scale is feed size; each body changes one complete instance 64 times."""
+    tree = subscriptions.InstanceTree(devices([entry(str(i), "old") for i in range(t.scale())]), POINT)
+    edits = [change("0", "new"), change("0", "old")]
+    for n in t.loop():
+        for i in range(64):
+            got = subscriptions.changed_instances(tree.patch(edits[i % 2]), POINT)
+            assert len(got) == 1
+
+def _test_whole_feed_change(t: testing.SyncT):
+    """Control: replaying the same edits into one whole immutable feed."""
+    tree = devices([entry(str(i), "old") for i in range(t.scale())])
+    edits = [change("0", "new"), change("0", "old")]
+    for n in t.loop():
+        for i in range(64):
+            tree = gdata.patch(tree, edits[i % 2])!
+    assert tree == devices([entry(str(i), "old") for i in range(t.scale())])
