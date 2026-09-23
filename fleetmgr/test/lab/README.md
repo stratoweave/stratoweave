@@ -57,7 +57,7 @@ In another terminal, from `../..`:
 
 Then:
 
-    just add-devices                            # onboard ce1-ce3 into flotilla-1
+    just add-devices                            # onboard ce1-ce3 into flotilla-1 as c8000v-ce1 and so on
 
 ## Upgrading
 
@@ -74,6 +74,28 @@ or in the environment; the top of the Justfile lists them all.
 
 Staging takes about two minutes for a ~1 GB image and the reload another
 four; a run ends after about eight.
+
+## The demo fleets in the running lab
+
+    just load-big                               # just demo-big's thousand mocks and their campaign, in plan
+    just load-ces                               # campaign "lab" over the CEs in a two-hour window opening now, in plan
+    just campaign-run                           # start the CE campaign; or press Run in the UI
+    just CAMPAIGN=fleet-upgrade campaign-run    # start the mocks
+    just state                                  # campaign "lab" from the top
+
+`just load-big` generates what `just demo-big` would start with and loads it
+into the top `just run` started: a thousand mocks, `cpe-0001` onwards, over
+the same ten flotillas, with 120 to 150 s upgrades and a tenth of them
+failing one of the five ways, picked by a fixed shuffle so the grids show no
+pattern, plus the three regional schedules and the planned campaign
+`fleet-upgrade`. Europe's window opens half a minute after the load;
+americas and asia keep their local midnight. `BIG` changes the count. `just
+load-ces` adds a campaign over the three CEs alone, named like its schedule,
+with one two-hour window that opens at once, so a real upgrade can run
+beside the mocks. Both campaigns wait in plan until run from the UI or with
+`just campaign-run`. A restart of the top drops the mocks, which only live
+in its datastore; `just upgrade` remains the headless CE campaign that
+starts without a schedule.
 
 ## The image server and the software images
 

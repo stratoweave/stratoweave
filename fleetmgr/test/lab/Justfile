@@ -9,9 +9,13 @@
 export TESTENV := env_var_or_default("TESTENV", "fleetmgr-lab-" + `id -un`)
 HTTP_PORT := env_var_or_default("HTTP_PORT", "18200")
 CES := env_var_or_default("CES", "ce1 ce2 ce3")
+# In the fleet a CE is c8000v-ce1 and so on: the name says what the device is.
+dev := "c8000v-"
 SHARD := env_var_or_default("SHARD", "flotilla-1")
 CAMPAIGN := env_var_or_default("CAMPAIGN", "lab")
 RELEASE := env_var_or_default("RELEASE", "17.18.03a")
+# The mock fleet load-big puts beside the CEs, as `just demo-big` would.
+BIG := env_var_or_default("BIG", "1000")
 # vrnetlab build of the c8000v: Cisco software, a private package.
 export C8000V_IMAGE := env_var_or_default("C8000V_IMAGE", "ghcr.io/stratoweave/vr-c8000v:17.18.02")
 # One OCI artifact per release, one .SPA.bin each, pinned in images.txt.
@@ -32,6 +36,7 @@ scp_password := "admin"
 oras := 'docker run --rm --network host --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$HOME/.docker/config.json:/tmp/.docker/config.json:ro"'
 ssh := "sshpass -p admin ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 json := '-H "Content-Type: application/yang-data+json" -H "Accept: application/yang-data+json"'
+xml := '-H "Content-Type: application/yang-data+xml"'
 # Container addresses are assigned by docker at deploy time and are not
 # stable across a redeploy, so every recipe resolves them at call time:
 # `{{docker_ip}} {{TESTENV}}-<node>`.
@@ -141,7 +146,7 @@ ip node:
 run:
 	cd ../.. && out/bin/fleetmgr --http.port {{HTTP_PORT}} --netconf.port 12900 test/lab/lab.xml
 
-# Onboard the CEs into flotilla SHARD.
+# Onboard the CEs into flotilla SHARD as c8000v-ce1 and so on.
 add-devices:
 	#!/usr/bin/env bash
 	# Async: the response returns at commit; a synchronous write waits for
@@ -150,10 +155,10 @@ add-devices:
 	for ce in {{CES}}; do
 	  addr=$({{docker_ip}} {{TESTENV}}-$ce)
 	  case $ce in ce3) vrf=vrf-b ;; *) vrf=vrf-a ;; esac
-	  echo "$ce -> $addr (shard {{SHARD}}, $vrf)"
+	  echo "{{dev}}$ce -> $addr (shard {{SHARD}}, $vrf)"
 	  curl -sf -X PATCH {{json}} -H "Async: true" --data-binary @- {{api}}/data <<EOF || echo "  FAILED"
-	{"fleetmgr:fleet": {"device": [{"name": "$ce", "type": "iosxe", "shard": "{{SHARD}}",
-	  "description": "c8000v CE in $vrf",
+	{"fleetmgr:fleet": {"device": [{"name": "{{dev}}$ce", "type": "iosxe", "shard": "{{SHARD}}",
+	  "description": "c8000v CE $ce in $vrf",
 	  "address": [{"name": "oob", "address": "$addr", "port": 830}],
 	  "credentials": {"username": "admin", "password": "admin"}}]}}
 	EOF
@@ -164,7 +169,7 @@ remove-devices:
 	#!/usr/bin/env bash
 	set -euo pipefail
 	for ce in {{CES}}; do
-	  curl -sf -X DELETE {{json}} "{{api}}/data/fleetmgr:fleet/device=$ce" && echo "removed $ce" || echo "$ce FAILED"
+	  curl -sf -X DELETE {{json}} "{{api}}/data/fleetmgr:fleet/device={{dev}}$ce" && echo "removed {{dev}}$ce" || echo "{{dev}}$ce FAILED"
 	done
 
 # Print the image URL for a campaign: the staged file for RELEASE on the image server.
@@ -183,12 +188,49 @@ upgrade:
 	set -- image-server/images/*.{{RELEASE}}.SPA.bin
 	[ -e "$1" ] || { echo "no image-server/images/*.{{RELEASE}}.SPA.bin staged; run just pull" >&2; exit 1; }
 	url="scp://root:{{scp_password}}@$({{docker_ip}} {{TESTENV}}-image-server):{{image_dir}}/${1##*/}"
-	devs=$(printf '{"name": "%s"},' {{CES}}); devs=${devs%,}
+	devs=$(printf '{"name": "{{dev}}%s"},' {{CES}}); devs=${devs%,}
 	echo "campaign {{CAMPAIGN}}: {{CES}} -> {{RELEASE}} from $url"
 	curl -sf -X PATCH {{json}} -H "Async: true" --data-binary @- {{api}}/data <<EOF && echo "  accepted"
 	{"software:software": {"upgrade-campaign": [{"name": "{{CAMPAIGN}}", "target-release": "{{RELEASE}}",
 	  "image-url": "$url", "device": [$devs], "admin-state": "run"}]}}
 	EOF
+
+# Load `just demo-big`'s fleet into the running top, in plan: BIG mocks over the ten flotillas, their three schedules and campaign fleet-upgrade.
+load-big:
+	#!/usr/bin/env bash
+	# The mocks are cpe-0001 onwards with the demo's knobs, 120 to 150 s
+	# upgrades and a tenth failing one of the five ways. Europe's window
+	# opens half a minute from now, americas and asia at their local
+	# midnight. A restart of the top drops it all, so this can be repeated.
+	set -euo pipefail
+	target=$(( ({{BIG}} + 3) / 4 ))
+	(cd ../.. && just gen-demo-fleet {{BIG}} "$target" "$((target * 2))" 10 120-150 14400 europe)
+	curl -fsS --max-time 60 -X PATCH {{xml}} -H "Async: true" --data-binary @../../out/demo-fleet.xml {{api}}/data && echo "  {{BIG}} mocks accepted"
+	curl -fsS --max-time 60 -X PATCH {{xml}} -H "Async: true" --data-binary @../../out/demo-fleet-campaign.xml {{api}}/data && echo "  schedules and campaign fleet-upgrade planned"
+
+# Plan campaign CAMPAIGN over the CEs alone in a two-hour window that opens now; `just campaign-run` or the UI starts it.
+load-ces:
+	#!/usr/bin/env bash
+	# The schedule is named like the campaign. `just upgrade` is the headless
+	# variant that starts at once without a schedule.
+	set -euo pipefail
+	set -- image-server/images/*.{{RELEASE}}.SPA.bin
+	[ -e "$1" ] || { echo "no image-server/images/*.{{RELEASE}}.SPA.bin staged; run just pull" >&2; exit 1; }
+	url="scp://root:{{scp_password}}@$({{docker_ip}} {{TESTENV}}-image-server):{{image_dir}}/${1##*/}"
+	devs=$(printf '{"name": "{{dev}}%s"},' {{CES}}); devs=${devs%,}
+	at=$(( $(date +%s) % 86400 ))
+	echo "campaign {{CAMPAIGN}}: {{CES}} -> {{RELEASE}}, one 2 h window opening now"
+	curl -sf -X PUT {{json}} -H "Async: true" --data-binary @- "{{api}}/data/maintenance:schedules/schedule={{CAMPAIGN}}" <<EOF && echo "  schedule {{CAMPAIGN}} set"
+	{"maintenance:schedule": [{"name": "{{CAMPAIGN}}", "utc-offset": 0, "window": [{"at": $at, "duration": 7200}]}]}
+	EOF
+	curl -sf -X PATCH {{json}} -H "Async: true" --data-binary @- {{api}}/data <<EOF && echo "  planned"
+	{"software:software": {"upgrade-campaign": [{"name": "{{CAMPAIGN}}", "target-release": "{{RELEASE}}",
+	  "image-url": "$url", "device": [$devs], "admin-state": "plan", "default-schedule": "{{CAMPAIGN}}"}]}}
+	EOF
+
+# Set a planned campaign to run; CAMPAIGN=fleet-upgrade for the mocks.
+campaign-run:
+	@curl -sf -X PATCH {{json}} -H "Async: true" --data-binary '{"software:software": {"upgrade-campaign": [{"name": "{{CAMPAIGN}}", "admin-state": "run"}]}}' {{api}}/data && echo "running {{CAMPAIGN}}"
 
 # Delete campaign CAMPAIGN.
 upgrade-clear:

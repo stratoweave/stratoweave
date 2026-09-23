@@ -4,11 +4,11 @@
 
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
-  import CellGrid from '$lib/software/CellGrid.svelte';
+  import PlanTimeline from '$lib/software/PlanTimeline.svelte';
   import StatusPill from '$lib/software/StatusPill.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
   import { createPoller } from '$lib/core/polling/poller';
-  import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
+  import { FAST_ENTRY_LIMIT, fetchCampaign } from '$lib/software/counters';
   import { RateTracker, formatEta } from '$lib/software/rate';
   import { formatClock, formatDuration, formatLocalTime } from '$lib/software/time';
   import { nameMatches } from '$lib/software/selection';
@@ -19,14 +19,12 @@
     adminStatePatch,
     maskUrlCredentials,
     type Campaign,
-    type CampaignCounters,
     type Schedule,
     type KnownStatus
   } from '$lib/software/model';
 
   const PAGE_SIZE = 100;
   const FAILED_LIMIT = 200;
-  const PLAN_DEVICE_LIMIT = 200;
 
   let {
     data
@@ -44,14 +42,15 @@
   let filterStatus = $state<KnownStatus | ''>('');
   let searchText = $state('');
   let page = $state(1);
-  /** Plan window (by schedule and start) whose device list is unfolded. */
-  let openWindow = $state<string | null>(null);
-
-  // Two tiers: fresh counters every 1.5 s for campaigns up to
-  // FAST_ENTRY_LIMIT members; the loader snapshot refreshes on open, every
-  // 12 s, and immediately when failed moves.
-  let liveCounters = $state<CampaignCounters | null>(null);
+  // Two tiers: a fresh entry every 1.5 s for campaigns up to
+  // FAST_ENTRY_LIMIT members, so cells and counters move with the
+  // controller; the loader snapshot refreshes on open, every 12 s, and
+  // immediately when failed moves.
+  let live = $state<Campaign | null>(null);
   let lastFailed = -1;
+
+  /** Unix seconds, ticking, for the timeline's marker. */
+  let now = $state(Date.now() / 1000);
 
   const tracker = new RateTracker();
   let rate = $state<number | null>(null);
@@ -63,10 +62,11 @@
         return;
       }
       try {
-        const c = await fetchCounters(data.name);
-        liveCounters = c;
+        const fresh = await fetchCampaign(data.name);
+        live = fresh;
+        const c = fresh?.counters ?? null;
         if (c !== null) {
-          if (data.campaign?.adminState === 'run') {
+          if (fresh?.adminState === 'run') {
             tracker.push(c.succeeded + c.failed);
             rate = tracker.ratePerMin();
             const remaining = c.total - c.succeeded - c.failed;
@@ -78,22 +78,29 @@
           lastFailed = c.failed;
         }
       } catch {
-        // keep the last counters; the slow tick recovers
+        // keep the last entry; the slow tick recovers
       }
     }, 1500);
     const slow = createPoller(() => invalidate('data:campaign'), 12000);
+    const clock = setInterval(() => (now = Date.now() / 1000), 1000);
     fast.start();
     slow.start();
     return () => {
       fast.stop();
       slow.stop();
+      clearInterval(clock);
     };
   });
 
-  let counters = $derived(liveCounters ?? data.campaign?.counters ?? null);
+  /** The fresh entry when there is one for this campaign, else the snapshot. */
+  let campaign = $derived(live !== null && live.name === data.name ? live : data.campaign);
+  let counters = $derived(campaign?.counters ?? null);
+  let statuses = $derived(
+    new Map<string, KnownStatus>((campaign?.deviceStatus ?? []).map((r) => [r.device, r.status]))
+  );
 
   let scheduleText = $derived.by(() => {
-    const c = data.campaign;
+    const c = campaign;
     if (!c || !c.defaultSchedule) return 'none — one open window from launch';
     const schedule = data.schedules.find((s) => s.name === c.defaultSchedule);
     if (!schedule) return `${c.defaultSchedule} (no such schedule)`;
@@ -107,7 +114,7 @@
   });
 
   let paceText = $derived.by(() => {
-    const c = data.campaign;
+    const c = campaign;
     if (!c) return '';
     const target = c.targetRate === 0 ? 'no preference' : `${c.targetRate}/h`;
     const cap = c.maxRate === 0 ? 'no cap' : `${c.maxRate}/h`;
@@ -115,21 +122,21 @@
   });
 
   let failedRows = $derived(
-    (data.campaign?.deviceStatus ?? []).filter(
+    (campaign?.deviceStatus ?? []).filter(
       (r) => r.status === 'failed' || r.status === 'rolled-back'
     )
   );
 
   let statusCounts = $derived.by(() => {
     const counts = new Map<KnownStatus, number>();
-    for (const row of data.campaign?.deviceStatus ?? []) {
+    for (const row of campaign?.deviceStatus ?? []) {
       counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
     }
     return counts;
   });
 
   let filteredRows = $derived(
-    (data.campaign?.deviceStatus ?? []).filter(
+    (campaign?.deviceStatus ?? []).filter(
       (r) =>
         (!filterStatus || r.status === filterStatus) &&
         nameMatches(r.device, searchText.trim())
@@ -144,7 +151,7 @@
   // No "done" claim anywhere: status is not latched, it tracks live device
   // state and regresses when the campaign goes back to plan.
   let summary = $derived.by(() => {
-    const c = data.campaign;
+    const c = campaign;
     if (!c) return '';
     if (c.adminState === 'plan') {
       const plan = c.plan;
@@ -183,7 +190,7 @@
   } as const;
 
   let confirmMessage = $derived.by(() => {
-    const c = data.campaign;
+    const c = campaign;
     if (!c || !confirmAction) return '';
     if (confirmAction === 'run') {
       const unplaced = c.plan?.unplaced.length ?? 0;
@@ -211,6 +218,9 @@
         return;
       }
       await restconfPatchJson(DATA_ROOT, adminStatePatch(data.name, action));
+      // The fresh entry predates the change; the snapshot leads until the
+      // next fast tick.
+      live = null;
       await invalidate('data:campaign');
     } catch (actionError) {
       statusMessage = {
@@ -229,12 +239,11 @@
   </div>
 {/if}
 
-{#if data.campaign === null}
+{#if campaign === null}
   <section class="card">
     <div class="empty-state">No campaign named {data.name}.</div>
   </section>
 {:else}
-  {@const campaign = data.campaign}
   <div class="page-header">
     <div>
       <h2>{campaign.name}</h2>
@@ -295,7 +304,7 @@
       <div class="fact">
         <span class="fact-label">Deadline</span>
         <span class="mono">
-          {campaign.deadline === null ? '—' : `${formatDuration(campaign.deadline)} after launch`}
+          {campaign.deadline === null ? '—' : formatClock(campaign.deadline)}
         </span>
       </div>
       <div class="fact">
@@ -310,10 +319,7 @@
     <section class="card">
       <div class="grids-head">
         <h3 class="panel-title">Plan</h3>
-        <span class="hint">
-          estimates in your local time · devices are released by the
-          controller as their window opens
-        </span>
+        <span class="hint">estimates in your local time</span>
       </div>
       {#if plan.alarms.length > 0}
         <ul class="alarms">
@@ -322,66 +328,14 @@
           {/each}
         </ul>
       {/if}
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Window</th>
-              <th>Opens</th>
-              <th>Closes</th>
-              <th class="right">Devices</th>
-              <th>Estimated starts</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each plan.windows as w (`${w.schedule}:${w.start}`)}
-              {@const first = w.devices[0]}
-              {@const last = w.devices[w.devices.length - 1]}
-              <tr>
-                <td>
-                  <button
-                    class="fold small"
-                    type="button"
-                    onclick={() =>
-                      (openWindow = openWindow === `${w.schedule}:${w.start}` ? null : `${w.schedule}:${w.start}`)}
-                  >
-                    {openWindow === `${w.schedule}:${w.start}` ? '▾' : '▸'} {w.schedule || 'window'}
-                  </button>
-                </td>
-                <td class="mono tn">{formatClock(w.start)}</td>
-                <td class="mono tn">{w.end === null ? 'open' : formatClock(w.end)}</td>
-                <td class="tn right">{w.devices.length.toLocaleString()}</td>
-                <td class="mono tn">
-                  {#if first && last}
-                    {formatClock(first.estimatedStart)}{w.devices.length > 1
-                      ? ` … ${formatClock(last.estimatedStart)}`
-                      : ''}
-                  {:else}
-                    —
-                  {/if}
-                </td>
-              </tr>
-              {#if openWindow === `${w.schedule}:${w.start}`}
-                <tr>
-                  <td colspan="5">
-                    <div class="plan-devices">
-                      {#each w.devices.slice(0, PLAN_DEVICE_LIMIT) as d (d.name)}
-                        <span class="plan-device">
-                          <span class="device-name">{d.name}</span>
-                          <span class="mono tn dim">{formatClock(d.estimatedStart)}</span>
-                        </span>
-                      {/each}
-                      {#if w.devices.length > PLAN_DEVICE_LIMIT}
-                        <span class="dim">showing {PLAN_DEVICE_LIMIT} of {w.devices.length}</span>
-                      {/if}
-                    </div>
-                  </td>
-                </tr>
-              {/if}
-            {/each}
-          </tbody>
-        </table>
-      </div>
+      {#if plan.windows.length > 0}
+        <PlanTimeline
+          {plan}
+          {statuses}
+          {now}
+          ondevice={(name) => goto(`/devices/${encodeURIComponent(name)}`)}
+        />
+      {/if}
       {#if plan.unplaced.length > 0}
         <p class="rate">
           not placed ({plan.unplaced.length}): {plan.unplaced.slice(0, 20).join(', ')}
@@ -404,16 +358,6 @@
           {/if}
         </p>
       {/if}
-    </section>
-  {/if}
-
-  {#if campaign.deviceStatus.length > 0}
-    <section class="card">
-      <div class="grids-head">
-        <span class="kick">Every device — one cell per device</span>
-        <span class="hint tn">{campaign.deviceStatus.length.toLocaleString()} cells · member order</span>
-      </div>
-      <CellGrid rows={campaign.deviceStatus} ondevice={(name) => goto(`/devices/${encodeURIComponent(name)}`)} />
     </section>
   {/if}
 
@@ -626,11 +570,6 @@
     padding: 0;
   }
 
-  .fold.small {
-    font-size: 13px;
-    font-weight: 500;
-  }
-
   .alarms {
     margin: 0 0 12px;
     padding: 10px 14px 10px 30px;
@@ -639,24 +578,6 @@
     background: var(--sw-warning-dim);
     color: var(--sw-warning);
     font-size: 13px;
-  }
-
-  .plan-devices {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 6px 16px;
-    padding: 4px 0 4px 18px;
-    font-size: 12px;
-  }
-
-  .plan-device {
-    display: inline-flex;
-    gap: 6px;
-    align-items: baseline;
-  }
-
-  .dim {
-    color: var(--sw-text-muted);
   }
 
   .filter-row {

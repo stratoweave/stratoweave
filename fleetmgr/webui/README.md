@@ -37,17 +37,19 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `{name, admin-state: run}`.
 - Campaign members are a list of `{name}` entries whose names reference
   `/fleetmgr:fleet/device`.
-- Pacing is campaign config: `window` entries (`start` and `duration`,
-  seconds after launch), `deadline` (seconds after launch), `target-rate`
-  and `max-rate` (devices per hour, defaults 100 and 500). A GET omits
-  leaves left at their default, so the UI fills the defaults in. The wizard
-  takes offsets as `30m`, `2h30m` or `1d` and sends seconds.
+- Pacing is campaign config: `default-schedule` naming a shared
+  `maintenance:schedules` entry, `deadline` (seconds since the Unix epoch),
+  `target-rate` and `max-rate` (devices per hour, defaults 100 and 500). A
+  GET omits leaves left at their default, so the UI fills the defaults in.
+  The wizard takes offsets as `30m`, `2h30m` or `1d` and sends seconds.
 - Progress is config-false `state` under each campaign, merged into GET
   responses; each `device-status` row also carries `running-release`.
   `state/plan` is the planner's layout: the windows it places devices into
-  (`start`/`end` as epoch seconds, one `device` entry per member with
-  `estimated-start`), plus an `alarm` list for what does not fit. Members
-  in no plan window are not actuated; the UI lists them as not placed.
+  (`start`/`end` as seconds since the Unix epoch, one `device` entry per
+  member with `estimated-start` and `estimated-duration`), plus an `alarm`
+  list for what does not fit. Members in no plan window are not actuated;
+  the UI lists them as not placed. The plan timeline draws these times on
+  the wall clock with a marker for now.
 - Polling is two-tier: campaigns up to 600 members get a fresh entry GET
   (~120 B per member) every 1.5 s; everything refreshes from the slow
   snapshot (on open, every 12-30 s, and when `failed` moves). Nothing
@@ -64,18 +66,19 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
 ## Campaigns
 
 Campaigns are the model's own concept and nothing more: created in plan,
-launched by merging `{name, admin-state: run}`. The planner fits the
-members into the configured windows at the rate the deadline demands,
-capped at `max-rate`; the plan is published in plan and in run alike, so
-the layout and its alarms are visible before anything is actuated. Run
-actuates every placed device at once: the backend does not yet release
-devices over the window, so the estimated starts are the planner's layout,
-not a schedule the devices follow. The UI adds no semantics the model does
-not carry — anything done here can be done identically over NETCONF or
+launched by merging `{name, admin-state: run}`. The planner fits the members
+into the configured windows at the rate the deadline demands, capped at
+`max-rate`; the plan is published in plan and in run alike, so the layout
+and its alarms are visible before anything is actuated. In run the
+controller releases devices a few at a time as their window opens and
+completions come in; the estimated starts follow that release schedule, and
+the campaign page draws them on a timeline, one cell per device, that takes
+the live status as the run passes them. The UI adds no semantics the model
+does not carry — anything done here can be done identically over NETCONF or
 plain RESTCONF. The one wizard rule beyond the model, a deadline needs a
-window, only rejects a campaign the planner would place nothing in. Rate
-and ETA are measured since page open, and nothing is latched: status
-tracks live device state and regresses when a campaign goes back to plan.
+window, only rejects a campaign the planner would place nothing in. Rate and
+ETA are measured since page open, and nothing is latched: status tracks live
+device state and regresses when a campaign goes back to plan.
 
 Sharding is internal: device creation places entries on the least-loaded
 flotilla node silently, and nothing in the UI shows the placement.

@@ -12,7 +12,7 @@ build:
 flotilla:
 	out/bin/flotilla --http.port 18201 --netconf.port 12901
 
-# Start the top, which spawns ten flotillas, with the 20-device demo and a
+# Start the top, which spawns ten flotillas, with the 100-device demo and a
 # planned sample campaign.
 demo:
 	out/bin/fleetmgr --http.port 18200 --netconf.port 12900 demo.xml demo-campaign.xml
@@ -29,12 +29,51 @@ demo:
 # about 30 seconds in, americas at 90 and asia at 150. 30% of the
 # devices are bound to americas and 10% to asia; the remaining 60%
 # follow the campaign default europe.
-demo-fleet n="100" target="3600" max="7200":
+# Three more knobs make the fleet realistic. FAIL is the percentage of
+# devices whose upgrade fails, each in one of the mock's five ways in turn,
+# picked by a fixed shuffle so the grids show no pattern. DURATION is the
+# install time in seconds; a range like 120-150 spreads it over the
+# devices like a lab c8000v. WINDOW is the length of every regional window
+# in seconds, an hour by default: a slow fleet at a low rate needs a longer
+# one, since europe holds 60% of the devices and what does not fit its
+# window is planned into the next day's. SOON names the schedules whose
+# windows are pulled forward to open shortly after the start, all of them
+# by default; the others open at their real local midnight, where a
+# fleet's windows are.
+demo-fleet n="100" target="3600" max="7200" fail="0" duration="8" window="3600" soon="all": (gen-demo-fleet n target max fail duration window soon)
+	out/bin/fleetmgr --http.port 18200 --netconf.port 12900 out/demo-fleet.xml out/demo-fleet-campaign.xml
+
+# Generate the demo fleet's two files into out/ without starting the top;
+# `just demo-fleet` runs this first, and the lab loads them into a running
+# top. The knobs are demo-fleet's.
+gen-demo-fleet n="100" target="3600" max="7200" fail="0" duration="8" window="3600" soon="all":
 	#!/usr/bin/env bash
 	set -euo pipefail
+	fail={{fail}}
+	[[ $fail =~ ^[0-9]+$ && $fail -le 100 ]] || { echo "fail must be a percentage 0-100, not '$fail'" >&2; exit 1; }
+	[[ "{{duration}}" =~ ^([0-9]+)(-([0-9]+))?$ ]] || { echo "duration must be seconds or a range like 8 or 120-150, not '{{duration}}'" >&2; exit 1; }
+	lo=${BASH_REMATCH[1]}; hi=${BASH_REMATCH[3]:-$lo}
+	(( lo >= 1 && hi >= lo && hi <= 65535 )) || { echo "duration must be 1-65535 s, low before high" >&2; exit 1; }
+	span=$((hi - lo + 1))
+	[[ "{{window}}" =~ ^[0-9]+$ && {{window}} -gt 0 ]] || { echo "window must be seconds, not '{{window}}'" >&2; exit 1; }
+	soon="{{soon}}"
+	[[ $soon =~ ^(all|(europe|americas|asia)(,(europe|americas|asia))*)$ ]] || { echo "soon must be all or a list of europe, americas and asia, not '$soon'" >&2; exit 1; }
 	mkdir -p out
 	f=out/demo-fleet.xml
 	c=out/demo-fleet-campaign.xml
+	# The failing devices in a fixed pseudo-random order, the five kinds
+	# rotating along it. A Park-Miller generator in awk: exact in doubles,
+	# so gawk, mawk and busybox pick the same devices, unlike rand().
+	kinds=(download-failed add-failed activate-refused commit-failed reverts)
+	count=$(( ({{n}} * fail + 50) / 100 ))
+	failing=()
+	if (( count > 0 )); then
+	  k=0
+	  for i in $(awk -v n={{n}} 'BEGIN { x = 20260921; for (i = 1; i <= n; i++) { x = (x * 48271) % 2147483647; printf "%d %d\n", x, i } }' | LC_ALL=C sort -n | awk -v k="$count" 'NR <= k { print $2 }'); do
+	    failing[$i]=${kinds[$(( k % 5 ))]}
+	    k=$((k + 1))
+	  done
+	fi
 	{
 	  echo '<?xml version="1.0" encoding="utf-8"?>'
 	  echo '<data>'
@@ -48,7 +87,13 @@ demo-fleet n="100" target="3600" max="7200":
 	      0) b="<schedule>asia</schedule>" ;;
 	      *) b="" ;;
 	    esac
-	    printf '        <device><name>dev-%04d</name><type>iosxe</type><shard>flotilla-%d</shard>%s<credentials><username>admin</username><password>admin</password></credentials><mock><enabled>true</enabled><software><upgrade-duration>8</upgrade-duration></software></mock></device>\n' "$i" "$(( (i - 1) % 10 + 1 ))" "$b"
+	    d=""
+	    x=""
+	    if [ -n "${failing[$i]:-}" ]; then
+	      d="<description>mock c8000v, fails: ${failing[$i]}</description>"
+	      x="<failure>${failing[$i]}</failure>"
+	    fi
+	    printf '        <device><name>cpe-%04d</name><type>iosxe</type><shard>flotilla-%d</shard>%s%s<credentials><username>admin</username><password>admin</password></credentials><mock><enabled>true</enabled><software><upgrade-duration>%d</upgrade-duration>%s</software></mock></device>\n' "$i" "$(( (i - 1) % 10 + 1 ))" "$b" "$d" "$(( lo + (i * 7) % span ))" "$x"
 	  done
 	  echo '    </fleet>'
 	  echo '</data>'
@@ -58,10 +103,13 @@ demo-fleet n="100" target="3600" max="7200":
 	  echo '<data>'
 	  now=$(date +%s)
 	  at() { echo $(( (now + $1 * 60 + $2) % 86400 )); }
+	  # A schedule named in SOON opens $3 seconds from now; any other at
+	  # its local midnight.
+	  opens() { if [[ $soon == all || ",$soon," == *",$1,"* ]]; then at "$2" "$3"; else echo 0; fi; }
 	  echo '    <schedules xmlns="urn:fleetmgr:maintenance">'
-	  printf '        <schedule><name>europe</name><utc-offset>60</utc-offset><window><at>%d</at><duration>3600</duration></window></schedule>\n' "$(at 60 30)"
-	  printf '        <schedule><name>americas</name><utc-offset>-300</utc-offset><window><at>%d</at><duration>3600</duration></window></schedule>\n' "$(at -300 90)"
-	  printf '        <schedule><name>asia</name><utc-offset>480</utc-offset><window><at>%d</at><duration>3600</duration></window></schedule>\n' "$(at 480 150)"
+	  printf '        <schedule><name>europe</name><utc-offset>60</utc-offset><window><at>%d</at><duration>{{window}}</duration></window></schedule>\n' "$(opens europe 60 30)"
+	  printf '        <schedule><name>americas</name><utc-offset>-300</utc-offset><window><at>%d</at><duration>{{window}}</duration></window></schedule>\n' "$(opens americas -300 90)"
+	  printf '        <schedule><name>asia</name><utc-offset>480</utc-offset><window><at>%d</at><duration>{{window}}</duration></window></schedule>\n' "$(opens asia 480 150)"
 	  echo '    </schedules>'
 	  echo '    <software xmlns="urn:fleetmgr:software">'
 	  echo '        <upgrade-campaign>'
@@ -69,7 +117,7 @@ demo-fleet n="100" target="3600" max="7200":
 	  echo '            <target-release>17.18.03a</target-release>'
 	  echo '            <image-url>scp://admin:admin@127.0.0.1:/images/c8000v-universalk9.17.18.03a.SPA.bin</image-url>'
 	  for i in $(seq 1 {{n}}); do
-	    printf '            <device><name>dev-%04d</name></device>\n' "$i"
+	    printf '            <device><name>cpe-%04d</name></device>\n' "$i"
 	  done
 	  echo '            <admin-state>plan</admin-state>'
 	  echo '            <default-schedule>europe</default-schedule>'
@@ -79,25 +127,46 @@ demo-fleet n="100" target="3600" max="7200":
 	  echo '    </software>'
 	  echo '</data>'
 	} > "$c"
-	echo "Generated $f and $c: {{n}} devices, target {{target}}/h, max {{max}}/h"
-	out/bin/fleetmgr --http.port 18200 --netconf.port 12900 "$f" "$c"
+	echo "Generated $f and $c: {{n}} devices, target {{target}}/h, max {{max}}/h, $count failing, installs {{duration}} s, windows {{window}} s, opening soon: $soon"
 
-# Recompute the running demo's three regional windows so they open about
-# 30, 90 and 150 seconds from now. The campaigns replan on the schedule
-# change. Devices that already upgraded stay upgraded; restart the demo
-# for a fresh run.
-demo-reschedule:
+# Recompute the running demo's regional windows so they open about 30, 90
+# and 150 seconds from now, WINDOW seconds long; pass the length and the
+# SOON list the demo was started with, so a demo that keeps americas and
+# asia at their local midnight only moves europe. The campaigns replan on
+# the schedule change. Devices that already upgraded stay upgraded;
+# restart the demo for a fresh run.
+demo-reschedule window="3600" soon="all":
 	#!/usr/bin/env bash
 	set -euo pipefail
+	[[ "{{window}}" =~ ^[0-9]+$ && {{window}} -gt 0 ]] || { echo "window must be seconds, not '{{window}}'" >&2; exit 1; }
+	soon="{{soon}}"
+	[[ $soon =~ ^(all|(europe|americas|asia)(,(europe|americas|asia))*)$ ]] || { echo "soon must be all or a list of europe, americas and asia, not '$soon'" >&2; exit 1; }
 	now=$(date +%s)
 	at() { echo $(( (now + $1 * 60 + $2) % 86400 )); }
+	chosen() { [[ $soon == all || ",$soon," == *",$1,"* ]]; }
 	# async: the write applies but its answer can get lost when a live
 	# campaign links the schedule, the same open engine bug as elsewhere.
-	put() { curl -fsS --max-time 5 -X PUT -H "Content-Type: application/yang-data+json" -H "async: true" --data-binary "{\"maintenance:schedule\": [{\"name\": \"$1\", \"utc-offset\": $2, \"window\": [{\"at\": $3, \"duration\": 3600}]}]}" "{{fleetmgr_api}}/restconf/data/maintenance:schedules/schedule=$1" > /dev/null; }
-	put europe 60 "$(at 60 30)"
-	put americas -300 "$(at -300 90)"
-	put asia 480 "$(at 480 150)"
-	echo "Windows recomputed: europe opens in ~30s, americas ~90s, asia ~150s"
+	put() { curl -fsS --max-time 5 -X PUT -H "Content-Type: application/yang-data+json" -H "async: true" --data-binary "{\"maintenance:schedule\": [{\"name\": \"$1\", \"utc-offset\": $2, \"window\": [{\"at\": $3, \"duration\": {{window}}}]}]}" "{{fleetmgr_api}}/restconf/data/maintenance:schedules/schedule=$1" > /dev/null; }
+	moved=()
+	chosen europe && put europe 60 "$(at 60 30)" && moved+=("europe in ~30s")
+	chosen americas && put americas -300 "$(at -300 90)" && moved+=("americas in ~90s")
+	chosen asia && put asia 480 "$(at 480 150)" && moved+=("asia in ~150s")
+	echo "Windows recomputed, {{window}} s long: ${moved[*]}"
+
+# The thousand-device preset: `just demo-fleet` with 120-150 s installs, a
+# tenth of the fleet failing and four-hour windows at a quarter of the fleet
+# per hour, about ten in flight, so europe's six hundred devices take two
+# and a half hours of their window. Only europe is pulled forward to open
+# half a minute in; americas and asia keep their local midnight, so the
+# plan shows them where a real fleet's windows are, and
+# `just demo-reschedule 14400 europe` reopens europe alone. A thousand
+# devices come up in about half a minute and take about a gigabyte. Do not
+# run it alongside `just demo`.
+demo-big n="1000":
+	#!/usr/bin/env bash
+	set -euo pipefail
+	target=$(( ({{n}} + 3) / 4 ))
+	exec just demo-fleet {{n}} "$target" "$((target * 2))" 10 120-150 14400 europe
 
 # Submit the three-device IOS XE demo campaign. The transaction applies but
 # its response can hang (open engine bug), so cap the wait and watch state.

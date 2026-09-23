@@ -39,14 +39,40 @@ Start the top:
 
 The top starts ten `flotilla` subprocesses and waits for every NETCONF listener
 before starting its own runtime. The demo declares `flotilla-1` through
-`flotilla-10` and assigns two complete mock IOS XE entries to each.
-`demo-campaign.xml` adds `xe-upgrade-fleet`, a planned campaign over
-`cpe-04` to `cpe-20` with two one-hour windows, so the web UI has a plan to
-show; it does nothing until set to `run`. The processes use these ports:
+`flotilla-10` and assigns ten complete mock IOS XE entries to each, `cpe-001`
+to `cpe-100`. Every device takes 120 to 150 s to upgrade, ten of them,
+picked at random when the file was generated so the grids show no pattern,
+fail in one of the mock's five ways, two per kind, and `cpe-003` already
+runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
+campaign over the 97 devices `upgrade.xml` does not use, bound to a
+`nightly` schedule with a one-hour window at midnight UTC, so the web UI
+has a plan to show; it does nothing until set to `run`, and then waits
+for the window. The processes use these ports:
 
     process          HTTP          NETCONF
     fleetmgr         18200         12900
     flotilla-1..10   18201..18210  12901..12910
+
+`just demo-fleet` is the same demo with a generated fleet, a hundred devices
+by default or `just demo-fleet 1000` for more: `cpe-0001` onwards, spread
+round-robin over the flotillas with quick eight-second installs, three
+regional schedules, europe, americas and asia, whose one-hour windows open
+half a minute, a minute and a half and two and a half minutes after the top
+starts, and `fleet-upgrade`, a planned campaign over all of them. The
+positional knobs are the device count, the target and maximum rate in
+devices per hour, the failing share in percent, the install duration in
+seconds or a range, the window length in seconds, and which schedules open
+soon rather than at their local midnight. `just demo-big` is `just
+demo-fleet 1000 250 500 10 120-150 14400 europe`: a thousand devices with
+`demo.xml`'s knobs, 120 to 150 s installs and a tenth failing one of the
+five ways, picked by a fixed shuffle so the grids show no pattern, in
+four-hour windows at a quarter of the fleet per hour, where only europe
+opens right away and americas and asia wait for their midnight, as a real
+fleet's windows would. The files land in `out/`; a thousand devices come up
+in about half a minute and take about a gigabyte of memory. `just
+demo-reschedule` reopens a running demo's windows shortly; give it the same
+window length and schedule list, `just demo-reschedule 14400 europe` for the
+big demo.
 
 For bottom-node development, `just flotilla` still starts one standalone
 instance on the first flotilla's ports. Do not run it alongside `just demo`.
@@ -58,11 +84,12 @@ operations as measured on a lab c8000v (the numbers are in
 operation at once. `failure`
 names one IOS XE failure to reproduce: `download-failed`, `add-failed`,
 `activate-refused`, `commit-failed` or `reverts`. `running-release` is the
-release the device runs before any upgrade. In the demo, `cpe-02` takes 40 s
-and fails its commit, so the campaign aborts it and it ends `rolled-back`;
-`cpe-03` already runs the target and ends `up-to-date`. The leaves are read
-when the device is created; change them by deleting and re-creating the
-device.
+release the device runs before any upgrade. In the demo ten devices each
+reproduce one of the five failures: `cpe-034` fails its commit, so the
+campaign aborts it and it ends `rolled-back`, while `cpe-007` fails its
+download and ends `failed`. `cpe-003` already runs the target and ends
+`up-to-date`. The leaves are read when the device is
+created; change them by deleting and re-creating the device.
 
 Inspect the top CFS and the bottom RFS independently:
 
@@ -75,13 +102,16 @@ Inspect the top CFS and the bottom RFS independently:
 The second response should contain the two `stratoweave-rfs:device` entries
 assigned to `flotilla-1` and rendered by the top.
 
-Run the two-device IOS XE campaign and follow its state from the top:
+Run the three-device IOS XE campaign over `cpe-001`, `cpe-003` and `cpe-007`
+and follow its state from the top:
 
     just upgrade-and-watch
 
-The watcher starts before the intent is submitted, so it catches the mock's
-short `in-progress` state and stops when both devices have either succeeded or
-failed. `running_release` changes from `17.18.02` to `17.18.3a` on success.
+The watcher starts before the intent is submitted and stops when every device
+has settled, after about three minutes: the controller releases the two
+devices that need work one after the other, so `cpe-001` ends `succeeded`
+with `running_release` `17.18.3a` first, `cpe-003` is `up-to-date` at once,
+and `cpe-007` ends `failed` last.
 
 The submission and observation steps are also available separately:
 
@@ -94,11 +124,15 @@ Set `FLEETMGR_API` to point these targets at a top node on another address.
 ## Web UI
 
 `webui/` is a SvelteKit UI for the same northbound: fleet inventory and
-upgrade campaigns over RESTCONF. The top serves it itself: the static build
-is embedded in the `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so
-with `just demo` running the UI is at http://127.0.0.1:18200/. After a UI
-change, `just gen-webui` rebuilds the UI and regenerates that module (needs
-Node), then `just build` picks it up. For UI work,
+upgrade campaigns over RESTCONF. A campaign page draws the plan as a
+timeline: each window is a band as wide as its duration, with one cell per
+device at its estimated start on the wall clock; a marker shows now, and
+once the campaign runs the cells take the devices' live status. The top
+serves the UI itself: the static build is embedded in the `fleetmgr` binary
+as `src/fleetmgr/webui_assets.act`, so with `just demo` running the UI is at
+http://127.0.0.1:18200/. After a UI change, `just gen-webui` rebuilds the UI
+and regenerates that module (needs Node), then `just build` picks it up. For
+UI work,
 
     just webui
 
