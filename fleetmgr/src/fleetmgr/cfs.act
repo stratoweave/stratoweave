@@ -10,9 +10,11 @@ import stratoweave.fleet_sched_sim as fsim
 
 import fleetmgr.layers.base_0 as base
 import fleetmgr.layers.y_0 as y_0
+import fleetmgr.layers.y_1_loose as y_1_loose
 import fleetmgr.layers.y_1_oper as y1_oper
 from fleetmgr.layers.y_1_oper import \
-    stratoweave_rfs__rfs__device__software__state as FlotillaDeviceStatus
+    stratoweave_rfs__rfs__device__software__state as FlotillaDeviceStatus, \
+    stratoweave_rfs__device__software__state as DirectDeviceStatus
 # TODO: required by the compiler, see acton issue #2390
 import yang.identityref
 import fleetmgr.layers.y_0_oper as y0_oper
@@ -81,10 +83,76 @@ class Node(base.Node):
         return o
 
 
+def direct_device(o: y_1_loose.root, i: y_0.fleetmgr__fleet__device_entry) -> None:
+    """Write the device entry for a device that this instance manages itself.
+    The entry is the same one that a flotilla receives for its devices."""
+    dev = o.device.create(i.name)
+    dev.type = i.type
+    dev.description = i.description
+    dev.approval_required = i.approval_required
+    dev.sync_check = i.sync_check
+
+    for address in i.address:
+        out_address = dev.address.create(
+            address.name,
+            address=address.address,
+            port=address.port,
+        )
+        for credentials in address.initial_credentials:
+            out_address.initial_credentials.create((
+                username=credentials.username,
+                password=credentials.password,
+                key=credentials.key,
+            ))
+
+    dev.credentials.username = i.credentials.username
+    dev.credentials.password = i.credentials.password
+    for key in i.credentials.key:
+        dev.credentials.key.create(key.key, private_key=key.private_key)
+
+    for credentials in i.initial_credentials:
+        dev.initial_credentials.create((
+            username=credentials.username,
+            password=credentials.password,
+            key=credentials.key,
+        ))
+
+    dev.ssh.cipher = i.ssh.cipher
+    dev.ssh.mac = i.ssh.mac
+    dev.ssh.key_exchange = i.ssh.key_exchange
+    dev.ssh.host_key_algorithm = i.ssh.host_key_algorithm
+    dev.ssh.public_key_algorithm = i.ssh.public_key_algorithm
+    dev.ssh.compression_algorithm = i.ssh.compression_algorithm
+    dev.ssh.compression_level = i.ssh.compression_level
+    dev.ssh.rekey_after_bytes = i.ssh.rekey_after_bytes
+    dev.ssh.rekey_after_seconds = i.ssh.rekey_after_seconds
+    dev.ssh.minimum_rsa_bits = i.ssh.minimum_rsa_bits
+
+    dev.mock.enabled = i.mock.enabled
+    dev.mock.software.upgrade_duration = i.mock.software.upgrade_duration
+    dev.mock.software.failure = i.mock.software.failure
+    dev.mock.software.running_release = i.mock.software.running_release
+    for module in i.mock.module:
+        out_module = dev.mock.module.create(
+            module.name,
+            namespace=module.namespace,
+            revision=module.revision,
+        )
+        for feature in module.feature:
+            out_module.feature.append(feature)
+
+    dev.debug.connection = i.debug.connection
+    dev.feature_flags.runtime_schema_fetch = i.feature_flags.runtime_schema_fetch
+
+
 class Device(base.Device):
     def transform(self, i):
         o = base.o_root()
-        dev = o.rfs.create(i.shard).device.create(i.name)
+        shard = i.shard
+        if shard is None:
+            direct_device(o, i)
+            return o
+        dev = o.rfs.create(shard!).device.create(i.name)
         dev.type = i.type
         dev.description = i.description
         dev.approval_required = i.approval_required
@@ -409,6 +477,25 @@ class Schedules(base.Schedules):
         return base.o_root()
 
 
+def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_entry,
+                   i: y_0.software__software__upgrade_campaign_entry) -> None:
+    """Write the software intent of campaign i for one device where the device
+    is managed: in the flotilla named by its shard, or in this instance."""
+    shard = fleet_device.shard
+    if shard is not None:
+        tiered = o.rfs.create(shard).device.create(fleet_device.name).software
+        tiered.target_release = i.target_release
+        tiered.upgrade_campaign = i.name
+        tiered.image_url = i.image_url
+        tiered.allow_staging = i.allow_staging
+    else:
+        direct = o.device.create(fleet_device.name).software
+        direct.target_release = i.target_release
+        direct.upgrade_campaign = i.name
+        direct.image_url = i.image_url
+        direct.allow_staging = i.allow_staging
+
+
 class UpgradeCampaign(base.UpgradeCampaign):
     def transform(self, i, linked, dynstate):
         """Actuate exactly the released set.
@@ -432,11 +519,7 @@ class UpgradeCampaign(base.UpgradeCampaign):
                     continue
                 fleet_device = inventory.fleet.device.get(member.name)
                 if fleet_device is not None:
-                    dev = o.rfs.create(fleet_device.shard).device.create(member.name)
-                    dev.software.target_release = i.target_release
-                    dev.software.upgrade_campaign = i.name
-                    dev.software.image_url = i.image_url
-                    dev.software.allow_staging = i.allow_staging
+                    route_software(o, fleet_device, i)
         return o
 
 
@@ -448,7 +531,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                                update_dynstate: proc(?y_0.software__software__upgrade_campaign__dynstate) -> None,
                                update_oper: proc(?y0_oper.software__software__upgrade_campaign_entry) -> None,
                                lower_tree_provider: ?ygdata.TreeProvider):
-    """Aggregate flotilla telemetry and control the release of the plan.
+    """Aggregate device telemetry and control the release of the plan.
 
     The actor plans for itself from the campaign and runs the core
     controller on the layout and the telemetry, driven by events rather
@@ -460,7 +543,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     """
     var members: list[str] = []
     var member_names: set[str] = set()
-    var latest: dict[str, (rfs_name: str, state: FlotillaDeviceStatus)] = {}
+    var latest: dict[str, (shard: ?str, status: ?str, running_release: ?str)] = {}
     var subscriptions: ?ygdata.SubscriptionManager = None
     var subscriptions_synced = False
     var plan_layout: list[(str, int, int, list[(str, int, int)])] = []
@@ -493,8 +576,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             running_release: ?str = None
             observed = latest.get(d)
             if observed is not None:
-                status = observed.state.status
-                running_release = observed.state.running_release
+                status = observed.status
+                running_release = observed.running_release
 
             ds = st.device_status.create(d)
             ds.status = status if status is not None else "pending"
@@ -528,6 +611,23 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             st.plan.alarm.append(alarm)
         update_oper(oper)
 
+    def observe(name: str, shard: ?str, status: ?str, running_release: ?str) -> None:
+        """Keep the state of one device, from the flotilla named by shard or,
+        without a shard, from this instance."""
+        latest[name] = (shard=shard, status=status, running_release=running_release)
+
+    def forget(name: str, shard: ?str) -> None:
+        # A device that moved keeps the state from where it is now.
+        previous = latest.get(name)
+        if previous is not None and previous.shard == shard:
+            del latest[name]
+
+    def changed(relevant: bool) -> None:
+        if relevant and subscriptions_synced and active and not debounce_armed:
+            debounce_armed = True
+            gen = generation
+            after debounce_s: decide(gen)
+
     def on_rfs(
         keys: ?(rfs_name: str, device_name: str),
         state: ?FlotillaDeviceStatus,
@@ -540,18 +640,27 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         elif keys is not None:
             relevant = keys.device_name in member_names
             if state is not None:
-                latest[keys.device_name] = (
-                    rfs_name=keys.rfs_name,
-                    state=state,
-                )
+                observe(keys.device_name, keys.rfs_name, state.status, state.running_release)
             else:
-                previous = latest.get(keys.device_name)
-                if previous is not None and previous.rfs_name == keys.rfs_name:
-                    del latest[keys.device_name]
-        if relevant and subscriptions_synced and active and not debounce_armed:
-            debounce_armed = True
-            gen = generation
-            after debounce_s: decide(gen)
+                forget(keys.device_name, keys.rfs_name)
+        changed(relevant)
+
+    def on_device(
+        keys: ?(device_name: str),
+        state: ?DirectDeviceStatus,
+        error: ?Exception,
+    ) -> None:
+        relevant = error is not None
+        if error is not None:
+            print("campaign status subscription failed at {path}: {error}", err=True)
+            latest = {}
+        elif keys is not None:
+            relevant = keys.device_name in member_names
+            if state is not None:
+                observe(keys.device_name, None, state.status, state.running_release)
+            else:
+                forget(keys.device_name, None)
+        changed(relevant)
 
     def on_subscriptions_synced() -> None:
         subscriptions_synced = True
@@ -578,7 +687,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             if name not in done_at:
                 observed = latest.get(name)
                 if observed is not None:
-                    status = observed.state.status
+                    status = observed.status
                     if status == "succeeded" or status == "up-to-date" or \
                        status == "failed" or status == "rolled-back":
                         done_at[name] = t
@@ -713,6 +822,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 statuses = y1_oper.subs.rfs.device.software.state
                 want.add(statuses.dst(on_rfs).deliver({
                     statuses.subscribe(),
+                }))
+                direct = y1_oper.subs.device.software.state
+                want.add(direct.dst(on_device).deliver({
+                    direct.subscribe(),
                 }))
             else:
                 # A later subscription starts with a fresh rooted replay. Do
