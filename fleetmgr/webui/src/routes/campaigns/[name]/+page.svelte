@@ -4,7 +4,6 @@
 
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
-  import CellGrid from '$lib/software/CellGrid.svelte';
   import PlanTimeline from '$lib/software/PlanTimeline.svelte';
   import StatusPill from '$lib/software/StatusPill.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
@@ -359,16 +358,6 @@
           {/if}
         </p>
       {/if}
-    </section>
-  {/if}
-
-  {#if campaign.deviceStatus.length > 0}
-    <section class="card">
-      <div class="grids-head">
-        <span class="kick">Every device — one cell per device</span>
-        <span class="hint tn">{campaign.deviceStatus.length.toLocaleString()} cells · member order</span>
-      </div>
-      <CellGrid rows={campaign.deviceStatus} ondevice={(name) => goto(`/devices/${encodeURIComponent(name)}`)} />
     </section>
   {/if}
 

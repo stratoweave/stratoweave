@@ -1,5 +1,4 @@
-// One palette for every device grid, so a cell means the same thing in the
-// member-order grid and on the plan timeline.
+// The palette of the plan timeline's device cells.
 
 import type { KnownStatus } from './model';
 
