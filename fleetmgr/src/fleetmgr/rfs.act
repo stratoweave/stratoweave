@@ -12,86 +12,66 @@ import fleetmgr.devices.flotilla_oper as flotilla_oper
 import yang.identityref
 
 
-class FlotillaStatus(base.FlotillaStatus):
-    def transform(self, i, di):
-        if "stratoweave-rfs" not in di.modules:
-            raise UnsupportedDevice()
-        return flotilla.root()
+def status_subscription(name: str) -> ygdata.SubscriptionSpec:
+    """Return the on-change subscription to the software state that the
+    flotilla reports for one device."""
+    return flotilla_oper.subs.device.entry(name).software.state.subscribe()
 
 
-actor FlotillaStatusTransform(
+actor DeviceTransform(
     path,
-    update_oper: proc(?y1_oper.stratoweave_rfs__rfs__flotilla_status) -> None,
+    update_oper: proc(?y1_oper.stratoweave_rfs__rfs__device_entry) -> None,
     dev: swdev.DeviceMgr,
 ):
-    """Normalize complete software-state instances from one flotilla."""
-    var subscriptions: ?ygdata.SubscriptionManager = None
-    var latest: dict[str, (status: ?str, running_release: ?str)] = {}
-    var enabled = False
-    var synced = False
-    var generation = 0
+    """Publish the software state that the flotilla reports for one device.
 
-    def publish() -> None:
-        # update_oper replaces our whole contribution. Retain the other
-        # devices when publishing a changed or removed instance.
-        oper = base.FlotillaStatus.new_state(path)
-        for name, state in latest.items():
-            oper.state.device.create(name, status=state.status,
-                                     running_release=state.running_release)
-        update_oper(oper)
+    The actor subscribes to the flotilla for this device only. It publishes
+    the status and running release as the oper state of its own entry, so
+    a change on one device publishes one entry."""
+    var subscriptions: ?ygdata.SubscriptionManager = None
+    var latest: ?(status: ?str, running_release: ?str) = None
+    var generation = 0
 
     def on_state(gen: int, keys: ?(device_name: str),
                  state: ?flotilla_oper.stratoweave_rfs__device__software__state,
                  error: ?Exception) -> None:
-        # A callback from an earlier declaration may already be queued.
-        if not enabled or gen != generation:
+        # A callback from an earlier subscription may already be queued.
+        if gen != generation:
             return
+        value: ?(status: ?str, running_release: ?str) = None
         if error is not None:
-            print("flotilla status subscription failed at {path}: {error}", err=True)
-            latest = {}
-        elif keys is not None:
-            value: ?(status: ?str, running_release: ?str) = None
-            if state is not None and (state.status is not None or state.running_release is not None):
-                value = (status=state.status, running_release=state.running_release)
-            if latest.get(keys.device_name) == value:
-                return
-            if value is not None:
-                latest[keys.device_name] = value
-            else:
-                del latest[keys.device_name]
-        if synced:
-            publish()
-
-    def on_synced(gen: int) -> None:
-        if enabled and gen == generation:
-            synced = True
-            # The initial replay may contain thousands of instances. Publish
-            # their combined state once, after the replay is complete.
-            publish()
+            print("device status subscription failed at {path}: {error}", err=True)
+        elif state is not None and (state.status is not None or state.running_release is not None):
+            value = (status=state.status, running_release=state.running_release)
+        if value == latest:
+            return
+        latest = value
+        if value is not None:
+            oper = base.Device.new_state(path)
+            oper.software.state.status = value.status
+            oper.software.state.running_release = value.running_release
+            update_oper(oper)
+        else:
+            update_oper(None)
 
     def shutdown() -> None:
-        enabled = False
         generation += 1
-        synced = False
-        latest = {}
+        latest = None
         if subscriptions is not None:
             subscriptions!.close()
             subscriptions = None
         update_oper(None)
 
-    def on_conf(conf: y_1.stratoweave_rfs__rfs__flotilla_status) -> None:
-        if conf.enabled == False:
-            shutdown()
-        elif not enabled:
-            enabled = True
+    def on_conf(conf: y_1.stratoweave_rfs__rfs__device_entry) -> None:
+        if subscriptions is None:
             generation += 1
             gen = generation
             subscriptions = ygdata.SubscriptionManager(dev.tree_provider(), str(path))
             state = flotilla_oper.subs.device.software.state
-            destination = state.dst(lambda keys, value, error: on_state(gen, keys, value, error))
+            destination = state.dst(lambda keys, value, error: self.on_state(gen, keys, value, error))
             subscriptions!.declare({destination.deliver({
-                state.subscribe(),
-            })}, synced=lambda: on_synced(gen))
+                status_subscription(conf.name),
+            })})
 
 
 class Device(base.Device):
