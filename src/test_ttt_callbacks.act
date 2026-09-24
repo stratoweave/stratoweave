@@ -472,3 +472,45 @@ actor rfs_dynstate_memory_change_delivers_onconf(t: testing.AsyncT):
     dev_registry.on_reconf(reconf_cb)
     dmc = DeviceMetaConfig("k1", Credentials("admin", "admin"), mock=mock_with_module())
     dev_registry.get_or_create("k1").set_dmc(dmc)
+
+
+# Intent can arrive before NETCONF module discovery. Actors that select their
+# subscriptions from the module set must be notified once it becomes available.
+actor rfs_module_discovery_delivers_onconf(t: testing.AsyncT):
+    dev_registry = swdev.DeviceRegistry(log_handler=t.log_handler)
+    var notifications = 0
+    var done = False
+
+    def notified():
+        dev = dev_registry.get_or_create("k1")
+        notifications += 1
+        if notifications == 1:
+            testing.assertEqual(len(dev.get_modules().0), 0)
+            dev.set_dmc(DeviceMetaConfig("k1", Credentials("admin", "admin"), mock=mock_with_module()))
+        elif notifications == 2:
+            testing.assertTrue("mock-module" in dev.get_modules().0)
+            done = True
+            t.success()
+
+    def actor_ctor(params: ttt.TransformActorParams) -> ttt.TransformActor:
+        act = EmptyOutputTransformActor(notified)
+        return ttt.TransformActor(act.on_conf, act.shutdown)
+
+    stack = ttt.Layer("rfs", ttt.Container({
+        q("rfs"): ttt.List(ttt.Container({
+            q("base"): ttt.List(ttt.RFSTransform(
+                EmptyOutputRFSTransform, dev_registry, actor_ctor,
+            ), [q("id")]),
+        }), [q("name")]),
+    }), None)
+
+    def reconf_cb(name):
+        stack.edit_config(rfs_fail_cfg)
+
+    def timeout():
+        if not done:
+            t.failure(AssertionError("Module discovery did not re-notify the RFS actor: {notifications} callback(s)"))
+
+    dev_registry.on_reconf(reconf_cb)
+    stack.edit_config(rfs_fail_cfg)
+    after 3: timeout()
