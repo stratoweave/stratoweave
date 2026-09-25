@@ -1,0 +1,619 @@
+"""Log files, levels and line formats of a running StratoWeave system.
+
+A system writes one log file per part:
+
+```text
+core.log            startup, TTT layers and transforms
+netconf.log         northbound NETCONF server
+http.log            HTTP server: RESTCONF, TMF API and web UI
+devices/<name>.log  one file per device
+```
+
+Each part has its own level. The console (stdout) shows the messages of all
+parts at the console level. Startup and exit messages are always written to
+core.log and the console at info level, whatever the levels are.
+
+Files are opened for each write and closed after it. An idle log holds no
+file descriptor, and a file that logrotate moved away is created again on
+the next write. A file that reaches the rotation size is renamed to
+<name>.log.1, the previous <name>.log.1 to <name>.log.2 and so on.
+
+The parts marked "TODO: upstream" belong in Acton's standard library. When
+they are there, this module keeps only the settings and the setup of a
+StratoWeave system.
+"""
+
+import argconf
+import file
+import json
+import logging
+import time
+
+
+# TODO: upstream to Acton's logging module, with parse_level and level_name.
+# It has labels for levels (lvl_names) but no names that settings can use.
+LEVELS: dict[str, int] = {
+    "off": logging.OFF,
+    "error": logging.ERR,
+    "warning": logging.WARNING,
+    "info": logging.INFO,
+    "debug": logging.DEBUG,
+    "trace": logging.TRACE,
+}
+
+_LEVEL_HELP = "off, error, warning, info, debug or trace"
+
+FORMATS = ["text", "json"]
+
+_HEX = "0123456789ABCDEF"
+
+
+def parse_level(name: str) -> int:
+    """Return the logging level for a level name, such as "warning".
+
+    Raise ValueError for a name that is not in LEVELS.
+    """
+    level = LEVELS.get(name.lower())
+    if level is not None:
+        return level
+    raise ValueError(f"Unknown log level '{name}': use {_LEVEL_HELP}")
+
+
+def level_name(level: int) -> str:
+    """Return the name of a level in LEVELS, or the number for other levels."""
+    for name, value in LEVELS.items():
+        if value == level:
+            return name
+    return str(level)
+
+
+def _label(level: int) -> str:
+    """Return the label of a level, as logging.DefaultFormatter writes it."""
+    label = logging.lvl_names.get(level)
+    if label is not None:
+        return label
+    return str(level)
+
+
+# TODO: upstream to Acton's time module: Timezone.str_offset writes UTC-5 as
+# "--5" and UTC+2 as "+02", where RFC 3339 needs "-05:00" and "+02:00". Then
+# the formatters can use str(ts).
+def timestamp(ts: time.DateTime) -> str:
+    """Format a time like str(ts), with the UTC offset that RFC 3339 needs."""
+    nano = ts.attosecond // 1000000000
+    text = f"{ts.year:04d}-{ts.month:02d}-{ts.day:02d}T{ts.hour:02d}:{ts.minute:02d}:{ts.second:02d}.{nano:09d}"
+    tz: ?time.Timezone = ts.timezone
+    if tz is not None:
+        offset = tz.offset
+        if offset == 0:
+            return text + "Z"
+        sign = "+" if offset > 0 else "-"
+        minutes = abs(offset) // 60
+        return text + f"{sign}{minutes // 60:02d}:{minutes % 60:02d}"
+    return text
+
+
+def _escape_char(c: str, quoted: bool) -> str:
+    if c == "\n":
+        return "\\n"
+    if c == "\r":
+        return "\\r"
+    if c == "\t":
+        return "\\t"
+    if quoted and (c == "\\" or c == "\""):
+        return "\\" + c
+    code = ord(c)
+    if code < 32 or code == 127:
+        return "\\x" + _HEX[code // 16] + _HEX[code % 16]
+    return c
+
+
+def _escape(s: str, quoted: bool) -> str:
+    """Escape line breaks and other control characters in s.
+
+    With quoted, also escape backslash and double quote, so that s can go
+    between double quotes.
+    """
+    if s == "" or (s.isprintable() and not (quoted and ("\\" in s or "\"" in s))):
+        return s
+    return "".join([_escape_char(c, quoted) for c in s])
+
+
+def _text_value(v: ?value) -> str:
+    """Format a structured data value for a text line.
+
+    A value with spaces, quotes, '=' or control characters, and the empty
+    string, is put between double quotes.
+    """
+    if v is None:
+        return "null"
+    s = ""
+    if isinstance(v, str):
+        s = v
+    else:
+        s = str(v)
+    if s == "" or not s.isprintable() or " " in s or "=" in s or "\"" in s:
+        return "\"" + _escape(s, True) + "\""
+    return s
+
+
+def _json_value(v: ?value) -> ?value:
+    """Convert a structured data value to a value that JSON can encode."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return v
+    if isinstance(v, list):
+        return [_json_value(x) for x in v]
+    if isinstance(v, dict):
+        d: dict[str, ?value] = {}
+        for k, x in v.items():
+            d[str(k)] = _json_value(x)
+        return d
+    return str(v)
+
+
+# TODO: upstream to Acton's logging module as DefaultFormatter. That one
+# writes line breaks in a message as they are, so one message can span
+# several lines, and it leaves the data to the sinks.
+class TextFormatter(logging.Formatter):
+    """Format a message as one line of text, like logging.DefaultFormatter.
+
+    The line holds the time, the level, the handler path, the class and id
+    of the actor that logged, the message and the structured data as
+    key=value pairs:
+
+        2026-09-22T14:03:07.123456789+02:00 WARN   device>rtr1: stratoweave.adapters.netconf.NetconfDriver[42]: Failed to connect err="Connection refused"
+
+    Line breaks and other control characters are escaped, so each message is
+    exactly one line.
+    """
+    def format(self, m: logging.Message) -> ?str:
+        msg = m.msg
+        data = m.data
+        if msg is None and data is None:
+            return None
+        text = f"{timestamp(m.ts)} {_label(m.level):<7}"
+        if len(m.path) > 0:
+            text += ">".join(m.path) + ": "
+        text += f"{m.actor_class}[{m.actor_id}]:"
+        if msg is not None:
+            text += " " + _escape(msg, False)
+        if data is not None:
+            for k, v in data.items():
+                text += " " + k + "=" + _text_value(v)
+        return text
+
+
+# TODO: upstream to Acton's logging module.
+class JsonFormatter(logging.Formatter):
+    """Format a message as one line of JSON.
+
+    The object has the keys time, level, logger, actor, actor_id, msg and,
+    when the message has structured data, data:
+
+        {"time":"2026-09-22T14:03:07.123456789+02:00","level":"warn","logger":"device>rtr1","actor":"stratoweave.adapters.netconf.NetconfDriver","actor_id":42,"msg":"Failed to connect","data":{"err":"Connection refused"}}
+    """
+    def format(self, m: logging.Message) -> ?str:
+        msg = m.msg
+        data = m.data
+        if msg is None and data is None:
+            return None
+        obj: dict[str, ?value] = {
+            "time": timestamp(m.ts),
+            "level": _label(m.level).lower(),
+            "logger": ">".join(m.path),
+            "actor": m.actor_class,
+            "actor_id": m.actor_id,
+            "msg": msg,
+        }
+        if data is not None:
+            d: dict[str, ?value] = {}
+            for k, v in data.items():
+                d[k] = _json_value(v)
+            obj["data"] = d
+        return json.encode(obj)
+
+
+def make_formatter(format: str) -> logging.Formatter:
+    """Return the formatter for a name in FORMATS."""
+    if format == "json":
+        return JsonFormatter()
+    return TextFormatter()
+
+
+def _open_append(cap: file.FileCap, path: str) -> file.WriteFile:
+    """Open the file at path to write at its end. Create missing directories."""
+    try:
+        return file.WriteFile(file.WriteFileCap(cap), path, append=True)
+    except OSError:
+        fs = file.FS(cap)
+        parts = path.split("/")
+        for i in range(1, len(parts)):
+            d = "/".join(parts[:i])
+            if d != "":
+                try:
+                    await async fs.mkdir(d)
+                except OSError:
+                    pass
+        return file.WriteFile(file.WriteFileCap(cap), path, append=True)
+
+
+def _rotate(cap: file.FileCap, path: str, keep: int) -> None:
+    """Rename path to path.1, after path.1 is renamed to path.2 and so on.
+
+    The oldest file, path.<keep>, is replaced. With keep 0, remove path.
+    """
+    fs = file.FS(cap)
+    if keep < 1:
+        await async fs.remove(path)
+        return
+    for i in range(keep - 1, 0, -1):
+        try:
+            await async fs.rename(f"{path}.{i}", f"{path}.{i + 1}")
+        except FileNotFoundError:
+            pass
+    await async fs.rename(path, f"{path}.1")
+
+
+# TODO: upstream to Acton's logging module, with FileSink. logging.act has a
+# FileSink that is commented out.
+actor LogFile(cap: file.FileCap, path: str, rotate_size: int=0, rotate_keep: int=0):
+    """Append text to one log file.
+
+    Text that arrives close together is written with one write. The file is
+    opened for each write and closed after it. When rotate_size is above 0
+    and the file reaches that size, the file is rotated and rotate_keep
+    rotated files are kept.
+
+    When the file cannot be written, the text is lost. The first failure and
+    the recovery are reported on stderr.
+    """
+    fs = file.FS(cap)
+    var _pending: list[str] = []
+    var _flush_queued = False
+    var _lost = 0
+    var _rotate_failed = False
+
+    def _flush() -> None:
+        _flush_queued = False
+        if len(_pending) == 0:
+            return
+        lines = _pending
+        _pending = []
+        size = 0
+        try:
+            f = _open_append(cap, path)
+            try:
+                await async f.write("".join(lines).encode())
+            finally:
+                await async f.close()
+            size = int(fs.stat(path).size)
+        except OSError as exc:
+            if _lost == 0:
+                print(f"Log messages to {path} are lost: {exc}", err=True)
+            _lost += len(lines)
+            return
+        if _lost > 0:
+            print(f"Log file {path} is written again, {_lost} messages were lost", err=True)
+            _lost = 0
+        if rotate_size > 0 and size >= rotate_size:
+            try:
+                _rotate(cap, path, rotate_keep)
+                _rotate_failed = False
+            except OSError as exc:
+                if not _rotate_failed:
+                    print(f"Log file {path} is not rotated: {exc}", err=True)
+                _rotate_failed = True
+
+    def write(text: str) -> None:
+        """Append text to the file. The text must end with a line break."""
+        _pending.append(text)
+        if not _flush_queued:
+            _flush_queued = True
+            after 0: _flush()
+
+    def flush() -> None:
+        """Write the text that is not written yet."""
+        _flush()
+
+
+class FileSink(logging.Sink):
+    """Write each message as one line to a LogFile."""
+    log_file: LogFile
+
+    def __init__(self, log_file: LogFile, formatter: logging.Formatter):
+        self.log_file = log_file
+        self.formatter = formatter
+
+    def handle(self, m: logging.Message):
+        text = self.formatter.format(m)
+        if text is not None:
+            self.log_file.write(text + "\n")
+
+
+# TODO: upstream to Acton's logging module: give Sink a level, and let
+# StdoutSink leave the data to the formatter.
+class ConsoleSink(logging.Sink):
+    """Print each message at level or more severe to stdout."""
+    level: int
+
+    def __init__(self, formatter: logging.Formatter, level: int=logging.ALL):
+        self.formatter = formatter
+        self.level = level
+
+    def handle(self, m: logging.Message):
+        if m.level <= self.level:
+            text = self.formatter.format(m)
+            if text is not None:
+                print(text)
+
+
+def device_file_name(name: str) -> str:
+    """Return the log file name of a device.
+
+    Letters, digits, '-', '_' and '.' are kept, except a '.' at the start.
+    Every other byte is written as %XX, so a name cannot point outside the
+    devices directory and two devices never share a file.
+    """
+    safe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+    data = name.encode()
+    res = ""
+    for i in range(len(data)):
+        b = data[i]
+        c = chr(b)
+        if b < 128 and c in safe and not (i == 0 and c == "."):
+            res += c
+        else:
+            res += "%" + _HEX[b // 16] + _HEX[b % 16]
+    return res + ".log"
+
+
+class LogSettings(value):
+    """Where log files go, how much each part logs and how lines look.
+
+    Levels are logging levels, from parse_level.
+    """
+    dir: str
+    format: str
+    rotate_size: int
+    rotate_keep: int
+    level: int
+    console_level: int
+    core_level: int
+    netconf_level: int
+    http_level: int
+    device_level: int
+
+    def __init__(self, dir: str, format: str, rotate_size: int,
+                 rotate_keep: int, level: int, console_level: int,
+                 core_level: int, netconf_level: int, http_level: int,
+                 device_level: int):
+        self.dir = dir
+        self.format = format
+        self.rotate_size = rotate_size
+        self.rotate_keep = rotate_keep
+        self.level = level
+        self.console_level = console_level
+        self.core_level = core_level
+        self.netconf_level = netconf_level
+        self.http_level = http_level
+        self.device_level = device_level
+
+    @staticmethod
+    def declare(p: argconf.Parser):
+        """Declare the log settings under log."""
+        p.add_str(
+            "log.dir", default="logs",
+            help="Directory for log files; empty to write no log files"
+        )
+        p.add_str(
+            "log.level", default="warning",
+            help="Log level: " + _LEVEL_HELP
+        )
+        p.add_str("log.format", default="text", help="Log line format: text or json")
+        p.add_int(
+            "log.rotate.size", default=10485760,
+            help="Rotate a log file when it reaches this many bytes; 0 to never rotate"
+        )
+        p.add_int(
+            "log.rotate.keep", default=5,
+            help="Number of rotated files to keep for each log file"
+        )
+        p.add_str("log.console.level", help="Log level for stdout; log.level if unset")
+        p.add_str("log.core.level", help="Log level for core.log; log.level if unset")
+        p.add_str("log.netconf.level", help="Log level for netconf.log; log.level if unset")
+        p.add_str("log.http.level", help="Log level for http.log; log.level if unset")
+        p.add_str(
+            "log.device.level",
+            help="Log level for device log files; log.level if unset"
+        )
+
+    @staticmethod
+    def read(args: argconf.Config) -> LogSettings:
+        """Read and check the settings declared by declare."""
+        def read_level(name: str, default: int) -> int:
+            text = args.get_opt_str(name)
+            if text is not None:
+                try:
+                    return parse_level(text)
+                except ValueError:
+                    raise argconf.ConfigurationError(
+                        f"Invalid {name} '{text}': use {_LEVEL_HELP}"
+                    )
+            return default
+
+        level = read_level("log.level", logging.WARNING)
+        format = args.get_str("log.format")
+        if format not in FORMATS:
+            raise argconf.ConfigurationError(
+                f"Invalid log.format '{format}': use text or json"
+            )
+        rotate_size = args.get_int("log.rotate.size")
+        if rotate_size < 0:
+            raise argconf.ConfigurationError("Invalid log.rotate.size: must be 0 or more")
+        rotate_keep = args.get_int("log.rotate.keep")
+        if rotate_keep < 0:
+            raise argconf.ConfigurationError("Invalid log.rotate.keep: must be 0 or more")
+        return LogSettings(
+            args.get_str("log.dir"),
+            format,
+            rotate_size,
+            rotate_keep,
+            level,
+            read_level("log.console.level", level),
+            read_level("log.core.level", level),
+            read_level("log.netconf.level", level),
+            read_level("log.http.level", level),
+            read_level("log.device.level", level))
+
+
+class DeviceLogs(object):
+    """Give each device a log file and a level.
+
+    With an empty dir, devices get a level and no file.
+    """
+    cap: file.FileCap
+    dir: str
+    format: str
+    rotate_size: int
+    rotate_keep: int
+    level: int
+
+    def __init__(self, cap: file.FileCap, dir: str, format: str,
+                 rotate_size: int, rotate_keep: int, level: int):
+        self.cap = cap
+        self.dir = dir
+        self.format = format
+        self.rotate_size = rotate_size
+        self.rotate_keep = rotate_keep
+        self.level = level
+
+    proc def add_file(self, handler: logging.Handler, name: str) -> ?LogFile:
+        """Make handler write to the log file of the device name.
+
+        Return the file, or None when dir is empty.
+        """
+        if self.dir == "":
+            return None
+        path = file.join_path([self.dir, "devices", device_file_name(name)])
+        f = LogFile(self.cap, path, self.rotate_size, self.rotate_keep)
+        handler.add_sink(FileSink(f, make_formatter(self.format)))
+        return f
+
+
+class Logs(object):
+    """The log handlers of a running system.
+
+    core, netconf, http and device are the handlers that the parts of the
+    system log to. Each device gets its own handler under device, from
+    device_logs. startup logs startup and exit messages: it passes info and
+    more severe messages to core.log and the console, whatever the levels
+    are.
+    """
+    core: logging.Handler
+    netconf: logging.Handler
+    http: logging.Handler
+    device: logging.Handler
+    startup: logging.Handler
+    device_logs: DeviceLogs
+    handlers: list[logging.Handler]
+    files: list[LogFile]
+
+    def __init__(self, core: logging.Handler, netconf: logging.Handler,
+                 http: logging.Handler, device: logging.Handler,
+                 startup: logging.Handler, device_logs: DeviceLogs,
+                 handlers: list[logging.Handler], files: list[LogFile]):
+        self.core = core
+        self.netconf = netconf
+        self.http = http
+        self.device = device
+        self.startup = startup
+        self.device_logs = device_logs
+        self.handlers = handlers
+        self.files = files
+
+    # TODO: upstream to Acton's logging module as a flush on Handler, which
+    # returns when its sinks have written what they got.
+    proc def drain(self) -> None:
+        """Wait until the messages sent so far are written.
+
+        This covers the messages that went to startup, core, netconf, http
+        and device before the call. Messages in device handlers can still be
+        in transit.
+        """
+        # A handler answers get_level after it has handled the messages that
+        # arrived before the call, and a file flushes after the text that
+        # arrived before the call.
+        for h in self.handlers:
+            level = h.get_level()
+        for f in self.files:
+            await async f.flush()
+
+
+def setup(settings: LogSettings, cap: file.FileCap) -> Logs:
+    """Create the handlers, sinks and files that settings describe.
+
+    Create the log directory and core.log first. Raise ConfigurationError
+    when they cannot be created, so that a system does not run without logs.
+    """
+    if settings.dir != "":
+        try:
+            f = _open_append(cap, file.join_path([settings.dir, "core.log"]))
+            await async f.close()
+        except OSError as exc:
+            raise argconf.ConfigurationError(f"Invalid log.dir '{settings.dir}': {exc}")
+    formatter = make_formatter(settings.format)
+    handlers: list[logging.Handler] = []
+    files: list[LogFile] = []
+
+    console: ?logging.Handler = None
+    if settings.console_level != logging.OFF:
+        c = logging.Handler(None)
+        c.set_output_level(settings.console_level)
+        c.add_sink(ConsoleSink(formatter))
+        console = c
+
+    def part(name: str, level: int) -> (logging.Handler, ?LogFile):
+        h = logging.Handler(name)
+        h.set_output_level(level)
+        if console is not None:
+            h.set_handler(console)
+        handlers.append(h)
+        if settings.dir == "":
+            return (h, None)
+        f = LogFile(cap, file.join_path([settings.dir, name + ".log"]),
+                    settings.rotate_size, settings.rotate_keep)
+        files.append(f)
+        h.add_sink(FileSink(f, formatter))
+        return (h, f)
+
+    startup = logging.Handler("core")
+    startup.set_output_level(max([logging.INFO, settings.core_level]))
+    if console is not None:
+        startup.add_sink(ConsoleSink(formatter, max([logging.INFO, settings.console_level])))
+    handlers.append(startup)
+
+    core, core_file = part("core", settings.core_level)
+    if core_file is not None:
+        startup.add_sink(FileSink(core_file, formatter))
+    netconf, _netconf_file = part("netconf", settings.netconf_level)
+    http, _http_file = part("http", settings.http_level)
+
+    device = logging.Handler("device")
+    if console is not None:
+        device.set_handler(console)
+    handlers.append(device)
+    if console is not None:
+        handlers.append(console)
+
+    device_logs = DeviceLogs(cap, settings.dir, settings.format,
+                             settings.rotate_size, settings.rotate_keep,
+                             settings.device_level)
+    return Logs(core, netconf, http, device, startup, device_logs, handlers, files)

@@ -1,0 +1,334 @@
+import argconf
+import file
+import json
+import logging
+import testing
+import time
+
+import logs
+
+
+def _test_parse_level():
+    cases = [
+        ("off", logging.OFF),
+        ("error", logging.ERR),
+        ("warning", logging.WARNING),
+        ("info", logging.INFO),
+        ("debug", logging.DEBUG),
+        ("trace", logging.TRACE),
+        ("WARNING", logging.WARNING),
+    ]
+    for name, level in cases:
+        testing.assertEqual(logs.parse_level(name), level, name)
+        testing.assertEqual(logs.level_name(level), name.lower(), name)
+    for name in ["", "warn", "notice", "critical", "verbose"]:
+        try:
+            logs.parse_level(name)
+            testing.error(f"parse_level accepted '{name}'")
+        except ValueError:
+            pass
+
+
+def _test_text_format():
+    """Each case gives the text between the time and the actor, and after the actor."""
+    f = logs.TextFormatter()
+    cases: list[(str, int, list[str], ?str, ?dict[str, ?value], str, str)] = [
+        ("message only", logging.WARNING, [], "Hello", None,
+         "WARN   ", " Hello"),
+        ("handler path", logging.ERR, ["device", "rtr1", "ssh"], "Failed", None,
+         "ERROR  device>rtr1>ssh: ", " Failed"),
+        ("data values", logging.INFO, ["core"], "Done",
+         {"n": 3, "s": "two words", "q": "say \"hi\"", "e": "", "none": None, "eq": "a=b", "path": "/a/b"},
+         "INFO   core: ", " Done n=3 s=\"two words\" q=\"say \\\"hi\\\"\" e=\"\" none=null eq=\"a=b\" path=/a/b"),
+        ("line break in message", logging.DEBUG, [], "line1\nline2\r", None,
+         "DEBUG  ", " line1\\nline2\\r"),
+        ("control characters in data", logging.TRACE, [], "Got", {"x": "a\tb\x1b[0m\\"},
+         "TRACE  ", " Got x=\"a\\tb\\x1B[0m\\\\\""),
+        ("data without message", logging.NOTICE, [], None, {"k": "v"},
+         "NOTICE ", " k=v"),
+    ]
+    for name, level, path, msg, data, head, tail in cases:
+        m = logging.Message(level, path, None, msg, data)
+        want = logs.timestamp(m.ts) + " " + head + f"{m.actor_class}[{m.actor_id}]:" + tail
+        testing.assertEqual(f.format(m), want, name)
+    testing.assertEqual(f.format(logging.Message(logging.INFO, [], None, None, None)), None, "empty message")
+
+
+def _test_timestamp():
+    cases: list[(str, ?int, str)] = [
+        ("east", 7200, "2026-09-22T14:03:07.123456789+02:00"),
+        ("utc", 0, "2026-09-22T14:03:07.123456789Z"),
+        ("west", -18000, "2026-09-22T14:03:07.123456789-05:00"),
+        ("west with minutes", -19800, "2026-09-22T14:03:07.123456789-05:30"),
+        ("east with minutes", 20700, "2026-09-22T14:03:07.123456789+05:45"),
+        ("no timezone", None, "2026-09-22T14:03:07.123456789"),
+    ]
+    for name, offset, expected in cases:
+        tz: ?time.Timezone = None
+        if offset is not None:
+            tz = time.Timezone("test", offset)
+        ts = time.DateTime(None, tz, None, None, 2026, 9, 22, 14, 3, 7, 123456789000000000, 1, 265)
+        testing.assertEqual(logs.timestamp(ts), expected, name)
+
+
+def _test_json_format():
+    f = logs.JsonFormatter()
+    m = logging.Message(logging.WARNING, ["device", "rtr1"], None, "Failed\nto connect",
+                        {"err": ValueError("refused"), "port": 830, "ok": False, "caps": ["a", "b"], "none": None})
+    text = f.format(m)
+    if text is not None:
+        testing.assertNotIn("\n", text)
+        obj = json.decode(text)
+        testing.assertEqual(str(obj["time"]), logs.timestamp(m.ts))
+        testing.assertEqual(str(obj["level"]), "warn")
+        testing.assertEqual(str(obj["logger"]), "device>rtr1")
+        testing.assertEqual(str(obj["actor"]), m.actor_class)
+        testing.assertEqual(str(obj["actor_id"]), str(m.actor_id))
+        testing.assertEqual(str(obj["msg"]), "Failed\nto connect")
+        data = obj["data"]
+        if isinstance(data, dict):
+            testing.assertIn("refused", str(data["err"]))
+            testing.assertEqual(str(data["port"]), "830")
+            testing.assertEqual(str(data["ok"]), "False")
+            testing.assertEqual(str(data["caps"]), str(["a", "b"]))
+            testing.assertTrue(data["none"] is None, "none")
+        else:
+            testing.error("data is not an object")
+    else:
+        testing.error("no JSON line")
+    no_data = f.format(logging.Message(logging.ERR, [], None, "x", None))
+    if no_data is not None:
+        testing.assertNotIn("data", json.decode(no_data))
+
+
+def _test_device_file_name():
+    cases = [
+        ("rtr1", "rtr1.log"),
+        ("core-sw_1.example.com", "core-sw_1.example.com.log"),
+        ("a/b", "a%2Fb.log"),
+        ("../x", "%2E.%2Fx.log"),
+        (".hidden", "%2Ehidden.log"),
+        ("a b", "a%20b.log"),
+        ("a%b", "a%25b.log"),
+        ("é", "%C3%A9.log"),
+        ("", ".log"),
+    ]
+    for name, expected in cases:
+        testing.assertEqual(logs.device_file_name(name), expected, name)
+
+
+def _parse_settings(argv: list[str], documents: list[dict[str, ?value]]=[], environment: dict[str, str]={}) -> logs.LogSettings:
+    p = argconf.Parser("TEST")
+    logs.LogSettings.declare(p)
+    return logs.LogSettings.read(p.parse(["test"] + argv, documents, environment))
+
+
+def _test_settings_defaults():
+    s = _parse_settings([])
+    testing.assertEqual(s.dir, "logs")
+    testing.assertEqual(s.format, "text")
+    testing.assertEqual(s.rotate_size, 10485760)
+    testing.assertEqual(s.rotate_keep, 5)
+    for name, level in [("level", s.level), ("console", s.console_level), ("core", s.core_level),
+                        ("netconf", s.netconf_level), ("http", s.http_level), ("device", s.device_level)]:
+        testing.assertEqual(level, logging.WARNING, name)
+
+
+def _test_settings_part_levels():
+    """A part without its own level follows log.level."""
+    documents: list[dict[str, ?value]] = [{"log": {"level": "info", "netconf": {"level": "debug"}}}]
+    s = _parse_settings(["--log.device.level", "trace"], documents, {"TEST_LOG__CONSOLE__LEVEL": "off"})
+    testing.assertEqual(s.level, logging.INFO)
+    testing.assertEqual(s.core_level, logging.INFO)
+    testing.assertEqual(s.http_level, logging.INFO)
+    testing.assertEqual(s.netconf_level, logging.DEBUG)
+    testing.assertEqual(s.device_level, logging.TRACE)
+    testing.assertEqual(s.console_level, logging.OFF)
+
+
+def _test_settings_errors():
+    cases = [
+        ("unknown level", ["--log.level", "loud"], "log.level 'loud'"),
+        ("unknown part level", ["--log.http.level", "warn"], "log.http.level 'warn'"),
+        ("unknown format", ["--log.format", "xml"], "log.format 'xml'"),
+        ("negative size", ["--log.rotate.size=-1"], "log.rotate.size"),
+        ("negative keep", ["--log.rotate.keep=-1"], "log.rotate.keep"),
+    ]
+    for name, argv, message in cases:
+        try:
+            _parse_settings(argv)
+            testing.error(f"{name}: no error")
+        except argconf.ConfigurationError as exc:
+            testing.assertIn(message, str(exc), name)
+
+
+def _read(fc: file.FileCap, path: str) -> ?str:
+    """Return the content of the file at path, or None if it does not exist."""
+    try:
+        f = file.ReadFile(file.ReadFileCap(fc), path)
+        data = f.read()
+        f.close()
+        return data.decode()
+    except OSError:
+        return None
+
+
+actor _test_log_file_appends(t: testing.EnvT):
+    """A LogFile appends to an existing file and creates missing directories."""
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    tmp = fs.mktmpdir("test_logs_")
+    path = tmp + "/a/b/test.log"
+    first = logs.LogFile(fc, path)
+    first.write("one\n")
+    first.write("two\n")
+    await async first.flush()
+    second = logs.LogFile(fc, path)
+    second.write("three\n")
+    await async second.flush()
+    testing.assertEqual(_read(fc, path), "one\ntwo\nthree\n")
+    await async fs.rmtree(tmp)
+    t.success()
+
+
+actor _test_log_file_rotates(t: testing.EnvT):
+    """A file that reaches rotate_size moves to .1, and only rotate_keep rotated files stay."""
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    tmp = fs.mktmpdir("test_logs_")
+    path = tmp + "/r.log"
+    f = logs.LogFile(fc, path, 10, 2)
+    for line in ["first 1234\n", "second 123\n", "third 1234\n", "four\n"]:
+        f.write(line)
+        await async f.flush()
+    testing.assertEqual(_read(fc, path), "four\n", "current")
+    testing.assertEqual(_read(fc, path + ".1"), "third 1234\n", "rotated once")
+    testing.assertEqual(_read(fc, path + ".2"), "second 123\n", "rotated twice")
+    testing.assertEqual(_read(fc, path + ".3"), None, "dropped")
+
+    none_kept = tmp + "/k.log"
+    g = logs.LogFile(fc, none_kept, 5, 0)
+    g.write("too long\n")
+    await async g.flush()
+    testing.assertEqual(_read(fc, none_kept), None, "keep 0 removes the file")
+    testing.assertEqual(_read(fc, none_kept + ".1"), None, "keep 0 keeps no rotated file")
+    await async fs.rmtree(tmp)
+    t.success()
+
+
+actor _test_log_file_unwritable(t: testing.EnvT):
+    """A LogFile that cannot write drops the text and keeps going."""
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    tmp = fs.mktmpdir("test_logs_")
+    blocker = tmp + "/file"
+    b = logs.LogFile(fc, blocker)
+    b.write("x\n")
+    await async b.flush()
+    f = logs.LogFile(fc, blocker + "/sub.log")
+    f.write("lost\n")
+    await async f.flush()
+    testing.assertEqual(_read(fc, blocker), "x\n")
+    await async fs.rmtree(tmp)
+    t.success()
+
+
+actor _test_setup_writes_part_files(t: testing.EnvT):
+    """Each part logs to its own file at its own level; startup messages always reach core.log."""
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    tmp = fs.mktmpdir("test_logs_")
+    settings = _parse_settings(["--log.dir", tmp, "--log.http.level", "info", "--log.console.level", "off"])
+    ls = logs.setup(settings, fc)
+
+    core = logging.Logger(ls.core)
+    core.warning("core warning", {"n": 1})
+    core.info("core info")
+    logging.Logger(ls.startup).info("starting")
+    logging.Logger(ls.netconf).error("netconf error")
+    logging.Logger(ls.netconf).info("netconf info")
+    logging.Logger(ls.http).info("http info")
+
+    dev = logging.Handler("rtr 1")
+    dev.set_handler(ls.device)
+    dev.set_output_level(ls.device_logs.level)
+    dev_file = ls.device_logs.add_file(dev, "rtr 1")
+    logging.Logger(dev).warning("device warning")
+    logging.Logger(dev).info("device info")
+    ls.drain()
+    level = dev.get_level()
+    if dev_file is not None:
+        await async dev_file.flush()
+
+    core_log = _read(fc, tmp + "/core.log")
+    if core_log is not None:
+        testing.assertIn("WARN   core: ", core_log)
+        testing.assertIn("core warning n=1", core_log)
+        testing.assertIn("INFO   core: ", core_log)
+        testing.assertIn("starting", core_log)
+        testing.assertNotIn("core info", core_log)
+    else:
+        testing.error("no core.log")
+    netconf_log = _read(fc, tmp + "/netconf.log")
+    if netconf_log is not None:
+        testing.assertIn("netconf error", netconf_log)
+        testing.assertNotIn("netconf info", netconf_log)
+    else:
+        testing.error("no netconf.log")
+    http_log = _read(fc, tmp + "/http.log")
+    if http_log is not None:
+        testing.assertIn("http info", http_log)
+    else:
+        testing.error("no http.log")
+    device_log = _read(fc, tmp + "/devices/rtr%201.log")
+    if device_log is not None:
+        testing.assertIn("rtr 1", device_log)
+        testing.assertIn("device warning", device_log)
+        testing.assertNotIn("device info", device_log)
+    else:
+        testing.error("no device log")
+    await async fs.rmtree(tmp)
+    t.success()
+
+
+actor _test_setup_unwritable_dir(t: testing.EnvT):
+    """A log directory that cannot be created is a configuration error."""
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    tmp = fs.mktmpdir("test_logs_")
+    blocker = logs.LogFile(fc, tmp + "/file")
+    blocker.write("x\n")
+    await async blocker.flush()
+    error = ""
+    try:
+        logs.setup(_parse_settings(["--log.dir", tmp + "/file/logs", "--log.console.level", "off"]), fc)
+    except argconf.ConfigurationError as exc:
+        error = str(exc)
+    await async fs.rmtree(tmp)
+    testing.assertIn("Invalid log.dir", error)
+    t.success()
+
+
+actor _test_setup_json_without_files(t: testing.EnvT):
+    """An empty log.dir writes no files; the json format applies to every file."""
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    tmp = fs.mktmpdir("test_logs_")
+    no_files = logs.setup(_parse_settings(["--log.dir", "", "--log.console.level", "off"]), fc)
+    testing.assertEqual(len(no_files.files), 0)
+    testing.assertTrue(no_files.device_logs.add_file(logging.Handler("x"), "x") is None, "no device file")
+
+    ls = logs.setup(_parse_settings(["--log.dir", tmp, "--log.format", "json", "--log.console.level", "off"]),
+                    fc)
+    logging.Logger(ls.core).error("broken", {"code": 3})
+    ls.drain()
+    core_log = _read(fc, tmp + "/core.log")
+    if core_log is not None:
+        obj = json.decode(core_log.strip())
+        testing.assertEqual(str(obj["msg"]), "broken")
+        testing.assertEqual(str(obj["level"]), "error")
+        testing.assertEqual(str(obj["logger"]), "core")
+    else:
+        testing.error("no core.log")
+    await async fs.rmtree(tmp)
+    t.success()
