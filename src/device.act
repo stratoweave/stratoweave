@@ -12,6 +12,8 @@ import yang.adata as yadata
 import yang.gdata as ygdata
 import yang.xml as yxml
 
+import logs as swlogs
+
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
     stratoweave_rfs__device__credentials as Credentials
@@ -526,12 +528,15 @@ class DeviceType(object):
         self.bundled_schema = DeviceSchema(name, src_dnode, oper_src_dnode, schema_transforms)
         self.software_adapter_type = software_adapter_type
 
-actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnectCap=None, log_handler: logging.Handler):
+actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnectCap=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None):
     """Device Registry keeps track of all devices and hands out references to
     them based on name.
 
     There must only be a single Device instance per device, i.e. the same device
     name must always return the same Device instance.
+
+    Each device logs to its own handler under log_handler. With device_logs,
+    that handler also writes the device's log file.
     """
     var devices = {}
 
@@ -550,7 +555,7 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPC
 
     def get_or_create(name: str) -> DeviceMgr:
         if name not in devices:
-            devices[name] = DeviceMgr(dev_types, connect_cap, name, log_handler, reconf_cb, schema_registry, self)
+            devices[name] = DeviceMgr(dev_types, connect_cap, name, log_handler, reconf_cb, schema_registry, self, device_logs)
         dev = devices[name]
         return dev
 
@@ -609,6 +614,13 @@ actor SchemaRegistry():
     def get_schema(content_hash) -> ?yschema.DRoot:
         if content_hash is not None:
             return store.get(content_hash)
+
+
+def _default_device_log_level(device_logs: ?swlogs.DeviceLogs) -> int:
+    """Return the log level of a device without debug settings."""
+    if device_logs is not None:
+        return device_logs.level
+    return logging.DEBUG
 
 
 def truncate_conf(conf: ?ygdata.Node) -> str:
@@ -698,7 +710,7 @@ class DeviceTreeProvider(ygdata.TreeProvider):
 
 
 
-actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnectCap=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None):
+actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnectCap=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None, device_logs: ?swlogs.DeviceLogs=None):
     """Device Manager manages a device and represents that device, as an
     abstract device, in the system. Platform specific handling is implemented in
     the DeviceAdapter, i.e.  in subclasses of DeviceAdapter, like NetconfAdapter
@@ -747,10 +759,18 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
     over the network. Tests can access the mock server and side-load data into
     it in order to verify the DeviceMgr's interaction with the device adapter
     and the adapter's interaction with the device.
+
+    ## Logging
+    The device and its adapters log to one handler, named after the device.
+    With device_logs, the handler writes the device's log file at the level
+    from device_logs.
     """
+    _default_log_level = _default_device_log_level(device_logs)
     _log_handler = logging.Handler(name)
     _log_handler.set_handler(log_handler)
-    _log_handler.set_output_level(logging.DEBUG)
+    _log_handler.set_output_level(_default_log_level)
+    if device_logs is not None:
+        device_logs.add_file(_log_handler, name)
     _log = logging.Logger(_log_handler)
 
     system_mock = True if connect_cap is None else False
@@ -785,7 +805,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
     # Per-device software manager. Statically instantiated: every device has
     # one, whether or not its device type can actually install software. It
     # stays idle until it is given both an adapter and a target release.
-    swmgr = SoftwareManager(name, log_handler, self)
+    swmgr = SoftwareManager(name, _log_handler, self)
 
     def set_update_oper(cb: action(?ygdata.Node) -> None) -> None:
         """Hand the DeviceMgr the oper publication hook for its device entry.
