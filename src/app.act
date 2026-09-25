@@ -7,6 +7,7 @@ import std.xml as xml
 
 import db as swdb
 import device as swdev
+import logs as swlogs
 import ttt as ttt
 import yang.gdata as ygdata
 import yang.schema as yschema
@@ -156,13 +157,14 @@ class SystemSettings(value):
     netconf_password: str
     netconf_ssh: SshTransportSettings
     exit_on_done: bool
+    log: swlogs.LogSettings
 
     def __init__(self, startup_config_files: list[str], db_spec: ?str,
                  http_port: int, netconf_port: int,
                  netconf_host_key_path: ?str,
                  netconf_user: str, netconf_password: str,
                  netconf_ssh: SshTransportSettings,
-                 exit_on_done: bool):
+                 exit_on_done: bool, log: swlogs.LogSettings):
         self.startup_config_files = startup_config_files
         self.db_spec = db_spec
         self.http_port = http_port
@@ -172,6 +174,7 @@ class SystemSettings(value):
         self.netconf_password = netconf_password
         self.netconf_ssh = netconf_ssh
         self.exit_on_done = exit_on_done
+        self.log = log
 
     @staticmethod
     def parser() -> argconf.Parser:
@@ -198,6 +201,7 @@ class SystemSettings(value):
         )
         SshTransportSettings.declare(p, "netconf.ssh")
         p.add_bool("exit_on_done", help="Exit after startup config has been applied")
+        swlogs.LogSettings.declare(p)
         return p
 
     @staticmethod
@@ -215,7 +219,8 @@ class SystemSettings(value):
             args.get_str("netconf.user"),
             args.get_str("netconf.password"),
             SshTransportSettings.read(args, "netconf.ssh"),
-            args.get_bool("exit_on_done"))
+            args.get_bool("exit_on_done"),
+            swlogs.LogSettings.read(args))
 
 
 NS_SW_RFS = "http://stratoweave.org/yang/stratoweave-rfs"
@@ -246,6 +251,23 @@ actor RfsReconf(dev_registry: swdev.DeviceRegistry, cfs: ttt.Layer):
     dev_registry.on_reconf(lambda dev: _rfs.edit_config(_rfs_for_device(dev)))
 
 
+actor Lifecycle(logs: swlogs.Logs, env_exit: action(int) -> None):
+    """Log the startup events that arrive as callbacks, and exit.
+
+    exit writes the log messages sent so far before the process ends.
+    """
+    log = logging.Logger(logs.startup)
+
+    def netconf_listening(port: int, error: ?Exception) -> None:
+        if error is None:
+            log.info("NETCONF server listening", {"port": port})
+
+    def exit(code: int) -> None:
+        log.info("StratoWeave exiting", {"code": code})
+        logs.drain()
+        env_exit(code)
+
+
 actor StartupConfigApplier(startup_config_files: list[str], exit_on_done: bool, top_schema: yschema.DRoot, cfs: ttt.Layer, exit: action(int) -> None, rfcap: file.ReadFileCap, log_handler: logging.Handler):
     var log = logging.Logger(log_handler)
 
@@ -264,15 +286,15 @@ actor StartupConfigApplier(startup_config_files: list[str], exit_on_done: bool, 
         input_merge = ygdata.Container()
         for filename in startup_config_files:
             log.debug("Reading config file", {"config_file": filename})
-            f = file.ReadFile(rfcap, filename)
-            data = f.read()
-            f.close()
             try:
+                f = file.ReadFile(rfcap, filename)
+                data = f.read()
+                f.close()
                 conf_xml = xml.decode(data.decode())
                 conf_gd = yxml.from_xml(top_schema, conf_xml, loose=True)
                 input_merge = ygdata.merge(input_merge, conf_gd)
             except Exception as e:
-                print("Error reading config file {filename}: {e}")
+                log.error("Error reading config file", {"config_file": filename, "error": e})
                 exit(1)
                 return
 

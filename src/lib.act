@@ -12,6 +12,7 @@ import db.etcd as swetcd
 import db.lmdb as swlmdb
 import device as swdev
 import http_server as swhttp
+import logs as swlogs
 import netconf_server as swnetconf
 import test_rig as swts
 
@@ -102,26 +103,22 @@ def _start(sysspec: swapp.SysSpec, env: Env,
     fcap = file.FileCap(env.cap)
     rfcap = file.ReadFileCap(fcap)
 
-    logh = logging.Handler("SWeave")
-    logh.add_sink(logging.StdoutSink())
-    logh.set_output_level(logging.TRACE)
-
-    logh_http = logging.Handler("HTTP")
-    logh_http.set_handler(logh)
-    logh_http.set_output_level(logging.DEBUG)
-
-    logh_netconf = logging.Handler("NETCONF")
-    logh_netconf.set_handler(logh)
-    logh_netconf.set_output_level(logging.DEBUG)
-
-    logh_ttt = logging.Handler("TTT")
-    logh_ttt.set_handler(logh)
-    logh_ttt.set_output_level(logging.INFO)
-
-    logh_dev = logging.Handler("Dev")
-    logh_dev.set_handler(logh)
-
-    log = logging.Logger(logh)
+    log_settings = system_settings.log
+    logs = swlogs.setup(log_settings, fcap)
+    lifecycle = swapp.Lifecycle(logs, env.exit)
+    log = logging.Logger(logs.startup)
+    log_dir = log_settings.dir
+    if log_dir != "" and not log_dir.startswith("/"):
+        log_dir = file.join_path([file.FS(fcap).cwd(), log_dir])
+    started: dict[str, ?value] = {
+        "log_dir": log_dir if log_dir != "" else None,
+        "log_level": swlogs.level_name(log_settings.level),
+    }
+    if http:
+        started["http_port"] = system_settings.http_port
+    if netconf:
+        started["netconf_port"] = system_settings.netconf_port
+    log.info("StratoWeave starting", started)
 
     top_schema = sysspec.schema_for_layer(0)
     top_oper_schema = sysspec.schema_for_oper_layer(0)
@@ -137,24 +134,25 @@ def _start(sysspec: swapp.SysSpec, env: Env,
         else:
             raise ValueError("Database backend is not available: {spec.backend}")
 
-    dev_registry = swdev.DeviceRegistry(sysspec.device_types, connect_cap, logh_dev)
-    cfs = sysspec.get_layers(dev_registry, logh_ttt, db)
+    dev_registry = swdev.DeviceRegistry(sysspec.device_types, connect_cap, logs.device, logs.device_logs)
+    cfs = sysspec.get_layers(dev_registry, logs.core, db)
     swapp.RfsReconf(dev_registry, cfs)
 
     def start_runtime(netconf_host_key: ?str):
         if http:
             tcpl_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))
             enable_tmf = len(tmf.cfs.services_from_schema(top_schema)) > 0
-            swhttp.HttpServer(tcpl_cap, top_schema=top_schema, cfs=cfs, dev_registry=dev_registry, schema_for_layer=sysspec.schema_for_layer, static_assets=static_assets, enable_tmf_api=enable_tmf, log_handler=logh_http, port=system_settings.http_port)
+            swhttp.HttpServer(tcpl_cap, top_schema=top_schema, cfs=cfs, dev_registry=dev_registry, schema_for_layer=sysspec.schema_for_layer, static_assets=static_assets, enable_tmf_api=enable_tmf, log_handler=logs.http, port=system_settings.http_port)
 
         if netconf:
             nc_listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))
-            swnetconf.NetconfServer(nc_listen_cap, log_handler=logh_netconf, top_schema=top_schema, cfs=cfs, port=system_settings.netconf_port, username=system_settings.netconf_user, password=system_settings.netconf_password, host_key=netconf_host_key, subscription_schema=top_oper_schema, ssh_transport=system_settings.netconf_ssh.transport_config())
+            netconf_port = system_settings.netconf_port
+            swnetconf.NetconfServer(nc_listen_cap, log_handler=logs.netconf, top_schema=top_schema, cfs=cfs, port=netconf_port, username=system_settings.netconf_user, password=system_settings.netconf_password, host_key=netconf_host_key, on_listen=lambda error: lifecycle.netconf_listening(netconf_port, error), subscription_schema=top_oper_schema, ssh_transport=system_settings.netconf_ssh.transport_config())
 
-        swapp.StartupConfigApplier(system_settings.startup_config_files, system_settings.exit_on_done, top_schema, cfs, env.exit, rfcap, logh)
-        log.info("StratoWeave running..")
+        swapp.StartupConfigApplier(system_settings.startup_config_files, system_settings.exit_on_done, top_schema, cfs, lifecycle.exit, rfcap, logs.startup)
+        log.info("StratoWeave running")
 
-    swapp.StartupBootstrap(cfs, db is not None, system_settings.netconf_host_key_path if netconf else None, rfcap, start_runtime, env.exit, logh)
+    swapp.StartupBootstrap(cfs, db is not None, system_settings.netconf_host_key_path if netconf else None, rfcap, start_runtime, lifecycle.exit, logs.startup)
 
 def test_main(sysspec: swapp.SysSpec, log_handler: logging.Handler) -> swts.TestRig:
     """Create a `TestRig` for actor-based StratoWeave tests.

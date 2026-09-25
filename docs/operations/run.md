@@ -22,12 +22,86 @@ ENTRYPOINT ["/usr/local/bin/sorespo"]
     image.
 
 ## Logging
-StratoWeave orchestrators log to `stdout` and `stderr` by default. When you run
-the orchestrator in a container, these streams are captured by the container
-runtime and can be viewed with `docker logs` or `kubectl logs`.
-Through [Docker logging drivers](https://docs.docker.com/engine/logging/configure/),
-you can also redirect these streams to a file or a logging service of your
-choice.
+StratoWeave writes one log file for each part of the system, in the directory
+`logs` below the working directory:
+
+| File | Content |
+|---|---|
+| `core.log` | Startup and exit, TTT layers and transforms |
+| `netconf.log` | Northbound NETCONF server: logins, sessions, subscriptions |
+| `http.log` | HTTP server: RESTCONF, TMF API and web UI, one line per request at `info` |
+| `devices/<name>.log` | One file per device: connection, configuration, software upgrades |
+
+The default level is `warning`, so a healthy system writes little. Startup
+messages are always written, at `info`, to `core.log` and to `stdout`: the
+log directory, the NETCONF listener and the startup configuration. So is the
+exit code when StratoWeave ends by itself, for example after `--exit-on-done`
+or a startup error. `stdout` also shows every message at the console level,
+which is `log.level` unless set.
+
+```aon title="system.aon"
+log:
+    dir = "/var/log/sorespo"
+    level = "warning"
+    netconf:
+        level = "info"
+    device:
+        level = "info"
+```
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `log.dir` | `logs` | Directory for log files; empty to write no files |
+| `log.level` | `warning` | Level of every part without its own level |
+| `log.core.level`, `log.netconf.level`, `log.http.level`, `log.device.level` | `log.level` | Level of one part |
+| `log.console.level` | `log.level` | Level of `stdout` |
+| `log.format` | `text` | `text` or `json` |
+| `log.rotate.size` | `10485760` | Rotate a file when it reaches this many bytes; `0` to never rotate |
+| `log.rotate.keep` | `5` | Rotated files to keep for each log file |
+
+The levels are `off`, `error`, `warning`, `info`, `debug` and `trace`. The
+same settings are command-line options such as `--log.level debug`, and
+environment variables such as `STRATOWEAVE_LOG__LEVEL`.
+
+A device can log at another level than the others: its `debug/log-level`
+overrides `log.device.level`, and `debug/connection` makes it log at `trace`.
+Both come from the device entry; see [Device management](devices.md).
+
+### Line format
+The `text` format writes one line for each message: the time with the UTC
+offset, the level, the part, the class and id of the actor that logged, the
+message, and its data as `key=value` pairs. Line breaks and other control
+characters are escaped, so a message is always one line.
+
+```text
+2026-09-22T14:03:07.123456789+02:00 ERROR  rtr1: stratoweave.adapters.netconf.NetconfDriver[-439]: Device._on_connect: error connecting to device error="Connection refused"
+```
+
+The `json` format writes one JSON object for each line, with the keys `time`,
+`level`, `logger`, `actor`, `actor_id`, `msg` and, when the message has data,
+`data`. Use it when a log shipper sends the files to a search system.
+
+Device configuration in debug messages leaves out the credentials.
+
+### Rotation
+When a file reaches `log.rotate.size`, it is renamed to `<name>.log.1`, the
+previous `<name>.log.1` to `<name>.log.2` and so on, and at most
+`log.rotate.keep` rotated files are kept.
+
+To rotate with `logrotate` instead, set `log.rotate.size` to `0`. StratoWeave
+opens the file for each write, so a file that `logrotate` moved away is
+created again on the next write. No signal and no `copytruncate` are
+necessary.
+
+### Containers
+In a container, mount a volume on the log directory, or set `log.dir` to an
+empty string to write no files. `stdout` then shows every message at
+`log.level`, and the container runtime captures it for `docker logs` or
+`kubectl logs`:
+
+```console
+out/bin/sorespo --log.dir= --log.level info
+```
 
 ## Run-time configuration
 Running `--help` is the fastest way to confirm the exact interface exposed by
