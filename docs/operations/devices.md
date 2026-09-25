@@ -179,6 +179,27 @@ connection that can never come up.
 The northbound NETCONF server has its own equivalent settings, configured as
 system settings rather than as intent; see [Running StratoWeave](run.md).
 
+## Device logs
+
+Every device writes its own log file, `devices/<name>.log` in the log
+directory; see [Running StratoWeave](run.md#logging). The device logs at the
+level of the `log.device.level` setting, unless its `debug/log-level` leaf
+sets another level. With `debug/connection` set, the device logs at `trace`
+and the file also holds every NETCONF message to and from the device,
+configuration data included.
+
+Like the other device settings, both leaves come from the transform that
+creates the device entry. To let operators change the level of one device at
+run time, expose the leaves in the northbound model and copy them, as the
+fleetmgr example does:
+
+```acton title="fleetmgr/src/fleetmgr/cfs.act"
+dev.debug.connection = i.debug.connection
+dev.debug.log_level = i.debug.log_level
+```
+
+A new level applies without a reconnect.
+
 ## RFS models still define the service-specific southbound data
 
 The built-in device list already comes from the StratoWeave RFS schema. Your

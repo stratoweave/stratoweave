@@ -63,6 +63,10 @@ The levels are `off`, `error`, `warning`, `info`, `debug` and `trace`. The
 same settings are command-line options such as `--log.level debug`, and
 environment variables such as `STRATOWEAVE_LOG__LEVEL`.
 
+A device can log at another level than the others: its `debug/log-level`
+overrides `log.device.level`, and `debug/connection` makes it log at `trace`.
+Both come from the device entry; see [Device management](devices.md).
+
 ### Line format
 The `text` format writes one line for each message: the time with the UTC
 offset, the level, the part, the class and id of the actor that logged, the
