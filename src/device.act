@@ -11,6 +11,7 @@ import yang.gdata as ygdata
 import yang.xml as yxml
 
 import logs as swlogs
+import device_translation as translation
 
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
@@ -989,12 +990,14 @@ class DeviceType(object):
     ## like a CLI adapter that knows which commands name the model.
     platform_probes: list[PlatformProbe]
 
-    def __init__(self, name: str, adapter_type, src_dnode, oper_src_dnode: ?yschema.DRoot=None, schema_transforms: list[SchemaTreeTransform]=[], software_adapter_type=None, platform_probes: list[PlatformProbe]=[]):
+    def __init__(self, name: str, adapter_type, src_dnode, oper_src_dnode: ?yschema.DRoot=None, schema_transforms: list[SchemaTreeTransform]=[], software_adapter_type=None, platform_probes: list[PlatformProbe]=[], model_translations: list[translation.ModelTranslation]=[]):
         self.name = name
         self.adapter_type = adapter_type
         self.bundled_schema = DeviceSchema(name, src_dnode, oper_src_dnode, schema_transforms)
         self.software_adapter_type = software_adapter_type
         self.platform_probes = platform_probes
+        translation.owners(model_translations)
+        self.model_translations = model_translations
 
 actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None, platform_probes: list[PlatformProbe]=[]):
     """Device Registry keeps track of all devices and hands out references to
@@ -1554,6 +1557,8 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
     # The modules supported by the device.
     var modset: dict[str, ModCap] = {}
     var modset_id: ?str = None
+    var model_translations: list[translation.ModelTranslation] = []
+    var config_generation = 0
 
     # Key of the fetched schema in the SchemaRegistry
     var schema_key: ?SchemaKey = None
@@ -1682,7 +1687,21 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
 
     def on_modset_update(new_modset: dict[str, ModCap]):
         _log.debug("Modset updated", {"new_modset": new_modset})
-        on_reconf(name)
+        on_connect(new_modset, schema_key)
+
+    def _invalidate_rendered_config():
+        # Transactions still wait for their intent to be rendered with the new
+        # device type/capabilities. Approval of an old native target is void.
+        config_generation += 1
+        modset_id = None
+        reconf_tids.update(confq.keys())
+        reconf_tids.update(current_tids)
+        confq = {}
+        current_tids = set()
+        target_conf = None
+        running_conf = None
+        last_sent_diff = None
+        _update_approval_state()
 
     def _on_config_change(ev: ?NotifEvent, err: ?Exception):
         # Channel trouble (err) is resync-neutral: reconnects already resync,
@@ -1737,20 +1756,23 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         _set_connected(reporter, True)
         _update_routes()
         new_union = union_modules(_adapter_types(), _modules_by_type())
+        changed = not modset_eq(modset, new_union) or modset_id is None
+        if is_primary:
+            changed = changed or schema_key != new_schema_key
+            schema_key = new_schema_key
+        if changed:
+            _log.debug("New supported modules or schema, triggering RFS reconf", {"name": name})
+            _invalidate_rendered_config()
+            modset = new_union
+            modset_id = "{bundled_schema.name}:{config_generation}:{hash_modset(modset)}"
+            on_reconf(name)
+        else:
+            _log.debug("Supported modules unchanged")
         resync()
         _read_platform(new_union)
         if is_primary:
             swmgr.on_connect()
         _ensure_config_change_subscription(new_union)
-        if modset_eq(modset, new_union):
-            _log.debug("Supported modules unchanged")
-        else:
-            _log.debug("New supported modules, triggering RFS reconf", {"name": name})
-            modset = new_union
-            modset_id = hash_modset(modset)
-            if is_primary:
-                schema_key = new_schema_key
-            on_reconf(name)
 
     def on_disconnect(dev_type: ?str=None):
         """An adapter lost its connection. dev_type is its device type; None
@@ -2171,6 +2193,9 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
                 swmgr.set_config(sw.upgrade_campaign, sw.target_release, sw.allow_staging, sw_vetoes)
 
                 if need_new_adapter:
+                    if type_changed:
+                        _invalidate_rendered_config()
+                    model_translations = device_type.model_translations
                     new_adapter = _build_adapter(device_type, new_dmc, effective_mock, _log_handler,
                                                  lambda m, k: self.on_connect(m, k))
                     use_generic_mock_adapter = effective_mock and isinstance(new_adapter, MockAdapter)
@@ -2291,12 +2316,16 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
                     _log.debug("DeviceMgr._send_config: no pending work as config queue items pend approval")
                 return
 
+        sent_generation = config_generation
+
         def on_configured(error: ?Exception, resulting_config, new_diff):
             """Handle transaction completion
 
             This callback is called when the adapter finishes the configuration
             transaction, either successfully or with an error.
             """
+            if sent_generation != config_generation:
+                return
             if error is not None:
                 if isinstance(error, NotConnectedError):
                     _log.debug("Device not connected, no need to retry - waiting for reconnect")
@@ -2435,7 +2464,10 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         txid matches our cached version. If the device does not support txid,
         we have to fetch the full config and diff it against our cached version.
         """
+        fetched_generation = config_generation
         def on_fetch_config_done(new_conf: ?ygdata.Node, err: ?Exception) -> None:
+            if fetched_generation != config_generation:
+                return
             if err is not None:
                 _log.error("Error fetching config from device", {"error": err})
             elif new_conf is not None:
@@ -2512,6 +2544,19 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
     # TODO: use named fields in the tuple
     def get_modules() -> (dict[str, ModCap], ?str):
         return modset, modset_id
+
+    def get_translation_modules() -> dict[str, ModCap]:
+        modules = {}
+        for mapping in model_translations:
+            for ns, meta in mapping.source_schema.module_metadata.items():
+                if ns in mapping.modules():
+                    modules[meta.name] = ModCap(meta.name, ns, meta.revision)
+        return modules
+
+    def render_config(intent: ygdata.Node, expected_modset_id: ?str) -> ygdata.Node:
+        if expected_modset_id != modset_id:
+            raise ValueError("Device capabilities changed while translating {name}; retry the transaction")
+        return translation.render(intent, bundled_schema.src_dnode, model_translations)
 
     def get_config():
         """Get the running config of the device, from the adapter which keeps a cached version of it

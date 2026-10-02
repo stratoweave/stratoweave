@@ -3070,8 +3070,9 @@ class _TransformTransactionBase(_Transaction):
         self.filter_fpath = path_filter(path)
 
         self.db = None
-        self.me = ''  # Initialize first before any self reference
-        self.me = '(src_' + str(self)[-10:-1] + ')'  # Now safe to use str(self)
+        # Lower-layer inputs persist this identifier. Object addresses change
+        # after restore and would leave orphaned contributions on recompute.
+        self.me = swdb.slot_key(_db_path(path), "source")
 
     def configure_output(self, tid, conf, out, dbuf):
         # Retain intent across candidate invalidation. Replay against current
@@ -3714,7 +3715,7 @@ class _RFSTransaction(_TransformTransactionBase):
         newoutmem = (gdata.Container({}), None)
         if len(modset) > 0:
             #print('####', tid, '(RFSTransform)', _format_path(self.path), 'compute', self.devname, err=True)
-            newoutmem = self.function.transform_wrapper(merged, DeviceInfo(self.devname, modset), self.memory, self.dynstate, self.output)
+            newoutmem = self.function.transform_wrapper(merged, DeviceInfo(self.devname, modset, self.dev.get_translation_modules()), self.memory, self.dynstate, self.output)
             newout = newoutmem.0
             dev_content[gdata.Id(NS_stratoweave_device, "config")] = newout
         else:
@@ -3732,6 +3733,9 @@ class _RFSTransaction(_TransformTransactionBase):
                 gdata.Id(NS_stratoweave_device, "name"): gdata.Leaf(self.devname),
                 gdata.Id(NS_stratoweave_device, "config"): gdata.Container()
             }
+            modset_id = self.dev.get_modules().1
+            if modset_id is not None:
+                dev_content[gdata.Id(NS_stratoweave_device, "modset_id")] = gdata.Leaf(modset_id)
             embedded_cfg: gdata.Node = self.embed(dev_content)
             out.write_config(tid, self.me, embedded_cfg)
 
@@ -3790,10 +3794,12 @@ class _RFSTransaction(_TransformTransactionBase):
 class DeviceInfo(object):
     name: str
     modules: dict[str, swadapt.ModCap]
+    translation_modules: dict[str, swadapt.ModCap]
 
-    def __init__(self, name: str, modules: dict[str, swadapt.ModCap] = {}):
+    def __init__(self, name: str, modules: dict[str, swadapt.ModCap] = {}, translation_modules: dict[str, swadapt.ModCap] = {}):
         self.name = name
         self.modules = modules
+        self.translation_modules = translation_modules
 
 class RFSFunction(object):
     transform_wrapper: mut(gdata.Node, DeviceInfo, ?gdata.Node, ?gdata.Node, ?gdata.Node) -> (gdata.Node, ?gdata.Node)
@@ -3914,7 +3920,26 @@ class _DeviceConfigTransaction(_TransformTransactionBase):
         self.logger = logging.Logger(log_handler)
         self.cont = None
 
-    def compute(self, tid, merged, linked, out):
+    def compute(self, tid: str, merged: gdata.Node, linked: gdata.Node, out: ?Session) -> (gdata.Node, ?gdata.Node):
+        if isinstance(merged, gdata.Container):
+            key = gdata.Id(NS_stratoweave_device, "config")
+            config = merged.children.get(key)
+            token = merged.children.get(gdata.Id(NS_stratoweave_device, "modset_id"))
+            expected: ?str = None
+            if isinstance(token, gdata.Leaf):
+                token_value = token.val
+                if isinstance(token_value, str):
+                    expected = token_value
+            # Patching away the last contribution removes the empty config
+            # container. With known capabilities this means an empty target,
+            # not an instruction to wait for capabilities indefinitely.
+            if config is None and expected is not None and self.dev.get_modules().0:
+                config = gdata.Container()
+            if config is not None:
+                native = self.dev.render_config(config, expected)
+                children = dict(merged.children.items())
+                children[key] = native
+                return gdata.Container(children), None
         return merged, None
 
     def clear(self, tid, out):

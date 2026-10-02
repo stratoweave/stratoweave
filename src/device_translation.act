@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: BSD-3-Clause
+"""Data-only model translation at the device configuration boundary.
+
+Adapters own the schemas and mapping functions. Each function renders a complete
+native contribution from its complete source tree; it must be deterministic and
+must not retain state. Transport, persistence and orchestration stay outside it.
+"""
+
+import yang.adata as adata
+import yang.gdata as gdata
+import yang.schema as schema
+
+
+class ModelTranslation(object):
+    name: str
+    source_schema: schema.DRoot
+    roots: list[gdata.Id]
+    @property
+    translate: mut(gdata.Node) -> gdata.Node
+
+    def __init__(self, name: str, source_schema: schema.DRoot, roots: list[gdata.Id], translate):
+        self.name = name
+        self.source_schema = source_schema
+        self.roots = roots
+        self.translate = translate
+        if not roots:
+            raise ValueError("Translation {name} must own at least one source root")
+        for root in roots:
+            source_schema.get(root.name, namespace=root.q)
+
+    def modules(self) -> set[str]:
+        """Namespaces defining owned data, excluding type-only imports."""
+        def collect(node: schema.DNode) -> set[str]:
+            namespaces = {node.namespace}
+            if isinstance(node, schema.DNodeInner):
+                for child in node.children:
+                    namespaces.update(collect(child))
+            return namespaces
+        result = set()
+        for root in self.roots:
+            result.update(collect(self.source_schema.get(root.name, namespace=root.q)))
+        return result
+
+
+class _AdataMapping[S(adata.MNode), T(adata.MNode)](object):
+    @property
+    from_gdata: mut(gdata.Node) -> S
+    @property
+    translate: mut(S) -> T
+
+    def __init__(self, from_gdata: mut(gdata.Node) -> S, translate: mut(S) -> T):
+        self.from_gdata = from_gdata
+        self.translate = translate
+
+    mut def translate_tree(self, source: gdata.Node) -> gdata.Node:
+        native: adata.MNode = self.translate(self.from_gdata(source))
+        return native.to_gdata()
+
+
+def adata_translation[S(adata.MNode), T(adata.MNode)](
+        name: str, source_schema: schema.DRoot, roots: list[gdata.Id],
+        from_gdata: mut(gdata.Node) -> S, translate: mut(S) -> T) -> ModelTranslation:
+    """Register a typed adata mapping, keeping conversion at the boundary.
+
+Pass the generated source root's from_gdata method and a data-only function
+returning a native root (or merge()). Each call receives fresh source bindings.
+The adapter's function needs no dependency on this module or on gdata.
+"""
+    mapping: _AdataMapping[S, T] = _AdataMapping(from_gdata, translate)
+    return ModelTranslation(name, source_schema, roots, mapping.translate_tree)
+
+
+class Merged(adata.MNode):
+    parts: list[adata.MNode]
+
+    def __init__(self, parts: list[adata.MNode]):
+        self.parts = parts
+
+    mut def to_gdata(self, prev: ?gdata.Container=None) -> gdata.Node:
+        result: gdata.Node = gdata.Container()
+        for part in self.parts:
+            tree = part.to_gdata()
+            if not isinstance(tree, gdata.Container):
+                raise ValueError("merge() expects configuration roots")
+            result = gdata.merge(result, tree)
+        # prev is the complete merged tree, not an individual contribution.
+        # Rebuild and check conflicts before reusing an unchanged result.
+        if prev is not None:
+            if result == prev:
+                return prev
+        return result
+
+    mut def copy(self) -> Merged:
+        return Merged([part.copy() for part in self.parts])
+
+
+def merge(parts: list[adata.MNode]) -> adata.MNode:
+    """Return standard and native typed roots from the same RFS transform."""
+    return Merged(parts)
+
+
+def owners(translations: list[ModelTranslation]) -> dict[gdata.Id, str]:
+    result = {}
+    names = set()
+    for translation in translations:
+        if translation.name in names:
+            raise ValueError("Duplicate model translation {translation.name}")
+        names.add(translation.name)
+        for root in translation.roots:
+            if root in result:
+                raise ValueError("Source root /{root.q}:{root.name} is owned by both {result[root]} and {translation.name}")
+            result[root] = translation.name
+    return result
+
+
+def _check_config(node: gdata.Node, sn: schema.DNode, path: str="", model: str="native") -> None:
+    if isinstance(node, gdata.Container):
+        for key, child in node.children.items():
+            child_path = "{path}/{key.q}:{key.name}"
+            try:
+                child_schema = sn.get(key.name, namespace=key.q)
+            except Exception:
+                raise ValueError("Unsupported {model} configuration at {child_path}")
+            if not child_schema.config or isinstance(child_schema, schema.DRpc):
+                raise ValueError("Not a {model} configuration node: {child_path}")
+            _check_config(child, child_schema, child_path, model)
+    elif isinstance(node, gdata.List):
+        for entry in node.entries():
+            _check_config(entry, sn, "{path}[{entry.key_str(node.keys)}]", model)
+
+
+mut def render(intent: gdata.Node, native_schema: schema.DRoot, translations: list[ModelTranslation]) -> gdata.Node:
+    """Render once after merging all RFS contributions, before committing.
+
+Source roots are consumed, never sent to the transport. Ordinary merge semantics
+allow identical values and reject competing assignments with their native path.
+"""
+    if not isinstance(intent, gdata.Container):
+        raise ValueError("Device configuration must be a root container")
+    owned = owners(translations)
+    result: gdata.Node = gdata.Container({k: v for k, v in intent.children.items() if k not in owned})
+    for translation in translations:
+        children = {k: v for k, v in intent.children.items() if k in translation.roots}
+        if children:
+            try:
+                source = gdata.Container(children)
+                _check_config(source, translation.source_schema, model="source")
+                contribution = translation.translate(source)
+                if not isinstance(contribution, gdata.Container):
+                    raise ValueError("Expected a native configuration root")
+                for root in contribution.children:
+                    if root in owned:
+                        raise ValueError("Untranslated source root /{root.q}:{root.name}")
+                _check_config(contribution, native_schema)
+                result = gdata.merge(result, contribution)
+            except Exception as error:
+                raise ValueError("Model translation {translation.name}: {error}")
+    # A schema-less generic mock retains its existing permissive behavior.
+    if native_schema.children:
+        _check_config(result, native_schema)
+    return result

@@ -181,3 +181,117 @@ other transforms it has subscribed to or any other information it has access to.
 
 These use cases are not mutually exclusive, and a single Transform Actor may
 need to do all of these things at once or more.
+
+## Device model translation
+
+An RFS transform can write shared standard bindings alongside the device's native
+bindings. Generate the standard bindings separately from the transport schema,
+then return an `MNode` using `merge`:
+
+```acton
+from stratoweave.device_translation import merge
+import myapp.devices.standard as standard
+import myapp.devices.vendor as vendor
+
+class BaseConfig(base.BaseConfig):
+    def transform(self, i, di):
+        intent = standard.root()
+        intent.system.hostname = di.name
+        native = vendor.root()
+        # Set native interfaces, routing configuration and policy attachments.
+        return merge([intent, native])
+```
+
+`di.translation_modules` lists modules defining the adapter's translation source
+data, including augmenting modules. `di.modules` continues to describe the
+native capabilities reported by the device. Translation schemas are never added
+to transport capability discovery, native schema negotiation, or NETCONF reads.
+Registration advertises the source model; an adapter may explicitly reject
+features of that model it does not implement.
+
+StratoWeave first merges **all** RFS contributions for a device. It then calls
+each registered translator with its complete source roots during the device
+configuration transaction's `compute()` step. A policy and a set it references
+can therefore come from different transforms. The translator returns a complete
+native contribution, which is merged with explicit native intent. Equal values
+can overlap; conflicting values abort the transaction with the translation name
+and native path. There is no precedence override. Normal YANG merge rules still
+apply to user-ordered lists.
+
+Duplicate ownership of a source root, unknown source/native roots, unsupported
+source nodes, translator exceptions and untranslated output all fail before
+commit and before device writes are queued. The descriptor's schema defines
+known source nodes; the mapping must reject known but unimplemented features.
+
+The transaction engine persists the mixed source intent as its input and the
+rendered native configuration as its output. Changes and deletions recompute the
+complete target, so generated configuration disappears when its source does.
+Approvals, drift reconciliation and transport writes operate on native data.
+Device-type or capability changes invalidate rendered targets and their pending
+approvals before retransformation. `DeviceMgr.configure()` remains a native
+transport-facing API; translation is not performed by that method.
+
+Transform contribution identifiers now derive from their paths, so restoring a
+store and recomputing does not create a second owner for the same contribution.
+Stores written by older versions with object-address contribution identifiers
+are not migrated by this change. Export and reapply their top-layer configuration
+to a fresh store when upgrading; retain the original store as a backup.
+
+### Adapter registration
+
+Mappings live with the adapter and use generated adata on both sides. Keep the
+mapping function independent of StratoWeave:
+
+```acton
+import myapp.devices.standard as standard
+import myapp.devices.vendor as vendor
+
+mut def translate_system(source: standard.root) -> vendor.root:
+    native = vendor.root()
+    native.configuration.system.host_name = source.system.hostname
+    return native
+```
+
+Use `adata_translation` in a separate integration module to register the typed
+function. The helper handles gdata conversion at the orchestration boundary:
+
+```acton
+from stratoweave.device_translation import adata_translation
+from yang.gdata import Id
+import myapp.devices.standard as standard
+from myapp.adapters.vendor_translation import translate_system
+
+system = adata_translation(
+    "ietf-system", standard.SRC_DNODE,
+    [Id("urn:ietf:params:xml:ns:yang:ietf-system", "system")],
+    standard.root.from_gdata, translate_system)
+```
+
+A mapping receives fresh typed source bindings populated with only its owned
+roots and returns a native adata root, or a `merge(...)` of native roots.
+Use ordinary generated field access, list iteration and keyed lookups in mapping
+code. The same function can be called directly with adata outside StratoWeave.
+Validation of known but unimplemented features belongs in that function so direct
+callers get the same errors. `ModelTranslation` remains the low-level descriptor
+for integrations that already operate on gdata.
+
+Mappings must be deterministic and must not mutate their input or retain
+configuration state. They receive no device manager, connection, database,
+orchestration state, or clock. A mapping may run more
+than once while a transaction is prepared and locked; it runs once per descriptor
+per complete render, never once per contributing RFS transform.
+
+In the generator, register qualified descriptor references on the device type:
+
+```acton
+stratoweave.build.DeviceType.from_dir(
+    fc, "Vendor", "yang/vendor",
+    model_translations=["myapp.adapters.translations.system"])
+```
+
+The generator emits descriptor imports and runtime registrations. For systems
+built without generation, pass descriptor objects to
+`stratoweave.device.DeviceType(..., model_translations=[system])`.
+
+This API provides forward configuration translation. Reverse translation,
+operational-state mapping, and a standalone runner are separate concerns.

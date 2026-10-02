@@ -1,0 +1,425 @@
+# SPDX-License-Identifier: BSD-3-Clause
+import testing
+import file
+import db.lmdb as swlmdb
+from adapters.adapter import ModCap
+import yang
+import yang.adata as adata
+import yang.gdata as gdata
+import device_translation as translation
+
+import ttt
+import device as swdev
+import adapters.netconf as netconf
+from device_meta_config import stratoweave_rfs__device_entry as Meta, stratoweave_rfs__device__credentials as Credentials, stratoweave_rfs__device__mock as Mock
+
+
+SOURCE = r"""module standard {
+  namespace "urn:test:standard"; prefix s;
+  container system { leaf hostname { type string; } }
+  container policy { leaf name { type string; } leaf set { type string; } }
+}"""
+NATIVE = r"""module native {
+  namespace "urn:test:native"; prefix n;
+  container system { leaf name { type string; } leaf domain { type string; } }
+  container policy { leaf name { type string; } leaf match { type string; } }
+}"""
+
+def s(name):
+    return gdata.Id("urn:test:standard", name)
+
+def n(name):
+    return gdata.Id("urn:test:native", name)
+
+def source(hostname="router"):
+    return gdata.Container({s("system"): gdata.Container({s("hostname"): gdata.Leaf(hostname)})})
+
+def native(hostname="router"):
+    return gdata.Container({n("system"): gdata.Container({n("name"): gdata.Leaf(hostname)}, ns="urn:test:native", module="native")})
+
+def system(tree: gdata.Node) -> gdata.Node:
+    return native(tree.children[s("system")].get_leaf(s("hostname")).val)
+
+def policy(tree: gdata.Node) -> gdata.Node:
+    p = tree.children[s("policy")]
+    return gdata.Container({n("policy"): gdata.Container({
+        n("name"): p.get_leaf(s("name")), n("match"): p.get_leaf(s("set"))}, ns="urn:test:native", module="native")})
+
+def mappings():
+    schema = yang.compile([SOURCE])
+    return [translation.ModelTranslation("system", schema, [s("system")], system),
+            translation.ModelTranslation("policy", schema, [s("policy")], policy)]
+
+class Root(adata.MNode):
+    def __init__(self, tree: gdata.Node):
+        self.tree = tree
+
+    mut def to_gdata(self, prev: ?gdata.Container=None) -> gdata.Node:
+        return self.tree
+
+    mut def copy(self) -> Root:
+        return Root(self.tree)
+
+def _test_merge_and_native_coexistence():
+    combined = translation.merge([Root(source()), Root(native())])
+    intent = combined.to_gdata()
+    testing.assertEqual(combined.copy().to_gdata(), intent)
+    testing.assertEqual(translation.render(intent, yang.compile([NATIVE]), mappings()), native())
+    testing.assertEqual(translation.render(native(), yang.compile([NATIVE]), []), native())
+
+def _test_merge_with_previous_tree():
+    previous = native()
+    combined = translation.merge([Root(native())])
+    testing.assertEqual(combined.to_gdata(prev=previous), previous)
+    changed = translation.merge([Root(native("changed"))])
+    testing.assertEqual(changed.to_gdata(prev=previous), native("changed"))
+    testing.assertEqual(translation.merge([]).to_gdata(prev=previous), gdata.Container())
+    conflict = translation.merge([Root(native()), Root(native("different"))])
+    rejected = False
+    try:
+        conflict.to_gdata(prev=previous)
+    except ValueError:
+        rejected = True
+    testing.assertTrue(rejected)
+
+def _test_multiple_translations_and_complete_source():
+    a = gdata.Container({s("policy"): gdata.Container({s("name"): gdata.Leaf("P")})})
+    b = gdata.Container({s("policy"): gdata.Container({s("set"): gdata.Leaf("S")})})
+    intent = gdata.merge(source(), gdata.merge(a, b))
+    rendered = translation.render(intent, yang.compile([NATIVE]), mappings())
+    testing.assertEqual(rendered, gdata.merge(native(), policy(gdata.merge(a, b))))
+    testing.assertEqual(translation.render(intent, yang.compile([NATIVE]), mappings()), rendered)
+    testing.assertEqual(translation.render(gdata.Container(), yang.compile([NATIVE]), mappings()), gdata.Container())
+    testing.assertEqual(translation.render(source("changed"), yang.compile([NATIVE]), mappings()), native("changed"))
+
+def _test_conflicts_abort_with_translation_and_path():
+    message = ""
+    try:
+        translation.render(gdata.merge(source(), native("different")), yang.compile([NATIVE]), mappings())
+    except ValueError as error:
+        message = str(error)
+    testing.assertTrue("system" in message and "name" in message)
+
+def _test_duplicate_ownership():
+    message = ""
+    try:
+        translation.owners(mappings() + [translation.ModelTranslation("duplicate", yang.compile([SOURCE]), [s("system")], system)])
+    except ValueError as error:
+        message = str(error)
+    testing.assertTrue("owned by both" in message)
+
+def _test_unsupported_source_and_untranslated_output():
+    rejected = False
+    try:
+        translation.render(source(), yang.compile([NATIVE]), [])
+    except ValueError:
+        rejected = True
+    testing.assertTrue(rejected)
+    rejected = False
+    identity = translation.ModelTranslation("identity", yang.compile([SOURCE]), [s("system")], lambda tree: tree)
+    try:
+        translation.render(source(), yang.compile([NATIVE]), [identity])
+    except ValueError as error:
+        rejected = "Untranslated" in str(error)
+    testing.assertTrue(rejected)
+
+def _test_mapping_errors_are_reported():
+    def fail(tree: gdata.Node) -> gdata.Node:
+        raise ValueError("unsupported setting")
+    mapping = translation.ModelTranslation("failing", yang.compile([SOURCE]), [s("system")], fail)
+    message = ""
+    try:
+        translation.render(source(), yang.compile([NATIVE]), [mapping])
+    except ValueError as error:
+        message = str(error)
+    testing.assertTrue("failing" in message and "unsupported setting" in message)
+
+
+class SourceData(adata.MNode):
+    hostname: str
+
+    def __init__(self, hostname: str):
+        self.hostname = hostname
+
+    @staticmethod
+    def from_gdata(tree: gdata.Node) -> SourceData:
+        return SourceData(tree.children[s("system")].get_str(s("hostname")))
+
+    mut def to_gdata(self, prev: ?gdata.Container=None) -> gdata.Node:
+        return source(self.hostname)
+
+
+class NativeData(adata.MNode):
+    name: str
+
+    def __init__(self, name: str):
+        self.name = name
+
+    mut def to_gdata(self, prev: ?gdata.Container=None) -> gdata.Node:
+        return native(self.name)
+
+
+def _test_adata_registration_and_errors():
+    mut def typed_system(config: SourceData) -> NativeData:
+        if config.hostname == "unsupported":
+            raise ValueError("unsupported typed hostname")
+        result = NativeData(config.hostname)
+        # Bindings belong to this call, not the persisted intent.
+        config.hostname = "changed locally"
+        return result
+    mapping = translation.adata_translation("typed-system", yang.compile([SOURCE]),
+        [s("system")], SourceData.from_gdata, typed_system)
+    intent = source()
+    for repeat in range(2):
+        testing.assertEqual(translation.render(intent, yang.compile([NATIVE]), [mapping]), native())
+        testing.assertEqual(intent, source())
+    message = ""
+    try:
+        translation.render(source("unsupported"), yang.compile([NATIVE]), [mapping])
+    except ValueError as error:
+        message = str(error)
+    testing.assertTrue("typed-system" in message and "unsupported typed hostname" in message)
+
+# Exercise aggregation, approval and failure through the real transaction and
+# NETCONF code paths, with the adapter's in-process NETCONF server.
+
+
+def tq(name):
+    return gdata.Id("urn:test:rfs", name)
+
+
+def dq(name):
+    return gdata.Id(ttt.NS_stratoweave_device, name)
+
+
+class EchoRFS(ttt.RFSFunction):
+    def transform_wrapper(self, cfg, device_info, memory, dynstate, prev_output):
+        testing.assertTrue("standard" in device_info.translation_modules)
+        testing.assertFalse("standard" in device_info.modules)
+        return cfg.children[tq("data")], None
+
+
+def rfs_config(parts: dict[str, gdata.Node]):
+    return gdata.Container({tq("rfs"): gdata.List([tq("name")], [gdata.Container({
+        tq("name"): gdata.Leaf("router"),
+        tq("part"): gdata.List([tq("id")], [gdata.Container({
+            tq("id"): gdata.Leaf(name), tq("data"): tree
+        }) for name, tree in parts.items()])
+    })])})
+
+
+actor _test_rfs_translation_approval_conflict_and_removal(t: testing.EnvT):
+    registry = swdev.DeviceRegistry(
+        {"translated": swdev.DeviceType("translated", netconf.NetconfAdapter,
+            yang.compile([NATIVE]), model_translations=mappings())},
+        t.env, t.log_handler)
+    fs = file.FS(file.FileCap(t.env.cap))
+    db_path = fs.mktmpdir("translation_restart_")
+    cap = file.WriteFileCap(file.FileCap(t.env.cap))
+    var db = swlmdb.LmdbStore(cap, db_path)
+    device_root: proc(ttt.Path, ?ttt.Layer) -> ttt.Node = ttt.Container({dq("devices"): ttt.Container({
+        dq("device"): ttt.List(ttt.DeviceConfig(registry), [dq("name")])})})
+    rfs_root: proc(ttt.Path, ?ttt.Layer) -> ttt.Node = ttt.Container({tq("rfs"): ttt.List(ttt.Container({
+        tq("part"): ttt.List(ttt.RFSTransform(EchoRFS, registry), [tq("id")])}), [tq("name")])})
+    var lower = ttt.Layer("devices", device_root, None, db)
+    var stack = ttt.Layer("rfs", rfs_root, lower, db)
+    dev = registry.get_or_create("router")
+    dev.set_dmc(Meta("router", Credentials("admin", "admin"), type="translated", mock=Mock(enabled=True), approval_required=True))
+    var finished = False
+    var history_length = 0
+    a = gdata.Container({s("policy"): gdata.Container({s("name"): gdata.Leaf("P")})})
+    b = gdata.Container({s("policy"): gdata.Container({s("set"): gdata.Leaf("S")})})
+    initial = rfs_config({"hostname": source(), "policy": a, "set": b, "native": native()})
+    bad = rfs_config({"hostname": source(), "policy": a, "set": b, "native": native("conflict")})
+    updated = rfs_config({"hostname": source("updated")})
+    expected = gdata.merge(native(), policy(gdata.merge(a, b)))
+
+    def fail(error):
+        if not finished:
+            finished = True
+            t.failure(ValueError(str(error)))
+
+    def approve(result):
+        if isinstance(result, Exception):
+            fail(result)
+            return
+        pending = dev.get_pending_approvals()
+        if not pending:
+            after 0.01: approve(result)
+            return
+        for tid, item in pending.items():
+            testing.assertFalse(s("system") in item.conf.children)
+            testing.assertFalse(s("policy") in item.conf.children)
+            dev.set_confq_approval(tid, dev.get_device_txid(), True)
+            break
+
+    def updated_done(result):
+        if isinstance(result, Exception):
+            fail(result)
+        else:
+            testing.assertEqual(dev.get_running_conf(), native("updated"))
+            testing.assertEqual(dev.get_target_conf(), native("updated"))
+            await async db.db.close()
+            db = swlmdb.LmdbStore(cap, db_path)
+            lower = ttt.Layer("devices", device_root, None, db)
+            stack = ttt.Layer("rfs", rfs_root, lower, db)
+            stack.load_from_db(restored)
+
+    def deleted_done(result):
+        if isinstance(result, Exception):
+            fail(result)
+            return
+        testing.assertEqual(dev.get_running_conf(), gdata.Container())
+        testing.assertEqual(dev.get_target_conf(), gdata.Container())
+        await async db.db.close()
+        await async fs.rmtree(db_path)
+        await async fs.rmdir(db_path)
+        finished = True
+        t.success()
+
+    def drift_done(result):
+        if isinstance(result, Exception):
+            fail(result)
+            return
+        testing.assertEqual(dev.get_running_conf(), native("updated"))
+        stack.edit_config(gdata.diff(updated, gdata.Container())!, approve, deleted_done)
+
+    def approve_drift():
+        pending = dev.get_pending_approvals()
+        if not pending:
+            after 0.01: approve_drift()
+            return
+        item = pending["resync"]
+        testing.assertEqual(item.conf, native("updated"))
+        dev.set_confq_approval("resync", dev.get_device_txid(), True)
+        dev.wait_complete("resync", drift_done)
+
+    def repeated_done(result):
+        if isinstance(result, Exception):
+            fail(result)
+            return
+        testing.assertEqual(dev.get_running_conf(), native("updated"))
+        adapter = dev.get_adapter()
+        if isinstance(adapter, netconf.NetconfAdapter):
+            adapter.get_mock_server()!.set_conf_ds(native("drift"))
+        dev.resync()
+        approve_drift()
+
+    def restored(error):
+        if error is not None:
+            fail(error)
+            return
+        testing.assertEqual(stack.get(), updated)
+        testing.assertTrue("urn:test:standard" in lower.get().prsrc())
+        stack.newsession().recompute(approve, repeated_done)
+
+    def conflict_done(result):
+        if not isinstance(result, Exception):
+            fail("conflicting translation was accepted")
+            return
+        testing.assertEqual(dev.get_running_conf(), expected)
+        testing.assertEqual(len(dev.get_pending_approvals()), 0)
+        adapter = dev.get_adapter()
+        if isinstance(adapter, netconf.NetconfAdapter):
+            testing.assertEqual(len(adapter.get_mock_server()!.get_rpc_history()), history_length)
+        # The rejected edit must not have replaced the committed source tree.
+        stack.newsession().edit_config(gdata.diff(initial, updated)!, approve, updated_done)
+
+    def initial_done(result):
+        if isinstance(result, Exception):
+            fail(result)
+            return
+        testing.assertEqual(dev.get_running_conf(), expected)
+        testing.assertEqual(dev.get_target_conf(), expected)
+        # Device-layer intent retains the source model even though its output
+        # and the approval queue contain only native data.
+        testing.assertTrue("urn:test:standard" in lower.get().prsrc())
+        adapter = dev.get_adapter()
+        if isinstance(adapter, netconf.NetconfAdapter):
+            history_length = len(adapter.get_mock_server()!.get_rpc_history())
+        stack.newsession().edit_config(gdata.diff(initial, bad)!, conflict_done)
+
+    def start():
+        if dev.get_modules().1 is None or dev.get_running_conf() is None:
+            after 0.01: start()
+            return
+        stack.newsession().edit_config(initial, approve, initial_done)
+
+    after 0: start()
+    def timeout():
+        if not finished:
+            fail("translation integration test timed out")
+
+    after 10: timeout()
+
+
+def alternate_system(tree: gdata.Node) -> gdata.Node:
+    return gdata.Container({n("system"): gdata.Container({n("domain"): tree.children[s("system")].get_leaf(s("hostname"))}, ns="urn:test:native", module="native")})
+
+
+actor _test_device_type_and_capability_changes_invalidate_approval(t: testing.EnvT):
+    alternate = translation.ModelTranslation("alternate", yang.compile([SOURCE]), [s("system")], alternate_system)
+    registry = swdev.DeviceRegistry({
+        "first": swdev.DeviceType("first", netconf.NetconfAdapter, yang.compile([NATIVE]), model_translations=mappings()),
+        "second": swdev.DeviceType("second", netconf.NetconfAdapter, yang.compile([NATIVE]), model_translations=[alternate])},
+        t.env, t.log_handler)
+    dev = registry.get_or_create("router")
+    var finished = False
+    var first_token: ?str = None
+
+    def fail(error):
+        if not finished:
+            finished = True
+            t.failure(ValueError(str(error)))
+
+    def complete(result):
+        if isinstance(result, Exception):
+            fail(result)
+            return
+        testing.assertEqual(dev.get_running_conf(), alternate_system(source()))
+        finished = True
+        t.success()
+
+    def switched():
+        token = dev.get_modules().1
+        if token is None or dev.get_running_conf() is None:
+            after 0.01: switched()
+            return
+        testing.assertNotEqual(token, first_token)
+        testing.assertEqual(len(dev.get_pending_approvals()), 0)
+        testing.assertEqual(dev.get_target_conf(), None)
+        new_conf = dev.render_config(source(), token)
+        testing.assertEqual(new_conf, alternate_system(source()))
+        dev.configure(new_conf, token, "new-type")
+        dev.set_confq_approval("new-type", dev.get_device_txid(), True)
+        dev.wait_complete("new-type", complete)
+
+    def connected():
+        modules, token = dev.get_modules()
+        if token is None or dev.get_running_conf() is None:
+            after 0.01: connected()
+            return
+        first_token = token
+        await async dev.configure(dev.render_config(source(), token), token, "old-capability")
+        testing.assertTrue("old-capability" in dev.get_pending_approvals())
+        changed = dict(modules.items())
+        changed["extra"] = ModCap("extra", "urn:test:extra")
+        await async dev.on_connect(changed, None)
+        testing.assertEqual(len(dev.get_pending_approvals()), 0)
+        rejected = False
+        try:
+            discarded = await async dev.render_config(source(), token)
+        except ValueError:
+            rejected = True
+        testing.assertTrue(rejected)
+        capability_token = dev.get_modules().1
+        testing.assertNotEqual(capability_token, token)
+        await async dev.configure(dev.render_config(source(), capability_token), capability_token, "old-type")
+        testing.assertTrue("old-type" in dev.get_pending_approvals())
+        await async dev.set_dmc(Meta("router", Credentials("admin", "admin"), type="second", mock=Mock(enabled=True), approval_required=True))
+        testing.assertEqual(len(dev.get_pending_approvals()), 0)
+        switched()
+
+    dev.set_dmc(Meta("router", Credentials("admin", "admin"), type="first", mock=Mock(enabled=True), approval_required=True))
+    after 0: connected()
+    after 10: fail("device change test timed out")
