@@ -9,6 +9,7 @@ import std.xml as xml
 
 import yang.schema as yschema
 import yang.gdata as ygdata
+import yang.filter_xpath as filter_xpath
 import yang.xml as yxml
 import yang.ypatch as ypatch
 
@@ -36,22 +37,6 @@ MODULE_EVENT_NOTIFICATIONS = "ietf-event-notifications"
 MODULE_PREFIX_IOSXR = "Cisco-IOS-XR-"
 RUNTIME_SCHEMA_MODULE_SETS = ["no-openconfig"]
 NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
-
-# TODO: Delete this table and read module prefixes from the compiled YANG
-# schema instead. XML namespace prefixes are supposed to be aliases, but IOS XE's
-# event-notifications YANG Push XPath handling currently rejects otherwise
-# equivalent filters when we generate synthetic prefixes such as "ypf0". This
-# hard-coded list is only here to keep the IOS XE interop path working while the
-# adapter is forced to synthesize XPath from FNode. The right place for this
-# knowledge is acton-yang/schema metadata: given a namespace, ask the compiled
-# schema for the advertised module prefix and use that when serializing XPath.
-XPATH_PREFERRED_PREFIXES = {
-    "urn:ietf:params:xml:ns:yang:iana-if-type": "ianaift",
-    "urn:ietf:params:xml:ns:yang:ietf-interfaces": "if",
-    "urn:ietf:params:xml:ns:yang:ietf-ip": "ip",
-    "urn:ietf:params:xml:ns:yang:ietf-system": "sys",
-    "urn:ietf:params:xml:ns:yang:ietf-yang-library": "yanglib",
-}
 
 def extract_txid(conf: ?xml.Node) -> ?str:
     """Attempt to extract a txid from configuration
@@ -108,138 +93,76 @@ def _test_yang_push_dialect():
         testing.assertEqual(_yang_push_event_notifs(modules), want, "modules: {names}")
 
 
-def _xpath_literal(v) -> ?str:
-    if isinstance(v, ygdata.VWildcard):
-        return None
-    s = ygdata.yang_str(v)
-    if "'" in s:
-        return None
-    return "'" + s + "'"
-
-
-def _xpath_name(name: ygdata.Id, prefixes: dict[str, str], nsdefs: list[(?str, str)]) -> str:
-    if name.q == "":
-        return name.name
-    if name.q not in prefixes:
-        preferred = XPATH_PREFERRED_PREFIXES.get(name.q)
-        if preferred is not None:
-            prefix = preferred!
-        else:
-            prefix = "ypf" + str(len(prefixes))
-        prefixes[name.q] = prefix
-        nsdefs.append((prefix, name.q))
-    return prefixes[name.q] + ":" + name.name
-
-
-def _fnode_xpath_step(filt: ygdata.FNode, prefixes: dict[str, str], nsdefs: list[(?str, str)]) -> ?str:
-    if filt.name is None or filt.value_match is not None:
-        return None
-
-    step = _xpath_name(filt.name!, prefixes, nsdefs)
-    predicates: list[str] = []
-    path_child: ?str = None
-
+def _has_wildcard(filt: ygdata.FNode) -> bool:
+    vm = filt.value_match
+    if vm is not None and isinstance(vm, ygdata.VWildcard):
+        return True
     for child in filt.children:
-        if child.value_match is not None:
-            if child.name is None or len(child.children) > 0:
-                return None
-            lit = _xpath_literal(child.value_match!)
-            if lit is None:
-                return None
-            predicates.append(_xpath_name(child.name!, prefixes, nsdefs) + "=" + lit!)
-        else:
-            if path_child is not None:
-                return None
-            child_path = _fnode_xpath_step(child, prefixes, nsdefs)
-            if child_path is None:
-                return None
-            path_child = child_path
-
-    if len(predicates) > 0:
-        step = step + "[" + " and ".join(predicates) + "]"
-
-    if path_child is not None:
-        return step + "/" + path_child!
-    return step
+        if _has_wildcard(child):
+            return True
+    return False
 
 
-def _fnode_to_xpath_filter(filt: ygdata.FNode) -> (xpath: ?str, nsdefs: list[(?str, str)]):
-    # TODO: Remove this whole FNode-to-XPath bridge. FNode is the internal
-    # subtree-filter representation, and translating it back into an XPath string
-    # here is a leaky compatibility hack for IOS XE's event-notifications YANG
-    # Push implementation. It only handles a single simple path with equality
-    # predicates, rejects multi-branch filters, cannot preserve arbitrary XPath
-    # expressions, and currently has to paper over IOS XE's prefix sensitivity via
-    # XPATH_PREFERRED_PREFIXES above. The cleaner design is for the filter layer
-    # to carry an adapter-neutral typed filter that can be rendered as either
-    # subtree XML or XPath at the protocol boundary, with prefixes supplied by the
-    # compiled schema rather than by this adapter.
-    root = filt
-    if root.name is None:
-        if root.value_match is not None or len(root.children) != 1:
-            return (xpath=None, nsdefs=[])
-        root = root.children[0]
+def _event_notifs_xpath_filter(schema: yschema.DRoot, filt: ygdata.FNode) -> (xpath: str, nsdefs: list[(?str, str)]):
+    """Render filt as the XPath filter for YANG Push filter
 
-    prefixes: dict[str, str] = {}
-    nsdefs: list[(?str, str)] = []
-    path = _fnode_xpath_step(root, prefixes, nsdefs)
-    if path is None:
-        return (xpath=None, nsdefs=[])
-    return (xpath="/" + path!, nsdefs=nsdefs)
+    This has been tested with IOS XE:
+    - multiple filters are combined with a union
+    - wildcards rendered as a quoted literal are interpreted as such
+    TODO: reject VWildcard in filter_xpath.to_xpaths?!
+    """
+    if _has_wildcard(filt):
+        raise ValueError("event-notifications yang-push does not support wildcard subscription filters")
+    res = filter_xpath.to_xpaths(schema, filt)
+    return (xpath=" | ".join(res.paths), nsdefs=res.nsdefs)
 
 
-def _test_fnode_to_xpath_filter_simple_path():
-    ns = "urn:test:system"
-    res = _fnode_to_xpath_filter(ygdata.FNode(children=[
-        ygdata.FNode(ygdata.Id(ns, "system-state"), children=[
-            ygdata.FNode(ygdata.Id(ns, "clock"), children=[
-                ygdata.FNode(ygdata.Id(ns, "current-datetime"))
+def _test_event_notifs_xpath_filter_list_predicate():
+    ns = "urn:ietf:params:xml:ns:yang:ietf-yang-library"
+    res = _event_notifs_xpath_filter(yl.SRC_DNODE, ygdata.FNode(children=[
+        ygdata.FNode(ygdata.Id(ns, "yang-library"), children=[
+            ygdata.FNode(ygdata.Id(ns, "module-set"), children=[
+                ygdata.FNode(ygdata.Id(ns, "name"), value_match="default"),
+                ygdata.FNode(ygdata.Id(ns, "module"), children=[
+                    ygdata.FNode(ygdata.Id(ns, "name"), value_match="ietf-ip"),
+                    ygdata.FNode(ygdata.Id(ns, "revision"))
+                ])
             ])
         ])
     ]))
-    testing.assertEqual(res.xpath, "/ypf0:system-state/ypf0:clock/ypf0:current-datetime")
-    testing.assertEqual(len(res.nsdefs), 1)
-    testing.assertEqual(res.nsdefs[0].0, "ypf0")
-    testing.assertEqual(res.nsdefs[0].1, ns)
+    testing.assertEqual(res.xpath, "/yanglib:yang-library/yanglib:module-set[yanglib:name='default']/yanglib:module[yanglib:name='ietf-ip']/yanglib:revision")
+    testing.assertEqual(res.nsdefs, [("yanglib", ns)])
 
 
-def _test_fnode_to_xpath_filter_list_predicate():
-    ns = "urn:test:interfaces"
-    res = _fnode_to_xpath_filter(ygdata.FNode(children=[
-        ygdata.FNode(ygdata.Id(ns, "interfaces"), children=[
-            ygdata.FNode(ygdata.Id(ns, "interface"), children=[
-                ygdata.FNode(ygdata.Id(ns, "name"), value_match="eth0"),
-                ygdata.FNode(ygdata.Id(ns, "in-octets"))
-            ])
+def _test_event_notifs_xpath_filter_multi_branch_union():
+    ns = "urn:ietf:params:xml:ns:yang:ietf-yang-library"
+    res = _event_notifs_xpath_filter(yl.SRC_DNODE, ygdata.FNode(children=[
+        ygdata.FNode(ygdata.Id(ns, "yang-library"), children=[
+            ygdata.FNode(ygdata.Id(ns, "content-id")),
+            ygdata.FNode(ygdata.Id(ns, "module-set"))
         ])
     ]))
-    testing.assertEqual(res.xpath, "/ypf0:interfaces/ypf0:interface[ypf0:name='eth0']/ypf0:in-octets")
-    testing.assertEqual(len(res.nsdefs), 1)
-    testing.assertEqual(res.nsdefs[0].1, ns)
+    testing.assertEqual(res.xpath, "/yanglib:yang-library/yanglib:content-id | /yanglib:yang-library/yanglib:module-set")
+    testing.assertEqual(res.nsdefs, [("yanglib", ns)])
 
 
-def _test_fnode_to_xpath_filter_prefers_known_prefix():
-    ns = "urn:ietf:params:xml:ns:yang:ietf-interfaces"
-    res = _fnode_to_xpath_filter(ygdata.FNode(children=[
-        ygdata.FNode(ygdata.Id(ns, "interfaces-state"))
-    ]))
-    testing.assertEqual(res.xpath, "/if:interfaces-state")
-    testing.assertEqual(len(res.nsdefs), 1)
-    testing.assertEqual(res.nsdefs[0].0, "if")
-    testing.assertEqual(res.nsdefs[0].1, ns)
-
-
-def _test_fnode_to_xpath_filter_rejects_multi_branch():
-    ns = "urn:test:system"
-    res = _fnode_to_xpath_filter(ygdata.FNode(children=[
-        ygdata.FNode(ygdata.Id(ns, "system-state"), children=[
-            ygdata.FNode(ygdata.Id(ns, "clock"), children=[
-                ygdata.FNode(ygdata.Id(ns, "current-datetime")),
-                ygdata.FNode(ygdata.Id(ns, "boot-datetime"))
+def _test_event_notifs_xpath_filter_rejects_wildcard():
+    ns = "urn:ietf:params:xml:ns:yang:ietf-yang-library"
+    try:
+        _event_notifs_xpath_filter(yl.SRC_DNODE, ygdata.FNode(children=[
+            ygdata.FNode(ygdata.Id(ns, "yang-library"), children=[
+                ygdata.FNode(ygdata.Id(ns, "module-set"), children=[
+                    ygdata.FNode(ygdata.Id(ns, "name"), value_match="default"),
+                    ygdata.FNode(ygdata.Id(ns, "module"), children=[
+                        ygdata.FNode(ygdata.Id(ns, "name"), value_match=ygdata.VWildcard("ietf-*")),
+                        ygdata.FNode(ygdata.Id(ns, "revision"))
+                    ])
+                ])
             ])
-        ])
-    ]))
-    testing.assertEqual(res.xpath is None, True)
+        ]))
+        testing.error("Expected a wildcard filter to fail")
+    except ValueError as e:
+        testing.assertIn("wildcard", e.error_message)
 
 
 def _mock_capabilities_from_dmc(new_dmc: DeviceMetaConfig) -> list[str]:
@@ -1923,13 +1846,18 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             if sf is not None:
                 filt = sf!
                 if _yp_event_notifs:
-                    xpath = _fnode_to_xpath_filter(filt)
-                    if xpath.xpath is None:
-                        err = ValueError("event-notifications yang-push only supports simple subscription filters")
-                        _stream_failed(spec, err)
+                    schema = _oper_schema()
+                    if schema is not None:
+                        try:
+                            xf = _event_notifs_xpath_filter(schema, filt)
+                            xpath_filter = xf.xpath
+                            xpath_nsdefs = xf.nsdefs
+                        except ValueError as err:
+                            _stream_failed(spec, err)
+                            return
+                    else:
+                        _stream_failed(spec, ValueError("event-notifications yang-push requires a device schema to render the XPath filter"))
                         return
-                    xpath_filter = xpath.xpath
-                    xpath_nsdefs = xpath.nsdefs
                 else:
                     # Carry the whole filter, including multi-root filters; dropping
                     # it would subscribe to the entire datastore and leak far more
