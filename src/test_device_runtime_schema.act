@@ -1,0 +1,313 @@
+#
+# Runtime schema fetch: DeviceMgr discovers, downloads and compiles the schema
+# of a NETCONF device. The SchemaRegistry keeps the compiled schemas, so that
+# devices with the same modules share one download.
+#
+# The SchemaRegistry tests compile the modules in this file. The DeviceMgr tests
+# fetch from yp_mockserver over loopback SSH, which lists its modules in
+# ietf-yang-library and answers <get-schema>.
+#
+
+import net
+import testing
+
+import yang
+import yang.schema as yschema
+
+import device as swdev
+import device_schema as swds
+import adapters.netconf as swna
+import yp_mockserver as ypms
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials
+
+
+BASE_YANG = r"""module base {
+  yang-version 1.1;
+  namespace "urn:base";
+  prefix base;
+  container system {
+    leaf hostname { type string; }
+    leaf location { type string; }
+  }
+  list interface {
+    key name;
+    leaf name { type string; }
+    leaf description { type string; }
+    leaf mtu { type uint16; }
+  }
+  list route {
+    key prefix;
+    ordered-by user;
+    leaf prefix { type string; }
+  }
+}"""
+
+# A module the bundled device type does not know about
+EXTRA_YANG = r"""module extra {
+  yang-version 1.1;
+  namespace "urn:extra";
+  prefix extra;
+  container telemetry {
+    leaf enabled { type boolean; }
+  }
+}"""
+
+# The nodes the application actually models
+KEEP_PATHS = [
+    "/base:system/hostname",
+    "/base:interface/name",
+    "/base:interface/description",
+]
+
+# Does not compile: the type is not defined
+BROKEN_YANG = r"""module broken {
+  yang-version 1.1;
+  namespace "urn:broken";
+  prefix broken;
+  leaf speed { type no-such-type; }
+}"""
+
+BASE_MODULE = (name="base", revision=None)
+EXTRA_MODULE = (name="extra", revision=None)
+
+MOCK_MODULE = "mock-interfaces"
+# No other module of the mock imports it
+UNIMPORTED_MODULE = "ietf-yang-library"
+
+
+def _src(schema: yschema.DRoot) -> str:
+    # Only print DRoot children to avoid mismatch in module_metadata (runtime
+    # fetched schema includes an extra module).
+    return "\n".join([c.prsrc() for c in schema.children])
+
+
+def _modules(schema: yschema.DRoot) -> set[str]:
+    return set([m.module for m in schema.module_metadata.values()])
+
+
+def _mock_server(t: testing.EnvT, ms: ypms.MockSchema, on_listen: action(?int, ?Exception) -> None, on_get_schema: action() -> None) -> ypms.YpMockServer:
+    """A yp_mockserver on a free loopback port"""
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    return ypms.YpMockServer(listen_cap, t.log_handler, ["eth0"], ms,
+                             address="127.0.0.1", port=0, tick_interval=0.0,
+                             on_listen=on_listen, on_get_schema=on_get_schema)
+
+
+def _device(t: testing.EnvT, registry: swdev.SchemaRegistry, name: str, port: int) -> swdev.DeviceMgr:
+    """A DeviceMgr that fetches its schema from the yp_mockserver at port"""
+    connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+    dev_types = {
+        "netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter, src_dnode=yschema.DRoot())
+    }
+    dev = swdev.DeviceMgr(dev_types, connect_cap, name, t.log_handler, lambda name: None, registry)
+    dmc = DeviceMetaConfig(name=name, credentials=Credentials("admin", "admin"), type="netconf")
+    dmc.address.create("primary", "127.0.0.1", u64(port))
+    dmc.feature_flags.runtime_schema_fetch = True
+    dev.set_dmc(dmc)
+    return dev
+
+
+def _test_schema_key():
+    """The key is the set of modules and the transforms"""
+    testing.assertEqual(swds.schema_key([BASE_MODULE, EXTRA_MODULE]),
+                        swds.schema_key([EXTRA_MODULE, BASE_MODULE]),
+                        "module order is not part of the key")
+    testing.assertNotEqual(swds.schema_key([BASE_MODULE, EXTRA_MODULE]),
+                           swds.schema_key([BASE_MODULE]),
+                           "modules are part of the key")
+    testing.assertNotEqual(swds.schema_key([(name="base", revision="2024-01-01")]),
+                           swds.schema_key([(name="base", revision="2025-01-01")]),
+                           "revisions are part of the key")
+    testing.assertNotEqual(swds.schema_key([BASE_MODULE]),
+                           swds.schema_key([BASE_MODULE], [swds.filter_schema(KEEP_PATHS)]),
+                           "transforms are part of the key")
+
+
+actor _test_schema_fetched_once(t: testing.EnvT):
+    """Of the requests for the same modules, only the first fetches them"""
+    registry = swdev.SchemaRegistry()
+    key = swds.schema_key([BASE_MODULE, EXTRA_MODULE])
+    var ready = 0
+
+    def on_ready(k: ?swds.SchemaKey, error: ?Exception):
+        if error is not None:
+            t.failure(error)
+            return
+        ready += 1
+        if ready == 3:
+            t.success()
+
+    def on_compiled(k: ?swds.SchemaKey, error: ?Exception):
+        on_ready(k, error)
+        # The schema is known now
+        if registry.request_schema(on_ready, key):
+            t.failure(ValueError("a compiled schema should not be fetched"))
+
+    first = registry.request_schema(on_compiled, key)
+    second = registry.request_schema(on_ready, key)
+    if not first:
+        t.failure(ValueError("the first request should fetch"))
+    elif second:
+        t.failure(ValueError("the second request should wait for the first"))
+    else:
+        registry.add_schema(key, [BASE_YANG, EXTRA_YANG])
+
+
+actor _test_schema_compile_error_kept(t: testing.EnvT):
+    """A failed compilation is reported to each request for the same modules"""
+    registry = swdev.SchemaRegistry()
+    key = swds.schema_key([(name="broken", revision=None)])
+
+    def on_second(first: Exception, k: ?swds.SchemaKey, error: ?Exception):
+        if error is not None:
+            testing.assertEqual(str(first), str(error), "the second request gets the kept error")
+            t.success()
+        else:
+            t.failure(ValueError("broken YANG compiled on the second request"))
+
+    def on_first(k: ?swds.SchemaKey, error: ?Exception):
+        if error is not None:
+            first: Exception = error
+            if registry.request_schema(lambda k2, e: on_second(first, k2, e), key):
+                t.failure(ValueError("a schema that failed to compile should not be fetched again"))
+        else:
+            t.failure(ValueError("broken YANG compiled"))
+
+    registry.request_schema(on_first, key)
+    registry.add_schema(key, [BROKEN_YANG])
+
+
+actor _test_schema_fetch_failure(t: testing.EnvT):
+    """A failed download is reported to the waiting requests and is not kept"""
+    registry = swdev.SchemaRegistry()
+    key = swds.schema_key([BASE_MODULE])
+    var failed = 0
+
+    def on_failed(k: ?swds.SchemaKey, error: ?Exception):
+        if not isinstance(error, swdev.SchemaFetchError):
+            t.failure(ValueError("expected a SchemaFetchError, got {error}"))
+            return
+        failed += 1
+        if failed == 2:
+            if not registry.request_schema(on_ready, key):
+                t.failure(ValueError("modules that failed to download should be fetched again"))
+                return
+            registry.add_schema(key, [BASE_YANG])
+
+    def on_ready(k: ?swds.SchemaKey, error: ?Exception):
+        if error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    registry.request_schema(on_failed, key)
+    registry.request_schema(on_failed, key)
+    registry.fetch_failed(key, ValueError("connection lost"))
+
+
+actor _test_runtime_schema_matches_bundled(t: testing.EnvT):
+    """After replaying transforms, the runtime-fetched schema is shaped like the
+    bundled one. The same modules without the transforms are another schema."""
+    root = yang.compile([BASE_YANG])
+    swds.filter_schema(KEEP_PATHS).apply(root)
+    bundled = _src(root)
+
+    registry = swdev.SchemaRegistry()
+    transforms = [swds.filter_schema(KEEP_PATHS)]
+    transformed_key = swds.schema_key([BASE_MODULE, EXTRA_MODULE], transforms)
+    untransformed_key = swds.schema_key([BASE_MODULE, EXTRA_MODULE])
+
+    def on_untransformed(key: ?swds.SchemaKey, error: ?Exception):
+        if error is not None:
+            t.failure(error)
+            return
+        testing.assertNotEqual(bundled, _src(registry.get_schema(key)!), "untransformed runtime schema is a larger tree")
+        t.success()
+
+    def on_transformed(key: ?swds.SchemaKey, error: ?Exception):
+        if error is not None:
+            t.failure(error)
+            return
+        testing.assertEqual(bundled, _src(registry.get_schema(key)!), "transformed runtime schema matches the bundled tree")
+        if not registry.request_schema(on_untransformed, untransformed_key):
+            t.failure(ValueError("modules with other transforms should be fetched"))
+            return
+        registry.add_schema(untransformed_key, [BASE_YANG, EXTRA_YANG])
+
+    registry.request_schema(on_transformed, transformed_key)
+    registry.add_schema(transformed_key, [BASE_YANG, EXTRA_YANG], transforms)
+
+
+actor _test_devices_share_runtime_schema(t: testing.EnvT):
+    """Devices with the same modules download them once and get the same schema"""
+    registry = swdev.SchemaRegistry()
+    var server: ?ypms.YpMockServer = None
+    var downloads = 0
+
+    def _on_get_schema():
+        downloads += 1
+
+    def verify(s: ypms.YpMockServer, sa: yschema.DRoot, sb: yschema.DRoot):
+        s.close()
+        if MOCK_MODULE not in _modules(sa) or _modules(sa) != _modules(sb):
+            t.failure(ValueError("expected the same schema with {MOCK_MODULE}, got {_modules(sa)} and {_modules(sb)}"))
+        elif downloads != len(_modules(sa)):
+            t.failure(ValueError("expected {len(_modules(sa))} module downloads, got {downloads}"))
+        else:
+            t.success()
+
+    def check(s: ypms.YpMockServer, a: swdev.DeviceMgr, b: swdev.DeviceMgr):
+        sa = a.get_fetched_schema()
+        sb = b.get_fetched_schema()
+        if sa is not None and sb is not None:
+            # The last _on_get_schema() calls may arrive while check() waits
+            # for the devices. They are handled before a later message.
+            after 0: verify(s, sa, sb)
+        else:
+            after 0.05: check(s, a, b)
+
+    def _on_listen(port: ?int, err: ?Exception):
+        s = server
+        if err is not None:
+            t.failure(ValueError("mock NETCONF server listen failed: {err}"))
+        elif port is not None and s is not None:
+            check(s, _device(t, registry, "dev-a", port), _device(t, registry, "dev-b", port))
+
+    server = _mock_server(t, ypms.build_mock_schema(), _on_listen, _on_get_schema)
+
+
+actor _test_runtime_schema_missing_module(t: testing.EnvT):
+    """A device that cannot download a module compiles no schema and downloads
+    the modules again"""
+    ms = ypms.build_mock_schema()
+    # The mock lists the module but answers <get-schema> for it with an rpc-error
+    module_count = len(ms.sources)
+    del ms.sources[UNIMPORTED_MODULE]
+    var server: ?ypms.YpMockServer = None
+    var requests = 0
+
+    def _on_get_schema():
+        requests += 1
+
+    def check(s: ypms.YpMockServer, dev: swdev.DeviceMgr):
+        schema = dev.get_fetched_schema()
+        if schema is not None:
+            s.close()
+            t.failure(ValueError("compiled a schema without {UNIMPORTED_MODULE}"))
+        elif requests > module_count:
+            # The device downloads the modules again
+            s.close()
+            t.success()
+        else:
+            after 0.05: check(s, dev)
+
+    def _on_listen(port: ?int, err: ?Exception):
+        s = server
+        if err is not None:
+            t.failure(ValueError("mock NETCONF server listen failed: {err}"))
+        elif port is not None and s is not None:
+            check(s, _device(t, swdev.SchemaRegistry(), "dev-missing", port))
+
+    server = _mock_server(t, ms, _on_listen, _on_get_schema)
