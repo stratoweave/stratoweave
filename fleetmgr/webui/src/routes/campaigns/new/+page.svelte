@@ -246,7 +246,10 @@
         ontouch={() => (touched = true)}
       />
     </div>
-    <p class="note">Devices that do not fit the windows are not actuated and show as plan alarms.</p>
+    <p class="note">
+      Devices that do not fit the windows are not actuated and show as plan alarms.
+      Windows are defined on the shared <a href="/schedules">schedules</a>.
+    </p>
   </Section>
 </section>
 
@@ -301,6 +304,10 @@
     margin: 0;
     font-size: 12px;
     color: var(--sw-text-muted);
+  }
+
+  .note a {
+    color: var(--sw-accent-bright);
   }
 
   .cred-warning {

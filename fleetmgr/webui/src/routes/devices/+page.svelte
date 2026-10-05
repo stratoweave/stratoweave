@@ -1,12 +1,14 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
+  import { onDestroy, untrack } from 'svelte';
   import { invalidate } from '$app/navigation';
 
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import Section from '$lib/core/ui/Section.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
-  import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device } from '$lib/software/model';
+  import { bindPatch, unbindDevice } from '$lib/maintenance/binding';
+  import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
+  import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device, type Schedule } from '$lib/software/model';
   import {
     IMPORT_BATCH,
     assignNodes,
@@ -21,7 +23,15 @@
 
   let {
     data
-  }: { data: { nodes: string[]; devices: Device[]; loadError: string } } = $props();
+  }: {
+    data: {
+      nodes: string[];
+      devices: Device[];
+      schedules: Schedule[];
+      scheduleFilter: string;
+      loadError: string;
+    };
+  } = $props();
 
   let draft = $state<NewDeviceInput | null>(null);
   let importOpen = $state(false);
@@ -38,9 +48,27 @@
 
   let filterText = $state('');
   let filterType = $state('');
+  // Schedule selects hold '' (any or nothing chosen), 'none' or '=NAME'.
+  let filterSchedule = $state(untrack(() => (data.scheduleFilter ? `=${data.scheduleFilter}` : '')));
   let page = $state(1);
 
   let types = $derived([...new Set(data.devices.map((d) => d.type))].sort());
+  let scheduleNames = $derived(data.schedules.map((s) => s.name));
+  let knownSchedules = $derived(new Set(scheduleNames));
+  let colors = $derived(scheduleColors(scheduleNames));
+  // Bindings to a schedule that does not exist: the planner places those
+  // devices in no window.
+  let missingSchedules = $derived(
+    [...new Set([...data.devices.map((d) => d.schedule), data.scheduleFilter])]
+      .filter((name) => name && !knownSchedules.has(name))
+      .sort()
+  );
+
+  function scheduleMatches(device: Device, filter: string): boolean {
+    if (filter === '') return true;
+    if (filter === 'none') return device.schedule === '';
+    return device.schedule === filter.slice(1);
+  }
 
   function nameMatches(name: string, filter: string): boolean {
     if (!filter) return true;
@@ -54,14 +82,154 @@
     return name.toLowerCase().includes(filter.toLowerCase());
   }
 
+  // The API returns devices in no particular order; ranges and pages need one.
+  let sorted = $derived([...data.devices].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));
   let filtered = $derived(
-    data.devices.filter(
-      (d) => nameMatches(d.name, filterText.trim()) && (!filterType || d.type === filterType)
+    sorted.filter(
+      (d) =>
+        nameMatches(d.name, filterText.trim()) &&
+        (!filterType || d.type === filterType) &&
+        scheduleMatches(d, filterSchedule)
     )
   );
   let pageCount = $derived(Math.max(1, Math.ceil(filtered.length / PAGE_SIZE)));
   let currentPage = $derived(Math.min(page, pageCount));
   let visible = $derived(filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE));
+
+  // The selection is by name and survives filter and page changes; the bar
+  // says how many selected devices the filter hides.
+  let selected = $state(new Set<string>());
+  // Last row clicked: a shift-click selects the range from it on this page.
+  let anchor = $state('');
+  let chosen = $derived(sorted.filter((d) => selected.has(d.name)));
+  let chosenShown = $derived(filtered.filter((d) => selected.has(d.name)).length);
+  let pageChosen = $derived(visible.filter((d) => selected.has(d.name)).length);
+  let pageAllChosen = $derived(visible.length > 0 && pageChosen === visible.length);
+
+  let bindChoice = $state('');
+  let confirmBind = $state(false);
+  let applying = $state(false);
+  let progress = $state<{ done: number; total: number } | null>(null);
+  // Shown in the bar, next to where the operator works on a long page.
+  let bindError = $state('');
+  let stopRequested = false;
+
+  // Leaving the page stops an unbind between two writes.
+  onDestroy(() => (stopRequested = true));
+
+  let bindPlan = $derived.by(() => {
+    if (!bindChoice) return null;
+    const schedule = bindChoice === 'none' ? '' : bindChoice.slice(1);
+    const change = chosen.filter((d) => d.schedule !== schedule);
+    return { schedule, change, unchanged: chosen.length - change.length };
+  });
+
+  function devicesText(n: number): string {
+    return `${n.toLocaleString()} device${n === 1 ? '' : 's'}`;
+  }
+
+  function namesText(devices: Device[]): string {
+    const head = devices.slice(0, 3).map((d) => d.name).join(', ');
+    return devices.length > 3 ? `${head} and ${(devices.length - 3).toLocaleString()} more` : head;
+  }
+
+  let bindMessage = $derived.by(() => {
+    if (!bindPlan) return '';
+    const { schedule, change, unchanged } = bindPlan;
+    if (schedule) {
+      const same = unchanged > 0 ? ` ${devicesText(unchanged)} already are.` : '';
+      return `Bind ${devicesText(change.length)} (${namesText(change)}) to ${schedule}?${same} Campaigns with these devices re-plan; a running campaign can start a device as soon as its new window opens.`;
+    }
+    const same = unchanged > 0 ? ` ${devicesText(unchanged)} have none already.` : '';
+    return `Unbind ${devicesText(change.length)} (${namesText(change)})?${same} They follow each campaign's default schedule. This writes one device at a time; leaving the page stops it.`;
+  });
+
+  function toggleRow(device: Device, shift: boolean): void {
+    const on = !selected.has(device.name);
+    const next = new Set(selected);
+    const from = shift && anchor ? visible.findIndex((d) => d.name === anchor) : -1;
+    const to = visible.findIndex((d) => d.name === device.name);
+    if (from >= 0 && to >= 0) {
+      for (const d of visible.slice(Math.min(from, to), Math.max(from, to) + 1)) {
+        if (on) next.add(d.name);
+        else next.delete(d.name);
+      }
+    } else if (on) {
+      next.add(device.name);
+    } else {
+      next.delete(device.name);
+    }
+    anchor = device.name;
+    selected = next;
+  }
+
+  function togglePage(): void {
+    const next = new Set(selected);
+    for (const d of visible) {
+      if (pageAllChosen) next.delete(d.name);
+      else next.add(d.name);
+    }
+    selected = next;
+  }
+
+  function selectAllMatching(): void {
+    selected = new Set([...selected, ...filtered.map((d) => d.name)]);
+  }
+
+  function clearSelection(): void {
+    selected = new Set();
+    anchor = '';
+    bindError = '';
+  }
+
+  async function handleBind(): Promise<void> {
+    confirmBind = false;
+    const plan = bindPlan;
+    if (!plan || plan.change.length === 0) return;
+    const names = plan.change.map((d) => d.name);
+    applying = true;
+    statusMessage = null;
+    bindError = '';
+    let done = 0;
+    let current = '';
+    try {
+      if (plan.schedule) {
+        await restconfPatchJson(DATA_ROOT, bindPatch(names, plan.schedule));
+        done = names.length;
+      } else {
+        stopRequested = false;
+        progress = { done, total: names.length };
+        for (const name of names) {
+          if (stopRequested) break;
+          current = name;
+          await unbindDevice(name);
+          done += 1;
+          progress = { done, total: names.length };
+        }
+      }
+      if (done === names.length) {
+        statusMessage = {
+          type: 'success',
+          text: plan.schedule
+            ? `Bound ${devicesText(done)} to ${plan.schedule}.`
+            : `Unbound ${devicesText(done)}.`
+        };
+        clearSelection();
+        bindChoice = '';
+      } else {
+        bindError = `Stopped after unbinding ${done} of ${devicesText(names.length)}.`;
+      }
+    } catch (writeError) {
+      const reason = writeError instanceof Error ? writeError.message : 'the write failed';
+      bindError = plan.schedule
+        ? `Nothing bound: ${reason}`
+        : `Unbound ${done} of ${devicesText(names.length)}; ${current} failed: ${reason}`;
+    } finally {
+      applying = false;
+      progress = null;
+      await invalidate('data:software');
+    }
+  }
 
   let validation = $derived(
     draft
@@ -195,10 +363,10 @@
     </p>
   </div>
   <div class="header-buttons">
-    <button class="btn btn-secondary" type="button" onclick={openImport} disabled={saving}>
+    <button class="btn btn-secondary" type="button" onclick={openImport} disabled={saving || applying}>
       Import
     </button>
-    <button class="btn btn-primary" type="button" onclick={openNew} disabled={saving}>
+    <button class="btn btn-primary" type="button" onclick={openNew} disabled={saving || applying}>
       Add device
     </button>
   </div>
@@ -228,31 +396,77 @@
           <option value={t}>{t}</option>
         {/each}
       </select>
+      <select class="filter-select" bind:value={filterSchedule} onchange={() => (page = 1)}>
+        <option value="">all schedules</option>
+        <option value="none">no schedule</option>
+        {#each scheduleNames as name (name)}
+          <option value={`=${name}`}>{name}</option>
+        {/each}
+        {#each missingSchedules as name (name)}
+          <option value={`=${name}`}>{name} (missing)</option>
+        {/each}
+      </select>
       <span class="filter-count">{filtered.length} of {data.devices.length}</span>
     </div>
     <div class="table-wrap">
       <table>
         <thead>
           <tr>
+            <th class="col-check">
+              <input
+                type="checkbox"
+                aria-label="Select the devices on this page"
+                checked={pageAllChosen}
+                indeterminate={pageChosen > 0 && !pageAllChosen}
+                disabled={applying || visible.length === 0}
+                onchange={togglePage}
+              />
+            </th>
             <th>Device</th>
             <th>Type</th>
             <th>Address</th>
+            <th>Schedule</th>
             <th></th>
           </tr>
         </thead>
         <tbody>
           {#each visible as device (device.name)}
-            <tr>
+            <tr class:chosen={selected.has(device.name)}>
+              <td class="col-check">
+                <!-- preventDefault on a shift mousedown keeps the browser from selecting text. -->
+                <input
+                  type="checkbox"
+                  aria-label={`Select ${device.name}`}
+                  checked={selected.has(device.name)}
+                  disabled={applying}
+                  onmousedown={(e) => e.shiftKey && e.preventDefault()}
+                  onclick={(e) => toggleRow(device, e.shiftKey)}
+                />
+              </td>
               <td>
                 <a class="device-name" href={`/devices/${encodeURIComponent(device.name)}`}>{device.name}</a>
               </td>
               <td>{device.type}</td>
               <td class="mono">{device.address || '—'}</td>
+              <td>
+                {#if !device.schedule}
+                  <span class="dim" title="No binding: each campaign's default schedule applies">—</span>
+                {:else if knownSchedules.has(device.schedule)}
+                  <a class="schedule-name mono" href={`/schedules/${encodeURIComponent(device.schedule)}`}>
+                    <span class="swatch" style:background={colors.get(device.schedule) ?? SCHEDULE_COLOR_OTHER}></span>
+                    {device.schedule}
+                  </a>
+                {:else}
+                  <span class="mono missing" title="No schedule by this name: the device is placed in no window">
+                    {device.schedule} (missing)
+                  </span>
+                {/if}
+              </td>
               <td class="col-action">
                 <button
                   class="btn btn-secondary btn-small btn-danger-ghost"
                   type="button"
-                  disabled={saving || deleting}
+                  disabled={saving || deleting || applying}
                   onclick={() => (deleteTarget = device)}
                 >
                   Remove
@@ -272,6 +486,59 @@
         <button class="btn btn-secondary btn-small" type="button" disabled={currentPage >= pageCount} onclick={() => (page = currentPage + 1)}>
           ›
         </button>
+      </div>
+    {/if}
+    {#if chosen.length > 0}
+      <div class="selection-bar">
+        <span class="tn"><strong>{chosen.length.toLocaleString()}</strong> selected</span>
+        {#if chosen.length > chosenShown}
+          <span class="dim tn">{(chosen.length - chosenShown).toLocaleString()} hidden by the filter</span>
+        {/if}
+        {#if chosenShown < filtered.length}
+          <button class="link-button tn" type="button" disabled={applying} onclick={selectAllMatching}>
+            Select all {filtered.length.toLocaleString()}{filtered.length < data.devices.length ? ' matching' : ''}
+          </button>
+        {/if}
+        <button class="link-button" type="button" disabled={applying} onclick={clearSelection}>Clear</button>
+        <span class="spacer"></span>
+        <label class="dim" for="bind-choice">Schedule</label>
+        <select
+          id="bind-choice"
+          class="filter-select"
+          bind:value={bindChoice}
+          disabled={applying}
+          onchange={() => (bindError = '')}
+        >
+          <option value="" disabled>choose…</option>
+          <option value="none">none (campaign default)</option>
+          {#each scheduleNames as name (name)}
+            <option value={`=${name}`}>{name}</option>
+          {/each}
+        </select>
+        {#if scheduleNames.length === 0}
+          <a class="link-button" href="/schedules/new">create a schedule</a>
+        {/if}
+        {#if bindPlan && bindPlan.change.length === 0}
+          <span class="dim">already set on all selected</span>
+        {/if}
+        {#if progress}
+          <span class="tn">Unbinding {progress.done.toLocaleString()} of {progress.total.toLocaleString()}…</span>
+          <button class="btn btn-secondary btn-small" type="button" onclick={() => (stopRequested = true)}>
+            Stop
+          </button>
+        {:else}
+          <button
+            class="btn btn-primary btn-small"
+            type="button"
+            disabled={applying || !bindPlan || bindPlan.change.length === 0}
+            onclick={() => (confirmBind = true)}
+          >
+            {applying ? 'Applying…' : 'Apply'}
+          </button>
+        {/if}
+        {#if bindError}
+          <div class="bar-error">{bindError}</div>
+        {/if}
       </div>
     {/if}
   {/if}
@@ -375,6 +642,16 @@
     </Section>
   </section>
 {/if}
+
+<ConfirmDialog
+  open={confirmBind}
+  title={bindPlan?.schedule ? 'Bind devices' : 'Unbind devices'}
+  message={bindMessage}
+  confirmLabel={bindPlan?.schedule ? 'Bind' : 'Unbind'}
+  confirmClass="btn-primary"
+  oncancel={() => (confirmBind = false)}
+  onconfirm={handleBind}
+/>
 
 <ConfirmDialog
   open={deleteTarget !== null}
@@ -495,6 +772,95 @@
   .col-action {
     text-align: right;
     white-space: nowrap;
+  }
+
+  .col-check {
+    width: 1%;
+    padding-right: 0;
+  }
+
+  .col-check input {
+    display: block;
+    accent-color: var(--sw-accent);
+    cursor: pointer;
+  }
+
+  tbody tr.chosen td {
+    background: var(--sw-accent-glow);
+  }
+
+  .schedule-name {
+    color: var(--sw-accent-bright);
+    text-decoration: none;
+    font-size: 12.5px;
+  }
+
+  .schedule-name:hover {
+    color: var(--sw-accent);
+  }
+
+  .swatch {
+    display: inline-block;
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+
+  .missing {
+    color: var(--sw-warning);
+    font-size: 12.5px;
+  }
+
+  .dim {
+    color: var(--sw-text-muted);
+  }
+
+  /* Sticks to the bottom of the view while a long page scrolls. */
+  .selection-bar {
+    position: sticky;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-top: 12px;
+    padding: 10px 14px;
+    border: 1px solid var(--sw-accent-glow-strong);
+    border-radius: var(--sw-radius-md);
+    background: var(--sw-bg-elevated);
+    box-shadow: var(--sw-shadow-sticky);
+    font-size: 13px;
+  }
+
+  .spacer {
+    flex: 1;
+  }
+
+  .link-button {
+    background: none;
+    border: none;
+    padding: 0;
+    color: var(--sw-accent-bright);
+    font: inherit;
+    cursor: pointer;
+  }
+
+  .link-button:hover:not(:disabled) {
+    color: var(--sw-accent);
+    text-decoration: underline;
+  }
+
+  .bar-error {
+    flex-basis: 100%;
+    font-size: 12px;
+    color: var(--sw-danger);
+  }
+
+  .link-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .btn-small {

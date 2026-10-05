@@ -1,20 +1,27 @@
-import { restconfGetJson } from '$lib/core/restconf/client';
-import { FLEET_ROOT, parseFleet } from '$lib/software/model';
+import { restconfGetJson, restconfGetOrNull } from '$lib/core/restconf/client';
+import { FLEET_ROOT, SCHEDULES_ROOT, parseFleet, parseSchedules } from '$lib/software/model';
 
 import type { PageLoad } from './$types';
 
-export const load: PageLoad = async ({ fetch, depends }) => {
+// ?schedule=NAME opens the list filtered to the devices bound to NAME.
+export const load: PageLoad = async ({ fetch, depends, url }) => {
   depends('data:software');
+  const scheduleFilter = url.searchParams.get('schedule') ?? '';
 
   try {
-    const response = await restconfGetJson<unknown>(FLEET_ROOT, fetch);
+    const [response, schedules] = await Promise.all([
+      restconfGetJson<unknown>(FLEET_ROOT, fetch),
+      restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch)
+    ]);
     const { nodes, devices } = parseFleet(response);
-    return { nodes, devices, loadError: '' };
+    return { nodes, devices, schedules: parseSchedules(schedules), scheduleFilter, loadError: '' };
   } catch (loadError) {
     const message = loadError instanceof Error ? loadError.message : 'Failed to load devices.';
     return {
       nodes: [],
       devices: [],
+      schedules: [],
+      scheduleFilter,
       // 404 just means nothing has been configured yet.
       loadError: message.includes('404') ? '' : message
     };

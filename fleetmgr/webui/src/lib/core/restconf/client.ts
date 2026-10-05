@@ -76,6 +76,18 @@ export function restconfGetJson<T>(path: string, fetchFn: Fetch = fetch): Promis
   }, fetchFn);
 }
 
+/** A GET whose 404 means "nothing configured yet": null instead of an error. */
+export async function restconfGetOrNull<T>(path: string, fetchFn: Fetch = fetch): Promise<T | null> {
+  try {
+    return await restconfGetJson<T>(path, fetchFn);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('404')) {
+      return null;
+    }
+    throw error;
+  }
+}
+
 export function restconfPutJson<T>(path: string, body: unknown): Promise<T> {
   return restconfRequest<T>(path, {
     method: 'PUT',

@@ -56,6 +56,26 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   ever polls `GET /restconf/data` — it also hauls the full yang-library.
   Paths into a campaign's oper state (`.../state/total`) currently fail
   upstream, which is why fresh counters cost a whole entry.
+- Schedules are the shared `maintenance:schedules` entries: a name, a
+  `utc-offset` in minutes and a `window` list keyed by `at`, the local
+  time of day a rule opens, with a `duration` and an optional `day`
+  leaf-list. Creating one PATCHes the datastore root; saving an existing
+  one PUTs the whole entry, because a rule removed in the editor has to
+  disappear and a merging PATCH cannot remove a list entry. Removing a
+  leaf on its own fails upstream (DELETE on a leaf returns 500), which is
+  another reason the editor replaces entries. The schedules page draws a
+  week of every schedule's occurrences in the viewer's local clock; the
+  occurrences are generated the way the planner generates them, so what
+  the calendar shows is the supply of windows a campaign will be placed
+  into.
+- A device binds to a schedule with the `schedule` leaf on its fleet
+  entry. Binding merges, so one PATCH binds any number of devices (1000
+  in about a second). Unbinding PUTs each entry back without the leaf,
+  one device at a time, since DELETE on a leaf returns 500. Every binding
+  write re-plans the campaigns, about half a second with a 1000-member
+  campaign, so unbinding many devices takes minutes; leaving the page
+  stops it. The leafref is not validated upstream, so the UI offers only
+  existing schedules and flags bindings to a missing one.
 - Per-device status values: `pending`, `unknown`, `up-to-date`,
   `upgrade-needed`, `in-progress`, `succeeded`, `failed`, `rolled-back`.
   The `succeeded` counter includes `up-to-date`, `failed` includes

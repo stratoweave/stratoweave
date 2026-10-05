@@ -19,16 +19,29 @@
   const PAGE_LABELS: Record<string, string> = {
     '/devices': 'Devices',
     '/campaigns': 'Campaigns',
-    '/campaigns/new': 'New campaign'
+    '/campaigns/new': 'New campaign',
+    '/schedules': 'Schedules',
+    '/schedules/new': 'New schedule'
+  };
+  // Detail pages sit under their list: /campaigns/<name>, /devices/<name>,
+  // /schedules/<name>.
+  const PARENTS: Record<string, string> = {
+    '/campaigns/': 'Campaigns',
+    '/devices/': 'Devices',
+    '/schedules/': 'Schedules'
   };
 
   let currentPathname = $derived(page.url.pathname);
-  let campaignName = $derived(
-    currentPathname.startsWith('/campaigns/') && PAGE_LABELS[currentPathname] === undefined
-      ? decodeURIComponent(currentPathname.slice('/campaigns/'.length))
-      : null
-  );
-  let currentLabel = $derived(campaignName ?? PAGE_LABELS[currentPathname] ?? 'Campaigns');
+  let parent = $derived.by(() => {
+    if (PAGE_LABELS[currentPathname] !== undefined) return null;
+    for (const [prefix, label] of Object.entries(PARENTS)) {
+      if (currentPathname.startsWith(prefix)) {
+        return { href: prefix.slice(0, -1), label, name: decodeURIComponent(currentPathname.slice(prefix.length)) };
+      }
+    }
+    return null;
+  });
+  let currentLabel = $derived(parent?.name ?? PAGE_LABELS[currentPathname] ?? 'Campaigns');
   let pageTitle = $derived(`${currentLabel} · fleetmgr`);
 </script>
 
@@ -73,6 +86,17 @@
           Devices
         </a>
       </div>
+      <div class="nav-section">
+        <div class="nav-section-label">Maintenance</div>
+        <a
+          class="nav-item"
+          class:active={currentPathname.startsWith('/schedules')}
+          href="/schedules"
+        >
+          <span class="nav-icon"><NavIcon name="schedules" /></span>
+          Schedules
+        </a>
+      </div>
     </nav>
   </aside>
 
@@ -80,8 +104,8 @@
   <div class="app-main-wrap">
     <header class="app-header">
       <nav class="yang-path" aria-label="Breadcrumb">
-        {#if campaignName !== null}
-          <a class="segment" href="/campaigns">Campaigns</a>
+        {#if parent !== null}
+          <a class="segment" href={parent.href}>{parent.label}</a>
           <span class="separator">›</span>
         {/if}
         <span class="segment current" aria-current="page">{currentLabel}</span>

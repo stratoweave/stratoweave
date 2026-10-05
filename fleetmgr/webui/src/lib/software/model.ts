@@ -6,6 +6,7 @@ import type { ValidationResult } from '$lib/core/validation/types';
 export const DATA_ROOT = 'data';
 export const SOFTWARE_ROOT = 'data/software:software';
 export const SCHEDULES_ROOT = 'data/maintenance:schedules';
+export const SCHEDULE_LIST_ROOT = 'data/maintenance:schedules/schedule';
 export const CAMPAIGN_LIST_ROOT = 'data/software:software/upgrade-campaign';
 export const FLEET_ROOT = 'data/fleetmgr:fleet';
 export const FLEET_DEVICE_LIST_ROOT = 'data/fleetmgr:fleet/device';

@@ -4,15 +4,58 @@
 
   import StatusPill from '$lib/software/StatusPill.svelte';
   import { createPoller } from '$lib/core/polling/poller';
-  import type { Campaign, Device } from '$lib/software/model';
+  import { setDeviceSchedule } from '$lib/maintenance/binding';
+  import { scheduleRulesText } from '$lib/maintenance/schedule-form';
+  import type { Campaign, Device, Schedule } from '$lib/software/model';
   import { formatClock } from '$lib/software/time';
 
   let {
     data
-  }: { data: { name: string; device: Device | null; campaigns: Campaign[]; loadError: string } } =
-    $props();
+  }: {
+    data: {
+      name: string;
+      device: Device | null;
+      campaigns: Campaign[];
+      schedules: Schedule[];
+      loadError: string;
+    };
+  } = $props();
 
   let statusMessage = $state<string>(untrack(() => data.loadError));
+
+  // null follows the device as polled; a pick holds until it is saved.
+  let picked = $state<string | null>(null);
+  let savingSchedule = $state(false);
+  let scheduleMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
+  let bound = $derived(data.device?.schedule ?? '');
+  let choice = $derived(picked ?? bound);
+  let scheduleOptions = $derived.by(() => {
+    const options = data.schedules.map((s) => ({ name: s.name, label: `${s.name} — ${scheduleRulesText(s)}` }));
+    if (bound && !data.schedules.some((s) => s.name === bound)) {
+      options.push({ name: bound, label: `${bound} (missing: placed in no window)` });
+    }
+    return options;
+  });
+
+  async function saveSchedule(): Promise<void> {
+    if (!data.device || choice === bound) return;
+    const schedule = choice;
+    try {
+      savingSchedule = true;
+      scheduleMessage = null;
+      await setDeviceSchedule(data.device.name, schedule);
+      await invalidate('data:device');
+      picked = null;
+      scheduleMessage = { type: 'success', text: schedule ? `Bound to ${schedule}.` : 'Unbound.' };
+    } catch (saveError) {
+      scheduleMessage = {
+        type: 'error',
+        text: saveError instanceof Error ? saveError.message : 'Failed to save the schedule.'
+      };
+    } finally {
+      savingSchedule = false;
+    }
+  }
 
   onMount(() => {
     const poller = createPoller(() => invalidate('data:device'), 5000);
@@ -68,6 +111,40 @@
       </p>
     </div>
   </div>
+
+  <section class="card">
+    <h3 class="panel-title">Maintenance schedule</h3>
+    <div class="binding">
+      <select
+        class="binding-select"
+        aria-label="Maintenance schedule"
+        value={choice}
+        disabled={savingSchedule}
+        onchange={(e) => (picked = e.currentTarget.value)}
+      >
+        <option value="">none — each campaign's default schedule</option>
+        {#each scheduleOptions as option (option.name)}
+          <option value={option.name}>{option.label}</option>
+        {/each}
+      </select>
+      <button
+        class="btn btn-primary"
+        type="button"
+        disabled={savingSchedule || choice === bound}
+        onclick={saveSchedule}
+      >
+        {savingSchedule ? 'Saving…' : 'Save'}
+      </button>
+      {#if scheduleMessage}
+        <span class={scheduleMessage.type === 'error' ? 'save-error' : 'save-ok'}>{scheduleMessage.text}</span>
+      {/if}
+    </div>
+    <p class="hint">
+      A bound device is placed only in its schedule's windows; without a binding each campaign's
+      default schedule applies. Campaigns with this device re-plan on save. Windows are defined on
+      the <a href="/schedules">schedules</a>.
+    </p>
+  </section>
 
   <section class="card">
     <h3 class="panel-title">Campaign membership</h3>
@@ -188,6 +265,38 @@
     margin: 14px 0 0;
     font-size: 12px;
     color: var(--sw-text-muted);
+  }
+
+  .hint a {
+    color: var(--sw-accent-bright);
+  }
+
+  .binding {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .binding-select {
+    min-width: 260px;
+    max-width: 100%;
+    padding: 8px 10px;
+    background: var(--sw-bg-input);
+    border: 1px solid var(--sw-border-default);
+    border-radius: var(--sw-radius-md);
+    color: var(--sw-text-primary);
+    font-size: 13px;
+  }
+
+  .save-ok {
+    font-size: 12px;
+    color: var(--sw-text-secondary);
+  }
+
+  .save-error {
+    font-size: 12px;
+    color: var(--sw-danger);
   }
 
   .mono {
