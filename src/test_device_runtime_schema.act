@@ -76,6 +76,10 @@ MOCK_MODULE = "mock-interfaces"
 # No other module of the mock imports it
 UNIMPORTED_MODULE = "ietf-yang-library"
 
+# Of the mock's modules, this set has only the two type modules
+NARROW_MODULE_SET = "cisco-xe-native"
+NARROW_MODULES = {"ietf-inet-types", "ietf-yang-types"}
+
 
 def _src(schema: yschema.DRoot) -> str:
     # Only print DRoot children to avoid mismatch in module_metadata (runtime
@@ -95,17 +99,23 @@ def _mock_server(t: testing.EnvT, ms: ypms.MockSchema, on_listen: action(?int, ?
                              on_listen=on_listen, on_get_schema=on_get_schema)
 
 
-def _device(t: testing.EnvT, registry: swdev.SchemaRegistry, name: str, port: int) -> swdev.DeviceMgr:
+def _dmc(name: str, port: int, module_sets: list[str]=[]) -> DeviceMetaConfig:
+    """The config of a device that fetches its schema from the yp_mockserver at port"""
+    dmc = DeviceMetaConfig(name=name, credentials=Credentials("admin", "admin"), type="netconf")
+    dmc.address.create("primary", "127.0.0.1", u64(port))
+    dmc.feature_flags.runtime_schema_fetch = True
+    dmc.runtime_schema.module_set = module_sets
+    return dmc
+
+
+def _device(t: testing.EnvT, registry: swdev.SchemaRegistry, name: str, port: int, module_sets: list[str]=[]) -> swdev.DeviceMgr:
     """A DeviceMgr that fetches its schema from the yp_mockserver at port"""
     connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
     dev_types = {
         "netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter, src_dnode=yschema.DRoot())
     }
     dev = swdev.DeviceMgr(dev_types, connect_cap, name, t.log_handler, lambda name: None, registry)
-    dmc = DeviceMetaConfig(name=name, credentials=Credentials("admin", "admin"), type="netconf")
-    dmc.address.create("primary", "127.0.0.1", u64(port))
-    dmc.feature_flags.runtime_schema_fetch = True
-    dev.set_dmc(dmc)
+    dev.set_dmc(_dmc(name, port, module_sets))
     return dev
 
 
@@ -311,3 +321,43 @@ actor _test_runtime_schema_missing_module(t: testing.EnvT):
             check(s, _device(t, swdev.SchemaRegistry(), "dev-missing", port))
 
     server = _mock_server(t, ms, _on_listen, _on_get_schema)
+
+
+actor _test_runtime_schema_module_sets(t: testing.EnvT):
+    """The configured module sets select the fetched modules, and changing them
+    replaces the fetched schema"""
+    var server: ?ypms.YpMockServer = None
+
+    def _on_get_schema():
+        pass
+
+    def check_empty(s: ypms.YpMockServer, dev: swdev.DeviceMgr):
+        # Until the device has reconnected, it has the narrow schema
+        if dev.get_fetched_schema() is None:
+            s.close()
+            t.success()
+        else:
+            after 0.05: check_empty(s, dev)
+
+    def check_narrow(s: ypms.YpMockServer, dev: swdev.DeviceMgr, port: int):
+        schema = dev.get_fetched_schema()
+        if schema is not None:
+            modules = _modules(schema)
+            if modules != NARROW_MODULES:
+                s.close()
+                t.failure(ValueError("module set {NARROW_MODULE_SET} fetched {modules}, expected {NARROW_MODULES}"))
+            else:
+                # None of the mock's modules are OpenConfig modules
+                dev.set_dmc(_dmc("dev-sets", port, ["openconfig"]))
+                check_empty(s, dev)
+        else:
+            after 0.05: check_narrow(s, dev, port)
+
+    def _on_listen(port: ?int, err: ?Exception):
+        s = server
+        if err is not None:
+            t.failure(ValueError("mock NETCONF server listen failed: {err}"))
+        elif port is not None and s is not None:
+            check_narrow(s, _device(t, swdev.SchemaRegistry(), "dev-sets", port, [NARROW_MODULE_SET]), port)
+
+    server = _mock_server(t, ypms.build_mock_schema(ypms.MOCK_MODULES), _on_listen, _on_get_schema)
