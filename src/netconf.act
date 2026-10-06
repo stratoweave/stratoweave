@@ -89,6 +89,11 @@ class MalformedRpcError(NetconfError):
     pass
 
 
+class SessionClosedError(NetconfError):
+    """The session closed before the reply to an RPC arrived"""
+    pass
+
+
 def required_text(child: xml.Node, field: str) -> str:
     text = child.text
     if text is not None:
@@ -311,11 +316,14 @@ actor Client(
     def get_capabilities() -> list[str]:
         return capabilities
 
+    def _fail_pending_rpcs() -> None:
+        for rpc_cb in rpc_cbs.values():
+            rpc_cb(self, None, SessionClosedError("Session closed"))
+        rpc_cbs = {}
+
     # TODO: Close protocol
     def close(cb: ?action() -> None) -> None:
-        for rpc_cb in rpc_cbs.values():
-            rpc_cb(self, None, None)
-        rpc_cbs = {}
+        _fail_pending_rpcs()
 
         if p is not None:
             p.close(cb)
@@ -326,8 +334,7 @@ actor Client(
     # TODO: Restart protocol
     def restart() -> None:
         _log.info("Restarting")
-        for rpc_cb in rpc_cbs.values():
-            rpc_cb(self, None, None)
+        _fail_pending_rpcs()
 
         framing = SEPARATOR_FRAMING
         recv_buf = Buffer()
@@ -337,7 +344,6 @@ actor Client(
         capabilities = []
 
         message_id = 1
-        rpc_cbs = {}
 
         state = STATE_NONE
         active_fixups.clear()
@@ -1299,8 +1305,10 @@ actor SchemaGetter(client):
                 - schema_id: (identifier, ?version, ?format)
                 - schema_data (?str): Schema content if successful, None on error
                 - error (?NetconfError): None if successful, error details if failed
-            on_done: Callback invoked when all downloads complete. Parameter:
-                - error (?NetconfError): None if successful, error details if failed
+            on_done: Callback invoked when the download ends. Parameter:
+                - error (?NetconfError): None when every schema was requested,
+                  or the SessionClosedError when the session closed first.
+                  The errors of single schemas go to on_get_schema.
             schemas: List of schemas to download, each as named tuple (identifier, ?version, ?format)
             TODO: ideally this would be a set of tuples, once named tuples are *Hashable*
         """
@@ -1321,6 +1329,9 @@ actor SchemaGetter(client):
 
         def _on_get_schema(current_download_index, c: Client, result: ?xml.Node, error: ?NetconfError):
             """Handle individual schema response"""
+            if isinstance(error, SessionClosedError):
+                on_done(self, error)
+                return
             schema = schemas[current_download_index]
             if error is not None:
                 on_get_schema(self, current_download_index+1, len(schemas), schema, None, error)
@@ -1606,6 +1617,54 @@ actor _test_client_uses_oldest_rpc_for_reply_without_message_id(t: testing.EnvT)
                     on_notif=None,
                     log_handler=t.log_handler,
                     pipe=pipes.client)
+
+
+actor _test_client_restart_fails_pending_rpc(t: testing.EnvT):
+    """Restarting the client completes a pending RPC with a SessionClosedError"""
+    pipes = actor_pipe_pair()
+    var done = False
+    var client: ?Client = None
+
+    def _on_reply(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if done:
+            return
+        done = True
+        if isinstance(error, SessionClosedError):
+            c.close(None)
+            t.success()
+        else:
+            t.failure(ValueError("expected a SessionClosedError, got {error}"))
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        # Leave the RPC unanswered
+        cl = client
+        if cl is not None:
+            cl.restart()
+
+    def _on_connect(c: Client, e: ?Exception):
+        # The reply to the pending RPC arrives before the restarted session
+        # connects, so the test is done by then
+        if done:
+            return
+        if e is not None:
+            done = True
+            t.failure(ValueError("Failed to connect to the server: {e}"))
+        else:
+            client = c
+            c.get(_on_reply)
+
+    server = Server(pipe=pipes.server, on_rpc=_on_server_rpc,
+                    capabilities=[CAP_NC_1_0], log_handler=t.log_handler)
+    Client(None,
+           address="actor-pipe",
+           username="actor-pipe",
+           key=None,
+           password=None,
+           port=0,
+           on_connect=_on_connect,
+           on_notif=None,
+           log_handler=t.log_handler,
+           pipe=pipes.client)
 
 
 actor _test_server_serializes_pipelined_rpc_dispatch(t: testing.EnvT):
