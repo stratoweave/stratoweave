@@ -215,7 +215,8 @@ no BGP neighbors at all, and records the established-session and
 advertised-prefix counts as the baseline. While every neighbor is down it
 keeps waiting and refuses after 45 s; the device is then left on the old
 release. The post-check passes once the device is back at the baseline and
-refuses after 10 minutes, which aborts the activation.
+refuses after 10 minutes, which aborts the activation. A fleet device's
+`upgrade-checks/precheck-wait` and `postcheck-wait` change those waits.
 
 Nothing is read from the device between checks and nothing is published
 but the verdicts, under `/device{cpe}/software/state/precheck` and

@@ -66,10 +66,10 @@ actor _test_direct_device_config(t: testing.AsyncT):
     tr.edit_config(root.to_gdata(), cont)
 
 
-actor _test_iosxe_software_upgrade(t: testing.AsyncT):
-    """Run the production IOS XE workflow against flotilla's device mock, with
-    the device-health checks gating it. The mock serves no BGP state, so both
-    checks pass on an empty reading."""
+actor MockUpgrade(t: testing.AsyncT, failure: str, status: str, release: str, pre: str, post: str):
+    """Upgrade a flotilla mock IOS XE device that reproduces failure, with the
+    device-health checks gating it and waiting a second, and check where it
+    ends: the status, the running release and both check verdicts."""
     root = rfs.root()
     dev = root.device.create(
         "xe-1",
@@ -77,9 +77,13 @@ actor _test_iosxe_software_upgrade(t: testing.AsyncT):
         credentials=Credentials(username="admin", password="admin"),
     )
     dev.mock.enabled = True
-    # The post-check waits for a sample taken after the reload, so the poll
-    # period bounds the test time.
-    root.rfs.create("xe-1").device_health.poll_period = u64(1)
+    dev.mock.software.failure = failure
+    # A check answers from a sample taken after it started, so the poll
+    # period and the waits bound the test time.
+    health_conf = root.rfs.create("xe-1").device_health
+    health_conf.poll_period = u64(1)
+    health_conf.precheck_wait = u64(1)
+    health_conf.postcheck_wait = u64(1)
 
     tr = stratoweave.test_main(sysspec.SYSSPEC, t.log_handler)
     var attempts = 0
@@ -92,32 +96,28 @@ actor _test_iosxe_software_upgrade(t: testing.AsyncT):
             t.failure(ValueError(message))
 
     def poll_status() -> None:
-        attempts += 1
         oper = rfs_oper.root.from_gdata(tr.cfs.newsession().get_data())
         out = oper.device.get("xe-1")
         if out is not None:
             state = out!.software.state
-            status = state.status
-            if status == "in-progress":
+            now = state.status
+            if now == "in-progress":
                 saw_in_progress = True
-            elif status == "failed":
-                fail("IOS XE software upgrade failed: {state.precheck.detail}")
-                return
-            elif status == "succeeded":
+            elif now == "succeeded" or now == "failed" or now == "rolled-back":
+                pre_check = state.precheck
+                post_check = state.postcheck
                 if not saw_in_progress:
                     fail("IOS XE upgrade skipped the observable in-progress state")
-                elif state.running_release != "17.18.3a":
-                    fail("IOS XE running release was not published")
-                elif state.precheck.verdict != "pass" or state.postcheck.verdict != "pass":
-                    fail("the device-health checks did not both pass")
+                elif now != status or state.running_release != release \
+                        or pre_check.verdict != pre or post_check.verdict != post:
+                    fail("IOS XE upgrade ended as {now} {state.running_release}"
+                         + " | pre {pre_check.verdict}: {pre_check.detail}"
+                         + " | post {post_check.verdict}: {post_check.detail}")
                 else:
                     finished = True
                     t.success()
                 return
-        if attempts >= 1000:
-            fail("timed out waiting for IOS XE software upgrade")
-        else:
-            after 0.01: poll_status()
+        after 0.01: poll_status()
 
     def start_upgrade() -> None:
         dev.software.upgrade_campaign = "xe-upgrade"
@@ -153,3 +153,21 @@ actor _test_iosxe_software_upgrade(t: testing.AsyncT):
             wait_for_mock()
 
     tr.edit_config(root.to_gdata(), on_device)
+
+
+actor _test_iosxe_software_upgrade(t: testing.AsyncT):
+    """The production IOS XE workflow against flotilla's device mock: both
+    checks pass on the mock's established BGP session."""
+    MockUpgrade(t, "none", status="succeeded", release="17.18.3a", pre="pass", post="pass")
+
+
+actor _test_iosxe_bgp_down_refuses_the_install(t: testing.AsyncT):
+    """With the session idle from the start, the pre-check refuses and the
+    device keeps its release."""
+    MockUpgrade(t, "bgp-down", status="failed", release="17.18.02", pre="fail", post="not-run")
+
+
+actor _test_iosxe_bgp_lost_rolls_back(t: testing.AsyncT):
+    """With the session idle on the new release, the post-check fails and the
+    abort takes the device back."""
+    MockUpgrade(t, "bgp-lost", status="rolled-back", release="17.18.02", pre="pass", post="fail")
