@@ -437,9 +437,14 @@ reproduces one IOS XE failure:
 | `activate-refused` | `activate` rejected | `failed`, no abort |
 | `commit-failed` | `install-commit` accepted, then the commit stage fails | `rolled-back` after `abort` |
 | `reverts` | the abort timer ran out before the commit, so the commit finds nothing to do | `failed`, nothing to abort |
+| `bgp-down` | the BGP session is idle from the start | `failed` with a BGP pre-check, nothing installed |
+| `bgp-lost` | the BGP session is idle while the activated release runs | `rolled-back` with a BGP post-check, after `abort` |
 
 A failed operation is recorded as the device records it: the stages that ran,
-the failed one marked, and nothing after it.
+the failed one marked, and nothing after it. The mock also serves one BGP
+neighbor in `Cisco-IOS-XE-bgp-oper`, established and advertising three
+prefixes unless one of the BGP failures takes it down, for an application's
+pre-check and post-check to read.
 
 Current coverage includes:
 
