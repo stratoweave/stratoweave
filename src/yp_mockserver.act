@@ -61,27 +61,35 @@ class MockSchema(object):
         self.sources = sources
 
 
-def build_mock_schema() -> MockSchema:
-    """Compile the mock interfaces module with the ietf-yang-library and ietf-yang-push
-    closures, so the server advertises + serves ietf-yang-library, lists ietf-yang-push
-    (which makes a client establish a real yang-push subscription rather than polling),
-    and answers get-schema for every module."""
-    modules: list[(name: str, src: str)] = [
-        (name="mock-interfaces", src=mb.INTERFACES_YANG),
-        (name="ietf-yang-library", src=swyang.ietf_yang_library),
-        (name="ietf-datastores", src=swyang.ietf_datastores),
-        (name="ietf-yang-types", src=swyang.ietf_yang_types),
-        (name="ietf-inet-types", src=swyang.ietf_inet_types),
-        (name="ietf-yang-push", src=swyang.ietf_yang_push),
-        (name="ietf-subscribed-notifications", src=swyang.ietf_subscribed_notifications),
-        (name="ietf-restconf", src=swyang.ietf_restconf),
-        (name="ietf-yang-patch", src=swyang.ietf_yang_patch),
-        (name="ietf-interfaces", src=swyang.ietf_interfaces),
-        (name="ietf-netconf-acm", src=swyang.ietf_netconf_acm),
-        (name="ietf-network-instance", src=swyang.ietf_network_instance),
-        (name="ietf-ip", src=swyang.ietf_ip),
-        (name="ietf-yang-schema-mount", src=swyang.ietf_yang_schema_mount),
-    ]
+# The mock interfaces module with the ietf-yang-library closure, so that the
+# server advertises + serves ietf-yang-library
+MOCK_MODULES: list[(name: str, src: str)] = [
+    (name="mock-interfaces", src=mb.INTERFACES_YANG),
+    (name="ietf-yang-library", src=swyang.ietf_yang_library),
+    (name="ietf-datastores", src=swyang.ietf_datastores),
+    (name="ietf-yang-types", src=swyang.ietf_yang_types),
+    (name="ietf-inet-types", src=swyang.ietf_inet_types),
+]
+
+# The ietf-yang-push closure, which makes a client establish a real yang-push
+# subscription rather than polling
+YANG_PUSH_MODULES: list[(name: str, src: str)] = [
+    (name="ietf-yang-push", src=swyang.ietf_yang_push),
+    (name="ietf-subscribed-notifications", src=swyang.ietf_subscribed_notifications),
+    (name="ietf-restconf", src=swyang.ietf_restconf),
+    (name="ietf-yang-patch", src=swyang.ietf_yang_patch),
+    (name="ietf-interfaces", src=swyang.ietf_interfaces),
+    (name="ietf-netconf-acm", src=swyang.ietf_netconf_acm),
+    (name="ietf-network-instance", src=swyang.ietf_network_instance),
+    (name="ietf-ip", src=swyang.ietf_ip),
+    (name="ietf-yang-schema-mount", src=swyang.ietf_yang_schema_mount),
+]
+
+
+def build_mock_schema(modules: list[(name: str, src: str)]) -> MockSchema:
+    """Compile modules into the schema that the server lists and serves
+
+    The server answers get-schema with the source of each module."""
     sources: dict[str, str] = {}
     srcs: list[str] = []
     for m in modules:
@@ -151,7 +159,8 @@ actor YpMockSession(pipe,
                     log_handler: logging.Handler,
                     backend: mb.MockBackend,
                     ms: MockSchema,
-                    on_close: ?action(YpMockSession) -> None=None):
+                    on_close: ?action(YpMockSession) -> None=None,
+                    on_get_schema: ?action() -> None=None):
     """One NETCONF session: a Server + a YANG-push service over a mock backend."""
     _log = logging.Logger(log_handler)
     var service: ?nyp.NetconfSubscriptionService = None
@@ -183,6 +192,8 @@ actor YpMockSession(pipe,
         elif op.tag == "get":
             s.send_reply(message_id, [xml.Node("data", [(None, netconf.NS_NC_1_0)], children=_get_reply_children(op))])
         elif op.tag == "get-schema":
+            if on_get_schema is not None:
+                on_get_schema()
             data = monitoring.get_schema_reply(op, ms.sources)
             if data is not None:
                 s.send_reply(message_id, [data])
@@ -219,8 +230,12 @@ actor YpMockServer(listen_cap: net.TCPListenCap,
                    username: str="admin",
                    password: str="admin",
                    tick_interval: float=1.0,
-                   on_listen: ?action(?Exception) -> None=None):
-    """SSH listener that turns each accepted channel into a YpMockSession."""
+                   on_listen: ?action(?int, ?Exception) -> None=None,
+                   on_get_schema: ?action() -> None=None):
+    """SSH listener that turns each accepted channel into a YpMockSession.
+
+    on_listen is called with the bound port, or with the error of the listen.
+    on_get_schema is called for each <get-schema> request of any session."""
     _log = logging.Logger(log_handler)
     _auth = StaticAuthChecker(username, password).check
     backend = OperBackend(if_names, ms.schema, ms.yl_view)
@@ -236,7 +251,7 @@ actor YpMockServer(listen_cap: net.TCPListenCap,
 
     def _on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
         _log.info("session accepted")
-        sessions.append(YpMockSession(p, log_handler, backend, ms, on_close=_session_closed))
+        sessions.append(YpMockSession(p, log_handler, backend, ms, on_close=_session_closed, on_get_schema=on_get_schema))
 
     def _notify_sessions(report: bool=False) -> None:
         """Trigger an on-change update on every active session. The per-session
@@ -260,13 +275,16 @@ actor YpMockServer(listen_cap: net.TCPListenCap,
             after tick_interval: _tick()
 
     def _on_listen(l: sshpipe.SshPipeListener, err: ?Exception):
+        cb = on_listen
         if err is not None:
             _log.error("listen error", {"address": address, "port": port, "error": err})
+            if cb is not None:
+                cb(None, err)
         else:
-            _log.info("yp mock server listening", {"address": address, "port": port})
-        cb = on_listen
-        if cb is not None:
-            cb(err)
+            bound = int(l.bound_port())
+            _log.info("yp mock server listening", {"address": address, "port": bound})
+            if cb is not None:
+                cb(bound, None)
 
     listener = sshpipe.SshPipeListener(
         listen_cap,
@@ -330,7 +348,7 @@ actor main(env):
             if_names = ["eth0", "eth1"]
 
         listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.auth)))
-        server = YpMockServer(listen_cap, logh, if_names, build_mock_schema(), address, port, username, password, tick_interval)
+        server = YpMockServer(listen_cap, logh, if_names, build_mock_schema(MOCK_MODULES + YANG_PUSH_MODULES), address, port, username, password, tick_interval)
         env.stdin_install(on_stdin=_on_input)
         print("yp mock server ready. Advancing every {tick_interval}s; press Enter for an immediate update; 'q' then Enter to quit.")
         # No env.exit(): the SSH listener keeps the runtime alive until killed.

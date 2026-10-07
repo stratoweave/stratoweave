@@ -1,4 +1,5 @@
 import diff
+import file
 import json
 import logging
 import net
@@ -22,7 +23,7 @@ from device_oper import \
     stratoweave_rfs__device_entry as DeviceOper, \
     stratoweave_rfs__device__software__state as SoftwareState
 
-from device_schema import DeviceSchema, SchemaTreeTransform
+from device_schema import DeviceSchema, SchemaKey, SchemaTreeTransform
 
 from adapters.adapter import \
     DeviceAdapter, NoAdapter, MockAdapter, MockRoot, \
@@ -588,32 +589,93 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPC
         return devices_needing_approval
 
 
-actor SchemaRegistry():
-    var store: dict[u64, yschema.DRoot] = {}
+class SchemaFetchError(Exception):
+    """The YANG modules of a schema could not be downloaded
 
-    def _schema_hash(yang_src: list[str], transforms: list[SchemaTreeTransform]) -> u64:
-        h = hasher()
-        for le in yang_src:
-            h.update(le.encode())
-        for t in transforms:
-            t.hash(h)
-        return h.finalize()
+    The download may succeed on another attempt, so the error is not kept.
+    """
+    pass
 
-    def add_schema(yang_src: list[str], transforms: list[SchemaTreeTransform]=[]) -> (hash: ?u64, error: ?Exception):
-        content_hash = _schema_hash(yang_src, transforms)
-        if content_hash not in store:
-            try:
-                compiled_schema = yang.compile(yang_src, strict_quoting=False)
-                for t in transforms:
-                    t.apply(compiled_schema)
-                store[content_hash] = compiled_schema
-            except Exception as e:
-                return (hash=None, error=e)
-        return (hash=content_hash, error=None)
 
-    def get_schema(content_hash) -> ?yschema.DRoot:
-        if content_hash is not None:
-            return store.get(content_hash)
+actor _SchemaCompiler(fc: ?file.FileCap):
+    """Compiles a device schema outside of the SchemaRegistry actor"""
+    def compile(done: action(SchemaKey, ?yschema.DRoot, ?Exception) -> None, key: SchemaKey, yang_src: list[str], transforms: list[SchemaTreeTransform]) -> None:
+        try:
+            if fc is not None:
+                compiled = yang.compile_with_cache(yang_src, strict_quoting=False, fc=fc)
+            else:
+                compiled = yang.compile(yang_src, strict_quoting=False)
+            for t in transforms:
+                t.apply(compiled)
+            done(key, compiled, None)
+        except Exception as e:
+            done(key, None, e)
+
+
+actor SchemaRegistry(fc: ?file.FileCap=None):
+    """Device schemas compiled from YANG modules downloaded from devices
+
+    When we connect to a device we get a list of YANG modules with names and
+    revisions. Before downloading the contents, we compute a "schema key" that
+    combines the set of YANG modules and the applied transforms into a unique
+    identifier. This identifier is then used to coordinate schema fetching and
+    compilation when multiple devices of the same type request the schema at the
+    same time. Only one DeviceMgr will download the modules and kick off
+    compilation. The other (pending) DeviceMgr are notified after it is done.
+    The assumption here is that the set of YANG modules and revisions is enough
+    to uniquely target a single software version on a device.
+
+    Compilation runs outside the registry actor so that it is not blocked.
+    """
+    var store: dict[SchemaKey, yschema.DRoot] = {}
+    var errors: dict[SchemaKey, Exception] = {}
+    # Callbacks of the requests for schemas that are being fetched or compiled
+    var waiting: dict[SchemaKey, list[action(?SchemaKey, ?Exception) -> None]] = {}
+
+    def request_schema(done: action(?SchemaKey, ?Exception) -> None, key: SchemaKey) -> bool:
+        """Request the schema of key
+
+        Calls done with key when the schema is compiled, or with the error.
+        Returns True when the caller is to download the modules of key, or
+        False when the schema is compiled or another caller is already fetching it.
+        """
+        if key in store:
+            done(key, None)
+            return False
+        if key in errors:
+            done(None, errors[key])
+            return False
+        if key in waiting:
+            waiting[key].append(done)
+            return False
+        waiting[key] = [done]
+        return True
+
+    def add_schema(key: SchemaKey, yang_src: list[str], transforms: list[SchemaTreeTransform]=[]) -> None:
+        """Compile the fetched schema and add it to the registry
+        """
+        _SchemaCompiler(fc).compile(_on_compiled, key, yang_src, transforms)
+
+    def fetch_failed(key: SchemaKey, error: Exception) -> None:
+        """Report that the download of the modules of key failed
+        """
+        for done in waiting.pop_def(key, []):
+            done(None, SchemaFetchError("Failed to download YANG modules: {error}"))
+
+    def _on_compiled(key: SchemaKey, schema: ?yschema.DRoot, error: ?Exception) -> None:
+        if schema is not None:
+            store[key] = schema
+        elif error is not None:
+            errors[key] = error
+        for done in waiting.pop_def(key, []):
+            if key in errors:
+                done(None, errors[key])
+            else:
+                done(key, None)
+
+    def get_schema(key: ?SchemaKey) -> ?yschema.DRoot:
+        if key is not None:
+            return store.get(key)
 
 
 def _default_device_log_level(device_logs: ?swlogs.DeviceLogs) -> int:
@@ -852,8 +914,8 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
     var modset: dict[str, ModCap] = {}
     var modset_id: ?str = None
 
-    # Content hash of the fetched schema YANG modules
-    var schema_hash = None
+    # Key of the fetched schema in the SchemaRegistry
+    var schema_key: ?SchemaKey = None
 
     # The device's current running configuration, as we know it.
     var running_conf: ?ygdata.Node = None
@@ -971,8 +1033,8 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
         _log.debug("Modset updated", {"new_modset": new_modset})
         on_reconf(name)
 
-    def on_connect(new_modset: dict[str, ModCap], new_schema_hash: ?u64):
-        _log.debug("Device connected", {"new_modset": new_modset, "new_schema_hash": new_schema_hash})
+    def on_connect(new_modset: dict[str, ModCap], new_schema_key: ?SchemaKey):
+        _log.debug("Device connected", {"new_modset": new_modset, "schema_modules": len(new_schema_key.modules) if new_schema_key is not None else None})
         resync()
         if modset_eq(modset, new_modset):
             _log.debug("Supported modules unchanged")
@@ -980,7 +1042,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
             _log.debug("New supported modules, triggering RFS reconf", {"name": name})
             modset = new_modset
             modset_id = hash_modset(modset)
-            schema_hash = new_schema_hash
+            schema_key = new_schema_key
             on_reconf(name)
             return
 
@@ -1377,7 +1439,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
         return bundled_schema
 
     def get_fetched_schema():
-        return schema_registry.get_schema(schema_hash)
+        return schema_registry.get_schema(schema_key)
 
     def rpc(cb: action(?ygdata.Node, ?Exception) -> None, gdata_rpc: ygdata.Node):
         adapter.rpc(cb, gdata_rpc)

@@ -18,6 +18,7 @@ import netconf.yp as nyp
 import yp
 from yp.engine import YangPushBackend
 import device as swdev
+import device_schema as swds
 import ietf_yang_library as yl
 import monitoring
 import schema_filter
@@ -609,7 +610,12 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
     var state: int = DISCONNECTED
 
     var modset: dict[str, ModCap] = {}
-    var schema_hash = None
+    # Key of the fetched schema in the schema registry
+    var schema_key: ?swds.SchemaKey = None
+    # The schema download of this driver, which waiting devices depend on
+    var _fetch: ?(key: swds.SchemaKey, session: int) = None
+    # Counts sessions, so callbacks from an earlier session are ignored
+    var _session = 0
 
     var streams: dict[ygdata.SubscriptionSpec, DeviceStream] = {}
     var subscribers: dict[str, Subscription] = {}
@@ -669,19 +675,30 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             return c is not cur
         return True
 
+    def _abandon_fetch():
+        """Release the schema download of a session that has ended, so that
+        the devices that wait for it can download the modules themselves."""
+        f = _fetch
+        if f is not None:
+            _fetch = None
+            schema_registry.fetch_failed(f.key, NotConnectedError())
+
     def _on_connect(c: netconf.Client, err):
         if _is_stale(c):
             _log.debug("Device._on_connect: ignoring callback from stale client")
             return
 
+        _abandon_fetch()
+        _session += 1
+        session = _session
         schemas = []
         failed_modules: list[str] = []
         sw = time.Stopwatch()
         schema_modset: dict[str, ModCap] = {}
 
-        def finish_connect(new_modset: dict[str, ModCap], new_schema_hash: ?u64=None):
+        def finish_connect(new_modset: dict[str, ModCap], new_schema_key: ?swds.SchemaKey=None):
             modset = new_modset
-            schema_hash = new_schema_hash
+            schema_key = new_schema_key
             # Pick the monitoring method from the device's modules. A fresh
             # client session invalidates any prior device-side subscriptions, so
             # drop the stale id maps and (re-)establish for this connection.
@@ -697,7 +714,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 for spec in list(streams.keys()):
                     if streams[spec].active:
                         _yp_ensure(spec)
-            dev.on_connect(modset, schema_hash)
+            dev.on_connect(modset, schema_key)
 
         def list_schemas(c1: netconf.Client, schema_list: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
             if _is_stale(c1, error):
@@ -729,21 +746,12 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             for s in schema_list:
                 if s.format != "yang":
                     continue
-                # Skip known broken models
-                if s.identifier.startswith("junos-rpc"):
-                    _log.debug("Device._on_connect: skipping broken schema", {"identifier": s.identifier, "reason": "undefined grouping common-forwarding"})
-                    continue
-                elif s.identifier == "junos-configuration-metadata":
-                    _log.debug("Device._on_connect: skipping broken schema", {"identifier": s.identifier, "reason": "listed but not served by get-schema on cRPD"})
-                    continue
-                elif s.identifier == "tailf-rollback" or s.identifier.startswith("cisco-xe-openconfig"):
-                    _log.debug("Device._on_connect: skipping broken schema", {"identifier": s.identifier, "reason": "Cisco IOS XE"})
+                broken = schema_filter.known_broken_module(s.identifier)
+                if broken is not None:
+                    _log.debug("Device._on_connect: skipping broken schema", {"identifier": s.identifier, "reason": broken})
                     continue
                 elif not schema_filter.should_include_module(s.identifier, RUNTIME_SCHEMA_MODULE_SETS):
                     _log.debug("Device._on_connect: skipping schema by module set", {"identifier": s.identifier, "module_sets": ",".join(RUNTIME_SCHEMA_MODULE_SETS)})
-                    continue
-                elif s.identifier == "openconfig-isis-types" and s.version == "2017-01-13":
-                    _log.debug("Device._on_connect: skipping broken schema", {"identifier": s.identifier, "version": s.version, "reason": "incorrect escape in double-quoted string"})
                     continue
                 schemas_to_download.append((identifier=s.identifier, version=s.version, format=s.format))
 
@@ -751,8 +759,13 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 _log.warning("Device._on_connect: no schemas available for download")
                 finish_connect(schema_modset)
                 return
-            _log.debug("Device._on_connect: found schemas to download", {"count": len(schemas_to_download)})
-            netconf.SchemaGetter(c1).download(schema_download, lambda sg: download_complete(), schemas_to_download)
+            key = swds.schema_key([(name=s.identifier, revision=s.version) for s in schemas_to_download], bundled_schema.transforms)
+            if schema_registry.request_schema(schema_ready, key):
+                _log.debug("Device._on_connect: found schemas to download", {"count": len(schemas_to_download)})
+                _fetch = (key=key, session=session)
+                netconf.SchemaGetter(c1).download(schema_download, lambda sg: download_complete(), schemas_to_download)
+            else:
+                _log.debug("Device._on_connect: schema of these modules is known, not downloading", {"count": len(schemas_to_download)})
 
         def schema_download(sg, index: int, total: int, schema_id: (identifier: str, version: ?str, format: ?str), schema_data, error):
             if _is_stale(c):
@@ -769,25 +782,34 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 schemas.append(schema_data)
 
         def download_complete():
-            if _is_stale(c):
-                _log.debug("Device._on_connect.download_complete: ignoring callback from stale client")
+            f = _fetch
+            if f is not None and f.session == session:
+                _fetch = None
+                if len(failed_modules) > 0:
+                    # Without all of its modules, the schema is not compiled
+                    modules = ", ".join(failed_modules)
+                    _log.error("Device._on_connect: failed to download schemas", {"modules": modules})
+                    schema_registry.fetch_failed(f.key, ValueError("no schema for {modules}"))
+                else:
+                    _log.debug("Device._on_connect: finished downloading schemas", {"count": len(schemas), "duration": sw.elapsed().to_float()})
+                    schema_registry.add_schema(f.key, schemas, bundled_schema.transforms)
+            else:
+                _log.debug("Device._on_connect.download_complete: ignoring abandoned download")
+
+        def schema_ready(new_schema_key: ?swds.SchemaKey, error: ?Exception):
+            if _is_stale(c) or session != _session:
+                _log.debug("Device._on_connect.schema_ready: ignoring callback from earlier session")
                 return
-            if len(failed_modules) > 0:
-                # Without all of its modules, the schema is not compiled
-                _log.error("Device._on_connect: failed to download schemas", {"modules": ", ".join(failed_modules)})
+            if isinstance(error, swdev.SchemaFetchError):
+                _log.error("Device._on_connect: failed to download device schema", {"error": str(error)})
                 modset = {}
                 after now 1: c.restart()
+            elif error is not None:
+                _log.error("Device._on_connect: failed to build device schema", {"error": str(error)})
+                finish_connect(schema_modset)
             else:
-                _log.debug("Device._on_connect: finished downloading schemas", {"duration": sw.elapsed().to_float()})
-                sw.reset()
-                result = schema_registry.add_schema(schemas, bundled_schema.transforms)
-                if result.error is not None:
-                    _log.error("Device._on_connect: failed to build device schema", {"error": str(result.error)})
-                    finish_connect(schema_modset)
-                else:
-                    schema_hash = result.hash
-                    _log.debug("Device._on_connect: compiled schemas", {"duration": sw.elapsed().to_float()})
-                    finish_connect(schema_modset, schema_hash)
+                _log.debug("Device._on_connect: device schema ready", {"duration": sw.elapsed().to_float()})
+                finish_connect(schema_modset, new_schema_key)
 
         if err is not None:
             if state == CONNECTING:
@@ -795,7 +817,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             else:
                 _log.debug("Device._on_connect: connection failed", {"error": str(err)})
             modset = {}
-            schema_hash = None
+            schema_key = None
             if client is not None:
                 after now 1: client.restart()
             return
@@ -902,6 +924,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             caps = _mock_capabilities_from_dmc(new_dmc)
             ms = NetconfMockServer(pipes.server, _con_log_handler, caps, bundled_schema)
             mock_server = ms
+            _abandon_fetch()
             client = netconf.Client(connect_cap,
                                     "dummy-address",
                                     0,
@@ -939,6 +962,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                                on_notif=_on_notif,
                                log_handler=_con_log_handler,
                                ssh_transport=transport)
+            _abandon_fetch()
             client = c
 
     def get_mock_server() -> ?NetconfMockServer:
@@ -949,6 +973,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         """Close the connection to the device
         """
         _log.debug("Device.close")
+        _abandon_fetch()
         c = client
         if c is not None:
             client = None
@@ -1069,11 +1094,11 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 if data_tag is not None:
                     current = None
                     if dmc.feature_flags.runtime_schema_fetch:
-                        fetched_schema = schema_registry.get_schema(schema_hash)
+                        fetched_schema = schema_registry.get_schema(schema_key)
                         if fetched_schema is not None:
                             current = yxml.from_xml(fetched_schema, data_tag, loose=True)
                         else:
-                            _log.error("Device.get_txid_generic: no schemas compiled", {"schema_hash": schema_hash})
+                            _log.error("Device.get_txid_generic: no schemas compiled")
                     else:
                         current = yxml.from_xml(bundled_schema.src_dnode, data_tag, loose=True)
                     if current is not None:
@@ -1496,11 +1521,11 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     # We want to extract the junos:commit-seconds and attach as txid on the root node in running_conf
                     new_conf = None
                     if dmc.feature_flags.runtime_schema_fetch:
-                        fetched_schema = schema_registry.get_schema(schema_hash)
+                        fetched_schema = schema_registry.get_schema(schema_key)
                         if fetched_schema is not None:
                             new_conf = yxml.from_xml(fetched_schema, r.children[0], loose=True)
                         else:
-                            _log.error("Device.on_get_config: no schemas compiled", {"schema_hash": schema_hash})
+                            _log.error("Device.on_get_config: no schemas compiled")
                     else:
                         new_conf = yxml.from_xml(bundled_schema.src_dnode, r.children[0], loose=True)
                     if new_conf is not None:
@@ -1544,7 +1569,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         # The schema to parse/patch operational data against: the runtime-fetched one
         # when enabled, else the bundled oper schema.
         if dmc.feature_flags.runtime_schema_fetch:
-            return schema_registry.get_schema(schema_hash)
+            return schema_registry.get_schema(schema_key)
         return bundled_schema.oper_src_dnode
 
     def _parse_data_node(data_tag: xml.Node) -> ?ygdata.Node:
