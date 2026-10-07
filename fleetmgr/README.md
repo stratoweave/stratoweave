@@ -52,9 +52,9 @@ The top starts ten `flotilla` subprocesses and waits for every NETCONF listener
 before starting its own runtime. The demo declares `flotilla-1` through
 `flotilla-10` and assigns ten complete mock IOS XE entries to each, `cpe-001`
 to `cpe-100`. `cpe-101` and `cpe-102` have no shard, so the top manages them
-itself. Every device takes 120 to 150 s to upgrade, ten of them,
+itself. Every device takes 120 to 150 s to upgrade, fourteen of them,
 picked at random when the file was generated so the grids show no pattern,
-fail in one of the mock's five ways, two per kind, and `cpe-003` already
+fail in one of the mock's seven ways, two per kind, and `cpe-003` already
 runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
 campaign over the 99 devices `upgrade.xml` does not use, bound to a
 `nightly` schedule with a one-hour window at midnight UTC, so the web UI
@@ -77,7 +77,7 @@ seconds or a range, the window length in seconds, and which schedules open
 soon rather than at their local midnight. `just demo-big` is `just
 demo-fleet 1000 250 500 10 120-150 14400 europe`: a thousand devices with
 `demo.xml`'s knobs, 120 to 150 s installs and a tenth failing one of the
-five ways, picked by a fixed shuffle so the grids show no pattern, in
+seven ways, picked by a fixed shuffle so the grids show no pattern, in
 four-hour windows at a quarter of the fleet per hour, where only europe
 opens right away and americas and asia wait for their midnight, as a real
 fleet's windows would. The files land in `out/`; a thousand devices come up
@@ -95,13 +95,17 @@ operations as measured on a lab c8000v (the numbers are in
 `docs/reference/software-upgrade.md`), and absent or 0 completes each
 operation at once. `failure`
 names one IOS XE failure to reproduce: `download-failed`, `add-failed`,
-`activate-refused`, `commit-failed` or `reverts`. `running-release` is the
-release the device runs before any upgrade. In the demo ten devices each
-reproduce one of the five failures: `cpe-034` fails its commit, so the
-campaign aborts it and it ends `rolled-back`, while `cpe-007` fails its
-download and ends `failed`. `cpe-003` already runs the target and ends
-`up-to-date`. The leaves are read when the device is
-created; change them by deleting and re-creating the device.
+`activate-refused`, `commit-failed` or `reverts`, or one that fails a BGP
+check: `bgp-down` keeps the session idle from the start, so the pre-check
+refuses, and `bgp-lost` keeps it idle on the new release, so the post-check
+fails and the activation is aborted. `running-release` is the release the
+device runs before any upgrade. In the demo fourteen devices each reproduce
+one of the seven failures: `cpe-034` fails its commit, so the campaign
+aborts it and it ends `rolled-back`, while `cpe-007` fails its download and
+ends `failed`. `cpe-039` refuses on its pre-check and `cpe-016` rolls back
+on its post-check. `cpe-003` already runs the target and ends `up-to-date`.
+The leaves are read when the device is created; change them by deleting and
+re-creating the device.
 
 Inspect the top CFS and the bottom RFS independently:
 
@@ -216,13 +220,15 @@ advertised-prefix counts as the baseline. While every neighbor is down it
 keeps waiting and refuses after 45 s; the device is then left on the old
 release. The post-check passes once the device is back at the baseline and
 refuses after 10 minutes, which aborts the activation. A fleet device's
-`upgrade-checks/precheck-wait` and `postcheck-wait` change those waits.
+`upgrade-checks/precheck-wait` and `postcheck-wait` change those waits; the
+demo's `bgp-lost` devices wait a minute.
 
 Nothing is read from the device between checks and nothing is published
 but the verdicts, under `/device{cpe}/software/state/precheck` and
 `postcheck`. The top carries both up to the campaign's `device-status`, next
-to the device's status. The mock IOS XE device serves no BGP state, so in the
-demo every device passes with "no BGP neighbors".
+to the device's status. The mock IOS XE device serves one established BGP
+neighbor, so in the demo both checks pass with its numbers, except on the
+`bgp-down` and `bgp-lost` devices.
 
 ## Tests
 
@@ -232,6 +238,7 @@ The focused tests cover node creation, per-device sharding, precise campaign
 links, campaign aggregation, the check verdicts reaching the campaign, the
 parent RFS-to-flotilla render, direct `/device` configuration at the RFS-only
 bottom, the mock leaves reaching the flotilla, reading the BGP neighbors, and a
-complete mock IOS XE software upgrade gated by the device-health checks. The
-root tests also cover IOS XE adapter behavior and ensure that a software-intent
-change preserves the existing NETCONF adapter and session.
+complete mock IOS XE software upgrade gated by the device-health checks, which
+the mock's BGP failures refuse or roll back. The root tests also cover IOS XE
+adapter behavior and ensure that a software-intent change preserves the
+existing NETCONF adapter and session.

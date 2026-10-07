@@ -94,7 +94,7 @@ is back at the pre-check's baseline before the commit goes out.
 `just load-big` generates what `just demo-big` would start with and loads it
 into the top `just run` started: a thousand mocks, `cpe-0001` onwards, over
 the same ten flotillas, with 120 to 150 s upgrades and a tenth of them
-failing one of the five ways, picked by a fixed shuffle so the grids show no
+failing one of the seven ways, picked by a fixed shuffle so the grids show no
 pattern, plus the three regional schedules and the planned campaign
 `fleet-upgrade`. Europe's window opens half a minute after the load;
 americas and asia keep their local midnight. `BIG` changes the count. `just
