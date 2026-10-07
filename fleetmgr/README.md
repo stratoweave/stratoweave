@@ -188,12 +188,12 @@ device entry that the inventory transform writes.
 
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription to the device's
-`/device/software/state` on the flotilla, and publishes the status and running
-release as the entry's own `software/state`. A change on one device publishes
-one entry. Removing the entry closes the subscription and clears the state.
-For a device without a shard, the top's own device manager publishes
-`/device/software/state`. Campaign transforms subscribe to both and aggregate
-their own members.
+`/device/software/state` on the flotilla, and publishes the status, running
+release and check verdicts as the entry's own `software/state`. A change on one
+device publishes one entry. Removing the entry closes the subscription and
+clears the state. For a device without a shard, the top's own device manager
+publishes `/device/software/state`. Campaign transforms subscribe to both and
+aggregate their own members.
 
 `flotilla` supplies one modeled layer, the standard RFS plus the
 `flotilla-rfs` augment below. StratoWeave adds the implicit device layer
@@ -219,18 +219,18 @@ refuses after 10 minutes, which aborts the activation.
 
 Nothing is read from the device between checks and nothing is published
 but the verdicts, under `/device{cpe}/software/state/precheck` and
-`postcheck`. The top does not carry either up to the campaign yet. The mock
-IOS XE device serves no BGP state, so in the demo every device passes with
-"no BGP neighbors".
+`postcheck`. The top carries both up to the campaign's `device-status`, next
+to the device's status. The mock IOS XE device serves no BGP state, so in the
+demo every device passes with "no BGP neighbors".
 
 ## Tests
 
     just test
 
 The focused tests cover node creation, per-device sharding, precise campaign
-links, campaign aggregation, the parent RFS-to-flotilla render, direct
-`/device` configuration at the RFS-only bottom, the mock leaves reaching the
-flotilla, reading the BGP neighbors, and a complete mock IOS XE software
-upgrade gated by the device-health checks. The root tests also cover IOS XE
-adapter behavior and ensure that a software-intent change preserves the
-existing NETCONF adapter and session.
+links, campaign aggregation, the check verdicts reaching the campaign, the
+parent RFS-to-flotilla render, direct `/device` configuration at the RFS-only
+bottom, the mock leaves reaching the flotilla, reading the BGP neighbors, and a
+complete mock IOS XE software upgrade gated by the device-health checks. The
+root tests also cover IOS XE adapter behavior and ensure that a software-intent
+change preserves the existing NETCONF adapter and session.

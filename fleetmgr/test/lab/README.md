@@ -58,10 +58,10 @@ In another terminal, from `../..`:
 Then:
 
     just add-devices                            # onboard ce1-ce3 into flotilla-1 as c8000v-ce1 and so on
-    just verdicts                               # software status and check verdicts per CE
 
-The verdict detail carries what the check saw, "1/1 sessions established,
-3 routes advertised"; the device is only read while a check runs.
+A campaign shows each CE's pre-check and post-check verdicts in `just state`.
+The detail carries what the check saw, "1/1 sessions established, 3 routes
+advertised"; the device is only read while a check runs.
 `just break-link ce1` takes ce1's WAN down and the session drops within
 15 s, so a campaign started now is refused by the pre-check, with the
 neighbor in the detail; `just heal-link ce1` brings it back.
@@ -73,8 +73,7 @@ Create and run a campaign with the URL `just image-url` prints, or headless:
     just upgrade                                # campaign "lab" -> 17.18.03a on all CEs
     just CES=ce3 upgrade                        # one device
     just RELEASE=17.16.01a CES=ce3 upgrade      # a downgrade is the same run with a lower release
-    just state                                  # campaign state from the top
-    just verdicts                               # verdicts from the flotilla
+    just state                                  # campaign state from the top, with the check verdicts
     just upgrade-clear                          # delete the campaign
 
 Knobs like `CES`, `RELEASE` and `CAMPAIGN` go before the recipe, as above,
