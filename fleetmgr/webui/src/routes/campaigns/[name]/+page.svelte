@@ -4,10 +4,9 @@
 
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
+  import DeviceStatusTable from '$lib/software/DeviceStatusTable.svelte';
   import PlanningFields from '$lib/software/PlanningFields.svelte';
   import PlanTimeline from '$lib/software/PlanTimeline.svelte';
-  import StatusPill from '$lib/software/StatusPill.svelte';
-  import VerdictPill from '$lib/software/VerdictPill.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCampaign } from '$lib/software/counters';
@@ -28,7 +27,6 @@
     DATA_ROOT,
     KNOWN_STATUSES,
     adminStatePatch,
-    failureReason,
     maskUrlCredentials,
     unplacedText,
     type Campaign,
@@ -443,31 +441,10 @@
   {#if failedRows.length > 0}
     <section class="card">
       <h3 class="panel-title">Failed ({failedRows.length})</h3>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Device</th>
-              <th>Status</th>
-              <th>Running release</th>
-              <th>Reason</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each failedRows.slice(0, FAILED_LIMIT) as row (row.device)}
-              <tr>
-                <td><span class="device-name">{row.device}</span></td>
-                <td><StatusPill status={row.status} raw={row.raw} /></td>
-                <td class="mono">{row.runningRelease || '—'}</td>
-                <td class="reason">{failureReason(row) || '—'}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-        {#if failedRows.length > FAILED_LIMIT}
-          <p class="rate">showing {FAILED_LIMIT} of {failedRows.length}</p>
-        {/if}
-      </div>
+      <DeviceStatusTable rows={failedRows.slice(0, FAILED_LIMIT)} />
+      {#if failedRows.length > FAILED_LIMIT}
+        <p class="rate">showing {FAILED_LIMIT} of {failedRows.length}</p>
+      {/if}
     </section>
   {/if}
 
@@ -514,30 +491,7 @@
             oninput={() => (page = 1)}
           />
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Device</th>
-                <th>Status</th>
-                <th>Pre-check</th>
-                <th>Post-check</th>
-                <th>Running release</th>
-              </tr>
-            </thead>
-            <tbody>
-              {#each visibleRows as row (row.device)}
-                <tr>
-                  <td><span class="device-name">{row.device}</span></td>
-                  <td><StatusPill status={row.status} raw={row.raw} /></td>
-                  <td><VerdictPill check={row.precheck} /></td>
-                  <td><VerdictPill check={row.postcheck} /></td>
-                  <td class="mono">{row.runningRelease || '—'}</td>
-                </tr>
-              {/each}
-            </tbody>
-          </table>
-        </div>
+        <DeviceStatusTable rows={visibleRows} />
         {#if pageCount > 1}
           <div class="pager">
             <button
@@ -767,47 +721,6 @@
   .mono {
     font-family: var(--sw-font-mono, ui-monospace, monospace);
     word-break: break-all;
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  th {
-    text-align: left;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--sw-text-muted);
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--sw-border-default);
-    white-space: nowrap;
-  }
-
-  td {
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--sw-border-default);
-    vertical-align: middle;
-    white-space: nowrap;
-  }
-
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
-
-  .device-name {
-    font-weight: 600;
-  }
-
-  .reason {
-    color: var(--sw-text-secondary);
-    white-space: normal;
   }
 
   .pager {

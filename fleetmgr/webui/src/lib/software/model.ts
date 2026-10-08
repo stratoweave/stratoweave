@@ -54,6 +54,7 @@ export interface DeviceStatusJson {
   device: string;
   status?: string;
   'running-release'?: string;
+  stage?: string;
   precheck?: CheckResultJson;
   postcheck?: CheckResultJson;
 }
@@ -199,6 +200,21 @@ export interface Device {
 
 export type Verdict = 'not-run' | 'pass' | 'fail';
 
+/** The steps of an upgrade run in order, as software/state/stage names
+ * them. A rollback is not one of them: it follows a failed post-check or
+ * commit. */
+export const STEPS = ['prepare', 'precheck', 'install', 'postcheck', 'commit'] as const;
+export type Step = (typeof STEPS)[number];
+export type Stage = Step | 'rollback';
+
+export const STEP_LABEL: Record<Step, string> = {
+  prepare: 'prepare',
+  precheck: 'pre-check',
+  install: 'install',
+  postcheck: 'post-check',
+  commit: 'commit'
+};
+
 export interface CheckResult {
   verdict: Verdict;
   detail: string;
@@ -211,6 +227,8 @@ export interface DeviceStatusRow {
   status: KnownStatus;
   raw: string;
   runningRelease: string;
+  /** The step the run is in or ended in; null before any run. */
+  stage: Stage | null;
   precheck: CheckResult;
   postcheck: CheckResult;
 }
@@ -350,12 +368,10 @@ function parseCheck(json: CheckResultJson | undefined): CheckResult {
   return { verdict, detail: json?.detail ?? '', at: Number.isFinite(at) ? at / 1000 : null };
 }
 
-/** Why a device failed or rolled back, when a check refused it; empty
- * otherwise. */
-export function failureReason(row: DeviceStatusRow): string {
-  if (row.precheck.verdict === 'fail') return `pre-check: ${row.precheck.detail}`;
-  if (row.postcheck.verdict === 'fail') return `post-check: ${row.postcheck.detail}`;
-  return '';
+function parseStage(raw: string | undefined): Stage | null {
+  return raw === 'rollback' || (STEPS as readonly (string | undefined)[]).includes(raw)
+    ? (raw as Stage)
+    : null;
 }
 
 /** RFC 7951 encodes uint64 as a string; this backend sends numbers. */
@@ -419,6 +435,7 @@ function parseCampaign(entry: CampaignJson): Campaign {
         status: normalizeStatus(raw),
         raw,
         runningRelease: row?.['running-release'] ?? '',
+        stage: parseStage(row?.stage),
         precheck: parseCheck(row?.precheck),
         postcheck: parseCheck(row?.postcheck)
       };

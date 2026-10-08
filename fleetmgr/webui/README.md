@@ -53,7 +53,8 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   install time / 3600, rounded up, at least one); with a plan, the campaign
   page shows them that way too, from the plan's install estimates.
 - Progress is config-false `state` under each campaign, merged into GET
-  responses; each `device-status` row also carries `running-release`.
+  responses; each `device-status` row also carries `running-release`,
+  `stage` and the `precheck` and `postcheck` verdicts.
   `state/plan` is the planner's layout: the windows it places devices into
   (`start`/`end` as seconds since the Unix epoch, one `device` entry per
   member with `estimated-start` and `estimated-duration`), plus an `alarm`
@@ -110,13 +111,16 @@ and its alarms are visible before anything is actuated. In run the
 controller releases devices a few at a time as their window opens and
 completions come in; the estimated starts follow that release schedule, and
 the campaign page draws them on a timeline, one cell per device, that takes
-the live status as the run passes them. The UI adds no semantics the model
-does not carry — anything done here can be done identically over NETCONF or
-plain RESTCONF. Two rules go beyond the model, in the wizard and on the
-campaign page: a newly set deadline must lie ahead, and the pace comes from
-a deadline or a target rate, not both. Rate and ETA are measured since page
-open, and nothing is latched: status tracks live device state and regresses
-when a campaign goes back to plan.
+the live status as the run passes them. Below it, each device's run is a
+chain of its steps, prepare, pre-check, install, post-check and commit: the
+step running now pulses, a failed step is red with a cross, and a rollback
+shows as ↺ after it. The UI adds no semantics the model does not carry —
+anything done here can be done identically over NETCONF or plain RESTCONF.
+Two rules go beyond the model, in the wizard and on the campaign page: a
+newly set deadline must lie ahead, and the pace comes from a deadline or a
+target rate, not both. Rate and ETA are measured since page open, and
+nothing is latched: status tracks live device state and regresses when a
+campaign goes back to plan.
 
 Sharding is internal: device creation places entries on the least-loaded
 flotilla node silently, and nothing in the UI shows the placement.

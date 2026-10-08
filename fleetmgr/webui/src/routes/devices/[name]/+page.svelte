@@ -2,12 +2,13 @@
   import { onMount, untrack } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import StageChain from '$lib/software/StageChain.svelte';
   import StatusPill from '$lib/software/StatusPill.svelte';
-  import VerdictPill from '$lib/software/VerdictPill.svelte';
   import { createPoller } from '$lib/core/polling/poller';
   import { setDeviceSchedule } from '$lib/maintenance/binding';
   import { scheduleRulesText } from '$lib/maintenance/schedule-form';
   import type { Campaign, Device, Schedule } from '$lib/software/model';
+  import { stageDetail } from '$lib/software/stages';
   import { formatClock } from '$lib/software/time';
 
   let {
@@ -161,8 +162,7 @@
               <th>admin-state</th>
               <th>Planned start</th>
               <th>Status</th>
-              <th>Pre-check</th>
-              <th>Post-check</th>
+              <th><StageChain /></th>
               <th>Running release</th>
             </tr>
           </thead>
@@ -190,14 +190,11 @@
                 </td>
                 <td>
                   {#if row}
-                    <VerdictPill check={row.precheck} />
-                  {:else}
-                    —
-                  {/if}
-                </td>
-                <td>
-                  {#if row}
-                    <VerdictPill check={row.postcheck} />
+                    {@const detail = stageDetail(row)}
+                    <StageChain {row} />
+                    {#if detail}
+                      <div class="detail">{detail}</div>
+                    {/if}
                   {:else}
                     —
                   {/if}
@@ -252,13 +249,23 @@
     color: var(--sw-text-muted);
     padding: 9px 10px;
     border-bottom: 1px solid var(--sw-border-subtle);
-    white-space: nowrap;
+    white-space: normal;
   }
 
   td {
     padding: 11px 10px;
     border-bottom: 1px solid var(--sw-border-subtle);
     vertical-align: middle;
+    white-space: nowrap;
+  }
+
+  /* Under the chain: the table has no room for a column of its own. */
+  .detail {
+    max-width: 300px;
+    margin-top: 4px;
+    font-size: 12px;
+    color: var(--sw-text-secondary);
+    white-space: normal;
   }
 
   tbody tr:last-child td {
