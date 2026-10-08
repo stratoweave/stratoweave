@@ -21,7 +21,9 @@ from device_meta_config import \
 
 from device_oper import \
     stratoweave_rfs__device_entry as DeviceOper, \
-    stratoweave_rfs__device__software__state as SoftwareState
+    stratoweave_rfs__device__software__state as SoftwareState, \
+    stratoweave_rfs__device__software__state__precheck as PrecheckResult, \
+    stratoweave_rfs__device__software__state__postcheck as PostcheckResult
 
 from device_schema import DeviceSchema, SchemaKey, SchemaTreeTransform
 
@@ -168,11 +170,25 @@ ST_SUCCEEDED = "succeeded"
 ST_FAILED = "failed"
 ST_ROLLED_BACK = "rolled-back"
 
+# check-result/verdict
+VERDICT_NOT_RUN = "not-run"
+VERDICT_PASS = "pass"
+VERDICT_FAIL = "fail"
+
+# Pre-checks must answer within this. They judge what the device runs now, so
+# there is nothing to wait for but the registrants.
+PRECHECK_TIMEOUT = 60.0
 # Post-checks must answer within this. The commit also has to land before the
 # platform's own abort timer fires, so the deadline is cut to what the adapter
 # says is left, minus room for the commit itself.
 POSTCHECK_TIMEOUT = 900.0
 COMMIT_MARGIN = 120.0
+
+
+def _now() -> str:
+    """The current UTC time as a yang:date-and-time."""
+    d = time.utcnow()
+    return f"{d.year:04d}-{d.month:02d}-{d.day:02d}T{d.hour:02d}:{d.minute:02d}:{d.second:02d}Z"
 
 
 actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr):
@@ -182,9 +198,9 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     readable, so tight coupling is fine: status changes are pushed straight
     to devmgr.on_software_state.
 
-    Implemented so far: check, prepare, install, post-checks, commit or
-    rollback, then a check to read the release back, and a resync. Pre-checks,
-    cleanup and early staging are still stubs.
+    Implemented so far: check, prepare, pre-checks, install, post-checks,
+    commit or rollback, then a check to read the release back, and a resync.
+    Cleanup and early staging are still stubs.
 
     Declarative like the rest of StratoWeave: the manager is told a target
     release and reconciles toward it, rather than being handed a command to
@@ -201,8 +217,9 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
       an install; they never abort one in flight.
     * Staging is never a precondition; install re-runs the prepare steps.
       `allow_staging` only decides whether that work may happen early.
-    * Every pre-check must pass for install to proceed. A failing pre-check
-      leaves the device untouched, which is the whole point of the gate.
+    * Every pre-check must pass for install to proceed. A failing pre-check,
+      or one that does not answer within PRECHECK_TIMEOUT, ends the run failed
+      with nothing activated, which is the whole point of the gate.
     * Any failing post-check triggers a rollback. So does a post-check that
       does not answer within POSTCHECK_TIMEOUT.
     * **Cleanup is the point of no return**: it removes the superseded image,
@@ -236,20 +253,28 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     # because the comparison happens before there is any work to report.
     var busy: bool = False
 
+    var prechecks: dict[str, action(action(bool, str) -> None) -> None] = {}
     var postchecks: dict[str, action(action(bool, str) -> None) -> None] = {}
-    # Registrants that have not answered yet in the current run.
+    # The round of checks under way, "precheck" or "postcheck", or "" between
+    # rounds.
+    var checking: str = ""
+    # Registrants that have not answered yet in the current round.
     var pending: dict[str, bool] = {}
-    var in_postchecks: bool = False
-    # Bumped at every decision, so a late post-check reply or timer from an
-    # earlier step is ignored.
+    var passed: dict[str, str] = {}
+    # Bumped at every decision, so a late check reply or timer from an earlier
+    # step is ignored.
     var attempt: int = 0
     # What the device ran before install; rollback returns to it.
     var previous_release: ?str = None
+    var precheck_timeout: float = PRECHECK_TIMEOUT
     var postcheck_timeout: float = POSTCHECK_TIMEOUT
 
     # The device/software/state oper tree this manager owns. Every change is
     # pushed to the DeviceMgr, which fuses it into the device entry's oper.
-    var state: SoftwareState = SoftwareState(status=ST_UNKNOWN)
+    var state: SoftwareState = SoftwareState(
+        status=ST_UNKNOWN,
+        precheck=PrecheckResult(VERDICT_NOT_RUN, None, None),
+        postcheck=PostcheckResult(VERDICT_NOT_RUN, None, None))
 
     #### configuration ######################################################
 
@@ -286,12 +311,16 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             swmgr.add_precheck("rfs-l3vpn", precheck)
 
         Additive: every registrant keeps its own entry and all of them must
-        proceed for the install to start.
+        proceed for the install to start. One that does not answer within
+        PRECHECK_TIMEOUT counts as refusing. A check added during a run counts
+        from the next run.
         """
-        pass
+        prechecks[registrant] = cb
 
     def remove_precheck(registrant: str) -> None:
-        pass
+        if registrant in prechecks:
+            del prechecks[registrant]
+        _drop_pending("precheck", registrant)
 
     def add_postcheck(registrant: str, cb: action(action(bool, str) -> None) -> None) -> None:
         """Register a check evaluated after install, same shape as a pre-check.
@@ -303,10 +332,18 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     def remove_postcheck(registrant: str) -> None:
         if registrant in postchecks:
             del postchecks[registrant]
-        if in_postchecks and registrant in pending:
+        _drop_pending("postcheck", registrant)
+
+    def _drop_pending(kind: str, registrant: str) -> None:
+        """A registrant removed during its round no longer holds it up."""
+        if checking == kind and registrant in pending:
             del pending[registrant]
             if len(pending) == 0:
-                _commit()
+                _checks_passed()
+
+    def set_precheck_timeout(secs: float) -> None:
+        """Test hook."""
+        precheck_timeout = secs
 
     def set_postcheck_timeout(secs: float) -> None:
         """Test hook."""
@@ -371,6 +408,9 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             busy = False
             return
         previous_release = running
+        # A new run: the verdicts below are from the last one.
+        state.precheck = PrecheckResult(VERDICT_NOT_RUN, None, None)
+        state.postcheck = PostcheckResult(VERDICT_NOT_RUN, None, None)
         _record(running, ST_IN_PROGRESS)
         adapter.prepare(_on_prepare_done, t!)
 
@@ -380,12 +420,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             busy = False
             _set_status(ST_FAILED)
             return
-        t = target_release
-        if t is None:
-            busy = False
-            _set_status(ST_FAILED)
-            return
-        adapter.install(_on_install_done, t!)
+        _run_checks("precheck", prechecks, precheck_timeout)
 
     def _on_install_done(err: ?Exception) -> None:
         if err is not None:
@@ -404,51 +439,101 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
                 return
             if left < limit:
                 limit = left
-        _run_postchecks(limit)
+        _run_checks("postcheck", postchecks, limit)
 
-    def _run_postchecks(limit: float) -> None:
-        names = list(postchecks.keys())
-        if len(names) == 0:
-            _commit()
-            return
+    #### checks #############################################################
+
+    def _run_checks(kind: str, reg: dict[str, action(action(bool, str) -> None) -> None],
+                    limit: float) -> None:
+        """Run every registered check of one kind concurrently. The round ends
+        with the first refusal, the deadline, or the last pass; none
+        registered passes at once."""
+        names = list(reg.keys())
         attempt += 1
         gen = attempt
-        in_postchecks = True
+        checking = kind
         pending = {}
+        passed = {}
         for n in names:
             pending[n] = True
+        if len(names) == 0:
+            _checks_passed()
+            return
         for n in names:
-            postchecks[n](_postcheck_done(gen, n))
+            reg[n](_check_done(gen, n))
         # Counted from now, when the checks were asked, however late this
         # message runs.
-        after now limit: _on_postcheck_timeout(gen)
+        after now limit: _on_check_timeout(gen)
 
-    def _postcheck_done(gen: int, registrant: str) -> action(bool, str) -> None:
+    def _check_done(gen: int, registrant: str) -> action(bool, str) -> None:
         def done(ok: bool, reason: str) -> None:
-            _on_postcheck_result(gen, registrant, ok, reason)
+            _on_check_result(gen, registrant, ok, reason)
         return done
 
-    def _on_postcheck_result(gen: int, registrant: str, ok: bool, reason: str) -> None:
+    def _on_check_result(gen: int, registrant: str, ok: bool, reason: str) -> None:
         if gen != attempt or registrant not in pending:
-            _log.debug("software: late post-check reply ignored",
+            _log.debug("software: late check reply ignored",
                        {"device": name, "check": registrant})
             return
         del pending[registrant]
         if not ok:
-            _start_rollback("post-check {registrant} failed: {reason}")
+            _checks_failed("{registrant}: {reason}")
             return
+        passed[registrant] = reason
         if len(pending) == 0:
-            _commit()
+            _checks_passed()
 
-    def _on_postcheck_timeout(gen: int) -> None:
+    def _on_check_timeout(gen: int) -> None:
         if gen != attempt:
             return
-        _start_rollback("post-checks did not answer: {list(pending.keys())}")
+        silent = ", ".join(sorted(pending.keys()))
+        _checks_failed("did not answer: {silent}")
 
-    def _commit() -> None:
-        in_postchecks = False
+    def _record_check(kind: str, verdict: str, detail: str) -> None:
+        if kind == "precheck":
+            state.precheck = PrecheckResult(verdict, detail, _now())
+        else:
+            state.postcheck = PostcheckResult(verdict, detail, _now())
+        devmgr.on_software_state(state.copy())
+
+    def _checks_passed() -> None:
+        kind = checking
+        checking = ""
         attempt += 1
-        adapter.commit(_on_commit_done)
+        if len(passed) > 0:
+            # What each check saw, so the verdict tells the story on its own.
+            parts: list[str] = []
+            for r in sorted(passed.keys()):
+                reason = passed[r]
+                parts.append("{r}: {reason}" if reason != "" else r)
+            _record_check(kind, VERDICT_PASS, "; ".join(parts))
+        else:
+            _record_check(kind, VERDICT_PASS, "no {kind}s registered")
+        if kind == "precheck":
+            t = target_release
+            if t is None:
+                busy = False
+                _set_status(ST_FAILED)
+                return
+            adapter.install(_on_install_done, t!)
+        else:
+            adapter.commit(_on_commit_done)
+
+    def _checks_failed(detail: str) -> None:
+        kind = checking
+        checking = ""
+        attempt += 1
+        _record_check(kind, VERDICT_FAIL, detail)
+        if kind == "precheck":
+            # Nothing has been activated, so there is nothing to roll back.
+            _log.error("software: pre-check refused, not installing",
+                       {"device": name, "detail": detail})
+            busy = False
+            _set_status(ST_FAILED)
+        else:
+            _start_rollback("post-check failed: {detail}")
+
+    #### commit and rollback ################################################
 
     def _on_commit_done(err: ?Exception) -> None:
         if err is not None:
@@ -461,7 +546,6 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     def _start_rollback(why: str) -> None:
         _log.error("software: rolling back", {"device": name, "reason": why})
-        in_postchecks = False
         attempt += 1
         adapter.rollback(_on_rollback_done, previous_release)
 

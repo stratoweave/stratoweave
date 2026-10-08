@@ -43,6 +43,26 @@ def _pub_running(oper: ?ygdata.Node) -> ?str:
     return None
 
 
+def _pub_verdict(oper: ?ygdata.Node, which: str) -> ?str:
+    """The precheck or postcheck verdict out of a published oper tree."""
+    if oper is not None:
+        st = swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).software.state
+        if which == "precheck":
+            return st.precheck.verdict
+        return st.postcheck.verdict
+    return None
+
+
+def _pub_detail(oper: ?ygdata.Node, which: str) -> ?str:
+    """The precheck or postcheck detail out of a published oper tree."""
+    if oper is not None:
+        st = swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).software.state
+        if which == "precheck":
+            return st.precheck.detail
+        return st.postcheck.detail
+    return None
+
+
 actor _test_target_release_installs(t: testing.EnvT):
     """Intent naming a target release is the only thing that starts an install."""
     def noop_on_reconf(name: str) -> None:
@@ -320,6 +340,142 @@ actor _test_install_runs_once(t: testing.EnvT):
     after 0.05: verify()
 
 
+actor _test_prechecks_gate_the_install(t: testing.EnvT):
+    """Install waits for every pre-check to pass, and both verdicts are
+    published."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var answered = 0
+
+    def quick(done: action(bool, str) -> None) -> None:
+        answered += 1
+        done(True, "")
+
+    def slow(done: action(bool, str) -> None) -> None:
+        def reply() -> None:
+            testing.assertTrue("install" not in adapter.calls(),
+                               "install must wait for all pre-checks")
+            answered += 1
+            done(True, "")
+        after 0.05: reply()
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if _pub_status(oper) == "succeeded":
+            testing.assertEqual(2, answered, "both pre-checks must have run")
+            testing.assertEqual(adapter.calls(),
+                                ["check", "prepare", "install", "commit", "check"],
+                                "install must follow the passed pre-checks")
+            testing.assertEqual("pass", _pub_verdict(oper, "precheck"),
+                                "pre-check verdict not published")
+            testing.assertEqual("a; b", _pub_detail(oper, "precheck"),
+                                "pre-check detail not published")
+            testing.assertEqual("pass", _pub_verdict(oper, "postcheck"),
+                                "post-check verdict not published")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.add_precheck("a", quick)
+    mgr.add_precheck("b", slow)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_refused_precheck_leaves_the_device_alone(t: testing.EnvT):
+    """A refusing pre-check ends the run failed before anything is installed."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+
+    def yes(done: action(bool, str) -> None) -> None:
+        done(True, "")
+
+    def no(done: action(bool, str) -> None) -> None:
+        done(False, "peer down")
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        status = _pub_status(oper)
+        if status == "succeeded":
+            t.failure(ValueError("a refused pre-check must not install"))
+        elif status == "failed":
+            testing.assertEqual(adapter.calls(), ["check", "prepare"],
+                                "install must not run after a refusal")
+            testing.assertEqual(OLD, adapter.running(),
+                                "device must still be on the old release")
+            testing.assertEqual("fail", _pub_verdict(oper, "precheck"),
+                                "pre-check verdict not published")
+            testing.assertEqual("b: peer down", _pub_detail(oper, "precheck"),
+                                "detail must name the objector")
+            testing.assertEqual("not-run", _pub_verdict(oper, "postcheck"),
+                                "post-checks must not have run")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.add_precheck("a", yes)
+    mgr.add_precheck("b", no)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_silent_precheck_fails_the_run(t: testing.EnvT):
+    """A pre-check that never answers counts as refusing once the deadline
+    passes."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+
+    def silent(done: action(bool, str) -> None) -> None:
+        pass
+
+    def verify() -> None:
+        st = mgr.get_status()
+        if st == "in-progress":
+            after 0.05: verify()
+            return
+        testing.assertEqual("failed", st, "deadline must fail the run")
+        testing.assertTrue("install" not in adapter.calls(), "no install without an answer")
+        t.success()
+
+    mgr.set_precheck_timeout(0.05)
+    mgr.add_precheck("a", silent)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+    after 0.05: verify()
+
+
+actor _test_removed_precheck_is_not_consulted(t: testing.EnvT):
+    """A removed pre-check no longer holds up the install."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+
+    def silent(done: action(bool, str) -> None) -> None:
+        pass
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if _pub_status(oper) == "succeeded":
+            testing.assertTrue("install" in adapter.calls(), "install must have run")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.add_precheck("a", silent)
+    mgr.remove_precheck("a")
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
 actor _test_postchecks_gate_the_commit(t: testing.EnvT):
     """Commit waits for every post-check to pass."""
     def noop_on_reconf(name: str) -> None:
@@ -383,6 +539,10 @@ actor _test_failed_postcheck_rolls_back(t: testing.EnvT):
                                 "device should be back on the old release")
             testing.assertEqual(OLD, _pub_running(oper),
                                 "running-release should show the old release")
+            testing.assertEqual("fail", _pub_verdict(oper, "postcheck"),
+                                "post-check verdict not published")
+            testing.assertEqual("a: peer down", _pub_detail(oper, "postcheck"),
+                                "detail must name the objector")
             t.success()
 
     dev.set_update_oper(on_state)
