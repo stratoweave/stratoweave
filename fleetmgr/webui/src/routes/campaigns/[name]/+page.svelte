@@ -4,13 +4,23 @@
 
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
+  import PlanningFields from '$lib/software/PlanningFields.svelte';
   import PlanTimeline from '$lib/software/PlanTimeline.svelte';
   import StatusPill from '$lib/software/StatusPill.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCampaign } from '$lib/software/counters';
+  import {
+    planningChanges,
+    planningDraft,
+    planningFromDraft,
+    planInstallSeconds,
+    planningOf,
+    saveCampaignPlanning,
+    validatePlanningDraft,
+    type PlanningDraft
+  } from '$lib/software/planning-form';
   import { RateTracker, formatEta } from '$lib/software/rate';
-  import { formatClock, formatDuration, formatLocalTime } from '$lib/software/time';
   import { nameMatches } from '$lib/software/selection';
   import {
     CAMPAIGN_LIST_ROOT,
@@ -18,6 +28,7 @@
     KNOWN_STATUSES,
     adminStatePatch,
     maskUrlCredentials,
+    unplacedText,
     type Campaign,
     type Schedule,
     type KnownStatus
@@ -39,6 +50,7 @@
   let confirmAction = $state<'run' | 'plan' | 'delete' | null>(null);
 
   let devicesOpen = $state(false);
+  let unplacedOpen = $state(false);
   let filterStatus = $state<KnownStatus | ''>('');
   let searchText = $state('');
   let page = $state(1);
@@ -99,27 +111,49 @@
     new Map<string, KnownStatus>((campaign?.deviceStatus ?? []).map((r) => [r.device, r.status]))
   );
 
-  let scheduleText = $derived.by(() => {
-    const c = campaign;
-    if (!c || !c.defaultSchedule) return 'none — one open window from launch';
-    const schedule = data.schedules.find((s) => s.name === c.defaultSchedule);
-    if (!schedule) return `${c.defaultSchedule} (no such schedule)`;
-    const windows = schedule.windows
-      .map(
-        (w) =>
-          `${w.days.length > 0 ? w.days.join(',') + ' ' : 'daily '}${formatLocalTime(w.at, schedule.utcOffset)} for ${formatDuration(w.duration)}`
-      )
-      .join(' · ');
-    return `${schedule.name}: ${windows || 'no windows'}`;
+  // Schedule and pace: the fields follow the campaign until edited.
+  let planningEdit = $state<PlanningDraft | null>(null);
+  let planningSaving = $state(false);
+  let planningMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
+  let savedPlanning = $derived(campaign ? planningOf(campaign) : null);
+  let savedDraft = $derived(savedPlanning ? planningDraft(savedPlanning) : null);
+  let planningForm = $derived(planningEdit ?? savedDraft);
+  let planningErrors = $derived(
+    planningForm && savedDraft ? validatePlanningDraft(planningForm, Date.now() / 1000, savedDraft) : {}
+  );
+  // Compared with what is stored, not with the form as loaded: a campaign
+  // with both a deadline and a target rate opens paced by the deadline and
+  // can be saved as is, which sets its target rate to 0.
+  let planningDirty = $derived.by(() => {
+    if (!planningForm || !savedPlanning || Object.keys(planningErrors).length > 0) return false;
+    const { set, remove } = planningChanges(savedPlanning, planningFromDraft(planningForm));
+    return Object.keys(set).length > 0 || remove.length > 0;
   });
+  let alsoTargetRate = $derived(
+    planningForm?.paceBy === 'deadline' && savedPlanning?.deadline != null && savedPlanning.targetRate !== 0
+      ? savedPlanning.targetRate
+      : null
+  );
 
-  let paceText = $derived.by(() => {
-    const c = campaign;
-    if (!c) return '';
-    const target = c.targetRate === 0 ? 'no preference' : `${c.targetRate}/h`;
-    const cap = c.maxRate === 0 ? 'no cap' : `${c.maxRate}/h`;
-    return `target ${target} · max ${cap}`;
-  });
+  async function savePlanning(): Promise<void> {
+    if (!planningForm || !savedPlanning) return;
+    try {
+      planningSaving = true;
+      planningMessage = null;
+      await saveCampaignPlanning(data.name, savedPlanning, planningFromDraft(planningForm));
+      live = null;
+      await invalidate('data:campaign');
+      planningEdit = null;
+      planningMessage = { type: 'success', text: 'Saved.' };
+    } catch (saveError) {
+      planningMessage = {
+        type: 'error',
+        text: saveError instanceof Error ? saveError.message : 'Failed to save.'
+      };
+    } finally {
+      planningSaving = false;
+    }
+  }
 
   let failedRows = $derived(
     (campaign?.deviceStatus ?? []).filter(
@@ -214,7 +248,8 @@
       statusMessage = null;
       if (action === 'delete') {
         await restconfDelete(getListEntryPath(CAMPAIGN_LIST_ROOT, data.name));
-        await goto('/campaigns');
+        // Not a preload made before the delete.
+        await goto('/campaigns', { invalidateAll: true });
         return;
       }
       await restconfPatchJson(DATA_ROOT, adminStatePatch(data.name, action));
@@ -297,35 +332,83 @@
         <span class="fact-label">Image URL</span>
         <span class="mono">{campaign.imageUrl ? maskUrlCredentials(campaign.imageUrl) : '—'}</span>
       </div>
-      <div class="fact">
-        <span class="fact-label">Default schedule</span>
-        <span class="mono">{scheduleText}</span>
-      </div>
-      <div class="fact">
-        <span class="fact-label">Deadline</span>
-        <span class="mono">
-          {campaign.deadline === null ? '—' : formatClock(campaign.deadline)}
-        </span>
-      </div>
-      <div class="fact">
-        <span class="fact-label">Pace</span>
-        <span class="mono">{paceText}</span>
-      </div>
     </div>
   </section>
 
-  {#if campaign.plan !== null && (campaign.plan.windows.length > 0 || campaign.plan.alarms.length > 0)}
+  {#if planningForm}
+    <section class="card">
+      <h3 class="panel-title">Schedule and pace</h3>
+      <PlanningFields
+        schedules={data.schedules}
+        draft={planningForm}
+        errors={planningErrors}
+        disabled={planningSaving}
+        installSeconds={planInstallSeconds(campaign.plan)}
+        onchange={(next) => {
+          planningEdit = next;
+          planningMessage = null;
+        }}
+      />
+      <div class="planning-actions">
+        {#if planningMessage}
+          <span class={planningMessage.type === 'error' ? 'save-error' : 'save-ok'}>{planningMessage.text}</span>
+        {:else if alsoTargetRate !== null}
+          <span class="save-ok">Target rate {alsoTargetRate}/h also applies; saving sets it to 0.</span>
+        {/if}
+        <button
+          class="btn btn-secondary"
+          type="button"
+          disabled={planningSaving || planningEdit === null}
+          onclick={() => {
+            planningEdit = null;
+            planningMessage = null;
+          }}
+        >
+          Reset
+        </button>
+        <button
+          class="btn btn-primary"
+          type="button"
+          disabled={planningSaving || !planningDirty}
+          onclick={savePlanning}
+        >
+          {planningSaving ? 'Saving…' : 'Save'}
+        </button>
+      </div>
+    </section>
+  {/if}
+
+  {#if campaign.plan !== null && (campaign.plan.windows.length > 0 || campaign.plan.alarms.length > 0 || campaign.plan.unplaced.length > 0)}
     {@const plan = campaign.plan}
     <section class="card">
       <div class="grids-head">
         <h3 class="panel-title">Plan</h3>
         <span class="hint">estimates in your local time</span>
       </div>
-      {#if plan.alarms.length > 0}
+      {#if plan.alarms.length > 0 || plan.unplaced.length > 0}
         <ul class="alarms">
           {#each plan.alarms as alarm, i (i)}
             <li>{alarm}</li>
           {/each}
+          {#if plan.unplaced.length > 0}
+            <li class="unplaced-item">
+              <button
+                class="fold unplaced-fold"
+                type="button"
+                aria-expanded={unplacedOpen}
+                onclick={() => (unplacedOpen = !unplacedOpen)}
+              >
+                {unplacedOpen ? '▾' : '▸'} {unplacedText(plan.unplaced.length)}
+              </button>
+              {#if unplacedOpen}
+                <ul class="unplaced">
+                  {#each plan.unplaced as name (name)}
+                    <li><a class="mono" href={`/devices/${encodeURIComponent(name)}`}>{name}</a></li>
+                  {/each}
+                </ul>
+              {/if}
+            </li>
+          {/if}
         </ul>
       {/if}
       {#if plan.windows.length > 0}
@@ -335,12 +418,6 @@
           {now}
           ondevice={(name) => goto(`/devices/${encodeURIComponent(name)}`)}
         />
-      {/if}
-      {#if plan.unplaced.length > 0}
-        <p class="rate">
-          not placed ({plan.unplaced.length}): {plan.unplaced.slice(0, 20).join(', ')}
-          {plan.unplaced.length > 20 ? '…' : ''}
-        </p>
       {/if}
     </section>
   {/if}
@@ -537,6 +614,27 @@
     color: var(--sw-text-muted);
   }
 
+  .fact .pill {
+    justify-self: start;
+  }
+
+  .planning-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+
+  .save-ok {
+    font-size: 12px;
+    color: var(--sw-text-secondary);
+  }
+
+  .save-error {
+    font-size: 12px;
+    color: var(--sw-danger);
+  }
+
   .rate {
     margin: 10px 0 0;
     font-size: 12px;
@@ -578,6 +676,45 @@
     background: var(--sw-warning-dim);
     color: var(--sw-warning);
     font-size: 13px;
+  }
+
+  /* The fold arrow stands in for the bullet. */
+  .unplaced-item {
+    list-style: none;
+  }
+
+  .unplaced-fold {
+    margin-left: -15px;
+    color: inherit;
+    font-size: inherit;
+    font-weight: inherit;
+    text-align: left;
+  }
+
+  .unplaced-fold:hover {
+    text-decoration: underline;
+  }
+
+  .unplaced {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    max-height: 240px;
+    overflow-y: auto;
+    margin: 8px 0 2px;
+    padding: 0;
+    list-style: none;
+  }
+
+  .unplaced a {
+    color: var(--sw-text-secondary);
+    font-size: 12px;
+    text-decoration: none;
+  }
+
+  .unplaced a:hover {
+    color: var(--sw-accent-bright);
+    text-decoration: underline;
   }
 
   .filter-row {

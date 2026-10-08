@@ -4,6 +4,7 @@
 
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import Section from '$lib/core/ui/Section.svelte';
+  import PlanningFields from '$lib/software/PlanningFields.svelte';
   import SelectionBuilder from '$lib/software/SelectionBuilder.svelte';
   import { campaignOwners } from '$lib/software/selection';
   import { restconfPatchJson } from '$lib/core/restconf/client';
@@ -13,11 +14,15 @@
     DEFAULT_TARGET_RATE,
     campaignCreatePatch,
     type Campaign,
-    type Device
-  ,
+    type Device,
     type Schedule
   } from '$lib/software/model';
-  import { formatDuration, formatLocalTime } from '$lib/software/time';
+  import {
+    emptyPlanningDraft,
+    planningFromDraft,
+    validatePlanningDraft,
+    type PlanningDraft
+  } from '$lib/software/planning-form';
 
   let {
     data
@@ -36,21 +41,7 @@
   let imageUrl = $state('');
   let allowStaging = $state(false);
   let members = $state<string[]>([]);
-  let defaultSchedule = $state('');
-  let deadline = $state('');
-  let targetRate = $state('');
-  let maxRate = $state('');
-  let nextWindowId = 0;
-
-  function scheduleRules(s: Schedule): string {
-    if (s.windows.length === 0) return 'no windows';
-    return s.windows
-      .map(
-        (w) =>
-          `${w.days.length > 0 ? w.days.join(',') + ' ' : 'daily '}${formatLocalTime(w.at, s.utcOffset)} for ${formatDuration(w.duration)}`
-      )
-      .join(' · ');
-  }
+  let planning = $state<PlanningDraft>(emptyPlanningDraft());
 
   let touched = $state(false);
   let validationKey = $state(0);
@@ -72,24 +63,7 @@
     if (members.length === 0) {
       e['device'] = 'Select at least one device.';
     }
-    const starts = new Set<number>();
-    if (deadline.trim()) {
-      const d = Date.parse(deadline);
-      if (Number.isNaN(d)) {
-        e['deadline'] = 'A date and time.';
-      } else if (d <= Date.now()) {
-        e['deadline'] = 'The deadline is in the past.';
-      }
-    }
-    for (const [key, text] of [
-      ['target-rate', targetRate],
-      ['max-rate', maxRate]
-    ] as const) {
-      if (text.trim() && !/^\d+$/.test(text.trim())) {
-        e[key] = 'A whole number of devices per hour.';
-      }
-    }
-    return e;
+    return { ...e, ...validatePlanningDraft(planning, Date.now() / 1000) };
   });
   let visibleErrors = $derived(touched ? errors : ({} as Record<string, string>));
 
@@ -103,6 +77,7 @@
       creating = true;
       statusMessage = '';
       const campaign = name.trim();
+      const p = planningFromDraft(planning);
       await restconfPatchJson(
         DATA_ROOT,
         campaignCreatePatch({
@@ -111,13 +86,13 @@
           imageUrl,
           devices: members,
           allowStaging,
-          defaultSchedule: defaultSchedule || undefined,
-          deadline: deadline.trim() ? Math.floor(Date.parse(deadline) / 1000) : null,
-          targetRate: targetRate.trim() ? Number(targetRate) : null,
-          maxRate: maxRate.trim() ? Number(maxRate) : null
+          defaultSchedule: p.defaultSchedule || undefined,
+          deadline: p.deadline,
+          targetRate: p.targetRate === DEFAULT_TARGET_RATE ? null : p.targetRate,
+          maxRate: p.maxRate === DEFAULT_MAX_RATE ? null : p.maxRate
         })
       );
-      await goto(`/campaigns/${encodeURIComponent(campaign)}`);
+      await goto(`/campaigns/${encodeURIComponent(campaign)}`, { invalidateAll: true });
     } catch (createError) {
       statusMessage =
         createError instanceof Error ? createError.message : 'Failed to create the campaign.';
@@ -199,53 +174,15 @@
     description="The shared maintenance schedule for members without a binding of their own, and the pace. Bound devices always follow their own schedule."
     yangPath="software:software/upgrade-campaign/default-schedule"
   >
-    <label class="field">
-      <span class="field-label">Default schedule</span>
-      <select class="input" bind:value={defaultSchedule} onchange={() => (touched = true)}>
-        <option value="">none — one always-open window</option>
-        {#each data.schedules as s (s.name)}
-          <option value={s.name}>{s.name} — {scheduleRules(s)}</option>
-        {/each}
-      </select>
-    </label>
-    <div class="grid-3">
-      <label class="field">
-        <span class="field-label">Deadline</span>
-        <input
-          class="input mono"
-          type="datetime-local"
-          bind:value={deadline}
-          onchange={() => (touched = true)}
-        />
-        {#if visibleErrors['deadline']}
-          <span class="field-error">{visibleErrors['deadline']}</span>
-        {/if}
-      </label>
-      <FieldText
-        label="Target rate"
-        value={targetRate}
-        error={visibleErrors['target-rate']}
-        {validationKey}
-        yangType="uint32"
-        mono={true}
-        placeholder={`${DEFAULT_TARGET_RATE}`}
-        help="Devices per hour. The planner goes faster only when the deadline needs it; 0 = no preference."
-        onchange={(v) => (targetRate = v)}
-        ontouch={() => (touched = true)}
-      />
-      <FieldText
-        label="Max rate"
-        value={maxRate}
-        error={visibleErrors['max-rate']}
-        {validationKey}
-        yangType="uint32"
-        mono={true}
-        placeholder={`${DEFAULT_MAX_RATE}`}
-        help="Hard cap in devices per hour. A deadline that needs more raises an alarm; 0 = no cap."
-        onchange={(v) => (maxRate = v)}
-        ontouch={() => (touched = true)}
-      />
-    </div>
+    <PlanningFields
+      schedules={data.schedules}
+      draft={planning}
+      errors={visibleErrors}
+      onchange={(next) => {
+        planning = next;
+        touched = true;
+      }}
+    />
     <p class="note">
       Devices that do not fit the windows are not actuated and show as plan alarms.
       Windows are defined on the shared <a href="/schedules">schedules</a>.
@@ -291,14 +228,6 @@
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     gap: 12px;
   }
-
-  .grid-3 {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 12px;
-  }
-
-
 
   .note {
     margin: 0;

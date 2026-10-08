@@ -97,6 +97,8 @@ export interface DraftValidation {
 // The model's range for utc-offset: UTC-12:00 to UTC+14:00.
 const OFFSET_MIN = -720;
 const OFFSET_MAX = 840;
+// duration is a uint32.
+const DURATION_MAX = 4294967295;
 
 export function validateScheduleDraft(
   draft: ScheduleDraft,
@@ -105,13 +107,16 @@ export function validateScheduleDraft(
 ): DraftValidation {
   const errors: Record<string, string> = {};
   const warnings: string[] = [];
+  // An existing name is the key: it cannot change, so it is not checked.
   const name = draft.name.trim();
-  if (!name) {
-    errors['name'] = 'A name is required.';
-  } else if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
-    errors['name'] = 'Letters, digits, dots, dashes and underscores; it becomes part of a URL.';
-  } else if (isNew && existingNames.includes(name)) {
-    errors['name'] = `${name} already exists.`;
+  if (isNew) {
+    if (!name) {
+      errors['name'] = 'A name is required.';
+    } else if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+      errors['name'] = 'Letters, digits, dots, dashes and underscores; it becomes part of a URL.';
+    } else if (existingNames.includes(name)) {
+      errors['name'] = `${name} already exists.`;
+    }
   }
   const offset = parseUtcOffset(draft.utcOffset);
   if (offset === null) {
@@ -134,8 +139,8 @@ export function validateScheduleDraft(
       errors[`window.${w.id}.duration`] = 'A duration like 30m, 2h30m or 1d.';
     } else if (duration <= 0) {
       errors[`window.${w.id}.duration`] = 'Longer than zero.';
-    } else if (duration > 7 * 86400) {
-      errors[`window.${w.id}.duration`] = 'At most a week.';
+    } else if (duration > DURATION_MAX) {
+      errors[`window.${w.id}.duration`] = `At most ${DURATION_MAX} seconds.`;
     }
   }
   if (draft.windows.length === 0) {
@@ -158,6 +163,15 @@ export function draftToSchedule(draft: ScheduleDraft): Schedule {
   }
   windows.sort((a, b) => a.at - b.at);
   return { name: draft.name.trim(), utcOffset: parseUtcOffset(draft.utcOffset) ?? 0, windows };
+}
+
+/** The draft row a rule of draftToSchedule(draft) came from: the first
+ * row that parses with that opening time, the one draftToSchedule keeps. */
+export function rowOfRule(draft: ScheduleDraft, rule: MaintenanceWindow): WindowDraft | undefined {
+  return draft.windows.find((w) => {
+    const duration = parseDuration(w.duration);
+    return parseTimeOfDay(w.at) === rule.at && duration !== null && duration > 0;
+  });
 }
 
 /** The wire entry. The offset is always sent: a PUT replaces the entry,

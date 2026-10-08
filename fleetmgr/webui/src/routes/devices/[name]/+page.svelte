@@ -116,7 +116,7 @@
     <h3 class="panel-title">Maintenance schedule</h3>
     <div class="binding">
       <select
-        class="binding-select"
+        class="select binding-select"
         aria-label="Maintenance schedule"
         value={choice}
         disabled={savingSchedule}
@@ -279,14 +279,7 @@
   }
 
   .binding-select {
-    min-width: 260px;
-    max-width: 100%;
-    padding: 8px 10px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 13px;
+    width: min(100%, 420px);
   }
 
   .save-ok {

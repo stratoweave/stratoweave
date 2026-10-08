@@ -378,6 +378,105 @@
   </div>
 {/if}
 
+{#if draft}
+  <section class="card editor-card">
+    <Section
+      title="Add device"
+      description="An address makes it a real endpoint; mock entries need none."
+      yangPath="fleetmgr:fleet/device"
+    >
+      <div class="grid-2">
+        <FieldText
+          label="Name"
+          required={true}
+          value={draft.name}
+          error={errors['name']}
+          {validationKey}
+          yangType="string"
+          placeholder="e.g., ce1"
+          onchange={(value) => patch({ name: value })}
+          ontouch={() => (touched = true)}
+        />
+        <FieldText
+          label="Type"
+          required={true}
+          value={draft.type}
+          error={errors['type']}
+          {validationKey}
+          yangType="string"
+          mono={true}
+          placeholder="iosxe"
+          onchange={(value) => patch({ type: value })}
+          ontouch={() => (touched = true)}
+        />
+        <FieldText
+          label="Management address"
+          value={draft.address}
+          error={errors['address']}
+          {validationKey}
+          yangType="inet:host"
+          mono={true}
+          placeholder="hostname or IP"
+          onchange={(value) => patch({ address: value })}
+          ontouch={() => (touched = true)}
+        />
+        <FieldText
+          label="NETCONF port"
+          value={draft.port}
+          error={errors['port']}
+          {validationKey}
+          yangType="uint16"
+          mono={true}
+          placeholder="830"
+          onchange={(value) => patch({ port: value })}
+          ontouch={() => (touched = true)}
+        />
+      </div>
+      <div class="editor-actions">
+        <button class="btn btn-secondary" type="button" onclick={closeEditor} disabled={saving}>
+          Cancel
+        </button>
+        <button class="btn btn-primary" type="button" onclick={handleAdd} disabled={saving}>
+          {saving ? 'Adding…' : 'Add device'}
+        </button>
+      </div>
+    </Section>
+  </section>
+{/if}
+
+{#if importOpen}
+  <section class="card editor-card">
+    <Section
+      title="Import devices"
+      description="One device per line: name[,address[,port]]. Lines starting with # are ignored; existing names are skipped."
+      yangPath="fleetmgr:fleet/device"
+    >
+      <FieldText
+        label="Type for all imported devices"
+        value={importType}
+        yangType="string"
+        mono={true}
+        placeholder="iosxe"
+        onchange={(value) => (importType = value)}
+      />
+      <textarea
+        class="import-text mono"
+        rows="10"
+        placeholder="ce1,192.0.2.11&#10;ce2,192.0.2.12,830&#10;mock-001"
+        bind:value={importText}
+      ></textarea>
+      <div class="editor-actions">
+        <button class="btn btn-secondary" type="button" onclick={closeEditor} disabled={saving}>
+          Cancel
+        </button>
+        <button class="btn btn-primary" type="button" onclick={handleImport} disabled={saving}>
+          {saving ? 'Importing…' : 'Import'}
+        </button>
+      </div>
+    </Section>
+  </section>
+{/if}
+
 <section class="card">
   {#if data.devices.length === 0}
     <div class="empty-state">No devices yet. Add or import some, or seed the fleet from a lab deploy.</div>
@@ -390,13 +489,13 @@
         bind:value={filterText}
         oninput={() => (page = 1)}
       />
-      <select class="filter-select" bind:value={filterType} onchange={() => (page = 1)}>
+      <select class="select compact" bind:value={filterType} onchange={() => (page = 1)}>
         <option value="">all types</option>
         {#each types as t (t)}
           <option value={t}>{t}</option>
         {/each}
       </select>
-      <select class="filter-select" bind:value={filterSchedule} onchange={() => (page = 1)}>
+      <select class="select compact" bind:value={filterSchedule} onchange={() => (page = 1)}>
         <option value="">all schedules</option>
         <option value="none">no schedule</option>
         {#each scheduleNames as name (name)}
@@ -504,7 +603,7 @@
         <label class="dim" for="bind-choice">Schedule</label>
         <select
           id="bind-choice"
-          class="filter-select"
+          class="select compact"
           bind:value={bindChoice}
           disabled={applying}
           onchange={() => (bindError = '')}
@@ -543,105 +642,6 @@
     {/if}
   {/if}
 </section>
-
-{#if draft}
-  <section class="card editor-card">
-    <Section
-      title="Add device"
-      description="An address makes it a real endpoint; mock entries need none."
-      yangPath="fleetmgr:fleet/device"
-    >
-      <div class="grid-2">
-        <FieldText
-          label="Name"
-          required={true}
-          value={draft.name}
-          error={errors['name']}
-          {validationKey}
-          yangType="string"
-          placeholder="e.g., ce1"
-          onchange={(value) => patch({ name: value })}
-          ontouch={() => (touched = true)}
-        />
-        <FieldText
-          label="Type"
-          required={true}
-          value={draft.type}
-          error={errors['type']}
-          {validationKey}
-          yangType="string"
-          mono={true}
-          placeholder="iosxe"
-          onchange={(value) => patch({ type: value })}
-          ontouch={() => (touched = true)}
-        />
-        <FieldText
-          label="Management address"
-          value={draft.address}
-          error={errors['address']}
-          {validationKey}
-          yangType="inet:host"
-          mono={true}
-          placeholder="hostname or IP"
-          onchange={(value) => patch({ address: value })}
-          ontouch={() => (touched = true)}
-        />
-        <FieldText
-          label="NETCONF port"
-          value={draft.port}
-          error={errors['port']}
-          {validationKey}
-          yangType="uint16"
-          mono={true}
-          placeholder="830"
-          onchange={(value) => patch({ port: value })}
-          ontouch={() => (touched = true)}
-        />
-      </div>
-      <div class="editor-actions">
-        <button class="btn btn-secondary" type="button" onclick={closeEditor} disabled={saving}>
-          Cancel
-        </button>
-        <button class="btn btn-primary" type="button" onclick={handleAdd} disabled={saving}>
-          {saving ? 'Adding…' : 'Add device'}
-        </button>
-      </div>
-    </Section>
-  </section>
-{/if}
-
-{#if importOpen}
-  <section class="card editor-card">
-    <Section
-      title="Import devices"
-      description="One device per line: name[,address[,port]]. Lines starting with # are ignored; existing names are skipped."
-      yangPath="fleetmgr:fleet/device"
-    >
-      <FieldText
-        label="Type for all imported devices"
-        value={importType}
-        yangType="string"
-        mono={true}
-        placeholder="iosxe"
-        onchange={(value) => (importType = value)}
-      />
-      <textarea
-        class="import-text mono"
-        rows="10"
-        placeholder="ce1,192.0.2.11&#10;ce2,192.0.2.12,830&#10;mock-001"
-        bind:value={importText}
-      ></textarea>
-      <div class="editor-actions">
-        <button class="btn btn-secondary" type="button" onclick={closeEditor} disabled={saving}>
-          Cancel
-        </button>
-        <button class="btn btn-primary" type="button" onclick={handleImport} disabled={saving}>
-          {saving ? 'Importing…' : 'Import'}
-        </button>
-      </div>
-    </Section>
-  </section>
-{/if}
 
 <ConfirmDialog
   open={confirmBind}
@@ -709,13 +709,9 @@
     border-color: var(--sw-accent);
   }
 
-  .filter-select {
-    padding: 7px 10px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 12px;
+  .filter-row .select,
+  #bind-choice {
+    width: 10rem;
   }
 
   .filter-count {

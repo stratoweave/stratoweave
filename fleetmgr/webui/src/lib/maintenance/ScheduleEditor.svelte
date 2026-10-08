@@ -19,9 +19,11 @@
     draftFromSchedule,
     draftToSchedule,
     emptyDraft,
+    formatTimeOfDay,
     newWindowDraft,
     parseTimeOfDay,
     parseUtcOffset,
+    rowOfRule,
     ruleText,
     scheduleCreatePatch,
     scheduleToJson,
@@ -30,7 +32,7 @@
     type ScheduleUsage,
     type WindowDraft
   } from '$lib/maintenance/schedule-form';
-  import { DATA_ROOT, SCHEDULE_LIST_ROOT, type Schedule } from '$lib/software/model';
+  import { DATA_ROOT, SCHEDULE_LIST_ROOT, type MaintenanceWindow, type Schedule } from '$lib/software/model';
   import { clockLabel, dayLabel, sameLocalDay } from '$lib/software/plan-timeline';
   import { formatDuration, parseDuration } from '$lib/software/time';
 
@@ -106,6 +108,29 @@
     };
   }
 
+  // The calendar moves or resizes a rule, or adds one; the rows follow.
+  function changeRuleFromCalendar(from: MaintenanceWindow, to: MaintenanceWindow): void {
+    const row = rowOfRule(draft, from);
+    if (!row) return;
+    patchWindow(row.id, { at: formatTimeOfDay(to.at), duration: formatDuration(to.duration), days: [...to.days] });
+    touched = true;
+  }
+
+  function addRuleFromCalendar(rule: MaintenanceWindow): void {
+    // The opening time is the key: a rule with the same time and length
+    // on other weekdays takes the new day instead.
+    const same = draft.windows.find(
+      (w) => w.days.length > 0 && parseTimeOfDay(w.at) === rule.at && parseDuration(w.duration) === rule.duration
+    );
+    if (same) {
+      patchWindow(same.id, { days: WEEKDAYS.filter((d) => same.days.includes(d) || rule.days.includes(d)) });
+    } else {
+      const row = newWindowDraft({ at: formatTimeOfDay(rule.at), duration: formatDuration(rule.duration), days: [...rule.days] });
+      draft = { ...draft, windows: [...draft.windows, row] };
+    }
+    touched = true;
+  }
+
   function removeRule(id: number): void {
     draft = { ...draft, windows: draft.windows.filter((w) => w.id !== id) };
   }
@@ -118,7 +143,8 @@
       statusMessage = `Not saved: ${[...new Set(Object.values(validation.errors))].join(' ')}`;
       return;
     }
-    const saved = draftToSchedule(draft);
+    // An existing entry keeps its name exactly as stored.
+    const saved = { ...draftToSchedule(draft), ...(schedule ? { name: schedule.name } : {}) };
     try {
       saving = true;
       statusMessage = '';
@@ -132,7 +158,8 @@
           wrapListEntryBody(SCHEDULE_LIST_ROOT, scheduleToJson(saved))
         );
       }
-      await goto('/schedules');
+      // Not a preload made before the write (hovering Cancel makes one).
+      await goto('/schedules', { invalidateAll: true });
     } catch (saveError) {
       statusMessage = saveError instanceof Error ? saveError.message : 'Failed to save the schedule.';
     } finally {
@@ -147,7 +174,7 @@
       deleting = true;
       statusMessage = '';
       await restconfDelete(getListEntryPath(SCHEDULE_LIST_ROOT, schedule.name));
-      await goto('/schedules');
+      await goto('/schedules', { invalidateAll: true });
     } catch (deleteError) {
       statusMessage = deleteError instanceof Error ? deleteError.message : 'Failed to delete the schedule.';
     } finally {
@@ -254,7 +281,7 @@
               <small class="field-error">{errors[`window.${w.id}.at`] ?? ''}</small>
             </label>
             <label class="field">
-              <span class="field-label">For</span>
+              <span class="field-label">Duration</span>
               <input
                 class="input mono"
                 class:has-error={!!errors[`window.${w.id}.duration`]}
@@ -297,9 +324,17 @@
   <section class="card">
     <div class="grids-head">
       <h3 class="panel-title">Next seven days</h3>
-      <span class="hint">as you type · in your local time</span>
+      <span class="hint">drag to move or resize, across a day to add · your local time</span>
     </div>
-    <WeekCalendar schedules={[previewSchedule]} {now} {colors} legend={false} />
+    <WeekCalendar
+      schedules={[previewSchedule]}
+      {now}
+      {colors}
+      legend={false}
+      hourPx={28}
+      onrulechange={changeRuleFromCalendar}
+      onrulecreate={addRuleFromCalendar}
+    />
     <h3 class="panel-title upcoming-title">Windows the planner would use</h3>
     {#if upcoming.length === 0}
       <p class="hint">None within the planner's {HORIZON_DAYS} days.</p>

@@ -98,7 +98,7 @@
         <span class="flabel">Requires approval</span>
         <span class="fop">is</span>
         <select
-          class="fld"
+          class="select"
           value={selection.requiresApproval}
           onchange={(e) => patch({ requiresApproval: e.currentTarget.value as '' | 'yes' | 'no' })}
         >
@@ -112,7 +112,7 @@
         <span class="flabel">Owned by a campaign</span>
         <span class="fop">is</span>
         <select
-          class="fld"
+          class="select"
           value={selection.ownedByCampaign}
           onchange={(e) => patch({ ownedByCampaign: e.currentTarget.value as '' | 'yes' | 'no' })}
         >
@@ -258,6 +258,14 @@
     font-size: 12.5px;
     outline: none;
     width: 100%;
+  }
+
+  .frow .select {
+    width: 100%;
+    padding-top: 7px;
+    padding-bottom: 7px;
+    border-radius: 6px;
+    font-size: 12.5px;
   }
 
   .fld:focus-visible {

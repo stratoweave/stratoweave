@@ -134,3 +134,73 @@ export function calendarOccurrences(schedules: Schedule[], days: DayColumn[]): O
     .filter((o) => o.end > days[0].start && o.start < days[days.length - 1].end)
     .sort((a, b) => a.start - b.start || a.end - b.end);
 }
+
+// Editing on the calendar: a rule moves and resizes in steps of a quarter
+// hour, on the absolute clock (every UTC offset is a whole number of
+// quarter hours, so the grid is the same in any zone).
+
+export const SNAP_S = 900;
+
+export function snapTime(t: number): number {
+  return Math.round(t / SNAP_S) * SNAP_S;
+}
+
+/** Local seconds -> weekday index, monday zero. */
+function weekdayOf(local: number): number {
+  return mod(Math.floor(local / DAY) + 3, 7);
+}
+
+function daysFromIndexes(indexes: Iterable<number>): Weekday[] {
+  const set = new Set(indexes);
+  return WEEKDAYS.filter((_, i) => set.has(i));
+}
+
+/** The rule after its occurrence opening at `occStart` moved by `shift`
+ * seconds and `dayMove` days. Every weekday of a rule shares the opening
+ * time, so a shift past midnight moves them all; the day move applies to
+ * the dragged weekday only, and only onto a weekday the rule does not
+ * have yet. A daily rule stays daily. */
+export function moveRule(
+  rule: MaintenanceWindow,
+  utcOffset: number,
+  occStart: number,
+  shift: number,
+  dayMove: number
+): MaintenanceWindow {
+  const raw = rule.at + shift;
+  const carry = Math.floor(raw / DAY);
+  const at = mod(raw, DAY);
+  if (rule.days.length === 0) return { at, duration: rule.duration, days: [] };
+  const dragged = weekdayOf(occStart + utcOffset * 60);
+  const others = rule.days
+    .map((d) => WEEKDAYS.indexOf(d as Weekday))
+    .filter((i) => i >= 0 && i !== dragged)
+    .map((i) => mod(i + carry, 7));
+  let moved = mod(dragged + carry + dayMove, 7);
+  if (others.includes(moved)) moved = mod(dragged + carry, 7);
+  return { at, duration: rule.duration, days: daysFromIndexes([...others, moved]) };
+}
+
+/** The rule after one edge of its occurrence opening at `occStart` moved
+ * to `to`: the opening edge keeps the closing time, the closing edge keeps
+ * the opening time, and the window stays at least a quarter hour long. */
+export function resizeRule(
+  rule: MaintenanceWindow,
+  utcOffset: number,
+  occStart: number,
+  edge: 'start' | 'end',
+  to: number
+): MaintenanceWindow {
+  const occEnd = occStart + rule.duration;
+  if (edge === 'end') {
+    return { at: rule.at, duration: Math.max(SNAP_S, to - occStart), days: [...rule.days] };
+  }
+  const start = Math.min(to, occEnd - SNAP_S);
+  return { ...moveRule(rule, utcOffset, occStart, start - occStart, 0), duration: occEnd - start };
+}
+
+/** A rule on one weekday for a span dragged out on the calendar. */
+export function ruleForSpan(start: number, end: number, utcOffset: number): MaintenanceWindow {
+  const local = start + utcOffset * 60;
+  return { at: mod(local, DAY), duration: end - start, days: [WEEKDAYS[weekdayOf(local)]] };
+}

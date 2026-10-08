@@ -5,7 +5,7 @@
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
-  import type { Campaign, CampaignCounters } from '$lib/software/model';
+  import { planAlarmLines, type Campaign, type CampaignCounters } from '$lib/software/model';
 
   let {
     data
@@ -143,11 +143,14 @@
                 {:else}
                   <span class="dim">—</span>
                 {/if}
-                {#if campaign.plan !== null && campaign.plan.alarms.length > 0}
-                  <span class="pill warning" title={campaign.plan.alarms.join('\n')}>
-                    <span class="dot"></span>
-                    {campaign.plan.alarms.length} alarm{campaign.plan.alarms.length === 1 ? '' : 's'}
-                  </span>
+                {#if campaign.plan !== null}
+                  {@const alarms = planAlarmLines(campaign.plan)}
+                  {#if alarms.length > 0}
+                    <span class="pill warning" title={alarms.join('\n')}>
+                      <span class="dot"></span>
+                      {alarms.length} alarm{alarms.length === 1 ? '' : 's'}
+                    </span>
+                  {/if}
                 {/if}
               </td>
               <td class="state-col">

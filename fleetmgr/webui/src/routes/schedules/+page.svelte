@@ -43,13 +43,6 @@
 <div class="page-header">
   <div>
     <h2>Maintenance schedules</h2>
-    <p>
-      Shared windows in which impacting work may run. A device binds to one
-      schedule on its inventory entry (set on the <a href="/devices">devices</a>
-      page) and a campaign names one as the default for members without a
-      binding; the planner places a device only into its own schedule's
-      windows.
-    </p>
   </div>
   <a class="btn btn-primary" href="/schedules/new">New schedule</a>
 </div>
@@ -124,10 +117,6 @@
 <style>
   .status {
     margin-bottom: 12px;
-  }
-
-  .page-header p a {
-    color: var(--sw-accent-bright);
   }
 
   .card {
