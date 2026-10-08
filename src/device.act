@@ -992,7 +992,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
 
     # The bundled schema is compiled at build time and bundled with stratoweave
     var bundled_schema: DeviceSchema = DeviceSchema.mock()
-    var adapter: DeviceAdapter = MockAdapter(self.on_connect, bundled_schema, _log_handler, connect_cap) if system_mock else NoAdapter(bundled_schema, _log_handler, connect_cap)
+    var adapter: DeviceAdapter = MockAdapter(self.connected, bundled_schema, _log_handler, connect_cap) if system_mock else NoAdapter(bundled_schema, _log_handler, connect_cap)
 
     # The modules supported by the device.
     var modset: dict[str, ModCap] = {}
@@ -1045,6 +1045,14 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
     # wait until configuration has been committed to the device. We keep track
     # of those callbacks keyed by tid.
     var callbacks: dict[str, action(value)->None] = {}
+
+    # Clients can register through on_connect(cb) to be told each time the
+    # device has connected and we have fetched its running configuration.
+    var connect_callbacks: list[action() -> None] = []
+    # Set by connected() and cleared once the resync that follows it is done
+    var connect_resync_pending = False
+    # True once the device has connected and been resynced at least once
+    var has_connected = False
 
     # Track whether we currently have config items in confq that need approval.
     # When we transition this we also register and / unregister with
@@ -1117,8 +1125,28 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
         _log.debug("Modset updated", {"new_modset": new_modset})
         on_reconf(name)
 
-    def on_connect(new_modset: dict[str, ModCap], new_schema_key: ?SchemaKey):
+    def on_connect(cb: action() -> None) -> None:
+        """Register cb to be called each time the device connects
+
+        cb is called once the device has connected and DeviceMgr has fetched
+        its running configuration, so the module set and running config are
+        available. If the device has already connected, cb is also called
+        right away.
+        """
+        connect_callbacks.append(cb)
+        if has_connected:
+            cb()
+
+    def _notify_connected():
+        connect_resync_pending = False
+        has_connected = True
+        for cb in connect_callbacks:
+            cb()
+
+    def connected(new_modset: dict[str, ModCap], new_schema_key: ?SchemaKey):
+        """Called by the device adapter when it has connected to the device"""
         _log.debug("Device connected", {"new_modset": new_modset, "schema_modules": len(new_schema_key.modules) if new_schema_key is not None else None})
+        connect_resync_pending = True
         resync()
         if modset_eq(modset, new_modset):
             _log.debug("Supported modules unchanged")
@@ -1141,7 +1169,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
         def build_adapter(device_type: DeviceType, new_dmc: DeviceMetaConfig, effective_mock: bool) -> DeviceAdapter:
             candidate = device_type.adapter_type(self, device_type.bundled_schema, new_dmc, schema_registry, _log_handler, connect_cap)
             if effective_mock and not candidate.supports_mocking():
-                return MockAdapter(self.on_connect, device_type.bundled_schema, _log_handler, connect_cap)
+                return MockAdapter(self.connected, device_type.bundled_schema, _log_handler, connect_cap)
             return candidate
 
         _log_handler.set_output_level(_device_log_level(new_dmc, _default_log_level))
@@ -1479,6 +1507,9 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
                         running_conf = new_conf
                         if len(confq) > 0 or len(reconf_tids) > 0:
                             _send_config()
+
+                if connect_resync_pending:
+                    _notify_connected()
 
         _log.debug("DeviceMgr.resync: starting resync", {"local_device_txid": running_conf.txid if running_conf is not None else None})
         adapter.fetch_config(on_fetch_config_done)
