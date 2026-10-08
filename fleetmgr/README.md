@@ -131,16 +131,22 @@ Set `FLEETMGR_API` to point these targets at a top node on another address.
 
 ## Web UI
 
-`webui/` is a SvelteKit UI for the same northbound: fleet inventory and
-upgrade campaigns over RESTCONF. A campaign page draws the plan as a
-timeline: each window is a band as wide as its duration, with one cell per
-device at its estimated start on the wall clock; a marker shows now, and
-once the campaign runs the cells take the devices' live status. The top
-serves the UI itself: the static build is embedded in the `fleetmgr` binary
-as `src/fleetmgr/webui_assets.act`, so with `just demo` running the UI is at
-http://127.0.0.1:18200/. After a UI change, `just gen-webui` rebuilds the UI
-and regenerates that module (needs Node), then `just build` picks it up. For
-UI work,
+`webui/` is a SvelteKit UI for the same northbound: fleet inventory,
+maintenance schedules and upgrade campaigns over RESTCONF. The schedules
+page shows a week of every schedule's windows on a calendar and edits the
+schedules themselves: the local time zone, and rules of an opening time, a
+duration and weekdays, typed or dragged on the calendar. The devices page
+binds devices to a schedule, one at a time or a whole filtered selection. A
+campaign page draws the plan as a timeline: each window is a band as wide
+as its duration, with one cell per device at its estimated start on the
+wall clock; a marker shows now, and once the campaign runs the cells take
+the devices' live status; the same page changes the campaign's default
+schedule and its pace, set by a deadline or a target rate, plus the max
+rate. The top serves the UI itself: the static build is embedded in the
+`fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so with `just demo`
+running the UI is at http://127.0.0.1:18200/. After a UI change,
+`just gen-webui` rebuilds the UI and regenerates that module (needs Node),
+then `just build` picks it up. For UI work,
 
     just webui
 

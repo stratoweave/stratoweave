@@ -41,21 +41,58 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `maintenance:schedules` entry, `deadline` (seconds since the Unix epoch),
   `target-rate` and `max-rate` (devices per hour, defaults 100 and 500). A
   GET omits leaves left at their default, so the UI fills the defaults in.
-  The wizard takes offsets as `30m`, `2h30m` or `1d` and sends seconds.
+  The UI paces by a deadline or by a target rate, not both: `target-rate` is
+  a floor under the deadline's pace, so pacing by the deadline sets it to 0
+  and pacing by the rate removes the deadline. A campaign that has both
+  opens paced by the deadline. The wizard sets them at create time and the
+  campaign page changes them later. A change PATCHes the leaves; clearing
+  the default schedule or the deadline PUTs the entry back without the leaf
+  and without `state`, since DELETE on a leaf returns 500. The controller
+  keeps the devices it has already released, so a running campaign can be
+  edited too. The controller enforces the rates as devices at once (rate ×
+  install time / 3600, rounded up, at least one); with a plan, the campaign
+  page shows them that way too, from the plan's install estimates.
 - Progress is config-false `state` under each campaign, merged into GET
   responses; each `device-status` row also carries `running-release`.
   `state/plan` is the planner's layout: the windows it places devices into
   (`start`/`end` as seconds since the Unix epoch, one `device` entry per
   member with `estimated-start` and `estimated-duration`), plus an `alarm`
-  list for what does not fit. Members in no plan window are not actuated;
-  the UI lists them as not placed. The plan timeline draws these times on
-  the wall clock with a marker for now.
+  list for what does not fit, with one entry per device that fits no
+  window. Members in no plan window are not actuated; the UI shows them as
+  one count that expands to the device list. The plan timeline draws these
+  times on the wall clock with a marker for now.
 - Polling is two-tier: campaigns up to 600 members get a fresh entry GET
   (~120 B per member) every 1.5 s; everything refreshes from the slow
   snapshot (on open, every 12-30 s, and when `failed` moves). Nothing
   ever polls `GET /restconf/data` — it also hauls the full yang-library.
   Paths into a campaign's oper state (`.../state/total`) currently fail
   upstream, which is why fresh counters cost a whole entry.
+- Schedules are the shared `maintenance:schedules` entries: a name, a
+  `utc-offset` in minutes and a `window` list keyed by `at`, the local
+  time of day a rule opens, with a `duration` and an optional `day`
+  leaf-list. New names are limited to letters, digits, dots, dashes and
+  underscores since they end up in URLs; an existing entry opens and saves
+  whatever its name. Creating one PATCHes the datastore root; saving an
+  existing one PUTs the whole entry, because a rule removed in the editor
+  has to disappear and a merging PATCH cannot remove a list entry.
+  Removing a leaf on its own fails upstream (DELETE on a leaf returns
+  500), which is another reason the editor replaces entries. The schedules
+  page draws a week of every schedule's occurrences in the viewer's local
+  clock; the occurrences are generated the way the planner generates them,
+  so what the calendar shows is the supply of windows a campaign will be
+  placed into. In the editor the calendar edits the rules: drag a window
+  to move it, an edge to resize it, or across an empty stretch of a day to
+  add one, in quarter-hour steps. A rule has one opening time, so moving
+  one window moves all of its weekdays in time; sideways only the dragged
+  weekday moves.
+- A device binds to a schedule with the `schedule` leaf on its fleet
+  entry. Binding merges, so one PATCH binds any number of devices (1000
+  in about a second). Unbinding PUTs each entry back without the leaf,
+  one device at a time, since DELETE on a leaf returns 500. Every binding
+  write re-plans the campaigns, about half a second with a 1000-member
+  campaign, so unbinding many devices takes minutes; leaving the page
+  stops it. The leafref is not validated upstream, so the UI offers only
+  existing schedules and flags bindings to a missing one.
 - Per-device status values: `pending`, `unknown`, `up-to-date`,
   `upgrade-needed`, `in-progress`, `succeeded`, `failed`, `rolled-back`.
   The `succeeded` counter includes `up-to-date`, `failed` includes
@@ -75,10 +112,11 @@ completions come in; the estimated starts follow that release schedule, and
 the campaign page draws them on a timeline, one cell per device, that takes
 the live status as the run passes them. The UI adds no semantics the model
 does not carry — anything done here can be done identically over NETCONF or
-plain RESTCONF. The one wizard rule beyond the model, a deadline needs a
-window, only rejects a campaign the planner would place nothing in. Rate and
-ETA are measured since page open, and nothing is latched: status tracks live
-device state and regresses when a campaign goes back to plan.
+plain RESTCONF. Two rules go beyond the model, in the wizard and on the
+campaign page: a newly set deadline must lie ahead, and the pace comes from
+a deadline or a target rate, not both. Rate and ETA are measured since page
+open, and nothing is latched: status tracks live device state and regresses
+when a campaign goes back to plan.
 
 Sharding is internal: device creation places entries on the least-loaded
 flotilla node silently, and nothing in the UI shows the placement.

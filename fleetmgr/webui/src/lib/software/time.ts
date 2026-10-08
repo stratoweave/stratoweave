@@ -55,12 +55,17 @@ export function formatClock(epochSeconds: number, now = new Date()): string {
   return sameDay ? time : `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${time}`;
 }
 
-/** Local time-of-day seconds and a schedule's UTC offset -> "00:00+01:00". */
+/** Local time-of-day seconds and a schedule's UTC offset -> "04:00 (UTC-05:00)":
+ * the time of day in the schedule's own zone, the zone spelled out so a
+ * negative offset does not read as a time range. Seconds show when the
+ * time does not sit on a whole minute. */
 export function formatLocalTime(at: number, utcOffsetMinutes: number): string {
   const sign = utcOffsetMinutes < 0 ? '-' : '+';
   const abs = Math.abs(utcOffsetMinutes);
-  const tz = `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
-  return `${pad2(Math.floor(at / 3600))}:${pad2(Math.floor((at % 3600) / 60))}${tz}`;
+  const zone = `UTC${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
+  const seconds = at % 60;
+  const time = `${pad2(Math.floor(at / 3600))}:${pad2(Math.floor((at % 3600) / 60))}${seconds > 0 ? `:${pad2(seconds)}` : ''}`;
+  return `${time} (${zone})`;
 }
 
 /** Epoch seconds -> "13:59:59" on the local clock: every part always

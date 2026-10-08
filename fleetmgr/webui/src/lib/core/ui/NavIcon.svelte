@@ -2,6 +2,7 @@
   export type NavIconName =
     | 'campaigns'
     | 'devices'
+    | 'schedules'
     | 'refresh'
     | 'alert'
     | 'check'
@@ -34,6 +35,9 @@
     <rect x="3" y="4" width="18" height="6" rx="1.5" />
     <rect x="3" y="14" width="18" height="6" rx="1.5" />
     <path d="M6 7h.01M6 17h.01M16 7h2M16 17h2" />
+  {:else if name === 'schedules'}
+    <rect x="3" y="5" width="18" height="16" rx="1.5" />
+    <path d="M3 10h18M8 3v4M16 3v4M7 14h3v3H7z" />
   {:else if name === 'refresh'}
     <path d="M20 4v5h-5M4 20v-5h5M20 9a8 8 0 0 0-14-3M4 15a8 8 0 0 0 14 3" />
   {:else if name === 'alert'}

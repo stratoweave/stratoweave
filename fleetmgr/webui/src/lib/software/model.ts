@@ -6,6 +6,7 @@ import type { ValidationResult } from '$lib/core/validation/types';
 export const DATA_ROOT = 'data';
 export const SOFTWARE_ROOT = 'data/software:software';
 export const SCHEDULES_ROOT = 'data/maintenance:schedules';
+export const SCHEDULE_LIST_ROOT = 'data/maintenance:schedules/schedule';
 export const CAMPAIGN_LIST_ROOT = 'data/software:software/upgrade-campaign';
 export const FLEET_ROOT = 'data/fleetmgr:fleet';
 export const FLEET_DEVICE_LIST_ROOT = 'data/fleetmgr:fleet/device';
@@ -244,8 +245,22 @@ export interface PlanWindow {
  * Members in no window are not actuated. */
 export interface CampaignPlan {
   windows: PlanWindow[];
+  /** The planner's alarms without its one alarm per device that fits no
+   * window: those devices are `unplaced`. */
   alarms: string[];
   unplaced: string[];
+}
+
+/** "3 devices do not fit their windows". */
+export function unplacedText(count: number): string {
+  return count === 1
+    ? '1 device does not fit its windows'
+    : `${count.toLocaleString()} devices do not fit their windows`;
+}
+
+/** The plan's alarms one per line, the unplaced devices as one line. */
+export function planAlarmLines(plan: CampaignPlan): string[] {
+  return plan.unplaced.length > 0 ? [...plan.alarms, unplacedText(plan.unplaced.length)] : plan.alarms;
 }
 
 export interface Campaign {
@@ -331,8 +346,8 @@ function parsePlan(state: CampaignStateJson | undefined, members: string[]): Cam
   const placed = new Set(windows.flatMap((w) => w.devices.map((d) => d.name)));
   return {
     windows,
-    alarms: state.plan?.alarm ?? [],
-    unplaced: members.filter((m) => !placed.has(m))
+    alarms: (state.plan?.alarm ?? []).filter((a) => !a.startsWith('unplannable: ')),
+    unplaced: members.filter((m) => !placed.has(m)).sort((a, b) => a.localeCompare(b))
   };
 }
 
@@ -427,11 +442,7 @@ export interface NewCampaign {
   maxRate?: number | null;
 }
 
-export interface CampaignCreatePatchJson extends SoftwarePatchJson {
-  'maintenance:schedules'?: { schedule: ScheduleJson[] };
-}
-
-export function campaignCreatePatch(input: NewCampaign): CampaignCreatePatchJson {
+export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
   const name = input.name.trim();
   const entry: Partial<CampaignJson> & { name: string } = {
     name,
@@ -439,7 +450,7 @@ export function campaignCreatePatch(input: NewCampaign): CampaignCreatePatchJson
     device: input.devices.map((device) => ({ name: device })),
     'admin-state': 'plan'
   };
-  const patch: CampaignCreatePatchJson = {
+  const patch: SoftwarePatchJson = {
     'software:software': { 'upgrade-campaign': [entry] }
   };
   const imageUrl = input.imageUrl.trim();
