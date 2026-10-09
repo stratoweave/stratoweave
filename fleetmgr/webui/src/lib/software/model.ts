@@ -15,7 +15,7 @@ export type AdminState = 'plan' | 'run';
 
 // ── Wire types: YANG-JSON exactly as it crosses /restconf/data ──
 
-export interface AddressJson {
+interface AddressJson {
   name: string;
   address?: string;
   port?: number;
@@ -33,24 +33,24 @@ export interface DeviceJson {
   mock?: { enabled?: boolean };
 }
 
-export interface NodeJson {
+interface NodeJson {
   name: string;
   address?: AddressJson[];
 }
 
-export interface CampaignMemberJson {
+interface CampaignMemberJson {
   name: string;
 }
 
 /** A software upgrade check verdict, relayed from the device as strings. */
-export interface CheckResultJson {
+interface CheckResultJson {
   verdict?: string;
   detail?: string;
   /** yang:date-and-time */
   at?: string;
 }
 
-export interface DeviceStatusJson {
+interface DeviceStatusJson {
   device: string;
   status?: string;
   'running-release'?: string;
@@ -60,7 +60,7 @@ export interface DeviceStatusJson {
 }
 
 /** One recurrence rule of a schedule: a local time of day. */
-export interface WindowJson {
+interface WindowJson {
   at: number;
   duration: number;
   day?: string[];
@@ -74,27 +74,27 @@ export interface ScheduleJson {
   window?: WindowJson[];
 }
 
-export interface PlanDeviceJson {
+interface PlanDeviceJson {
   name: string;
   'estimated-start'?: number | string;
   'estimated-duration'?: number | string;
 }
 
-export interface PlanWindowJson {
+interface PlanWindowJson {
   start: number | string;
   end?: number | string;
   schedule?: string;
   device?: PlanDeviceJson[];
 }
 
-export interface PlanJson {
+interface PlanJson {
   window?: PlanWindowJson[];
   alarm?: string[];
 }
 
 /** Counters are optional and do not sum to total: pending, unknown and
  * up-to-date devices fall into no counter. */
-export interface CampaignStateJson {
+interface CampaignStateJson {
   total?: number;
   'in-progress'?: number;
   succeeded?: number;
@@ -118,7 +118,7 @@ export interface CampaignJson {
 }
 
 /** GET data merges every module; this UI reads three of them. */
-export interface DataTreeJson {
+interface DataTreeJson {
   'fleetmgr:fleet'?: {
     node?: NodeJson[];
     device?: DeviceJson[];
@@ -143,7 +143,7 @@ export interface FleetPatchJson {
   };
 }
 
-export interface SoftwarePatchJson {
+interface SoftwarePatchJson {
   'software:software': {
     'upgrade-campaign'?: (Partial<CampaignJson> & { name: string })[];
   };
@@ -165,7 +165,7 @@ export const KNOWN_STATUSES = [
 ] as const;
 export type KnownStatus = (typeof KNOWN_STATUSES)[number];
 
-export function normalizeStatus(raw: unknown): KnownStatus {
+function normalizeStatus(raw: unknown): KnownStatus {
   return typeof raw === 'string' && (KNOWN_STATUSES as readonly string[]).includes(raw)
     ? (raw as KnownStatus)
     : 'unknown';

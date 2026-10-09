@@ -9,15 +9,15 @@ import type { KnownStatus, PlanWindow } from './model';
 const HOUR = 3600;
 
 /** Long idle stretches between windows collapse to a break this wide. */
-export const BREAK_W = 44;
+const BREAK_W = 44;
 /** A gap that would draw narrower than this stays at true scale. */
 const BREAK_MIN_PX = BREAK_W * 1.5;
 /** A window's band stops this far before its end, so one that starts
  * right after another does not touch it. */
 export const WINDOW_GAP = 6;
 
-export const MAX_SIZE = 10;
-export const MIN_SIZE = 3;
+const MAX_SIZE = 10;
+const MIN_SIZE = 3;
 
 /** Where a window's band ends on the axis: its end, or for an open window
  * the last estimated finish plus a small margin. */
@@ -194,7 +194,7 @@ export interface WindowCells {
  * starts a cell's width apart share a column instead of overlapping. A
  * full column spills into the next, so a crowded window degrades into a
  * packed fill instead of growing without bound. */
-export function layoutCells(p: Placed, axis: Axis, size: number, pitch: number, rowsCap: number): WindowCells {
+function layoutCells(p: Placed, axis: Axis, size: number, pitch: number, rowsCap: number): WindowCells {
   const maxX = p.xEnd - WINDOW_GAP - size;
   const devices = [...p.w.devices].sort(
     (a, b) => a.estimatedStart - b.estimatedStart || a.name.localeCompare(b.name)

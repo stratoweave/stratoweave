@@ -13,6 +13,7 @@
     DEFAULT_MAX_RATE,
     DEFAULT_TARGET_RATE,
     campaignCreatePatch,
+    validateNewCampaign,
     type Campaign,
     type Device,
     type Schedule
@@ -35,7 +36,6 @@
     };
   } = $props();
 
-
   let name = $state('');
   let targetRelease = $state('');
   let imageUrl = $state('');
@@ -48,22 +48,12 @@
   let creating = $state(false);
   let statusMessage = $state<string>(untrack(() => data.loadError));
 
-
-  let errors = $derived.by(() => {
-    const e: Record<string, string> = {};
-    const n = name.trim();
-    if (!n) {
-      e['name'] = 'A name is required.';
-    } else if (data.campaigns.some((c) => c.name === n)) {
-      e['name'] = `${n} is already in use.`;
-    }
-    if (!targetRelease.trim()) {
-      e['target-release'] = 'A target release is required.';
-    }
-    if (members.length === 0) {
-      e['device'] = 'Select at least one device.';
-    }
-    return { ...e, ...validatePlanningDraft(planning, Date.now() / 1000) };
+  let errors = $derived({
+    ...validateNewCampaign(
+      { name, targetRelease, imageUrl, devices: members },
+      data.campaigns.map((c) => c.name)
+    ).errors,
+    ...validatePlanningDraft(planning, Date.now() / 1000)
   });
   let visibleErrors = $derived(touched ? errors : ({} as Record<string, string>));
 

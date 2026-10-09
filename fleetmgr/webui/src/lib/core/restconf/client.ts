@@ -13,7 +13,7 @@ function normalizePath(path: string): string {
   return path.replace(/^\/+/, '');
 }
 
-function encodeListKeyPart(value: string): string {
+function encodeListKey(value: string): string {
   // List keys take exactly the single percent-encoding RFC 8040 prescribes.
   return encodeURIComponent(value.trim());
 }
@@ -40,7 +40,7 @@ async function readResponse<T>(response: Response, readBody = true): Promise<T> 
   }
 }
 
-export async function restconfRequest<T>(
+async function restconfRequest<T>(
   path: string,
   init: RequestInit & RestconfRequestOptions = {},
   fetchFn: Fetch = fetch
@@ -110,32 +110,6 @@ export function restconfPatchJson<T>(path: string, body: unknown): Promise<T> {
   });
 }
 
-/**
- * Send a raw string body with a caller-chosen method + Content-Type.
- * Use this when the body is already serialized (e.g. an XML payload, or
- * a JSON string the caller produced manually) and the JSON helpers
- * would double-encode by `JSON.stringify`'ing it.
- */
-export function restconfRaw<T = string>(
-  method: 'PUT' | 'PATCH' | 'POST',
-  path: string,
-  body: string,
-  contentType: string,
-  readBody = false,
-  headers?: HeadersInit,
-  signal?: AbortSignal
-): Promise<T> {
-  return restconfRequest<T>(path, {
-    method,
-    body,
-    headers,
-    signal,
-    accept: contentType,
-    contentType,
-    readBody
-  });
-}
-
 export function restconfDelete(path: string): Promise<unknown> {
   return restconfRequest(path, {
     method: 'DELETE',
@@ -144,19 +118,11 @@ export function restconfDelete(path: string): Promise<unknown> {
   });
 }
 
-export function encodeListKey(key: string | string[]): string {
-  if (Array.isArray(key)) {
-    return key.map((part) => encodeListKeyPart(String(part))).join(',');
-  }
-
-  return encodeListKeyPart(String(key));
-}
-
-export function getListEntryPath(root: string, key: string | string[]): string {
+export function getListEntryPath(root: string, key: string): string {
   return `${normalizePath(root)}=${encodeListKey(key)}`;
 }
 
-export function getListWrapperKey(restconfRoot: string): string {
+function getListWrapperKey(restconfRoot: string): string {
   const segments = normalizePath(restconfRoot).replace(/^data\//, '').split('/');
   const last = segments[segments.length - 1];
 

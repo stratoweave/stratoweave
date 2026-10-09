@@ -11,11 +11,6 @@
 
   let { children }: { children?: Snippet } = $props();
 
-  async function handleRefresh(): Promise<void> {
-    window.dispatchEvent(new CustomEvent('global-refresh'));
-    await invalidateAll();
-  }
-
   const PAGE_LABELS: Record<string, string> = {
     '/devices': 'Devices',
     '/campaigns': 'Campaigns',
@@ -112,7 +107,7 @@
       </nav>
 
       <div class="header-actions">
-        <button class="btn btn-ghost btn-sm" type="button" onclick={handleRefresh}>
+        <button class="btn btn-ghost btn-sm" type="button" onclick={() => invalidateAll()}>
           <NavIcon name="refresh" size={16} /> Refresh
         </button>
       </div>

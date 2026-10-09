@@ -35,11 +35,6 @@ export function formatDuration(seconds: number): string {
   return parts.join('');
 }
 
-/** Seconds after launch -> "at launch", "+2h30m". */
-export function formatOffset(seconds: number): string {
-  return seconds === 0 ? 'at launch' : `+${formatDuration(seconds)}`;
-}
-
 function pad2(n: number): string {
   return n < 10 ? `0${n}` : `${n}`;
 }
