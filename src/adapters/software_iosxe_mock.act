@@ -2,9 +2,9 @@
 
 The mock sits behind NetconfAdapter's in-process NETCONF server. It replies to
 RPCs before their asynchronous operation records complete, just like IOS XE,
-and publishes install history, the image inventory and the running software
-banner. `upgrade_duration` and `failure` make it behave like a particular
-device; see IosXeSoftwareMock.
+and publishes install history, the image inventory, the running software
+banner and one BGP neighbor. `upgrade_duration` and `failure` make it behave
+like a particular device; see IosXeSoftwareMock.
 """
 
 import logging
@@ -56,8 +56,17 @@ FAILURE_ADD = "add-failed"
 FAILURE_ACTIVATE_REFUSED = "activate-refused"
 FAILURE_COMMIT = "commit-failed"
 FAILURE_REVERTS = "reverts"
+FAILURE_BGP_DOWN = "bgp-down"
+FAILURE_BGP_LOST = "bgp-lost"
 FAILURES = [FAILURE_NONE, FAILURE_DOWNLOAD, FAILURE_ADD,
-            FAILURE_ACTIVATE_REFUSED, FAILURE_COMMIT, FAILURE_REVERTS]
+            FAILURE_ACTIVATE_REFUSED, FAILURE_COMMIT, FAILURE_REVERTS,
+            FAILURE_BGP_DOWN, FAILURE_BGP_LOST]
+
+NS_BGP_OPER = "http://cisco.com/ns/yang/Cisco-IOS-XE-bgp-oper"
+# The mock's one BGP neighbor and the prefixes it exchanges while up.
+BGP_NEIGHBOR = "10.0.0.1"
+BGP_ADVERTISED = 3
+BGP_RECEIVED = 4
 
 # Device vocabulary for a failed operation (Cisco-IOS-XE-install-oper-types).
 OP_FAIL = "install-op-fail"
@@ -177,9 +186,55 @@ def version_state_info(state: str, version: str) -> ygdata.Node:
     }, ns=ns, module=mod)
 
 
+def bgp_up(failure: str, running: str, committed: str) -> bool:
+    """Whether the mock's BGP session is established: never with bgp-down,
+    and with bgp-lost not while an uncommitted release runs."""
+    if failure == FAILURE_BGP_DOWN:
+        return False
+    if failure == FAILURE_BGP_LOST:
+        return running == committed
+    return True
+
+
+def bgp_datastore(up: bool) -> ygdata.Node:
+    """Return Cisco-IOS-XE-bgp-oper with the one neighbor, established and
+    exchanging prefixes, or idle with none."""
+    def q(n: str) -> ygdata.Id:
+        return ygdata.Id(NS_BGP_OPER, n)
+    ns = NS_BGP_OPER
+    mod = "Cisco-IOS-XE-bgp-oper"
+
+    def prefixes(count: int) -> ygdata.Node:
+        return ygdata.Container({
+            q("current-prefixes"): ygdata.Leaf(count if up else 0, ns=ns, module=mod),
+        }, ns=ns, module=mod)
+
+    neighbor = ygdata.Container({
+        q("afi-safi"): ygdata.Leaf("ipv4-unicast", ns=ns, module=mod),
+        q("vrf-name"): ygdata.Leaf("default", ns=ns, module=mod),
+        q("neighbor-id"): ygdata.Leaf(BGP_NEIGHBOR, ns=ns, module=mod),
+        q("session-state"): ygdata.Leaf("fsm-established" if up else "fsm-idle",
+                                        ns=ns, module=mod),
+        q("prefix-activity"): ygdata.Container({
+            q("sent"): prefixes(BGP_ADVERTISED),
+            q("received"): prefixes(BGP_RECEIVED),
+        }, ns=ns, module=mod),
+    }, ns=ns, module=mod)
+    return ygdata.Container({
+        q("bgp-state-data"): ygdata.Container({
+            q("neighbors"): ygdata.Container({
+                q("neighbor"): ygdata.List([q("afi-safi"), q("vrf-name"), q("neighbor-id")],
+                                           [neighbor], ns=ns, module=mod),
+            }, ns=ns, module=mod)
+        }, ns=ns, module=mod)
+    })
+
+
 def operational_datastore(version: str, history: list[ygdata.Node],
-                          vstates: list[ygdata.Node]=[]) -> ygdata.Node:
-    """Return the complete operational datastore served by the mock."""
+                          vstates: list[ygdata.Node]=[],
+                          bgp: bool=True) -> ygdata.Node:
+    """Return the complete operational datastore served by the mock; bgp says
+    whether its BGP session is up."""
     def q(n: str) -> ygdata.Id:
         return ygdata.Id(ixoper.NS_Cisco_IOS_XE_install_oper, n)
     ns = ixoper.NS_Cisco_IOS_XE_install_oper
@@ -194,7 +249,8 @@ def operational_datastore(version: str, history: list[ygdata.Node],
             q("install-location-information"): ygdata.KeylessList([loc]),
         }, ns=ns, module=mod)
     })
-    return ygdata.merge(install_oper, hardware_datastore(version))
+    return ygdata.merge(ygdata.merge(install_oper, hardware_datastore(version)),
+                        bgp_datastore(bgp))
 
 
 def _uuid_of(request: xml.Node) -> ?str:
@@ -246,6 +302,9 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
       commit-failed     install-commit accepted, then the commit stage fails
       reverts           the abort timer runs out before the commit, so the
                         device is back on the committed release
+      bgp-down          the BGP session is idle from the start
+      bgp-lost          the BGP session is idle while the activated release
+                        runs, until a commit or an abort
     """
     _log = logging.Logger(log_handler)
 
@@ -282,7 +341,8 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         if a is not None and not swxe.releases_equal(a!, committed):
             vstates.append(version_state_info(
                 "install-version-state-provisioned-uncommitted", device_version(a!)))
-        mock_server.set_oper_ds(operational_datastore(cur, history, vstates))
+        mock_server.set_oper_ds(operational_datastore(
+            cur, history, vstates, bgp_up(failure, cur, committed)))
 
     def _remember(record: ygdata.Node) -> None:
         # Copy on write: the published datastore still holds the old list.

@@ -1,5 +1,6 @@
 import testing
 import std.xml as xml
+import yang.gdata as gdata
 import yang.xml as yxml
 
 import stratoweave
@@ -11,8 +12,10 @@ from stratoweave.device_meta_config import \
 import fleetmgr.cfs as cfs
 import fleetmgr.rfs as rfs
 import fleetmgr.layers.y_0 as y_0
+import fleetmgr.layers.y_0_oper as y0_oper
 import fleetmgr.layers.y_1 as y_1_config
 import fleetmgr.layers.y_1_loose as y_1
+import fleetmgr.layers.y_1_oper as y1_oper
 import fleetmgr.sysspec as sysspec
 import flotilla.layers.y_0 as flotilla_rfs
 from fleetmgr.layers.y_0 import \
@@ -299,6 +302,8 @@ mut def _lab_device(shard: ?str) -> InputDevice:
     i.ssh.rekey_after_seconds = u64(3600)
     i.debug.connection = True
     i.feature_flags.runtime_schema_fetch = True
+    i.upgrade_checks.precheck_wait = u64(30)
+    i.upgrade_checks.postcheck_wait = u64(120)
     return i
 
 
@@ -343,6 +348,8 @@ actor _test_device_transform(t: testing.AsyncT):
         t.failure(ValueError("mock upgrade duration, failure or running release was not preserved"))
     elif not dev.debug.connection! or not dev.feature_flags.runtime_schema_fetch!:
         t.failure(ValueError("debug or feature flags were not preserved"))
+    elif dev.upgrade_checks.precheck_wait != u64(30) or dev.upgrade_checks.postcheck_wait != u64(120):
+        t.failure(ValueError("upgrade check waits were not preserved"))
     else:
         t.success()
 
@@ -537,6 +544,80 @@ actor _test_campaign_full_release_actuates_all(t: testing.AsyncT):
             actuated += 1
     testing.assertEqual(actuated, 3, None)
     t.success()
+
+
+def _campaign_path(name: str) -> ttt.Path:
+    """Return the path of one campaign entry, as TTT builds it."""
+    software = ttt.PathElem(gdata.Id(y0_oper.NS_software, "software"), ttt.PathRoot("root"))
+    campaigns = ttt.PathElem(gdata.Id(y0_oper.NS_software, "upgrade-campaign"), software)
+    return ttt.PathKey(name, campaigns, {gdata.Id(y0_oper.NS_software, "name"): gdata.Leaf(name)})
+
+
+actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
+    """Each device's check verdicts reach the campaign next to its status,
+    from a flotilla and from the top alike. A device not heard from has
+    none."""
+    var done = False
+
+    def row(o: y0_oper.software__software__upgrade_campaign_entry, name: str) -> str:
+        r = o.state.device_status.get(name)
+        if r is not None:
+            pre = r.precheck
+            post = r.postcheck
+            return "{name} {r.status}, pre {pre.verdict} {pre.detail} {pre.at}, post {post.verdict} {post.detail} {post.at}"
+        return "{name} missing"
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        first = o.state.device_status.get("cpe-1")
+        # The first publication comes before the device states.
+        if first is not None:
+            if first.precheck.verdict is not None:
+                done = True
+                got = [row(o, "cpe-1"), row(o, "cpe-2"), row(o, "cpe-3")]
+                want = [
+                    "cpe-1 rolled-back, pre pass rfs-device-health: 1/1 sessions established 2026-10-07T12:00:00Z, "
+                    + "post fail rfs-device-health: not back to the baseline 2026-10-07T12:12:00Z",
+                    "cpe-2 failed, pre fail did not answer: rfs-device-health 2026-10-07T12:01:00Z, post not-run None None",
+                    "cpe-3 pending, pre None None None, post None None None",
+                ]
+                if got != want:
+                    t.failure(ValueError("device-status: {got}"))
+                else:
+                    t.success()
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda d: None, on_oper, None)
+    campaign.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+
+    sharded = y1_oper.stratoweave_rfs__rfs__device__software__state(status="rolled-back", running_release="17.18.02")
+    sharded.precheck.verdict = "pass"
+    sharded.precheck.detail = "rfs-device-health: 1/1 sessions established"
+    sharded.precheck.at = "2026-10-07T12:00:00Z"
+    sharded.postcheck.verdict = "fail"
+    sharded.postcheck.detail = "rfs-device-health: not back to the baseline"
+    sharded.postcheck.at = "2026-10-07T12:12:00Z"
+    campaign.on_rfs((rfs_name="flotilla-1", device_name="cpe-1"), sharded, None)
+
+    direct = y1_oper.stratoweave_rfs__device__software__state(status="failed", running_release="17.18.02")
+    direct.precheck.verdict = "fail"
+    direct.precheck.detail = "did not answer: rfs-device-health"
+    direct.precheck.at = "2026-10-07T12:01:00Z"
+    direct.postcheck.verdict = "not-run"
+    campaign.on_device((device_name="cpe-2"), direct, None)
+
+    # The replay is in. A campaign in plan publishes once it is synced.
+    campaign.on_subscriptions_synced()
+    after 2.0: fail("the campaign published no verdicts")
 
 
 def _render_layout(header: str, layout: list[(str, int, int, list[(str, int, int)])],

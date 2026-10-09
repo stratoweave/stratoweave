@@ -42,10 +42,20 @@ export interface CampaignMemberJson {
   name: string;
 }
 
+/** A software upgrade check verdict, relayed from the device as strings. */
+export interface CheckResultJson {
+  verdict?: string;
+  detail?: string;
+  /** yang:date-and-time */
+  at?: string;
+}
+
 export interface DeviceStatusJson {
   device: string;
   status?: string;
   'running-release'?: string;
+  precheck?: CheckResultJson;
+  postcheck?: CheckResultJson;
 }
 
 /** One recurrence rule of a schedule: a local time of day. */
@@ -187,11 +197,22 @@ export interface Device {
   address: string;
 }
 
+export type Verdict = 'not-run' | 'pass' | 'fail';
+
+export interface CheckResult {
+  verdict: Verdict;
+  detail: string;
+  /** Seconds since the Unix epoch; null when there is no time. */
+  at: number | null;
+}
+
 export interface DeviceStatusRow {
   device: string;
   status: KnownStatus;
   raw: string;
   runningRelease: string;
+  precheck: CheckResult;
+  postcheck: CheckResult;
 }
 
 export interface CampaignCounters {
@@ -322,6 +343,21 @@ function parseCounters(state: CampaignStateJson | undefined): CampaignCounters |
   };
 }
 
+/** An absent check has not run. */
+function parseCheck(json: CheckResultJson | undefined): CheckResult {
+  const verdict = json?.verdict === 'pass' || json?.verdict === 'fail' ? json.verdict : 'not-run';
+  const at = json?.at ? Date.parse(json.at) : NaN;
+  return { verdict, detail: json?.detail ?? '', at: Number.isFinite(at) ? at / 1000 : null };
+}
+
+/** Why a device failed or rolled back, when a check refused it; empty
+ * otherwise. */
+export function failureReason(row: DeviceStatusRow): string {
+  if (row.precheck.verdict === 'fail') return `pre-check: ${row.precheck.detail}`;
+  if (row.postcheck.verdict === 'fail') return `post-check: ${row.postcheck.detail}`;
+  return '';
+}
+
 /** RFC 7951 encodes uint64 as a string; this backend sends numbers. */
 function num(value: unknown): number {
   const n = typeof value === 'string' ? Number(value) : value;
@@ -382,7 +418,9 @@ function parseCampaign(entry: CampaignJson): Campaign {
         device,
         status: normalizeStatus(raw),
         raw,
-        runningRelease: row?.['running-release'] ?? ''
+        runningRelease: row?.['running-release'] ?? '',
+        precheck: parseCheck(row?.precheck),
+        postcheck: parseCheck(row?.postcheck)
       };
     })
   };

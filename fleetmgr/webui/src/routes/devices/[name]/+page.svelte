@@ -3,6 +3,7 @@
   import { invalidate } from '$app/navigation';
 
   import StatusPill from '$lib/software/StatusPill.svelte';
+  import VerdictPill from '$lib/software/VerdictPill.svelte';
   import { createPoller } from '$lib/core/polling/poller';
   import { setDeviceSchedule } from '$lib/maintenance/binding';
   import { scheduleRulesText } from '$lib/maintenance/schedule-form';
@@ -160,6 +161,8 @@
               <th>admin-state</th>
               <th>Planned start</th>
               <th>Status</th>
+              <th>Pre-check</th>
+              <th>Post-check</th>
               <th>Running release</th>
             </tr>
           </thead>
@@ -185,6 +188,20 @@
                     —
                   {/if}
                 </td>
+                <td>
+                  {#if row}
+                    <VerdictPill check={row.precheck} />
+                  {:else}
+                    —
+                  {/if}
+                </td>
+                <td>
+                  {#if row}
+                    <VerdictPill check={row.postcheck} />
+                  {:else}
+                    —
+                  {/if}
+                </td>
                 <td class="mono tn">{row?.runningRelease || '—'}</td>
               </tr>
             {/each}
@@ -192,10 +209,6 @@
         </table>
       </div>
     {/if}
-    <p class="hint">
-      The flotilla publishes the pre- and post-check verdicts per device; the top carries only
-      status and running release up, so that is what this page shows.
-    </p>
   </section>
 {/if}
 

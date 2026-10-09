@@ -7,6 +7,7 @@
   import PlanningFields from '$lib/software/PlanningFields.svelte';
   import PlanTimeline from '$lib/software/PlanTimeline.svelte';
   import StatusPill from '$lib/software/StatusPill.svelte';
+  import VerdictPill from '$lib/software/VerdictPill.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCampaign } from '$lib/software/counters';
@@ -27,6 +28,7 @@
     DATA_ROOT,
     KNOWN_STATUSES,
     adminStatePatch,
+    failureReason,
     maskUrlCredentials,
     unplacedText,
     type Campaign,
@@ -448,6 +450,7 @@
               <th>Device</th>
               <th>Status</th>
               <th>Running release</th>
+              <th>Reason</th>
             </tr>
           </thead>
           <tbody>
@@ -456,6 +459,7 @@
                 <td><span class="device-name">{row.device}</span></td>
                 <td><StatusPill status={row.status} raw={row.raw} /></td>
                 <td class="mono">{row.runningRelease || '—'}</td>
+                <td class="reason">{failureReason(row) || '—'}</td>
               </tr>
             {/each}
           </tbody>
@@ -516,6 +520,8 @@
               <tr>
                 <th>Device</th>
                 <th>Status</th>
+                <th>Pre-check</th>
+                <th>Post-check</th>
                 <th>Running release</th>
               </tr>
             </thead>
@@ -524,6 +530,8 @@
                 <tr>
                   <td><span class="device-name">{row.device}</span></td>
                   <td><StatusPill status={row.status} raw={row.raw} /></td>
+                  <td><VerdictPill check={row.precheck} /></td>
+                  <td><VerdictPill check={row.postcheck} /></td>
                   <td class="mono">{row.runningRelease || '—'}</td>
                 </tr>
               {/each}
@@ -786,6 +794,7 @@
     padding: 8px 10px;
     border-bottom: 1px solid var(--sw-border-default);
     vertical-align: middle;
+    white-space: nowrap;
   }
 
   tbody tr:last-child td {
@@ -794,6 +803,11 @@
 
   .device-name {
     font-weight: 600;
+  }
+
+  .reason {
+    color: var(--sw-text-secondary);
+    white-space: normal;
   }
 
   .pager {
