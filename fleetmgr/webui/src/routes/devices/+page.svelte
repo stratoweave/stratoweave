@@ -21,20 +21,11 @@
     validateNewDevice,
     type NewDeviceInput
   } from '$lib/software/inventory';
+  import type { PageProps } from './$types';
 
   const PAGE_SIZE = 100;
 
-  let {
-    data
-  }: {
-    data: {
-      nodes: string[];
-      devices: Device[];
-      schedules: Schedule[];
-      scheduleFilter: string;
-      loadError: string;
-    };
-  } = $props();
+  let { data }: PageProps = $props();
 
   let draft = $state<NewDeviceInput | null>(null);
   let importOpen = $state(false);

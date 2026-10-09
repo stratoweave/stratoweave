@@ -7,10 +7,9 @@
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
   import { planAlarmLines, type Campaign, type CampaignCounters } from '$lib/software/model';
+  import type { PageProps } from './$types';
 
-  let {
-    data
-  }: { data: { campaigns: Campaign[]; loadError: string } } = $props();
+  let { data }: PageProps = $props();
 
   // Discovery (full campaign entries) refreshes slowly; running campaigns
   // get fresh counters from cheap entry GETs.

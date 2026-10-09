@@ -6,12 +6,10 @@
   import WeekCalendar from '$lib/maintenance/WeekCalendar.svelte';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
   import { scheduleRulesText, scheduleUsage } from '$lib/maintenance/schedule-form';
-  import type { Campaign, Device, Schedule } from '$lib/software/model';
   import { formatUtcOffset } from '$lib/core/time';
+  import type { PageProps } from './$types';
 
-  let {
-    data
-  }: { data: { schedules: Schedule[]; devices: Device[]; campaigns: Campaign[]; loadError: string } } = $props();
+  let { data }: PageProps = $props();
 
   let now = $state(Date.now() / 1000);
 

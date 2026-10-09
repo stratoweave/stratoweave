@@ -1,7 +1,8 @@
 <script lang="ts">
   import ScheduleEditor from '$lib/maintenance/ScheduleEditor.svelte';
+  import type { PageProps } from './$types';
 
-  let { data }: { data: { existingNames: string[]; loadError: string } } = $props();
+  let { data }: PageProps = $props();
 </script>
 
 {#if data.loadError}

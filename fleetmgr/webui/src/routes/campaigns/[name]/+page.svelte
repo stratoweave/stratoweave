@@ -36,15 +36,12 @@
     type Schedule,
     type KnownStatus
   } from '$lib/software/model';
+  import type { PageProps } from './$types';
 
   const PAGE_SIZE = 100;
   const FAILED_LIMIT = 200;
 
-  let {
-    data
-  }: {
-    data: { name: string; campaign: Campaign | null; schedules: Schedule[]; loadError: string };
-  } = $props();
+  let { data }: PageProps = $props();
 
   let busy = $state(false);
   let actionError = $state('');

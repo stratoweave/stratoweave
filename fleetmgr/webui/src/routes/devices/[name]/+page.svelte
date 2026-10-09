@@ -9,21 +9,12 @@
   import { createPoller } from '$lib/core/polling/poller';
   import { setDeviceSchedule } from '$lib/maintenance/binding';
   import { scheduleRulesText } from '$lib/maintenance/schedule-form';
-  import type { Campaign, Device, Schedule } from '$lib/software/model';
+  import type { Campaign } from '$lib/software/model';
   import { stageDetail } from '$lib/software/stages';
   import { formatClock } from '$lib/core/time';
+  import type { PageProps } from './$types';
 
-  let {
-    data
-  }: {
-    data: {
-      name: string;
-      device: Device | null;
-      campaigns: Campaign[];
-      schedules: Schedule[];
-      loadError: string;
-    };
-  } = $props();
+  let { data }: PageProps = $props();
 
   // null follows the device as polled; a pick holds until it is saved.
   let picked = $state<string | null>(null);

@@ -56,7 +56,7 @@
   const ZOOMS = [1, 2, 4, 8];
   const NOW_COLOR = '#22d3ee';
   const DONE_COLOR = '#16a34a';
-  const uid = `pt-${Math.random().toString(36).slice(2, 9)}`;
+  const uid = $props.id();
 
   interface Block {
     p: Placed;

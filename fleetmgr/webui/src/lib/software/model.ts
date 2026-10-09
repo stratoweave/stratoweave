@@ -28,6 +28,7 @@ export interface DeviceJson {
   shard?: string;
   description?: string;
   schedule?: string;
+  'approval-required'?: boolean;
   address?: AddressJson[];
   credentials?: { username?: string; password?: string };
   mock?: { enabled?: boolean };
@@ -332,7 +333,7 @@ function firstAddress(entry: { address?: AddressJson[] }): string {
   return typeof first.port === 'number' ? `${first.address}:${first.port}` : first.address;
 }
 
-function parseDevice(entry: DeviceJson & { 'approval-required'?: boolean }): Device {
+function parseDevice(entry: DeviceJson): Device {
   return {
     name: entry.name,
     type: entry.type ?? '',

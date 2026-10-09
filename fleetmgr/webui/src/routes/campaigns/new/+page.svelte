@@ -13,10 +13,7 @@
     DEFAULT_MAX_RATE,
     DEFAULT_TARGET_RATE,
     campaignCreatePatch,
-    validateNewCampaign,
-    type Campaign,
-    type Device,
-    type Schedule
+    validateNewCampaign
   } from '$lib/software/model';
   import {
     emptyPlanningDraft,
@@ -24,17 +21,9 @@
     validatePlanningDraft,
     type PlanningDraft
   } from '$lib/software/planning-form';
+  import type { PageProps } from './$types';
 
-  let {
-    data
-  }: {
-    data: {
-      devices: Device[];
-      campaigns: Campaign[];
-      schedules: Schedule[];
-      loadError: string;
-    };
-  } = $props();
+  let { data }: PageProps = $props();
 
   let name = $state('');
   let targetRelease = $state('');
