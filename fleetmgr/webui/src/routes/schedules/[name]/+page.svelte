@@ -36,13 +36,3 @@
     />
   {/key}
 {/if}
-
-<style>
-  .status {
-    margin-bottom: 12px;
-  }
-
-  .card {
-    padding: 20px;
-  }
-</style>

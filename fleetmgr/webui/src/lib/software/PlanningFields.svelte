@@ -135,24 +135,6 @@
     gap: 12px;
   }
 
-  .field {
-    display: grid;
-    gap: 6px;
-    min-width: 0;
-  }
-
-  .field__label {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--sw-text-label);
-  }
-
-  .field__meta {
-    min-height: 1rem;
-    font-size: 11px;
-    color: var(--sw-text-muted);
-  }
-
   .at-once {
     margin: 0;
     font-size: 12px;

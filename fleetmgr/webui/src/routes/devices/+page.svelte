@@ -441,7 +441,7 @@
         onchange={(value) => (importType = value)}
       />
       <textarea
-        class="import-text mono"
+        class="input mono"
         rows="10"
         placeholder="ce1,192.0.2.11&#10;ce2,192.0.2.12,830&#10;mock-001"
         bind:value={importText}
@@ -464,7 +464,7 @@
   {:else}
     <div class="filter-row">
       <input
-        class="filter-input mono"
+        class="input compact mono filter-input"
         type="text"
         placeholder="filter by name (glob with * and ?)"
         bind:value={filterText}
@@ -489,7 +489,7 @@
       <span class="filter-count">{filtered.length} of {data.devices.length}</span>
     </div>
     <div class="table-wrap">
-      <table>
+      <table class="dense">
         <thead>
           <tr>
             <th class="col-check">
@@ -544,7 +544,7 @@
               </td>
               <td class="col-action">
                 <button
-                  class="btn btn-secondary btn-small btn-danger-ghost"
+                  class="btn btn-secondary btn-sm btn-danger-ghost"
                   type="button"
                   disabled={saving || deleting || applying}
                   onclick={() => (deleteTarget = device)}
@@ -593,12 +593,12 @@
         {/if}
         {#if progress}
           <span class="tn">Unbinding {progress.done.toLocaleString()} of {progress.total.toLocaleString()}…</span>
-          <button class="btn btn-secondary btn-small" type="button" onclick={() => (stopRequested = true)}>
+          <button class="btn btn-secondary btn-sm" type="button" onclick={() => (stopRequested = true)}>
             Stop
           </button>
         {:else}
           <button
-            class="btn btn-primary btn-small"
+            class="btn btn-primary btn-sm"
             type="button"
             disabled={applying || !bindPlan || bindPlan.change.length === 0}
             onclick={() => (confirmBind = true)}
@@ -634,10 +634,6 @@
 />
 
 <style>
-  .status {
-    margin-bottom: 12px;
-  }
-
   .success-banner {
     padding: 10px 14px;
     border-radius: var(--sw-radius-md);
@@ -653,7 +649,6 @@
   }
 
   .card {
-    padding: 20px;
     margin-bottom: 16px;
   }
 
@@ -667,17 +662,6 @@
   .filter-input {
     flex: 1;
     max-width: 320px;
-    padding: 7px 10px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 12px;
-    outline: none;
-  }
-
-  .filter-input:focus {
-    border-color: var(--sw-accent);
   }
 
   .filter-row .select,
@@ -688,37 +672,6 @@
   .filter-count {
     font-size: 12px;
     color: var(--sw-text-muted);
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  th {
-    text-align: left;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--sw-text-muted);
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--sw-border-default);
-    white-space: nowrap;
-  }
-
-  td {
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--sw-border-default);
-    vertical-align: middle;
-  }
-
-  tbody tr:last-child td {
-    border-bottom: none;
   }
 
   .device-name {
@@ -732,7 +685,6 @@
   }
 
   .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
     white-space: nowrap;
   }
 
@@ -830,36 +782,10 @@
     cursor: not-allowed;
   }
 
-  .btn-small {
-    padding: 4px 10px;
-    font-size: 12px;
-  }
-
-  .btn-danger-ghost {
-    color: var(--sw-danger);
-  }
-
   .grid-2 {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     gap: 12px;
-  }
-
-  .import-text {
-    width: 100%;
-    padding: 9px 12px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 12px;
-    resize: vertical;
-    outline: none;
-    white-space: pre;
-  }
-
-  .import-text:focus {
-    border-color: var(--sw-accent);
   }
 
   .editor-actions {

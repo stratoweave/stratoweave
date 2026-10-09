@@ -14,9 +14,3 @@
   usage={{ boundDevices: 0, defaultOf: [] }}
   now={Date.now() / 1000}
 />
-
-<style>
-  .status {
-    margin-bottom: 12px;
-  }
-</style>

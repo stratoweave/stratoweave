@@ -476,11 +476,6 @@
     color: var(--sw-text-muted);
   }
 
-  .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
-    font-variant-numeric: tabular-nums;
-  }
-
   /* Editing */
   .cal.editable {
     user-select: none;

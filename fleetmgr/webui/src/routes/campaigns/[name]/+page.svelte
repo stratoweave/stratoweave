@@ -472,7 +472,7 @@
             {/if}
           {/each}
           <input
-            class="search mono"
+            class="input compact mono search"
             type="text"
             placeholder="find device (glob with * and ?)"
             bind:value={searchText}
@@ -497,10 +497,6 @@
 />
 
 <style>
-  .status {
-    margin-bottom: 12px;
-  }
-
   .summary {
     margin: 4px 0 0;
     color: var(--sw-text-secondary);
@@ -513,7 +509,6 @@
   }
 
   .card {
-    padding: 20px;
     margin-bottom: 16px;
   }
 
@@ -646,43 +641,12 @@
     margin: 12px 0;
   }
 
-  .chip {
-    font-size: 12px;
-    padding: 3px 10px;
-    border-radius: 999px;
-    border: 1px solid var(--sw-border-default);
-    color: var(--sw-text-secondary);
-    background: var(--sw-bg-elevated);
-    cursor: pointer;
-  }
-
-  .chip.active {
-    color: var(--sw-accent);
-    border-color: var(--sw-accent-glow-strong);
-    background: var(--sw-accent-glow);
-  }
-
   .search {
+    width: auto;
     margin-left: auto;
-    padding: 5px 10px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 12px;
-    outline: none;
-  }
-
-  .search:focus {
-    border-color: var(--sw-accent);
   }
 
   .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
     word-break: break-all;
-  }
-
-  .btn-danger-ghost {
-    color: var(--sw-danger);
   }
 </style>

@@ -256,7 +256,7 @@
             <span class="kick">Rule {index + 1}</span>
             <span class="rule-preview mono">{rulePreview(w)}</span>
             <button
-              class="btn btn-secondary btn-small btn-danger-ghost"
+              class="btn btn-secondary btn-sm btn-danger-ghost"
               type="button"
               onclick={() => removeRule(w.id)}
             >
@@ -264,35 +264,27 @@
             </button>
           </div>
           <div class="rule-fields">
-            <label class="field">
-              <span class="field-label">Opens at</span>
-              <input
-                class="input mono"
-                class:has-error={!!errors[`window.${w.id}.at`]}
-                type="text"
-                value={w.at}
-                placeholder="22:00"
-                oninput={(e) => patchWindow(w.id, { at: e.currentTarget.value })}
-                onblur={() => (touched = true)}
-              />
-              <small class="field-error">{errors[`window.${w.id}.at`] ?? ''}</small>
-            </label>
-            <label class="field">
-              <span class="field-label">Duration</span>
-              <input
-                class="input mono"
-                class:has-error={!!errors[`window.${w.id}.duration`]}
-                type="text"
-                value={w.duration}
-                placeholder="4h"
-                oninput={(e) => patchWindow(w.id, { duration: e.currentTarget.value })}
-                onblur={() => (touched = true)}
-              />
-              <small class="field-error">{errors[`window.${w.id}.duration`] ?? ''}</small>
-            </label>
+            <FieldText
+              label="Opens at"
+              value={w.at}
+              error={errors[`window.${w.id}.at`]}
+              mono={true}
+              placeholder="22:00"
+              onchange={(v) => patchWindow(w.id, { at: v })}
+              ontouch={() => (touched = true)}
+            />
+            <FieldText
+              label="Duration"
+              value={w.duration}
+              error={errors[`window.${w.id}.duration`]}
+              mono={true}
+              placeholder="4h"
+              onchange={(v) => patchWindow(w.id, { duration: v })}
+              ontouch={() => (touched = true)}
+            />
           </div>
           <div class="field">
-            <span class="field-label">Weekdays</span>
+            <span class="field__label">Weekdays</span>
             <div class="days">
               {#each WEEKDAYS as day (day)}
                 <button
@@ -310,7 +302,7 @@
         </div>
       {/each}
       <div class="rule-actions">
-        <button class="btn btn-secondary btn-small" type="button" onclick={addRule}>Add a rule</button>
+        <button class="btn btn-secondary btn-sm" type="button" onclick={addRule}>Add a rule</button>
         {#each validation.warnings as warning (warning)}
           <span class="warning">{warning}</span>
         {/each}
@@ -337,7 +329,7 @@
       <p class="hint">None within the planner's {HORIZON_DAYS} days.</p>
     {:else}
       <div class="table-wrap">
-        <table>
+        <table class="dense">
           <thead>
             <tr>
               <th>Opens</th>
@@ -381,10 +373,6 @@
     gap: 8px;
   }
 
-  .status {
-    margin-bottom: 12px;
-  }
-
   .editor {
     display: grid;
     grid-template-columns: minmax(360px, 440px) minmax(0, 1fr);
@@ -396,10 +384,6 @@
     .editor {
       grid-template-columns: 1fr;
     }
-  }
-
-  .card {
-    padding: 20px;
   }
 
   .grid-2 {
@@ -436,48 +420,6 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 10px;
-  }
-
-  .field {
-    display: grid;
-    gap: 6px;
-    align-content: start;
-  }
-
-  .field-label {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--sw-text-label);
-  }
-
-  .input {
-    width: 100%;
-    padding: 9px 12px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 12px;
-    outline: none;
-  }
-
-  .input:focus {
-    border-color: var(--sw-accent);
-    box-shadow: 0 0 0 3px var(--sw-accent-glow);
-  }
-
-  .input.has-error {
-    border-color: var(--sw-danger);
-    box-shadow: 0 0 0 3px var(--sw-danger-dim);
-  }
-
-  .field-error {
-    min-height: 1rem;
-    font-size: 11px;
-    color: var(--sw-danger);
   }
 
   .days {
@@ -540,55 +482,5 @@
     font-size: 12px;
     color: var(--sw-text-muted);
     margin: 8px 0 0;
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  th {
-    text-align: left;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--sw-text-muted);
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--sw-border-default);
-    white-space: nowrap;
-    background: none;
-  }
-
-  td {
-    padding: 7px 10px;
-    border-bottom: 1px solid var(--sw-border-default);
-    vertical-align: middle;
-  }
-
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
-
-  .right {
-    text-align: right;
-  }
-
-  .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .btn-small {
-    padding: 4px 10px;
-    font-size: 12px;
-  }
-
-  .btn-danger-ghost {
-    color: var(--sw-danger);
   }
 </style>

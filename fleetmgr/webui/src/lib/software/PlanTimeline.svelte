@@ -349,22 +349,6 @@
     gap: 6px;
   }
 
-  .chip {
-    font-size: 12px;
-    padding: 2px 9px;
-    border-radius: 999px;
-    border: 1px solid var(--sw-border-default);
-    color: var(--sw-text-secondary);
-    background: var(--sw-bg-elevated);
-    cursor: pointer;
-  }
-
-  .chip.active {
-    color: var(--sw-accent);
-    border-color: var(--sw-accent-glow-strong);
-    background: var(--sw-accent-glow);
-  }
-
   .scroller {
     overflow-x: auto;
     overflow-y: hidden;

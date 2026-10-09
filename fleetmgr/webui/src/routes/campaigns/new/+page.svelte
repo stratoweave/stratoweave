@@ -196,12 +196,7 @@
 </section>
 
 <style>
-  .status {
-    margin-bottom: 12px;
-  }
-
   .card {
-    padding: 20px;
     margin-bottom: 16px;
   }
 

@@ -167,10 +167,6 @@
 </section>
 
 <style>
-  .status {
-    margin-bottom: 12px;
-  }
-
   .kpis {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -201,52 +197,11 @@
   }
 
   .card {
-    padding: 20px;
     margin-bottom: 16px;
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  th {
-    text-align: left;
-    font-size: 10.5px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.09em;
-    color: var(--sw-text-muted);
-    padding: 9px 10px;
-    border-bottom: 1px solid var(--sw-border-subtle);
-    white-space: nowrap;
-  }
-
-  th.right {
-    text-align: right;
   }
 
   .state-col {
     width: 290px;
-  }
-
-  td {
-    padding: 11px 10px;
-    border-bottom: 1px solid var(--sw-border-subtle);
-    vertical-align: middle;
-  }
-
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
-
-  td.right {
-    text-align: right;
   }
 
   .campaign-name {
@@ -275,13 +230,5 @@
 
   .failed-cell {
     color: var(--sw-danger);
-  }
-
-  .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
-  }
-
-  .tn {
-    font-variant-numeric: tabular-nums;
   }
 </style>

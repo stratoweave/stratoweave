@@ -46,6 +46,7 @@
   </span>
   <input
     type={password ? 'password' : 'text'}
+    class="input"
     class:mono
     class:has-error={!!error}
     aria-invalid={error ? 'true' : undefined}
@@ -59,20 +60,6 @@
 </label>
 
 <style>
-  .field {
-    display: grid;
-    gap: 6px;
-  }
-
-  .field__label {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--sw-text-label);
-  }
-
   .field__required {
     color: var(--sw-danger);
     font-weight: 700;
@@ -88,51 +75,5 @@
     background: var(--sw-bg-deep);
     padding: 1px 6px;
     border-radius: 3px;
-  }
-
-  input {
-    width: 100%;
-    padding: 9px 12px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 13px;
-    transition: border-color 0.15s, box-shadow 0.15s;
-    outline: none;
-  }
-
-  input::placeholder {
-    color: var(--sw-text-muted);
-  }
-
-  input:focus {
-    border-color: var(--sw-accent);
-    box-shadow: 0 0 0 3px var(--sw-accent-glow);
-  }
-
-  input.has-error {
-    border-color: var(--sw-danger);
-    box-shadow: 0 0 0 3px var(--sw-danger-dim);
-  }
-
-  input.mono {
-    font-family: var(--sw-font-mono);
-    font-size: 12px;
-  }
-
-  input:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
-  .field__meta {
-    min-height: 1rem;
-    font-size: 11px;
-    color: var(--sw-text-muted);
-  }
-
-  .field__meta--error {
-    color: var(--sw-danger);
   }
 </style>
