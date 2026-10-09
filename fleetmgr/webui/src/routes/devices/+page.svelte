@@ -11,7 +11,7 @@
   import { bindPatch, unbindDevice } from '$lib/maintenance/binding';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
   import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device, type Schedule } from '$lib/software/model';
-  import { nameMatches } from '$lib/software/selection';
+  import { nameMatcher } from '$lib/software/selection';
   import {
     IMPORT_BATCH,
     assignNodes,
@@ -72,14 +72,12 @@
 
   // The API returns devices in no particular order; ranges and pages need one.
   let sorted = $derived([...data.devices].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));
-  let filtered = $derived(
-    sorted.filter(
-      (d) =>
-        nameMatches(d.name, filterText.trim()) &&
-        (!filterType || d.type === filterType) &&
-        scheduleMatches(d, filterSchedule)
-    )
-  );
+  let filtered = $derived.by(() => {
+    const matchName = nameMatcher(filterText.trim());
+    return sorted.filter(
+      (d) => matchName(d.name) && (!filterType || d.type === filterType) && scheduleMatches(d, filterSchedule)
+    );
+  });
   let paged = $derived(paginate(filtered, page, PAGE_SIZE));
   let visible = $derived(paged.rows);
 

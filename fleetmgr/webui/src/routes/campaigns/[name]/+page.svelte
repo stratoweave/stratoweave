@@ -24,7 +24,7 @@
     type PlanningDraft
   } from '$lib/software/planning-form';
   import { RateTracker, formatEta } from '$lib/software/rate';
-  import { nameMatches } from '$lib/software/selection';
+  import { nameMatcher } from '$lib/software/selection';
   import {
     CAMPAIGN_LIST_ROOT,
     DATA_ROOT,
@@ -170,13 +170,12 @@
     return counts;
   });
 
-  let filteredRows = $derived(
-    (campaign?.deviceStatus ?? []).filter(
-      (r) =>
-        (!filterStatus || r.status === filterStatus) &&
-        nameMatches(r.device, searchText.trim())
-    )
-  );
+  let filteredRows = $derived.by(() => {
+    const matchName = nameMatcher(searchText.trim());
+    return (campaign?.deviceStatus ?? []).filter(
+      (r) => (!filterStatus || r.status === filterStatus) && matchName(r.device)
+    );
+  });
   let paged = $derived(paginate(filteredRows, page, PAGE_SIZE));
 
   // No "done" claim anywhere: status is not latched, it tracks live device

@@ -411,10 +411,8 @@ function parseCampaign(entry: CampaignJson): Campaign {
   }
   // Configured members joined with reported rows; a member the state does
   // not mention yet renders as unknown.
-  const names = [...members];
-  for (const device of reported.keys()) {
-    if (!names.includes(device)) names.push(device);
-  }
+  const memberSet = new Set(members);
+  const names = [...members, ...[...reported.keys()].filter((device) => !memberSet.has(device))];
   return {
     name: entry.name,
     targetRelease: entry['target-release'] ?? '',
@@ -473,6 +471,12 @@ export function parseSchedules(json: unknown): Schedule[] {
   });
   schedules.sort((a, b) => a.name.localeCompare(b.name));
   return schedules;
+}
+
+/** Parse a GET of data/fleetmgr:fleet/device={name}. */
+export function parseDeviceEntry(json: unknown): Device | null {
+  const entries = (json as { 'fleetmgr:device'?: DeviceJson[] })?.['fleetmgr:device'];
+  return entries && entries.length > 0 ? parseDevice(entries[0]) : null;
 }
 
 export function parseCampaignEntry(json: unknown): Campaign | null {

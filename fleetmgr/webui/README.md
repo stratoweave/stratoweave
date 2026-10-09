@@ -62,10 +62,12 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   window. Members in no plan window are not actuated; the UI shows them as
   one count that expands to the device list. The plan timeline draws these
   times on the wall clock with a marker for now.
-- Polling is two-tier: campaigns up to 600 members get a fresh entry GET
-  (~120 B per member) every 1.5 s; everything refreshes from the slow
-  snapshot (on open, every 12-30 s, and when `failed` moves). Nothing
-  ever polls `GET /restconf/data` — it also hauls the full yang-library.
+- Polling is two-tier. The campaign page GETs its campaign's entry
+  (~120 B per member) every 1.5 s when it has up to 600 members, and
+  reloads its snapshot on open, every 12 s and when `failed` moves. The
+  list page GETs the entries of the first six running campaigns of up to
+  600 members every 2 s, and reloads the list every 30 s. Nothing ever
+  polls `GET /restconf/data` — it also hauls the full yang-library.
   Paths into a campaign's oper state (`.../state/total`) currently fail
   upstream, which is why fresh counters cost a whole entry.
 - Schedules are the shared `maintenance:schedules` entries: a name, a
