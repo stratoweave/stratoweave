@@ -2,13 +2,16 @@
   import { onDestroy, untrack } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import { errorText } from '$lib/core/errors';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
+  import Pager, { paginate } from '$lib/core/ui/Pager.svelte';
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import Section from '$lib/core/ui/Section.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
   import { bindPatch, unbindDevice } from '$lib/maintenance/binding';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
   import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device, type Schedule } from '$lib/software/model';
+  import { nameMatches } from '$lib/software/selection';
   import {
     IMPORT_BATCH,
     assignNodes,
@@ -67,18 +70,6 @@
     return device.schedule === filter.slice(1);
   }
 
-  function nameMatches(name: string, filter: string): boolean {
-    if (!filter) return true;
-    if (filter.includes('*') || filter.includes('?')) {
-      const rx = new RegExp(
-        `^${filter.replace(/[.+^${}()|[\]\\]/g, '\\$&').replaceAll('*', '.*').replaceAll('?', '.')}$`,
-        'i'
-      );
-      return rx.test(name);
-    }
-    return name.toLowerCase().includes(filter.toLowerCase());
-  }
-
   // The API returns devices in no particular order; ranges and pages need one.
   let sorted = $derived([...data.devices].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));
   let filtered = $derived(
@@ -89,9 +80,8 @@
         scheduleMatches(d, filterSchedule)
     )
   );
-  let pageCount = $derived(Math.max(1, Math.ceil(filtered.length / PAGE_SIZE)));
-  let currentPage = $derived(Math.min(page, pageCount));
-  let visible = $derived(filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE));
+  let paged = $derived(paginate(filtered, page, PAGE_SIZE));
+  let visible = $derived(paged.rows);
 
   // The selection is by name and survives filter and page changes; the bar
   // says how many selected devices the filter hides.
@@ -217,7 +207,7 @@
         bindError = `Stopped after unbinding ${done} of ${devicesText(names.length)}.`;
       }
     } catch (writeError) {
-      const reason = writeError instanceof Error ? writeError.message : 'the write failed';
+      const reason = errorText(writeError, 'the write failed');
       bindError = plan.schedule
         ? `Nothing bound: ${reason}`
         : `Unbound ${done} of ${devicesText(names.length)}; ${current} failed: ${reason}`;
@@ -274,7 +264,7 @@
     } catch (saveError) {
       statusMessage = {
         type: 'error',
-        text: saveError instanceof Error ? saveError.message : 'Failed to add the device.'
+        text: errorText(saveError, 'Failed to add the device.')
       };
     } finally {
       saving = false;
@@ -317,7 +307,7 @@
     } catch (importError) {
       statusMessage = {
         type: 'error',
-        text: importError instanceof Error ? importError.message : 'Import failed.'
+        text: errorText(importError, 'Import failed.')
       };
     } finally {
       saving = false;
@@ -336,7 +326,7 @@
     } catch (deleteError) {
       statusMessage = {
         type: 'error',
-        text: deleteError instanceof Error ? deleteError.message : 'Failed to remove the device.'
+        text: errorText(deleteError, 'Failed to remove the device.')
       };
     } finally {
       deleting = false;
@@ -569,17 +559,7 @@
         </tbody>
       </table>
     </div>
-    {#if pageCount > 1}
-      <div class="pager">
-        <button class="btn btn-secondary btn-small" type="button" disabled={currentPage <= 1} onclick={() => (page = currentPage - 1)}>
-          ‹
-        </button>
-        <span>page {currentPage} / {pageCount}</span>
-        <button class="btn btn-secondary btn-small" type="button" disabled={currentPage >= pageCount} onclick={() => (page = currentPage + 1)}>
-          ›
-        </button>
-      </div>
-    {/if}
+    <Pager page={paged.page} pageCount={paged.pageCount} onchange={(p) => (page = p)} />
     {#if chosen.length > 0}
       <div class="selection-bar">
         <span class="tn"><strong>{chosen.length.toLocaleString()}</strong> selected</span>
@@ -865,16 +845,6 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     gap: 12px;
-  }
-
-  .pager {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    justify-content: flex-end;
-    margin-top: 10px;
-    font-size: 12px;
-    color: var(--sw-text-secondary);
   }
 
   .import-text {

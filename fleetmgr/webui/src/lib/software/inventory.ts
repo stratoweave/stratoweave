@@ -11,6 +11,11 @@ export interface NewDeviceInput {
 /** Devices per PATCH when importing in bulk. */
 export const IMPORT_BATCH = 100;
 
+function validPort(text: string): boolean {
+  const n = Number(text);
+  return Number.isInteger(n) && n >= 1 && n <= 65535;
+}
+
 export function validateNewDevice(
   input: NewDeviceInput,
   existingNames: string[]
@@ -27,8 +32,7 @@ export function validateNewDevice(
   }
   const port = input.port.trim();
   if (port) {
-    const value = Number(port);
-    if (!Number.isInteger(value) || value < 1 || value > 65535) {
+    if (!validPort(port)) {
       errors['port'] = 'Port must be 1-65535.';
     } else if (!input.address.trim()) {
       errors['port'] = 'A port needs an address.';
@@ -68,7 +72,7 @@ export function parseImport(
       skippedExisting.push(name);
       continue;
     }
-    if (port && (!Number.isInteger(Number(port)) || Number(port) < 1 || Number(port) > 65535)) {
+    if (port && !validPort(port)) {
       errors.push(`line ${index + 1}: bad port ${port}`);
       continue;
     }

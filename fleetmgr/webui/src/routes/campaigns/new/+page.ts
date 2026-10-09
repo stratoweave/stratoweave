@@ -1,3 +1,4 @@
+import { errorText } from '$lib/core/errors';
 import { restconfGetOrNull } from '$lib/core/restconf/client';
 import {
   FLEET_ROOT,
@@ -24,7 +25,7 @@ export const load: PageLoad = async ({ fetch }) => {
       loadError: ''
     };
   } catch (loadError) {
-    const message = loadError instanceof Error ? loadError.message : 'Failed to load inventory.';
+    const message = errorText(loadError, 'Failed to load inventory.');
     return { devices: [], campaigns: [], schedules: [], loadError: message };
   }
 };

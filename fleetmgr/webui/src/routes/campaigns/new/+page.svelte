@@ -1,6 +1,7 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
 
+  import { errorText } from '$lib/core/errors';
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import Section from '$lib/core/ui/Section.svelte';
   import PlanningFields from '$lib/software/PlanningFields.svelte';
@@ -79,7 +80,7 @@
       );
       await goto(`/campaigns/${encodeURIComponent(campaign)}`, { invalidateAll: true });
     } catch (error) {
-      createError = error instanceof Error ? error.message : 'Failed to create the campaign.';
+      createError = errorText(error, 'Failed to create the campaign.');
     } finally {
       creating = false;
     }

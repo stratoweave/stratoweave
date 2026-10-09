@@ -4,8 +4,8 @@
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import { scheduleRulesText } from '$lib/maintenance/schedule-form';
   import { DEFAULT_MAX_RATE, DEFAULT_TARGET_RATE, type Schedule } from './model';
-  import { atOnceText, toLocalInput, type PaceBy, type PlanningDraft } from './planning-form';
-  import { formatDuration } from './time';
+  import { atOnceText, type PaceBy, type PlanningDraft } from './planning-form';
+  import { formatDuration, toLocalInput } from '$lib/core/time';
 
   interface Props {
     schedules: Schedule[];

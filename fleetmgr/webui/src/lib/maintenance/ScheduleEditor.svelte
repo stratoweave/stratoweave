@@ -2,6 +2,7 @@
   import { untrack } from 'svelte';
   import { goto } from '$app/navigation';
 
+  import { errorText } from '$lib/core/errors';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import Section from '$lib/core/ui/Section.svelte';
@@ -19,7 +20,6 @@
     draftFromSchedule,
     draftToSchedule,
     emptyDraft,
-    formatTimeOfDay,
     newWindowDraft,
     parseTimeOfDay,
     parseUtcOffset,
@@ -33,8 +33,14 @@
     type WindowDraft
   } from '$lib/maintenance/schedule-form';
   import { DATA_ROOT, SCHEDULE_LIST_ROOT, type MaintenanceWindow, type Schedule } from '$lib/software/model';
-  import { clockLabel, dayLabel, sameLocalDay } from '$lib/software/plan-timeline';
-  import { formatDuration, parseDuration } from '$lib/software/time';
+  import {
+    clockLabel,
+    dayLabel,
+    formatDuration,
+    formatTimeOfDay,
+    parseDuration,
+    sameLocalDay
+  } from '$lib/core/time';
 
   interface Props {
     /** null creates a new schedule. */
@@ -99,12 +105,7 @@
     // on the key.
     const ats = draft.windows.map((w) => parseTimeOfDay(w.at)).filter((a): a is number => a !== null);
     const at = ats.length > 0 ? (Math.max(...ats) + 3600) % 86400 : 79200;
-    const h = Math.floor(at / 3600);
-    const m = Math.floor((at % 3600) / 60);
-    draft = {
-      ...draft,
-      windows: [...draft.windows, newWindowDraft({ at: `${h < 10 ? '0' : ''}${h}:${m < 10 ? '0' : ''}${m}` })]
-    };
+    draft = { ...draft, windows: [...draft.windows, newWindowDraft({ at: formatTimeOfDay(at - (at % 60)) })] };
   }
 
   // The calendar moves or resizes a rule, or adds one; the rows follow.
@@ -159,7 +160,7 @@
       // Not a preload made before the write (hovering Cancel makes one).
       await goto('/schedules', { invalidateAll: true });
     } catch (saveError) {
-      statusMessage = saveError instanceof Error ? saveError.message : 'Failed to save the schedule.';
+      statusMessage = errorText(saveError, 'Failed to save the schedule.');
     } finally {
       saving = false;
     }
@@ -174,7 +175,7 @@
       await restconfDelete(getListEntryPath(SCHEDULE_LIST_ROOT, schedule.name));
       await goto('/schedules', { invalidateAll: true });
     } catch (deleteError) {
-      statusMessage = deleteError instanceof Error ? deleteError.message : 'Failed to delete the schedule.';
+      statusMessage = errorText(deleteError, 'Failed to delete the schedule.');
     } finally {
       deleting = false;
     }

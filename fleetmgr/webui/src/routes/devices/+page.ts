@@ -1,3 +1,4 @@
+import { errorText } from '$lib/core/errors';
 import { restconfGetOrNull } from '$lib/core/restconf/client';
 import { FLEET_ROOT, SCHEDULES_ROOT, parseFleet, parseSchedules } from '$lib/software/model';
 
@@ -16,7 +17,7 @@ export const load: PageLoad = async ({ fetch, depends, url }) => {
     const { nodes, devices } = parseFleet(response);
     return { nodes, devices, schedules: parseSchedules(schedules), scheduleFilter, loadError: '' };
   } catch (loadError) {
-    const message = loadError instanceof Error ? loadError.message : 'Failed to load devices.';
+    const message = errorText(loadError, 'Failed to load devices.');
     return { nodes: [], devices: [], schedules: [], scheduleFilter, loadError: message };
   }
 };

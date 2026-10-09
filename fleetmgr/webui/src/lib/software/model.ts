@@ -132,7 +132,7 @@ interface DataTreeJson {
 }
 
 /** GET data/software:software/upgrade-campaign={name} */
-export interface CampaignEntryJson {
+interface CampaignEntryJson {
   'software:upgrade-campaign'?: CampaignJson[];
 }
 

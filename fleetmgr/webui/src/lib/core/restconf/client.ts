@@ -151,3 +151,19 @@ function getListWrapperKey(restconfRoot: string): string {
 export function wrapListEntryBody(restconfRoot: string, entry: unknown): Record<string, unknown[]> {
   return { [getListWrapperKey(restconfRoot)]: [entry] };
 }
+
+/** Read a list entry, change it and PUT it back whole. This is how a leaf
+ * is removed: DELETE on a leaf returns 500 upstream and a PATCH only
+ * merges. `edit` gets the entry as read and returns null to leave it be. */
+export async function rewriteListEntry(
+  root: string,
+  key: string,
+  edit: (entry: Record<string, unknown>) => Record<string, unknown> | null
+): Promise<void> {
+  const path = getListEntryPath(root, key);
+  const got = await restconfGetJson<Record<string, Record<string, unknown>[]>>(path);
+  const entry = got?.[getListWrapperKey(root)]?.[0];
+  if (!entry) throw new Error(`${key} no longer exists.`);
+  const next = edit(entry);
+  if (next !== null) await restconfPutJson(path, wrapListEntryBody(root, next));
+}

@@ -325,25 +325,6 @@ export function axisTicks(axis: Axis, step: number): number[] {
   return out;
 }
 
-/** Local wall clock "13:07" for a Unix time. */
-export function clockLabel(unix: number): string {
-  const d = new Date(unix * 1000);
-  const h = d.getHours();
-  const m = d.getMinutes();
-  return `${h < 10 ? '0' : ''}${h}:${m < 10 ? '0' : ''}${m}`;
-}
-
-/** Local day "Tue 22 Sep" for a Unix time. */
-export function dayLabel(unix: number): string {
-  return new Date(unix * 1000).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
-}
-
-export function sameLocalDay(a: number, b: number): boolean {
-  const da = new Date(a * 1000);
-  const db = new Date(b * 1000);
-  return da.getFullYear() === db.getFullYear() && da.getMonth() === db.getMonth() && da.getDate() === db.getDate();
-}
-
 const DONE = new Set<KnownStatus>(['succeeded', 'failed', 'rolled-back', 'up-to-date']);
 
 /** Share of a window's devices that have settled, 0..1. */

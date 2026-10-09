@@ -1,3 +1,4 @@
+import { errorText } from '$lib/core/errors';
 import { restconfGetOrNull } from '$lib/core/restconf/client';
 import { SOFTWARE_ROOT, parseCampaigns } from '$lib/software/model';
 
@@ -10,7 +11,7 @@ export const load: PageLoad = async ({ fetch, depends }) => {
     const response = await restconfGetOrNull<unknown>(SOFTWARE_ROOT, fetch);
     return { campaigns: parseCampaigns(response), loadError: '' };
   } catch (loadError) {
-    const message = loadError instanceof Error ? loadError.message : 'Failed to load campaigns.';
+    const message = errorText(loadError, 'Failed to load campaigns.');
     return { campaigns: [], loadError: message };
   }
 };

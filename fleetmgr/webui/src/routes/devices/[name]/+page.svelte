@@ -2,14 +2,16 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import AdminStatePill from '$lib/software/AdminStatePill.svelte';
   import StageChain from '$lib/software/StageChain.svelte';
   import StatusPill from '$lib/software/StatusPill.svelte';
+  import { errorText } from '$lib/core/errors';
   import { createPoller } from '$lib/core/polling/poller';
   import { setDeviceSchedule } from '$lib/maintenance/binding';
   import { scheduleRulesText } from '$lib/maintenance/schedule-form';
   import type { Campaign, Device, Schedule } from '$lib/software/model';
   import { stageDetail } from '$lib/software/stages';
-  import { formatClock } from '$lib/software/time';
+  import { formatClock } from '$lib/core/time';
 
   let {
     data
@@ -50,7 +52,7 @@
     } catch (saveError) {
       scheduleMessage = {
         type: 'error',
-        text: saveError instanceof Error ? saveError.message : 'Failed to save the schedule.'
+        text: errorText(saveError, 'Failed to save the schedule.')
       };
     } finally {
       savingSchedule = false;
@@ -173,10 +175,7 @@
                 </td>
                 <td class="mono tn">{campaign.targetRelease}</td>
                 <td>
-                  <span class="pill" class:pill-run={campaign.adminState === 'run'} class:muted={campaign.adminState === 'plan'}>
-                    <span class="dot"></span>
-                    {campaign.adminState}
-                  </span>
+                  <AdminStatePill state={campaign.adminState} />
                 </td>
                 <td class="mono tn">{plannedStart(campaign)}</td>
                 <td>

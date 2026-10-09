@@ -1,3 +1,4 @@
+import { errorText } from '$lib/core/errors';
 import { getListEntryPath, restconfGetJson, restconfGetOrNull } from '$lib/core/restconf/client';
 import {
   CAMPAIGN_LIST_ROOT,
@@ -29,7 +30,7 @@ export const load: PageLoad = async ({ fetch, depends, params }) => {
     ]);
     return { name: params.name, campaign: parseCampaignEntry(response), schedules, loadError: '' };
   } catch (loadError) {
-    const message = loadError instanceof Error ? loadError.message : 'Failed to load the campaign.';
+    const message = errorText(loadError, 'Failed to load the campaign.');
     return { name: params.name, campaign: null, schedules: [] as Schedule[], loadError: message };
   }
 };

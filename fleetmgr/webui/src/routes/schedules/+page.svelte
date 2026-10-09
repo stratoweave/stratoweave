@@ -5,8 +5,9 @@
   import { createPoller } from '$lib/core/polling/poller';
   import WeekCalendar from '$lib/maintenance/WeekCalendar.svelte';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
-  import { formatUtcOffset, scheduleRulesText, scheduleUsage } from '$lib/maintenance/schedule-form';
+  import { scheduleRulesText, scheduleUsage } from '$lib/maintenance/schedule-form';
   import type { Campaign, Device, Schedule } from '$lib/software/model';
+  import { formatUtcOffset } from '$lib/core/time';
 
   let {
     data

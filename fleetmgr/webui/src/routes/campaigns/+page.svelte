@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import AdminStatePill from '$lib/software/AdminStatePill.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
@@ -127,10 +128,7 @@
               </td>
               <td class="mono tn">{campaign.targetRelease}</td>
               <td>
-                <span class="pill" class:pill-run={campaign.adminState === 'run'} class:muted={campaign.adminState === 'plan'}>
-                  <span class="dot"></span>
-                  {campaign.adminState}
-                </span>
+                <AdminStatePill state={campaign.adminState} />
               </td>
               <td class="tn right">{campaign.devices.length.toLocaleString()}</td>
               <td class="plan-cell">

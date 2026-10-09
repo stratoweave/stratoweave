@@ -8,11 +8,8 @@
     buildAxis,
     cellRects,
     chooseCells,
-    clockLabel,
     columnAt,
-    dayLabel,
     fitScale,
-    sameLocalDay,
     tickStep,
     windowDone,
     windowEnd,
@@ -20,7 +17,14 @@
     type Rect,
     type WindowCells
   } from '$lib/software/plan-timeline';
-  import { formatClock, formatClockSeconds, formatDuration } from '$lib/software/time';
+  import {
+    clockLabel,
+    dayLabel,
+    formatClock,
+    formatClockSeconds,
+    formatDuration,
+    sameLocalDay
+  } from '$lib/core/time';
 
   interface Props {
     plan: CampaignPlan;

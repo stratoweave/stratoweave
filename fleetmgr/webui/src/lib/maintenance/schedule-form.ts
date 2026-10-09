@@ -2,8 +2,14 @@
 // (a time of day, a duration, a UTC offset), validated into the model's
 // seconds and minutes, and turned into the YANG-JSON the API takes.
 
-import type { Campaign, Device, MaintenanceWindow, Schedule, ScheduleJson } from '../software/model';
-import { formatDuration, formatLocalTime, parseDuration } from '../software/time';
+import type { Campaign, Device, MaintenanceWindow, Schedule, ScheduleJson } from '$lib/software/model';
+import {
+  formatDuration,
+  formatLocalTime,
+  formatTimeOfDay,
+  formatUtcOffset,
+  parseDuration
+} from '$lib/core/time';
 import { WEEKDAYS } from './occurrences';
 
 export interface WindowDraft {
@@ -56,13 +62,6 @@ export function parseUtcOffset(text: string): number | null {
   return sign * (Number(m[2]) * 60 + minutes);
 }
 
-/** minutes -> "+01:00". */
-export function formatUtcOffset(minutes: number): string {
-  const sign = minutes < 0 ? '-' : '+';
-  const abs = Math.abs(minutes);
-  return `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
-}
-
 /** "22:00", "7:30", "12:07:18" -> seconds after midnight; null when
  * unparsable. The model counts seconds, so seconds are accepted. */
 export function parseTimeOfDay(text: string): number | null {
@@ -73,18 +72,6 @@ export function parseTimeOfDay(text: string): number | null {
   const sec = Number(m[3] ?? '0');
   if (h > 23 || min > 59 || sec > 59) return null;
   return h * 3600 + min * 60 + sec;
-}
-
-/** seconds after midnight -> "22:00", or "12:07:18" when the value does
- * not sit on a whole minute, so an edit round-trips the model's value. */
-export function formatTimeOfDay(seconds: number): string {
-  const hm = `${pad2(Math.floor(seconds / 3600))}:${pad2(Math.floor((seconds % 3600) / 60))}`;
-  const sec = seconds % 60;
-  return sec === 0 ? hm : `${hm}:${pad2(sec)}`;
-}
-
-function pad2(n: number): string {
-  return n < 10 ? `0${n}` : `${n}`;
 }
 
 export interface DraftValidation {

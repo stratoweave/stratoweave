@@ -2,7 +2,10 @@
   import { onMount } from 'svelte';
   import { goto, invalidate } from '$app/navigation';
 
+  import { errorText } from '$lib/core/errors';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
+  import Pager, { paginate } from '$lib/core/ui/Pager.svelte';
+  import AdminStatePill from '$lib/software/AdminStatePill.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
   import DeviceStatusTable from '$lib/software/DeviceStatusTable.svelte';
   import PlanningFields from '$lib/software/PlanningFields.svelte';
@@ -146,7 +149,7 @@
     } catch (saveError) {
       planningMessage = {
         type: 'error',
-        text: saveError instanceof Error ? saveError.message : 'Failed to save.'
+        text: errorText(saveError, 'Failed to save.')
       };
     } finally {
       planningSaving = false;
@@ -174,11 +177,7 @@
         nameMatches(r.device, searchText.trim())
     )
   );
-  let pageCount = $derived(Math.max(1, Math.ceil(filteredRows.length / PAGE_SIZE)));
-  let currentPage = $derived(Math.min(page, pageCount));
-  let visibleRows = $derived(
-    filteredRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
-  );
+  let paged = $derived(paginate(filteredRows, page, PAGE_SIZE));
 
   // No "done" claim anywhere: status is not latched, it tracks live device
   // state and regresses when the campaign goes back to plan.
@@ -256,7 +255,7 @@
       live = null;
       await invalidate('data:campaign');
     } catch (error) {
-      actionError = error instanceof Error ? error.message : 'The action failed.';
+      actionError = errorText(error, 'The action failed.');
     } finally {
       busy = false;
     }
@@ -316,10 +315,7 @@
       </div>
       <div class="fact">
         <span class="fact-label">Admin state</span>
-        <span class="pill" class:muted={campaign.adminState === 'plan'}>
-          <span class="dot"></span>
-          {campaign.adminState}
-        </span>
+        <AdminStatePill state={campaign.adminState} />
       </div>
       <div class="fact">
         <span class="fact-label">Image URL</span>
@@ -484,28 +480,8 @@
             oninput={() => (page = 1)}
           />
         </div>
-        <DeviceStatusTable rows={visibleRows} />
-        {#if pageCount > 1}
-          <div class="pager">
-            <button
-              class="btn btn-secondary btn-small"
-              type="button"
-              disabled={currentPage <= 1}
-              onclick={() => (page = currentPage - 1)}
-            >
-              ‹
-            </button>
-            <span>page {currentPage} / {pageCount}</span>
-            <button
-              class="btn btn-secondary btn-small"
-              type="button"
-              disabled={currentPage >= pageCount}
-              onclick={() => (page = currentPage + 1)}
-            >
-              ›
-            </button>
-          </div>
-        {/if}
+        <DeviceStatusTable rows={paged.rows} />
+        <Pager page={paged.page} pageCount={paged.pageCount} onchange={(p) => (page = p)} />
       {/if}
     {/if}
   </section>
@@ -560,7 +536,7 @@
     color: var(--sw-text-muted);
   }
 
-  .fact .pill {
+  .fact :global(.pill) {
     justify-self: start;
   }
 
@@ -705,21 +681,6 @@
   .mono {
     font-family: var(--sw-font-mono, ui-monospace, monospace);
     word-break: break-all;
-  }
-
-  .pager {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    justify-content: flex-end;
-    margin-top: 10px;
-    font-size: 12px;
-    color: var(--sw-text-secondary);
-  }
-
-  .btn-small {
-    padding: 4px 10px;
-    font-size: 12px;
   }
 
   .btn-danger-ghost {
