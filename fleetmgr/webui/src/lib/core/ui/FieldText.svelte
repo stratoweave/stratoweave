@@ -12,7 +12,6 @@
     /** Render as a password input: the value round-trips through the draft
      * but is never displayed as text. */
     password?: boolean;
-    validationKey?: number;
     onchange?: (next: string) => void;
     ontouch?: () => void;
   }
@@ -28,21 +27,11 @@
     disabled = false,
     mono = false,
     password = false,
-    validationKey = 0,
     onchange,
     ontouch
   }: Props = $props();
 
-  let touched = $state(false);
-
-  $effect(() => {
-    // Reset touched whenever validationKey bumps.
-    validationKey;
-    touched = false;
-  });
-
-  let visibleError = $derived(touched ? error : '');
-  let metaText = $derived(visibleError || help || '\u00A0');
+  let metaText = $derived(error || help || '\u00A0');
 </script>
 
 <label class="field">
@@ -58,18 +47,15 @@
   <input
     type={password ? 'password' : 'text'}
     class:mono
-    class:has-error={!!visibleError}
-    aria-invalid={visibleError ? 'true' : undefined}
+    class:has-error={!!error}
+    aria-invalid={error ? 'true' : undefined}
     {value}
     {placeholder}
     {disabled}
     oninput={(event) => onchange?.((event.currentTarget as HTMLInputElement).value)}
-    onblur={() => {
-      touched = true;
-      ontouch?.();
-    }}
+    onblur={() => ontouch?.()}
   />
-  <small class:field__meta--error={!!visibleError} class="field__meta">{metaText}</small>
+  <small class:field__meta--error={!!error} class="field__meta">{metaText}</small>
 </label>
 
 <style>

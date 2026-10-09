@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
@@ -10,8 +10,6 @@
   let {
     data
   }: { data: { campaigns: Campaign[]; loadError: string } } = $props();
-
-  let statusMessage = $state<string>(untrack(() => data.loadError));
 
   // Discovery (full campaign entries) refreshes slowly; running campaigns
   // get fresh counters from cheap entry GETs.
@@ -78,8 +76,8 @@
   <a class="btn btn-primary" href="/campaigns/new">New campaign</a>
 </div>
 
-{#if statusMessage}
-  <div class="error-state status">{statusMessage}</div>
+{#if data.loadError}
+  <div class="error-state status">{data.loadError}</div>
 {/if}
 
 <div class="kpis">

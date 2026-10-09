@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
   import StageChain from '$lib/software/StageChain.svelte';
@@ -22,8 +22,6 @@
       loadError: string;
     };
   } = $props();
-
-  let statusMessage = $state<string>(untrack(() => data.loadError));
 
   // null follows the device as polled; a pick holds until it is saved.
   let picked = $state<string | null>(null);
@@ -85,8 +83,8 @@
   }
 </script>
 
-{#if statusMessage}
-  <div class="error-state status">{statusMessage}</div>
+{#if data.loadError}
+  <div class="error-state status">{data.loadError}</div>
 {/if}
 
 {#if data.device === null}

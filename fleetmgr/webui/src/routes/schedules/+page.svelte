@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
   import { createPoller } from '$lib/core/polling/poller';
@@ -12,7 +12,6 @@
     data
   }: { data: { schedules: Schedule[]; devices: Device[]; campaigns: Campaign[]; loadError: string } } = $props();
 
-  let statusMessage = $state<string>(untrack(() => data.loadError));
   let now = $state(Date.now() / 1000);
 
   onMount(() => {
@@ -47,8 +46,8 @@
   <a class="btn btn-primary" href="/schedules/new">New schedule</a>
 </div>
 
-{#if statusMessage}
-  <div class="error-state status">{statusMessage}</div>
+{#if data.loadError}
+  <div class="error-state status">{data.loadError}</div>
 {/if}
 
 <section class="card">

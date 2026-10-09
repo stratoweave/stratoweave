@@ -38,11 +38,8 @@
   let importText = $state('');
   let importType = $state('iosxe');
   let touched = $state(false);
-  let validationKey = $state(0);
   let saving = $state(false);
-  let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(
-    untrack(() => (data.loadError ? { type: 'error', text: data.loadError } : null))
-  );
+  let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
   let deleteTarget = $state<Device | null>(null);
   let deleting = $state(false);
 
@@ -242,7 +239,6 @@
     draft = { name: '', type: 'iosxe', address: '', port: '' };
     importOpen = false;
     touched = false;
-    validationKey += 1;
     statusMessage = null;
   }
 
@@ -265,10 +261,7 @@
   async function handleAdd(): Promise<void> {
     if (!draft) return;
     touched = true;
-    if (!validation.ok) {
-      validationKey += 1;
-      return;
-    }
+    if (!validation.ok) return;
     try {
       saving = true;
       statusMessage = null;
@@ -372,6 +365,10 @@
   </div>
 </div>
 
+{#if data.loadError}
+  <div class="error-state status">{data.loadError}</div>
+{/if}
+
 {#if statusMessage}
   <div class={statusMessage.type === 'error' ? 'error-state status' : 'success-banner status'}>
     {statusMessage.text}
@@ -391,7 +388,6 @@
           required={true}
           value={draft.name}
           error={errors['name']}
-          {validationKey}
           yangType="string"
           placeholder="e.g., ce1"
           onchange={(value) => patch({ name: value })}
@@ -402,7 +398,6 @@
           required={true}
           value={draft.type}
           error={errors['type']}
-          {validationKey}
           yangType="string"
           mono={true}
           placeholder="iosxe"
@@ -413,7 +408,6 @@
           label="Management address"
           value={draft.address}
           error={errors['address']}
-          {validationKey}
           yangType="inet:host"
           mono={true}
           placeholder="hostname or IP"
@@ -424,7 +418,6 @@
           label="NETCONF port"
           value={draft.port}
           error={errors['port']}
-          {validationKey}
           yangType="uint16"
           mono={true}
           placeholder="830"

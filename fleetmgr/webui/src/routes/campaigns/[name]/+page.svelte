@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { goto, invalidate } from '$app/navigation';
 
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
@@ -44,9 +44,7 @@
   } = $props();
 
   let busy = $state(false);
-  let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(
-    untrack(() => (data.loadError ? { type: 'error', text: data.loadError } : null))
-  );
+  let actionError = $state('');
   let confirmAction = $state<'run' | 'plan' | 'delete' | null>(null);
 
   let devicesOpen = $state(false);
@@ -245,7 +243,7 @@
     if (!action) return;
     try {
       busy = true;
-      statusMessage = null;
+      actionError = '';
       if (action === 'delete') {
         await restconfDelete(getListEntryPath(CAMPAIGN_LIST_ROOT, data.name));
         // Not a preload made before the delete.
@@ -257,21 +255,16 @@
       // next fast tick.
       live = null;
       await invalidate('data:campaign');
-    } catch (actionError) {
-      statusMessage = {
-        type: 'error',
-        text: actionError instanceof Error ? actionError.message : 'The action failed.'
-      };
+    } catch (error) {
+      actionError = error instanceof Error ? error.message : 'The action failed.';
     } finally {
       busy = false;
     }
   }
 </script>
 
-{#if statusMessage}
-  <div class={statusMessage.type === 'error' ? 'error-state status' : 'success-banner status'}>
-    {statusMessage.text}
-  </div>
+{#if actionError || data.loadError}
+  <div class="error-state status">{actionError || data.loadError}</div>
 {/if}
 
 {#if campaign === null}
@@ -531,15 +524,6 @@
 <style>
   .status {
     margin-bottom: 12px;
-  }
-
-  .success-banner {
-    padding: 10px 14px;
-    border-radius: var(--sw-radius-md);
-    border: 1px solid rgb(var(--sw-accent-rgb) / 0.35);
-    background: var(--sw-accent-glow);
-    color: var(--sw-text-primary);
-    font-size: 13px;
   }
 
   .summary {

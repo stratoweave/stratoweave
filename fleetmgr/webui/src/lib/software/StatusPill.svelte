@@ -13,6 +13,7 @@
 
 <span
   class="pill"
+  class:pill-run={tone === 'accent'}
   class:success={tone === 'success'}
   class:warning={tone === 'warning'}
   class:danger={tone === 'danger'}

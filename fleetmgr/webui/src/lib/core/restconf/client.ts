@@ -9,6 +9,15 @@ const ASYNC_WRITE_HEADERS = { async: 'true' } as const;
 
 type Fetch = typeof fetch;
 
+export class RestconfError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(`RESTCONF ${status}: ${message}`);
+    this.status = status;
+  }
+}
+
 function normalizePath(path: string): string {
   return path.replace(/^\/+/, '');
 }
@@ -20,8 +29,7 @@ function encodeListKey(value: string): string {
 
 async function readResponse<T>(response: Response, readBody = true): Promise<T> {
   if (!response.ok) {
-    const message = (await response.text()) || response.statusText;
-    throw new Error(`RESTCONF ${response.status}: ${message}`);
+    throw new RestconfError(response.status, (await response.text()) || response.statusText);
   }
 
   if (!readBody) {
@@ -81,7 +89,7 @@ export async function restconfGetOrNull<T>(path: string, fetchFn: Fetch = fetch)
   try {
     return await restconfGetJson<T>(path, fetchFn);
   } catch (error) {
-    if (error instanceof Error && error.message.includes('404')) {
+    if (error instanceof RestconfError && error.status === 404) {
       return null;
     }
     throw error;

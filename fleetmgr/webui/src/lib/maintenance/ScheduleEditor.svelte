@@ -50,7 +50,6 @@
   const isNew = untrack(() => schedule === null);
   let draft = $state<ScheduleDraft>(untrack(() => (schedule ? draftFromSchedule(schedule) : emptyDraft())));
   let touched = $state(false);
-  let validationKey = $state(0);
   let saving = $state(false);
   let deleting = $state(false);
   let confirmDelete = $state(false);
@@ -138,8 +137,7 @@
   async function handleSave(): Promise<void> {
     touched = true;
     if (!validation.ok) {
-      // Fields show their own error once blurred; a field never visited
-      // would stay silent, so the banner names every problem.
+      // The banner also names problems scrolled out of view.
       statusMessage = `Not saved: ${[...new Set(Object.values(validation.errors))].join(' ')}`;
       return;
     }
@@ -232,7 +230,6 @@
           required={isNew}
           value={draft.name}
           error={errors['name']}
-          {validationKey}
           mono={true}
           disabled={!isNew}
           placeholder="e.g., europe"
@@ -243,7 +240,6 @@
           label="UTC offset"
           value={draft.utcOffset}
           error={errors['utc-offset']}
-          {validationKey}
           mono={true}
           placeholder="+01:00"
           help="no daylight saving"

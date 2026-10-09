@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
   import { goto } from '$app/navigation';
 
   import FieldText from '$lib/core/ui/FieldText.svelte';
@@ -44,9 +43,8 @@
   let planning = $state<PlanningDraft>(emptyPlanningDraft());
 
   let touched = $state(false);
-  let validationKey = $state(0);
   let creating = $state(false);
-  let statusMessage = $state<string>(untrack(() => data.loadError));
+  let createError = $state('');
 
   let errors = $derived({
     ...validateNewCampaign(
@@ -59,13 +57,10 @@
 
   async function handleCreate(): Promise<void> {
     touched = true;
-    if (Object.keys(errors).length > 0) {
-      validationKey += 1;
-      return;
-    }
+    if (Object.keys(errors).length > 0) return;
     try {
       creating = true;
-      statusMessage = '';
+      createError = '';
       const campaign = name.trim();
       const p = planningFromDraft(planning);
       await restconfPatchJson(
@@ -83,9 +78,8 @@
         })
       );
       await goto(`/campaigns/${encodeURIComponent(campaign)}`, { invalidateAll: true });
-    } catch (createError) {
-      statusMessage =
-        createError instanceof Error ? createError.message : 'Failed to create the campaign.';
+    } catch (error) {
+      createError = error instanceof Error ? error.message : 'Failed to create the campaign.';
     } finally {
       creating = false;
     }
@@ -102,8 +96,8 @@
   </div>
 </div>
 
-{#if statusMessage}
-  <div class="error-state status">{statusMessage}</div>
+{#if createError || data.loadError}
+  <div class="error-state status">{createError || data.loadError}</div>
 {/if}
 
 <section class="card">
@@ -118,7 +112,6 @@
         required={true}
         value={name}
         error={visibleErrors['name']}
-        {validationKey}
         yangType="string"
         placeholder="e.g., xe-1718-emea"
         onchange={(v) => (name = v)}
@@ -129,7 +122,6 @@
         required={true}
         value={targetRelease}
         error={visibleErrors['target-release']}
-        {validationKey}
         yangType="string"
         mono={true}
         placeholder="e.g., 17.18.03a"
@@ -140,7 +132,6 @@
     <FieldText
       label="Image URL"
       value={imageUrl}
-      {validationKey}
       yangType="string"
       mono={true}
       placeholder="scp://user:password@host:/path/image.bin"

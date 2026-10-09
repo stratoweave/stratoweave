@@ -1,4 +1,4 @@
-import { getListEntryPath, restconfGetJson } from '$lib/core/restconf/client';
+import { getListEntryPath, restconfGetOrNull } from '$lib/core/restconf/client';
 import {
   CAMPAIGN_LIST_ROOT,
   parseCampaignEntry,
@@ -20,18 +20,7 @@ export async function fetchCampaign(
   name: string,
   fetchFn: typeof fetch = fetch
 ): Promise<Campaign | null> {
-  try {
-    const json = await restconfGetJson<unknown>(
-      getListEntryPath(CAMPAIGN_LIST_ROOT, name),
-      fetchFn
-    );
-    return parseCampaignEntry(json);
-  } catch (error) {
-    if (error instanceof Error && error.message.includes('404')) {
-      return null;
-    }
-    throw error;
-  }
+  return parseCampaignEntry(await restconfGetOrNull<unknown>(getListEntryPath(CAMPAIGN_LIST_ROOT, name), fetchFn));
 }
 
 /** Fresh counters for one campaign; null when it has no state yet or does
