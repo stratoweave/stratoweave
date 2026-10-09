@@ -145,11 +145,11 @@ stratoweave-rfs:device=<name>/software/state
 ```
 
 `SoftwareManager` sends a `SoftwareState` copy to `DeviceMgr` whenever `status`
-or `running-release` changes, and whenever a round of checks reaches a
-verdict. `DeviceMgr` merges it into the device entry's operational tree and
-calls the TTT device node's `update_oper`. Registration replays the current
-state, so a device node created after a state change still gets the latest
-value.
+or `running-release` changes, whenever the run moves to its next step, and
+whenever a round of checks reaches a verdict. `DeviceMgr` merges it into the
+device entry's operational tree and calls the TTT device node's `update_oper`.
+Registration replays the current state, so a device node created after a state
+change still gets the latest value.
 
 The manager currently populates:
 
@@ -157,10 +157,11 @@ The manager currently populates:
 |---|---|
 | `status` | `unknown`, `up-to-date`, `in-progress`, `succeeded`, `rolled-back`, or `failed` |
 | `running-release` | last release returned by `check`, using the device's spelling |
+| `stage` | `prepare`, `precheck`, `install`, `postcheck`, `commit`, or `rollback`: the step the run is in, or the step it ended in |
 | `precheck`, `postcheck` | one `check-result` each: `verdict` is `not-run`, `pass`, or `fail`; `detail` names the first refusing registrant and its reason, the registrants that did not answer, or each passing registrant with its reason; `at` is when the verdict was reached |
 
-Both verdicts return to `not-run` when a new run starts. The results are one
-aggregate per round, not one per registrant.
+When a new run starts, `stage` returns to `prepare` and both verdicts to
+`not-run`. The results are one aggregate per round, not one per registrant.
 
 The YANG model also contains `upgrade-needed` and `job`. The current manager
 does not publish those values.
