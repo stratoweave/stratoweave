@@ -1,0 +1,102 @@
+// Schedules speak in local times of day, and the published plan and the
+// deadline in absolute seconds since the Unix epoch. Durations read and
+// type as 30m, 2h30m or 1d.
+
+const UNIT_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+
+/** "600", "10m", "2h30m", "1d 12h" -> seconds; null when unparsable. A bare
+ * number is seconds. */
+export function parseDuration(text: string): number | null {
+  const t = text.trim().toLowerCase();
+  if (!t) return null;
+  if (/^\d+$/.test(t)) return Number(t);
+  let total = 0;
+  let matched = '';
+  for (const m of t.matchAll(/(\d+)\s*([smhd])/g)) {
+    total += Number(m[1]) * UNIT_SECONDS[m[2]];
+    matched += m[0];
+  }
+  return matched.replace(/\s+/g, '') === t.replace(/\s+/g, '') ? total : null;
+}
+
+/** seconds -> "45s", "2h30m", "1d12h". */
+export function formatDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  if (s < 60) return `${s}s`;
+  const parts: string[] = [];
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (d > 0) parts.push(`${d}d`);
+  if (h > 0) parts.push(`${h}h`);
+  if (m > 0) parts.push(`${m}m`);
+  if (sec > 0) parts.push(`${sec}s`);
+  return parts.join('');
+}
+
+function pad2(n: number): string {
+  return n < 10 ? `0${n}` : `${n}`;
+}
+
+/** Seconds after midnight -> "22:00", or "12:07:18" when the value does
+ * not sit on a whole minute, so an edit round-trips the model's value. */
+export function formatTimeOfDay(seconds: number): string {
+  const hm = `${pad2(Math.floor(seconds / 3600))}:${pad2(Math.floor((seconds % 3600) / 60))}`;
+  const sec = seconds % 60;
+  return sec === 0 ? hm : `${hm}:${pad2(sec)}`;
+}
+
+/** Minutes east of UTC -> "+01:00". */
+export function formatUtcOffset(minutes: number): string {
+  const sign = minutes < 0 ? '-' : '+';
+  const abs = Math.abs(minutes);
+  return `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
+}
+
+/** Local time-of-day seconds and a schedule's UTC offset -> "04:00 (UTC-05:00)":
+ * the time of day in the schedule's own zone, the zone spelled out so a
+ * negative offset does not read as a time range. */
+export function formatLocalTime(at: number, utcOffsetMinutes: number): string {
+  return `${formatTimeOfDay(at)} (UTC${formatUtcOffset(utcOffsetMinutes)})`;
+}
+
+function localDate(d: Date): string {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+}
+
+/** Epoch seconds -> "13:07" on the local clock. */
+export function clockLabel(epochSeconds: number): string {
+  const d = new Date(epochSeconds * 1000);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+/** Epoch seconds -> "13:59:59" on the local clock: every part always
+ * present, so a ticking display keeps its width. */
+export function formatClockSeconds(epochSeconds: number): string {
+  const d = new Date(epochSeconds * 1000);
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+}
+
+/** Epoch seconds -> "Tue 22 Sep" on the local clock. */
+export function dayLabel(epochSeconds: number): string {
+  return new Date(epochSeconds * 1000).toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short' });
+}
+
+export function sameLocalDay(a: number, b: number): boolean {
+  const da = new Date(a * 1000);
+  const db = new Date(b * 1000);
+  return da.getFullYear() === db.getFullYear() && da.getMonth() === db.getMonth() && da.getDate() === db.getDate();
+}
+
+/** Epoch seconds -> local wall clock; the date is added when it is not today. */
+export function formatClock(epochSeconds: number, now = Date.now() / 1000): string {
+  const time = clockLabel(epochSeconds);
+  return sameLocalDay(epochSeconds, now) ? time : `${localDate(new Date(epochSeconds * 1000))} ${time}`;
+}
+
+/** Epoch seconds -> "2026-10-05T14:30" on the local clock, for a
+ * `datetime-local` input. */
+export function toLocalInput(epochSeconds: number): string {
+  return `${localDate(new Date(epochSeconds * 1000))}T${clockLabel(epochSeconds)}`;
+}

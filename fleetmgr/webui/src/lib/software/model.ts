@@ -15,7 +15,7 @@ export type AdminState = 'plan' | 'run';
 
 // ── Wire types: YANG-JSON exactly as it crosses /restconf/data ──
 
-export interface AddressJson {
+interface AddressJson {
   name: string;
   address?: string;
   port?: number;
@@ -28,29 +28,30 @@ export interface DeviceJson {
   shard?: string;
   description?: string;
   schedule?: string;
+  'approval-required'?: boolean;
   address?: AddressJson[];
   credentials?: { username?: string; password?: string };
   mock?: { enabled?: boolean };
 }
 
-export interface NodeJson {
+interface NodeJson {
   name: string;
   address?: AddressJson[];
 }
 
-export interface CampaignMemberJson {
+interface CampaignMemberJson {
   name: string;
 }
 
 /** A software upgrade check verdict, relayed from the device as strings. */
-export interface CheckResultJson {
+interface CheckResultJson {
   verdict?: string;
   detail?: string;
   /** yang:date-and-time */
   at?: string;
 }
 
-export interface DeviceStatusJson {
+interface DeviceStatusJson {
   device: string;
   status?: string;
   'running-release'?: string;
@@ -60,7 +61,7 @@ export interface DeviceStatusJson {
 }
 
 /** One recurrence rule of a schedule: a local time of day. */
-export interface WindowJson {
+interface WindowJson {
   at: number;
   duration: number;
   day?: string[];
@@ -74,27 +75,27 @@ export interface ScheduleJson {
   window?: WindowJson[];
 }
 
-export interface PlanDeviceJson {
+interface PlanDeviceJson {
   name: string;
   'estimated-start'?: number | string;
   'estimated-duration'?: number | string;
 }
 
-export interface PlanWindowJson {
+interface PlanWindowJson {
   start: number | string;
   end?: number | string;
   schedule?: string;
   device?: PlanDeviceJson[];
 }
 
-export interface PlanJson {
+interface PlanJson {
   window?: PlanWindowJson[];
   alarm?: string[];
 }
 
 /** Counters are optional and do not sum to total: pending, unknown and
  * up-to-date devices fall into no counter. */
-export interface CampaignStateJson {
+interface CampaignStateJson {
   total?: number;
   'in-progress'?: number;
   succeeded?: number;
@@ -118,7 +119,7 @@ export interface CampaignJson {
 }
 
 /** GET data merges every module; this UI reads three of them. */
-export interface DataTreeJson {
+interface DataTreeJson {
   'fleetmgr:fleet'?: {
     node?: NodeJson[];
     device?: DeviceJson[];
@@ -132,7 +133,7 @@ export interface DataTreeJson {
 }
 
 /** GET data/software:software/upgrade-campaign={name} */
-export interface CampaignEntryJson {
+interface CampaignEntryJson {
   'software:upgrade-campaign'?: CampaignJson[];
 }
 
@@ -143,7 +144,7 @@ export interface FleetPatchJson {
   };
 }
 
-export interface SoftwarePatchJson {
+interface SoftwarePatchJson {
   'software:software': {
     'upgrade-campaign'?: (Partial<CampaignJson> & { name: string })[];
   };
@@ -165,7 +166,7 @@ export const KNOWN_STATUSES = [
 ] as const;
 export type KnownStatus = (typeof KNOWN_STATUSES)[number];
 
-export function normalizeStatus(raw: unknown): KnownStatus {
+function normalizeStatus(raw: unknown): KnownStatus {
   return typeof raw === 'string' && (KNOWN_STATUSES as readonly string[]).includes(raw)
     ? (raw as KnownStatus)
     : 'unknown';
@@ -332,7 +333,7 @@ function firstAddress(entry: { address?: AddressJson[] }): string {
   return typeof first.port === 'number' ? `${first.address}:${first.port}` : first.address;
 }
 
-function parseDevice(entry: DeviceJson & { 'approval-required'?: boolean }): Device {
+function parseDevice(entry: DeviceJson): Device {
   return {
     name: entry.name,
     type: entry.type ?? '',
@@ -411,10 +412,8 @@ function parseCampaign(entry: CampaignJson): Campaign {
   }
   // Configured members joined with reported rows; a member the state does
   // not mention yet renders as unknown.
-  const names = [...members];
-  for (const device of reported.keys()) {
-    if (!names.includes(device)) names.push(device);
-  }
+  const memberSet = new Set(members);
+  const names = [...members, ...[...reported.keys()].filter((device) => !memberSet.has(device))];
   return {
     name: entry.name,
     targetRelease: entry['target-release'] ?? '',
@@ -473,6 +472,12 @@ export function parseSchedules(json: unknown): Schedule[] {
   });
   schedules.sort((a, b) => a.name.localeCompare(b.name));
   return schedules;
+}
+
+/** Parse a GET of data/fleetmgr:fleet/device={name}. */
+export function parseDeviceEntry(json: unknown): Device | null {
+  const entries = (json as { 'fleetmgr:device'?: DeviceJson[] })?.['fleetmgr:device'];
+  return entries && entries.length > 0 ? parseDevice(entries[0]) : null;
 }
 
 export function parseCampaignEntry(json: unknown): Campaign | null {

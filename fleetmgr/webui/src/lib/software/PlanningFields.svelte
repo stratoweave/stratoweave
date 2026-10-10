@@ -4,8 +4,8 @@
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import { scheduleRulesText } from '$lib/maintenance/schedule-form';
   import { DEFAULT_MAX_RATE, DEFAULT_TARGET_RATE, type Schedule } from './model';
-  import { atOnceText, toLocalInput, type PaceBy, type PlanningDraft } from './planning-form';
-  import { formatDuration } from './time';
+  import { atOnceText, type PaceBy, type PlanningDraft } from './planning-form';
+  import { formatDuration, toLocalInput } from '$lib/core/time';
 
   interface Props {
     schedules: Schedule[];
@@ -133,24 +133,6 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 12px;
-  }
-
-  .field {
-    display: grid;
-    gap: 6px;
-    min-width: 0;
-  }
-
-  .field__label {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--sw-text-label);
-  }
-
-  .field__meta {
-    min-height: 1rem;
-    font-size: 11px;
-    color: var(--sw-text-muted);
   }
 
   .at-once {

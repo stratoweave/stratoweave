@@ -19,9 +19,3 @@
     <a class="btn btn-primary btn-sm" href="/campaigns">Back to campaigns</a>
   </div>
 </section>
-
-<style>
-  .card {
-    padding: 20px;
-  }
-</style>

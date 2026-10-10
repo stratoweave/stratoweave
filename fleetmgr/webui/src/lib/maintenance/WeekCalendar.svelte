@@ -12,10 +12,9 @@
     type Occurrence
   } from '$lib/maintenance/occurrences';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
-  import { formatUtcOffset, ruleText, scheduleRulesText } from '$lib/maintenance/schedule-form';
+  import { ruleText, scheduleRulesText } from '$lib/maintenance/schedule-form';
   import type { MaintenanceWindow, Schedule } from '$lib/software/model';
-  import { clockLabel, dayLabel } from '$lib/software/plan-timeline';
-  import { formatClock } from '$lib/software/time';
+  import { clockLabel, dayLabel, formatClock, formatTimeOfDay, formatUtcOffset } from '$lib/core/time';
 
   interface Props {
     schedules: Schedule[];
@@ -253,7 +252,7 @@
 
   <div class="hours">
     {#each HOURS as h (h)}
-      <span class="hour mono" style:top={`${h * hourPx}px`}>{h < 10 ? `0${h}` : h}:00</span>
+      <span class="hour mono" style:top={`${h * hourPx}px`}>{formatTimeOfDay(h * 3600)}</span>
     {/each}
   </div>
   {#each columns as col, i (col.start)}
@@ -475,11 +474,6 @@
   .tz {
     margin-left: auto;
     color: var(--sw-text-muted);
-  }
-
-  .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
-    font-variant-numeric: tabular-nums;
   }
 
   /* Editing */

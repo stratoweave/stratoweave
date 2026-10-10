@@ -1,7 +1,7 @@
 <script lang="ts">
   import { STEPS, STEP_LABEL, type DeviceStatusRow, type Step } from '$lib/software/model';
   import { stageView, type RollbackState, type StepState } from '$lib/software/stages';
-  import { formatClock } from '$lib/software/time';
+  import { formatClock } from '$lib/core/time';
 
   interface Props {
     /** Without a row the chain shows the step names, for a table header. */

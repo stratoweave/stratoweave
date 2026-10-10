@@ -25,7 +25,7 @@
 
   let dialog: HTMLDialogElement | null = $state(null);
   let cancelButton: HTMLButtonElement | null = $state(null);
-  const id = `confirm-${Math.random().toString(36).slice(2, 9)}`;
+  const id = $props.id();
 
   // showModal() traps focus and restores it to the opener on close.
   $effect(() => {

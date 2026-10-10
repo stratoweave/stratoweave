@@ -124,7 +124,7 @@
     </div>
 
     <textarea
-      class="paste mono"
+      class="input mono"
       rows="3"
       placeholder="optional: explicit names, one per line or comma-separated — used instead of the whole inventory"
       value={selection.pasted}
@@ -307,19 +307,6 @@
     padding-left: 4px;
   }
 
-  .paste {
-    width: 100%;
-    padding: 9px 12px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: 6px;
-    color: var(--sw-text-primary);
-    font-size: 12px;
-    resize: vertical;
-    outline: none;
-    white-space: pre;
-  }
-
   .count-row {
     display: flex;
     align-items: baseline;
@@ -449,13 +436,5 @@
   .hint {
     font-size: 12px;
     color: var(--sw-text-muted);
-  }
-
-  .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
-  }
-
-  .tn {
-    font-variant-numeric: tabular-nums;
   }
 </style>

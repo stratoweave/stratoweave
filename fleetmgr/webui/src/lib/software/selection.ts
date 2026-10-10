@@ -53,16 +53,19 @@ export function emptySelection(): Selection {
   };
 }
 
-export function nameMatches(name: string, pattern: string): boolean {
-  if (!pattern) return true;
+/** A name test for `pattern`: a substring, or a glob when it contains *
+ * or ?; case-insensitive, and empty matches every name. */
+export function nameMatcher(pattern: string): (name: string) => boolean {
+  if (!pattern) return () => true;
   if (pattern.includes('*') || pattern.includes('?')) {
     const rx = new RegExp(
       `^${pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replaceAll('*', '.*').replaceAll('?', '.')}$`,
       'i'
     );
-    return rx.test(name);
+    return (name) => rx.test(name);
   }
-  return name.toLowerCase().includes(pattern.toLowerCase());
+  const needle = pattern.toLowerCase();
+  return (name) => name.toLowerCase().includes(needle);
 }
 
 export function expandSelection(
@@ -95,12 +98,12 @@ export function expandSelection(
     candidates = [...inventory];
   }
 
-  const pattern = sel.namePattern.trim();
+  const matchName = nameMatcher(sel.namePattern.trim());
   const description = sel.descriptionContains.trim().toLowerCase();
   candidates = candidates.filter(
     (d) =>
       (sel.types.length === 0 || sel.types.includes(d.type)) &&
-      nameMatches(d.name, pattern) &&
+      matchName(d.name) &&
       (!description || d.description.toLowerCase().includes(description))
   );
 

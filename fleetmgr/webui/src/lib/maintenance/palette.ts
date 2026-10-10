@@ -4,7 +4,7 @@
 // UI reserves. Colours are assigned by name order; every block also
 // carries its schedule's name, so identity never rests on colour alone.
 
-export const SCHEDULE_COLORS = ['#9085e9', '#d55181', '#3987e5'];
+const SCHEDULE_COLORS = ['#9085e9', '#d55181', '#3987e5'];
 
 /** Schedules beyond the palette share this and rely on their label. */
 export const SCHEDULE_COLOR_OTHER = '#6b7a99';

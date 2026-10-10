@@ -1,17 +1,15 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import AdminStatePill from '$lib/software/AdminStatePill.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
   import { createPoller } from '$lib/core/polling/poller';
   import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
   import { planAlarmLines, type Campaign, type CampaignCounters } from '$lib/software/model';
+  import type { PageProps } from './$types';
 
-  let {
-    data
-  }: { data: { campaigns: Campaign[]; loadError: string } } = $props();
-
-  let statusMessage = $state<string>(untrack(() => data.loadError));
+  let { data }: PageProps = $props();
 
   // Discovery (full campaign entries) refreshes slowly; running campaigns
   // get fresh counters from cheap entry GETs.
@@ -78,8 +76,8 @@
   <a class="btn btn-primary" href="/campaigns/new">New campaign</a>
 </div>
 
-{#if statusMessage}
-  <div class="error-state status">{statusMessage}</div>
+{#if data.loadError}
+  <div class="error-state status">{data.loadError}</div>
 {/if}
 
 <div class="kpis">
@@ -129,10 +127,7 @@
               </td>
               <td class="mono tn">{campaign.targetRelease}</td>
               <td>
-                <span class="pill" class:pill-run={campaign.adminState === 'run'} class:muted={campaign.adminState === 'plan'}>
-                  <span class="dot"></span>
-                  {campaign.adminState}
-                </span>
+                <AdminStatePill state={campaign.adminState} />
               </td>
               <td class="tn right">{campaign.devices.length.toLocaleString()}</td>
               <td class="plan-cell">
@@ -171,10 +166,6 @@
 </section>
 
 <style>
-  .status {
-    margin-bottom: 12px;
-  }
-
   .kpis {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -205,52 +196,11 @@
   }
 
   .card {
-    padding: 20px;
     margin-bottom: 16px;
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  th {
-    text-align: left;
-    font-size: 10.5px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.09em;
-    color: var(--sw-text-muted);
-    padding: 9px 10px;
-    border-bottom: 1px solid var(--sw-border-subtle);
-    white-space: nowrap;
-  }
-
-  th.right {
-    text-align: right;
   }
 
   .state-col {
     width: 290px;
-  }
-
-  td {
-    padding: 11px 10px;
-    border-bottom: 1px solid var(--sw-border-subtle);
-    vertical-align: middle;
-  }
-
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
-
-  td.right {
-    text-align: right;
   }
 
   .campaign-name {
@@ -279,13 +229,5 @@
 
   .failed-cell {
     color: var(--sw-danger);
-  }
-
-  .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
-  }
-
-  .tn {
-    font-variant-numeric: tabular-nums;
   }
 </style>

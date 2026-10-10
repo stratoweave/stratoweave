@@ -6,24 +6,17 @@
 // and a default of 100, so pacing by the deadline sends target-rate 0 and
 // pacing by the rate sends no deadline.
 
-import {
-  getListEntryPath,
-  restconfGetJson,
-  restconfPatchJson,
-  restconfPutJson,
-  wrapListEntryBody
-} from '$lib/core/restconf/client';
+import { restconfPatchJson, rewriteListEntry } from '$lib/core/restconf/client';
 import {
   CAMPAIGN_LIST_ROOT,
   DATA_ROOT,
   DEFAULT_MAX_RATE,
   DEFAULT_TARGET_RATE,
   type Campaign,
-  type CampaignEntryJson,
   type CampaignJson,
   type CampaignPlan
 } from './model';
-import { formatDuration } from './time';
+import { formatDuration, toLocalInput } from '$lib/core/time';
 
 export type PaceBy = 'deadline' | 'rate';
 
@@ -67,16 +60,6 @@ export function planningDraft(p: Planning): PlanningDraft {
     targetRate: paceBy === 'deadline' || p.targetRate === DEFAULT_TARGET_RATE ? '' : String(p.targetRate),
     maxRate: p.maxRate === DEFAULT_MAX_RATE ? '' : String(p.maxRate)
   };
-}
-
-function pad2(n: number): string {
-  return n < 10 ? `0${n}` : `${n}`;
-}
-
-/** Epoch seconds -> "2026-10-05T14:30" on the viewer's clock. */
-export function toLocalInput(epochSeconds: number): string {
-  const d = new Date(epochSeconds * 1000);
-  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
 /** Errors by field: deadline, target-rate, max-rate; only the pace field
@@ -184,20 +167,18 @@ export function planningChanges(saved: Planning, next: Planning): { set: Partial
   return { set, remove };
 }
 
-/** Setting leaves is a merge. Removing one takes a PUT of the whole entry
- * without it, since DELETE on a leaf returns 500 upstream; the entry is
- * read right before the write and sent back as read, minus its state. */
+/** Setting leaves is a merge. Removing one rewrites the entry as read,
+ * minus its state. */
 export async function saveCampaignPlanning(name: string, saved: Planning, next: Planning): Promise<void> {
   const { set, remove } = planningChanges(saved, next);
   if (remove.length === 0) {
     await restconfPatchJson(DATA_ROOT, { 'software:software': { 'upgrade-campaign': [{ name, ...set }] } });
     return;
   }
-  const path = getListEntryPath(CAMPAIGN_LIST_ROOT, name);
-  const entry = (await restconfGetJson<CampaignEntryJson>(path))?.['software:upgrade-campaign']?.[0];
-  if (!entry) throw new Error(`Campaign ${name} no longer exists.`);
-  const config: Partial<CampaignJson> = { ...entry, ...set };
-  delete config.state;
-  for (const leaf of remove) delete config[leaf];
-  await restconfPutJson(path, wrapListEntryBody(CAMPAIGN_LIST_ROOT, config));
+  await rewriteListEntry(CAMPAIGN_LIST_ROOT, name, (entry) => {
+    const config: Record<string, unknown> = { ...entry, ...set };
+    delete config.state;
+    for (const leaf of remove) delete config[leaf];
+    return config;
+  });
 }

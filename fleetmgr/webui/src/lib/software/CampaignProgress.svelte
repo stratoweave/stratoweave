@@ -148,10 +148,6 @@
     color: var(--sw-text-muted);
   }
 
-  .tn {
-    font-variant-numeric: tabular-nums;
-  }
-
   @keyframes seg-pulse {
     0%,
     100% {

@@ -2,13 +2,16 @@
   import { onDestroy, untrack } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import { errorText } from '$lib/core/errors';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
+  import Pager, { paginate } from '$lib/core/ui/Pager.svelte';
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import Section from '$lib/core/ui/Section.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
   import { bindPatch, unbindDevice } from '$lib/maintenance/binding';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
   import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device, type Schedule } from '$lib/software/model';
+  import { nameMatcher } from '$lib/software/selection';
   import {
     IMPORT_BATCH,
     assignNodes,
@@ -18,31 +21,19 @@
     validateNewDevice,
     type NewDeviceInput
   } from '$lib/software/inventory';
+  import type { PageProps } from './$types';
 
   const PAGE_SIZE = 100;
 
-  let {
-    data
-  }: {
-    data: {
-      nodes: string[];
-      devices: Device[];
-      schedules: Schedule[];
-      scheduleFilter: string;
-      loadError: string;
-    };
-  } = $props();
+  let { data }: PageProps = $props();
 
   let draft = $state<NewDeviceInput | null>(null);
   let importOpen = $state(false);
   let importText = $state('');
   let importType = $state('iosxe');
   let touched = $state(false);
-  let validationKey = $state(0);
   let saving = $state(false);
-  let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(
-    untrack(() => (data.loadError ? { type: 'error', text: data.loadError } : null))
-  );
+  let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
   let deleteTarget = $state<Device | null>(null);
   let deleting = $state(false);
 
@@ -70,31 +61,16 @@
     return device.schedule === filter.slice(1);
   }
 
-  function nameMatches(name: string, filter: string): boolean {
-    if (!filter) return true;
-    if (filter.includes('*') || filter.includes('?')) {
-      const rx = new RegExp(
-        `^${filter.replace(/[.+^${}()|[\]\\]/g, '\\$&').replaceAll('*', '.*').replaceAll('?', '.')}$`,
-        'i'
-      );
-      return rx.test(name);
-    }
-    return name.toLowerCase().includes(filter.toLowerCase());
-  }
-
   // The API returns devices in no particular order; ranges and pages need one.
   let sorted = $derived([...data.devices].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));
-  let filtered = $derived(
-    sorted.filter(
-      (d) =>
-        nameMatches(d.name, filterText.trim()) &&
-        (!filterType || d.type === filterType) &&
-        scheduleMatches(d, filterSchedule)
-    )
-  );
-  let pageCount = $derived(Math.max(1, Math.ceil(filtered.length / PAGE_SIZE)));
-  let currentPage = $derived(Math.min(page, pageCount));
-  let visible = $derived(filtered.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE));
+  let filtered = $derived.by(() => {
+    const matchName = nameMatcher(filterText.trim());
+    return sorted.filter(
+      (d) => matchName(d.name) && (!filterType || d.type === filterType) && scheduleMatches(d, filterSchedule)
+    );
+  });
+  let paged = $derived(paginate(filtered, page, PAGE_SIZE));
+  let visible = $derived(paged.rows);
 
   // The selection is by name and survives filter and page changes; the bar
   // says how many selected devices the filter hides.
@@ -220,7 +196,7 @@
         bindError = `Stopped after unbinding ${done} of ${devicesText(names.length)}.`;
       }
     } catch (writeError) {
-      const reason = writeError instanceof Error ? writeError.message : 'the write failed';
+      const reason = errorText(writeError, 'the write failed');
       bindError = plan.schedule
         ? `Nothing bound: ${reason}`
         : `Unbound ${done} of ${devicesText(names.length)}; ${current} failed: ${reason}`;
@@ -242,7 +218,6 @@
     draft = { name: '', type: 'iosxe', address: '', port: '' };
     importOpen = false;
     touched = false;
-    validationKey += 1;
     statusMessage = null;
   }
 
@@ -265,10 +240,7 @@
   async function handleAdd(): Promise<void> {
     if (!draft) return;
     touched = true;
-    if (!validation.ok) {
-      validationKey += 1;
-      return;
-    }
+    if (!validation.ok) return;
     try {
       saving = true;
       statusMessage = null;
@@ -281,7 +253,7 @@
     } catch (saveError) {
       statusMessage = {
         type: 'error',
-        text: saveError instanceof Error ? saveError.message : 'Failed to add the device.'
+        text: errorText(saveError, 'Failed to add the device.')
       };
     } finally {
       saving = false;
@@ -324,7 +296,7 @@
     } catch (importError) {
       statusMessage = {
         type: 'error',
-        text: importError instanceof Error ? importError.message : 'Import failed.'
+        text: errorText(importError, 'Import failed.')
       };
     } finally {
       saving = false;
@@ -343,7 +315,7 @@
     } catch (deleteError) {
       statusMessage = {
         type: 'error',
-        text: deleteError instanceof Error ? deleteError.message : 'Failed to remove the device.'
+        text: errorText(deleteError, 'Failed to remove the device.')
       };
     } finally {
       deleting = false;
@@ -372,6 +344,10 @@
   </div>
 </div>
 
+{#if data.loadError}
+  <div class="error-state status">{data.loadError}</div>
+{/if}
+
 {#if statusMessage}
   <div class={statusMessage.type === 'error' ? 'error-state status' : 'success-banner status'}>
     {statusMessage.text}
@@ -391,7 +367,6 @@
           required={true}
           value={draft.name}
           error={errors['name']}
-          {validationKey}
           yangType="string"
           placeholder="e.g., ce1"
           onchange={(value) => patch({ name: value })}
@@ -402,7 +377,6 @@
           required={true}
           value={draft.type}
           error={errors['type']}
-          {validationKey}
           yangType="string"
           mono={true}
           placeholder="iosxe"
@@ -413,7 +387,6 @@
           label="Management address"
           value={draft.address}
           error={errors['address']}
-          {validationKey}
           yangType="inet:host"
           mono={true}
           placeholder="hostname or IP"
@@ -424,7 +397,6 @@
           label="NETCONF port"
           value={draft.port}
           error={errors['port']}
-          {validationKey}
           yangType="uint16"
           mono={true}
           placeholder="830"
@@ -460,7 +432,7 @@
         onchange={(value) => (importType = value)}
       />
       <textarea
-        class="import-text mono"
+        class="input mono"
         rows="10"
         placeholder="ce1,192.0.2.11&#10;ce2,192.0.2.12,830&#10;mock-001"
         bind:value={importText}
@@ -483,7 +455,7 @@
   {:else}
     <div class="filter-row">
       <input
-        class="filter-input mono"
+        class="input compact mono filter-input"
         type="text"
         placeholder="filter by name (glob with * and ?)"
         bind:value={filterText}
@@ -508,7 +480,7 @@
       <span class="filter-count">{filtered.length} of {data.devices.length}</span>
     </div>
     <div class="table-wrap">
-      <table>
+      <table class="dense">
         <thead>
           <tr>
             <th class="col-check">
@@ -563,7 +535,7 @@
               </td>
               <td class="col-action">
                 <button
-                  class="btn btn-secondary btn-small btn-danger-ghost"
+                  class="btn btn-secondary btn-sm btn-danger-ghost"
                   type="button"
                   disabled={saving || deleting || applying}
                   onclick={() => (deleteTarget = device)}
@@ -576,17 +548,7 @@
         </tbody>
       </table>
     </div>
-    {#if pageCount > 1}
-      <div class="pager">
-        <button class="btn btn-secondary btn-small" type="button" disabled={currentPage <= 1} onclick={() => (page = currentPage - 1)}>
-          ‹
-        </button>
-        <span>page {currentPage} / {pageCount}</span>
-        <button class="btn btn-secondary btn-small" type="button" disabled={currentPage >= pageCount} onclick={() => (page = currentPage + 1)}>
-          ›
-        </button>
-      </div>
-    {/if}
+    <Pager page={paged.page} pageCount={paged.pageCount} onchange={(p) => (page = p)} />
     {#if chosen.length > 0}
       <div class="selection-bar">
         <span class="tn"><strong>{chosen.length.toLocaleString()}</strong> selected</span>
@@ -622,12 +584,12 @@
         {/if}
         {#if progress}
           <span class="tn">Unbinding {progress.done.toLocaleString()} of {progress.total.toLocaleString()}…</span>
-          <button class="btn btn-secondary btn-small" type="button" onclick={() => (stopRequested = true)}>
+          <button class="btn btn-secondary btn-sm" type="button" onclick={() => (stopRequested = true)}>
             Stop
           </button>
         {:else}
           <button
-            class="btn btn-primary btn-small"
+            class="btn btn-primary btn-sm"
             type="button"
             disabled={applying || !bindPlan || bindPlan.change.length === 0}
             onclick={() => (confirmBind = true)}
@@ -663,10 +625,6 @@
 />
 
 <style>
-  .status {
-    margin-bottom: 12px;
-  }
-
   .success-banner {
     padding: 10px 14px;
     border-radius: var(--sw-radius-md);
@@ -682,7 +640,6 @@
   }
 
   .card {
-    padding: 20px;
     margin-bottom: 16px;
   }
 
@@ -696,17 +653,6 @@
   .filter-input {
     flex: 1;
     max-width: 320px;
-    padding: 7px 10px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 12px;
-    outline: none;
-  }
-
-  .filter-input:focus {
-    border-color: var(--sw-accent);
   }
 
   .filter-row .select,
@@ -717,37 +663,6 @@
   .filter-count {
     font-size: 12px;
     color: var(--sw-text-muted);
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  th {
-    text-align: left;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--sw-text-muted);
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--sw-border-default);
-    white-space: nowrap;
-  }
-
-  td {
-    padding: 8px 10px;
-    border-bottom: 1px solid var(--sw-border-default);
-    vertical-align: middle;
-  }
-
-  tbody tr:last-child td {
-    border-bottom: none;
   }
 
   .device-name {
@@ -761,7 +676,6 @@
   }
 
   .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
     white-space: nowrap;
   }
 
@@ -859,46 +773,10 @@
     cursor: not-allowed;
   }
 
-  .btn-small {
-    padding: 4px 10px;
-    font-size: 12px;
-  }
-
-  .btn-danger-ghost {
-    color: var(--sw-danger);
-  }
-
   .grid-2 {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     gap: 12px;
-  }
-
-  .pager {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    justify-content: flex-end;
-    margin-top: 10px;
-    font-size: 12px;
-    color: var(--sw-text-secondary);
-  }
-
-  .import-text {
-    width: 100%;
-    padding: 9px 12px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 12px;
-    resize: vertical;
-    outline: none;
-    white-space: pre;
-  }
-
-  .import-text:focus {
-    border-color: var(--sw-accent);
   }
 
   .editor-actions {

@@ -8,11 +8,8 @@
     buildAxis,
     cellRects,
     chooseCells,
-    clockLabel,
     columnAt,
-    dayLabel,
     fitScale,
-    sameLocalDay,
     tickStep,
     windowDone,
     windowEnd,
@@ -20,7 +17,14 @@
     type Rect,
     type WindowCells
   } from '$lib/software/plan-timeline';
-  import { formatClock, formatClockSeconds, formatDuration } from '$lib/software/time';
+  import {
+    clockLabel,
+    dayLabel,
+    formatClock,
+    formatClockSeconds,
+    formatDuration,
+    sameLocalDay
+  } from '$lib/core/time';
 
   interface Props {
     plan: CampaignPlan;
@@ -52,7 +56,7 @@
   const ZOOMS = [1, 2, 4, 8];
   const NOW_COLOR = '#22d3ee';
   const DONE_COLOR = '#16a34a';
-  const uid = `pt-${Math.random().toString(36).slice(2, 9)}`;
+  const uid = $props.id();
 
   interface Block {
     p: Placed;
@@ -343,22 +347,6 @@
   .chips {
     display: flex;
     gap: 6px;
-  }
-
-  .chip {
-    font-size: 12px;
-    padding: 2px 9px;
-    border-radius: 999px;
-    border: 1px solid var(--sw-border-default);
-    color: var(--sw-text-secondary);
-    background: var(--sw-bg-elevated);
-    cursor: pointer;
-  }
-
-  .chip.active {
-    color: var(--sw-accent);
-    border-color: var(--sw-accent-glow-strong);
-    background: var(--sw-accent-glow);
   }
 
   .scroller {

@@ -1,8 +1,11 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { goto, invalidate } from '$app/navigation';
 
+  import { errorText } from '$lib/core/errors';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
+  import Pager, { paginate } from '$lib/core/ui/Pager.svelte';
+  import AdminStatePill from '$lib/software/AdminStatePill.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
   import DeviceStatusTable from '$lib/software/DeviceStatusTable.svelte';
   import PlanningFields from '$lib/software/PlanningFields.svelte';
@@ -21,7 +24,7 @@
     type PlanningDraft
   } from '$lib/software/planning-form';
   import { RateTracker, formatEta } from '$lib/software/rate';
-  import { nameMatches } from '$lib/software/selection';
+  import { nameMatcher } from '$lib/software/selection';
   import {
     CAMPAIGN_LIST_ROOT,
     DATA_ROOT,
@@ -33,20 +36,15 @@
     type Schedule,
     type KnownStatus
   } from '$lib/software/model';
+  import type { PageProps } from './$types';
 
   const PAGE_SIZE = 100;
   const FAILED_LIMIT = 200;
 
-  let {
-    data
-  }: {
-    data: { name: string; campaign: Campaign | null; schedules: Schedule[]; loadError: string };
-  } = $props();
+  let { data }: PageProps = $props();
 
   let busy = $state(false);
-  let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(
-    untrack(() => (data.loadError ? { type: 'error', text: data.loadError } : null))
-  );
+  let actionError = $state('');
   let confirmAction = $state<'run' | 'plan' | 'delete' | null>(null);
 
   let devicesOpen = $state(false);
@@ -148,7 +146,7 @@
     } catch (saveError) {
       planningMessage = {
         type: 'error',
-        text: saveError instanceof Error ? saveError.message : 'Failed to save.'
+        text: errorText(saveError, 'Failed to save.')
       };
     } finally {
       planningSaving = false;
@@ -169,18 +167,13 @@
     return counts;
   });
 
-  let filteredRows = $derived(
-    (campaign?.deviceStatus ?? []).filter(
-      (r) =>
-        (!filterStatus || r.status === filterStatus) &&
-        nameMatches(r.device, searchText.trim())
-    )
-  );
-  let pageCount = $derived(Math.max(1, Math.ceil(filteredRows.length / PAGE_SIZE)));
-  let currentPage = $derived(Math.min(page, pageCount));
-  let visibleRows = $derived(
-    filteredRows.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE)
-  );
+  let filteredRows = $derived.by(() => {
+    const matchName = nameMatcher(searchText.trim());
+    return (campaign?.deviceStatus ?? []).filter(
+      (r) => (!filterStatus || r.status === filterStatus) && matchName(r.device)
+    );
+  });
+  let paged = $derived(paginate(filteredRows, page, PAGE_SIZE));
 
   // No "done" claim anywhere: status is not latched, it tracks live device
   // state and regresses when the campaign goes back to plan.
@@ -245,7 +238,7 @@
     if (!action) return;
     try {
       busy = true;
-      statusMessage = null;
+      actionError = '';
       if (action === 'delete') {
         await restconfDelete(getListEntryPath(CAMPAIGN_LIST_ROOT, data.name));
         // Not a preload made before the delete.
@@ -257,21 +250,16 @@
       // next fast tick.
       live = null;
       await invalidate('data:campaign');
-    } catch (actionError) {
-      statusMessage = {
-        type: 'error',
-        text: actionError instanceof Error ? actionError.message : 'The action failed.'
-      };
+    } catch (error) {
+      actionError = errorText(error, 'The action failed.');
     } finally {
       busy = false;
     }
   }
 </script>
 
-{#if statusMessage}
-  <div class={statusMessage.type === 'error' ? 'error-state status' : 'success-banner status'}>
-    {statusMessage.text}
-  </div>
+{#if actionError || data.loadError}
+  <div class="error-state status">{actionError || data.loadError}</div>
 {/if}
 
 {#if campaign === null}
@@ -323,10 +311,7 @@
       </div>
       <div class="fact">
         <span class="fact-label">Admin state</span>
-        <span class="pill" class:muted={campaign.adminState === 'plan'}>
-          <span class="dot"></span>
-          {campaign.adminState}
-        </span>
+        <AdminStatePill state={campaign.adminState} />
       </div>
       <div class="fact">
         <span class="fact-label">Image URL</span>
@@ -484,35 +469,15 @@
             {/if}
           {/each}
           <input
-            class="search mono"
+            class="input compact mono search"
             type="text"
             placeholder="find device (glob with * and ?)"
             bind:value={searchText}
             oninput={() => (page = 1)}
           />
         </div>
-        <DeviceStatusTable rows={visibleRows} />
-        {#if pageCount > 1}
-          <div class="pager">
-            <button
-              class="btn btn-secondary btn-small"
-              type="button"
-              disabled={currentPage <= 1}
-              onclick={() => (page = currentPage - 1)}
-            >
-              ‹
-            </button>
-            <span>page {currentPage} / {pageCount}</span>
-            <button
-              class="btn btn-secondary btn-small"
-              type="button"
-              disabled={currentPage >= pageCount}
-              onclick={() => (page = currentPage + 1)}
-            >
-              ›
-            </button>
-          </div>
-        {/if}
+        <DeviceStatusTable rows={paged.rows} />
+        <Pager page={paged.page} pageCount={paged.pageCount} onchange={(p) => (page = p)} />
       {/if}
     {/if}
   </section>
@@ -529,19 +494,6 @@
 />
 
 <style>
-  .status {
-    margin-bottom: 12px;
-  }
-
-  .success-banner {
-    padding: 10px 14px;
-    border-radius: var(--sw-radius-md);
-    border: 1px solid rgb(var(--sw-accent-rgb) / 0.35);
-    background: var(--sw-accent-glow);
-    color: var(--sw-text-primary);
-    font-size: 13px;
-  }
-
   .summary {
     margin: 4px 0 0;
     color: var(--sw-text-secondary);
@@ -554,7 +506,6 @@
   }
 
   .card {
-    padding: 20px;
     margin-bottom: 16px;
   }
 
@@ -576,7 +527,7 @@
     color: var(--sw-text-muted);
   }
 
-  .fact .pill {
+  .fact :global(.pill) {
     justify-self: start;
   }
 
@@ -687,58 +638,12 @@
     margin: 12px 0;
   }
 
-  .chip {
-    font-size: 12px;
-    padding: 3px 10px;
-    border-radius: 999px;
-    border: 1px solid var(--sw-border-default);
-    color: var(--sw-text-secondary);
-    background: var(--sw-bg-elevated);
-    cursor: pointer;
-  }
-
-  .chip.active {
-    color: var(--sw-accent);
-    border-color: var(--sw-accent-glow-strong);
-    background: var(--sw-accent-glow);
-  }
-
   .search {
+    width: auto;
     margin-left: auto;
-    padding: 5px 10px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 12px;
-    outline: none;
-  }
-
-  .search:focus {
-    border-color: var(--sw-accent);
   }
 
   .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
     word-break: break-all;
-  }
-
-  .pager {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    justify-content: flex-end;
-    margin-top: 10px;
-    font-size: 12px;
-    color: var(--sw-text-secondary);
-  }
-
-  .btn-small {
-    padding: 4px 10px;
-    font-size: 12px;
-  }
-
-  .btn-danger-ghost {
-    color: var(--sw-danger);
   }
 </style>

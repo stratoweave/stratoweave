@@ -3,11 +3,7 @@
     | 'campaigns'
     | 'devices'
     | 'schedules'
-    | 'refresh'
-    | 'alert'
-    | 'check'
-    | 'chevron-left'
-    | 'chevron-right';
+    | 'refresh';
 </script>
 
 <script lang="ts">
@@ -40,14 +36,5 @@
     <path d="M3 10h18M8 3v4M16 3v4M7 14h3v3H7z" />
   {:else if name === 'refresh'}
     <path d="M20 4v5h-5M4 20v-5h5M20 9a8 8 0 0 0-14-3M4 15a8 8 0 0 0 14 3" />
-  {:else if name === 'alert'}
-    <path d="M12 3 2.5 20h19z" />
-    <path d="M12 10v4M12 17h.01" />
-  {:else if name === 'check'}
-    <path d="m5 12.5 4.5 4.5L19 7.5" />
-  {:else if name === 'chevron-left'}
-    <path d="m15 5-7 7 7 7" />
-  {:else if name === 'chevron-right'}
-    <path d="m9 5 7 7-7 7" />
   {/if}
 </svg>

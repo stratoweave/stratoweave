@@ -1,18 +1,16 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
   import { createPoller } from '$lib/core/polling/poller';
   import WeekCalendar from '$lib/maintenance/WeekCalendar.svelte';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
-  import { formatUtcOffset, scheduleRulesText, scheduleUsage } from '$lib/maintenance/schedule-form';
-  import type { Campaign, Device, Schedule } from '$lib/software/model';
+  import { scheduleRulesText, scheduleUsage } from '$lib/maintenance/schedule-form';
+  import { formatUtcOffset } from '$lib/core/time';
+  import type { PageProps } from './$types';
 
-  let {
-    data
-  }: { data: { schedules: Schedule[]; devices: Device[]; campaigns: Campaign[]; loadError: string } } = $props();
+  let { data }: PageProps = $props();
 
-  let statusMessage = $state<string>(untrack(() => data.loadError));
   let now = $state(Date.now() / 1000);
 
   onMount(() => {
@@ -47,8 +45,8 @@
   <a class="btn btn-primary" href="/schedules/new">New schedule</a>
 </div>
 
-{#if statusMessage}
-  <div class="error-state status">{statusMessage}</div>
+{#if data.loadError}
+  <div class="error-state status">{data.loadError}</div>
 {/if}
 
 <section class="card">
@@ -115,12 +113,7 @@
 {/if}
 
 <style>
-  .status {
-    margin-bottom: 12px;
-  }
-
   .card {
-    padding: 20px;
     margin-bottom: 16px;
   }
 
@@ -140,43 +133,6 @@
   .hint {
     font-size: 12px;
     color: var(--sw-text-muted);
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  th {
-    text-align: left;
-    font-size: 10.5px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.09em;
-    color: var(--sw-text-muted);
-    padding: 9px 10px;
-    border-bottom: 1px solid var(--sw-border-subtle);
-    white-space: nowrap;
-    background: none;
-  }
-
-  td {
-    padding: 11px 10px;
-    border-bottom: 1px solid var(--sw-border-subtle);
-    vertical-align: middle;
-  }
-
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
-
-  .right {
-    text-align: right;
   }
 
   .schedule-name,
@@ -218,13 +174,5 @@
 
   .dim {
     color: var(--sw-text-muted);
-  }
-
-  .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
-  }
-
-  .tn {
-    font-variant-numeric: tabular-nums;
   }
 </style>

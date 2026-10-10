@@ -1,4 +1,5 @@
-import { getListEntryPath, restconfGetJson } from '$lib/core/restconf/client';
+import { errorText } from '$lib/core/errors';
+import { getListEntryPath, restconfGetJson, restconfGetOrNull } from '$lib/core/restconf/client';
 import {
   CAMPAIGN_LIST_ROOT,
   SCHEDULES_ROOT,
@@ -24,17 +25,12 @@ export const load: PageLoad = async ({ fetch, depends, params }) => {
 
   try {
     const [response, schedules] = await Promise.all([
-      restconfGetJson<unknown>(getListEntryPath(CAMPAIGN_LIST_ROOT, params.name), fetch),
+      restconfGetOrNull<unknown>(getListEntryPath(CAMPAIGN_LIST_ROOT, params.name), fetch),
       loadSchedules(fetch)
     ]);
     return { name: params.name, campaign: parseCampaignEntry(response), schedules, loadError: '' };
   } catch (loadError) {
-    const message = loadError instanceof Error ? loadError.message : 'Failed to load the campaign.';
-    return {
-      name: params.name,
-      campaign: null,
-      schedules: [] as Schedule[],
-      loadError: message.includes('404') ? '' : message
-    };
+    const message = errorText(loadError, 'Failed to load the campaign.');
+    return { name: params.name, campaign: null, schedules: [] as Schedule[], loadError: message };
   }
 };

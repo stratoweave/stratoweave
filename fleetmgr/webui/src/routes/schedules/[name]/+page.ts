@@ -1,3 +1,4 @@
+import { errorText } from '$lib/core/errors';
 import { restconfGetOrNull } from '$lib/core/restconf/client';
 import { scheduleUsage } from '$lib/maintenance/schedule-form';
 import {
@@ -30,7 +31,7 @@ export const load: PageLoad = async ({ fetch, depends, params }) => {
       loadError: ''
     };
   } catch (loadError) {
-    const message = loadError instanceof Error ? loadError.message : 'Failed to load the schedule.';
+    const message = errorText(loadError, 'Failed to load the schedule.');
     return {
       name: params.name,
       schedule: null,

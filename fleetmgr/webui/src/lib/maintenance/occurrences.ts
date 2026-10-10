@@ -4,7 +4,7 @@
 // weekdays, every day when none are listed, over a fixed horizon. The
 // calendar cuts them into the viewer's local days.
 
-import type { MaintenanceWindow, Schedule } from '../software/model';
+import type { MaintenanceWindow, Schedule } from '$lib/software/model';
 
 /** How far ahead the planner generates occurrences. */
 export const HORIZON_DAYS = 9;
@@ -26,6 +26,17 @@ function mod(a: number, b: number): number {
   return ((a % b) + b) % b;
 }
 
+/** Local seconds -> weekday index, monday zero (1970-01-01 was a
+ * Thursday). */
+function weekdayOf(local: number): number {
+  return mod(Math.floor(local / DAY) + 3, 7);
+}
+
+/** A rule's weekdays as indexes, monday zero; unknown names are dropped. */
+function dayIndexes(days: string[]): number[] {
+  return days.map((d) => WEEKDAYS.indexOf(d as Weekday)).filter((i) => i >= 0);
+}
+
 /** The occurrences whose local day lies within `horizonDays` of the
  * schedule's local day of `from`, in start order. With `closedBefore`,
  * occurrences already closed at that time are left out, as the planner
@@ -41,14 +52,10 @@ export function occurrences(
   const day0 = localFrom - mod(localFrom, DAY);
   const out: Occurrence[] = [];
   for (const rule of schedule.windows) {
-    const days = rule.days.map((d) => WEEKDAYS.indexOf(d as Weekday)).filter((i) => i >= 0);
+    const days = dayIndexes(rule.days);
     for (let k = 0; k < horizonDays; k++) {
       const localDay = day0 + k * DAY;
-      if (days.length > 0) {
-        // 1970-01-01 was a Thursday; monday is day zero here.
-        const weekday = mod(Math.floor(localDay / DAY) + 3, 7);
-        if (!days.includes(weekday)) continue;
-      }
+      if (days.length > 0 && !days.includes(weekdayOf(localDay))) continue;
       const start = localDay + rule.at - off;
       const end = start + rule.duration;
       if (closedBefore !== undefined && end <= closedBefore) continue;
@@ -145,11 +152,6 @@ export function snapTime(t: number): number {
   return Math.round(t / SNAP_S) * SNAP_S;
 }
 
-/** Local seconds -> weekday index, monday zero. */
-function weekdayOf(local: number): number {
-  return mod(Math.floor(local / DAY) + 3, 7);
-}
-
 function daysFromIndexes(indexes: Iterable<number>): Weekday[] {
   const set = new Set(indexes);
   return WEEKDAYS.filter((_, i) => set.has(i));
@@ -172,9 +174,8 @@ export function moveRule(
   const at = mod(raw, DAY);
   if (rule.days.length === 0) return { at, duration: rule.duration, days: [] };
   const dragged = weekdayOf(occStart + utcOffset * 60);
-  const others = rule.days
-    .map((d) => WEEKDAYS.indexOf(d as Weekday))
-    .filter((i) => i >= 0 && i !== dragged)
+  const others = dayIndexes(rule.days)
+    .filter((i) => i !== dragged)
     .map((i) => mod(i + carry, 7));
   let moved = mod(dragged + carry + dayMove, 7);
   if (others.includes(moved)) moved = mod(dragged + carry, 7);

@@ -2,6 +2,7 @@
   import { untrack } from 'svelte';
   import { goto } from '$app/navigation';
 
+  import { errorText } from '$lib/core/errors';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import Section from '$lib/core/ui/Section.svelte';
@@ -19,7 +20,6 @@
     draftFromSchedule,
     draftToSchedule,
     emptyDraft,
-    formatTimeOfDay,
     newWindowDraft,
     parseTimeOfDay,
     parseUtcOffset,
@@ -33,8 +33,14 @@
     type WindowDraft
   } from '$lib/maintenance/schedule-form';
   import { DATA_ROOT, SCHEDULE_LIST_ROOT, type MaintenanceWindow, type Schedule } from '$lib/software/model';
-  import { clockLabel, dayLabel, sameLocalDay } from '$lib/software/plan-timeline';
-  import { formatDuration, parseDuration } from '$lib/software/time';
+  import {
+    clockLabel,
+    dayLabel,
+    formatDuration,
+    formatTimeOfDay,
+    parseDuration,
+    sameLocalDay
+  } from '$lib/core/time';
 
   interface Props {
     /** null creates a new schedule. */
@@ -50,7 +56,6 @@
   const isNew = untrack(() => schedule === null);
   let draft = $state<ScheduleDraft>(untrack(() => (schedule ? draftFromSchedule(schedule) : emptyDraft())));
   let touched = $state(false);
-  let validationKey = $state(0);
   let saving = $state(false);
   let deleting = $state(false);
   let confirmDelete = $state(false);
@@ -100,12 +105,7 @@
     // on the key.
     const ats = draft.windows.map((w) => parseTimeOfDay(w.at)).filter((a): a is number => a !== null);
     const at = ats.length > 0 ? (Math.max(...ats) + 3600) % 86400 : 79200;
-    const h = Math.floor(at / 3600);
-    const m = Math.floor((at % 3600) / 60);
-    draft = {
-      ...draft,
-      windows: [...draft.windows, newWindowDraft({ at: `${h < 10 ? '0' : ''}${h}:${m < 10 ? '0' : ''}${m}` })]
-    };
+    draft = { ...draft, windows: [...draft.windows, newWindowDraft({ at: formatTimeOfDay(at - (at % 60)) })] };
   }
 
   // The calendar moves or resizes a rule, or adds one; the rows follow.
@@ -138,8 +138,7 @@
   async function handleSave(): Promise<void> {
     touched = true;
     if (!validation.ok) {
-      // Fields show their own error once blurred; a field never visited
-      // would stay silent, so the banner names every problem.
+      // The banner also names problems scrolled out of view.
       statusMessage = `Not saved: ${[...new Set(Object.values(validation.errors))].join(' ')}`;
       return;
     }
@@ -161,7 +160,7 @@
       // Not a preload made before the write (hovering Cancel makes one).
       await goto('/schedules', { invalidateAll: true });
     } catch (saveError) {
-      statusMessage = saveError instanceof Error ? saveError.message : 'Failed to save the schedule.';
+      statusMessage = errorText(saveError, 'Failed to save the schedule.');
     } finally {
       saving = false;
     }
@@ -176,7 +175,7 @@
       await restconfDelete(getListEntryPath(SCHEDULE_LIST_ROOT, schedule.name));
       await goto('/schedules', { invalidateAll: true });
     } catch (deleteError) {
-      statusMessage = deleteError instanceof Error ? deleteError.message : 'Failed to delete the schedule.';
+      statusMessage = errorText(deleteError, 'Failed to delete the schedule.');
     } finally {
       deleting = false;
     }
@@ -232,7 +231,6 @@
           required={isNew}
           value={draft.name}
           error={errors['name']}
-          {validationKey}
           mono={true}
           disabled={!isNew}
           placeholder="e.g., europe"
@@ -243,7 +241,6 @@
           label="UTC offset"
           value={draft.utcOffset}
           error={errors['utc-offset']}
-          {validationKey}
           mono={true}
           placeholder="+01:00"
           help="no daylight saving"
@@ -259,7 +256,7 @@
             <span class="kick">Rule {index + 1}</span>
             <span class="rule-preview mono">{rulePreview(w)}</span>
             <button
-              class="btn btn-secondary btn-small btn-danger-ghost"
+              class="btn btn-secondary btn-sm btn-danger-ghost"
               type="button"
               onclick={() => removeRule(w.id)}
             >
@@ -267,35 +264,27 @@
             </button>
           </div>
           <div class="rule-fields">
-            <label class="field">
-              <span class="field-label">Opens at</span>
-              <input
-                class="input mono"
-                class:has-error={!!errors[`window.${w.id}.at`]}
-                type="text"
-                value={w.at}
-                placeholder="22:00"
-                oninput={(e) => patchWindow(w.id, { at: e.currentTarget.value })}
-                onblur={() => (touched = true)}
-              />
-              <small class="field-error">{errors[`window.${w.id}.at`] ?? ''}</small>
-            </label>
-            <label class="field">
-              <span class="field-label">Duration</span>
-              <input
-                class="input mono"
-                class:has-error={!!errors[`window.${w.id}.duration`]}
-                type="text"
-                value={w.duration}
-                placeholder="4h"
-                oninput={(e) => patchWindow(w.id, { duration: e.currentTarget.value })}
-                onblur={() => (touched = true)}
-              />
-              <small class="field-error">{errors[`window.${w.id}.duration`] ?? ''}</small>
-            </label>
+            <FieldText
+              label="Opens at"
+              value={w.at}
+              error={errors[`window.${w.id}.at`]}
+              mono={true}
+              placeholder="22:00"
+              onchange={(v) => patchWindow(w.id, { at: v })}
+              ontouch={() => (touched = true)}
+            />
+            <FieldText
+              label="Duration"
+              value={w.duration}
+              error={errors[`window.${w.id}.duration`]}
+              mono={true}
+              placeholder="4h"
+              onchange={(v) => patchWindow(w.id, { duration: v })}
+              ontouch={() => (touched = true)}
+            />
           </div>
           <div class="field">
-            <span class="field-label">Weekdays</span>
+            <span class="field__label">Weekdays</span>
             <div class="days">
               {#each WEEKDAYS as day (day)}
                 <button
@@ -313,7 +302,7 @@
         </div>
       {/each}
       <div class="rule-actions">
-        <button class="btn btn-secondary btn-small" type="button" onclick={addRule}>Add a rule</button>
+        <button class="btn btn-secondary btn-sm" type="button" onclick={addRule}>Add a rule</button>
         {#each validation.warnings as warning (warning)}
           <span class="warning">{warning}</span>
         {/each}
@@ -340,7 +329,7 @@
       <p class="hint">None within the planner's {HORIZON_DAYS} days.</p>
     {:else}
       <div class="table-wrap">
-        <table>
+        <table class="dense">
           <thead>
             <tr>
               <th>Opens</th>
@@ -384,10 +373,6 @@
     gap: 8px;
   }
 
-  .status {
-    margin-bottom: 12px;
-  }
-
   .editor {
     display: grid;
     grid-template-columns: minmax(360px, 440px) minmax(0, 1fr);
@@ -399,10 +384,6 @@
     .editor {
       grid-template-columns: 1fr;
     }
-  }
-
-  .card {
-    padding: 20px;
   }
 
   .grid-2 {
@@ -439,48 +420,6 @@
     display: grid;
     grid-template-columns: 1fr 1fr;
     gap: 10px;
-  }
-
-  .field {
-    display: grid;
-    gap: 6px;
-    align-content: start;
-  }
-
-  .field-label {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--sw-text-label);
-  }
-
-  .input {
-    width: 100%;
-    padding: 9px 12px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-size: 12px;
-    outline: none;
-  }
-
-  .input:focus {
-    border-color: var(--sw-accent);
-    box-shadow: 0 0 0 3px var(--sw-accent-glow);
-  }
-
-  .input.has-error {
-    border-color: var(--sw-danger);
-    box-shadow: 0 0 0 3px var(--sw-danger-dim);
-  }
-
-  .field-error {
-    min-height: 1rem;
-    font-size: 11px;
-    color: var(--sw-danger);
   }
 
   .days {
@@ -543,55 +482,5 @@
     font-size: 12px;
     color: var(--sw-text-muted);
     margin: 8px 0 0;
-  }
-
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
-  th {
-    text-align: left;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--sw-text-muted);
-    padding: 6px 10px;
-    border-bottom: 1px solid var(--sw-border-default);
-    white-space: nowrap;
-    background: none;
-  }
-
-  td {
-    padding: 7px 10px;
-    border-bottom: 1px solid var(--sw-border-default);
-    vertical-align: middle;
-  }
-
-  tbody tr:last-child td {
-    border-bottom: none;
-  }
-
-  .right {
-    text-align: right;
-  }
-
-  .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .btn-small {
-    padding: 4px 10px;
-    font-size: 12px;
-  }
-
-  .btn-danger-ghost {
-    color: var(--sw-danger);
   }
 </style>

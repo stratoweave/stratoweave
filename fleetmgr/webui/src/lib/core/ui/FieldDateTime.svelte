@@ -22,6 +22,7 @@
   <span class="field__label">{label}</span>
   <input
     type="datetime-local"
+    class="input mono"
     class:empty={!value}
     class:has-error={!!error}
     aria-invalid={error ? 'true' : undefined}
@@ -34,51 +35,6 @@
 </label>
 
 <style>
-  .field {
-    display: grid;
-    gap: 6px;
-    min-width: 0;
-  }
-
-  .field__label {
-    font-size: 12px;
-    font-weight: 500;
-    color: var(--sw-text-label);
-  }
-
-  input {
-    width: 100%;
-    padding: 9px 12px;
-    background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    color: var(--sw-text-primary);
-    font-family: var(--sw-font-mono);
-    font-size: 12px;
-    line-height: 1.5;
-    outline: none;
-    transition: border-color var(--sw-dur-fast), box-shadow var(--sw-dur-fast);
-  }
-
-  input:hover:not(:disabled) {
-    border-color: var(--sw-text-muted);
-  }
-
-  input:focus {
-    border-color: var(--sw-accent);
-    box-shadow: 0 0 0 3px var(--sw-accent-glow);
-  }
-
-  input.has-error {
-    border-color: var(--sw-danger);
-    box-shadow: 0 0 0 3px var(--sw-danger-dim);
-  }
-
-  input:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
-
   /* The empty mask (dd/mm/yyyy, --:--) reads as a placeholder. */
   input.empty::-webkit-datetime-edit {
     color: var(--sw-text-muted);
@@ -114,15 +70,5 @@
   input::-webkit-calendar-picker-indicator:hover {
     background-color: var(--sw-bg-hover);
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 16 16' fill='none' stroke='%2322d3ee' stroke-width='1.5' stroke-linecap='round'%3E%3Crect x='2' y='3' width='12' height='11' rx='2'/%3E%3Cpath d='M2 6.5h12M5.5 1.5v3M10.5 1.5v3'/%3E%3C/svg%3E");
-  }
-
-  .field__meta {
-    min-height: 1rem;
-    font-size: 11px;
-    color: var(--sw-text-muted);
-  }
-
-  .field__meta--error {
-    color: var(--sw-danger);
   }
 </style>

@@ -1,3 +1,4 @@
+import { errorText } from '$lib/core/errors';
 import { restconfGetOrNull } from '$lib/core/restconf/client';
 import {
   FLEET_ROOT,
@@ -28,7 +29,7 @@ export const load: PageLoad = async ({ fetch, depends }) => {
       loadError: ''
     };
   } catch (loadError) {
-    const message = loadError instanceof Error ? loadError.message : 'Failed to load schedules.';
+    const message = errorText(loadError, 'Failed to load schedules.');
     return { schedules: [], devices: [], campaigns: [], loadError: message };
   }
 };

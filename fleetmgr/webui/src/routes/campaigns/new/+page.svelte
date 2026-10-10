@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
   import { goto } from '$app/navigation';
 
+  import { errorText } from '$lib/core/errors';
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import Section from '$lib/core/ui/Section.svelte';
   import PlanningFields from '$lib/software/PlanningFields.svelte';
@@ -13,9 +13,7 @@
     DEFAULT_MAX_RATE,
     DEFAULT_TARGET_RATE,
     campaignCreatePatch,
-    type Campaign,
-    type Device,
-    type Schedule
+    validateNewCampaign
   } from '$lib/software/model';
   import {
     emptyPlanningDraft,
@@ -23,18 +21,9 @@
     validatePlanningDraft,
     type PlanningDraft
   } from '$lib/software/planning-form';
+  import type { PageProps } from './$types';
 
-  let {
-    data
-  }: {
-    data: {
-      devices: Device[];
-      campaigns: Campaign[];
-      schedules: Schedule[];
-      loadError: string;
-    };
-  } = $props();
-
+  let { data }: PageProps = $props();
 
   let name = $state('');
   let targetRelease = $state('');
@@ -44,38 +33,24 @@
   let planning = $state<PlanningDraft>(emptyPlanningDraft());
 
   let touched = $state(false);
-  let validationKey = $state(0);
   let creating = $state(false);
-  let statusMessage = $state<string>(untrack(() => data.loadError));
+  let createError = $state('');
 
-
-  let errors = $derived.by(() => {
-    const e: Record<string, string> = {};
-    const n = name.trim();
-    if (!n) {
-      e['name'] = 'A name is required.';
-    } else if (data.campaigns.some((c) => c.name === n)) {
-      e['name'] = `${n} is already in use.`;
-    }
-    if (!targetRelease.trim()) {
-      e['target-release'] = 'A target release is required.';
-    }
-    if (members.length === 0) {
-      e['device'] = 'Select at least one device.';
-    }
-    return { ...e, ...validatePlanningDraft(planning, Date.now() / 1000) };
+  let errors = $derived({
+    ...validateNewCampaign(
+      { name, targetRelease, imageUrl, devices: members },
+      data.campaigns.map((c) => c.name)
+    ).errors,
+    ...validatePlanningDraft(planning, Date.now() / 1000)
   });
   let visibleErrors = $derived(touched ? errors : ({} as Record<string, string>));
 
   async function handleCreate(): Promise<void> {
     touched = true;
-    if (Object.keys(errors).length > 0) {
-      validationKey += 1;
-      return;
-    }
+    if (Object.keys(errors).length > 0) return;
     try {
       creating = true;
-      statusMessage = '';
+      createError = '';
       const campaign = name.trim();
       const p = planningFromDraft(planning);
       await restconfPatchJson(
@@ -93,9 +68,8 @@
         })
       );
       await goto(`/campaigns/${encodeURIComponent(campaign)}`, { invalidateAll: true });
-    } catch (createError) {
-      statusMessage =
-        createError instanceof Error ? createError.message : 'Failed to create the campaign.';
+    } catch (error) {
+      createError = errorText(error, 'Failed to create the campaign.');
     } finally {
       creating = false;
     }
@@ -112,8 +86,8 @@
   </div>
 </div>
 
-{#if statusMessage}
-  <div class="error-state status">{statusMessage}</div>
+{#if createError || data.loadError}
+  <div class="error-state status">{createError || data.loadError}</div>
 {/if}
 
 <section class="card">
@@ -128,7 +102,6 @@
         required={true}
         value={name}
         error={visibleErrors['name']}
-        {validationKey}
         yangType="string"
         placeholder="e.g., xe-1718-emea"
         onchange={(v) => (name = v)}
@@ -139,7 +112,6 @@
         required={true}
         value={targetRelease}
         error={visibleErrors['target-release']}
-        {validationKey}
         yangType="string"
         mono={true}
         placeholder="e.g., 17.18.03a"
@@ -150,7 +122,6 @@
     <FieldText
       label="Image URL"
       value={imageUrl}
-      {validationKey}
       yangType="string"
       mono={true}
       placeholder="scp://user:password@host:/path/image.bin"
@@ -214,12 +185,7 @@
 </section>
 
 <style>
-  .status {
-    margin-bottom: 12px;
-  }
-
   .card {
-    padding: 20px;
     margin-bottom: 16px;
   }
 

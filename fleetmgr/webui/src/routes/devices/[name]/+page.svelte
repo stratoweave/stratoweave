@@ -1,29 +1,20 @@
 <script lang="ts">
-  import { onMount, untrack } from 'svelte';
+  import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import AdminStatePill from '$lib/software/AdminStatePill.svelte';
   import StageChain from '$lib/software/StageChain.svelte';
   import StatusPill from '$lib/software/StatusPill.svelte';
+  import { errorText } from '$lib/core/errors';
   import { createPoller } from '$lib/core/polling/poller';
   import { setDeviceSchedule } from '$lib/maintenance/binding';
   import { scheduleRulesText } from '$lib/maintenance/schedule-form';
-  import type { Campaign, Device, Schedule } from '$lib/software/model';
+  import type { Campaign } from '$lib/software/model';
   import { stageDetail } from '$lib/software/stages';
-  import { formatClock } from '$lib/software/time';
+  import { formatClock } from '$lib/core/time';
+  import type { PageProps } from './$types';
 
-  let {
-    data
-  }: {
-    data: {
-      name: string;
-      device: Device | null;
-      campaigns: Campaign[];
-      schedules: Schedule[];
-      loadError: string;
-    };
-  } = $props();
-
-  let statusMessage = $state<string>(untrack(() => data.loadError));
+  let { data }: PageProps = $props();
 
   // null follows the device as polled; a pick holds until it is saved.
   let picked = $state<string | null>(null);
@@ -52,7 +43,7 @@
     } catch (saveError) {
       scheduleMessage = {
         type: 'error',
-        text: saveError instanceof Error ? saveError.message : 'Failed to save the schedule.'
+        text: errorText(saveError, 'Failed to save the schedule.')
       };
     } finally {
       savingSchedule = false;
@@ -85,8 +76,8 @@
   }
 </script>
 
-{#if statusMessage}
-  <div class="error-state status">{statusMessage}</div>
+{#if data.loadError}
+  <div class="error-state status">{data.loadError}</div>
 {/if}
 
 {#if data.device === null}
@@ -175,10 +166,7 @@
                 </td>
                 <td class="mono tn">{campaign.targetRelease}</td>
                 <td>
-                  <span class="pill" class:pill-run={campaign.adminState === 'run'} class:muted={campaign.adminState === 'plan'}>
-                    <span class="dot"></span>
-                    {campaign.adminState}
-                  </span>
+                  <AdminStatePill state={campaign.adminState} />
                 </td>
                 <td class="mono tn">{plannedStart(campaign)}</td>
                 <td>
@@ -210,12 +198,7 @@
 {/if}
 
 <style>
-  .status {
-    margin-bottom: 12px;
-  }
-
   .card {
-    padding: 20px;
     margin-bottom: 16px;
   }
 
@@ -230,32 +213,12 @@
     font-size: 14px;
   }
 
-  .table-wrap {
-    overflow-x: auto;
-  }
-
-  table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-  }
-
+  /* Stage chain header labels wrap; the cells do not. */
   th {
-    text-align: left;
-    font-size: 10.5px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.09em;
-    color: var(--sw-text-muted);
-    padding: 9px 10px;
-    border-bottom: 1px solid var(--sw-border-subtle);
     white-space: normal;
   }
 
   td {
-    padding: 11px 10px;
-    border-bottom: 1px solid var(--sw-border-subtle);
-    vertical-align: middle;
     white-space: nowrap;
   }
 
@@ -266,10 +229,6 @@
     font-size: 12px;
     color: var(--sw-text-secondary);
     white-space: normal;
-  }
-
-  tbody tr:last-child td {
-    border-bottom: none;
   }
 
   .campaign-name {
@@ -310,13 +269,5 @@
   .save-error {
     font-size: 12px;
     color: var(--sw-danger);
-  }
-
-  .mono {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
-  }
-
-  .tn {
-    font-variant-numeric: tabular-nums;
   }
 </style>

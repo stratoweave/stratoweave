@@ -1,19 +1,8 @@
 <script lang="ts">
   import ScheduleEditor from '$lib/maintenance/ScheduleEditor.svelte';
-  import type { ScheduleUsage } from '$lib/maintenance/schedule-form';
-  import type { Schedule } from '$lib/software/model';
+  import type { PageProps } from './$types';
 
-  let {
-    data
-  }: {
-    data: {
-      name: string;
-      schedule: Schedule | null;
-      existingNames: string[];
-      usage: ScheduleUsage;
-      loadError: string;
-    };
-  } = $props();
+  let { data }: PageProps = $props();
 </script>
 
 {#if data.loadError}
@@ -36,13 +25,3 @@
     />
   {/key}
 {/if}
-
-<style>
-  .status {
-    margin-bottom: 12px;
-  }
-
-  .card {
-    padding: 20px;
-  }
-</style>

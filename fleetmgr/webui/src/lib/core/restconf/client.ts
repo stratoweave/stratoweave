@@ -9,19 +9,27 @@ const ASYNC_WRITE_HEADERS = { async: 'true' } as const;
 
 type Fetch = typeof fetch;
 
+export class RestconfError extends Error {
+  status: number;
+
+  constructor(status: number, message: string) {
+    super(`RESTCONF ${status}: ${message}`);
+    this.status = status;
+  }
+}
+
 function normalizePath(path: string): string {
   return path.replace(/^\/+/, '');
 }
 
-function encodeListKeyPart(value: string): string {
+function encodeListKey(value: string): string {
   // List keys take exactly the single percent-encoding RFC 8040 prescribes.
   return encodeURIComponent(value.trim());
 }
 
 async function readResponse<T>(response: Response, readBody = true): Promise<T> {
   if (!response.ok) {
-    const message = (await response.text()) || response.statusText;
-    throw new Error(`RESTCONF ${response.status}: ${message}`);
+    throw new RestconfError(response.status, (await response.text()) || response.statusText);
   }
 
   if (!readBody) {
@@ -40,7 +48,7 @@ async function readResponse<T>(response: Response, readBody = true): Promise<T> 
   }
 }
 
-export async function restconfRequest<T>(
+async function restconfRequest<T>(
   path: string,
   init: RequestInit & RestconfRequestOptions = {},
   fetchFn: Fetch = fetch
@@ -81,7 +89,7 @@ export async function restconfGetOrNull<T>(path: string, fetchFn: Fetch = fetch)
   try {
     return await restconfGetJson<T>(path, fetchFn);
   } catch (error) {
-    if (error instanceof Error && error.message.includes('404')) {
+    if (error instanceof RestconfError && error.status === 404) {
       return null;
     }
     throw error;
@@ -110,32 +118,6 @@ export function restconfPatchJson<T>(path: string, body: unknown): Promise<T> {
   });
 }
 
-/**
- * Send a raw string body with a caller-chosen method + Content-Type.
- * Use this when the body is already serialized (e.g. an XML payload, or
- * a JSON string the caller produced manually) and the JSON helpers
- * would double-encode by `JSON.stringify`'ing it.
- */
-export function restconfRaw<T = string>(
-  method: 'PUT' | 'PATCH' | 'POST',
-  path: string,
-  body: string,
-  contentType: string,
-  readBody = false,
-  headers?: HeadersInit,
-  signal?: AbortSignal
-): Promise<T> {
-  return restconfRequest<T>(path, {
-    method,
-    body,
-    headers,
-    signal,
-    accept: contentType,
-    contentType,
-    readBody
-  });
-}
-
 export function restconfDelete(path: string): Promise<unknown> {
   return restconfRequest(path, {
     method: 'DELETE',
@@ -144,19 +126,11 @@ export function restconfDelete(path: string): Promise<unknown> {
   });
 }
 
-export function encodeListKey(key: string | string[]): string {
-  if (Array.isArray(key)) {
-    return key.map((part) => encodeListKeyPart(String(part))).join(',');
-  }
-
-  return encodeListKeyPart(String(key));
-}
-
-export function getListEntryPath(root: string, key: string | string[]): string {
+export function getListEntryPath(root: string, key: string): string {
   return `${normalizePath(root)}=${encodeListKey(key)}`;
 }
 
-export function getListWrapperKey(restconfRoot: string): string {
+function getListWrapperKey(restconfRoot: string): string {
   const segments = normalizePath(restconfRoot).replace(/^data\//, '').split('/');
   const last = segments[segments.length - 1];
 
@@ -176,4 +150,20 @@ export function getListWrapperKey(restconfRoot: string): string {
 
 export function wrapListEntryBody(restconfRoot: string, entry: unknown): Record<string, unknown[]> {
   return { [getListWrapperKey(restconfRoot)]: [entry] };
+}
+
+/** Read a list entry, change it and PUT it back whole. This is how a leaf
+ * is removed: DELETE on a leaf returns 500 upstream and a PATCH only
+ * merges. `edit` gets the entry as read and returns null to leave it be. */
+export async function rewriteListEntry(
+  root: string,
+  key: string,
+  edit: (entry: Record<string, unknown>) => Record<string, unknown> | null
+): Promise<void> {
+  const path = getListEntryPath(root, key);
+  const got = await restconfGetJson<Record<string, Record<string, unknown>[]>>(path);
+  const entry = got?.[getListWrapperKey(root)]?.[0];
+  if (!entry) throw new Error(`${key} no longer exists.`);
+  const next = edit(entry);
+  if (next !== null) await restconfPutJson(path, wrapListEntryBody(root, next));
 }
