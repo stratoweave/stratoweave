@@ -146,9 +146,10 @@ schedules themselves: the local time zone, and rules of an opening time, a
 duration and weekdays, typed or dragged on the calendar. The devices page
 binds devices to a schedule, one at a time or a whole filtered selection. A
 campaign page draws the plan as a timeline: each window is a band as wide
-as its duration, with one cell per device at its estimated start on the
-wall clock; a marker shows now, and once the campaign runs the cells take
-the devices' live status; the same page changes the campaign's default
+as its duration, with one cell per device at its start on the wall
+clock, the real one once the controller has released the device; a marker
+shows now, and once the campaign runs the cells take the devices' live
+status; the same page changes the campaign's default
 schedule and its pace, set by a deadline or a target rate, plus the max
 rate. The top serves the UI itself: the static build is embedded in the
 `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so with `just demo`

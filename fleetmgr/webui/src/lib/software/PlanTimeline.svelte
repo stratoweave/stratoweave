@@ -1,6 +1,13 @@
 <script lang="ts">
   import { CELL_BG } from '$lib/software/cells';
-  import type { CampaignPlan, KnownStatus, PlanDevice, PlanWindow } from '$lib/software/model';
+  import {
+    deviceDuration,
+    deviceStart,
+    type CampaignPlan,
+    type KnownStatus,
+    type PlanDevice,
+    type PlanWindow
+  } from '$lib/software/model';
   import {
     WINDOW_GAP,
     assignLanes,
@@ -38,7 +45,7 @@
 
   // The plan on a wall-clock axis. Each window is a band as wide as its
   // duration with one cell per device below it, in a column at its
-  // estimated start; devices released together stack in one column.
+  // start; devices released together stack in one column.
   // Windows that overlap sit in lanes above each other, idle stretches
   // between windows collapse to a break, and a marker shows now.
   const PAD_L = 30;
@@ -230,7 +237,9 @@
     const d = devices.get(hit.name);
     const status = statuses.get(hit.name) ?? 'pending';
     if (!d) return `${hit.name} — ${status}`;
-    return `${hit.name} — ${status} · starts ${formatClock(d.estimatedStart)} · ~${formatDuration(d.estimatedDuration)}`;
+    const start = `${d.started === null ? 'starts' : 'started'} ${formatClock(deviceStart(d))}`;
+    const took = `${d.finished === null ? '~' : 'took '}${formatDuration(deviceDuration(d))}`;
+    return `${hit.name} — ${status} · ${start} · ${took}`;
   }
 
   function onClick(event: MouseEvent): void {
@@ -247,7 +256,7 @@
 </script>
 
 <div class="bar">
-  <span class="hint">one cell per device at its estimated start</span>
+  <span class="hint">one cell per device at its start</span>
   <div class="chips">
     {#if zoom > 1}
       <button class="chip" class:active={follow} type="button" onclick={() => (follow = !follow)}>
@@ -280,7 +289,7 @@
     viewBox={`0 0 ${axis.width} ${lanes.height}`}
     shape-rendering="crispEdges"
     role="img"
-    aria-label="The plan's windows over time, one cell per device at its estimated start"
+    aria-label="The plan's windows over time, one cell per device at its start"
     onclick={onClick}
     onmousemove={onMove}
   >

@@ -80,6 +80,8 @@ interface PlanDeviceJson {
   name: string;
   'estimated-start'?: number | string;
   'estimated-duration'?: number | string;
+  started?: number | string;
+  finished?: number | string;
 }
 
 interface PlanWindowJson {
@@ -269,9 +271,23 @@ export interface Schedule {
 
 export interface PlanDevice {
   name: string;
-  /** Seconds since the Unix epoch; an estimate. */
+  /** Seconds since the Unix epoch; an estimate, 0 once released. */
   estimatedStart: number;
   estimatedDuration: number;
+  /** Seconds since the Unix epoch, when the controller released the
+   * device and saw it done; null until then. */
+  started: number | null;
+  finished: number | null;
+}
+
+/** When a device starts: its real start once released, else the estimate. */
+export function deviceStart(d: PlanDevice): number {
+  return d.started ?? d.estimatedStart;
+}
+
+/** How long it takes: the real duration once done, else the estimate. */
+export function deviceDuration(d: PlanDevice): number {
+  return d.started !== null && d.finished !== null ? d.finished - d.started : d.estimatedDuration;
 }
 
 export interface PlanWindow {
@@ -395,7 +411,9 @@ function parsePlan(state: CampaignStateJson | undefined, members: string[]): Cam
     devices: (w.device ?? []).map((d) => ({
       name: d.name,
       estimatedStart: num(d['estimated-start']),
-      estimatedDuration: num(d['estimated-duration'])
+      estimatedDuration: num(d['estimated-duration']),
+      started: d.started == null ? null : num(d.started),
+      finished: d.finished == null ? null : num(d.finished)
     }))
   }));
   windows.sort((a, b) => a.start - b.start);

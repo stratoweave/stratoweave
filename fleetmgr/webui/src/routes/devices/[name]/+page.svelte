@@ -8,7 +8,14 @@
   import { errorText } from '$lib/core/errors';
   import { createPoller } from '$lib/core/polling/poller';
   import { setDeviceSchedule } from '$lib/maintenance/binding';
-  import { STEP_LABEL, type Campaign, type CheckResult, type DeviceStatusRow, type Step } from '$lib/software/model';
+  import {
+    STEP_LABEL,
+    deviceStart,
+    type Campaign,
+    type CheckResult,
+    type DeviceStatusRow,
+    type Step
+  } from '$lib/software/model';
   import { stageDetail, stageView } from '$lib/software/stages';
   import { formatClock } from '$lib/core/time';
   import type { PageProps } from './$types';
@@ -68,13 +75,14 @@
     return `/campaigns/${encodeURIComponent(campaign.name)}`;
   }
 
-  /** The planner's estimate for this device, or "not placed" when the plan
-   * has the campaign but no window for it. */
+  /** This device's start in the plan, real once released, else the
+   * planner's estimate; "not placed" when the plan has the campaign but
+   * no window for it. */
   function plannedStart(campaign: Campaign): string {
     if (campaign.plan === null) return '—';
     for (const w of campaign.plan.windows) {
       const d = w.devices.find((x) => x.name === data.name);
-      if (d) return formatClock(d.estimatedStart);
+      if (d) return formatClock(deviceStart(d));
     }
     return campaign.plan.unplaced.includes(data.name) ? 'not placed' : '—';
   }

@@ -59,8 +59,10 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   (`start`/`end` as seconds since the Unix epoch, one `device` entry per
   member with `estimated-start` and `estimated-duration`), plus an `alarm`
   list for what does not fit, with one entry per device that fits no
-  window. Members in no plan window are not actuated; the UI shows them as
-  one count that expands to the device list. The plan timeline draws these
+  window. A released device stays in the window it was released in, with
+  `started`, and `finished` once done, instead of `estimated-start`.
+  Members in no plan window are not actuated; the UI shows them as one
+  count that expands to the device list. The plan timeline draws these
   times on the wall clock with a marker for now.
 - Polling is two-tier. The campaign page GETs its campaign's entry
   (~120 B per member) every 1.5 s when it has up to 600 members, and
