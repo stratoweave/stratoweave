@@ -6,9 +6,11 @@
   interface Props {
     /** Without a row the chain shows the step names, for a table header. */
     row?: DeviceStatusRow;
+    /** Bigger, with the step names under the dots, for one device. */
+    large?: boolean;
   }
 
-  let { row }: Props = $props();
+  let { row, large = false }: Props = $props();
   let view = $derived(row ? stageView(row) : null);
 
   const STATE_TEXT: Record<StepState, string> = {
@@ -49,6 +51,7 @@
 {:else}
   <span
     class="chain"
+    class:large
     role="img"
     aria-label={view.steps
       .map((s) => `${STEP_LABEL[s.step]} ${STATE_TEXT[s.state]}`)
@@ -64,59 +67,118 @@
         class:to-done={s.state === 'done'}
         title={title(row!, s.step, s.state)}
       >
-        <span class="dot {s.state}">
-          {#if s.state === 'failed'}
-            <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M3 3l4 4M7 3l-4 4" /></svg>
-          {/if}
+        <span class="pin">
+          <span class="dot {s.state}">
+            {#if s.state === 'failed'}
+              <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M3 3l4 4M7 3l-4 4" /></svg>
+            {/if}
+          </span>
         </span>
+        {#if large}
+          <span class="name {s.state}">{STEP_LABEL[s.step]}</span>
+        {/if}
       </span>
     {/each}
-    <span class="end">
-      {#if view.rollback}
-        <svg class="rollback {view.rollback}" viewBox="0 0 16 16" role="img">
-          <title>{ROLLBACK_TEXT[view.rollback]}</title>
-          <path d="M3.1 6.2A5.2 5.2 0 1 0 5.4 3.5M5.4 3.5l2.9.5M5.4 3.5l1-2.8" />
-        </svg>
-      {/if}
-    </span>
+    <!-- A large chain has no header to line up with. -->
+    {#if !large || view.rollback}
+      <span class="end">
+        {#if view.rollback}
+          <span class="pin">
+            <svg class="rollback {view.rollback}" viewBox="0 0 16 16" role="img">
+              <title>{ROLLBACK_TEXT[view.rollback]}</title>
+              <path d="M3.1 6.2A5.2 5.2 0 1 0 5.4 3.5M5.4 3.5l2.9.5M5.4 3.5l1-2.8" />
+            </svg>
+          </span>
+          {#if large}
+            <span class="name {view.rollback}">{ROLLBACK_TEXT[view.rollback]}</span>
+          {/if}
+        {/if}
+      </span>
+    {/if}
   </span>
 {/if}
 
 <style>
   .chain {
+    --cell: 56px;
+    --end: 20px;
+    --track: 16px;
+    --line: 2px;
+    --ring: 2px;
+    --dot: 10px;
+    --dot-running: 12px;
+    --dot-failed: 14px;
+    --cross: 10px;
+    --icon: 16px;
     display: inline-flex;
-    align-items: center;
+    align-items: flex-start;
     vertical-align: middle;
   }
 
+  /* Cells share the width, so the chain narrows with the page. */
+  .chain.large {
+    --end: 100px;
+    --track: 32px;
+    --line: 3px;
+    --ring: 3px;
+    --dot: 22px;
+    --dot-running: 24px;
+    --dot-failed: 30px;
+    --cross: 14px;
+    --icon: 28px;
+    display: flex;
+    width: min(100%, 850px);
+  }
+
+  .large .cell {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
   /* One cell per step, so the header names sit over the dots. */
-  .cell {
+  .cell,
+  .end {
     position: relative;
+    display: inline-flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    width: var(--cell);
+    min-height: var(--track);
+  }
+
+  .end {
+    width: var(--end);
+    flex: none;
+  }
+
+  /* Holds the dot, so the links meet its middle whatever its size. */
+  .pin {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    width: 56px;
-    height: 16px;
+    height: var(--track);
   }
 
   /* Each cell draws half of the link on either side of its dot, up to
-     the edge of a 10px dot. */
+     the edge of the dot. */
   .line::before,
   .line::after {
     content: '';
     position: absolute;
-    top: 7px;
-    height: 2px;
+    top: calc((var(--track) - var(--line)) / 2);
+    height: var(--line);
     background: var(--sw-border-default);
   }
 
   .line::before {
     left: 0;
-    right: calc(50% + 5px);
+    right: calc(50% + var(--dot) / 2);
   }
 
   .line::after {
-    left: calc(50% + 5px);
+    left: calc(50% + var(--dot) / 2);
     right: 0;
   }
 
@@ -139,6 +201,26 @@
     white-space: nowrap;
   }
 
+  .name {
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.2;
+    color: var(--sw-text-muted);
+    white-space: nowrap;
+  }
+
+  .name.done {
+    color: var(--sw-text-secondary);
+  }
+
+  .name.running {
+    color: var(--sw-accent);
+  }
+
+  .name.failed {
+    color: var(--sw-danger);
+  }
+
   .dot {
     position: relative;
     z-index: 1;
@@ -146,10 +228,10 @@
     align-items: center;
     justify-content: center;
     box-sizing: border-box;
-    width: 10px;
-    height: 10px;
+    width: var(--dot);
+    height: var(--dot);
     border-radius: 50%;
-    border: 2px solid var(--sw-border-default);
+    border: var(--ring) solid var(--sw-border-default);
   }
 
   .dot.done {
@@ -163,37 +245,31 @@
   }
 
   .dot.running {
-    width: 12px;
-    height: 12px;
+    width: var(--dot-running);
+    height: var(--dot-running);
     border-color: var(--sw-accent);
     background: var(--sw-accent);
     animation: ring 1.6s var(--sw-ease) infinite;
   }
 
   .dot.failed {
-    width: 14px;
-    height: 14px;
+    width: var(--dot-failed);
+    height: var(--dot-failed);
     border-color: var(--sw-danger);
     background: var(--sw-danger);
   }
 
   .dot svg {
-    width: 10px;
-    height: 10px;
+    width: var(--cross);
+    height: var(--cross);
     stroke: #fff;
     stroke-width: 1.8;
     stroke-linecap: round;
   }
 
-  .end {
-    display: inline-flex;
-    justify-content: center;
-    width: 20px;
-  }
-
   .rollback {
-    width: 16px;
-    height: 16px;
+    width: var(--icon);
+    height: var(--icon);
     fill: none;
     stroke: var(--sw-text-secondary);
     stroke-width: 1.8;

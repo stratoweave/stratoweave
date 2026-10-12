@@ -2,15 +2,14 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
-  import AdminStatePill from '$lib/software/AdminStatePill.svelte';
+  import DevicePicture from '$lib/software/DevicePicture.svelte';
   import StageChain from '$lib/software/StageChain.svelte';
   import StatusPill from '$lib/software/StatusPill.svelte';
   import { errorText } from '$lib/core/errors';
   import { createPoller } from '$lib/core/polling/poller';
   import { setDeviceSchedule } from '$lib/maintenance/binding';
-  import { scheduleRulesText } from '$lib/maintenance/schedule-form';
-  import type { Campaign } from '$lib/software/model';
-  import { stageDetail } from '$lib/software/stages';
+  import { STEPS, STEP_LABEL, type Campaign, type CheckResult, type DeviceStatusRow, type Step } from '$lib/software/model';
+  import { stageView } from '$lib/software/stages';
   import { formatClock } from '$lib/core/time';
   import type { PageProps } from './$types';
 
@@ -23,11 +22,16 @@
   let bound = $derived(data.device?.schedule ?? '');
   let choice = $derived(picked ?? bound);
   let scheduleOptions = $derived.by(() => {
-    const options = data.schedules.map((s) => ({ name: s.name, label: `${s.name} — ${scheduleRulesText(s)}` }));
+    const options = data.schedules.map((s) => ({ name: s.name, label: s.name }));
     if (bound && !data.schedules.some((s) => s.name === bound)) {
-      options.push({ name: bound, label: `${bound} (missing: placed in no window)` });
+      options.push({ name: bound, label: `${bound} (missing)` });
     }
     return options;
+  });
+  // Unbound, the device follows each campaign's default schedule.
+  let defaultLabel = $derived.by(() => {
+    const names = new Set(data.campaigns.map((c) => c.defaultSchedule || 'none'));
+    return `${names.size > 0 ? [...names].join(', ') : 'none'} (default)`;
   });
 
   async function saveSchedule(): Promise<void> {
@@ -74,6 +78,34 @@
     }
     return campaign.plan.unplaced.includes(data.name) ? 'not placed' : '—';
   }
+
+  /** The checks of the last run that have a verdict. */
+  function checks(row: DeviceStatusRow): { step: Step; result: CheckResult }[] {
+    const all: { step: Step; result: CheckResult }[] = [
+      { step: 'precheck', result: row.precheck },
+      { step: 'postcheck', result: row.postcheck }
+    ];
+    return all.filter((c) => c.result.verdict !== 'not-run');
+  }
+
+  /** "a: x; b: y" -> one part per check, with the check's name apart. */
+  function detailParts(detail: string): { source: string; text: string }[] {
+    return detail.split('; ').map((part) => {
+      const i = part.indexOf(': ');
+      return i > 0 ? { source: part.slice(0, i + 1), text: part.slice(i + 2) } : { source: '', text: part };
+    });
+  }
+
+  /** What neither the chain nor the check rows show. */
+  function note(row: DeviceStatusRow): string {
+    const view = stageView(row);
+    if (view.steps[0].state === 'skipped') return 'already on the target release';
+    const postcheck = view.steps[STEPS.indexOf('postcheck')];
+    if (postcheck.state === 'failed' && row.postcheck.verdict === 'not-run' && view.rollback !== null) {
+      return 'no time left to commit';
+    }
+    return '';
+  }
 </script>
 
 {#if data.loadError}
@@ -86,24 +118,98 @@
   </section>
 {:else}
   {@const device = data.device}
-  <div class="page-header">
-    <div>
-      <div class="kick mono">/fleet/device={device.name}</div>
-      <h2>{device.name}</h2>
-      <p class="meta">
-        type <span class="mono">{device.type}</span>
-        {#if device.address}
-          · OOB <span class="mono">{device.address}</span>
+  {@const single = data.campaigns.length === 1}
+  <section class="card hero">
+    <div class="kick mono">/fleet/device={device.name}</div>
+    <div class="head">
+      <DevicePicture />
+      <div class="ident">
+        <h1>{device.name}</h1>
+        <p class="meta">
+          type <span class="mono">{device.type}</span>
+          {#if device.address}
+            · OOB <span class="mono">{device.address}</span>
+          {/if}
+          {#if device.description}
+            · {device.description}
+          {/if}
+          {#if device.schedule}
+            · schedule <span class="mono">{device.schedule}</span>
+          {/if}
+        </p>
+      </div>
+      {#if single}
+        {@const row = statusRow(data.campaigns[0])}
+        {#if row}
+          <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
         {/if}
-        {#if device.description}
-          · {device.description}
-        {/if}
-        {#if device.schedule}
-          · schedule <span class="mono">{device.schedule}</span>
-        {/if}
-      </p>
+      {/if}
     </div>
-  </div>
+
+    {#if data.campaigns.length === 0}
+      <p class="none">Not a member of any campaign.</p>
+    {/if}
+    {#each data.campaigns as campaign (campaign.name)}
+      {@const row = statusRow(campaign)}
+      <div class="run">
+        <div class="run-head">
+          <div class="facts">
+            <span class="fact">
+              <span class="fact-label">Campaign:</span>
+              <a class="mono campaign-name" href={campaignHref(campaign)}>{campaign.name}</a>
+            </span>
+            <span class="fact">
+              <span class="fact-label">Admin state:</span>
+              <span class="mono">{campaign.adminState}</span>
+            </span>
+            <span class="fact">
+              <span class="fact-label">Target release:</span>
+              <span class="mono">{campaign.targetRelease}</span>
+            </span>
+            <span class="fact">
+              <span class="fact-label">Running release:</span>
+              <span class="mono">{row?.runningRelease || '—'}</span>
+            </span>
+            <span class="fact">
+              <span class="fact-label">Planned start:</span>
+              <span class="mono">{plannedStart(campaign)}</span>
+            </span>
+          </div>
+          {#if !single && row}
+            <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
+          {/if}
+        </div>
+        {#if row}
+          {@const text = note(row)}
+          <div class="track"><StageChain {row} large /></div>
+          {#if text}
+            <p class="note">{text}</p>
+          {/if}
+          {#each checks(row) as check (check.step)}
+            {@const verdict = check.result.verdict}
+            <div class="check" class:pass={verdict === 'pass'} class:fail={verdict === 'fail'}>
+              <span class="check-name">{STEP_LABEL[check.step]}</span>
+              <span class="pill verdict" class:success={verdict === 'pass'} class:danger={verdict === 'fail'}>
+                {verdict}
+              </span>
+              <span class="check-detail mono">
+                {#each detailParts(check.result.detail) as part, i (i)}
+                  <span class="part">
+                    {#if part.source}<span class="source">{part.source}</span>{/if}
+                    {part.text}
+                  </span>
+                {/each}
+              </span>
+              {#if check.step === 'precheck' && verdict === 'pass'}
+                <span class="baseline mono" title="The post-check compares against this.">baseline</span>
+              {/if}
+              <span class="at mono">{check.result.at !== null ? formatClock(check.result.at) : ''}</span>
+            </div>
+          {/each}
+        {/if}
+      </div>
+    {/each}
+  </section>
 
   <section class="card">
     <h3 class="panel-title">Maintenance schedule</h3>
@@ -115,7 +221,7 @@
         disabled={savingSchedule}
         onchange={(e) => (picked = e.currentTarget.value)}
       >
-        <option value="">none — each campaign's default schedule</option>
+        <option value="">{defaultLabel}</option>
         {#each scheduleOptions as option (option.name)}
           <option value={option.name}>{option.label}</option>
         {/each}
@@ -132,68 +238,6 @@
         <span class={scheduleMessage.type === 'error' ? 'save-error' : 'save-ok'}>{scheduleMessage.text}</span>
       {/if}
     </div>
-    <p class="hint">
-      A bound device is placed only in its schedule's windows; without a binding each campaign's
-      default schedule applies. Campaigns with this device re-plan on save. Windows are defined on
-      the <a href="/schedules">schedules</a>.
-    </p>
-  </section>
-
-  <section class="card">
-    <h3 class="panel-title">Campaign membership</h3>
-    {#if data.campaigns.length === 0}
-      <div class="empty-state">Not a member of any campaign.</div>
-    {:else}
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>Campaign</th>
-              <th>Target release</th>
-              <th>admin-state</th>
-              <th>Planned start</th>
-              <th>Status</th>
-              <th><StageChain /></th>
-              <th>Running release</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each data.campaigns as campaign (campaign.name)}
-              {@const row = statusRow(campaign)}
-              <tr>
-                <td>
-                  <a class="campaign-name mono" href={campaignHref(campaign)}>{campaign.name}</a>
-                </td>
-                <td class="mono tn">{campaign.targetRelease}</td>
-                <td>
-                  <AdminStatePill state={campaign.adminState} />
-                </td>
-                <td class="mono tn">{plannedStart(campaign)}</td>
-                <td>
-                  {#if row}
-                    <StatusPill status={row.status} raw={row.raw} />
-                  {:else}
-                    —
-                  {/if}
-                </td>
-                <td>
-                  {#if row}
-                    {@const detail = stageDetail(row)}
-                    <StageChain {row} />
-                    {#if detail}
-                      <div class="detail">{detail}</div>
-                    {/if}
-                  {:else}
-                    —
-                  {/if}
-                </td>
-                <td class="mono tn">{row?.runningRelease || '—'}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
-    {/if}
   </section>
 {/if}
 
@@ -202,33 +246,83 @@
     margin-bottom: 16px;
   }
 
+  .hero {
+    padding: 28px;
+  }
+
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 28px;
+    margin-top: 16px;
+  }
+
+  .ident {
+    min-width: 0;
+  }
+
+  .ident h1 {
+    font-size: 36px;
+    font-weight: 700;
+    letter-spacing: -0.025em;
+    line-height: 1.15;
+    overflow-wrap: anywhere;
+  }
+
   .meta {
     margin: 4px 0 0;
     color: var(--sw-text-secondary);
-    font-size: 13px;
+    font-size: 15px;
   }
 
-  .panel-title {
-    margin: 0 0 12px;
+  .status {
+    margin-left: auto;
+  }
+
+  .status :global(.pill) {
+    padding: 4px 12px;
     font-size: 14px;
   }
 
-  /* Stage chain header labels wrap; the cells do not. */
-  th {
-    white-space: normal;
+  .none {
+    margin: 24px 0 0;
+    color: var(--sw-text-muted);
   }
 
-  td {
-    white-space: nowrap;
+  .run {
+    margin-top: 24px;
   }
 
-  /* Under the chain: the table has no room for a column of its own. */
-  .detail {
-    max-width: 300px;
-    margin-top: 4px;
-    font-size: 12px;
-    color: var(--sw-text-secondary);
-    white-space: normal;
+  .run + .run {
+    padding-top: 24px;
+    border-top: 1px solid var(--sw-border-subtle);
+  }
+
+  .run-head {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+  }
+
+  .facts {
+    flex: 1;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 28px;
+  }
+
+  .fact {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--sw-text-primary);
+  }
+
+  .fact-label {
+    margin-right: 4px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--sw-text-muted);
   }
 
   .campaign-name {
@@ -240,14 +334,83 @@
     color: var(--sw-accent);
   }
 
-  .hint {
-    margin: 14px 0 0;
-    font-size: 12px;
+  .track {
+    display: flex;
+    justify-content: center;
+    margin: 32px 0 28px;
+  }
+
+  .note {
+    margin: -12px 0 20px;
+    text-align: center;
+    font-size: 13px;
+    color: var(--sw-text-secondary);
+  }
+
+  .check {
+    display: grid;
+    grid-template-columns: 120px 72px minmax(0, 1fr) auto auto;
+    align-items: center;
+    gap: 16px;
+    padding: 14px 20px;
+    border: 1px solid var(--sw-border-default);
+    border-radius: var(--sw-radius-md);
+    background: var(--sw-bg-deep);
+  }
+
+  .check + .check {
+    margin-top: 10px;
+  }
+
+  .check.pass {
+    border-color: rgb(var(--sw-success-rgb) / 0.3);
+  }
+
+  .check.fail {
+    border-color: rgb(var(--sw-danger-rgb) / 0.3);
+  }
+
+  .check-name {
+    font-size: 15px;
+    font-weight: 600;
+  }
+
+  .verdict {
+    justify-self: start;
+    padding: 2px 10px;
+    font-size: 13px;
+  }
+
+  .check-detail {
+    font-size: 13px;
+    color: var(--sw-text-primary);
+  }
+
+  .part {
+    display: block;
+  }
+
+  .source {
     color: var(--sw-text-muted);
   }
 
-  .hint a {
-    color: var(--sw-accent-bright);
+  .baseline {
+    padding: 1px 7px;
+    border: 1px solid rgb(var(--sw-accent-rgb) / 0.4);
+    border-radius: 4px;
+    font-size: 11px;
+    color: var(--sw-accent);
+  }
+
+  .at {
+    grid-column: 5;
+    font-size: 13px;
+    color: var(--sw-text-muted);
+  }
+
+  .panel-title {
+    margin: 0 0 12px;
+    font-size: 14px;
   }
 
   .binding {
@@ -258,7 +421,7 @@
   }
 
   .binding-select {
-    width: min(100%, 420px);
+    width: min(100%, 260px);
   }
 
   .save-ok {
@@ -269,5 +432,28 @@
   .save-error {
     font-size: 12px;
     color: var(--sw-danger);
+  }
+
+  @media (max-width: 720px) {
+    .head > :global(.device-picture) {
+      display: none;
+    }
+
+    .check {
+      grid-template-columns: auto auto 1fr auto;
+    }
+
+    .check-detail {
+      grid-column: 1 / -1;
+      grid-row: 2;
+    }
+
+    .baseline {
+      justify-self: start;
+    }
+
+    .at {
+      grid-column: 4;
+    }
   }
 </style>

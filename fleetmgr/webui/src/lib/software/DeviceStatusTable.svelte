@@ -25,7 +25,7 @@
     <tbody>
       {#each rows as row (row.device)}
         <tr>
-          <td><span class="device-name">{row.device}</span></td>
+          <td><a class="device-name" href={`/devices/${encodeURIComponent(row.device)}`}>{row.device}</a></td>
           <td><StatusPill status={row.status} raw={row.raw} /></td>
           <td><StageChain {row} /></td>
           <td class="mono">{row.runningRelease || '—'}</td>
@@ -52,6 +52,12 @@
 
   .device-name {
     font-weight: 600;
+    color: var(--sw-accent-bright);
+    text-decoration: none;
+  }
+
+  .device-name:hover {
+    color: var(--sw-accent);
   }
 
   .detail {
