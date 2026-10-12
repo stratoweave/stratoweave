@@ -1,0 +1,88 @@
+#
+# IOS XE hardware adapter.
+#
+# What the device is, read from Cisco-IOS-XE-device-hardware-oper: the chassis
+# entry of the hardware inventory names the product id, like C8000V, which a
+# software image must match. The DeviceMgr asks for it on every connect and
+# publishes it as device/state/hardware/model.
+#
+# Cisco-IOS-XE-platform-oper names the chassis too, but a lab c8000v returned
+# invalid UTF-8 in one of its leaves, which no XML parser accepts.
+#
+# See src/adapters/test_hardware_iosxe.act for the pure side and
+# src/adapters/test_software_iosxe.act for the device side, mocked.
+#
+
+import logging
+
+import yang.gdata as ygdata
+
+import device as swdev
+import adapters.software_iosxe_oper as ixoper
+
+# device-inventory hw-type of the chassis entry. An enumeration on the device,
+# a string in the pruned module.
+HW_TYPE_CHASSIS = "hw-type-chassis"
+
+
+def inventory_filter() -> ygdata.FNode:
+    """Select the hardware inventory, chassis entry included.
+
+    The whole list rather than the chassis entry: the generated entry filter
+    pins hw-dev-index too, and a chassis need not be index 0. About 2 KB on a
+    c8000v.
+    """
+    paths = ixoper.subs.device_hardware_data.device_hardware
+    return paths.device_inventory.filt()!
+
+
+def chassis_model(root: ?ygdata.Node) -> ?str:
+    """The chassis product id out of the inventory, like C8000V, or None.
+
+    The first chassis entry's part-number. A stack has a chassis per member,
+    all of one family, so the first serves image selection.
+    """
+    hardware = ixoper.root.from_gdata(root).device_hardware_data.device_hardware
+    for e in hardware.device_inventory:
+        if e.hw_type == HW_TYPE_CHASSIS:
+            pn = e.part_number
+            if pn is not None and len(pn) > 0:
+                return pn
+    return None
+
+
+actor IosXeHardwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler):
+    """Reads the inventory over the device's NETCONF session.
+
+    An actor, like the software driver, because the reply callback handed to
+    dev.get must be an action.
+    """
+    _log = logging.Logger(log_handler)
+
+    def model(done: action(?str, ?Exception) -> None) -> None:
+        def on_reply(root: ?ygdata.Node, err: ?Exception) -> None:
+            if err is not None:
+                done(None, err)
+                return
+            try:
+                m = chassis_model(root)
+                if m is None:
+                    _log.debug("IOS XE hardware: no chassis entry in the inventory")
+                done(m, None)
+            except Exception as e:
+                # A reply the pruned schema cannot make sense of is a failed
+                # read, not a device without a chassis.
+                done(None, e)
+        dev.get(on_reply, inventory_filter())
+
+
+class IosXeHardwareAdapter(swdev.HardwareAdapter):
+    """Hardware adapter for IOS XE. See the module header."""
+
+    _driver: IosXeHardwareDriver
+
+    def __init__(self, dev: swdev.DeviceMgr, log_handler: logging.Handler):
+        self._driver = IosXeHardwareDriver(dev, log_handler)
+
+    def model(self, done: action(?str, ?Exception) -> None) -> None:
+        self._driver.model(done)

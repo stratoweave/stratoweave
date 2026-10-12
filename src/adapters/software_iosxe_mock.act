@@ -3,8 +3,9 @@
 The mock sits behind NetconfAdapter's in-process NETCONF server. It replies to
 RPCs before their asynchronous operation records complete, just like IOS XE,
 and publishes install history, the image inventory, the running software
-banner and one BGP neighbor. `upgrade_duration` and `failure` make it behave
-like a particular device; see IosXeSoftwareMock.
+banner, one BGP neighbor and the chassis entry of the hardware inventory.
+`upgrade_duration`, `failure` and `model` make it behave like a particular
+device; see IosXeSoftwareMock.
 """
 
 import logging
@@ -12,6 +13,7 @@ import std.xml as xml
 
 import yang.gdata as ygdata
 
+import adapters.hardware_iosxe as swxehw
 import adapters.netconf as swna
 import adapters.software_iosxe as swxe
 import adapters.software_iosxe_oper as ixoper
@@ -125,20 +127,44 @@ def _banner(version: str) -> str:
     return "Cisco IOS XE Software, Version {version}, RELEASE SOFTWARE (fc1)"
 
 
-def hardware_datastore(version: str) -> ygdata.Node:
-    """Return device-hardware-oper containing the running release."""
+def inventory_entry(hw_type: str, hw_dev_index: int, part_number: str) -> ygdata.Node:
+    """One device-inventory entry, keyed by type and index like the device."""
     def q(n: str) -> ygdata.Id:
         return ygdata.Id(ixoper.NS_Cisco_IOS_XE_device_hardware_oper, n)
     ns = ixoper.NS_Cisco_IOS_XE_device_hardware_oper
     mod = "Cisco-IOS-XE-device-hardware-oper"
     return ygdata.Container({
+        q("hw-type"): ygdata.Leaf(hw_type, ns=ns, module=mod),
+        q("hw-dev-index"): ygdata.Leaf(u64(hw_dev_index), ns=ns, module=mod),
+        q("part-number"): ygdata.Leaf(part_number, ns=ns, module=mod),
+    }, ns=ns, module=mod)
+
+
+def chassis_entry(model: str) -> ygdata.Node:
+    """The inventory entry naming the chassis, as a c8000v reports it: the
+    product id is its part-number."""
+    return inventory_entry(swxehw.HW_TYPE_CHASSIS, 0, model)
+
+
+def hardware_datastore(version: str, inventory: list[ygdata.Node]=[]) -> ygdata.Node:
+    """Return device-hardware-oper containing the running release and the
+    given inventory entries, if any."""
+    def q(n: str) -> ygdata.Id:
+        return ygdata.Id(ixoper.NS_Cisco_IOS_XE_device_hardware_oper, n)
+    ns = ixoper.NS_Cisco_IOS_XE_device_hardware_oper
+    mod = "Cisco-IOS-XE-device-hardware-oper"
+    hardware: dict[ygdata.Id, ygdata.Node] = {
+        q("device-system-data"): ygdata.Container({
+            q("software-version"): ygdata.Leaf(_banner(version),
+                                               ns=ns, module=mod)
+        }, ns=ns, module=mod)
+    }
+    if len(inventory) > 0:
+        hardware[q("device-inventory")] = ygdata.List(
+            [q("hw-type"), q("hw-dev-index")], inventory)
+    return ygdata.Container({
         q("device-hardware-data"): ygdata.Container({
-            q("device-hardware"): ygdata.Container({
-                q("device-system-data"): ygdata.Container({
-                    q("software-version"): ygdata.Leaf(_banner(version),
-                                                       ns=ns, module=mod)
-                }, ns=ns, module=mod)
-            }, ns=ns, module=mod)
+            q("device-hardware"): ygdata.Container(hardware, ns=ns, module=mod)
         }, ns=ns, module=mod)
     })
 
@@ -232,9 +258,11 @@ def bgp_datastore(up: bool) -> ygdata.Node:
 
 def operational_datastore(version: str, history: list[ygdata.Node],
                           vstates: list[ygdata.Node]=[],
-                          bgp: bool=True) -> ygdata.Node:
+                          bgp: bool=True,
+                          inventory: list[ygdata.Node]=[]) -> ygdata.Node:
     """Return the complete operational datastore served by the mock; bgp says
-    whether its BGP session is up."""
+    whether its BGP session is up, inventory holds its hardware inventory
+    entries, if any."""
     def q(n: str) -> ygdata.Id:
         return ygdata.Id(ixoper.NS_Cisco_IOS_XE_install_oper, n)
     ns = ixoper.NS_Cisco_IOS_XE_install_oper
@@ -249,7 +277,7 @@ def operational_datastore(version: str, history: list[ygdata.Node],
             q("install-location-information"): ygdata.KeylessList([loc]),
         }, ns=ns, module=mod)
     })
-    return ygdata.merge(ygdata.merge(install_oper, hardware_datastore(version)),
+    return ygdata.merge(ygdata.merge(install_oper, hardware_datastore(version, inventory)),
                         bgp_datastore(bgp))
 
 
@@ -282,9 +310,12 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
                         upgrade_duration: float=0.0,
                         failure: str=FAILURE_NONE,
                         running: str=OLD_RELEASE,
-                        complete_after: ?float=None):
-    """Model the staged and added image, running and committed release, and
-    install history.
+                        complete_after: ?float=None,
+                        model: ?str=None):
+    """Model the staged and added image, running and committed release,
+    install history and, with `model`, the chassis entry of the hardware
+    inventory that names the product id. Without it the inventory is
+    absent, like an IOS XE build that does not serve the list.
 
     Without one-shot, install only adds; activate boots the added image by its
     version and leaves it uncommitted; install-commit keeps it, abort reloads
@@ -341,8 +372,10 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         if a is not None and not swxe.releases_equal(a!, committed):
             vstates.append(version_state_info(
                 "install-version-state-provisioned-uncommitted", device_version(a!)))
+        m = model
+        inventory = [chassis_entry(m!)] if m is not None else []
         mock_server.set_oper_ds(operational_datastore(
-            cur, history, vstates, bgp_up(failure, cur, committed)))
+            cur, history, vstates, bgp_up(failure, cur, committed), inventory))
 
     def _remember(record: ygdata.Node) -> None:
         # Copy on write: the published datastore still holds the old list.
