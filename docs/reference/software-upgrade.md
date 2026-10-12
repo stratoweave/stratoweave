@@ -166,9 +166,46 @@ When a new run starts, `stage` returns to `prepare` and both verdicts to
 The YANG model also contains `upgrade-needed` and `job`. The current manager
 does not publish those values.
 
-Operational reads return the current state. `update_oper` does not trigger a
-TTT recompute, so a northbound subscription does not receive these changes yet.
-State is not persisted and returns to `unknown` when the process restarts.
+Operational reads return the current state, and TTT pushes each change to
+on-change subscribers of the device entry. State is not persisted and returns
+to `unknown` when the process restarts.
+
+### 3.2 Hardware state
+
+The device entry also publishes what the device reported about itself:
+
+```text
+stratoweave-rfs:device=<name>/state/hardware/model
+```
+
+`model` is the chassis product id as the device reports it, `C8000V` on a
+Catalyst 8000V. A software image must match it, which is what the leaf is
+for: a fleet manager picks the image per model.
+
+`DeviceMgr` asks the device type's hardware adapter for it on every connect,
+right after the config resync, and publishes a change through the same
+`update_oper` hook as the software state. Every connect, because that is the
+only moment the model can have changed: a chassis does not change under a live
+NETCONF session, and a replaced box, a re-addressed entry or a redeployed lab
+always come with a new connection. Nothing polls, and the module set is no
+signal: it hashes the YANG modules, which follow the software release, not the
+hardware.
+
+The leaf is absent until the first read succeeds and after a failed read, so a
+value from an earlier box does not outlive a reconnect. While the device is
+down the last value stays; nothing can be installed on it anyway, and the
+reconnect reads again before a job can run. A model that differs from the last
+read is logged as a warning. Like the software state, it is not persisted; it
+is back seconds after the device reconnects.
+
+The read is `HardwareAdapter` in `src/device.act`: one method, `model(done)`,
+whose base implementation reports nothing. A device type registers its own as
+`hardware_adapter_type`, next to the software adapter and separate from it,
+because a platform may report what it is without being able to install
+software on it. A type without one leaves the leaf absent. On IOS XE the model
+is the `part-number` of the chassis entry in
+`Cisco-IOS-XE-device-hardware-oper` `device-hardware/device-inventory`, read
+by `src/adapters/hardware_iosxe.act`; see section 6.
 
 ## 4. Software adapter API
 
@@ -337,6 +374,12 @@ TODO: Select only the required record leaves after `acton-yang` preserves all
 keyless-list entries and an empty selected list no longer drops matching sibling
 data. Measure the IOS XE reply size again after changing the filter.
 
+The hardware model read selects the complete `device-inventory` list, about
+2 KB on a c8000v. The list is keyed, so a content match on `hw-type` alone
+would do, but the generated entry filter pins `hw-dev-index` as well and a
+chassis need not be index 0; the hardware adapter picks the chassis entry out
+of the reply instead.
+
 ### 5.6 Time bounds and estimates
 
 The driver counts polls and fails when they run out. Operation records are
@@ -406,6 +449,22 @@ When adding another IOS XE operation, check its current schema with
 `get-schema`. A pruned local module can have the same revision as the complete
 module and is not evidence that an omitted node or RPC does not exist.
 
+The hardware model comes from the chassis entry of the same module:
+
+```text
+Cisco-IOS-XE-device-hardware-oper:
+  device-hardware-data/device-hardware/device-inventory[hw-type=hw-type-chassis]/part-number
+```
+
+On a c8000v the entry reads `part-number C8000V`, `hw-description "Cisco
+Catalyst 8000V Edge Chassis"`. The pruned list keeps the device's keys,
+`hw-type` and `hw-dev-index`, so its entries stay apart; `hw-type` is an
+enumeration on the device and a string here. `Cisco-IOS-XE-platform-oper` also
+names the chassis, but a lab c8000v returned invalid UTF-8 in a `firmware-ver`
+leaf of that tree, which no XML parser accepts, so it is not used.
+`cisco-smart-license` `licensing/state/state-info/udi/pid` carries the same
+product id and would be the fallback for a platform without the inventory.
+
 ## 7. Testing
 
 `IosXeSoftwareMock` runs behind `NetconfMockServer`, not behind a stubbed adapter.
@@ -419,10 +478,12 @@ changes are published through the mock operational datastore and observed by
 later `get` calls. The release after an install comes from the image file
 name, spelled as the device banner spells it.
 
-Two arguments make the mock behave like a particular device; a device entry
-carries them as `mock/software/upgrade-duration`, `mock/software/failure`
-and `mock/software/running-release` for the device type's adapter factory
-to pass on. A
+A few arguments make the mock behave like a particular device; a device entry
+carries them as `mock/software/upgrade-duration`, `mock/software/failure`,
+`mock/software/running-release` and `mock/hardware/model` for the device
+type's adapter factory to pass on. `model` is the chassis product id the mock
+serves in its hardware inventory, `C8000V` by default; without one the
+inventory is absent, like an IOS XE build that does not serve the list. A
 factory that passes `complete_after` instead gets a fixed delay per
 operation. `upgrade_duration` is the seconds a whole
 upgrade takes; the mock spreads it over the operations in the proportions
@@ -468,7 +529,12 @@ Current coverage includes:
 - the choice of delay between the upgrade duration, a fixed delay and instant;
 - proof that RPC acceptance is not completion, and that a copy is still
   running 0.2 s later under an upgrade duration;
-- publication of software status and running release as operational data.
+- publication of software status and running release as operational data;
+- the hardware model read on connect and published as device state, cleared
+  again by a reconnect to a device without an inventory.
+
+`src/adapters/test_hardware_iosxe.act` covers the inventory filter keeping
+every keyed entry, and the chassis entry found wherever it sits in the list.
 
 `src/test_swmgr.act` covers the manager against the in-memory adapter:
 pre-checks gate the install, a refused or silent pre-check ends `failed` with
@@ -495,6 +561,8 @@ The hardware acceptance check is:
 7. With a failing post-check registered, the device receives `abort` instead
    of `install-commit`, returns on the previous release, and the manager
    reports `rolled-back`.
+8. After connect the device entry reports `state/hardware/model` `C8000V`,
+   and again after the reload.
 
 Images remain outside git. Test environments should resolve device and image
 server addresses at run time rather than storing deployment-specific addresses
@@ -541,8 +609,7 @@ manual recovery.
 ### 8.4 Operational detail
 
 Populate the modeled `job` node. Decide whether check results stay one
-aggregate per round or become keyed by registrant. Make `update_oper` notify
-northbound subscribers as well as serving current values to reads.
+aggregate per round or become keyed by registrant.
 
 Report why an operation reverted, not only that it did.
 
@@ -565,18 +632,24 @@ state remains monolithic or needs per-component versions. Fleet campaign order,
 parallelism, bandwidth limits, and window capacity belong above the per-device
 manager.
 
+Pick the image per hardware model in the fleet manager, which has one image
+URL per campaign today, and have the adapter refuse an image chosen for
+another model before it stages anything.
+
 ## 9. References
 
-- `src/device.act` — `SoftwareAdapter`, `SoftwareManager`, and operational-state
-  publication through `DeviceMgr`.
+- `src/device.act` — `SoftwareAdapter`, `SoftwareManager`, `HardwareAdapter`, and
+  operational-state publication through `DeviceMgr`.
 - `src/swyang.act` — software configuration and state model.
 - `src/adapters/software_iosxe.act` — IOS XE adapter and driver.
+- `src/adapters/hardware_iosxe.act` — IOS XE hardware adapter: the chassis model.
 - `src/adapters/software_iosxe_yang.act` — pruned IOS XE schema used by the
   adapter.
 - `src/adapters/software_iosxe_rpc.act` — generated typed RPC bindings.
 - `src/adapters/software_iosxe_oper.act` — generated operational-data bindings
   and filter paths.
 - `src/adapters/test_software_iosxe.act` — IOS XE NETCONF mock and adapter tests.
+- `src/adapters/test_hardware_iosxe.act` — IOS XE hardware adapter tests.
 - `src/test_swmgr.act` — platform-neutral manager tests.
 - `src/test_ttt_oper_read.act` — operational-state publication test.
 - Cisco C8000V upgrade guide, "Upgrading IOS XE Software":
