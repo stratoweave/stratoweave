@@ -1702,6 +1702,10 @@ actor ContainerState(keys: set[gdata.Id]):
         erasures[tid] = (erasures[tid] - set(candidate.keys())) | erasure
 
     def acquire_deletes(tid: str, reply: action(dict[str, set[gdata.Id]]) -> None):
+        # Locking may be the first operation of an empty transaction. Register
+        # it so both deletion acquisition and the later release have state.
+        if tid not in candidates:
+            acquire(tid, {}, set())
         erasure = erasures[tid]
         if any([src in locked and locked[src] != tid for src in erasure]):
             pending.append((tid, reply))
@@ -2125,6 +2129,7 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
     var provisional = set()
     var active: dict[str, set[str]] = {}
     var candidates: dict[str, dict[str, set[str]]] = {}
+    var touched: dict[str, dict[str, set[str]]] = {}
     var erasures:   dict[str, set[str]] = {}
     var pending: list[(str, action(dict[str, set[str]], dict[str,Node]) -> None)] = []
     var locked: set[str] = set()
@@ -2202,7 +2207,12 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
     def acquire(tid, candidate: dict[str,set[str]], erasure: set[str], leaves_by_key: dict[str, dict[gdata.Id, gdata.Leaf]]):
         if tid not in candidates:
             candidates[tid] = {}
+            touched[tid] = {}
             erasures[tid] = set()
+        # Keep the source contributions already sent to child transactions,
+        # including keys omitted by a later configure in this transaction.
+        for src,keys in candidate.items():
+            touched[tid][src] = touched[tid].get_def(src, set()) | keys
         # Replace only the supplied sources' key sets, retaining the last
         # contribution from every other source seen in this transaction.
         candidates[tid].update(candidate.items())
@@ -2226,10 +2236,14 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
             candidates[tid][LINK_SRC] = keys1
         else:
             candidates[tid] = {LINK_SRC: keys1}
+            touched[tid] = {}
             erasures[tid] = set()
         return {k: elems[k] for k in keys1}
 
     def acquire_deletes(tid, reply: action(dict[str, set[str]], dict[str,Node]) -> None):
+        # Register empty transactions even when no configure or linkage ran.
+        if tid not in candidates:
+            acquire(tid, {}, set(), {})
         erasure = erasures[tid]
         if erasure & locked:
             pending.append((tid,reply))
@@ -2238,18 +2252,19 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
             candidate = candidates[tid]
             keys_by_src = {}
             nodes = {}
-            for src,keys in active.items():
-                if src in erasure:
-                    keys1 = keys - candidate.get_def(src, set())
-                    keys_by_src[src] = keys1
-                    for k in keys1:
-                        nodes[k] = elems[k]
+            for src in erasure:
+                keys = active.get_def(src, set()) | touched[tid].get_def(src, set())
+                keys1 = keys - candidate.get_def(src, set())
+                keys_by_src[src] = keys1
+                for k in keys1:
+                    nodes[k] = elems[k]
             reply(keys_by_src, nodes)
 
     def release(tid: str, ok: bool, deletes: set[str]):
         candidate = candidates[tid]
         erasure = erasures[tid]
         del candidates[tid]
+        del touched[tid]
         del erasures[tid]
         if ok:
             for src in erasure:
@@ -2333,9 +2348,8 @@ class _ListTransaction(_Transaction):
         for key,node in nodes.items():
             if key not in self.elems:
                 self.elems[key] = node.newtrans()
-        for key in self.elems:
-            if key not in nodes:
-                del self.elems[key]
+        # Retain touched child transactions until completion: acquire_deletes
+        # must clear omitted contributions in the transaction that received them.
 
         msgs = {}
         for key,subcfg in cfg_by_key.items():
