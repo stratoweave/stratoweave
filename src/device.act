@@ -23,7 +23,8 @@ from device_oper import \
     stratoweave_rfs__device_entry as DeviceOper, \
     stratoweave_rfs__device__software__state as SoftwareState, \
     stratoweave_rfs__device__software__state__precheck as PrecheckResult, \
-    stratoweave_rfs__device__software__state__postcheck as PostcheckResult
+    stratoweave_rfs__device__software__state__postcheck as PostcheckResult, \
+    stratoweave_rfs__device__state__hardware as HardwareState
 
 from device_schema import DeviceSchema, SchemaKey, SchemaTreeTransform
 
@@ -602,6 +603,31 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     devmgr.on_software_state(state.copy())
 
 
+#############################################################################
+# Hardware identity
+#
+# What the device is, as opposed to what it runs. The DeviceMgr reads it once
+# per connect and publishes it as device/state/hardware; consumers read that
+# state, never the adapter. Separate from SoftwareAdapter because a platform
+# may report its hardware without being able to install software on it.
+#############################################################################
+
+class HardwareAdapter(object):
+    """Platform-specific read of the hardware identity.
+
+    One fact so far, the chassis model: the product id, like C8000V, which a
+    software image must match. The base class is also the null object: a
+    platform without such a read reports nothing, `done(None, None)`, which
+    is not a failed read, `done(None, err)`.
+    """
+
+    def __init__(self):
+        pass
+
+    def model(self, done: action(?str, ?Exception) -> None) -> None:
+        done(None, None)
+
+
 ## DeviceType represents a type of device, i.e. a specific platform or
 ## implementation of a device. It is used to define the schema and
 ## adapter type for the device.
@@ -622,11 +648,18 @@ class DeviceType(object):
     @property
     software_adapter_type: ?proc(DeviceMgr, DeviceMetaConfig, logging.Handler, ?net.TCPConnectCap) -> SoftwareAdapter
 
-    def __init__(self, name: str, adapter_type, src_dnode, oper_src_dnode: ?yschema.DRoot=None, schema_transforms: list[SchemaTreeTransform]=[], software_adapter_type=None):
+    ## Hardware adapter type, i.e. the HardwareAdapter subclass that reads
+    ## what the platform is. Optional: without one the device publishes no
+    ## hardware model.
+    @property
+    hardware_adapter_type: ?proc(DeviceMgr, logging.Handler) -> HardwareAdapter
+
+    def __init__(self, name: str, adapter_type, src_dnode, oper_src_dnode: ?yschema.DRoot=None, schema_transforms: list[SchemaTreeTransform]=[], software_adapter_type=None, hardware_adapter_type=None):
         self.name = name
         self.adapter_type = adapter_type
         self.bundled_schema = DeviceSchema(name, src_dnode, oper_src_dnode, schema_transforms)
         self.software_adapter_type = software_adapter_type
+        self.hardware_adapter_type = hardware_adapter_type
 
 actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnectCap=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None):
     """Device Registry keeps track of all devices and hands out references to
@@ -983,10 +1016,54 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
         oper.software.state = state
         update_oper()
 
+    def on_hardware_state(model: ?str, err: ?Exception) -> None:
+        """The hardware model read on connect: fuse and publish.
+
+        None clears the leaf, so what an earlier box reported does not
+        outlive a reconnect. A failed read is logged; a platform without the
+        read is not. Published only on a change, so a reconnect does not
+        push an unchanged entry.
+        """
+        old = oper.state.hardware.model
+        if model is None:
+            if err is not None:
+                _log.warning("DeviceMgr: hardware model read failed",
+                             {"device": name, "error": str(err)})
+        elif old is not None and old != model:
+            _log.warning("DeviceMgr: hardware model changed",
+                         {"device": name, "old": old, "new": model})
+        else:
+            _log.info("DeviceMgr: hardware model", {"device": name, "model": model})
+        if old != model:
+            oper.state.hardware = HardwareState(model=model)
+            update_oper()
+
     # Per-device software manager. Statically instantiated: every device has
     # one, whether or not its device type can actually install software. It
     # stays idle until it is given both an adapter and a target release.
     swmgr = SoftwareManager(name, _log_handler, self)
+
+    # The platform's hardware read, set with the device type. The base class
+    # reports nothing, for a type without one.
+    var hwadapter: HardwareAdapter = HardwareAdapter()
+
+    # Bumped per connect, so a hardware reply from an earlier connection is
+    # ignored.
+    var _hw_gen: int = 0
+
+    def _read_hardware() -> None:
+        """Read the hardware model for this connection and publish it.
+
+        The model cannot change while a session is up; a replaced box always
+        comes with a new connection. So every connect reads it once, and
+        nothing polls.
+        """
+        _hw_gen += 1
+        gen = _hw_gen
+        def on_model(model: ?str, err: ?Exception) -> None:
+            if gen == _hw_gen:
+                on_hardware_state(model, err)
+        hwadapter.model(on_model)
 
     def set_update_oper(cb: action(?ygdata.Node) -> None) -> None:
         """Hand the DeviceMgr the oper publication hook for its device entry.
@@ -1136,6 +1213,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
     def on_connect(new_modset: dict[str, ModCap], new_schema_key: ?SchemaKey):
         _log.debug("Device connected", {"new_modset": new_modset, "schema_modules": len(new_schema_key.modules) if new_schema_key is not None else None})
         resync()
+        _read_hardware()
         if modset_eq(modset, new_modset):
             _log.debug("Supported modules unchanged")
         else:
@@ -1184,13 +1262,15 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
                     isinstance(adapter, NoAdapter) or \
                     (mock_mode_changed and not adapter.supports_mocking())
 
-                # Hand the software manager its adapter and config. The
-                # software adapter follows the same lifecycle as the device
-                # adapter: rebuilt when the device type changes.
+                # Hand the software manager its adapter and config, and take
+                # the hardware adapter. Both follow the same lifecycle as the
+                # device adapter: rebuilt when the device type changes.
                 if type_changed:
                     sw_type = device_type.software_adapter_type
                     if sw_type is not None:
                         swmgr.set_adapter(sw_type(self, new_dmc, _log_handler, connect_cap))
+                    hw_type = device_type.hardware_adapter_type
+                    hwadapter = hw_type(self, _log_handler) if hw_type is not None else HardwareAdapter()
                 sw = new_dmc.software
                 sw_vetoes = {}
                 for v in sw.veto:
