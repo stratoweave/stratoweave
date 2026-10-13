@@ -74,7 +74,7 @@ actor StaticAuthChecker(expected_user: str, expected_password: str, log_handler:
             respond(False)
 
 
-actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRoot, cfs: ttt.Layer, capabilities: ?list[str]=None, on_close: ?action(NetconfSession) -> None=None, session_seq: int=0, subscription_schema: ?yschema.DRoot=None):
+actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRoot, top_oper_schema: yschema.DRoot, cfs: ttt.Layer, capabilities: ?list[str]=None, on_close: ?action(NetconfSession) -> None=None, session_seq: int=0):
     """A single NETCONF session driving the configuration tree.
 
     Wraps a netconf.Server bound to `pipe` (one transport channel) and handles
@@ -84,15 +84,17 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
     lock/unlock -- is rejected with operation-not-supported rather than faked.
     Incoming <config> is parsed against `top_schema`, carrying per-node NETCONF
     operation= semantics (merge/create/delete/remove/replace) into the edit.
+    A <get> filter is parsed against `top_oper_schema`, which allows <get> to
+    also select operational state. A <get-config> filter or <edit-config>
+    request is parsed against `top_schema` for config only.
 
     YANG-push (RFC 8641) periodic subscriptions are served from the same cfs
     datastore via a per-session TttSubscriptionService, which drives TTT's native
     declare_subscriptions: establish/delete-subscription RPCs are routed to it and
     it streams push-update notifications back over this session. A subscription
     may carry a datastore-subtree-filter or datastore-xpath-filter, parsed
-    against `subscription_schema` when supplied so operational-only nodes can be
-    selected. session_seq makes the per-session subscription owner ids unique on
-    the shared cfs.
+    against `top_oper_schema` so oper nodes can be selected. session_seq makes
+    the per-session subscription owner ids unique on the shared cfs.
 
     `on_close`, if given, is called with this session when its transport drops,
     so the owner can release its reference and let the session be reclaimed.
@@ -135,10 +137,10 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
                         return ds.tag
         return None
 
-    def _read(filter_node: ?xml.Node) -> list[xml.Node]:
+    def _read(filter_node: ?xml.Node, schema: yschema.DRoot) -> list[xml.Node]:
         filt: ?ygdata.FNode = None
         if filter_node is not None:
-            filt = yxml.from_filter_xml(top_schema, filter_node)
+            filt = yxml.from_filter_xml(schema, filter_node)
         data = cfs.newsession().get_data(filt)
         if data is not None:
             return data.to_xml(deterministic=True)
@@ -175,7 +177,7 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
                 return
             data_children: list[xml.Node] = []
             try:
-                data_children = _read(filter_node)
+                data_children = _read(filter_node, top_oper_schema if op.tag == "get" else top_schema)
             except Exception as e:
                 s.send_error(message_id, "invalid-value", "Failed to read datastore: {e}")
                 return
@@ -228,14 +230,14 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
     var server: netconf.Server = netconf.Server(pipe=pipe, on_connect=_on_conn, on_rpc=on_rpc, capabilities=capabilities, log_handler=log_handler)
     # owner_prefix must be unique per session: TTT keys subscriptions by owner id,
     # so sessions sharing this cfs must not collide on "yp-<sub_id>".
-    served_subscription_schema = subscription_schema if subscription_schema is not None else top_schema
-    service = yp_ttt.TttSubscriptionService(server, cfs, served_subscription_schema, owner_prefix="yp-" + str(session_seq), log_handler=log_handler)
+    service = yp_ttt.TttSubscriptionService(server, cfs, top_oper_schema, owner_prefix="yp-" + str(session_seq), log_handler=log_handler)
 
 
 actor NetconfServer(
     listen_cap: net.TCPListenCap,
     log_handler: logging.Handler,
     top_schema: yschema.DRoot,
+    top_oper_schema: yschema.DRoot,
     cfs: ttt.Layer,
     address: str = "::",
     port: int = 830,
@@ -244,7 +246,6 @@ actor NetconfServer(
     auth_check: ?action(str, ?str, ?bytes, action(bool) -> None) -> None = None,
     host_key: ?str = None,
     on_listen: ?action(?Exception) -> None = None,
-    subscription_schema: ?yschema.DRoot = None,
     ssh_transport: ?ssh.TransportConfig = None,
 ):
     """Northbound NETCONF server over SSH.
@@ -291,7 +292,7 @@ actor NetconfServer(
     def _on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
         _session_seq += 1
         _log.info("NETCONF session accepted", {"session": _session_seq})
-        _sessions.append(NetconfSession(p, log_handler, top_schema, cfs, _capabilities, on_close=_session_closed, session_seq=_session_seq, subscription_schema=subscription_schema))
+        _sessions.append(NetconfSession(p, log_handler, top_schema, top_oper_schema, cfs, _capabilities, on_close=_session_closed, session_seq=_session_seq))
 
     listener = sshpipe.SshPipeListener(
         listen_cap,
