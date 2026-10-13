@@ -1,0 +1,78 @@
+"""update_dynstate deadlocks against a read that is waiting at the transform's Node.
+
+A transform's Transaction runs update_dynstate by constructing a Session
+for the recompute, and constructing an actor waits until its __init__ has
+run. Session.__init__ calls newtrans() on the transform's Node. If that
+Node is serving get_data, it is waiting for the Transaction's get_data,
+which is queued behind update_dynstate. The Transaction waits for the
+Session, the Session for the Node and the Node for the Transaction.
+
+The test actor sends the transform's Transaction configure, in which the
+transform function spins for BUSY seconds, and then update_dynstate, so the
+two are queued in that order. Then a Reader calls get_data on the
+transform's Node. The Node's get_data is queued at the Transaction behind
+update_dynstate, and the Node waits for it. When configure ends, the
+Transaction takes update_dynstate, and the Session it constructs waits for
+the Node.
+
+The order of the messages at the Transaction follows from who sends what
+after what; the one timing assumption is that the read reaches the Node
+within BUSY seconds. That needs a second RTS worker thread to run the read
+while the Transaction spins (acton test uses at least 4).
+"""
+import testing
+import time
+
+import ttt
+import yang.gdata as gdata
+
+BUSY = 0.5          # seconds configure keeps the Transaction busy
+WATCHDOG = 2.0      # seconds the read may take (acton test stops a test after 3 s)
+
+def q(n: str) -> gdata.Id:
+    return gdata.Id("urn:test", n)
+
+
+class SlowTransform(ttt.TransformFunction):
+    def transform_wrapper(self, cfg: gdata.Node, linked: gdata.Node, memory: ?gdata.Node, dynstate: ?gdata.Node, prev_output):
+        t0 = time.monotonic()
+        while time.monotonic().since(t0).to_float() < BUSY:
+            pass
+        return (cfg, memory)
+
+
+def no_actor(params: ttt.TransformActorParams) -> ttt.TransformActor:
+    # Never called, since nothing commits. update_dynstate starts a recompute
+    # only for a transform that was given an actor.
+    def on_conf(conf: gdata.Node, linked: gdata.Node, memory: ?gdata.Node) -> None:
+        pass
+    def shutdown(memory: ?gdata.Node) -> None:
+        pass
+    return ttt.TransformActor(on_conf, shutdown)
+
+
+actor Reader(node: ttt.Node, done: action(?gdata.Node) -> None):
+    def read():
+        done(node.get_data(None))
+
+
+actor update_dynstate_during_read(t: testing.AsyncT):
+    node = ttt.Transform(SlowTransform, no_actor)(ttt.PathRoot("0:"), None)
+    tr = node.newtrans()            # a transform's Node has one Transaction
+    var finished = False
+
+    def read_returned(data: ?gdata.Node):
+        if not finished:
+            finished = True
+            t.success()
+
+    def watchdog():
+        if not finished:
+            finished = True
+            t.failure(AssertionError("read did not return within {WATCHDOG} s: update_dynstate deadlock"))
+
+    tr.configure("1", {"src": gdata.Container({q("a"): gdata.Leaf(1)})}, None)  # spins for BUSY s
+    tr.update_dynstate(gdata.Leaf("x"))     # queued behind configure
+    Reader(node, read_returned).read()      # the Node's get_data is queued behind update_dynstate
+    if "no-watchdog" not in t.tags:         # acton test --tag no-watchdog stays hung, for a core
+        after WATCHDOG: watchdog()
