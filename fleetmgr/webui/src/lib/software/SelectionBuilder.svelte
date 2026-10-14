@@ -58,6 +58,7 @@
             <button
               class="tok"
               class:on={selection.types.includes(t)}
+              aria-pressed={selection.types.includes(t)}
               type="button"
               onclick={() => patch({ types: toggle(selection.types, t) })}
             >
@@ -76,6 +77,7 @@
         <input
           class="fld mono"
           type="text"
+          aria-label="Name matches"
           placeholder="substring, or glob with * and ?"
           value={selection.namePattern}
           oninput={(e) => patch({ namePattern: e.currentTarget.value })}
@@ -88,6 +90,7 @@
         <input
           class="fld"
           type="text"
+          aria-label="Description contains"
           placeholder="anything"
           value={selection.descriptionContains}
           oninput={(e) => patch({ descriptionContains: e.currentTarget.value })}
@@ -99,6 +102,7 @@
         <span class="fop">is</span>
         <select
           class="select"
+          aria-label="Requires approval"
           value={selection.requiresApproval}
           onchange={(e) => patch({ requiresApproval: e.currentTarget.value as '' | 'yes' | 'no' })}
         >
@@ -113,6 +117,7 @@
         <span class="fop">is</span>
         <select
           class="select"
+          aria-label="Owned by a campaign"
           value={selection.ownedByCampaign}
           onchange={(e) => patch({ ownedByCampaign: e.currentTarget.value as '' | 'yes' | 'no' })}
         >
@@ -126,6 +131,7 @@
     <textarea
       class="input mono"
       rows="3"
+      aria-label="Explicit device names"
       placeholder="optional: explicit names, one per line or comma-separated — used instead of the whole inventory"
       value={selection.pasted}
       oninput={(e) => patch({ pasted: e.currentTarget.value })}
@@ -198,13 +204,13 @@
 <style>
   .builder {
     display: grid;
-    grid-template-columns: 1fr 280px;
+    grid-template-columns: minmax(0, 1fr) 280px;
     gap: 26px;
   }
 
   @media (max-width: 900px) {
     .builder {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 
@@ -216,13 +222,15 @@
 
   .filters-head {
     display: flex;
+    flex-wrap: wrap;
     align-items: baseline;
     justify-content: space-between;
+    gap: 4px 12px;
   }
 
   .filters {
     border: 1px solid var(--sw-border-subtle);
-    border-radius: 8px;
+    border-radius: var(--sw-radius-md);
     background: var(--sw-bg-elevated);
     padding: 14px 16px;
     display: grid;
@@ -231,18 +239,30 @@
 
   .frow {
     display: grid;
-    grid-template-columns: 160px 90px 1fr;
+    grid-template-columns: 160px 90px minmax(0, 1fr);
     gap: 9px;
     align-items: center;
+  }
+
+  /* On a phone the field and its operator share a line; the value takes
+     the next one. */
+  @media (max-width: 560px) {
+    .frow {
+      grid-template-columns: minmax(0, 1fr) auto;
+    }
+
+    .frow > :last-child {
+      grid-column: 1 / -1;
+    }
   }
 
   .flabel,
   .fop {
     background: var(--sw-bg-card);
     border: 1px solid var(--sw-border-default);
-    border-radius: 6px;
+    border-radius: var(--sw-radius-sm);
     padding: 7px 10px;
-    font-size: 12.5px;
+    font-size: var(--sw-text-sm);
   }
 
   .fop {
@@ -252,10 +272,10 @@
   .fld {
     background: var(--sw-bg-input);
     border: 1px solid var(--sw-border-default);
-    border-radius: 6px;
+    border-radius: var(--sw-radius-sm);
     color: var(--sw-text-primary);
     padding: 7px 10px;
-    font-size: 12.5px;
+    font-size: var(--sw-text-sm);
     outline: none;
     width: 100%;
   }
@@ -264,13 +284,18 @@
     width: 100%;
     padding-top: 7px;
     padding-bottom: 7px;
-    border-radius: 6px;
-    font-size: 12.5px;
+    border-radius: var(--sw-radius-sm);
+    font-size: var(--sw-text-sm);
   }
 
+  .fld::placeholder {
+    color: var(--sw-text-muted);
+  }
+
+  /* The same focus as every other text field. */
   .fld:focus-visible {
-    outline: 2px solid var(--sw-primary);
-    outline-offset: 1px;
+    border-color: var(--sw-accent);
+    box-shadow: 0 0 0 3px var(--sw-accent-glow);
   }
 
   .fvalue.tokens {
@@ -285,10 +310,10 @@
     align-items: center;
     background: none;
     border: 1px dashed var(--sw-border-default);
-    border-radius: 4px;
+    border-radius: var(--sw-radius-xs);
     padding: 3px 8px;
     font-family: var(--sw-font-mono, monospace);
-    font-size: 11.5px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-secondary);
     cursor: pointer;
   }
@@ -300,7 +325,7 @@
   }
 
   .andr {
-    font-size: 10.5px;
+    font-size: var(--sw-text-2xs);
     font-weight: 500;
     letter-spacing: 0.1em;
     color: var(--sw-text-muted);
@@ -317,7 +342,7 @@
   }
 
   .count {
-    font-size: 42px;
+    font-size: var(--sw-text-3xl);
     font-weight: 600;
     line-height: 1;
   }
@@ -328,7 +353,7 @@
 
   .err {
     font-size: 12px;
-    color: var(--sw-danger);
+    color: var(--sw-danger-text);
   }
 
   .dists {
@@ -346,7 +371,7 @@
   .bar-name {
     width: 80px;
     color: var(--sw-text-muted);
-    font-size: 11.5px;
+    font-size: var(--sw-text-xs);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -355,7 +380,7 @@
   .bar-track {
     flex: 1;
     height: 7px;
-    border-radius: 4px;
+    border-radius: var(--sw-radius-xs);
     background: var(--sw-bg-hover);
     overflow: hidden;
     display: block;
@@ -364,7 +389,7 @@
   .bar-fill {
     display: block;
     height: 100%;
-    border-radius: 4px;
+    border-radius: var(--sw-radius-xs);
     background: var(--sw-primary);
   }
 
@@ -372,7 +397,7 @@
     width: 42px;
     text-align: right;
     color: var(--sw-text-secondary);
-    font-size: 11.5px;
+    font-size: var(--sw-text-xs);
   }
 
   .rail {
@@ -395,7 +420,7 @@
   }
 
   .excl-n {
-    font-size: 19px;
+    font-size: var(--sw-text-xl);
     font-weight: 600;
     width: 50px;
     text-align: right;
@@ -404,7 +429,7 @@
   }
 
   .excl-what {
-    font-size: 12.5px;
+    font-size: var(--sw-text-sm);
   }
 
   .excl-path {

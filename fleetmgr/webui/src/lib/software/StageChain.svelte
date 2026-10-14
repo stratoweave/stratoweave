@@ -193,7 +193,7 @@
   }
 
   .label {
-    font-size: 10px;
+    font-size: var(--sw-text-2xs);
     font-weight: 500;
     letter-spacing: 0;
     text-transform: none;
@@ -202,7 +202,7 @@
   }
 
   .name {
-    font-size: 15px;
+    font-size: var(--sw-text-md);
     font-weight: 600;
     line-height: 1.2;
     color: var(--sw-text-muted);
@@ -218,7 +218,25 @@
   }
 
   .name.failed {
-    color: var(--sw-danger);
+    color: var(--sw-danger-text);
+  }
+
+  /* Five names do not fit side by side on a phone: they shrink and break
+     at their hyphens, under narrower ends. */
+  @media (max-width: 560px) {
+    .chain.large {
+      --end: 8px;
+      --dot: 18px;
+      --dot-running: 20px;
+      --dot-failed: 24px;
+    }
+
+    .large .name {
+      font-size: var(--sw-text-2xs);
+      white-space: normal;
+      text-align: center;
+      overflow-wrap: anywhere;
+    }
   }
 
   .dot {
@@ -262,7 +280,7 @@
   .dot svg {
     width: var(--cross);
     height: var(--cross);
-    stroke: #fff;
+    stroke: var(--sw-paper);
     stroke-width: 1.8;
     stroke-linecap: round;
   }
@@ -283,7 +301,7 @@
   }
 
   .rollback.failed {
-    stroke: var(--sw-danger);
+    stroke: var(--sw-danger-text);
   }
 
   @keyframes ring {

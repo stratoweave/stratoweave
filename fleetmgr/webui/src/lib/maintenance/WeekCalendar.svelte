@@ -116,10 +116,15 @@
     return Math.max(4, ((b.end - b.start) / 3600) * hourPx - 2);
   }
 
-  /** "Wed 23": the weekday and the day of the month fit a narrow column. */
-  function dayHeader(unix: number): string {
+  /** "Wed 23": the weekday and the day of the month fit a narrow column;
+   * a phone's column gets the one-letter weekday instead. */
+  function dayHeader(unix: number): { short: string; narrow: string; day: number } {
     const d = new Date(unix * 1000);
-    return `${d.toLocaleDateString(undefined, { weekday: 'short' })} ${d.getDate()}`;
+    return {
+      short: d.toLocaleDateString(undefined, { weekday: 'short' }),
+      narrow: d.toLocaleDateString(undefined, { weekday: 'narrow' }),
+      day: d.getDate()
+    };
   }
 
   function describe(b: Block): string {
@@ -247,7 +252,10 @@
 >
   <div class="corner"></div>
   {#each columns as col, i (col.start)}
-    <div class="head" class:today={i === todayIndex} title={dayLabel(col.start)}>{dayHeader(col.start)}</div>
+    <div class="head" class:today={i === todayIndex} title={dayLabel(col.start)}>
+      <span class="wd-short">{dayHeader(col.start).short}</span><span class="wd-narrow">{dayHeader(col.start).narrow}</span>
+      {dayHeader(col.start).day}
+    </div>
   {/each}
 
   <div class="hours">
@@ -281,7 +289,7 @@
             <span class="name">{b.occurrence.schedule}</span>
           {/if}
           {#if h >= 34}
-            <span class="range mono">{clockLabel(b.occurrence.start)}–{clockLabel(b.occurrence.end)}</span>
+            <span class="range mono">{clockLabel(b.occurrence.start)}–<wbr />{clockLabel(b.occurrence.end)}</span>
           {/if}
           {#if editable && b.start === b.occurrence.start}
             <span class="edge top" data-edge="start"></span>
@@ -363,7 +371,7 @@
     position: absolute;
     right: 8px;
     transform: translateY(-50%);
-    font-size: 10.5px;
+    font-size: var(--sw-text-2xs);
     color: var(--sw-text-muted);
   }
 
@@ -381,7 +389,7 @@
       transparent 1px,
       transparent calc(3 * var(--hour-px))
     );
-    border-radius: 4px;
+    border-radius: var(--sw-radius-xs);
     overflow: hidden;
   }
 
@@ -395,7 +403,7 @@
     flex-direction: column;
     gap: 1px;
     padding: 2px 5px;
-    border-radius: 3px;
+    border-radius: var(--sw-radius-xs);
     border-left: 3px solid;
     box-sizing: border-box;
     overflow: hidden;
@@ -421,16 +429,26 @@
     text-overflow: ellipsis;
   }
 
+  /* A narrow block breaks the range after its dash instead of cutting the
+     closing time off. */
   .range {
-    font-size: 10.5px;
+    font-size: var(--sw-text-2xs);
     color: var(--sw-text-secondary);
-    white-space: nowrap;
     overflow: hidden;
-    text-overflow: ellipsis;
   }
 
+  /* A phone's day column is too narrow for the times; the block keeps its
+     colour and name, and the table under the calendar lists the times. */
+  @media (max-width: 560px) {
+    .range {
+      display: none;
+    }
+  }
+
+  /* Above the blocks, so a window open now cannot hide the time. */
   .now {
     position: absolute;
+    z-index: 4;
     left: 0;
     right: 0;
     height: 0;
@@ -440,10 +458,27 @@
 
   .now span {
     position: absolute;
-    right: 4px;
-    top: 1px;
-    font-size: 10px;
+    right: 2px;
+    top: 2px;
+    padding: 0 3px;
+    border-radius: var(--sw-radius-xs);
+    background: var(--sw-bg-deep);
+    font-size: var(--sw-text-2xs);
     color: var(--sw-accent);
+  }
+
+  .wd-narrow {
+    display: none;
+  }
+
+  @media (max-width: 560px) {
+    .wd-short {
+      display: none;
+    }
+
+    .wd-narrow {
+      display: inline;
+    }
   }
 
   .legend {
@@ -464,7 +499,7 @@
   .swatch {
     width: 9px;
     height: 9px;
-    border-radius: 2px;
+    border-radius: var(--sw-radius-xs);
   }
 
   .rule {
@@ -537,7 +572,7 @@
     left: 2px;
     right: 3px;
     border: 1px dashed var(--sw-accent);
-    border-radius: 3px;
+    border-radius: var(--sw-radius-xs);
     background: var(--sw-accent-glow);
     pointer-events: none;
   }
@@ -548,10 +583,10 @@
     z-index: 3;
     padding: 0 4px;
     border: 1px solid var(--sw-border-default);
-    border-radius: 3px;
+    border-radius: var(--sw-radius-xs);
     background: var(--sw-bg-elevated);
     color: var(--sw-text-primary);
-    font-size: 10.5px;
+    font-size: var(--sw-text-2xs);
     line-height: 14px;
     white-space: nowrap;
     pointer-events: none;

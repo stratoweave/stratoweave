@@ -35,13 +35,10 @@
 </script>
 
 <label class="field">
-  <span class="field__label">
+  <span class="field__label" title={yangType ? `YANG type: ${yangType}` : undefined}>
     {label}
     {#if required}
       <span class="field__required">*</span>
-    {/if}
-    {#if yangType}
-      <span class="field__yang-type">{yangType}</span>
     {/if}
   </span>
   <input
@@ -61,19 +58,9 @@
 
 <style>
   .field__required {
-    color: var(--sw-danger);
+    color: var(--sw-danger-text);
     font-weight: 700;
     font-size: 14px;
     line-height: 1;
-  }
-
-  .field__yang-type {
-    margin-left: auto;
-    font-family: var(--sw-font-mono);
-    font-size: 10px;
-    color: var(--sw-text-muted);
-    background: var(--sw-bg-deep);
-    padding: 1px 6px;
-    border-radius: 3px;
   }
 </style>

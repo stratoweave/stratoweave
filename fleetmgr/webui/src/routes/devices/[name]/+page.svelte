@@ -120,11 +120,10 @@
   {@const device = data.device}
   {@const single = data.campaigns.length === 1}
   <section class="card hero">
-    <div class="kick mono">/fleet/device={device.name}</div>
     <div class="head">
       <DevicePicture />
       <div class="ident">
-        <h1>{device.name}</h1>
+        <h1 title={`YANG: /fleet/device=${device.name}`}>{device.name}</h1>
         <p class="meta">
           type <span class="mono">{device.type}</span>
           {#if device.address}
@@ -155,23 +154,23 @@
         <div class="run-head">
           <div class="facts">
             <span class="fact">
-              <span class="fact-label">Campaign:</span>
+              <span class="fact-label">Campaign</span>
               <a class="mono campaign-name" href={campaignHref(campaign)}>{campaign.name}</a>
             </span>
             <span class="fact">
-              <span class="fact-label">Admin state:</span>
+              <span class="fact-label">Mode</span>
               <span class="mono">{campaign.adminState}</span>
             </span>
             <span class="fact">
-              <span class="fact-label">Target release:</span>
+              <span class="fact-label">Target release</span>
               <span class="mono">{campaign.targetRelease}</span>
             </span>
             <span class="fact">
-              <span class="fact-label">Running release:</span>
+              <span class="fact-label">Running release</span>
               <span class="mono">{row?.runningRelease || '—'}</span>
             </span>
             <span class="fact">
-              <span class="fact-label">Planned start:</span>
+              <span class="fact-label">Planned start</span>
               <span class="mono">{plannedStart(campaign)}</span>
             </span>
           </div>
@@ -212,7 +211,7 @@
   </section>
 
   <section class="card">
-    <h3 class="panel-title">Maintenance schedule</h3>
+    <h2 class="panel-title">Maintenance schedule</h2>
     <div class="binding">
       <select
         class="select binding-select"
@@ -242,10 +241,6 @@
 {/if}
 
 <style>
-  .card {
-    margin-bottom: 16px;
-  }
-
   .hero {
     padding: 28px;
   }
@@ -254,7 +249,6 @@
     display: flex;
     align-items: center;
     gap: 28px;
-    margin-top: 16px;
   }
 
   .ident {
@@ -262,7 +256,7 @@
   }
 
   .ident h1 {
-    font-size: 36px;
+    font-size: var(--sw-text-3xl);
     font-weight: 700;
     letter-spacing: -0.025em;
     line-height: 1.15;
@@ -272,7 +266,7 @@
   .meta {
     margin: 4px 0 0;
     color: var(--sw-text-secondary);
-    font-size: 15px;
+    font-size: var(--sw-text-md);
   }
 
   .status {
@@ -281,7 +275,7 @@
 
   .status :global(.pill) {
     padding: 4px 12px;
-    font-size: 14px;
+    font-size: var(--sw-text-sm);
   }
 
   .none {
@@ -313,16 +307,13 @@
   }
 
   .fact {
-    font-size: 13px;
+    font-size: var(--sw-text-sm);
     font-weight: 600;
     color: var(--sw-text-primary);
   }
 
-  .fact-label {
-    margin-right: 4px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-    color: var(--sw-text-muted);
+  .fact .fact-label {
+    margin-right: 6px;
   }
 
   .campaign-name {
@@ -371,14 +362,14 @@
   }
 
   .check-name {
-    font-size: 15px;
+    font-size: var(--sw-text-md);
     font-weight: 600;
   }
 
   .verdict {
     justify-self: start;
     padding: 2px 10px;
-    font-size: 13px;
+    font-size: var(--sw-text-xs);
   }
 
   .check-detail {
@@ -397,8 +388,8 @@
   .baseline {
     padding: 1px 7px;
     border: 1px solid rgb(var(--sw-accent-rgb) / 0.4);
-    border-radius: 4px;
-    font-size: 11px;
+    border-radius: var(--sw-radius-xs);
+    font-size: var(--sw-text-2xs);
     color: var(--sw-accent);
   }
 
@@ -406,11 +397,6 @@
     grid-column: 5;
     font-size: 13px;
     color: var(--sw-text-muted);
-  }
-
-  .panel-title {
-    margin: 0 0 12px;
-    font-size: 14px;
   }
 
   .binding {
@@ -431,12 +417,24 @@
 
   .save-error {
     font-size: 12px;
-    color: var(--sw-danger);
+    color: var(--sw-danger-text);
   }
 
   @media (max-width: 720px) {
+    .hero {
+      padding: 20px 16px;
+    }
+
     .head > :global(.device-picture) {
       display: none;
+    }
+
+    .ident h1 {
+      font-size: var(--sw-text-2xl);
+    }
+
+    .track {
+      margin: 24px 0 20px;
     }
 
     .check {

@@ -85,14 +85,14 @@
   .bar {
     display: flex;
     height: 30px;
-    border-radius: 6px;
+    border-radius: var(--sw-radius-sm);
     overflow: hidden;
     background: var(--sw-bg-deep);
   }
 
   .bar.compact {
     height: 7px;
-    border-radius: 4px;
+    border-radius: var(--sw-radius-xs);
   }
 
   .seg {
@@ -123,12 +123,19 @@
   .swatch {
     width: 9px;
     height: 9px;
-    border-radius: 2px;
+    border-radius: var(--sw-radius-xs);
     align-self: center;
   }
 
-  .entry.empty {
-    opacity: 0.55;
+  /* A zero entry recedes by colour, not opacity, so it keeps 4.5:1. */
+  .entry.empty .name,
+  .entry.empty .n {
+    color: var(--sw-text-muted);
+    font-weight: 400;
+  }
+
+  .entry.empty .swatch {
+    opacity: 0.5;
   }
 
   .name {
@@ -138,13 +145,13 @@
   }
 
   .n {
-    font-size: 15px;
+    font-size: var(--sw-text-lg);
     font-weight: 600;
     color: var(--sw-text-primary);
   }
 
   .pct {
-    font-size: 11.5px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-muted);
   }
 

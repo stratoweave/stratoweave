@@ -54,6 +54,8 @@
   const MAX_STACK = 200;
   const FALLBACK_WIDTH = 960;
   const ZOOMS = [1, 2, 4, 8];
+  /** The smallest cell the timeline opens with when a zoom can give it. */
+  const READABLE_SIZE = 8;
   const NOW_COLOR = '#22d3ee';
   const DONE_COLOR = '#16a34a';
   const uid = $props.id();
@@ -72,15 +74,35 @@
 
   let scroller = $state<HTMLDivElement | null>(null);
   let width = $state(0);
-  let zoom = $state(1);
+  // Until a chip is picked, the timeline opens at the least zoom whose cells
+  // are readable: 1× on a wide screen, more on a phone, where the fitted
+  // axis would shrink the cells to a few pixels.
+  let zoomChoice = $state<number | null>(null);
   let follow = $state(true);
   let lastSet = -1;
 
   let spans = $derived(plan.windows.map((w) => ({ start: w.start, end: windowEnd(w) })));
-  let axis = $derived.by(() => {
+
+  function axisAt(z: number) {
     const w = width > 0 ? width : FALLBACK_WIDTH;
-    return buildAxis(spans, now, fitScale(spans, now, w, PAD_L, PAD_R) * zoom, PAD_L, PAD_R);
+    return buildAxis(spans, now, fitScale(spans, now, w, PAD_L, PAD_R) * z, PAD_L, PAD_R);
+  }
+
+  // A crowded plan can stay small at every zoom; then the least zoom with
+  // the largest cells, so zooming in never costs the overview for nothing.
+  let autoZoom = $derived.by(() => {
+    if (width === 0) return 1;
+    let best = { zoom: ZOOMS[0], size: 0 };
+    for (const z of ZOOMS) {
+      const a = axisAt(z);
+      const size = chooseCells(assignLanes(plan.windows, a, WINDOW_GAP), a, MAX_STACK).size;
+      if (size >= READABLE_SIZE) return z;
+      if (size > best.size) best = { zoom: z, size };
+    }
+    return best.zoom;
   });
+  let zoom = $derived(zoomChoice ?? autoZoom);
+  let axis = $derived(axisAt(zoom));
   let placed = $derived(assignLanes(plan.windows, axis, WINDOW_GAP));
   let cells = $derived(chooseCells(placed, axis, MAX_STACK));
 
@@ -237,8 +259,9 @@
         class="chip"
         class:active={zoom === z}
         type="button"
+        aria-pressed={zoom === z}
         onclick={() => {
-          zoom = z;
+          zoomChoice = z;
           follow = true;
         }}
       >
@@ -379,7 +402,7 @@
   }
 
   .lbl.day {
-    font-size: 10px;
+    font-size: var(--sw-text-2xs);
     fill: var(--sw-text-muted);
   }
 

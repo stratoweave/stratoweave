@@ -40,9 +40,12 @@
 
 <div class="page-header">
   <div>
-    <h2>Maintenance schedules</h2>
+    <h1>Maintenance schedules</h1>
+    <p>When devices may be upgraded. Campaigns place each device in its schedule's windows.</p>
   </div>
-  <a class="btn btn-primary" href="/schedules/new">New schedule</a>
+  <div class="page-actions">
+    <a class="btn btn-primary" href="/schedules/new">New schedule</a>
+  </div>
 </div>
 
 {#if data.loadError}
@@ -51,7 +54,7 @@
 
 <section class="card">
   <div class="grids-head">
-    <h3 class="panel-title">Next seven days</h3>
+    <h2 class="panel-title">Next seven days</h2>
     <span class="hint">every schedule's windows in your local time · click one to edit its schedule</span>
   </div>
   {#if data.schedules.length === 0}
@@ -68,7 +71,7 @@
         <thead>
           <tr>
             <th>Schedule</th>
-            <th>Local time zone</th>
+            <th>UTC offset</th>
             <th>Windows</th>
             <th class="right">Bound devices</th>
             <th>Default of</th>
@@ -113,10 +116,6 @@
 {/if}
 
 <style>
-  .card {
-    margin-bottom: 16px;
-  }
-
   .grids-head {
     display: flex;
     align-items: baseline;
@@ -140,7 +139,7 @@
     color: var(--sw-accent-bright);
     text-decoration: none;
     font-weight: 500;
-    font-size: 12.5px;
+    font-size: var(--sw-text-sm);
   }
 
   .schedule-name:hover,
@@ -162,7 +161,7 @@
     display: inline-block;
     width: 9px;
     height: 9px;
-    border-radius: 2px;
+    border-radius: var(--sw-radius-xs);
     margin-right: 8px;
     vertical-align: middle;
   }
