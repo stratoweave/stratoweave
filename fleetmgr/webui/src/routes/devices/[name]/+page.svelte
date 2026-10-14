@@ -8,8 +8,8 @@
   import { errorText } from '$lib/core/errors';
   import { createPoller } from '$lib/core/polling/poller';
   import { setDeviceSchedule } from '$lib/maintenance/binding';
-  import { STEPS, STEP_LABEL, type Campaign, type CheckResult, type DeviceStatusRow, type Step } from '$lib/software/model';
-  import { stageView } from '$lib/software/stages';
+  import { STEP_LABEL, type Campaign, type CheckResult, type DeviceStatusRow, type Step } from '$lib/software/model';
+  import { stageDetail, stageView } from '$lib/software/stages';
   import { formatClock } from '$lib/core/time';
   import type { PageProps } from './$types';
 
@@ -100,11 +100,11 @@
   function note(row: DeviceStatusRow): string {
     const view = stageView(row);
     if (view.steps[0].state === 'skipped') return 'already on the target release';
-    const postcheck = view.steps[STEPS.indexOf('postcheck')];
-    if (postcheck.state === 'failed' && row.postcheck.verdict === 'not-run' && view.rollback !== null) {
-      return 'no time left to commit';
-    }
-    return '';
+    if (!view.steps.some((s) => s.state === 'failed')) return '';
+    // A refusing check says why in its own row.
+    const refused = row.precheck.verdict === 'fail' || row.postcheck.verdict === 'fail';
+    if (refused && view.rollback !== 'failed') return '';
+    return stageDetail(row);
   }
 </script>
 

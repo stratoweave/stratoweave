@@ -59,15 +59,6 @@ export function stageDetail(row: DeviceStatusRow): string {
   if (view.steps[0].state === 'skipped') return 'already on the target release';
   const failed = view.steps.find((s) => s.state === 'failed');
   if (!failed) return '';
-  let why = `${STEP_LABEL[failed.step]} failed`;
-  if (failed.step === 'precheck' && row.precheck.verdict === 'fail') {
-    why = `pre-check: ${row.precheck.detail}`;
-  } else if (failed.step === 'postcheck' && row.postcheck.verdict === 'fail') {
-    why = `post-check: ${row.postcheck.detail}`;
-  } else if (failed.step === 'postcheck' && view.rollback !== null) {
-    why = 'no time left to commit';
-  }
-  if (view.rollback === 'running') return `rolling back: ${why}`;
-  if (view.rollback === 'failed') return `${why}; rollback failed`;
-  return why;
+  const why = row.reason || `${STEP_LABEL[failed.step]} failed`;
+  return view.rollback === 'running' ? `rolling back: ${why}` : why;
 }
