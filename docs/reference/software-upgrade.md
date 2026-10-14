@@ -80,7 +80,8 @@ The current reconcile rules are:
 11. When a post-check fails, a post-check has not answered within the
     deadline, or `commit` fails, call `rollback` with the release read in
     step 3, read the release again, and publish `rolled-back`.
-12. A `prepare`, `install`, or `rollback` error publishes `failed`.
+12. A `prepare`, `install`, or `rollback` error publishes `failed`, with the
+    adapter's error message as the `reason`.
 
 Every decision bumps an attempt counter. A check reply or timer that belongs
 to an earlier step is ignored. Checks registered during a run count from the
@@ -158,10 +159,12 @@ The manager currently populates:
 | `status` | `unknown`, `up-to-date`, `in-progress`, `succeeded`, `rolled-back`, or `failed` |
 | `running-release` | last release returned by `check`, using the device's spelling |
 | `stage` | `prepare`, `precheck`, `install`, `postcheck`, `commit`, or `rollback`: the step the run is in, or the step it ended in |
+| `reason` | why the run failed or rolled back: the adapter's error, `pre-check failed: <detail>`, `post-check failed: <detail>`, or the manager's own cause (no time left to commit, target withdrawn, device reverted after the commit). A failed rollback adds its error after `; `. Set together with the status or stage it explains |
 | `precheck`, `postcheck` | one `check-result` each: `verdict` is `not-run`, `pass`, or `fail`; `detail` names the first refusing registrant and its reason, the registrants that did not answer, or each passing registrant with its reason; `at` is when the verdict was reached |
 
-When a new run starts, `stage` returns to `prepare` and both verdicts to
-`not-run`. The results are one aggregate per round, not one per registrant.
+When a new run starts, `stage` returns to `prepare`, `reason` is removed and
+both verdicts return to `not-run`. `up-to-date` removes `reason` too. The
+results are one aggregate per round, not one per registrant.
 
 The YANG model also contains `upgrade-needed` and `job`. The current manager
 does not publish those values.
@@ -191,7 +194,8 @@ Jobs are asynchronous and report through callbacks. `install` must call
 `done(None)` only after the device is reachable again and the requested release
 has been confirmed running. `rollback` likewise reports only once the device
 runs `previous`; with `previous` unknown it reports once the device runs
-anything other than the release it aborted.
+anything other than the release it aborted. A job's error message is published
+as the run's `reason`, so it should name the platform operation and its cause.
 
 The intended contract says `install` rechecks its preparation because an image
 staged earlier may have been removed. The current manager always calls
@@ -474,7 +478,8 @@ Current coverage includes:
 pre-checks gate the install, a refused or silent pre-check ends `failed` with
 nothing installed, post-checks gate the commit, a failed or silent post-check
 rolls back, a late reply is ignored, a removed check is not consulted, both
-verdicts are published, and a failed commit or rollback ends as designed.
+verdicts are published, a failed prepare, commit or rollback ends as designed,
+every failure publishes its reason, and the next run starts without one.
 
 The mock does not reproduce memory pressure, SSH and NETCONF startup timing,
 vendor bugs, or all RPC error details. Run at least one real upgrade with the

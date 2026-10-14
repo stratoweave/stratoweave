@@ -70,6 +70,13 @@ def _pub_stage(oper: ?ygdata.Node) -> ?str:
     return None
 
 
+def _pub_reason(oper: ?ygdata.Node) -> ?str:
+    """The reason leaf out of a published device entry oper tree."""
+    if oper is not None:
+        return swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).software.state.reason
+    return None
+
+
 actor _test_target_release_installs(t: testing.EnvT):
     """Intent naming a target release is the only thing that starts an install."""
     def noop_on_reconf(name: str) -> None:
@@ -200,6 +207,8 @@ actor _test_failed_install_is_reported(t: testing.EnvT):
         status = _pub_status(oper)
         if status == "failed":
             testing.assertEqual("install", _pub_stage(oper), "the stage should be the failed step")
+            testing.assertEqual("mock: install failed", _pub_reason(oper),
+                                "the adapter's error should be the reason")
             t.success()
         elif status == "succeeded":
             t.failure(ValueError("install failed but the manager reported success"))
@@ -207,6 +216,58 @@ actor _test_failed_install_is_reported(t: testing.EnvT):
     dev.set_update_oper(on_state)
     mgr = dev.get_swmgr()
     mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_failed_prepare_is_reported(t: testing.EnvT):
+    """A failed staging ends the run at prepare with nothing installed."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "prepare")
+    dev = _devmgr(t, noop_on_reconf)
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        status = _pub_status(oper)
+        if status == "failed":
+            testing.assertEqual(adapter.calls(), ["check", "prepare"],
+                                "nothing may run after a failed prepare")
+            testing.assertEqual("prepare", _pub_stage(oper), "the stage should be the failed step")
+            testing.assertEqual("mock: prepare failed", _pub_reason(oper),
+                                "the adapter's error should be the reason")
+            t.success()
+        elif status == "succeeded":
+            t.failure(ValueError("prepare failed but the manager reported success"))
+
+    dev.set_update_oper(on_state)
+    mgr = dev.get_swmgr()
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_next_run_clears_the_reason(t: testing.EnvT):
+    """A new run does not carry the last run's reason."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var retried = False
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        status = _pub_status(oper)
+        if status == "failed" and not retried:
+            retried = True
+            # The same target again, on a device that now installs.
+            mgr.set_adapter(swmock.MockSoftwareAdapter(t.log_handler, OLD))
+        elif retried and status == "in-progress":
+            testing.assertNone(_pub_reason(oper), "the new run must start without a reason")
+        elif retried and status == "succeeded":
+            testing.assertNone(_pub_reason(oper), "a succeeded run has no reason")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.set_adapter(swmock.MockSoftwareAdapter(t.log_handler, OLD, "install"))
     mgr.set_config("camp-1", NEW, False, {})
 
 
@@ -448,6 +509,8 @@ actor _test_refused_precheck_leaves_the_device_alone(t: testing.EnvT):
             testing.assertEqual("not-run", _pub_verdict(oper, "postcheck"),
                                 "post-checks must not have run")
             testing.assertEqual("precheck", _pub_stage(oper), "the stage should be the refusing round")
+            testing.assertEqual("pre-check failed: b: peer down", _pub_reason(oper),
+                                "the reason should name the objector")
             t.success()
 
     dev.set_update_oper(on_state)
@@ -578,6 +641,8 @@ actor _test_failed_postcheck_rolls_back(t: testing.EnvT):
             testing.assertEqual("a: peer down", _pub_detail(oper, "postcheck"),
                                 "detail must name the objector")
             testing.assertEqual("rollback", _pub_stage(oper), "the run should end in the rollback")
+            testing.assertEqual("post-check failed: a: peer down", _pub_reason(oper),
+                                "the reason should say why it rolled back")
             t.success()
 
     dev.set_update_oper(on_state)
@@ -687,6 +752,8 @@ actor _test_failed_rollback_is_failed(t: testing.EnvT):
         status = _pub_status(oper)
         if status == "failed":
             testing.assertEqual("rollback", _pub_stage(oper), "the stage should be the failed rollback")
+            testing.assertEqual("post-check failed: a: peer down; mock: rollback failed",
+                                _pub_reason(oper), "the reason should keep why it rolled back")
             t.success()
         elif status == "succeeded" or status == "rolled-back":
             t.failure(ValueError("a failed rollback must end failed, got {status}"))
@@ -716,6 +783,8 @@ actor _test_failed_commit_rolls_back(t: testing.EnvT):
             # The passed post-check tells a failed commit from a failed post-check.
             testing.assertEqual("pass", _pub_verdict(oper, "postcheck"),
                                 "post-check verdict not published")
+            testing.assertEqual("mock: commit failed", _pub_reason(oper),
+                                "the adapter's error should be the reason, once")
             t.success()
         elif status == "succeeded" or status == "failed":
             t.failure(ValueError("a failed commit must roll back, got {status}"))
@@ -747,6 +816,8 @@ actor _test_no_commit_window_left_rolls_back(t: testing.EnvT):
             testing.assertEqual(adapter.calls(),
                                 ["check", "prepare", "install", "rollback", "check"],
                                 "rollback must replace commit")
+            testing.assertEqual("no time left to commit before the device reverts",
+                                _pub_reason(oper), "the reason should say why it rolled back")
             t.success()
         elif status == "succeeded":
             t.failure(ValueError("must not commit after the device timer"))
@@ -773,6 +844,8 @@ actor _test_reverted_device_is_not_succeeded(t: testing.EnvT):
             testing.assertEqual(OLD, _pub_running(oper),
                                 "running-release must show what the device runs")
             testing.assertEqual("commit", _pub_stage(oper), "the stage should be the commit")
+            testing.assertEqual("device runs {OLD} after the commit, not {NEW}", _pub_reason(oper),
+                                "the reason should name both releases")
             t.success()
         elif status == "succeeded":
             t.failure(ValueError("device on the old release must not be succeeded"))

@@ -53,6 +53,10 @@ class SoftwareAdapter(object):
     `prepare` may run two weeks before `install`, and `install` re-runs the
     staging steps anyway, so a deleted image or a full disk self-heals rather
     than failing the upgrade.
+
+    A job's error message is published as the run's reason, so it should name
+    the platform operation and the platform's cause, like
+    "add failed: install-verify-pkg-fail".
     """
     _log_handler: logging.Handler
 
@@ -195,6 +199,14 @@ def _now() -> str:
     """The current UTC time as a yang:date-and-time."""
     d = time.utcnow()
     return f"{d.year:04d}-{d.month:02d}-{d.day:02d}T{d.hour:02d}:{d.minute:02d}:{d.second:02d}Z"
+
+
+def error_text(err: Exception) -> str:
+    """An error as one line for a published reason, without the class name
+    str() puts first. An error without a message gives its class name."""
+    lines = [l.strip() for l in err.error_message.splitlines()]
+    text = " ".join([l for l in lines if l != ""])
+    return text if text != "" else str(err).rstrip(": ")
 
 
 actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr):
@@ -362,6 +374,9 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         s = state.status
         return s if s is not None else ST_UNKNOWN
 
+    def get_reason() -> ?str:
+        return state.reason
+
     #### install ############################################################
 
     def _record(running: ?str, status: ?str) -> None:
@@ -378,8 +393,11 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             # the DeviceMgr keeps what it receives in its oper tree.
             devmgr.on_software_state(state.copy())
 
-    def _set_status(s: str) -> None:
-        _record(None, s)
+    def _fail(why: str, running: ?str=None) -> None:
+        """End the run failed; the reason goes out with the status."""
+        state.reason = why
+        busy = False
+        _record(running, ST_FAILED)
 
     def _set_stage(s: str) -> None:
         state.stage = s
@@ -414,12 +432,14 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         elif adapter.matches_release(running, t!):
             _log.info("software: already on the target release, nothing to do",
                       {"device": name, "release": running, "target": t!})
+            state.reason = None
             _record(running, ST_UP_TO_DATE)
             busy = False
             return
         previous_release = running
         # A new run starts at prepare; the verdicts below are from the last one.
         state.stage = STAGE_PREPARE
+        state.reason = None
         state.precheck = PrecheckResult(VERDICT_NOT_RUN, None, None)
         state.postcheck = PostcheckResult(VERDICT_NOT_RUN, None, None)
         _record(running, ST_IN_PROGRESS)
@@ -428,16 +448,14 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     def _on_prepare_done(err: ?Exception) -> None:
         if err is not None:
             _log.error("software staging failed", {"device": name, "error": str(err)})
-            busy = False
-            _set_status(ST_FAILED)
+            _fail(error_text(err!))
             return
         _run_checks("precheck", prechecks, precheck_timeout)
 
     def _on_install_done(err: ?Exception) -> None:
         if err is not None:
             _log.error("software install failed", {"device": name, "error": str(err)})
-            busy = False
-            _set_status(ST_FAILED)
+            _fail(error_text(err!))
             return
         adapter.commit_window(_on_commit_window)
 
@@ -524,8 +542,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         if kind == "precheck":
             t = target_release
             if t is None:
-                busy = False
-                _set_status(ST_FAILED)
+                _fail("target release withdrawn before install")
                 return
             _set_stage(STAGE_INSTALL)
             adapter.install(_on_install_done, t!)
@@ -542,8 +559,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             # Nothing has been activated, so there is nothing to roll back.
             _log.error("software: pre-check refused, not installing",
                        {"device": name, "detail": detail})
-            busy = False
-            _set_status(ST_FAILED)
+            _fail("pre-check failed: {detail}")
         else:
             _start_rollback("post-check failed: {detail}")
 
@@ -553,7 +569,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         if err is not None:
             # The device drops an uncommitted release on its own timer anyway.
             # Abort now so the outcome is known.
-            _start_rollback("commit failed: {err}")
+            _start_rollback(error_text(err!))
             return
         # Refresh running-release with the value reported by the device.
         adapter.check(_on_final_check)
@@ -561,14 +577,18 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     def _start_rollback(why: str) -> None:
         _log.error("software: rolling back", {"device": name, "reason": why})
         attempt += 1
+        state.reason = why
         _set_stage(STAGE_ROLLBACK)
         adapter.rollback(_on_rollback_done, previous_release)
 
     def _on_rollback_done(err: ?Exception) -> None:
         if err is not None:
             _log.error("software rollback failed", {"device": name, "error": str(err)})
-            busy = False
-            _set_status(ST_FAILED)
+            why = error_text(err!)
+            r = state.reason
+            if r is not None:
+                why = r! + "; " + why
+            _fail(why)
             return
         adapter.check(_on_rollback_check)
 
@@ -589,9 +609,11 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         t = target_release
         if running is not None and t is not None and not adapter.matches_release(running, t!):
             # The device reverted on its own before the commit took.
+            got = running!
+            want = t!
             _log.error("software: device does not run the target after commit",
-                       {"device": name, "running": running!, "target": t!})
-            _record(running, ST_FAILED)
+                       {"device": name, "running": got, "target": want})
+            _fail("device runs {got} after the commit, not {want}", got)
             return
         # New software may mean a different modset, so the device has to be
         # re-discovered before anything trusts its schema again.
