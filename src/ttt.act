@@ -1358,7 +1358,8 @@ actor Session(name: str, root: Transaction, lowerlayer: ?Layer, db: ?swdb.Store,
     def edit_config(diff: gdata.Node, done: ?action(value)->None=None, complete: ?action(value)->None=None):
         tid = 'tr' + actorid()
         #print('####', tid, '(Layer)', name, 'edit_config', actorid(), err=True)
-        res = patch(tid, {'_': diff})
+        res = root.configure(tid, {'_': diff}, lower, dbuf, differential=True)
+        res = _apply(tid, res)
         #print('   #', tid, '(Layer)', name, 'EDIT_CONFIG', 'PREP RESULT', res, err=True)
         if not res.errors:
             done_cont = done
@@ -1393,10 +1394,6 @@ actor Session(name: str, root: Transaction, lowerlayer: ?Layer, db: ?swdb.Store,
         comp_cont = None
         tid_state = None
 
-    def patch(tid, diff):
-        r = root.configure(tid, diff, lower, dbuf, differential=True)
-        return _apply(tid, r)
-
     def write_config(tid, source, config):
         #print('####', tid, '(Layer)', name, 'write_config', source, err=True)
         buf[source] = config
@@ -1427,7 +1424,7 @@ actor Session(name: str, root: Transaction, lowerlayer: ?Layer, db: ?swdb.Store,
         #print('####', tid, '(Layer)', name, 'lock', err=True)
         if buf:                                         # An upper layer has re-configured
             #print('####', tid, '(Layer)', name, 'LOCK RE-APPLY', err=True)
-            res = patch(tid, {})
+            res = apply(tid)
             if res.errors:
                 if done is not None:
                     done(res)
@@ -1469,7 +1466,11 @@ actor Session(name: str, root: Transaction, lowerlayer: ?Layer, db: ?swdb.Store,
     def recompute(done: ?action(value)->None=None, complete: ?action(value)->None=None):
         tid = 'tr' + actorid()
         #print('####', tid, '(Layer)', name, 'recompute', actorid(), err=True)
-        res = patch(tid, {})
+        # Production callers give this Session a transform transaction as root.
+        # This is a self refresh of that transform with its current inputs and
+        # state; the empty differential input replaces no source configuration.
+        res = root.configure(tid, {}, lower, dbuf, differential=True)
+        res = _apply(tid, res)
         if not res.errors:
             done_cont = done
             comp_cont = complete
@@ -1779,9 +1780,14 @@ class _ContainerTransaction(_Transaction):
                             cfg_by_child[key] = {src: subcfg}
             elif not isinstance(cfg, gdata.Absent):
                 raise NotImplementedError("Cannot configure container with configuration type {type(cfg)}")
-            cfg_keys[src] = keys
+            # An empty differential fragment requests a refresh, without
+            # replacing this source's earlier membership or erasure intent.
+            if keys or not differential or isinstance(cfg, gdata.Absent):
+                cfg_keys[src] = keys
 
         self.containerstate.acquire(tid, cfg_keys, erasure)
+        if differential and not cfg_by_child and all([isinstance(cfg, gdata.Container) for cfg in cfg_by_src.values()]):
+            cfg_by_child = {child: {} for child in self.elems}
         msgs = {}
         for child,subcfg in cfg_by_child.items():
             msgs[child] = async self.elems[child].configure(tid, subcfg, out, dbuf, differential)
@@ -2132,7 +2138,7 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
     var touched: dict[str, dict[str, set[str]]] = {}
     var erasures:   dict[str, set[str]] = {}
     var pending: list[(str, action(dict[str, set[str]], dict[str,Node]) -> None)] = []
-    var locked: set[str] = set()
+    var locked: dict[str, str] = {}
     var db = None
     var oper_subscriptions: dict[str, OperListSubscription] = {}
 
@@ -2245,10 +2251,11 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
         if tid not in candidates:
             acquire(tid, {}, set(), {})
         erasure = erasures[tid]
-        if erasure & locked:
+        if any([src in locked and locked[src] != tid for src in erasure]):
             pending.append((tid,reply))
         else:
-            locked |= erasure
+            for src in erasure:
+                locked[src] = tid
             candidate = candidates[tid]
             keys_by_src = {}
             nodes = {}
@@ -2283,8 +2290,13 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
             for k in provisional:
                 del elems[k]
             provisional = set()
+        # Release only this transaction's locks, including when an external
+        # abort occurs before its pending acquisition has been granted.
+        for src in erasure:
+            if locked.get(src) == tid:
+                del locked[src]
+        pending = [(tid1, reply) for tid1, reply in pending if tid1 != tid]
         if erasure:
-            locked -= erasure
             pend = pending
             pending = []
             for tid,reply in pend:
@@ -2316,7 +2328,7 @@ class _ListTransaction(_Transaction):
         self.state2 = None
         self.reset = False
 
-    def configure(self, tid, cfg_by_src, out: ?Session, dbuf: ?swdb.Buffer=None, differential=True):
+    def configure(self, tid, cfg_by_src, out: ?Session, dbuf: ?swdb.Buffer=None, differential=False):
         print('####', tid, '(List)', _format_path(self.path), 'configure\n', per_src(cfg_by_src), 'differential:', differential, err=True)
         if self.reset:
             self.elems = {}
@@ -2339,9 +2351,16 @@ class _ListTransaction(_Transaction):
                         cfg_by_key[k][src] = le
                     else:
                         cfg_by_key[k] = {src: le}
-            cfg_keys[src] = keys
+            if keys or not differential or isinstance(cfg, gdata.Absent):
+                cfg_keys[src] = keys
 
         nodes = self.liststate.acquire(tid, cfg_keys, erasure, leaves_by_key)
+        refresh = differential and not cfg_by_key and all([isinstance(cfg, gdata.List) for cfg in cfg_by_src.values()])
+        if refresh:
+            # Refresh the selected subtree, including committed entries in a
+            # transaction that has not configured any of them yet.
+            nodes.update(self.liststate.all().items())
+            cfg_by_key = {key: {} for key in nodes}
 
         print('   #', tid, '(List)', _format_path(self.path), 'acquired nodes:', set(nodes.keys()), err=True)
         print('   #', tid, '(List)', _format_path(self.path), 'cfg_by_key:', set(cfg_by_key.keys()), err=True)
@@ -2361,7 +2380,7 @@ class _ListTransaction(_Transaction):
             print('   #', tid, '(List)', _format_path(self.path), 'RESULT ELEMENT NEW', key, ':', results[key], err=True)
         res = self._analyze(results)
 
-        if dbuf is not None:
+        if dbuf is not None and not refresh:
             dbuf.replace(swdb.slot_key(_db_path(self.path), "list"), self.db_ops(leaves_by_key))
         return res
 
@@ -2945,6 +2964,8 @@ class _TransformTransactionBase(_Transaction):
         ###
         if updates:
             self.candidate_link_updates[tid] = self.candidate_link_updates.get_def(tid, []) + updates
+        # Self refresh this transform after updating its links. The empty
+        # differential input retains its configuration sources.
         return self.configure(tid, {}, out, dbuf, differential=True)
 
     # yield action
@@ -2962,6 +2983,9 @@ class _TransformTransactionBase(_Transaction):
         self.locker = tid
         if tid not in self.candidates:
             #print('   #', tid, '(Transform)', _format_path(self.path), 'LOCK - RE-CONFIGURING', err=True)
+            # Self refresh this transform under the lock. If another commit
+            # discarded its candidate, rebuild it from the current committed
+            # configuration and this transaction's retained fragments.
             res = self.configure(tid, {}, out, dbuf, differential=True)
             done(res)
         else:
