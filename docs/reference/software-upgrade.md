@@ -80,7 +80,8 @@ The current reconcile rules are:
 11. When a post-check fails, a post-check has not answered within the
     deadline, or `commit` fails, call `rollback` with the release read in
     step 3, read the release again, and publish `rolled-back`.
-12. A `prepare`, `install`, or `rollback` error publishes `failed`.
+12. A `prepare`, `install`, or `rollback` error publishes `failed`, with the
+    adapter's error message as the `reason`.
 
 Every decision bumps an attempt counter. A check reply or timer that belongs
 to an earlier step is ignored. Checks registered during a run count from the
@@ -158,10 +159,12 @@ The manager currently populates:
 | `status` | `unknown`, `up-to-date`, `in-progress`, `succeeded`, `rolled-back`, or `failed` |
 | `running-release` | last release returned by `check`, using the device's spelling |
 | `stage` | `prepare`, `precheck`, `install`, `postcheck`, `commit`, or `rollback`: the step the run is in, or the step it ended in |
+| `reason` | why the run failed or rolled back: the adapter's error, `pre-check failed: <detail>`, `post-check failed: <detail>`, or the manager's own cause (no time left to commit, target withdrawn, device reverted after the commit). A failed rollback adds its error after `; `. Set together with the status or stage it explains |
 | `precheck`, `postcheck` | one `check-result` each: `verdict` is `not-run`, `pass`, or `fail`; `detail` names the first refusing registrant and its reason, the registrants that did not answer, or each passing registrant with its reason; `at` is when the verdict was reached |
 
-When a new run starts, `stage` returns to `prepare` and both verdicts to
-`not-run`. The results are one aggregate per round, not one per registrant.
+When a new run starts, `stage` returns to `prepare`, `reason` is removed and
+both verdicts return to `not-run`. `up-to-date` removes `reason` too. The
+results are one aggregate per round, not one per registrant.
 
 The YANG model also contains `upgrade-needed` and `job`. The current manager
 does not publish those values.
@@ -191,7 +194,8 @@ Jobs are asynchronous and report through callbacks. `install` must call
 `done(None)` only after the device is reachable again and the requested release
 has been confirmed running. `rollback` likewise reports only once the device
 runs `previous`; with `previous` unknown it reports once the device runs
-anything other than the release it aborted.
+anything other than the release it aborted. A job's error message is published
+as the run's `reason`, so it should name the platform operation and its cause.
 
 The intended contract says `install` rechecks its preparation because an image
 staged earlier may have been removed. The current manager always calls
@@ -302,25 +306,38 @@ IOS XE keeps active and finished operations in sibling lists:
 
 ```text
 Cisco-IOS-XE-install-oper:install-oper-data
-  install-oper
+  install-oper, install-oper-hist
     op-uuid, op-id, op-status, op-done
-    install-txn-summary-op
-      txn-cmd, txn-status
-  install-oper-hist
-    op-uuid, op-id, op-status, op-done
-    install-txn-sum-op-hist
-      txn-cmd, txn-status
+    install-txn-summary-op        while op-done is op-not-complete
+      txn-cmd, txn-status, txn-sub-state
+    install-txn-sum-op-hist       once op-done is op-complete
+      txn-cmd, txn-status, txn-sub-state
 ```
 
 One RPC can create several records with the same UUID. `op-id` restarts for each
 operation, so the adapter correlates by UUID and checks all matching records.
 A record moves from the active list to history when it finishes, and that move
-can happen between polls.
+can happen between polls. A record that has finished but not moved yet already
+keeps its transactions in `install-txn-sum-op-hist`, so the adapter reads both
+transaction lists of both record lists.
+
+A failed operation's cause is the `txn-sub-state` of its first failed
+transaction, like `install-download-fail`. Without one it is that
+transaction's `txn-cmd` and `txn-status`, and without a failed transaction the
+`op-status`. The first, because the device records a notify transaction after
+the one that failed.
+install-oper has no free-text error; the device's own message, like
+`REMOTE_FILE_NOT_FOUND`, goes to its syslog. The adapter's error names the
+operation as the device does: `download failed: <cause>`, `add failed:
+<cause>`, `activate failed: <rpc-error message>`, `commit failed: nothing to
+do: install-op-marked-succ`, `abort failed: <message>`, or `<operation> did
+not finish in time` when polling runs out.
 
 `install-op-marked-succ` means IOS XE had nothing to do. It is not an error, but
 it is not proof that requested work happened. `op-done=op-reverted` and
 `op-status=install-op-fail-revert` mean the device undid the operation; the
-adapter treats both as a terminal failure.
+adapter treats both as a terminal failure. A reverted record has no
+transactions, so its cause is the `op-status`.
 
 ### 5.5 Filters
 
@@ -431,18 +448,20 @@ reload for activate and for abort, commit 5 s, 395 s in all), so 395 is as
 slow as the device and 0 completes each operation at once. `failure`
 reproduces one IOS XE failure:
 
-| failure | device behavior | manager ends |
-|---|---|---|
-| `download-failed` | `xcopy` accepted, then the download stage fails | `failed`, nothing installed |
-| `add-failed` | `install` accepted, then the verify stage fails | `failed` |
-| `activate-refused` | `activate` rejected | `failed`, no abort |
-| `commit-failed` | `install-commit` accepted, then the commit stage fails | `rolled-back` after `abort` |
-| `reverts` | the abort timer ran out before the commit, so the commit finds nothing to do | `failed`, nothing to abort |
-| `bgp-down` | the BGP session is idle from the start | `failed` with a BGP pre-check, nothing installed |
-| `bgp-lost` | the BGP session is idle while the activated release runs | `rolled-back` with a BGP post-check, after `abort` |
+| failure | device behavior | manager ends | reason |
+|---|---|---|---|
+| `download-failed` | `xcopy` accepted, then the download stage fails | `failed`, nothing installed | `download failed: install-download-fail` |
+| `add-failed` | `install` accepted, then the add pre-check fails | `failed` | `add failed: install-verify-pkg-fail` |
+| `activate-refused` | `activate` rejected | `failed`, no abort | `activate failed: <rpc-error message>` |
+| `commit-failed` | `install-commit` accepted, then the commit stage fails | `rolled-back` after `abort` | `commit failed: install-img-commit-fail` |
+| `reverts` | the abort timer ran out before the commit, so the commit finds nothing to do | `failed`, nothing to abort | `commit failed: nothing to do: install-op-marked-succ; abort failed: nothing to abort` |
+| `bgp-down` | the BGP session is idle from the start | `failed` with a BGP pre-check, nothing installed | `pre-check failed: <detail>` |
+| `bgp-lost` | the BGP session is idle while the activated release runs | `rolled-back` with a BGP post-check, after `abort` | `post-check failed: <detail>` |
 
 A failed operation is recorded as the device records it: the stages that ran,
-the failed one marked, and nothing after it. The mock also serves one BGP
+the failed one marked with its `txn-sub-state`, then a notify. A c8000v
+17.18.02 reports the same sub-states for a missing file and a truncated image;
+the commit failure's is taken from the YANG. The mock also serves one BGP
 neighbor in `Cisco-IOS-XE-bgp-oper`, established and advertising three
 prefixes unless one of the BGP failures takes it down, for an application's
 pre-check and post-check to read.
@@ -453,7 +472,10 @@ Current coverage includes:
 - image filename and RPC input construction, including the abort timer;
 - credential redaction in the adapter's own log message;
 - record aggregation across UUIDs and multiple stages, and reverted records;
-- preservation of multiple keyless history records by the current filter;
+- the failure cause from the first failed transaction, also of a finished
+  record still in `install-oper`;
+- preservation of multiple keyless history records, and of every transaction
+  in them, by the current filter;
 - a complete `xcopy`, `install`, `activate`, `install-commit` run through
   `DeviceMgr` and `SoftwareManager`;
 - a failing post-check ending in `abort` and `rolled-back`;
@@ -463,6 +485,8 @@ Current coverage includes:
 - a download that fails after the copy was accepted, ending in `failed` with
   nothing installed;
 - propagation of a device-side add failure to manager status `failed`;
+- the reason each failure publishes, naming the operation and the device's
+  cause;
 - no RPCs when the device already runs an equivalent release;
 - the running release following the image file name;
 - the choice of delay between the upgrade duration, a fixed delay and instant;
@@ -474,7 +498,8 @@ Current coverage includes:
 pre-checks gate the install, a refused or silent pre-check ends `failed` with
 nothing installed, post-checks gate the commit, a failed or silent post-check
 rolls back, a late reply is ignored, a removed check is not consulted, both
-verdicts are published, and a failed commit or rollback ends as designed.
+verdicts are published, a failed prepare, commit or rollback ends as designed,
+every failure publishes its reason, and the next run starts without one.
 
 The mock does not reproduce memory pressure, SSH and NETCONF startup timing,
 vendor bugs, or all RPC error details. Run at least one real upgrade with the
@@ -543,8 +568,6 @@ manual recovery.
 Populate the modeled `job` node. Decide whether check results stay one
 aggregate per round or become keyed by registrant. Make `update_oper` notify
 northbound subscribers as well as serving current values to reads.
-
-Report why an operation reverted, not only that it did.
 
 ### 8.5 Credentials and verification
 

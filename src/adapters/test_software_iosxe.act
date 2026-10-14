@@ -135,19 +135,61 @@ def _test_delay_for_prefers_the_upgrade_duration():
 
 
 def _test_failed_record_stops_at_the_failed_stage():
-    """A device reports a failed operation with the stages it ran, the last of
-    them failed and nothing after it; the adapter reads that as a failure."""
+    """A device reports a failed operation with the stages it ran up to the
+    failed one and a notify after it; the adapter reads that as a failure."""
     rec = swxemock.operation_record("u1", "1", swxemock.OP_FAIL, swxe.OP_COMPLETE,
                                     ["install-txn-dwnld-precheck",
                                      "install-txn-download"],
-                                    "install-txn-dwnld-precheck")
+                                    "install-txn-dwnld-precheck",
+                                    swxemock.SUB_DOWNLOAD_FAIL)
     ds = _oper_ds(OLD_RELEASE, [rec])
     got = swxe.records_for(ds, "u1")
     testing.assertEqual(1, len(got), "one record expected")
-    testing.assertEqual(["install-txn-dwnld-precheck"], got[0].stages,
-                        "stages after the failed one must be absent")
+    testing.assertEqual(["install-txn-dwnld-precheck", "install-txn-notify"], got[0].stages,
+                        "only the notify may follow the failed stage")
+    testing.assertEqual(swxemock.SUB_DOWNLOAD_FAIL, got[0].cause,
+                        "the cause is the failed transaction's sub-state")
     v = swxe.aggregate(ds, "u1", swxe.STAGE_DOWNLOAD)
     testing.assertTrue(v.done and v.failed, "a failed record is a finished failure")
+    testing.assertEqual(swxemock.SUB_DOWNLOAD_FAIL, v.detail, "the detail is the cause")
+
+
+def _test_failure_cause_is_the_failed_transaction():
+    """The first failed transaction's sub-state, else its command and status,
+    else the operation status. The transactions around it must not hide it:
+    a c8000v records a failed add as sched, add-prechk (failed) and notify."""
+    ok = (cmd="install-txn-sched", status=swxemock.TXN_SUCC, sub_state="install-sub-state-undef")
+    prechk = (cmd="install-txn-add-prechk", status=swxe.TXN_FAIL,
+              sub_state=swxemock.SUB_VERIFY_FAIL)
+    notify = (cmd="install-txn-notify", status=swxemock.TXN_SUCC, sub_state="none")
+    testing.assertEqual(swxemock.SUB_VERIFY_FAIL,
+                        swxe.failure_cause(swxemock.OP_FAIL, [ok, prechk, notify]),
+                        "the failed transaction's sub-state")
+    silent = (cmd="install-txn-add-prechk", status=swxe.TXN_FAIL, sub_state="none")
+    testing.assertEqual("install-txn-add-prechk: install-txn-sts-fail",
+                        swxe.failure_cause(swxemock.OP_FAIL, [ok, silent, notify]),
+                        "without a sub-state, the transaction that failed")
+    timeout = (cmd="install-txn-download", status="install-txn-sts-timeout", sub_state="")
+    testing.assertEqual("install-txn-download: install-txn-sts-timeout",
+                        swxe.failure_cause(swxemock.OP_FAIL, [timeout]),
+                        "a timed-out transaction failed too")
+    testing.assertEqual(swxemock.OP_FAIL, swxe.failure_cause(swxemock.OP_FAIL, [ok]),
+                        "without a failed transaction, the operation status")
+
+
+def _test_finished_record_is_read_before_it_moves():
+    """A record that completed while still in install-oper keeps its
+    transactions in install-txn-sum-op-hist; they are read there too."""
+    rec = swxemock.operation_record("u1", "1", swxemock.OP_FAIL, swxe.OP_COMPLETE,
+                                    ["install-txn-add-prechk", "install-txn-verify"],
+                                    "install-txn-verify", swxemock.SUB_VERIFY_FAIL)
+    ds = swxemock.operational_datastore(OLD_RELEASE, [], active=[rec])
+    got = swxe.records_for(ds, "u1")
+    testing.assertEqual(1, len(got), "the live record must be read")
+    testing.assertEqual(["install-txn-add-prechk", "install-txn-verify", "install-txn-notify"],
+                        got[0].stages, "its transactions must be read")
+    testing.assertEqual(swxemock.SUB_VERIFY_FAIL, got[0].cause,
+                        "the cause must come from them")
 
 
 def _test_running_release_comes_out_of_the_banner():
@@ -239,12 +281,17 @@ def _test_added_version_picks_the_target_by_prefix():
 
 
 def _test_records_filter_preserves_keyless_history():
-    """The mock must return every record from the keyless history list."""
+    """The mock must return every record from the keyless history list, and
+    every transaction of each."""
     root = _oper_ds(OLD_RELEASE, [
         _record("job-1", "1", swxe.OP_SUCC, swxe.OP_COMPLETE,
                 ["install-txn-download"]),
         _record("job-2", "1", swxe.OP_SUCC, swxe.OP_COMPLETE,
                 ["install-txn-download"]),
+        swxemock.operation_record("job-3", "1", swxemock.OP_FAIL, swxe.OP_COMPLETE,
+                                  ["install-txn-add-prechk", "install-txn-copy",
+                                   "install-txn-verify", "install-txn-extract"],
+                                  "install-txn-verify", swxemock.SUB_VERIFY_FAIL),
     ])
     # NetconfMockServer parses the wire filter into an unnamed root FNode.
     filt = ygdata.FNode(children=[swxe.records_filter()])
@@ -253,8 +300,14 @@ def _test_records_filter_preserves_keyless_history():
     oper = ixoper.root.from_gdata(got).install_oper_data
     testing.assertEqual(0, len(oper.install_oper),
                         "empty active list was not preserved")
-    testing.assertEqual(2, len(oper.install_oper_hist),
+    testing.assertEqual(3, len(oper.install_oper_hist),
                         "keyless history entries were collapsed")
+    failed = swxe.records_for(got, "job-3")
+    testing.assertEqual(["install-txn-add-prechk", "install-txn-copy", "install-txn-verify",
+                         "install-txn-notify"],
+                        failed[0].stages, "keyless transactions were collapsed")
+    testing.assertEqual(swxemock.SUB_VERIFY_FAIL, failed[0].cause,
+                        "the failed transaction's sub-state was lost")
     hardware = ixoper.root.from_gdata(got).device_hardware_data.device_hardware
     version = hardware.device_system_data.software_version
     testing.assertEqual(None, version,
@@ -608,6 +661,9 @@ actor _test_iosxe_device_failure_is_reported(t: testing.EnvT):
         st = d!.get_swmgr().get_status()
         if st == "failed":
             finished = True
+            testing.assertEqual("add failed: " + swxemock.SUB_VERIFY_FAIL,
+                                d!.get_swmgr().get_reason(),
+                                "the reason must name the add and the device's cause")
             t.success()
             return
         if st == "succeeded":
@@ -734,6 +790,9 @@ actor _test_iosxe_activate_refusal_is_failed(t: testing.EnvT):
                                 "no abort after a refused activate")
             testing.assertEqual(OLD_RELEASE, m!.get_running(),
                                 "the device must still run the old release")
+            testing.assertEqual("activate failed: install-smu-not-added: mock refuses to activate",
+                                d!.get_swmgr().get_reason(),
+                                "the reason must carry the device's refusal")
             t.success()
             return
         if st == "succeeded" or st == "rolled-back":
@@ -851,6 +910,9 @@ actor _test_iosxe_download_failure_fails_in_prepare(t: testing.EnvT):
                                 "nothing may be installed after a failed download")
             testing.assertEqual(OLD_RELEASE, m.get_running(),
                                 "the device must still run the old release")
+            testing.assertEqual("download failed: " + swxemock.SUB_DOWNLOAD_FAIL,
+                                d.get_swmgr().get_reason(),
+                                "the reason must name the download and the device's cause")
             t.success()
         except Exception as e:
             t.failure(e)
@@ -871,6 +933,9 @@ actor _test_iosxe_commit_failure_rolls_back(t: testing.EnvT):
                                 "the abort must reload the committed release")
             testing.assertEqual(OLD_RELEASE, m.get_committed(),
                                 "nothing may have been committed")
+            testing.assertEqual("commit failed: " + swxemock.SUB_COMMIT_FAIL,
+                                d.get_swmgr().get_reason(),
+                                "the reason must say why it rolled back")
             t.success()
         except Exception as e:
             t.failure(e)
@@ -891,6 +956,10 @@ actor _test_iosxe_revert_before_commit_is_failed(t: testing.EnvT):
                                 "the device must run the committed release again")
             testing.assertEqual(OLD_RELEASE, m.get_committed(),
                                 "the target may not have been committed")
+            testing.assertEqual("commit failed: nothing to do: install-op-marked-succ; "
+                                + "abort failed: nothing to abort",
+                                d.get_swmgr().get_reason(),
+                                "the reason must keep the commit and the abort")
             t.success()
         except Exception as e:
             t.failure(e)

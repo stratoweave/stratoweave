@@ -193,8 +193,8 @@ device entry that the inventory transform writes.
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription to the device's
 `/device/software/state` on the flotilla, and publishes the status, running
-release, stage and check verdicts as the entry's own `software/state`. A change
-on one device publishes one entry. Removing the entry closes the subscription
+release, stage, reason and check verdicts as the entry's own `software/state`.
+A change on one device publishes one entry. Removing the entry closes the subscription
 and clears the state. For a device without a shard, the top's own device
 manager publishes `/device/software/state`. Campaign transforms subscribe to
 both and aggregate their own members.
@@ -226,7 +226,7 @@ demo's `bgp-lost` devices wait a minute.
 Nothing is read from the device between checks and nothing is published
 but the verdicts, under `/device{cpe}/software/state/precheck` and
 `postcheck`. The top carries both up to the campaign's `device-status`, next
-to the device's status and the step its upgrade is at. The mock IOS XE
+to the device's status, the step its upgrade is at and why it stopped. The mock IOS XE
 device serves one established BGP neighbor, so in the demo both checks pass
 with its numbers, except on the `bgp-down` and `bgp-lost` devices.
 
@@ -235,7 +235,7 @@ with its numbers, except on the `bgp-down` and `bgp-lost` devices.
     just test
 
 The focused tests cover node creation, per-device sharding, precise campaign
-links, campaign aggregation, the stage and check verdicts reaching the
+links, campaign aggregation, the stage, reason and check verdicts reaching the
 campaign, the parent RFS-to-flotilla render, direct `/device` configuration at
 the RFS-only bottom, the mock leaves reaching the flotilla, reading the BGP
 neighbors, and a complete mock IOS XE software upgrade gated by the

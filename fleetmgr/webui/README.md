@@ -54,7 +54,7 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   page shows them that way too, from the plan's install estimates.
 - Progress is config-false `state` under each campaign, merged into GET
   responses; each `device-status` row also carries `running-release`,
-  `stage` and the `precheck` and `postcheck` verdicts.
+  `stage`, `reason` and the `precheck` and `postcheck` verdicts.
   `state/plan` is the planner's layout: the windows it places devices into
   (`start`/`end` as seconds since the Unix epoch, one `device` entry per
   member with `estimated-start` and `estimated-duration`), plus an `alarm`
@@ -116,7 +116,8 @@ the campaign page draws them on a timeline, one cell per device, that takes
 the live status as the run passes them. Below it, each device's run is a
 chain of its steps, prepare, pre-check, install, post-check and commit: the
 step running now pulses, a failed step is red with a cross, and a rollback
-shows as ↺ after it. The UI adds no semantics the model does not carry —
+shows as ↺ after it; the device's `reason` says why the run stopped. The UI
+adds no semantics the model does not carry —
 anything done here can be done identically over NETCONF or plain RESTCONF.
 Two rules go beyond the model, in the wizard and on the campaign page: a
 newly set deadline must lie ahead, and the pace comes from a deadline or a

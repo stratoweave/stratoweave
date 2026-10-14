@@ -56,6 +56,7 @@ interface DeviceStatusJson {
   status?: string;
   'running-release'?: string;
   stage?: string;
+  reason?: string;
   precheck?: CheckResultJson;
   postcheck?: CheckResultJson;
 }
@@ -230,6 +231,8 @@ export interface DeviceStatusRow {
   runningRelease: string;
   /** The step the run is in or ended in; null before any run. */
   stage: Stage | null;
+  /** Why the run failed or rolled back; '' otherwise. */
+  reason: string;
   precheck: CheckResult;
   postcheck: CheckResult;
 }
@@ -435,6 +438,7 @@ function parseCampaign(entry: CampaignJson): Campaign {
         raw,
         runningRelease: row?.['running-release'] ?? '',
         stage: parseStage(row?.stage),
+        reason: row?.reason ?? '',
         precheck: parseCheck(row?.precheck),
         postcheck: parseCheck(row?.postcheck)
       };
