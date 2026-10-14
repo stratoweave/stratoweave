@@ -2073,9 +2073,10 @@ actor ListRestore(
     The list first reads the keys entries and creates one element per
     entry; each element then reads its own subtree from the store, in
     parallel through the layer load's RestoreWindow. The list then walks
-    the subtrees under l1/ to check that each has a keys entry, skipping
-    past each one; a subtree with no keys entry, such as l1/baz without
-    l1@keys[baz], is an error.
+    the subtrees under l1/ to check that each has a keys entry and rebuild
+    source membership from the descendant transforms' running records.
+    A subtree with no keys entry, such as l1/baz without l1@keys[baz],
+    is an error.
     """
 
     db_path = _db_path(path)
@@ -2104,7 +2105,12 @@ actor ListRestore(
         try:
             child = swdb.child_from_key(db_path, record.key, codec)
             if child.name in restored:
-                elements!.skip_to(child.next_key)
+                # Structural containers and lists preserve source names until
+                # the transform boundary. Its running qualifier identifies
+                # the source contributing to each enclosing list element.
+                parsed = swdb.parse_attr_key(record.key, codec)
+                if parsed.attr == swdb.ATTR_RUNNING and parsed.qualifier is not None:
+                    await async liststate.restore_source(child.name, parsed.qualifier!)
                 proceed(None)
             else:
                 raise ValueError("Persisted data for unknown list element at {_format_path(path)}[{child.name}]")
@@ -2210,6 +2216,11 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
         _attach(key)
         return node
 
+    def restore_source(key: str, src: str) -> None:
+        if src not in active:
+            active[src] = set()
+        active[src].add(key)
+
     def acquire(tid, candidate: dict[str,set[str]], erasure: set[str], leaves_by_key: dict[str, dict[gdata.Id, gdata.Leaf]]):
         if tid not in candidates:
             candidates[tid] = {}
@@ -2309,6 +2320,7 @@ class _ListTransaction(_Transaction):
     sources_by_key : dict[str, set[str]]
     elems : dict[str, Transaction]
     results : dict[str, CfgResult]
+    key_leaves: dict[str, dict[gdata.Id, gdata.Leaf]]
     state1 : ?YieldState1
     state2 : ?YieldState2[str]
     reset: bool
@@ -2324,6 +2336,7 @@ class _ListTransaction(_Transaction):
         self.sources_by_key = {}
         self.elems = {}
         self.results = {}
+        self.key_leaves = {}
         self.state1 = None
         self.state2 = None
         self.reset = False
@@ -2333,6 +2346,7 @@ class _ListTransaction(_Transaction):
         if self.reset:
             self.elems = {}
             self.results = {}
+            self.key_leaves = {}
             self.reset = False
 
         cfg_keys = {}
@@ -2354,6 +2368,7 @@ class _ListTransaction(_Transaction):
             if keys or not differential or isinstance(cfg, gdata.Absent):
                 cfg_keys[src] = keys
 
+        self.key_leaves.update(leaves_by_key.items())
         nodes = self.liststate.acquire(tid, cfg_keys, erasure, leaves_by_key)
         refresh = differential and not cfg_by_key and all([isinstance(cfg, gdata.List) for cfg in cfg_by_src.values()])
         if refresh:
@@ -2381,7 +2396,7 @@ class _ListTransaction(_Transaction):
         res = self._analyze(results)
 
         if dbuf is not None and not refresh:
-            dbuf.replace(swdb.slot_key(_db_path(self.path), "list"), self.db_ops(leaves_by_key))
+            dbuf.replace(swdb.slot_key(_db_path(self.path), "list"), self.db_ops(self.key_leaves))
         return res
 
     def db_ops(self, leaves_by_key) -> list[swdb.BufferOp]:
@@ -2422,6 +2437,7 @@ class _ListTransaction(_Transaction):
             self.sources_by_key = {}
             self.elems = {}
             self.results = {}
+            self.key_leaves = {}
             self.reset = False
 
         # linkage may target list entries committed by an earlier tx and not
@@ -2523,7 +2539,14 @@ class _ListTransaction(_Transaction):
             else:
                 self.state2 = None
                 #print('   #', state.tid, '(List)', _format_path(self.path), 'LOCK DONE', err=True)
-                state.done(self._analyze(state.results))
+                res = self._analyze(state.results)
+                # Deferred source erasures can make entries empty only during
+                # locking. Persist their key deletions before the buffer flush,
+                # retaining keys staged by earlier configure calls as well.
+                dbuf = state.dbuf
+                if dbuf is not None:
+                    dbuf.replace(swdb.slot_key(_db_path(self.path), "list"), self.db_ops(self.key_leaves))
+                state.done(res)
         else:
             pass
             #print('#### ...... (List)', _format_path(self.path), 'lock_cont2 empty state!!!', err=True)
