@@ -15,17 +15,18 @@
 <section class="section">
   <header class="section__header">
     <div class="section__title-group">
-      <h4>{title}</h4>
+      <!-- The YANG path is for the people who know the model; it stays out
+           of the way as the heading's tooltip. -->
+      <h2 title={yangPath ? `YANG: ${yangPath}` : undefined}>{title}</h2>
       {#if description}
         <p>{description}</p>
       {/if}
     </div>
-    <div class="section__meta">
-      {#if yangPath}
-        <span class="section__yang-path">{yangPath}</span>
-      {/if}
-      {@render actions?.()}
-    </div>
+    {#if actions}
+      <div class="section__meta">
+        {@render actions()}
+      </div>
+    {/if}
   </header>
 
   <div class="section__content">
@@ -51,16 +52,17 @@
     gap: 1rem;
   }
 
-  .section__title-group h4 {
+  .section__title-group h2 {
     margin: 0;
-    font-size: 14px;
+    font-size: var(--sw-text-md);
     font-weight: 600;
     letter-spacing: -0.01em;
   }
 
   .section__title-group p {
+    max-width: 75ch;
     margin: 4px 0 0;
-    font-size: 12px;
+    font-size: var(--sw-text-sm);
     color: var(--sw-text-secondary);
   }
 
@@ -68,15 +70,6 @@
     display: flex;
     align-items: center;
     gap: 8px;
-  }
-
-  .section__yang-path {
-    font-family: var(--sw-font-mono);
-    font-size: 10px;
-    color: var(--sw-text-muted);
-    background: var(--sw-bg-deep);
-    padding: 2px 8px;
-    border-radius: 3px;
   }
 
   .section__content {

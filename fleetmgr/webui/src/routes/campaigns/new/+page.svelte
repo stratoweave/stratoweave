@@ -78,10 +78,10 @@
 
 <div class="page-header">
   <div>
-    <h2>New campaign</h2>
+    <h1>New campaign</h1>
     <p>
-      Created in plan: declared and inspectable, doing nothing until you run it.
-      The plan shows how the members fit the windows before anything is actuated.
+      A new campaign starts in plan: nothing changes on the devices until you
+      run it, and its plan shows when each device would go.
     </p>
   </div>
 </div>
@@ -185,10 +185,6 @@
 </section>
 
 <style>
-  .card {
-    margin-bottom: 16px;
-  }
-
   .grid-2 {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
@@ -197,7 +193,7 @@
 
   .note {
     margin: 0;
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-muted);
   }
 
@@ -206,12 +202,12 @@
   }
 
   .cred-warning {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     line-height: 1.6;
     color: var(--sw-warning);
     background: var(--sw-warning-dim);
     border: 1px solid rgb(var(--sw-warning-rgb) / 0.3);
-    border-radius: 6px;
+    border-radius: var(--sw-radius-sm);
     padding: 9px 11px;
   }
 
@@ -219,7 +215,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--sw-text-sm);
     cursor: pointer;
   }
 

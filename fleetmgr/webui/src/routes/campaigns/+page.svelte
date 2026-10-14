@@ -64,16 +64,15 @@
 
 <div class="page-header">
   <div>
-    <h2>Upgrade campaigns</h2>
+    <h1>Upgrade campaigns</h1>
     <p>
-      A campaign owns each of its devices exclusively, which is what stops
-      two campaigns scheduling the same device. The planner fits the members
-      into their schedules' windows; run releases devices through the
-      controller as their windows open - a few at a time, growing as
-      completions come in.
+      Each campaign upgrades its own devices to a target release, a few at a
+      time, as their maintenance schedules open.
     </p>
   </div>
-  <a class="btn btn-primary" href="/campaigns/new">New campaign</a>
+  <div class="page-actions">
+    <a class="btn btn-primary" href="/campaigns/new">New campaign</a>
+  </div>
 </div>
 
 {#if data.loadError}
@@ -87,10 +86,10 @@
   </div>
   <div class="kpi">
     <div class="kick">Devices in flight</div>
-    <div class="kpi-n tn" style:color="var(--sw-accent)">{kpis.inFlight.toLocaleString()}</div>
+    <div class="kpi-n tn" class:progress-text={kpis.inFlight > 0}>{kpis.inFlight.toLocaleString()}</div>
   </div>
   <div class="kpi" class:alert={kpis.failed > 0}>
-    <div class="kick" class:alert-text={kpis.failed > 0}>Failed, needs an operator</div>
+    <div class="kick">Failed, needs an operator</div>
     <div class="kpi-n tn" class:alert-text={kpis.failed > 0}>{kpis.failed.toLocaleString()}</div>
   </div>
   <div class="kpi">
@@ -101,7 +100,10 @@
 
 <section class="card">
   {#if campaigns.length === 0}
-    <div class="empty-state">No campaigns yet.</div>
+    <div class="empty-state">
+      No campaigns yet. <a href="/campaigns/new">Create one</a> to plan an upgrade; nothing
+      changes on the devices until you run it.
+    </div>
   {:else}
     <div class="table-wrap">
       <table>
@@ -109,7 +111,7 @@
           <tr>
             <th>Campaign</th>
             <th>Target release</th>
-            <th>admin-state</th>
+            <th>Mode</th>
             <th class="right">Devices</th>
             <th>Plan</th>
             <th class="state-col">State</th>
@@ -120,17 +122,17 @@
         <tbody>
           {#each campaigns as campaign (campaign.name)}
             <tr>
-              <td>
+              <td class="name-cell">
                 <a class="campaign-name mono" href={`/campaigns/${encodeURIComponent(campaign.name)}`}>
                   {campaign.name}
                 </a>
               </td>
-              <td class="mono tn">{campaign.targetRelease}</td>
-              <td>
+              <td class="mono tn" data-label="Target release">{campaign.targetRelease}</td>
+              <td data-label="Mode">
                 <AdminStatePill state={campaign.adminState} />
               </td>
-              <td class="tn right">{campaign.devices.length.toLocaleString()}</td>
-              <td class="plan-cell">
+              <td class="tn right" data-label="Devices">{campaign.devices.length.toLocaleString()}</td>
+              <td class="plan-cell" data-label="Plan">
                 {#if campaign.plan !== null && campaign.plan.windows.length > 0}
                   <span class="dim">
                     {campaign.plan.windows.length} window{campaign.plan.windows.length === 1 ? '' : 's'}
@@ -148,15 +150,17 @@
                   {/if}
                 {/if}
               </td>
-              <td class="state-col">
+              <td class="state-col" data-label="State">
                 {#if campaign.counters !== null}
                   <CampaignProgress counters={campaign.counters} compact={true} />
                 {:else}
                   <span class="dim">—</span>
                 {/if}
               </td>
-              <td class="tn right">{campaign.counters?.succeeded.toLocaleString() ?? '—'}</td>
-              <td class="tn right failed-cell">{campaign.counters?.failed.toLocaleString() ?? '—'}</td>
+              <td class="tn right" data-label="Succeeded">{campaign.counters?.succeeded.toLocaleString() ?? '—'}</td>
+              <td class="tn right" class:failed-cell={(campaign.counters?.failed ?? 0) > 0} data-label="Failed">
+                {campaign.counters?.failed.toLocaleString() ?? '—'}
+              </td>
             </tr>
           {/each}
         </tbody>
@@ -175,28 +179,28 @@
 
   .kpi {
     border: 1px solid var(--sw-border-subtle);
-    border-radius: 8px;
-    padding: 13px 16px;
+    border-radius: var(--sw-radius-md);
+    padding: 12px 16px;
     background: var(--sw-bg-elevated);
   }
 
   .kpi.alert {
-    border-color: rgb(var(--sw-danger-rgb) / 0.3);
-    background: rgb(var(--sw-danger-rgb) / 0.08);
+    border-color: rgb(var(--sw-danger-rgb) / 0.4);
+    background: rgb(var(--sw-danger-rgb) / 0.1);
   }
 
   .alert-text {
-    color: var(--sw-danger);
+    color: var(--sw-danger-text);
+  }
+
+  .progress-text {
+    color: var(--sw-accent);
   }
 
   .kpi-n {
-    font-size: 30px;
+    font-size: var(--sw-text-3xl);
     font-weight: 600;
     line-height: 1.15;
-  }
-
-  .card {
-    margin-bottom: 16px;
   }
 
   .state-col {
@@ -205,7 +209,7 @@
 
   .campaign-name {
     font-weight: 500;
-    font-size: 12.5px;
+    font-size: var(--sw-text-sm);
     color: var(--sw-accent-bright);
     text-decoration: none;
   }
@@ -216,7 +220,7 @@
 
   .dim {
     color: var(--sw-text-muted);
-    font-size: 11.5px;
+    font-size: var(--sw-text-xs);
   }
 
   .plan-cell {
@@ -228,6 +232,89 @@
   }
 
   .failed-cell {
-    color: var(--sw-danger);
+    color: var(--sw-danger-text);
+    font-weight: 600;
+  }
+
+  .empty-state a {
+    color: var(--sw-accent-bright);
+  }
+
+  @media (max-width: 720px) {
+    .kpis {
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    .kpi {
+      padding: 10px 12px;
+    }
+
+    .kpi-n {
+      font-size: var(--sw-text-2xl);
+    }
+
+    /* Each campaign becomes a block of labelled lines. */
+    table,
+    tbody,
+    tr,
+    td {
+      display: block;
+    }
+
+    thead {
+      display: none;
+    }
+
+    tr + tr {
+      border-top: 1px solid var(--sw-border-subtle);
+    }
+
+    td {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      justify-content: flex-end;
+      padding: 6px 0;
+      border: none;
+      text-align: right;
+    }
+
+    td[data-label]::before {
+      content: attr(data-label);
+      margin-right: auto;
+      font-size: var(--sw-text-2xs);
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--sw-text-muted);
+      text-align: left;
+    }
+
+    /* The campaign's name heads its block. */
+    .name-cell {
+      justify-content: flex-start;
+      padding: 4px 0 8px;
+      text-align: left;
+    }
+
+    .name-cell .campaign-name {
+      font-size: var(--sw-text-lg);
+      font-weight: 600;
+    }
+
+    .state-col {
+      width: auto;
+    }
+
+    .state-col :global(.progress) {
+      flex: 1;
+      max-width: 60%;
+    }
+
+    tbody tr:hover td {
+      background: none;
+    }
   }
 </style>

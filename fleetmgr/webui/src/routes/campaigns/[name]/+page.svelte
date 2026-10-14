@@ -5,7 +5,6 @@
   import { errorText } from '$lib/core/errors';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import Pager, { paginate } from '$lib/core/ui/Pager.svelte';
-  import AdminStatePill from '$lib/software/AdminStatePill.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
   import DeviceStatusTable from '$lib/software/DeviceStatusTable.svelte';
   import PlanningFields from '$lib/software/PlanningFields.svelte';
@@ -24,6 +23,7 @@
     type PlanningDraft
   } from '$lib/software/planning-form';
   import { RateTracker, formatEta } from '$lib/software/rate';
+  import { formatClock } from '$lib/core/time';
   import { nameMatcher } from '$lib/software/selection';
   import {
     CAMPAIGN_LIST_ROOT,
@@ -48,6 +48,9 @@
   let confirmAction = $state<'run' | 'plan' | 'delete' | null>(null);
 
   let devicesOpen = $state(false);
+  // Changing the pace is occasional; while a campaign runs the section stays
+  // folded below the live status. null: follow the admin state.
+  let paceOpenChoice = $state<boolean | null>(null);
   let unplacedOpen = $state(false);
   let filterStatus = $state<KnownStatus | ''>('');
   let searchText = $state('');
@@ -69,6 +72,12 @@
   onMount(() => {
     const fast = createPoller(async () => {
       if ((data.campaign?.devices.length ?? 0) > FAST_ENTRY_LIMIT) {
+        // Too big to fetch whole every tick, but an entry without state yet
+        // is small: refresh it until the first report, so a new campaign's
+        // progress and plan do not wait for the slow tick.
+        if (data.campaign !== null && data.campaign.counters === null) {
+          void invalidate('data:campaign');
+        }
         return;
       }
       try {
@@ -105,6 +114,7 @@
   /** The fresh entry when there is one for this campaign, else the snapshot. */
   let campaign = $derived(live !== null && live.name === data.name ? live : data.campaign);
   let counters = $derived(campaign?.counters ?? null);
+  let paceOpen = $derived(paceOpenChoice ?? campaign?.adminState === 'plan');
   let statuses = $derived(
     new Map<string, KnownStatus>((campaign?.deviceStatus ?? []).map((r) => [r.device, r.status]))
   );
@@ -186,9 +196,9 @@
         const placed = c.devices.length - plan.unplaced.length;
         const windows = `${plan.windows.length} window${plan.windows.length === 1 ? '' : 's'}`;
         const missing = plan.unplaced.length > 0 ? `, ${plan.unplaced.length} not placed` : '';
-        return `Planned — inert until run. ${placed} of ${c.devices.length} placed in ${windows}${missing}.`;
+        return `Planned — ${placed} of ${c.devices.length} placed in ${windows}${missing}.`;
       }
-      return 'Planned — inert until run.';
+      return 'Planned.';
     }
     if (counters === null) return 'Running — no state reported yet.';
     if (counters.inProgress > 0)
@@ -207,7 +217,7 @@
     plan: {
       title: 'Revert to plan',
       confirmLabel: 'Revert',
-      confirmClass: 'btn-primary'
+      confirmClass: 'btn-danger'
     },
     delete: {
       title: 'Delete campaign',
@@ -222,8 +232,14 @@
     if (confirmAction === 'run') {
       const unplaced = c.plan?.unplaced.length ?? 0;
       const placed = c.devices.length - unplaced;
+      const first = c.plan?.windows.find((w) => w.end === null || w.end > Date.now() / 1000);
+      const opens =
+        first && first.start > Date.now() / 1000
+          ? ` The first window${first.schedule ? `, ${first.schedule},` : ''} opens at ${formatClock(first.start)}.`
+          : '';
       return (
         `Start upgrading ${placed} device(s) to ${c.targetRelease}? Devices are released a few at a time as their windows open and completions come in. Real installs reload devices and take several minutes.` +
+        opens +
         (unplaced > 0 ? ` ${unplaced} device(s) do not fit the windows and are left alone.` : '')
       );
     }
@@ -269,10 +285,25 @@
 {:else}
   <div class="page-header">
     <div>
-      <h2>{campaign.name}</h2>
+      <h1>{campaign.name}</h1>
       <p class="summary">{summary}</p>
+      <p class="facts">
+        <span><span class="fact-label">Release</span> <span class="mono">{campaign.targetRelease}</span></span>
+        <span class="image">
+          <span class="fact-label">Image</span>
+          <span class="mono image-url">{campaign.imageUrl ? maskUrlCredentials(campaign.imageUrl) : '—'}</span>
+        </span>
+      </p>
     </div>
-    <div class="actions">
+    <div class="page-actions">
+      <button
+        class="btn btn-secondary btn-danger-ghost"
+        type="button"
+        disabled={busy}
+        onclick={() => (confirmAction = 'delete')}
+      >
+        Delete
+      </button>
       {#if campaign.adminState === 'plan'}
         <button
           class="btn btn-primary"
@@ -292,74 +323,43 @@
           Revert to plan
         </button>
       {/if}
-      <button
-        class="btn btn-secondary btn-danger-ghost"
-        type="button"
-        disabled={busy}
-        onclick={() => (confirmAction = 'delete')}
-      >
-        Delete
-      </button>
     </div>
   </div>
 
-  <section class="card">
-    <div class="facts">
-      <div class="fact">
-        <span class="fact-label">Target release</span>
-        <span class="mono">{campaign.targetRelease}</span>
-      </div>
-      <div class="fact">
-        <span class="fact-label">Admin state</span>
-        <AdminStatePill state={campaign.adminState} />
-      </div>
-      <div class="fact">
-        <span class="fact-label">Image URL</span>
-        <span class="mono">{campaign.imageUrl ? maskUrlCredentials(campaign.imageUrl) : '—'}</span>
-      </div>
-    </div>
-  </section>
+  {#if counters !== null}
+    <section class="card status-card" aria-label="Progress">
+      <CampaignProgress {counters} />
+      {#if campaign.adminState === 'run'}
+        <div class="status-foot">
+          <p class="rate">
+            {#if rate !== null}
+              ~{rate.toFixed(1)} devices finished/min{eta !== null ? ` · ETA ${formatEta(eta)}` : ''} ·
+              measured since this page opened
+            {:else}
+              The rate shows once devices finish.
+            {/if}
+          </p>
+        </div>
+      {/if}
+    </section>
+  {/if}
 
-  {#if planningForm}
-    <section class="card">
-      <h3 class="panel-title">Schedule and pace</h3>
-      <PlanningFields
-        schedules={data.schedules}
-        draft={planningForm}
-        errors={planningErrors}
-        disabled={planningSaving}
-        installSeconds={planInstallSeconds(campaign.plan)}
-        onchange={(next) => {
-          planningEdit = next;
-          planningMessage = null;
-        }}
-      />
-      <div class="planning-actions">
-        {#if planningMessage}
-          <span class={planningMessage.type === 'error' ? 'save-error' : 'save-ok'}>{planningMessage.text}</span>
-        {:else if alsoTargetRate !== null}
-          <span class="save-ok">Target rate {alsoTargetRate}/h also applies; saving sets it to 0.</span>
-        {/if}
-        <button
-          class="btn btn-secondary"
-          type="button"
-          disabled={planningSaving || planningEdit === null}
-          onclick={() => {
-            planningEdit = null;
-            planningMessage = null;
-          }}
-        >
-          Reset
-        </button>
-        <button
-          class="btn btn-primary"
-          type="button"
-          disabled={planningSaving || !planningDirty}
-          onclick={savePlanning}
-        >
-          {planningSaving ? 'Saving…' : 'Save'}
-        </button>
-      </div>
+  {#if counters === null && campaign.devices.length > 0}
+    <!-- Holds the space until the first state report, so the page does not
+         jump when it arrives. -->
+    <section class="card status-card" aria-label="Progress" aria-busy="true">
+      <div class="placeholder-bar"></div>
+      <p class="rate">Waiting for the first status report…</p>
+    </section>
+  {/if}
+
+  {#if failedRows.length > 0}
+    <section class="card failed-card">
+      <h2 class="panel-title">Failed or rolled back ({failedRows.length})</h2>
+      <DeviceStatusTable rows={failedRows.slice(0, FAILED_LIMIT)} />
+      {#if failedRows.length > FAILED_LIMIT}
+        <p class="rate">showing {FAILED_LIMIT} of {failedRows.length}</p>
+      {/if}
     </section>
   {/if}
 
@@ -367,7 +367,7 @@
     {@const plan = campaign.plan}
     <section class="card">
       <div class="grids-head">
-        <h3 class="panel-title">Plan</h3>
+        <h2 class="panel-title">Plan</h2>
         <span class="hint">estimates in your local time</span>
       </div>
       {#if plan.alarms.length > 0 || plan.unplaced.length > 0}
@@ -383,7 +383,7 @@
                 aria-expanded={unplacedOpen}
                 onclick={() => (unplacedOpen = !unplacedOpen)}
               >
-                {unplacedOpen ? '▾' : '▸'} {unplacedText(plan.unplaced.length)}
+                {unplacedText(plan.unplaced.length)}
               </button>
               {#if unplacedOpen}
                 <ul class="unplaced">
@@ -407,36 +407,22 @@
     </section>
   {/if}
 
-  {#if counters !== null}
-    <section class="card">
-      <CampaignProgress {counters} />
-      {#if campaign.adminState === 'run'}
-        <p class="rate">
-          {#if rate !== null}
-            ~{rate.toFixed(1)} settles/min{eta !== null ? ` · ETA ${formatEta(eta)}` : ''} —
-            measured since page open
-          {:else}
-            rate appears once counters move
-          {/if}
-        </p>
-      {/if}
-    </section>
-  {/if}
-
-  {#if failedRows.length > 0}
-    <section class="card">
-      <h3 class="panel-title">Failed ({failedRows.length})</h3>
-      <DeviceStatusTable rows={failedRows.slice(0, FAILED_LIMIT)} />
-      {#if failedRows.length > FAILED_LIMIT}
-        <p class="rate">showing {FAILED_LIMIT} of {failedRows.length}</p>
-      {/if}
+  {#if campaign.plan === null && campaign.devices.length > 0}
+    <section class="card" aria-busy="true">
+      <div class="grids-head">
+        <h2 class="panel-title">Plan</h2>
+        <span class="hint">estimates in your local time</span>
+      </div>
+      <div class="placeholder-plan">Planning…</div>
     </section>
   {/if}
 
   <section class="card">
-    <button class="fold" type="button" onclick={() => (devicesOpen = !devicesOpen)}>
-      {devicesOpen ? '▾' : '▸'} Devices ({campaign.deviceStatus.length})
-    </button>
+    <h2 class="fold-heading">
+      <button class="fold" type="button" aria-expanded={devicesOpen} onclick={() => (devicesOpen = !devicesOpen)}>
+        Devices ({campaign.deviceStatus.length.toLocaleString()})
+      </button>
+    </h2>
     {#if devicesOpen}
       {#if campaign.deviceStatus.length === 0}
         <div class="empty-state">The campaign has no member devices.</div>
@@ -446,6 +432,7 @@
             class="chip"
             class:active={filterStatus === ''}
             type="button"
+            aria-pressed={filterStatus === ''}
             onclick={() => {
               filterStatus = '';
               page = 1;
@@ -459,6 +446,7 @@
                 class="chip"
                 class:active={filterStatus === status}
                 type="button"
+                aria-pressed={filterStatus === status}
                 onclick={() => {
                   filterStatus = status;
                   page = 1;
@@ -471,6 +459,7 @@
           <input
             class="input compact mono search"
             type="text"
+            aria-label="Find device"
             placeholder="find device (glob with * and ?)"
             bind:value={searchText}
             oninput={() => (page = 1)}
@@ -481,6 +470,60 @@
       {/if}
     {/if}
   </section>
+
+  {#if planningForm}
+    <section class="card">
+      <h2 class="fold-heading">
+        <button class="fold" type="button" aria-expanded={paceOpen} onclick={() => (paceOpenChoice = !paceOpen)}>
+          Schedule and pace
+        </button>
+        {#if !paceOpen}
+          <span class="hint">{planningDirty ? 'unsaved changes' : 'change the default schedule, a deadline or the rates'}</span>
+        {/if}
+      </h2>
+      {#if paceOpen}
+        <div class="pace-body">
+          <PlanningFields
+            schedules={data.schedules}
+            draft={planningForm}
+            errors={planningErrors}
+            disabled={planningSaving}
+            installSeconds={planInstallSeconds(campaign.plan)}
+            onchange={(next) => {
+              planningEdit = next;
+              planningMessage = null;
+            }}
+          />
+          <div class="planning-actions">
+            {#if planningMessage}
+              <span class={planningMessage.type === 'error' ? 'save-error' : 'save-ok'}>{planningMessage.text}</span>
+            {:else if alsoTargetRate !== null}
+              <span class="save-ok">Target rate {alsoTargetRate}/h also applies; saving sets it to 0.</span>
+            {/if}
+            <button
+              class="btn btn-secondary"
+              type="button"
+              disabled={planningSaving || planningEdit === null}
+              onclick={() => {
+                planningEdit = null;
+                planningMessage = null;
+              }}
+            >
+              Reset
+            </button>
+            <button
+              class="btn btn-primary"
+              type="button"
+              disabled={planningSaving || !planningDirty}
+              onclick={savePlanning}
+            >
+              {planningSaving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </div>
+      {/if}
+    </section>
+  {/if}
 {/if}
 
 <ConfirmDialog
@@ -497,60 +540,108 @@
   .summary {
     margin: 4px 0 0;
     color: var(--sw-text-secondary);
-    font-size: 13px;
-  }
-
-  .actions {
-    display: flex;
-    gap: 8px;
-  }
-
-  .card {
-    margin-bottom: 16px;
+    font-size: var(--sw-text-md);
   }
 
   .facts {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 14px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 24px;
+    margin-top: 10px;
+    font-size: var(--sw-text-sm);
+    color: var(--sw-text-primary);
   }
 
-  .fact {
-    display: grid;
-    gap: 4px;
+  .facts .fact-label {
+    margin-right: 6px;
   }
 
-  .fact-label {
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.04em;
+  .image {
+    min-width: 0;
+  }
+
+  /* A long URL breaks at its slashes rather than mid-word. */
+  .image-url {
+    overflow-wrap: anywhere;
+    color: var(--sw-text-secondary);
+  }
+
+  .status-card {
+    padding-bottom: 16px;
+  }
+
+  .status-foot {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 8px 16px;
+    margin-top: 12px;
+  }
+
+  .status-foot .rate {
+    margin: 0;
+  }
+
+  /* Same height as CampaignProgress's bar. */
+  .placeholder-bar {
+    height: 30px;
+    border-radius: var(--sw-radius-sm);
+    background: var(--sw-bg-deep);
+  }
+
+  .placeholder-plan {
+    display: grid;
+    place-items: center;
+    min-height: 240px;
+    border: 1px dashed var(--sw-border-subtle);
+    border-radius: var(--sw-radius-md);
+    font-size: var(--sw-text-sm);
     color: var(--sw-text-muted);
   }
 
-  .fact :global(.pill) {
-    justify-self: start;
+  .failed-card {
+    border-color: rgb(var(--sw-danger-rgb) / 0.35);
+  }
+
+  .failed-card .panel-title {
+    color: var(--sw-danger-text);
+  }
+
+  .fold-heading {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    margin: 0;
+    font-size: inherit;
+  }
+
+  .pace-body {
+    margin-top: 16px;
   }
 
   .planning-actions {
     display: flex;
     align-items: center;
     justify-content: flex-end;
+    flex-wrap: wrap;
     gap: 8px;
   }
 
   .save-ok {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-secondary);
   }
 
   .save-error {
-    font-size: 12px;
-    color: var(--sw-danger);
+    font-size: var(--sw-text-xs);
+    color: var(--sw-danger-text);
   }
 
   .rate {
     margin: 10px 0 0;
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-muted);
   }
 
@@ -558,27 +649,18 @@
     display: flex;
     align-items: baseline;
     justify-content: space-between;
+    gap: 12px;
     margin-bottom: 12px;
   }
 
+  .grids-head .panel-title {
+    margin: 0;
+  }
+
   .hint {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
+    font-weight: 400;
     color: var(--sw-text-muted);
-  }
-
-  .panel-title {
-    margin: 0 0 12px;
-    font-size: 14px;
-  }
-
-  .fold {
-    background: none;
-    border: none;
-    color: var(--sw-text-primary);
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    padding: 0;
   }
 
   .alarms {
@@ -588,16 +670,17 @@
     border: 1px solid rgb(var(--sw-warning-rgb) / 0.3);
     background: var(--sw-warning-dim);
     color: var(--sw-warning);
-    font-size: 13px;
+    font-size: var(--sw-text-sm);
   }
 
-  /* The fold arrow stands in for the bullet. */
+  /* The fold's chevron stands in for the bullet. */
   .unplaced-item {
     list-style: none;
   }
 
   .unplaced-fold {
-    margin-left: -15px;
+    margin-left: -18px;
+    min-height: 0;
     color: inherit;
     font-size: inherit;
     font-weight: inherit;
@@ -605,6 +688,7 @@
   }
 
   .unplaced-fold:hover {
+    color: inherit;
     text-decoration: underline;
   }
 
@@ -621,7 +705,7 @@
 
   .unplaced a {
     color: var(--sw-text-secondary);
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     text-decoration: none;
   }
 
@@ -643,7 +727,10 @@
     margin-left: auto;
   }
 
-  .mono {
-    word-break: break-all;
+  @media (max-width: 720px) {
+    .search {
+      width: 100%;
+      margin-left: 0;
+    }
   }
 </style>

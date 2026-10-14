@@ -60,8 +60,11 @@
     color: var(--sw-accent);
   }
 
+  /* Takes the spare width, but never so little that a long check result
+     turns into a column of single words when the table scrolls. */
   .detail {
     width: 100%;
+    min-width: 18rem;
     color: var(--sw-text-secondary);
     white-space: normal;
   }

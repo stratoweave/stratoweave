@@ -16,7 +16,7 @@ const BREAK_MIN_PX = BREAK_W * 1.5;
  * right after another does not touch it. */
 export const WINDOW_GAP = 6;
 
-const MAX_SIZE = 10;
+const MAX_SIZE = 14;
 const MIN_SIZE = 3;
 
 /** Where a window's band ends on the axis: its end, or for an open window

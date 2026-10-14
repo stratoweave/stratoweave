@@ -53,7 +53,7 @@
   input::-webkit-datetime-edit-ampm-field:focus {
     background: var(--sw-accent-glow-strong);
     color: var(--sw-text-primary);
-    border-radius: 3px;
+    border-radius: var(--sw-radius-xs);
   }
 
   input::-webkit-calendar-picker-indicator {
@@ -61,7 +61,7 @@
     height: 14px;
     margin-left: 6px;
     padding: 2px;
-    border-radius: 4px;
+    border-radius: var(--sw-radius-xs);
     background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 16 16' fill='none' stroke='%237d8cac' stroke-width='1.5' stroke-linecap='round'%3E%3Crect x='2' y='3' width='12' height='11' rx='2'/%3E%3Cpath d='M2 6.5h12M5.5 1.5v3M10.5 1.5v3'/%3E%3C/svg%3E") center / 14px 14px no-repeat;
     opacity: 1;
     cursor: pointer;

@@ -326,15 +326,13 @@
 
 <div class="page-header">
   <div>
-    <h2>Devices</h2>
+    <h1>Devices</h1>
     <p>
-      The fleet inventory. Entries added here get the lab credentials
-      (admin/admin) and are placed onto internal workers automatically.
-      Lab deploys usually onboard devices over RESTCONF once their
-      addresses are known.
+      The fleet inventory. Devices added here use the lab credentials
+      (admin/admin); lab deploys usually onboard them over RESTCONF.
     </p>
   </div>
-  <div class="header-buttons">
+  <div class="page-actions">
     <button class="btn btn-secondary" type="button" onclick={openImport} disabled={saving || applying}>
       Import
     </button>
@@ -457,17 +455,18 @@
       <input
         class="input compact mono filter-input"
         type="text"
+        aria-label="Filter by name"
         placeholder="filter by name (glob with * and ?)"
         bind:value={filterText}
         oninput={() => (page = 1)}
       />
-      <select class="select compact" bind:value={filterType} onchange={() => (page = 1)}>
+      <select class="select compact" aria-label="Device type" bind:value={filterType} onchange={() => (page = 1)}>
         <option value="">all types</option>
         {#each types as t (t)}
           <option value={t}>{t}</option>
         {/each}
       </select>
-      <select class="select compact" bind:value={filterSchedule} onchange={() => (page = 1)}>
+      <select class="select compact" aria-label="Maintenance schedule" bind:value={filterSchedule} onchange={() => (page = 1)}>
         <option value="">all schedules</option>
         <option value="none">no schedule</option>
         {#each scheduleNames as name (name)}
@@ -494,10 +493,10 @@
               />
             </th>
             <th>Device</th>
-            <th>Type</th>
-            <th>Address</th>
+            <th class="col-type">Type</th>
+            <th class="col-address">Address</th>
             <th>Schedule</th>
-            <th></th>
+            <th class="col-action"><span class="sr-only">Actions</span></th>
           </tr>
         </thead>
         <tbody>
@@ -517,8 +516,8 @@
               <td>
                 <a class="device-name" href={`/devices/${encodeURIComponent(device.name)}`}>{device.name}</a>
               </td>
-              <td>{device.type}</td>
-              <td class="mono">{device.address || '—'}</td>
+              <td class="col-type">{device.type}</td>
+              <td class="mono col-address">{device.address || '—'}</td>
               <td>
                 {#if !device.schedule}
                   <span class="dim" title="No binding: each campaign's default schedule applies">—</span>
@@ -535,8 +534,9 @@
               </td>
               <td class="col-action">
                 <button
-                  class="btn btn-secondary btn-sm btn-danger-ghost"
+                  class="btn btn-ghost btn-sm row-remove"
                   type="button"
+                  aria-label={`Remove ${device.name}`}
                   disabled={saving || deleting || applying}
                   onclick={() => (deleteTarget = device)}
                 >
@@ -620,6 +620,7 @@
   title="Remove device"
   message={`Remove ${deleteTarget?.name ?? ''} from the fleet? The orchestrator disconnects from it.`}
   confirmLabel={deleting ? 'Removing…' : 'Remove'}
+  confirmClass="btn-danger"
   oncancel={() => (deleteTarget = null)}
   onconfirm={handleDelete}
 />
@@ -634,18 +635,10 @@
     font-size: 13px;
   }
 
-  .header-buttons {
-    display: flex;
-    gap: 8px;
-  }
-
-  .card {
-    margin-bottom: 16px;
-  }
-
   .filter-row {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 10px;
     margin-bottom: 12px;
   }
@@ -680,7 +673,42 @@
   }
 
   .col-action {
+    width: 1%;
     text-align: right;
+    white-space: nowrap;
+  }
+
+  /* One quiet action per row: it takes the danger colour only when its row
+     is pointed at or focused, so a page of devices is not a page of red. */
+  .row-remove {
+    color: var(--sw-text-muted);
+    opacity: 0;
+  }
+
+  tbody tr:hover .row-remove,
+  tbody tr:focus-within .row-remove {
+    opacity: 1;
+  }
+
+  .row-remove:hover:not(:disabled),
+  .row-remove:focus-visible {
+    color: var(--sw-danger-text);
+    background: var(--sw-danger-dim);
+    opacity: 1;
+  }
+
+  @media (hover: none) {
+    .row-remove {
+      opacity: 1;
+    }
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
     white-space: nowrap;
   }
 
@@ -691,7 +719,6 @@
 
   .col-check input {
     display: block;
-    accent-color: var(--sw-accent);
     cursor: pointer;
   }
 
@@ -702,7 +729,7 @@
   .schedule-name {
     color: var(--sw-accent-bright);
     text-decoration: none;
-    font-size: 12.5px;
+    font-size: var(--sw-text-sm);
   }
 
   .schedule-name:hover {
@@ -713,14 +740,14 @@
     display: inline-block;
     width: 9px;
     height: 9px;
-    border-radius: 2px;
+    border-radius: var(--sw-radius-xs);
     margin-right: 6px;
     vertical-align: middle;
   }
 
   .missing {
     color: var(--sw-warning);
-    font-size: 12.5px;
+    font-size: var(--sw-text-sm);
   }
 
   .dim {
@@ -764,8 +791,8 @@
 
   .bar-error {
     flex-basis: 100%;
-    font-size: 12px;
-    color: var(--sw-danger);
+    font-size: var(--sw-text-xs);
+    color: var(--sw-danger-text);
   }
 
   .link-button:disabled {
@@ -784,5 +811,27 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 4px;
+  }
+
+  @media (max-width: 720px) {
+    /* The device page has these; the list keeps the name and the binding. */
+    .col-type,
+    .col-address {
+      display: none;
+    }
+
+    .filter-input {
+      flex-basis: 100%;
+      max-width: none;
+    }
+
+    .filter-row .select {
+      flex: 1;
+      width: auto;
+    }
+
+    .device-name {
+      white-space: nowrap;
+    }
   }
 </style>

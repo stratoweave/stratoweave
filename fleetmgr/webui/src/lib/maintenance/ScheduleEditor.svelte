@@ -196,11 +196,12 @@
 
 <div class="page-header">
   <div>
-    <div class="kick mono">/maintenance:schedules/schedule{isNew ? '' : `=${schedule?.name}`}</div>
-    <h2>{isNew ? 'New schedule' : schedule?.name}</h2>
+    <h1 title={`YANG: /maintenance:schedules/schedule${isNew ? '' : `=${schedule?.name}`}`}>
+      {isNew ? 'New schedule' : schedule?.name}
+    </h1>
     <p>{usageText}</p>
   </div>
-  <div class="actions">
+  <div class="page-actions">
     {#if !isNew}
       <button
         class="btn btn-secondary btn-danger-ghost"
@@ -258,6 +259,7 @@
             <button
               class="btn btn-secondary btn-sm btn-danger-ghost"
               type="button"
+              aria-label={`Remove rule ${index + 1}`}
               onclick={() => removeRule(w.id)}
             >
               Remove
@@ -283,8 +285,11 @@
               ontouch={() => (touched = true)}
             />
           </div>
-          <div class="field">
-            <span class="field__label">Weekdays</span>
+          <div class="field" role="group" aria-label={`Rule ${index + 1} weekdays`}>
+            <span class="field__label">
+              Weekdays
+              <span class="days-hint">{w.days.length === 0 ? 'none picked: every day' : ''}</span>
+            </span>
             <div class="days">
               {#each WEEKDAYS as day (day)}
                 <button
@@ -312,7 +317,7 @@
 
   <section class="card">
     <div class="grids-head">
-      <h3 class="panel-title">Next seven days</h3>
+      <h2 class="panel-title">Next seven days</h2>
       <span class="hint">drag to move or resize, across a day to add · your local time</span>
     </div>
     <WeekCalendar
@@ -324,7 +329,7 @@
       onrulechange={changeRuleFromCalendar}
       onrulecreate={addRuleFromCalendar}
     />
-    <h3 class="panel-title upcoming-title">Windows the planner would use</h3>
+    <h2 class="panel-title upcoming-title">Windows the planner would use</h2>
     {#if upcoming.length === 0}
       <p class="hint">None within the planner's {HORIZON_DAYS} days.</p>
     {:else}
@@ -368,21 +373,16 @@
 />
 
 <style>
-  .actions {
-    display: flex;
-    gap: 8px;
-  }
-
   .editor {
     display: grid;
-    grid-template-columns: minmax(360px, 440px) minmax(0, 1fr);
+    grid-template-columns: minmax(0, 440px) minmax(0, 1fr);
     gap: 16px;
     align-items: start;
   }
 
   @media (max-width: 1100px) {
     .editor {
-      grid-template-columns: 1fr;
+      grid-template-columns: minmax(0, 1fr);
     }
   }
 
@@ -405,11 +405,13 @@
     display: flex;
     align-items: center;
     gap: 10px;
+    min-width: 0;
   }
 
   .rule-preview {
     flex: 1;
-    font-size: 11.5px;
+    min-width: 0;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-secondary);
     white-space: nowrap;
     overflow: hidden;
@@ -423,19 +425,26 @@
   }
 
   .days {
-    display: flex;
+    display: grid;
+    grid-template-columns: repeat(7, minmax(0, 1fr));
     gap: 4px;
   }
 
+  .days-hint {
+    margin-left: auto;
+    font-weight: 400;
+    color: var(--sw-text-muted);
+  }
+
   .day-toggle {
-    flex: 1;
+    min-width: 0;
     min-height: 34px;
     border-radius: var(--sw-radius-sm);
     border: 1px solid var(--sw-border-default);
     background: var(--sw-bg-input);
     color: var(--sw-text-muted);
     font-family: var(--sw-font-mono);
-    font-size: 11.5px;
+    font-size: var(--sw-text-xs);
     cursor: pointer;
   }
 
@@ -457,14 +466,16 @@
   }
 
   .warning {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-warning);
   }
 
   .grids-head {
     display: flex;
     align-items: baseline;
+    flex-wrap: wrap;
     justify-content: space-between;
+    gap: 4px 12px;
     margin-bottom: 12px;
   }
 
@@ -479,7 +490,7 @@
   }
 
   .hint {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-muted);
     margin: 8px 0 0;
   }
