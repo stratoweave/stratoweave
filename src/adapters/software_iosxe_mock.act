@@ -71,7 +71,12 @@ BGP_RECEIVED = 4
 # Device vocabulary for a failed operation (Cisco-IOS-XE-install-oper-types).
 OP_FAIL = "install-op-fail"
 TXN_SUCC = "install-txn-sts-succ"
-TXN_FAIL = "install-txn-sts-fail"
+# txn-sub-state of the transaction each failure stops at. A c8000v 17.18.02
+# reports the first two for a missing file and a truncated image; the commit
+# one is from Cisco-IOS-XE-install-event-types.
+SUB_DOWNLOAD_FAIL = "install-download-fail"
+SUB_VERIFY_FAIL = "install-verify-pkg-fail"
+SUB_COMMIT_FAIL = "install-img-commit-fail"
 
 HISTORY_MAX = 20
 RPCS_MAX = 50
@@ -83,8 +88,9 @@ _ACT_STAGES = ["install-txn-act-prechk", "install-txn-img-act", "install-txn-rel
 _COMMIT_STAGES = ["install-txn-commit-prechk", "install-txn-commit",
                   "install-txn-commit-postchk"]
 _ABORT_STAGES = ["install-txn-rbk-prechk", "install-txn-reload"]
-STAGE_VERIFY = "install-txn-verify"
+STAGE_ADD_PRECHK = "install-txn-add-prechk"
 STAGE_COMMIT = "install-txn-commit"
+STAGE_NOTIFY = "install-txn-notify"
 
 
 def op_seconds(rpc: str, upgrade_duration: float) -> float:
@@ -144,26 +150,32 @@ def hardware_datastore(version: str) -> ygdata.Node:
 
 
 def operation_record(uuid: str, op_id: str, status: str, done: str,
-                     stages: list[str], failed_stage: ?str=None) -> ygdata.Node:
+                     stages: list[str], failed_stage: ?str=None,
+                     sub_state: ?str=None) -> ygdata.Node:
     """Return one finished IOS XE install operation record. With failed_stage
-    the stages stop there, the last one failed, as the device reports an
-    operation that got no further."""
+    the stages stop there, that one failed with sub_state and a notify after
+    it, as the device reports an operation that got no further."""
     def q(n: str) -> ygdata.Id:
         return ygdata.Id(ixoper.NS_Cisco_IOS_XE_install_oper, n)
     ns = ixoper.NS_Cisco_IOS_XE_install_oper
     mod = "Cisco-IOS-XE-install-oper"
     txns: list[ygdata.Node] = []
-    stop = False
     for stage in stages:
-        txn_status = TXN_SUCC
-        if failed_stage is not None and stage == failed_stage!:
-            txn_status = TXN_FAIL
-            stop = True
-        txns.append(ygdata.Container({
+        txn: dict[ygdata.Id, ygdata.Node] = {
             q("txn-cmd"): ygdata.Leaf(stage, ns=ns, module=mod),
-            q("txn-status"): ygdata.Leaf(txn_status, ns=ns, module=mod),
-        }, ns=ns, module=mod))
-        if stop:
+        }
+        failed = failed_stage is not None and stage == failed_stage!
+        txn[q("txn-status")] = ygdata.Leaf(swxe.TXN_FAIL if failed else TXN_SUCC,
+                                           ns=ns, module=mod)
+        if failed and sub_state is not None:
+            txn[q("txn-sub-state")] = ygdata.Leaf(sub_state!, ns=ns, module=mod)
+        txns.append(ygdata.Container(txn, ns=ns, module=mod))
+        if failed:
+            txns.append(ygdata.Container({
+                q("txn-cmd"): ygdata.Leaf(STAGE_NOTIFY, ns=ns, module=mod),
+                q("txn-status"): ygdata.Leaf(TXN_SUCC, ns=ns, module=mod),
+                q("txn-sub-state"): ygdata.Leaf(swxe.SUB_STATE_NONE, ns=ns, module=mod),
+            }, ns=ns, module=mod))
             break
     return ygdata.Container({
         q("op-uuid"): ygdata.Leaf(uuid, ns=ns, module=mod),
@@ -232,9 +244,11 @@ def bgp_datastore(up: bool) -> ygdata.Node:
 
 def operational_datastore(version: str, history: list[ygdata.Node],
                           vstates: list[ygdata.Node]=[],
-                          bgp: bool=True) -> ygdata.Node:
+                          bgp: bool=True,
+                          active: list[ygdata.Node]=[]) -> ygdata.Node:
     """Return the complete operational datastore served by the mock; bgp says
-    whether its BGP session is up."""
+    whether its BGP session is up. The mock moves a finished record straight
+    to history; active is for tests of records still in install-oper."""
     def q(n: str) -> ygdata.Id:
         return ygdata.Id(ixoper.NS_Cisco_IOS_XE_install_oper, n)
     ns = ixoper.NS_Cisco_IOS_XE_install_oper
@@ -244,7 +258,7 @@ def operational_datastore(version: str, history: list[ygdata.Node],
     }, ns=ns, module=mod)
     install_oper = ygdata.Container({
         q("install-oper-data"): ygdata.Container({
-            q("install-oper"): ygdata.KeylessList([]),
+            q("install-oper"): ygdata.KeylessList(active),
             q("install-oper-hist"): ygdata.KeylessList(history),
             q("install-location-information"): ygdata.KeylessList([loc]),
         }, ns=ns, module=mod)
@@ -296,10 +310,13 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
     `complete_after` when a caller gives a fixed delay per operation instead.
     `failure` reproduces one IOS XE failure:
 
-      download-failed   xcopy accepted, then the download stage fails
-      add-failed        install accepted, then the verify stage fails
+      download-failed   xcopy accepted, then the download stage fails with
+                        install-download-fail
+      add-failed        install accepted, then the add pre-check fails with
+                        install-verify-pkg-fail
       activate-refused  activate rejected, as when the image was not added
       commit-failed     install-commit accepted, then the commit stage fails
+                        with install-img-commit-fail
       reverts           the abort timer runs out before the commit, so the
                         device is back on the committed release
       bgp-down          the BGP session is idle from the start
@@ -354,8 +371,9 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
     def _record(uuid: str, op_id: str, stages: list[str]) -> None:
         _remember(operation_record(uuid, op_id, swxe.OP_SUCC, swxe.OP_COMPLETE, stages))
 
-    def _fail(uuid: str, op_id: str, stages: list[str], stage: str) -> None:
-        _remember(operation_record(uuid, op_id, OP_FAIL, swxe.OP_COMPLETE, stages, stage))
+    def _fail(uuid: str, op_id: str, stages: list[str], stage: str, sub_state: str) -> None:
+        _remember(operation_record(uuid, op_id, OP_FAIL, swxe.OP_COMPLETE, stages, stage,
+                                   sub_state))
 
     def _noop(uuid: str, stages: list[str]) -> None:
         _remember(operation_record(uuid, "1", swxe.OP_MARKED_SUCC, swxe.OP_COMPLETE, stages))
@@ -368,7 +386,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
 
     def _finish_xcopy(uuid: str) -> None:
         if failure == FAILURE_DOWNLOAD:
-            _fail(uuid, "1", _DOWNLOAD_STAGES, swxe.STAGE_DOWNLOAD)
+            _fail(uuid, "1", _DOWNLOAD_STAGES, swxe.STAGE_DOWNLOAD, SUB_DOWNLOAD_FAIL)
         else:
             staged = last_destination
             _record(uuid, "1", _DOWNLOAD_STAGES)
@@ -376,7 +394,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
 
     def _finish_add(uuid: str, release: str) -> None:
         if failure == FAILURE_ADD:
-            _fail(uuid, "1", _ADD_STAGES, STAGE_VERIFY)
+            _fail(uuid, "1", _ADD_STAGES, STAGE_ADD_PRECHK, SUB_VERIFY_FAIL)
         else:
             added = release
             _record(uuid, "1", _ADD_STAGES)
@@ -385,7 +403,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
     def _finish_install(uuid: str, release: str) -> None:
         """one-shot: add, activate, commit, reload as one operation."""
         if failure == FAILURE_ADD:
-            _fail(uuid, "1", _ADD_STAGES, STAGE_VERIFY)
+            _fail(uuid, "1", _ADD_STAGES, STAGE_ADD_PRECHK, SUB_VERIFY_FAIL)
         else:
             _record(uuid, "1", _ADD_STAGES)
             _record(uuid, "2", ["install-txn-act-prechk", "install-txn-img-act",
@@ -418,7 +436,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
             _revert()
             _noop(uuid, _COMMIT_STAGES)
         elif failure == FAILURE_COMMIT:
-            _fail(uuid, "1", _COMMIT_STAGES, STAGE_COMMIT)
+            _fail(uuid, "1", _COMMIT_STAGES, STAGE_COMMIT, SUB_COMMIT_FAIL)
         elif cur == committed:
             _noop(uuid, _COMMIT_STAGES)
         else:

@@ -41,6 +41,13 @@ OP_FAIL_REVERT = "install-op-fail-revert"
 # install-oper op-done.
 OP_COMPLETE = "op-complete"
 OP_REVERTED = "op-reverted"
+# install-oper txn-status of a transaction that did not succeed.
+TXN_FAIL = "install-txn-sts-fail"
+TXN_FAILED = [TXN_FAIL, "install-txn-sts-dep-fail", "install-txn-sts-timeout",
+              "install-txn-sts-cancel", "install-txn-sts-op-timeout",
+              "install-txn-sts-disconnect"]
+# txn-sub-state when the device says nothing more.
+SUB_STATE_NONE = "none"
 
 # The stage that ends each records-polled job. A pure file copy really does
 # report through the install records.
@@ -184,42 +191,68 @@ def running_release(root: ?ygdata.Node) -> ?str:
 # Pure: operation records
 #############################################################################
 
+def failure_cause(status: str, txns: list[(cmd: str, status: str, sub_state: str)]) -> str:
+    """Why an operation failed, as far as the device says: the sub-state of the
+    first failed transaction, else its command and status, else the operation
+    status. The first, because the device records a notify transaction
+    after the one that failed."""
+    for t in txns:
+        if t.status in TXN_FAILED:
+            if t.sub_state != "" and t.sub_state != SUB_STATE_NONE:
+                return t.sub_state
+            return "{t.cmd}: {t.status}"
+    return status
+
+
+def _txn(cmd: ?str, status: ?str, sub_state: ?str) -> (cmd: str, status: str, sub_state: str):
+    return (cmd=cmd! if cmd is not None else "",
+            status=status! if status is not None else "",
+            sub_state=sub_state! if sub_state is not None else "")
+
+
+def _record_of(status: ?str, done: ?str,
+               txns: list[(cmd: str, status: str, sub_state: str)]) -> (status: str, done: str,
+                                                                        stages: list[str], cause: str):
+    st = status! if status is not None else ""
+    stages: list[str] = []
+    for t in txns:
+        if t.cmd != "":
+            stages.append(t.cmd)
+    return (status=st, done=done! if done is not None else "", stages=stages,
+            cause=failure_cause(st, txns))
+
+
 def records_for(root: ?ygdata.Node, uuid: str) -> list[(status: str,
                                                         done: str,
-                                                        stages: list[str])]:
+                                                        stages: list[str],
+                                                        cause: str)]:
     """Every record carrying this uuid, live and historical.
 
     Both lists, because a record moves from install-oper to install-oper-hist
-    when it finishes and the move can happen between two polls.
+    when it finishes and the move can happen between two polls. Both
+    transaction lists of each, because a record keeps its transactions in
+    install-txn-sum-op-hist once complete, also while still in install-oper.
     """
-    out: list[(status: str, done: str, stages: list[str])] = []
+    out: list[(status: str, done: str, stages: list[str], cause: str)] = []
     iod = ixoper.root.from_gdata(root).install_oper_data
     for e in iod.install_oper:
         if e.op_uuid != uuid:
             continue
-        stages: list[str] = []
+        txns: list[(cmd: str, status: str, sub_state: str)] = []
         for t in e.install_txn_summary_op:
-            cmd = t.txn_cmd
-            if cmd is not None:
-                stages.append(cmd!)
-        status = e.op_status
-        done = e.op_done
-        out.append((status=status! if status is not None else "",
-                    done=done! if done is not None else "",
-                    stages=stages))
+            txns.append(_txn(t.txn_cmd, t.txn_status, t.txn_sub_state))
+        for t in e.install_txn_sum_op_hist:
+            txns.append(_txn(t.txn_cmd, t.txn_status, t.txn_sub_state))
+        out.append(_record_of(e.op_status, e.op_done, txns))
     for e in iod.install_oper_hist:
         if e.op_uuid != uuid:
             continue
-        stages = []
+        txns = []
+        for t in e.install_txn_summary_op:
+            txns.append(_txn(t.txn_cmd, t.txn_status, t.txn_sub_state))
         for t in e.install_txn_sum_op_hist:
-            cmd = t.txn_cmd
-            if cmd is not None:
-                stages.append(cmd!)
-        status = e.op_status
-        done = e.op_done
-        out.append((status=status! if status is not None else "",
-                    done=done! if done is not None else "",
-                    stages=stages))
+            txns.append(_txn(t.txn_cmd, t.txn_status, t.txn_sub_state))
+        out.append(_record_of(e.op_status, e.op_done, txns))
     return out
 
 
@@ -231,7 +264,7 @@ def aggregate(root: ?ygdata.Node, uuid: str, expect_stage: str,
     record may not have appeared yet even when all current records succeeded.
     An empty `expect_stage` skips that wait, for operations with one record.
     With `allow_noop` False, `install-op-marked-succ` is a failure: the device
-    found nothing to do.
+    found nothing to do. A failure's detail is the device's cause.
     """
     recs = records_for(root, uuid)
     if len(recs) == 0:
@@ -239,12 +272,12 @@ def aggregate(root: ?ygdata.Node, uuid: str, expect_stage: str,
     saw_end = False
     for r in recs:
         if r.done == OP_REVERTED or r.status == OP_FAIL_REVERT:
-            return (done=True, failed=True, detail="operation reverted: {r.status}")
+            return (done=True, failed=True, detail="operation reverted: {r.cause}")
         finished = r.done == OP_COMPLETE
         if finished and r.status == OP_MARKED_SUCC and not allow_noop:
             return (done=True, failed=True, detail="nothing to do: {r.status}")
         if finished and r.status != OP_SUCC and r.status != OP_MARKED_SUCC:
-            return (done=True, failed=True, detail="stage failed: {r.status}")
+            return (done=True, failed=True, detail=r.cause)
         if not finished:
             return (done=False, failed=False, detail="still running")
         for s in r.stages:
@@ -345,6 +378,11 @@ def job_uuid(phase: str, release: str, token: str) -> str:
     return "swi-{phase}-{release}-{token}"
 
 
+def operation_name(phase: str) -> str:
+    """A driver phase as the device names the operation: staging is a download."""
+    return "download" if phase == "stage" else phase
+
+
 def xcopy_input(uuid: str, url: str, filename: str) -> ixrpc.Cisco_IOS_XE_xcopy_rpc__xcopy__input:
     """Stage an image. `destination_path` must be a bare filename: the device
     prepends /bootflash itself, so passing a path doubles it and fails."""
@@ -424,6 +462,12 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         if d is not None:
             d!(err)
 
+    def _fail(detail: str) -> None:
+        """End the job with an error naming the operation; the manager
+        publishes it as the run's reason."""
+        op = operation_name(_phase)
+        _finish(ValueError("{op} failed: {detail}"))
+
     def _busy() -> bool:
         return _phase != ""
 
@@ -467,7 +511,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _finish(err)
+                _fail(swdev.error_text(err!))
                 return
             after now period: _poll(gen)
         return cb
@@ -505,7 +549,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _finish(err)
+                # The device may quote the source, credentials and all.
+                _fail(swdev.error_text(err!).replace(url!, redact_url(url!)))
                 return
             after now poll_period: _poll(gen)
         _rpcs.xcopy(on_rpc, xcopy_input(_uuid, url!, _filename))
@@ -536,11 +581,11 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _finish(err)
+                _fail(swdev.error_text(err!))
                 return
             ver = added_version(root, _release)
             if ver is None:
-                _finish(ValueError("added image for {_release} not found"))
+                _fail("added image for {_release} not found")
                 return
             _activate(ver!)
         dev.get(on_versions, versions_filter())
@@ -604,7 +649,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _polls += 1
         limit = VERSION_MAX_POLLS if (_phase == "activate" or _phase == "abort") else MAX_POLLS
         if _polls > limit:
-            _finish(ValueError("software job {_phase} did not finish in time"))
+            op = operation_name(_phase)
+            _finish(ValueError("{op} did not finish in time"))
             return
         if _phase == "abort":
             _poll_version(gen)
@@ -631,7 +677,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if not v.done:
                 return
             if v.failed:
-                _finish(ValueError("activate failed: {v.detail}"))
+                _fail(v.detail)
                 return
             _activate_booting = True
         dev.get(on_oper, records_filter())
@@ -649,7 +695,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if not v.done:
                 return
             if v.failed:
-                _finish(ValueError("{_phase} failed: {v.detail}"))
+                _fail(v.detail)
                 return
             _log.info("software: {_phase} done", {"uuid": _uuid})
             _end_phase()
