@@ -40,7 +40,7 @@
   onMount(() => {
     const fast = createPoller(async () => {
       const running = data.campaigns
-        .filter((c) => c.adminState === 'run')
+        .filter((c) => c.adminState === 'run' && c.counters !== null)
         .map((c) => c.name)
         .slice(0, 6);
       for (const name of running) {

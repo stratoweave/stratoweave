@@ -74,7 +74,9 @@
 
   async function refreshState(): Promise<void> {
     const base = data.campaign;
-    if (base === null) return;
+    // The state paths 404 until the campaign has published its first
+    // report; the fast tick reloads the snapshot until then.
+    if (base === null || base.counters === null) return;
     const fresh = await fetchCampaignState(base);
     if (fresh !== null) live = fresh;
   }
@@ -83,6 +85,13 @@
     const fast = createPoller(async () => {
       const base = data.campaign;
       if (base === null) return;
+      if (base.counters === null) {
+        // No state yet: an entry without state is small, so refresh the
+        // snapshot until the first report, so a new campaign's progress
+        // and plan do not wait for the slow tick.
+        void invalidate('data:campaign');
+        return;
+      }
       try {
         let c: CampaignCounters | null;
         if (base.devices.length <= FAST_ENTRY_LIMIT) {
@@ -92,13 +101,7 @@
           c = await fetchCounters(base.name);
           liveCounters = c === null ? null : { name: base.name, counters: c };
         }
-        if (c === null) {
-          // No state yet: an entry without state is small, so refresh the
-          // snapshot until the first report, so a new campaign's progress
-          // and plan do not wait for the slow tick.
-          if (base.counters === null) void invalidate('data:campaign');
-          return;
-        }
+        if (c === null) return;
         if (campaign?.adminState === 'run') {
           tracker.push(c.succeeded + c.failed);
           rate = tracker.ratePerMin();
