@@ -1,0 +1,357 @@
+"""Operational mode commands of the CLI.
+
+The commands are `show configuration [path] [| display set|xml|json]`, `exit`
+and `quit`. Keywords take a unique prefix, so `sh conf` is `show
+configuration`.
+"""
+
+import yang.schema as yschema
+import yang.gdata as ygdata
+
+import cli.hints as hints
+import cli.path as cpath
+import cli.render as render
+
+
+_TOP = [
+    ("exit", "Exit the CLI"),
+    ("quit", "Exit the CLI"),
+    ("show", "Show information"),
+]
+
+_SHOW = [
+    ("configuration", "Show the running configuration"),
+]
+
+_PIPE = [
+    ("display", "Show the output in another format"),
+]
+
+_DISPLAY = [
+    ("json", "Show the configuration as JSON"),
+    ("set", "Show the configuration as set commands"),
+    ("xml", "Show the configuration as XML"),
+]
+
+ENTER = cpath.Completion("<[Enter]>", " ", "Execute this command", insert=False)
+PIPE = cpath.Completion("|", " ", "Pipe through a command", insert=False)
+
+
+class Context(object):
+    """The schema and running configuration that commands work on.
+
+    root_path holds the containers above the start node of CLI paths. data is
+    the running configuration at the schema root.
+    """
+    root: yschema.DRoot
+    root_path: list[yschema.DNode]
+    start: yschema.DNode
+    data: ?ygdata.Node
+    start_data: ?ygdata.Node
+
+    def __init__(self, root: yschema.DRoot, data: ?ygdata.Node=None):
+        self.root = root
+        self.root_path = hints.cli_root(root)
+        start: yschema.DNode = root
+        d = data
+        for n in self.root_path:
+            start = n
+            d = cpath.child_data(d, n)
+        self.start = start
+        self.data = data
+        self.start_data = d
+
+
+class Command(object):
+    """A parsed command.
+
+    name is "show configuration", "exit" or "" for an empty line. display is
+    the format a `| display` pipe asks for, or "".
+    """
+    name: str
+    path: ?cpath.PathResult
+    display: str
+
+    def __init__(self, name: str, path: ?cpath.PathResult=None, display: str=""):
+        self.name = name
+        self.path = path
+        self.display = display
+
+
+class ParseResult(object):
+    """A parsed command, or an error at a character position of the line."""
+    cmd: ?Command
+    error: ?str
+    column: int
+    matches: list[str]
+
+    def __init__(self, cmd: ?Command, error: ?str=None, column: int=0, matches: list[str]=[]):
+        self.cmd = cmd
+        self.error = error
+        self.column = column
+        self.matches = matches
+
+
+class _Word(object):
+    word: ?str
+    error: ?str
+    matches: list[str]
+
+    def __init__(self, word: ?str, error: ?str=None, matches: list[str]=[]):
+        self.word = word
+        self.error = error
+        self.matches = matches
+
+
+def _match_word(words: list[(str, str)], t: cpath.Token) -> _Word:
+    if t.quoted:
+        return _Word(None, "syntax error.")
+    found = []
+    for w, _ in words:
+        if w == t.text:
+            return _Word(w)
+        if w.startswith(t.text):
+            found.append(w)
+    if len(found) == 1:
+        return _Word(found[0])
+    if len(found) > 1:
+        return _Word(None, "'{t.text}' is ambiguous.", found)
+    return _Word(None, "syntax error.")
+
+
+def _msg(err: ?str) -> str:
+    if err is not None:
+        return err
+    return "syntax error."
+
+
+def _column(line: str, toks: list[cpath.Token], i: int) -> int:
+    if i < len(toks):
+        return toks[i].start
+    return len(line)
+
+
+def _error(line: str, toks: list[cpath.Token], i: int, msg: str, matches: list[str]=[]) -> ParseResult:
+    return ParseResult(None, msg, _column(line, toks, i), matches)
+
+
+def _parse_pipe(line: str, toks: list[cpath.Token], i: int) -> (display: str, error: ?ParseResult):
+    """Parse `| display <format>` from token i, which is the `|` token."""
+    if i + 1 >= len(toks):
+        return ("", _error(line, toks, i + 1, "missing argument."))
+    w = _match_word(_PIPE, toks[i + 1])
+    if w.word is None:
+        return ("", _error(line, toks, i + 1, _msg(w.error), w.matches))
+    if i + 2 >= len(toks):
+        return ("", _error(line, toks, i + 2, "missing argument."))
+    f = _match_word(_DISPLAY, toks[i + 2])
+    fw = f.word
+    if fw is not None:
+        if i + 3 < len(toks):
+            return ("", _error(line, toks, i + 3, "syntax error."))
+        return (fw, None)
+    return ("", _error(line, toks, i + 2, _msg(f.error), f.matches))
+
+
+def parse(ctx: Context, line: str) -> ParseResult:
+    """Parse one command line."""
+    tk = cpath.tokenize(line)
+    toks = tk.items
+    if tk.open_quote:
+        return _error(line, toks, len(toks) - 1, "missing closing quote.")
+    if len(toks) == 0:
+        return ParseResult(Command(""))
+    w = _match_word(_TOP, toks[0])
+    top = w.word
+    if top is None:
+        return _error(line, toks, 0, _msg(w.error), w.matches)
+    if top == "exit" or top == "quit":
+        if len(toks) > 1:
+            return _error(line, toks, 1, "syntax error.")
+        return ParseResult(Command("exit"))
+    if len(toks) < 2:
+        return _error(line, toks, 1, "missing argument.")
+    s = _match_word(_SHOW, toks[1])
+    if s.word is None:
+        return _error(line, toks, 1, _msg(s.error), s.matches)
+    rest = toks[2:]
+    pres = cpath.resolve(ctx.root, ctx.start, ctx.start_data, rest)
+    err = pres.error
+    if err is not None:
+        return _error(line, toks, 2 + pres.error_at, err, pres.matches)
+    display = ""
+    p = 2 + pres.used
+    if p < len(toks):
+        pp = _parse_pipe(line, toks, p)
+        perr = pp.error
+        if perr is not None:
+            return perr
+        display = pp.display
+    return ParseResult(Command("show configuration", pres, display))
+
+
+class Reply(object):
+    """Completions for the word under the cursor.
+
+    partial is the start of the word under the cursor, and start is the
+    character position where that word begins; items are filtered by it. error
+    is set when the words before the cursor do not parse; column is then its
+    character position.
+    """
+    items: list[cpath.Completion]
+    partial: str
+    start: int
+    error: ?str
+    column: int
+    matches: list[str]
+
+    def __init__(self, items: list[cpath.Completion], partial: str, start: int=0, error: ?str=None, column: int=0, matches: list[str]=[]):
+        self.items = items
+        self.partial = partial
+        self.start = start
+        self.error = error
+        self.column = column
+        self.matches = matches
+
+
+def _words(words: list[(str, str)]) -> list[cpath.Completion]:
+    return [cpath.Completion(w, " ", h, keyword=True) for w, h in words]
+
+
+def _filter(items: list[cpath.Completion], partial: str) -> list[cpath.Completion]:
+    return [c for c in items if not c.insert or _matches(c, partial)]
+
+
+def _matches(c: cpath.Completion, partial: str) -> bool:
+    """Return True when a completion starts with the partial word.
+
+    A keyword also matches by its name without the module prefix.
+    """
+    if c.value.startswith(partial):
+        return True
+    if c.keyword:
+        return c.value[c.value.find(":") + 1:].startswith(partial)
+    return False
+
+
+def _after_words(line: str, toks: list[cpath.Token], partial: str, words: list[(str, str)], i: int) -> ?Reply:
+    """Match token i against words; return an error reply when it does not match."""
+    w = _match_word(words, toks[i])
+    if w.word is None:
+        return Reply([], partial, len(line), w.error, _column(line, toks, i), w.matches)
+    return None
+
+
+def complete(ctx: Context, line: str) -> Reply:
+    """Return the completions at the end of a line.
+
+    The line is the text up to the cursor. When it does not end in white space,
+    its last word is the partial word to complete.
+    """
+    tk = cpath.tokenize(line)
+    if tk.open_quote:
+        return Reply([], "", len(line))
+    toks = tk.items
+    partial = ""
+    start = len(line)
+    if not tk.trailing and len(toks) > 0:
+        partial = toks[-1].text
+        start = toks[-1].start
+        toks = toks[:-1]
+    r = _complete(ctx, line, toks, partial)
+    r.start = start
+    return r
+
+
+def _complete(ctx: Context, line: str, toks: list[cpath.Token], partial: str) -> Reply:
+    if len(toks) == 0:
+        return Reply(_filter(_words(_TOP), partial), partial)
+    bad = _after_words(line, toks, partial, _TOP, 0)
+    if bad is not None:
+        return bad
+    top = _match_word(_TOP, toks[0]).word
+    if top == "exit" or top == "quit":
+        if len(toks) > 1:
+            return Reply([], partial, error="syntax error.", column=_column(line, toks, 1))
+        return Reply([ENTER], partial)
+    if len(toks) == 1:
+        return Reply(_filter(_words(_SHOW), partial), partial)
+    bad = _after_words(line, toks, partial, _SHOW, 1)
+    if bad is not None:
+        return bad
+    rest = toks[2:]
+    p = len(rest)
+    for j in range(len(rest)):
+        if rest[j].is_pipe():
+            p = j
+            break
+    if p < len(rest):
+        # Completing after `|`.
+        res = cpath.resolve(ctx.root, ctx.start, ctx.start_data, rest[:p])
+        err = res.error
+        if err is not None:
+            return Reply([], partial, error=err, column=_column(line, toks, 2 + res.error_at), matches=res.matches)
+        piped = rest[p + 1:]
+        if len(piped) == 0:
+            return Reply(_filter(_words(_PIPE), partial), partial)
+        b = _after_words(line, toks, partial, _PIPE, 2 + p + 1)
+        if b is not None:
+            return b
+        if len(piped) == 1:
+            return Reply(_filter(_words(_DISPLAY), partial), partial)
+        b = _after_words(line, toks, partial, _DISPLAY, 2 + p + 2)
+        if b is not None:
+            return b
+        if len(piped) == 2:
+            return Reply([ENTER], partial)
+        return Reply([], partial, error="syntax error.", column=_column(line, toks, 2 + p + 3))
+    r = cpath.complete(ctx.root, ctx.start, ctx.start_data, rest)
+    err = r.path.error
+    if err is not None and err != "missing argument.":
+        return Reply([], partial, error=err, column=_column(line, toks, 2 + r.path.error_at), matches=r.path.matches)
+    items = _filter(r.items, partial)
+    if r.can_end and partial == "":
+        items = [ENTER] + items + [PIPE]
+    return Reply(items, partial)
+
+
+def help_text(items: list[cpath.Completion]) -> str:
+    """Format completions as the `?` help list."""
+    lines = ["Possible completions:"]
+    first = []
+    by_text = {}
+    last = []
+    for c in items:
+        if c.text == "|":
+            last.append(c)
+        elif c.text.startswith("<"):
+            first.append(c)
+        elif c.text not in by_text:
+            by_text[c.text] = c
+    middle = [by_text[t] for t in sorted(by_text.keys())]
+    for c in first + middle + last:
+        name = c.text
+        if c.help == "":
+            lines.append("{c.marker} {name}")
+        elif len(name) < 21:
+            lines.append("{c.marker} {name.ljust(21)}{c.help}")
+        else:
+            lines.append("{c.marker} {name}  {c.help}")
+    return "\n".join(lines)
+
+
+def output(ctx: Context, cmd: Command) -> str:
+    """Return the output of a show configuration command."""
+    pres = cmd.path
+    if pres is not None:
+        if cmd.display == "set":
+            return render.set_lines(ctx.start, pres.steps, pres.pos)
+        if cmd.display == "xml" or cmd.display == "json":
+            d = ctx.data
+            if d is not None:
+                sub = render.prune(ctx.root_path, pres.steps, d)
+                if sub is not None:
+                    return sub.to_xmlstr(pretty=True) if cmd.display == "xml" else sub.to_yang_jsonstr(pretty=True)
+            return ""
+        return render.curly(pres.pos)
+    return ""

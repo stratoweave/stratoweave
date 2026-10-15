@@ -1,0 +1,246 @@
+"""Show configuration data in the CLI formats.
+
+The curly-brace format and the set format follow the Junos CLI. Both walk the
+schema and the data together, so children show in schema order and the CLI
+hints apply. Each node shows with the keyword and value quoting that the path
+resolver reads back.
+"""
+
+import yang.schema as yschema
+import yang.gdata as ygdata
+
+import cli.hints as hints
+import cli.path as cpath
+
+
+INDENT = "    "
+
+
+def _has_data(s: yschema.DNode, d: ygdata.Node) -> bool:
+    for c in cpath.candidates(s):
+        if cpath.child_data(d, c) is not None:
+            return True
+    return False
+
+
+def _keyword(parent: yschema.DNode, c: yschema.DNode) -> str:
+    return cpath.keyword(c, cpath.clashes(parent))
+
+
+def _leaf_tokens(parent: yschema.DNode, c: yschema.DLeaf, d: ygdata.Leaf) -> list[str]:
+    if isinstance(c.type, yschema.DTypeEmpty):
+        return [_keyword(parent, c)]
+    if hints.hints(c).nokeyword:
+        return [cpath.value_text_at(parent, d.val)]
+    return [_keyword(parent, c), cpath.value_text(d.val)]
+
+
+def _leaflist_tokens(parent: yschema.DNode, c: yschema.DLeafList, d: ygdata.LeafList) -> list[str]:
+    vals = [cpath.value_text(e.val) for e in d.entries]
+    if len(vals) == 1:
+        return [_keyword(parent, c), vals[0]]
+    return [_keyword(parent, c), "["] + vals + ["]"]
+
+
+def _entry_header(parent: ?yschema.DNode, c: yschema.DList, e: ygdata.Node, keyword: bool) -> list[str]:
+    """Return the words that start a list entry: the keyword, if any, and the keys.
+
+    parent is the node above the list. Without a keyword, the first key is
+    quoted when it would read as a keyword of the parent; parent is None where
+    no path reads the entry back.
+    """
+    vals = cpath.entry_keys(e, hints.key_leaves(c))
+    res = []
+    for j in range(len(vals)):
+        res.append(cpath.value_text(vals[j]) if keyword or j > 0 else cpath.value_text_at(parent, vals[j]))
+    if keyword and parent is not None:
+        return [_keyword(parent, c)] + res
+    return res
+
+
+def _inline(s: yschema.DNode, d: ygdata.Node) -> list[str]:
+    res = []
+    for c in cpath.candidates(s):
+        cd = cpath.child_data(d, c)
+        if cd is not None:
+            if isinstance(c, yschema.DLeaf) and isinstance(cd, ygdata.Leaf):
+                res.extend(_leaf_tokens(s, c, cd))
+            elif isinstance(c, yschema.DLeafList) and isinstance(cd, ygdata.LeafList):
+                res.extend(_leaflist_tokens(s, c, cd))
+            elif isinstance(c, yschema.DContainer):
+                res.append(_keyword(s, c))
+                res.extend(_inline(c, cd))
+            elif isinstance(c, yschema.DList):
+                for e in cpath.list_entries(cd):
+                    res.extend(_entry_header(s, c, e, hints.has_keyword(c)))
+                    res.extend(_inline(c, e))
+    return res
+
+
+def _is_simple(s: yschema.DNode, d: ygdata.Node) -> bool:
+    for c in cpath.candidates(s):
+        cd = cpath.child_data(d, c)
+        if isinstance(cd, ygdata.LeafList):
+            if len(cd.entries) > 1:
+                return False
+        elif cd is not None and not isinstance(cd, ygdata.Leaf):
+            return False
+    return True
+
+
+def _block(s: yschema.DNode, header: list[str], d: ygdata.Node, indent: int, out: list[str]):
+    pad = INDENT * indent
+    if not _has_data(s, d):
+        if isinstance(s, yschema.DContainer) and not s.presence:
+            return
+        out.append(pad + " ".join(header) + ";")
+        return
+    h = hints.hints(s)
+    if h.oneliner or (h.oneliner_plus and _is_simple(s, d)):
+        out.append(pad + " ".join(header + _inline(s, d)) + ";")
+        return
+    out.append(pad + " ".join(header) + " {{")
+    _curly_children(s, d, indent + 1, out)
+    out.append(pad + "}}")
+
+
+def _curly_node(parent: yschema.DNode, c: yschema.DNode, cd: ygdata.Node, indent: int, out: list[str], prefix: list[str]=[]):
+    """Show one child node. prefix holds the keywords of homogeneous containers above it."""
+    pad = INDENT * indent
+    if isinstance(c, yschema.DLeaf) and isinstance(cd, ygdata.Leaf):
+        out.append(pad + " ".join(prefix + _leaf_tokens(parent, c, cd)) + ";")
+    elif isinstance(c, yschema.DLeafList) and isinstance(cd, ygdata.LeafList):
+        if len(cd.entries) > 0:
+            out.append(pad + " ".join(prefix + _leaflist_tokens(parent, c, cd)) + ";")
+    elif isinstance(c, yschema.DContainer):
+        if hints.hints(c).homogeneous and _has_data(c, cd):
+            # Each child shows with the container keyword in front, as in
+            # `family inet {`.
+            for c2 in cpath.candidates(c):
+                cd2 = cpath.child_data(cd, c2)
+                if cd2 is not None:
+                    _curly_node(c, c2, cd2, indent, out, prefix + [_keyword(parent, c)])
+        else:
+            _block(c, prefix + [_keyword(parent, c)], cd, indent, out)
+    elif isinstance(c, yschema.DList):
+        h = hints.hints(c)
+        if h.homogeneous and not h.nokeyword:
+            out.append(pad + " ".join(prefix + [_keyword(parent, c)]) + " {{")
+            for e in cpath.list_entries(cd):
+                _block(c, _entry_header(None, c, e, False), e, indent + 1, out)
+            out.append(pad + "}}")
+        else:
+            for e in cpath.list_entries(cd):
+                _block(c, prefix + _entry_header(parent, c, e, not h.nokeyword), e, indent, out)
+
+
+def _curly_children(s: yschema.DNode, d: ygdata.Node, indent: int, out: list[str]):
+    for c in cpath.candidates(s):
+        cd = cpath.child_data(d, c)
+        if cd is not None:
+            _curly_node(s, c, cd, indent, out)
+
+
+def curly(pos: cpath.Position) -> str:
+    """Show the data at a path position in curly-brace format.
+
+    At a container or list entry, show its children. At a list, show all
+    entries. At a leaf, show the leaf statement.
+    """
+    d = pos.data
+    p = pos.parent
+    out = []
+    if d is not None:
+        if pos.kind == "inner":
+            _curly_children(pos.node, d, 0, out)
+        elif p is not None:
+            _curly_node(p, pos.node, d, 0, out)
+    return "\n".join(out)
+
+
+def _set_children(prefix: list[str], s: yschema.DNode, d: ygdata.Node, out: list[str]):
+    for c in cpath.candidates(s):
+        cd = cpath.child_data(d, c)
+        if cd is not None:
+            _set_node(prefix, s, c, cd, out)
+
+
+def _set_line(tokens: list[str]) -> str:
+    return "set " + " ".join(tokens)
+
+
+def _set_node(prefix: list[str], parent: yschema.DNode, c: yschema.DNode, cd: ygdata.Node, out: list[str]):
+    kw = [_keyword(parent, c)] if hints.has_keyword(c) else []
+    if isinstance(c, yschema.DLeaf) and isinstance(cd, ygdata.Leaf):
+        out.append(_set_line(prefix + _leaf_tokens(parent, c, cd)))
+    elif isinstance(c, yschema.DLeafList) and isinstance(cd, ygdata.LeafList):
+        for e in cd.entries:
+            out.append(_set_line(prefix + kw + [cpath.value_text(e.val)]))
+    elif isinstance(c, yschema.DContainer):
+        _set_inner(prefix + kw, c, cd, c.presence, out)
+    elif isinstance(c, yschema.DList):
+        for e in cpath.list_entries(cd):
+            _set_inner(prefix + _entry_header(parent, c, e, hints.has_keyword(c)), c, e, True, out)
+
+
+def _set_inner(prefix: list[str], s: yschema.DNode, d: ygdata.Node, alone: bool, out: list[str]):
+    if _has_data(s, d):
+        _set_children(prefix, s, d, out)
+    elif alone and len(prefix) > 0:
+        out.append(_set_line(prefix))
+
+
+def set_lines(start: yschema.DNode, steps: list[cpath.Step], pos: cpath.Position) -> str:
+    """Show the data at a path position as set commands with full paths from the start node."""
+    d = pos.data
+    p = pos.parent
+    out = []
+    if d is not None:
+        n = pos.node
+        if pos.kind == "inner":
+            entry = len(steps) > 0 and steps[-1].is_entry()
+            presence = isinstance(n, yschema.DContainer) and n.presence
+            _set_inner(cpath.path_tokens(start, steps), n, d, entry or presence, out)
+        elif p is not None:
+            # The path ends at a list or a leaf: show it from its parent.
+            _set_node(cpath.path_tokens(start, steps[:-1]), p, n, d, out)
+    return "\n".join(out)
+
+
+def prune(root_steps: list[yschema.DNode], steps: list[cpath.Step], data: ygdata.Node) -> ?ygdata.Node:
+    """Return a copy of the data that holds only the subtree at a path.
+
+    root_steps are the containers above the CLI start node, and steps is the
+    CLI path below it. The copy keeps every ancestor, so it encodes as XML or
+    JSON with the right namespaces.
+    """
+    all_steps = [cpath.Step(n) for n in root_steps] + steps
+    return _prune(None, all_steps, 0, data)
+
+
+def _prune(parent: ?yschema.DList, steps: list[cpath.Step], i: int, d: ygdata.Node) -> ?ygdata.Node:
+    if i == len(steps):
+        return d
+    s = steps[i]
+    n = s.node
+    cd = cpath.child_data(d, n)
+    sub: ?ygdata.Node = None
+    if isinstance(n, yschema.DList) and isinstance(cd, ygdata.List) and len(s.keys) > 0:
+        e = cpath.list_entry(cd, s.keys)
+        if e is not None:
+            inner = _prune(n, steps, i + 1, e)
+            if inner is not None:
+                sub = ygdata.List(cd.keys, [inner], ns=cd.ns, module=cd.module)
+    elif cd is not None:
+        sub = _prune(None, steps, i + 1, cd)
+    if sub is not None:
+        children: dict[ygdata.Id, ygdata.Node] = {ygdata.Id(n.namespace, n.name): sub}
+        # A list entry keeps its key leaves.
+        if parent is not None:
+            for k in hints.key_leaves(parent):
+                kid = ygdata.Id(k.namespace, k.name)
+                kd = d.children.get(kid)
+                if kd is not None:
+                    children[kid] = kd
+        return ygdata.Container(children, ns=d.ns, module=d.module)
+    return None

@@ -272,6 +272,14 @@
   with `track_config=True`. Before, it read it on every connect, so tools that
   only read data or subscribe, like `ncurl monitor`, read the whole
   configuration too.
+- `ncurl cli` is an interactive command line in the style of the Junos CLI.
+  Its commands, completion with TAB and space, and `?` help come from the
+  device schema, shaped by the Junos `cli-feature` and the Tail-f
+  `cli-drop-node-name` and `cli-no-keyword` statements in it.
+  `show configuration` prints the running configuration in curly braces, or
+  in other formats with `| display set`, `| display xml` and
+  `| display json`. With a command as arguments, it runs that command and
+  exits. Without a terminal, it reads commands line by line from stdin.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with

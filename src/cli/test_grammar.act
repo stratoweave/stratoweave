@@ -1,0 +1,467 @@
+"""Tests for CLI tokens, paths, completion, commands and output formats."""
+
+import testing
+import std.xml as xml
+import yang
+import yang.schema as yschema
+import yang.gdata as ygdata
+import yang.xml as yxml
+
+import cli.hints as hints
+import cli.path as cpath
+import cli.render as render
+import cli.command as command
+
+
+EXT = r"""module junos-common-ddl-extensions {
+  namespace "http://yang.juniper.net/junos/common/ddl-extensions";
+  prefix junos;
+  extension cli-feature { argument "feature"; }
+}"""
+
+DEMO = r"""module demo {
+  namespace "urn:demo";
+  prefix d;
+  import junos-common-ddl-extensions { prefix junos; }
+
+  identity if-type;
+  identity ethernet { base if-type; }
+  identity loopback { base if-type; }
+
+  container system {
+    description "System parameters";
+    leaf host-name { type string; description "Hostname for this router"; }
+    leaf weight { type union { type uint8 { range "1..10"; } type string { pattern "<.*>|$.*"; } } }
+    leaf-list name-server { type string; ordered-by user; description "DNS name servers"; }
+    container services { presence "enable services"; leaf ssh { type empty; } }
+    container syslog {
+      list file {
+        key name;
+        leaf name { type string; }
+        list contents {
+          key name;
+          junos:cli-feature "nokeyword";
+          junos:cli-feature "oneliner";
+          leaf name { type enumeration { enum any; enum authorization; enum daemon; } }
+          leaf any { type empty; }
+          leaf notice { type empty; }
+        }
+      }
+    }
+  }
+  container interfaces {
+    description "Interface configuration";
+    leaf traceoptions { type string; }
+    list interface {
+      key name;
+      junos:cli-feature "nokeyword";
+      description "Physical interface";
+      leaf name { type string; description "Interface name"; }
+      leaf description { type string; description "Text description of interface"; }
+      leaf mtu { type uint16 { range "256..9192"; } }
+      leaf type { type identityref { base if-type; } }
+      leaf enabled { type boolean; }
+      leaf speed { type enumeration { enum auto; enum "10m"; enum "100m"; enum "1g"; } }
+      list unit {
+        key name;
+        leaf name { type uint32; }
+        leaf vlan-id { type uint16; }
+        container family {
+          junos:cli-feature "homogeneous";
+          container inet {
+            presence "enable inet";
+            list address { key name; leaf name { type string; } }
+          }
+          container inet6 { presence "enable inet6"; }
+        }
+      }
+    }
+  }
+  container routing {
+    list route {
+      key "prefix next-hop";
+      leaf prefix { type string; }
+      leaf next-hop { type string; }
+      leaf metric { type uint32; }
+    }
+  }
+  container snmp { leaf location { type string; } }
+  container state { config false; leaf uptime { type uint32; } }
+}"""
+
+EXTRA = r"""module demo-extra {
+  namespace "urn:demo-extra";
+  prefix x;
+  import demo { prefix d; }
+  augment "/d:snmp" { leaf location { type string; } }
+}"""
+
+DATA = r"""<data>
+<system xmlns="urn:demo">
+  <host-name>r1</host-name>
+  <name-server>10.0.0.1</name-server>
+  <name-server>10.0.0.2</name-server>
+  <services/>
+  <syslog><file><name>messages</name><contents><name>any</name><notice/></contents></file></syslog>
+</system>
+<interfaces xmlns="urn:demo">
+  <interface>
+    <name>ge-0/0/0</name>
+    <description>uplink to core</description>
+    <mtu>9000</mtu>
+    <type xmlns:d="urn:demo">d:ethernet</type>
+    <enabled>true</enabled>
+    <unit><name>0</name><vlan-id>10</vlan-id><family><inet><address><name>10.0.0.1/24</name></address></inet><inet6/></family></unit>
+  </interface>
+  <interface><name>lo0</name></interface>
+  <interface><name>trace</name><mtu>1500</mtu></interface>
+</interfaces>
+<routing xmlns="urn:demo">
+  <route><prefix>10.0.0.0/8</prefix><next-hop>192.0.2.1</next-hop><metric>5</metric></route>
+</routing>
+<snmp xmlns="urn:demo">
+  <location>dc1</location>
+  <location xmlns="urn:demo-extra">rack4</location>
+</snmp>
+</data>"""
+
+
+def _ctx() -> command.Context:
+    root = yang.compile([EXT, DEMO, EXTRA])
+    data = yxml.from_xml(root, xml.decode(DATA))
+    return command.Context(root, data)
+
+
+def _test_tokenize():
+    cases = [
+        ("empty", "", [], False, True),
+        ("words", "show configuration", ["show", "configuration"], False, False),
+        ("trailing space", "show ", ["show"], False, True),
+        ("quoted", "set a \"b c\" d", ["set", "a", "b c", "d"], False, False),
+        ("escape", "x \"a\\\"b\"", ["x", "a\"b"], False, False),
+        ("open quote", "x \"a b", ["x", "a b"], True, False),
+        ("pipe", "show|display set", ["show", "|", "display", "set"], False, False),
+        ("quoted pipe", "x \"|\"", ["x", "|"], False, False),
+    ]
+    for name, line, words, open_quote, trailing in cases:
+        t = cpath.tokenize(line)
+        testing.assertEqual([w.text for w in t.items], words, "tokenize {name}")
+        testing.assertEqual(t.open_quote, open_quote, "open quote {name}")
+        testing.assertEqual(t.trailing, trailing, "trailing {name}")
+    t = cpath.tokenize("x \"|\"")
+    testing.assertFalse(t.items[1].is_pipe(), "a quoted | is a value")
+    testing.assertEqual(t.items[1].start, 2, "token start")
+
+
+def _test_hints():
+    ctx = _ctx()
+    interfaces = ctx.root.get("interfaces")
+    iface = interfaces.get("interface")
+    trace = interfaces.get("traceoptions")
+    contents = ctx.root.get("system").get("syslog").get("file").get("contents")
+    testing.assertTrue(hints.hints(iface).nokeyword, "interface list has nokeyword")
+    testing.assertFalse(hints.has_keyword(iface), "interface list has no keyword")
+    testing.assertTrue(hints.has_keyword(trace), "traceoptions has a keyword")
+    testing.assertTrue(hints.hints(contents).oneliner, "contents is a oneliner")
+    testing.assertEqual(len(hints.cli_root(ctx.root)), 0, "the demo schema starts at the root")
+    testing.assertEqual(hints.quote("a b"), "\"a b\"", "quote space")
+    testing.assertEqual(hints.quote(""), "\"\"", "quote empty")
+    testing.assertEqual(hints.quote("ge-0/0/0"), "ge-0/0/0", "no quote")
+    testing.assertEqual(hints.summary("Interface name.\r\n  More text."), "Interface name", "summary of CRLF text")
+
+
+def _resolve(ctx: command.Context, line: str, values: bool) -> cpath.PathResult:
+    return cpath.resolve(ctx.root, ctx.start, ctx.start_data, cpath.tokenize(line).items, values)
+
+
+def _test_resolve_show():
+    ctx = _ctx()
+    # (name, line, canonical path, error, error token)
+    cases = [
+        ("root", "", "", None, 0),
+        ("container", "system", "system", None, 0),
+        ("prefix", "sys host", "system host-name", None, 0),
+        ("nokeyword list", "interfaces ge-0/0/0", "interfaces ge-0/0/0", None, 0),
+        ("keyword before nokeyword", "interfaces tr", "interfaces traceoptions", None, 0),
+        ("quoted is a value", "interfaces \"tr\"", "interfaces \"tr\"", None, 0),
+        ("key that reads as a keyword", "interfaces \"trace\" mtu", "interfaces \"trace\" mtu", None, 0),
+        ("qualified clash", "snmp x:location", "snmp x:location", None, 0),
+        ("qualified clash prefix", "snmp x:loc", "snmp x:location", None, 0),
+        ("module qualified clash", "snmp demo:location", "snmp d:location", None, 0),
+        ("clash needs a prefix", "snmp location", "", "'location' is ambiguous.", 1),
+        ("nested list", "interfaces ge-0/0/0 unit 0 vlan-id", "interfaces ge-0/0/0 unit 0 vlan-id", None, 0),
+        ("whole list", "routing route", "routing route", None, 0),
+        ("multi key", "routing route 10.0.0.0/8 192.0.2.1", "routing route 10.0.0.0/8 192.0.2.1", None, 0),
+        ("partial keys", "routing route 10.0.0.0/8", "", "missing argument.", 3),
+        ("bad key type", "interfaces ge-0/0/0 unit x", "", "'x' is not a valid value, expected uint32 with range 0..4294967295", 3),
+        ("unknown", "system foo", "", "syntax error.", 1),
+        ("after leaf", "system host-name r1", "", "syntax error.", 2),
+        ("state is not config", "state", "", "syntax error.", 0),
+        ("ambiguous", "system s", "", "'s' is ambiguous.", 1),
+        ("pipe stops", "system | display set", "system", None, 0),
+    ]
+    for name, line, path, err, at in cases:
+        r = _resolve(ctx, line, False)
+        testing.assertEqual(r.error, err, "error {name}")
+        if err is None:
+            testing.assertEqual(" ".join(cpath.path_tokens(ctx.start, r.steps)), path, "path {name}")
+        else:
+            testing.assertEqual(r.error_at, at, "error token {name}")
+    r = _resolve(ctx, "system s", False)
+    testing.assertEqual(r.matches, ["services", "syslog"], "ambiguous matches")
+
+
+def _test_resolve_values():
+    ctx = _ctx()
+    cases = [
+        ("leaf", "system host-name r2", "system host-name r2", None),
+        ("quoted value", "interfaces ge-0/0/0 description \"a b\"", "interfaces ge-0/0/0 description \"a b\"", None),
+        ("range", "interfaces ge-0/0/0 mtu 10", "", "'10' is not a valid value, expected uint16 with range 256..9192"),
+        ("boolean", "interfaces ge-0/0/0 enabled maybe", "", "'maybe' is not a valid value, expected boolean"),
+        ("identity", "interfaces ge-0/0/0 type loopback", "interfaces ge-0/0/0 type demo:loopback", None),
+        ("identity prefix", "interfaces ge-0/0/0 type eth", "interfaces ge-0/0/0 type demo:ethernet", None),
+        ("enum", "interfaces ge-0/0/0 speed 10m", "interfaces ge-0/0/0 speed 10m", None),
+        ("enum prefix", "interfaces ge-0/0/0 speed au", "interfaces ge-0/0/0 speed auto", None),
+        ("ambiguous enum prefix", "interfaces ge-0/0/0 speed 1", "", "'1' is ambiguous: 100m, 10m, 1g."),
+        ("qualified identity", "interfaces ge-0/0/0 type d:ethernet", "interfaces ge-0/0/0 type demo:ethernet", None),
+        ("unknown identity", "interfaces ge-0/0/0 type foo", "", "'foo' is not a valid value, expected identityref with bases: ['d:if-type']"),
+        ("empty leaf", "system services ssh", "system services ssh", None),
+        ("leaf-list", "system name-server 10.0.0.3", "system name-server 10.0.0.3", None),
+        ("leaf-list brackets", "system name-server [ a b ]", "system name-server [ a b ]", None),
+        ("open brackets", "system name-server [ a b", "", "missing argument."),
+        ("missing value", "system host-name", "", "missing argument."),
+        ("container needs more", "system", "", "missing argument."),
+        ("presence container", "system services", "system services", None),
+        ("list entry", "interfaces lo1", "interfaces lo1", None),
+        ("nokeyword oneliner", "system syslog file messages any notice", "system syslog file messages any notice", None),
+    ]
+    for name, line, path, err in cases:
+        r = _resolve(ctx, line, True)
+        testing.assertEqual(r.error, err, "error {name}")
+        if err is None:
+            testing.assertEqual(" ".join(cpath.path_tokens(ctx.start, r.steps)), path, "path {name}")
+
+
+def _texts(r: command.Reply) -> list[str]:
+    return [c.text for c in r.items]
+
+
+def _test_complete():
+    ctx = _ctx()
+    cases = [
+        ("empty", "", ["exit", "quit", "show"]),
+        ("prefix", "sh", ["show"]),
+        ("show", "show ", ["configuration"]),
+        ("root", "show configuration ", ["<[Enter]>", "system", "interfaces", "routing", "snmp", "|"]),
+        ("partial", "show configuration int", ["interfaces"]),
+        ("nokeyword keys", "show configuration interfaces ", ["<[Enter]>", "traceoptions", "<name>", "ge-0/0/0", "lo0", "\"trace\"", "|"]),
+        ("quoted key by prefix", "show configuration interfaces tra", ["traceoptions", "<name>", "\"trace\""]),
+        ("clash", "show configuration snmp ", ["<[Enter]>", "d:location", "x:location", "|"]),
+        ("clash by name", "show configuration snmp loc", ["d:location", "x:location"]),
+        ("qualified clash by prefix", "show configuration snmp x:", ["x:location"]),
+        ("nokeyword enum keys", "show configuration system syslog file messages ", ["<[Enter]>", "any", "authorization", "daemon", "|"]),
+        ("nokeyword partial", "show configuration interfaces ge", ["<name>", "ge-0/0/0"]),
+        ("entry", "show configuration interfaces ge-0/0/0 ", ["<[Enter]>", "description", "mtu", "type", "enabled", "speed", "unit", "|"]),
+        ("homogeneous", "show configuration interfaces ge-0/0/0 unit 0 family ", ["<[Enter]>", "inet", "inet6", "|"]),
+        ("keys", "show configuration routing route ", ["<[Enter]>", "<prefix>", "10.0.0.0/8", "|"]),
+        ("second key", "show configuration routing route 10.0.0.0/8 ", ["<next-hop>", "192.0.2.1"]),
+        ("all keys", "show configuration routing route 10.0.0.0/8 192.0.2.1 ", ["<[Enter]>", "metric", "|"]),
+        ("leaf", "show configuration interfaces ge-0/0/0 mtu ", ["<[Enter]>", "|"]),
+        ("pipe", "show configuration | ", ["display"]),
+        ("pipe without space", "show configuration |", ["display"]),
+        ("display", "show configuration | display ", ["json", "set", "xml"]),
+        ("display done", "show configuration | display set ", ["<[Enter]>"]),
+        ("exit", "exit ", ["<[Enter]>"]),
+    ]
+    for name, line, texts in cases:
+        r = command.complete(ctx, line)
+        testing.assertEqual(r.error, None, "no error {name}")
+        testing.assertEqual(_texts(r), texts, "completions {name}")
+    r = command.complete(ctx, "show configuration foo ")
+    testing.assertEqual(r.error, "syntax error.", "error before the cursor")
+    testing.assertEqual(r.column, 19, "error column")
+    r = command.complete(ctx, "show configuration system s")
+    testing.assertEqual(r.partial, "s", "partial word")
+    testing.assertEqual(_texts(r), ["services", "syslog"], "partial completions")
+
+
+def _test_parse():
+    ctx = _ctx()
+    # (name, line, command, display, error, column)
+    cases = [
+        ("empty", "", "", "", None, 0),
+        ("exit", "exit", "exit", "", None, 0),
+        ("quit prefix", "q", "exit", "", None, 0),
+        ("show configuration", "sh conf", "show configuration", "", None, 0),
+        ("display", "show configuration system | display set", "show configuration", "set", None, 0),
+        ("display prefix", "show configuration | d x", "show configuration", "xml", None, 0),
+        ("unknown command", "foo", "", "", "syntax error.", 0),
+        ("unknown show", "show foo", "", "", "syntax error.", 5),
+        ("show alone", "show", "", "", "missing argument.", 4),
+        ("bad path", "show configuration system foo", "", "", "syntax error.", 26),
+        ("pipe alone", "show configuration |", "", "", "missing argument.", 20),
+        ("display alone", "show configuration | display", "", "", "missing argument.", 28),
+        ("bad display", "show configuration | display foo", "", "", "syntax error.", 29),
+        ("exit extra", "exit now", "", "", "syntax error.", 5),
+        ("open quote", "show configuration \"x", "", "", "missing closing quote.", 19),
+    ]
+    for name, line, cmd, display, err, col in cases:
+        r = command.parse(ctx, line)
+        testing.assertEqual(r.error, err, "error {name}")
+        if err is None:
+            c = r.cmd
+            if c is not None:
+                testing.assertEqual(c.name, cmd, "command {name}")
+                testing.assertEqual(c.display, display, "display {name}")
+            else:
+                testing.error("no command for {name}")
+        else:
+            testing.assertEqual(r.column, col, "column {name}")
+
+
+CURLY = r"""system {
+    host-name r1;
+    name-server [ 10.0.0.1 10.0.0.2 ];
+    services;
+    syslog {
+        file messages {
+            any notice;
+        }
+    }
+}
+interfaces {
+    ge-0/0/0 {
+        description "uplink to core";
+        mtu 9000;
+        type demo:ethernet;
+        enabled true;
+        unit 0 {
+            vlan-id 10;
+            family inet {
+                address 10.0.0.1/24;
+            }
+            family inet6;
+        }
+    }
+    lo0;
+    "trace" {
+        mtu 1500;
+    }
+}
+routing {
+    route 10.0.0.0/8 192.0.2.1 {
+        metric 5;
+    }
+}
+snmp {
+    d:location dc1;
+    x:location rack4;
+}"""
+
+SET = r"""set system host-name r1
+set system name-server 10.0.0.1
+set system name-server 10.0.0.2
+set system services
+set system syslog file messages any notice
+set interfaces ge-0/0/0 description "uplink to core"
+set interfaces ge-0/0/0 mtu 9000
+set interfaces ge-0/0/0 type demo:ethernet
+set interfaces ge-0/0/0 enabled true
+set interfaces ge-0/0/0 unit 0 vlan-id 10
+set interfaces ge-0/0/0 unit 0 family inet address 10.0.0.1/24
+set interfaces ge-0/0/0 unit 0 family inet6
+set interfaces lo0
+set interfaces "trace" mtu 1500
+set routing route 10.0.0.0/8 192.0.2.1 metric 5
+set snmp d:location dc1
+set snmp x:location rack4"""
+
+
+def _show(ctx: command.Context, line: str) -> str:
+    r = command.parse(ctx, line)
+    c = r.cmd
+    if c is not None:
+        return command.output(ctx, c)
+    testing.error("cannot parse {line}: {r.error}")
+    return ""
+
+
+def _test_curly():
+    ctx = _ctx()
+    cases = [
+        ("root", "show configuration", CURLY),
+        ("entry", "show configuration interfaces ge-0/0/0 unit 0", "vlan-id 10;\nfamily inet {{\n    address 10.0.0.1/24;\n}}\nfamily inet6;"),
+        ("at a homogeneous container", "show configuration interfaces ge-0/0/0 unit 0 family", "inet {{\n    address 10.0.0.1/24;\n}}\ninet6;"),
+        ("whole list", "show configuration routing route", "route 10.0.0.0/8 192.0.2.1 {{\n    metric 5;\n}}"),
+        ("leaf", "show configuration system host-name", "host-name r1;"),
+        ("leaf-list", "show configuration system name-server", "name-server [ 10.0.0.1 10.0.0.2 ];"),
+        ("missing", "show configuration interfaces xe-1/0/0", ""),
+        ("key-only entry", "show configuration interfaces lo0", ""),
+    ]
+    for name, line, expected in cases:
+        testing.assertEqual(_show(ctx, line), expected, "curly {name}")
+
+
+def _test_display_set():
+    ctx = _ctx()
+    cases = [
+        ("root", "show configuration | display set", SET),
+        ("container", "show configuration system syslog | display set", "set system syslog file messages any notice"),
+        ("whole list", "show configuration routing route | display set", "set routing route 10.0.0.0/8 192.0.2.1 metric 5"),
+        ("leaf", "show configuration system host-name | display set", "set system host-name r1"),
+        ("presence", "show configuration system services | display set", "set system services"),
+        ("key-only entry", "show configuration interfaces lo0 | display set", "set interfaces lo0"),
+    ]
+    for name, line, expected in cases:
+        testing.assertEqual(_show(ctx, line), expected, "display set {name}")
+
+
+def _test_display_set_round_trip():
+    ctx = _ctx()
+    for line in SET.split("\n"):
+        words = line[4:]
+        r = _resolve(ctx, words, True)
+        testing.assertEqual(r.error, None, "parse {line}")
+        testing.assertEqual(" ".join(cpath.path_tokens(ctx.start, r.steps)), words, "round trip {line}")
+
+
+def _test_display_xml_json():
+    ctx = _ctx()
+    x = _show(ctx, "show configuration interfaces ge-0/0/0 unit | display xml")
+    testing.assertIn("<interfaces xmlns=\"urn:demo\">", x, "xml keeps ancestors")
+    testing.assertIn("<name>ge-0/0/0</name>", x, "xml keeps the entry key")
+    testing.assertIn("<vlan-id>10</vlan-id>", x, "xml has the subtree")
+    testing.assertNotIn("lo0", x, "xml has only the path")
+    testing.assertNotIn("description", x, "xml has only the subtree")
+    j = _show(ctx, "show configuration system host-name | display json")
+    testing.assertIn("\"demo:system\"", j, "json is module qualified")
+    testing.assertIn("\"host-name\": \"r1\"", j, "json has the leaf")
+    testing.assertNotIn("name-server", j, "json has only the path")
+
+
+def _test_value_help():
+    ctx = _ctx()
+    toks = cpath.tokenize("interfaces ge-0/0/0 mtu ").items
+    r = cpath.complete(ctx.root, ctx.start, ctx.start_data, toks, True)
+    testing.assertEqual([c.text for c in r.items], ["<mtu>"], "value placeholder")
+    testing.assertEqual(r.items[0].help, "uint16 with range 256..9192", "range in the help")
+    toks = cpath.tokenize("interfaces ge-0/0/0 speed ").items
+    r = cpath.complete(ctx.root, ctx.start, ctx.start_data, toks, True)
+    testing.assertEqual([c.text for c in r.items], ["auto", "10m", "100m", "1g"], "enum values")
+    toks = cpath.tokenize("system weight ").items
+    r = cpath.complete(ctx.root, ctx.start, ctx.start_data, toks, True)
+    testing.assertEqual(r.items[0].help, "uint8 with range 1..10", "Junos wildcard member hidden")
+
+
+def _test_help_text():
+    ctx = _ctx()
+    r = command.complete(ctx, "show configuration interfaces ")
+    expected = r"""Possible completions:
+  <[Enter]>            Execute this command
+> <name>               Physical interface
+> "trace"              Physical interface
+> ge-0/0/0             Physical interface
+> lo0                  Physical interface
+  traceoptions
+  |                    Pipe through a command"""
+    testing.assertEqual(command.help_text(r.items), expected, "help layout")
