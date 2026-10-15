@@ -364,14 +364,7 @@ function parseDevice(entry: DeviceJson): Device {
   };
 }
 
-function parseCounters(state: CampaignStateJson | undefined): CampaignCounters | null {
-  if (!state || typeof state.total !== 'number') {
-    return null;
-  }
-  const total = state.total;
-  const inProgress = state['in-progress'] ?? 0;
-  const succeeded = state.succeeded ?? 0;
-  const failed = state.failed ?? 0;
+export function countersOf(total: number, inProgress: number, succeeded: number, failed: number): CampaignCounters {
   return {
     total,
     inProgress,
@@ -379,6 +372,13 @@ function parseCounters(state: CampaignStateJson | undefined): CampaignCounters |
     failed,
     remainder: Math.max(0, total - inProgress - succeeded - failed)
   };
+}
+
+function parseCounters(state: CampaignStateJson | undefined): CampaignCounters | null {
+  if (!state || typeof state.total !== 'number') {
+    return null;
+  }
+  return countersOf(state.total, state['in-progress'] ?? 0, state.succeeded ?? 0, state.failed ?? 0);
 }
 
 /** An absent check has not run. */
@@ -425,10 +425,13 @@ function parsePlan(state: CampaignStateJson | undefined, members: string[]): Cam
   };
 }
 
-function parseCampaign(entry: CampaignJson): Campaign {
-  const members = (entry.device ?? []).map((m) => m.name);
+/** The published half of a campaign: counters, plan and one row per
+ * member. */
+type CampaignState = Pick<Campaign, 'counters' | 'plan' | 'deviceStatus'>;
+
+function parseState(state: CampaignStateJson | undefined, members: string[]): CampaignState {
   const reported = new Map<string, DeviceStatusJson>();
-  for (const row of entry.state?.['device-status'] ?? []) {
+  for (const row of state?.['device-status'] ?? []) {
     reported.set(row.device, row);
   }
   // Configured members joined with reported rows; a member the state does
@@ -436,17 +439,8 @@ function parseCampaign(entry: CampaignJson): Campaign {
   const memberSet = new Set(members);
   const names = [...members, ...[...reported.keys()].filter((device) => !memberSet.has(device))];
   return {
-    name: entry.name,
-    targetRelease: entry['target-release'] ?? '',
-    devices: members,
-    imageUrl: entry['image-url'] ?? '',
-    adminState: entry['admin-state'] === 'run' ? 'run' : 'plan',
-    defaultSchedule: entry['default-schedule'] ?? '',
-    deadline: typeof entry.deadline === 'number' ? entry.deadline : null,
-    targetRate: entry['target-rate'] ?? DEFAULT_TARGET_RATE,
-    maxRate: entry['max-rate'] ?? DEFAULT_MAX_RATE,
-    counters: parseCounters(entry.state),
-    plan: parsePlan(entry.state, members),
+    counters: parseCounters(state),
+    plan: parsePlan(state, members),
     deviceStatus: names.map((device) => {
       const row = reported.get(device);
       const raw = row?.status ?? 'unknown';
@@ -462,6 +456,29 @@ function parseCampaign(entry: CampaignJson): Campaign {
       };
     })
   };
+}
+
+function parseCampaign(entry: CampaignJson): Campaign {
+  const members = (entry.device ?? []).map((m) => m.name);
+  return {
+    name: entry.name,
+    targetRelease: entry['target-release'] ?? '',
+    devices: members,
+    imageUrl: entry['image-url'] ?? '',
+    adminState: entry['admin-state'] === 'run' ? 'run' : 'plan',
+    defaultSchedule: entry['default-schedule'] ?? '',
+    deadline: typeof entry.deadline === 'number' ? entry.deadline : null,
+    targetRate: entry['target-rate'] ?? DEFAULT_TARGET_RATE,
+    maxRate: entry['max-rate'] ?? DEFAULT_MAX_RATE,
+    ...parseState(entry.state, members)
+  };
+}
+
+/** Parse a GET of one campaign's state node onto the campaign it belongs
+ * to; null when the campaign has published nothing yet (404). */
+export function parseCampaignState(json: unknown, campaign: Campaign): Campaign | null {
+  const state = (json as { 'software:state'?: CampaignStateJson })?.['software:state'];
+  return state ? { ...campaign, ...parseState(state, campaign.devices) } : null;
 }
 
 /** Parse a GET of data/fleetmgr:fleet (never poll data/ itself: it also

@@ -5,7 +5,7 @@
   import AdminStatePill from '$lib/software/AdminStatePill.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
   import { createPoller } from '$lib/core/polling/poller';
-  import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
+  import { fetchCounters } from '$lib/software/counters';
   import { planAlarmLines, type Campaign, type CampaignCounters } from '$lib/software/model';
   import type { PageProps } from './$types';
 
@@ -40,7 +40,7 @@
   onMount(() => {
     const fast = createPoller(async () => {
       const running = data.campaigns
-        .filter((c) => c.adminState === 'run' && c.devices.length <= FAST_ENTRY_LIMIT)
+        .filter((c) => c.adminState === 'run')
         .map((c) => c.name)
         .slice(0, 6);
       for (const name of running) {

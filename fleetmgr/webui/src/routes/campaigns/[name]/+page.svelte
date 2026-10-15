@@ -11,7 +11,7 @@
   import PlanTimeline from '$lib/software/PlanTimeline.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
   import { createPoller } from '$lib/core/polling/poller';
-  import { FAST_ENTRY_LIMIT, fetchCampaign } from '$lib/software/counters';
+  import { FAST_ENTRY_LIMIT, fetchCampaignState, fetchCounters } from '$lib/software/counters';
   import {
     planningChanges,
     planningDraft,
@@ -33,6 +33,7 @@
     maskUrlCredentials,
     unplacedText,
     type Campaign,
+    type CampaignCounters,
     type Schedule,
     type KnownStatus
   } from '$lib/software/model';
@@ -55,11 +56,13 @@
   let filterStatus = $state<KnownStatus | ''>('');
   let searchText = $state('');
   let page = $state(1);
-  // Two tiers: a fresh entry every 1.5 s for campaigns up to
-  // FAST_ENTRY_LIMIT members, so cells and counters move with the
-  // controller; the loader snapshot refreshes on open, every 12 s, and
-  // immediately when failed moves.
+  // Two tiers. The counters (four leaf GETs) refresh every 1.5 s at any
+  // campaign size. The state node (plan and per-device rows, ~150 B per
+  // member) refreshes every 1.5 s up to FAST_ENTRY_LIMIT members and
+  // every 12 s beyond, plus when failed moves. The loader snapshot carries
+  // the config and reloads on open and after this page's own writes.
   let live = $state<Campaign | null>(null);
+  let liveCounters = $state<{ name: string; counters: CampaignCounters } | null>(null);
   let lastFailed = -1;
 
   /** Unix seconds, ticking, for the timeline's marker. */
@@ -69,38 +72,48 @@
   let rate = $state<number | null>(null);
   let eta = $state<number | null>(null);
 
+  async function refreshState(): Promise<void> {
+    const base = data.campaign;
+    if (base === null) return;
+    const fresh = await fetchCampaignState(base);
+    if (fresh !== null) live = fresh;
+  }
+
   onMount(() => {
     const fast = createPoller(async () => {
-      if ((data.campaign?.devices.length ?? 0) > FAST_ENTRY_LIMIT) {
-        // Too big to fetch whole every tick, but an entry without state yet
-        // is small: refresh it until the first report, so a new campaign's
-        // progress and plan do not wait for the slow tick.
-        if (data.campaign !== null && data.campaign.counters === null) {
-          void invalidate('data:campaign');
-        }
-        return;
-      }
+      const base = data.campaign;
+      if (base === null) return;
       try {
-        const fresh = await fetchCampaign(data.name);
-        live = fresh;
-        const c = fresh?.counters ?? null;
-        if (c !== null) {
-          if (fresh?.adminState === 'run') {
-            tracker.push(c.succeeded + c.failed);
-            rate = tracker.ratePerMin();
-            const remaining = c.total - c.succeeded - c.failed;
-            eta = remaining > 0 ? tracker.etaMs(remaining) : null;
-          }
-          if (lastFailed !== -1 && c.failed !== lastFailed) {
-            void invalidate('data:campaign');
-          }
-          lastFailed = c.failed;
+        let c: CampaignCounters | null;
+        if (base.devices.length <= FAST_ENTRY_LIMIT) {
+          await refreshState();
+          c = live?.counters ?? null;
+        } else {
+          c = await fetchCounters(base.name);
+          liveCounters = c === null ? null : { name: base.name, counters: c };
         }
+        if (c === null) {
+          // No state yet: an entry without state is small, so refresh the
+          // snapshot until the first report, so a new campaign's progress
+          // and plan do not wait for the slow tick.
+          if (base.counters === null) void invalidate('data:campaign');
+          return;
+        }
+        if (campaign?.adminState === 'run') {
+          tracker.push(c.succeeded + c.failed);
+          rate = tracker.ratePerMin();
+          const remaining = c.total - c.succeeded - c.failed;
+          eta = remaining > 0 ? tracker.etaMs(remaining) : null;
+        }
+        if (lastFailed !== -1 && c.failed !== lastFailed && base.devices.length > FAST_ENTRY_LIMIT) {
+          void refreshState();
+        }
+        lastFailed = c.failed;
       } catch {
-        // keep the last entry; the slow tick recovers
+        // keep the last state; the slow tick recovers
       }
     }, 1500);
-    const slow = createPoller(() => invalidate('data:campaign'), 12000);
+    const slow = createPoller(refreshState, 12000);
     const clock = setInterval(() => (now = Date.now() / 1000), 1000);
     fast.start();
     slow.start();
@@ -113,7 +126,9 @@
 
   /** The fresh entry when there is one for this campaign, else the snapshot. */
   let campaign = $derived(live !== null && live.name === data.name ? live : data.campaign);
-  let counters = $derived(campaign?.counters ?? null);
+  let counters = $derived(
+    liveCounters !== null && liveCounters.name === data.name ? liveCounters.counters : (campaign?.counters ?? null)
+  );
   let paceOpen = $derived(paceOpenChoice ?? campaign?.adminState === 'plan');
   let statuses = $derived(
     new Map<string, KnownStatus>((campaign?.deviceStatus ?? []).map((r) => [r.device, r.status]))
@@ -150,6 +165,7 @@
       planningMessage = null;
       await saveCampaignPlanning(data.name, savedPlanning, planningFromDraft(planningForm));
       live = null;
+      liveCounters = null;
       await invalidate('data:campaign');
       planningEdit = null;
       planningMessage = { type: 'success', text: 'Saved.' };
@@ -265,6 +281,7 @@
       // The fresh entry predates the change; the snapshot leads until the
       // next fast tick.
       live = null;
+      liveCounters = null;
       await invalidate('data:campaign');
     } catch (error) {
       actionError = errorText(error, 'The action failed.');

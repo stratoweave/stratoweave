@@ -68,14 +68,15 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   cached in the browser for 30 s and shared by the devices, schedules and
   new-campaign pages. A write through the RESTCONF client drops the cache
   and Refresh bypasses it; changes made elsewhere show when it expires.
-- Polling is two-tier. The campaign page GETs its campaign's entry
-  (~120 B per member) every 1.5 s when it has up to 600 members, and
-  reloads its snapshot on open, every 12 s and when `failed` moves. The
-  list page GETs the entries of the first six running campaigns of up to
-  600 members every 2 s, and reloads the list every 30 s. Nothing ever
-  polls `GET /restconf/data` — it also hauls the full yang-library.
-  Paths into a campaign's oper state (`.../state/total`) currently fail
-  upstream, which is why fresh counters cost a whole entry.
+- Polling is two-tier. The campaign page GETs its campaign's four
+  counter leaves (`.../state/total` and friends) every 1.5 s at any size,
+  and its `state` node (plan and per-device rows, ~150 B per member) every
+  1.5 s when it has up to 600 members, else every 12 s and when `failed`
+  moves. The config half comes from the loader snapshot, reloaded on open
+  and after the page's own writes. The list page GETs the counter leaves
+  of the first six running campaigns every 2 s, and reloads the list every
+  30 s. Nothing ever polls `GET /restconf/data` — it also hauls the full
+  yang-library.
 - Schedules are the shared `maintenance:schedules` entries: a name, a
   `utc-offset` in minutes and a `window` list keyed by `at`, the local
   time of day a rule opens, with a `duration` and an optional `day`
