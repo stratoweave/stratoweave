@@ -1,10 +1,10 @@
 // Layout for the plan timeline: the plan's windows on a wall-clock axis,
-// and inside each window one cell per device in a column at its estimated
-// start. Pure functions over the parsed plan; the component draws what
-// comes out.
+// and inside each window one cell per device in a column at its start,
+// real once released, estimated before. Pure functions over the parsed
+// plan; the component draws what comes out.
 
 import { CELL_COLOR, gutter } from './cells';
-import type { KnownStatus, PlanWindow } from './model';
+import { deviceDuration, deviceStart, type KnownStatus, type PlanWindow } from './model';
 
 const HOUR = 3600;
 
@@ -20,11 +20,11 @@ const MAX_SIZE = 14;
 const MIN_SIZE = 3;
 
 /** Where a window's band ends on the axis: its end, or for an open window
- * the last estimated finish plus a small margin. */
+ * the last finish plus a small margin. */
 export function windowEnd(w: PlanWindow): number {
   if (w.end !== null) return w.end;
   let last = w.start;
-  for (const d of w.devices) last = Math.max(last, d.estimatedStart + d.estimatedDuration);
+  for (const d of w.devices) last = Math.max(last, deviceStart(d) + deviceDuration(d));
   return Math.max(w.start + 60, last + Math.max(60, Math.round((last - w.start) * 0.05)));
 }
 
@@ -167,7 +167,7 @@ export function assignLanes(windows: PlanWindow[], axis: Axis, minGap: number): 
 }
 
 export interface Column {
-  /** Pixel x of the column; its cells share one estimated start. */
+  /** Pixel x of the column; its cells share one start. */
   x: number;
   start: number;
   count: number;
@@ -184,20 +184,20 @@ export interface WindowCells {
   cols: Column[];
   /** Rows in the tallest column. */
   rows: number;
-  /** Devices drawn later than their estimate because the column at their
+  /** Devices drawn later than their start because the column at their
    * start was full and they spilled into the next. */
   displaced: number;
 }
 
-/** Cells for one window: a column opens at a device's estimated start
- * and takes every later start that falls within one pitch of it, so
+/** Cells for one window: a column opens at a device's start and takes
+ * every later start that falls within one pitch of it, so
  * starts a cell's width apart share a column instead of overlapping. A
  * full column spills into the next, so a crowded window degrades into a
  * packed fill instead of growing without bound. */
 function layoutCells(p: Placed, axis: Axis, size: number, pitch: number, rowsCap: number): WindowCells {
   const maxX = p.xEnd - WINDOW_GAP - size;
   const devices = [...p.w.devices].sort(
-    (a, b) => a.estimatedStart - b.estimatedStart || a.name.localeCompare(b.name)
+    (a, b) => deviceStart(a) - deviceStart(b) || a.name.localeCompare(b.name)
   );
   const cells: Cell[] = [];
   const cols: Column[] = [];
@@ -205,12 +205,13 @@ function layoutCells(p: Placed, axis: Axis, size: number, pitch: number, rowsCap
   let displaced = 0;
   let col: Column | null = null;
   for (const d of devices) {
-    const wanted = Math.max(p.x, Math.min(maxX, Math.round(axis.xOf(d.estimatedStart))));
+    const start = deviceStart(d);
+    const wanted = Math.max(p.x, Math.min(maxX, Math.round(axis.xOf(start))));
     if (col === null || wanted >= col.x + pitch || col.count >= rowsCap) {
       const prevX: number | null = col === null ? null : col.x;
       const x: number = prevX === null ? wanted : Math.max(wanted, prevX + pitch);
       if (x !== wanted) displaced++;
-      col = { x, start: d.estimatedStart, count: 0 };
+      col = { x, start, count: 0 };
       cols.push(col);
     }
     cells.push({ name: d.name, col: cols.length - 1, row: col.count });

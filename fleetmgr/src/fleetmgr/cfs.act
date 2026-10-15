@@ -297,7 +297,10 @@ def occurrences(sched: y_0.maintenance__schedules__schedule_entry, now: int) -> 
 
 
 def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
-                  inventory: y_0.root, now: int) -> (list[(str, int, int, list[(str, int, int)])], list[str]):
+                  inventory: y_0.root, now: int,
+                  released_in: dict[str, (str, int, int)] = {},
+                  released_at: dict[str, int] = {},
+                  done_at: dict[str, int] = {}) -> (list[(str, int, int, list[(str, int, int)])], list[str]):
     """Plan the campaign into its windows at the rate the deadline demands.
 
     A campaign without windows gets one synthetic window that opens at
@@ -308,29 +311,41 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
     rather than overruns. Rates are devices per hour; the core's
     concurrency is rate times estimated duration.
 
-    Returns the materialized layout: one (name, start-offset, end-offset,
-    devices) entry per window, each device with its estimated start
-    offset, all in seconds from campaign launch, plus the placement
-    alarms. Devices that do not fit are absent from the layout and
-    present in the alarms.
+    Devices the controller has released stay in the window they were
+    released in (released_in: schedule, start, end), at their real
+    start, also when that window has closed or its schedule changed
+    since. Only the others are placed and simulated: devices in flight
+    hold their slots until they are expected to finish, done ones take
+    no part.
+
+    Returns the materialized layout: one (name, start, end, devices)
+    entry per window, each device with its start, real or estimated,
+    and its estimated duration, times as seconds since the Unix epoch,
+    plus the placement alarms. Devices that do not fit are absent from
+    the layout and present in the alarms.
 
     The transform actuates from the layout; the companion actor publishes
     the same layout as the plan, so both views come from one computation.
     """
     devices = []
     est_of: dict[str, int] = {}
+    held: list[str] = []
     for member in i.device:
         dev = inventory.fleet.device.get(member.name)
         est = device_estimate(dev)
         est_of[member.name] = est
+        if member.name in released_in:
+            held.append(member.name)
+            continue
         binding: ?str = None
         if dev is not None:
             binding = dev.schedule
         devices.append(fs.DeviceIn(member.name, "cpe", binding, [], [], est, True))
     estimate = estimated_duration(i, inventory)
-    n = len(devices)
-    if n == 0:
+    if len(est_of) == 0:
         return ([], [])
+    n = len(devices)
+    debounce = int(campaign_debounce_s(len(est_of)))
     sel = [d.name for d in devices]
     alarms: list[str] = []
 
@@ -390,7 +405,7 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
         # than assumed away: the smallest concurrency whose waves finish
         # the fleet within the windows, converted back to a rate.
         spans = [(we.2 - imax(we.1, now)) * 95 // 100 for we in wins]
-        needed_c = fs.needed_concurrency(spans, n, estimate, int(campaign_debounce_s(n)))
+        needed_c = fs.needed_concurrency(spans, n, estimate, debounce)
         needed = fs.ceil_div(needed_c * 3600, estimate)
     rate = needed
     if target > rate:
@@ -408,7 +423,9 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
 
     conc = imax(1, fs.ceil_div(rate * estimate, 3600))
 
-    ordered = sorted([(we.1, we.0, we.2) for we in wins])
+    # A window already open gets only the time it has left, so the core
+    # does not fill it as if it were whole.
+    ordered = sorted([(imax(we.1, now), we.0, we.2) for we in wins])
     fwins = []
     for oe in ordered:
         fwins.append(fs.Window(oe.1, oe.0, oe.2, conc))
@@ -427,25 +444,51 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
     mr = int(i.max_rate)
     pred_max = imax(pred_target, fs.ceil_div(mr * estimate, 3600)) if mr > 0 else 1000000
 
-    layout: list[(str, int, int, list[(str, int, int)])] = []
+    # Released devices by the window they were released in. Windows the
+    # schedules no longer produce, closed since or changed, come first.
+    current: set[str] = set()
     for we in wins:
+        current.add("{we.0}@{we.1}")
+    held_in: dict[str, list[(int, str)]] = {}
+    gone: list[(int, str, int)] = []
+    for name in held:
+        hw = released_in[name]
+        k = "{hw.0}@{hw.1}"
+        if k not in held_in:
+            held_in[k] = []
+            if k not in current:
+                gone.append((hw.1, hw.0, hw.2))
+        held_in[k].append((released_at.get_def(name, now), name))
+    all_wins = [(g.1, g.0, g.2) for g in sorted(gone)] + wins
+
+    layout: list[(str, int, int, list[(str, int, int)])] = []
+    overflow = 0
+    for we in all_wins:
+        devs: list[(str, int, int)] = []
+        running: list[(int, int)] = []
+        for h in sorted(held_in.get_def("{we.0}@{we.1}", [])):
+            est = est_of.get_def(h.1, estimate)
+            devs.append((h.1, h.0, est))
+            if h.1 not in done_at:
+                running.append((h.0 + est, est))
         placed: list[str] = []
         for a in r.assigns:
             if a.status != "unplannable":
-                if a.schedule == we.0 and a.start == we.1:
+                if a.schedule == we.0 and a.start == imax(we.1, now):
                     placed.append(a.device)
         if len(placed) > 0:
             pcamp = fs.Campaign(i.name, [we.0], pred_target, pred_max, 1, 2, 0,
                                 "spread", admin_state="run")
             durations = [est_of.get_def(d, estimate) for d in placed]
             # A window already open predicts from now, not from its past
-            # opening.
+            # opening. The controller has ramped at least as far as it
+            # has devices in flight.
             pred = fsim.simulate_window(len(placed), estimate, estimate,
                                         fs.Window(we.0, imax(we.1, now), we.2, 1000000),
-                                        pcamp, 1, int(campaign_debounce_s(n)),
+                                        pcamp, imax(1, len(running)), debounce,
                                         durations=durations,
-                                        target_rate=tr, max_rate=mr)
-            devs: list[(str, int, int)] = []
+                                        target_rate=tr, max_rate=mr,
+                                        running=running)
             idx = 0
             for d in placed:
                 if idx < len(pred.launch_offsets):
@@ -454,17 +497,14 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
                     # The core placed it, but the ramp cannot reach it
                     # before the window closes: show it at the close.
                     devs.append((d, we.2, est_of.get_def(d, estimate)))
+                    if we.2 != OPEN_END:
+                        overflow += 1
                 idx += 1
+        if len(devs) > 0:
             layout.append((we.0, we.1, we.2, devs))
 
     # Devices the core placed but the ramp cannot reach before their
     # window closes are shown at the close; say so out loud too.
-    overflow = 0
-    for win in layout:
-        if win.2 != OPEN_END:
-            for entry in win.3:
-                if entry.1 >= win.2:
-                    overflow += 1
     if overflow > 0:
         alarms.append("{overflow} device(s) will not complete before their "
                       + "window closes at the planned rate")
@@ -565,6 +605,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var controller_alarms: list[str] = []
     var released: set[str] = set()
     var released_at: dict[str, int] = {}
+    # The window each device was released in, as (schedule, start, end).
+    var released_in: dict[str, (str, int, int)] = {}
     var done_at: dict[str, int] = {}
     var observed_s: int = 1
     var rung: int = 1
@@ -620,7 +662,14 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 win.end = u64(pw.2)
             for entry in pw.3:
                 pd = win.device.create(entry.0)
-                pd.estimated_start = u64(entry.1)
+                started = released_at.get(entry.0)
+                if started is not None:
+                    pd.started = u64(started)
+                    finished = done_at.get(entry.0)
+                    if finished is not None:
+                        pd.finished = u64(finished)
+                else:
+                    pd.estimated_start = u64(entry.1)
                 pd.estimated_duration = u64(entry.2)
         for alarm in plan_alarms:
             st.plan.alarm.append(alarm)
@@ -769,6 +818,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 if idx < n_new:
                     released.add(name)
                     released_at[name] = t
+                    released_in[name] = (win.0, wstart, wend)
                     grew = True
                 idx += 1
         if grew:
@@ -813,7 +863,22 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         debounce_s = campaign_debounce_s(len(members))
 
         inventory = y_0.root.from_gdata(linked)
-        layout, alarms = plan_campaign(conf, inventory, time.time().unix_s())
+        run_now = conf.admin_state == "run"
+        if run_now and not running:
+            released = set()
+            released_at = {}
+            released_in = {}
+            done_at = {}
+            observed_s = estimated_duration(conf, inventory)
+            rung = 1
+            rung_target = 1
+            alarmed = False
+            controller_alarms = []
+        running = run_now
+
+        # Released devices keep their window and real times in the replan.
+        layout, alarms = plan_campaign(conf, inventory, time.time().unix_s(),
+                                       released_in, released_at, done_at)
         plan_layout = layout
         plan_alarms = alarms
 
@@ -823,17 +888,6 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         max_rate = int(conf.max_rate)
 
         paced = len(plan_layout) > 0
-        run_now = conf.admin_state == "run"
-        if run_now and not running:
-            released = set()
-            released_at = {}
-            done_at = {}
-            observed_s = estimated_duration(conf, y_0.root.from_gdata(linked))
-            rung = 1
-            rung_target = 1
-            alarmed = False
-            controller_alarms = []
-        running = run_now
         # New intent invalidates every armed timer. The first decision after
         # subscription sync arms the exact timers the fresh layout needs.
         generation += 1
