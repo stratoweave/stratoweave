@@ -64,6 +64,10 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   Members in no plan window are not actuated; the UI shows them as one
   count that expands to the device list. The plan timeline draws these
   times on the wall clock with a marker for now.
+- The whole-fleet read (`data/fleetmgr:fleet`, 14 MB at 30k devices) is
+  cached in the browser for 30 s and shared by the devices, schedules and
+  new-campaign pages. A write through the RESTCONF client drops the cache
+  and Refresh bypasses it; changes made elsewhere show when it expires.
 - Polling is two-tier. The campaign page GETs its campaign's entry
   (~120 B per member) every 1.5 s when it has up to 600 members, and
   reloads its snapshot on open, every 12 s and when `failed` moves. The

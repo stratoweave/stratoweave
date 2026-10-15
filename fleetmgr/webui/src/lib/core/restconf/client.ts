@@ -69,12 +69,22 @@ async function restconfRequest<T>(
   const url = normalized.length > 0
     ? `${RESTCONF_BASE}/${normalized}`
     : RESTCONF_BASE;
+  const writing = init.method !== undefined && init.method !== 'GET';
+  if (writing) {
+    dropReadCache();
+  }
   const response = await fetchFn(url, {
     ...init,
     headers
   });
 
-  return readResponse<T>(response, init.readBody ?? true);
+  const result = await readResponse<T>(response, init.readBody ?? true);
+  if (writing) {
+    // Again after the commit: a read that was in flight during the write
+    // may have been cached with the old data.
+    dropReadCache();
+  }
+  return result;
 }
 
 export function restconfGetJson<T>(path: string, fetchFn: Fetch = fetch): Promise<T> {
@@ -94,6 +104,32 @@ export async function restconfGetOrNull<T>(path: string, fetchFn: Fetch = fetch)
     }
     throw error;
   }
+}
+
+// The devices, schedules and new-campaign pages all read the whole fleet,
+// which at 30k devices is 14 MB and 2 s, so one read serves every page
+// opened within READ_CACHE_MS. A write through this client drops the cache
+// and the Refresh button bypasses it; what others change shows up when the
+// entry expires.
+const READ_CACHE_MS = 30_000;
+const readCache = new Map<string, { at: number; value: Promise<unknown> }>();
+
+/** `restconfGetOrNull` served from a short-lived cache shared by every page. */
+export function restconfGetCachedOrNull<T>(path: string, fetchFn: Fetch = fetch): Promise<T | null> {
+  const key = normalizePath(path);
+  const hit = readCache.get(key);
+  if (hit && Date.now() - hit.at < READ_CACHE_MS) {
+    return hit.value as Promise<T | null>;
+  }
+  const value = restconfGetOrNull<T>(path, fetchFn);
+  readCache.set(key, { at: Date.now(), value });
+  value.catch(() => readCache.delete(key));
+  return value;
+}
+
+/** Forget every cached read; the next page load hits the server. */
+export function dropReadCache(): void {
+  readCache.clear();
 }
 
 export function restconfPutJson<T>(path: string, body: unknown): Promise<T> {
