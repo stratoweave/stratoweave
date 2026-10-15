@@ -370,16 +370,6 @@
     </section>
   {/if}
 
-  {#if failedRows.length > 0}
-    <section class="card failed-card">
-      <h2 class="panel-title">Failed or rolled back ({failedRows.length})</h2>
-      <DeviceStatusTable rows={failedRows.slice(0, FAILED_LIMIT)} />
-      {#if failedRows.length > FAILED_LIMIT}
-        <p class="rate">showing {FAILED_LIMIT} of {failedRows.length}</p>
-      {/if}
-    </section>
-  {/if}
-
   {#if campaign.plan !== null && (campaign.plan.windows.length > 0 || campaign.plan.alarms.length > 0 || campaign.plan.unplaced.length > 0)}
     {@const plan = campaign.plan}
     <section class="card">
@@ -431,6 +421,16 @@
         <span class="hint">estimates in your local time</span>
       </div>
       <div class="placeholder-plan">Planning…</div>
+    </section>
+  {/if}
+
+  {#if failedRows.length > 0}
+    <section class="card failed-card">
+      <h2 class="panel-title">Failed or rolled back ({failedRows.length})</h2>
+      <DeviceStatusTable rows={failedRows.slice(0, FAILED_LIMIT)} />
+      {#if failedRows.length > FAILED_LIMIT}
+        <p class="rate">showing {FAILED_LIMIT} of {failedRows.length}</p>
+      {/if}
     </section>
   {/if}
 
