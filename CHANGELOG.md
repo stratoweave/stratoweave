@@ -278,8 +278,11 @@
   `cli-drop-node-name` and `cli-no-keyword` statements in it.
   `show configuration` prints the running configuration in curly braces, or
   in other formats with `| display set`, `| display xml` and
-  `| display json`. With a command as arguments, it runs that command and
-  exits. Without a terminal, it reads commands line by line from stdin.
+  `| display json`. `configure` starts configuration mode on a candidate
+  kept in the CLI, with `set`, `delete`, `edit`, `up`, `top`, `rollback`,
+  `run`, `show` and `show | compare`. With a command as arguments, it runs
+  that command and exits. Without a terminal, it reads commands line by line
+  from stdin.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with

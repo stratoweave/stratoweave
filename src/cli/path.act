@@ -397,7 +397,9 @@ def _match_child(root: yschema.DRoot, node: yschema.DNode, t: Token, values: boo
     return _Match("none", error=value_error)
 
 
-def _missing(pos: Position, values: bool) -> bool:
+def _missing(pos: Position, values: bool, optional: bool) -> bool:
+    if optional:
+        return pos.kind == "keys" and len(pos.keys) > 0
     if pos.kind == "value":
         return True
     if pos.kind == "keys":
@@ -408,13 +410,15 @@ def _missing(pos: Position, values: bool) -> bool:
     return False
 
 
-def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, tokens: list[Token], values: bool=False) -> PathResult:
+def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, tokens: list[Token], values: bool=False, optional: bool=False) -> PathResult:
     """Walk the schema from a start node along CLI tokens.
 
     The walk stops at the first `|` token. With values=True a leaf takes a value
     and a leaf-list takes a value or `[ a b ]`; otherwise a leaf ends the path.
-    The data node follows the walk when given, so completion can offer the keys
-    that exist.
+    With optional=True as well, as for delete, the path can end at any node
+    but between the keys of a list, a leaf takes no value and a leaf-list
+    value is optional. The data node
+    follows the walk when given, so completion can offer the keys that exist.
     """
     steps = []
     pos = Position("inner", start, data)
@@ -445,12 +449,12 @@ def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, token
                     steps.append(Step(c, values=[v] if v is not None else []))
                     pos = Position("end", c, cd, parent=p)
                 elif isinstance(c, yschema.DLeaf):
-                    if values and isinstance(c.type, yschema.DTypeEmpty):
+                    if values and not optional and isinstance(c.type, yschema.DTypeEmpty):
                         steps.append(Step(c, values=[ygdata.Present()]))
                         pos = Position("end", c, cd, parent=p)
                     else:
                         steps.append(Step(c))
-                        pos = Position("value" if values else "end", c, cd, parent=p)
+                        pos = Position("value" if values and not optional else "end", c, cd, parent=p)
                 elif isinstance(c, yschema.DLeafList):
                     steps.append(Step(c))
                     pos = Position("value" if values else "end", c, cd, parent=p)
@@ -485,7 +489,7 @@ def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, token
                         except ValueError as e:
                             return PathResult(steps, pos, i, e.error_message, i)
                         i += 1
-                    if not closed:
+                    if not closed or len(vals) == 0:
                         return PathResult(steps, pos, i, "missing argument.", i)
                 else:
                     try:
@@ -504,9 +508,21 @@ def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, token
             steps[-1].keys = pos.keys
             pos = Position("inner", n, list_entry(pos.data, pos.keys), parent=pos.parent)
 
-    if _missing(pos, values):
+    if _missing(pos, values, optional):
         return PathResult(steps, pos, i, "missing argument.", i)
     return PathResult(steps, pos, i)
+
+
+def descend(node: yschema.DNode, data: ?ygdata.Node, steps: list[Step]) -> (node: yschema.DNode, data: ?ygdata.Node):
+    """Walk container and list entry steps from a node and return the node and data at the end."""
+    n = node
+    d = data
+    for s in steps:
+        d = child_data(d, s.node)
+        if isinstance(s.node, yschema.DList):
+            d = list_entry(d, s.keys)
+        n = s.node
+    return (node=n, data=d)
 
 
 def path_tokens(start: yschema.DNode, steps: list[Step]) -> list[str]:
@@ -637,7 +653,8 @@ def _value_items(root: yschema.DRoot, leaf: yschema.DNodeLeaf, existing: list[va
     parent is the node where the value stands without a keyword, or None.
     """
     res = []
-    if not isinstance(leaf.type, yschema.DTypeEnum):
+    # A type with a fixed set of values shows the values, not a placeholder.
+    if not _has_fixed_values(leaf):
         res.append(Completion("<{leaf.name}>", " ", _type_help(leaf), insert=False))
     seen = set()
     for v in _type_values(root, leaf.type):
@@ -668,12 +685,12 @@ class CompletionResult(object):
         self.path = path
 
 
-def complete(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, tokens: list[Token], values: bool=False) -> CompletionResult:
+def complete(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, tokens: list[Token], values: bool=False, optional: bool=False) -> CompletionResult:
     """Return what can follow a list of complete tokens.
 
     The caller filters the items by the word under the cursor.
     """
-    res = resolve(root, start, data, tokens, values)
+    res = resolve(root, start, data, tokens, values, optional)
     items = []
     pos = res.pos
     if res.error is not None and res.error != "missing argument.":
@@ -718,6 +735,10 @@ def complete(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, toke
                 existing.append(ev[k])
         items.extend(_value_items(root, kl[k], existing, None))
     elif pos.kind == "value" and isinstance(n, yschema.DNodeLeaf):
-        items.extend(_value_items(root, n, [], None))
+        existing = []
+        d = pos.data
+        if optional and isinstance(d, ygdata.LeafList):
+            existing = [e.val for e in d.entries]
+        items.extend(_value_items(root, n, existing, None))
     can_end = res.error is None
     return CompletionResult(items, can_end, res)

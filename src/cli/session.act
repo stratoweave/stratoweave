@@ -4,8 +4,14 @@ The session owns the line editor and a DeviceMgr for the device. Key presses
 and device replies arrive as messages, and every device request has a timeout,
 so a slow device never stops the editor.
 
+`configure` starts a candidate configuration from the running configuration,
+if there is none with changes yet. The candidate lives in the session: it
+stays when the user leaves configuration mode, and goes when the CLI exits.
+
 Without a terminal on stdout, the session reads commands line by line from
-stdin and prints only their output. A command script ends with `exit`.
+stdin and prints only their output. A command script ends with `exit`, after
+`exit configuration-mode` when it is in configuration mode. A command given as
+arguments runs alone, and the CLI exits after it.
 """
 
 import std.argparse
@@ -23,6 +29,7 @@ from device_meta_config import \
     stratoweave_rfs__device__credentials as Credentials, \
     stratoweave_rfs__device__ssh as DeviceMetaConfigSsh
 
+import cli.candidate as candidate
 import cli.command as command
 import cli.lineedit as lineedit
 import cli.path as cpath
@@ -70,12 +77,19 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
     timeout = float(args.get_int("timeout"))
     oneshot = args.get_strlist("command")
     interactive = len(oneshot) == 0 and env.stdio.is_tty()
-    editor = lineedit.LineEditor("{username}@{host}> ")
+    op_prompt = "{username}@{host}> "
+    config_prompt = "{username}@{host}# "
+    editor = lineedit.LineEditor(op_prompt)
     decoder = lineedit.KeyDecoder()
 
     var local_schema: ?yschema.DRoot = None
     var schema: ?yschema.DRoot = None
-    var ctx: ?command.Context = None
+    var running: ?ygdata.Node = None
+    var cand: ?candidate.Candidate = None
+    var mode = "op"
+    var edit: list[cpath.Step] = []
+    var back: list[list[cpath.Step]] = []
+    var confirm = False
     var dev: ?swdev.DeviceMgr = None
     var ready = False
     var busy = False
@@ -86,7 +100,7 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
     var partial_line = b""
     var esc_gen = 0
     var request = 0
-    var show_line = ""
+    var pending: ?command.Command = None
 
     def out(text: str):
         print(text, end="", flush=True)
@@ -120,33 +134,118 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
             for m in matches:
                 say("  " + m)
 
+    def make_ctx() -> ?command.Context:
+        """Return the command context for the current mode and edit level."""
+        s = schema
+        if s is not None:
+            c = cand
+            if mode == "config" and c is not None:
+                return command.Context(s, c.data, "config", edit, c.base, running, back)
+            return command.Context(s, running)
+        return None
+
+    def banner() -> str:
+        c = make_ctx()
+        if c is not None:
+            words = cpath.path_tokens(c.start, edit)
+            if len(words) > 0:
+                return "[edit " + " ".join(words) + "]"
+        return "[edit]"
+
     def prompt():
         """Show the prompt, then handle the keys or lines that wait."""
         if done or busy:
             return
         if interactive:
+            if mode == "config" and not confirm:
+                out("\n" + banner() + "\n")
             out(editor.render())
             while not busy and not done and len(pending_keys) > 0:
                 handle_key(pending_keys.pop(0))
         elif len(lines) > 0:
             execute(lines.pop(0))
+        elif len(oneshot) > 0:
+            finish(1 if failed else 0)
+
+    def enter_config():
+        mode = "config"
+        edit = []
+        back = []
+        editor.set_prompt(config_prompt)
+        say("Entering configuration mode")
+        c = cand
+        if c is not None and c.changed():
+            say("The candidate configuration has changes that are not committed")
+
+    def leave_config():
+        mode = "op"
+        edit = []
+        back = []
+        editor.set_prompt(op_prompt)
+        say("Exiting configuration mode")
+
+    def leave_cli():
+        """Exit, after the user confirms when the candidate has changes."""
+        c = cand
+        if c is not None and c.changed():
+            if interactive:
+                confirm = True
+                editor.set_prompt("Discard uncommitted changes? [yes,no] (no) ")
+                return
+            say("warning: discarding uncommitted changes")
+        finish(1 if failed else 0)
 
     def execute(line: str):
-        c = ctx
-        if c is not None:
-            r = command.parse(c, line)
-            e = r.error
-            cmd = r.cmd
-            if e is not None:
-                show_error(line, r.column, e, r.matches)
-            elif cmd is not None:
-                if cmd.name == "exit":
-                    finish(1 if failed else 0)
+        if confirm:
+            confirm = False
+            editor.set_prompt(config_prompt if mode == "config" else op_prompt)
+            if line.strip() in {"yes", "y"}:
+                finish(1 if failed else 0)
+                return
+        else:
+            c = make_ctx()
+            if c is not None:
+                r = command.parse(c, line)
+                e = r.error
+                cmd = r.cmd
+                if e is not None:
+                    show_error(line, r.column, e, r.matches)
+                elif cmd is not None:
+                    run_command(c, cmd)
                     return
-                if cmd.name == "show configuration":
-                    show_line = line
-                    fetch()
-                    return
+        prompt()
+
+    def run_command(c: command.Context, cmd: command.Command):
+        """Run a parsed command, then show the prompt unless the command waits for the device."""
+        n = cmd.name
+        ca = cand
+        fresh = True
+        if ca is not None and n == "configure":
+            fresh = not ca.changed()
+        if n == "show configuration" or (n == "configure" and fresh):
+            pending = cmd
+            fetch()
+            return
+        if n == "configure":
+            enter_config()
+        elif n == "exit" and c.mode == "op":
+            leave_cli()
+        elif n == "run":
+            sub = cmd.sub
+            if sub is not None:
+                run_command(c.op(), sub)
+                return
+        elif ca is not None and c.mode == "config":
+            r = command.apply(c, ca, cmd)
+            edit = r.edit
+            back = r.back
+            if r.text != "":
+                if interactive:
+                    out(r.text + "\n")
+                else:
+                    print(r.text)
+            if r.leave:
+                leave_config()
         prompt()
 
     def fetch():
@@ -175,30 +274,32 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
             return
         busy = False
         s = schema
+        p = pending
+        pending = None
         if e is not None:
             fail("cannot read the configuration: {e}")
             if not ready:
                 finish(1)
                 return
         elif s is not None:
-            c = command.Context(s, data)
-            ctx = c
-            if ready:
-                show(c)
+            running = data
+            if ready and p is not None:
+                if p.name == "configure":
+                    cand = candidate.Candidate(s, data)
+                    enter_config()
+                else:
+                    show_running(command.Context(s, data), p)
             ready = True
         prompt()
 
-    def show(c: command.Context):
-        """Print the output of the show command that waited for the configuration."""
-        r = command.parse(c, show_line)
-        cmd = r.cmd
-        if cmd is not None:
-            text = command.output(c, cmd)
-            if text != "":
-                if interactive:
-                    out(text + "\n")
-                else:
-                    print(text)
+    def show_running(c: command.Context, cmd: command.Command):
+        """Print a show configuration command against freshly read running configuration."""
+        text = command.output(c, command.refresh(c, cmd))
+        if text != "":
+            if interactive:
+                out(text + "\n")
+            else:
+                print(text)
 
     def on_reconf(name: str):
         if schema is not None or done:
@@ -214,7 +315,6 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
                     fetch()
                 else:
                     # Each show command reads the configuration itself.
-                    ctx = command.Context(s, None)
                     ready = True
                     prompt()
             else:
@@ -237,8 +337,8 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
 
         suffix is added to the text, so a space completes the next word.
         """
-        c = ctx
-        if c is not None:
+        c = make_ctx()
+        if c is not None and not confirm:
             text = editor.line()[:editor.cursor()] + suffix
             if cpath.tokenize(text).open_quote:
                 return None
@@ -316,12 +416,21 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
         kind = r.kind
         if kind == "submit":
             echo_line(r.line)
-            editor.add_history(r.line)
+            if not confirm:
+                editor.add_history(r.line)
             editor.reset()
             execute(r.line)
         elif kind == "eof":
             out("\n")
-            finish(1 if failed else 0)
+            if confirm:
+                # Ctrl-D answers no.
+                execute("no")
+                return
+            if mode == "config":
+                leave_config()
+            else:
+                leave_cli()
+            prompt()
         elif kind == "interrupt":
             out("\n")
             editor.reset()
@@ -388,7 +497,6 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
             out("Connecting to {host}:{port}...\n")
         if len(oneshot) > 0:
             lines.append(" ".join(oneshot))
-            lines.append("exit")
         else:
             env.stdio.stdin_install(on_stdin_bytes=on_bytes)
             if interactive:
