@@ -1,5 +1,5 @@
 import { errorText } from '$lib/core/errors';
-import { restconfGetOrNull } from '$lib/core/restconf/client';
+import { restconfGetCachedOrNull, restconfGetOrNull } from '$lib/core/restconf/client';
 import { FLEET_ROOT, SCHEDULES_ROOT, parseFleet, parseSchedules } from '$lib/software/model';
 
 import type { PageLoad } from './$types';
@@ -11,7 +11,7 @@ export const load: PageLoad = async ({ fetch, depends, url }) => {
 
   try {
     const [response, schedules] = await Promise.all([
-      restconfGetOrNull<unknown>(FLEET_ROOT, fetch),
+      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch),
       restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch)
     ]);
     const { nodes, devices } = parseFleet(response);

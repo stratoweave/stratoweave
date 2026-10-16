@@ -5,14 +5,14 @@
   import AdminStatePill from '$lib/software/AdminStatePill.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
   import { createPoller } from '$lib/core/polling/poller';
-  import { FAST_ENTRY_LIMIT, fetchCounters } from '$lib/software/counters';
-  import { planAlarmLines, type Campaign, type CampaignCounters } from '$lib/software/model';
+  import { fetchCounters } from '$lib/software/counters';
+  import type { Campaign, CampaignCounters } from '$lib/software/model';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
 
-  // Discovery (full campaign entries) refreshes slowly; running campaigns
-  // get fresh counters from cheap entry GETs.
+  // Discovery (config plus counters and alarms) refreshes slowly; running
+  // campaigns get fresh counters from the leaf GETs every tick.
   let live = $state<Record<string, CampaignCounters>>({});
 
   let campaigns = $derived(
@@ -40,7 +40,7 @@
   onMount(() => {
     const fast = createPoller(async () => {
       const running = data.campaigns
-        .filter((c) => c.adminState === 'run' && c.devices.length <= FAST_ENTRY_LIMIT)
+        .filter((c) => c.adminState === 'run' && c.counters !== null)
         .map((c) => c.name)
         .slice(0, 6);
       for (const name of running) {
@@ -133,21 +133,17 @@
               </td>
               <td class="tn right" data-label="Devices">{campaign.devices.length.toLocaleString()}</td>
               <td class="plan-cell" data-label="Plan">
-                {#if campaign.plan !== null && campaign.plan.windows.length > 0}
-                  <span class="dim">
-                    {campaign.plan.windows.length} window{campaign.plan.windows.length === 1 ? '' : 's'}
-                  </span>
-                {:else}
-                  <span class="dim">—</span>
-                {/if}
-                {#if campaign.plan !== null}
-                  {@const alarms = planAlarmLines(campaign.plan)}
+                {#if campaign.counters !== null}
+                  {@const alarms = data.alarms[campaign.name] ?? []}
+                  <span class="dim">planned</span>
                   {#if alarms.length > 0}
                     <span class="pill warning" title={alarms.join('\n')}>
                       <span class="dot"></span>
                       {alarms.length} alarm{alarms.length === 1 ? '' : 's'}
                     </span>
                   {/if}
+                {:else}
+                  <span class="dim">—</span>
                 {/if}
               </td>
               <td class="state-col" data-label="State">

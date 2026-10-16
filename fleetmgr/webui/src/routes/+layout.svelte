@@ -6,10 +6,17 @@
   import { page } from '$app/state';
   import type { Snippet } from 'svelte';
 
+  import { dropReadCache } from '$lib/core/restconf/client';
   import NavIcon from '$lib/core/ui/NavIcon.svelte';
   import logoUrl from '$lib/assets/stratoweave-logo.svg';
 
   let { children }: { children?: Snippet } = $props();
+
+  /** Reload every page load from the server, cached fleet included. */
+  function refresh(): void {
+    dropReadCache();
+    void invalidateAll();
+  }
 
   const PAGE_LABELS: Record<string, string> = {
     '/devices': 'Devices',
@@ -107,7 +114,7 @@
       </nav>
 
       <div class="header-actions">
-        <button class="btn btn-ghost btn-sm" type="button" onclick={() => invalidateAll()}>
+        <button class="btn btn-ghost btn-sm" type="button" onclick={refresh}>
           <NavIcon name="refresh" size={16} /> Refresh
         </button>
       </div>
