@@ -46,3 +46,10 @@ export async function fetchCounters(
   );
   return total === null ? null : countersOf(total, inProgress ?? 0, succeeded ?? 0, failed ?? 0);
 }
+
+/** The plan's alarm lines for one campaign; empty when it has none or no
+ * plan yet (both 404). */
+export async function fetchPlanAlarms(name: string, fetchFn: typeof fetch = fetch): Promise<string[]> {
+  const json = await restconfGetOrNull<{ 'software:alarm'?: string[] }>(`${statePath(name)}/plan/alarm`, fetchFn);
+  return json?.['software:alarm'] ?? [];
+}

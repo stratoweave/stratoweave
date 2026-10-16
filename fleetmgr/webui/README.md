@@ -68,6 +68,11 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   cached in the browser for 30 s and shared by the devices, schedules and
   new-campaign pages. A write through the RESTCONF client drops the cache
   and Refresh bypasses it; changes made elsewhere show when it expires.
+- The campaigns, schedules and new-campaign pages read the campaigns
+  with `content=config` (RFC 8040), which leaves out the published state:
+  the device rows and the plan, most of the subtree once a campaign has
+  members. The campaigns list adds each campaign's counters and alarm
+  lines from small GETs of its state leaves.
 - Polling is two-tier. The campaign page GETs its campaign's four
   counter leaves (`.../state/total` and friends) every 1.5 s at any size,
   and its `state` node (plan and per-device rows, ~150 B per member) every

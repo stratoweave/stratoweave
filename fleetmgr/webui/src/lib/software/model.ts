@@ -5,6 +5,8 @@ import type { ValidationResult } from '$lib/core/validation/types';
 // so creation merges into `data` under the module-qualified wrappers.
 export const DATA_ROOT = 'data';
 export const SOFTWARE_ROOT = 'data/software:software';
+/** The campaigns without their published state: RFC 8040 content=config. */
+export const SOFTWARE_CONFIG = `${SOFTWARE_ROOT}?content=config`;
 export const SCHEDULES_ROOT = 'data/maintenance:schedules';
 export const SCHEDULE_LIST_ROOT = 'data/maintenance:schedules/schedule';
 export const CAMPAIGN_LIST_ROOT = 'data/software:software/upgrade-campaign';

@@ -4,7 +4,7 @@ import { scheduleUsage } from '$lib/maintenance/schedule-form';
 import {
   FLEET_ROOT,
   SCHEDULES_ROOT,
-  SOFTWARE_ROOT,
+  SOFTWARE_CONFIG,
   parseCampaigns,
   parseFleet,
   parseSchedules
@@ -19,7 +19,7 @@ export const load: PageLoad = async ({ fetch, depends, params }) => {
     const [schedules, fleet, software] = await Promise.all([
       restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch),
       restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch),
-      restconfGetOrNull<unknown>(SOFTWARE_ROOT, fetch)
+      restconfGetOrNull<unknown>(SOFTWARE_CONFIG, fetch)
     ]);
     const all = parseSchedules(schedules);
     const schedule = all.find((s) => s.name === params.name) ?? null;
