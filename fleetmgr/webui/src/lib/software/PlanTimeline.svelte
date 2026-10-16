@@ -10,16 +10,20 @@
   } from '$lib/software/model';
   import {
     WINDOW_GAP,
-    assignLanes,
+    anchorStep,
+    axisSpans,
     axisTicks,
-    buildAxis,
+    cellAt,
     cellRects,
-    chooseCells,
     columnAt,
-    fitScale,
+    fitter,
+    holdWindows,
+    layoutAt,
+    nowAnchor,
+    orderWindows,
+    pickZoom,
     tickStep,
     windowDone,
-    windowEnd,
     type Placed,
     type Rect,
     type WindowCells
@@ -75,8 +79,6 @@
     gridW: number;
     gridH: number;
     bandW: number;
-    done: number;
-    open: boolean;
   }
 
   let scroller = $state<HTMLDivElement | null>(null);
@@ -88,30 +90,23 @@
   let follow = $state(true);
   let lastSet = -1;
 
-  let spans = $derived(plan.windows.map((w) => ({ start: w.start, end: windowEnd(w) })));
-
-  function axisAt(z: number) {
-    const w = width > 0 ? width : FALLBACK_WIDTH;
-    return buildAxis(spans, now, fitScale(spans, now, w, PAD_L, PAD_R) * z, PAD_L, PAD_R);
-  }
-
-  // A crowded plan can stay small at every zoom; then the least zoom with
-  // the largest cells, so zooming in never costs the overview for nothing.
-  let autoZoom = $derived.by(() => {
-    if (width === 0) return 1;
-    let best = { zoom: ZOOMS[0], size: 0 };
-    for (const z of ZOOMS) {
-      const a = axisAt(z);
-      const size = chooseCells(assignLanes(plan.windows, a, WINDOW_GAP), a, MAX_STACK).size;
-      if (size >= READABLE_SIZE) return z;
-      if (size > best.size) best = { zoom: z, size };
-    }
-    return best.zoom;
-  });
+  // Geometry: rebuilt when the plan's times, the width or the zoom change.
+  // The clock reaches it only through the anchor, which moves once per step
+  // and only while no window holds now.
+  const hold = holdWindows();
+  let windows = $derived(hold(plan.windows));
+  let ordered = $derived(orderWindows(windows));
+  let spans = $derived(ordered.map((o) => ({ start: o.w.start, end: o.end })));
+  let step = $derived(anchorStep(spans));
+  let anchor = $derived(nowAnchor(spans, now, step));
+  let fit = $derived(
+    fitter(ordered, axisSpans(spans, anchor, step), width > 0 ? width : FALLBACK_WIDTH, PAD_L, PAD_R, MAX_STACK)
+  );
+  let autoZoom = $derived(width === 0 ? 1 : pickZoom(ZOOMS, READABLE_SIZE, fit));
   let zoom = $derived(zoomChoice ?? autoZoom);
-  let axis = $derived(axisAt(zoom));
-  let placed = $derived(assignLanes(plan.windows, axis, WINDOW_GAP));
-  let cells = $derived(chooseCells(placed, axis, MAX_STACK));
+  let axis = $derived(fit(zoom).axis);
+  let placed = $derived(fit(zoom).placed);
+  let cells = $derived(layoutAt(placed, fit(zoom).size, MAX_STACK));
 
   let lanes = $derived.by(() => {
     const count = Math.max(1, ...placed.map((p) => p.lane + 1));
@@ -140,35 +135,26 @@
         gy: y + HEAD_H,
         gridW: c.cols.length > 0 ? c.cols[c.cols.length - 1].x + cells.size - p.x : 0,
         gridH: c.rows > 0 ? (c.rows - 1) * cells.pitch + cells.size : 0,
-        bandW: Math.max(2, p.xEnd - p.x - WINDOW_GAP),
-        done: windowDone(p.w, statuses),
-        open: now >= p.w.start && (p.w.end === null || now < p.w.end)
+        bandW: Math.max(2, p.xEnd - p.x - WINDOW_GAP)
       };
     })
   );
 
+  let ticks = $derived(axisTicks(axis, tickStep(axis.pxPerHour)));
+
+  // Statuses: the colours and each window's done share.
   let rects = $derived(
     blocks.map((b): Rect[] => cellRects(b.cells, statuses, b.gy, cells.size, cells.pitch))
   );
+  let done = $derived(placed.map((p) => windowDone(p.w, statuses)));
 
-  /** column*65536+row -> device, per block, for the hit test. */
-  let index = $derived(
-    blocks.map((b) => {
-      const m = new Map<number, string>();
-      for (const c of b.cells.cells) m.set(c.col * 65536 + c.row, c.name);
-      return m;
-    })
-  );
-
-  let devices = $derived.by(() => {
-    const m = new Map<string, PlanDevice>();
-    for (const w of plan.windows) for (const d of w.devices) m.set(d.name, d);
-    return m;
-  });
-
-  let ticks = $derived(axisTicks(axis, tickStep(axis.pxPerHour)));
+  // The clock: the marker and which windows are open.
   let markerX = $derived(Math.min(axis.width - PAD_R, Math.max(PAD_L, axis.xOf(now))));
   let markerLabelLeft = $derived(markerX > axis.width - 90);
+
+  function isOpen(w: PlanWindow): boolean {
+    return now >= w.start && (w.end === null || now < w.end);
+  }
 
   $effect(() => {
     if (!follow || !scroller) return;
@@ -186,13 +172,13 @@
 
   /** The label parts that fit the band: first to go is the range, then
    * the progress, then the count. */
-  function label(b: Block): string {
+  function label(b: Block, share: number): string {
     const w = b.p.w;
     const name = w.schedule || 'window';
     const range = `${clockLabel(w.start)} → ${w.end === null ? 'open' : clockLabel(w.end)}`;
     const n = w.devices.length;
     const count = `${n.toLocaleString()} device${n === 1 ? '' : 's'}`;
-    const pct = now >= w.start ? `${Math.round(b.done * 100)}%` : null;
+    const pct = now >= w.start ? `${Math.round(share * 100)}%` : null;
     const options = [
       [name, range, count, pct],
       [name, count, pct],
@@ -206,22 +192,20 @@
     return '';
   }
 
-  type Hit = { kind: 'device'; name: string } | { kind: 'window'; w: PlanWindow } | null;
+  type Hit = { kind: 'device'; d: PlanDevice } | { kind: 'window'; w: PlanWindow } | null;
 
   function hitAt(event: MouseEvent): Hit {
     const svg = event.currentTarget as SVGSVGElement;
     const bounds = svg.getBoundingClientRect();
     const px = event.clientX - bounds.left;
     const py = event.clientY - bounds.top;
-    for (let i = 0; i < blocks.length; i++) {
-      const b = blocks[i];
+    for (const b of blocks) {
       if (px < b.p.x) continue;
       if (py >= b.y && py < b.y + HEAD_H && px < b.p.x + b.bandW) return { kind: 'window', w: b.p.w };
       if (py >= b.gy && py < b.gy + b.gridH && px < b.p.x + b.gridW) {
         const col = columnAt(b.cells.cols, px, cells.size);
-        const row = Math.floor((py - b.gy) / cells.pitch);
-        const name = col < 0 ? undefined : index[i].get(col * 65536 + row);
-        if (name !== undefined) return { kind: 'device', name };
+        const d = col < 0 ? null : cellAt(b.cells, col, Math.floor((py - b.gy) / cells.pitch));
+        if (d !== null) return { kind: 'device', d };
       }
     }
     return null;
@@ -234,17 +218,16 @@
       const closes = w.end === null ? 'never closes' : `closes ${formatClock(w.end)}`;
       return `${w.schedule || 'window'}: opens ${formatClock(w.start)}, ${closes}, ${w.devices.length} device(s)`;
     }
-    const d = devices.get(hit.name);
-    const status = statuses.get(hit.name) ?? 'pending';
-    if (!d) return `${hit.name} — ${status}`;
+    const d = hit.d;
+    const status = statuses.get(d.name) ?? 'pending';
     const start = `${d.started === null ? 'starts' : 'started'} ${formatClock(deviceStart(d))}`;
     const took = `${d.finished === null ? '~' : 'took '}${formatDuration(deviceDuration(d))}`;
-    return `${hit.name} — ${status} · ${start} · ${took}`;
+    return `${d.name} — ${status} · ${start} · ${took}`;
   }
 
   function onClick(event: MouseEvent): void {
     const hit = hitAt(event);
-    if (hit !== null && hit.kind === 'device') ondevice?.(hit.name);
+    if (hit !== null && hit.kind === 'device') ondevice?.(hit.d.name);
   }
 
   function onMove(event: MouseEvent): void {
@@ -332,13 +315,13 @@
 
     {#each blocks as b, i (i)}
       <rect class="head" x={b.p.x} y={b.y} width={b.bandW} height={HEAD_H - 4} />
-      {#if b.done > 0}
-        <rect x={b.p.x} y={b.y} width={b.bandW * b.done} height={HEAD_H - 4} fill={DONE_COLOR} />
+      {#if done[i] > 0}
+        <rect x={b.p.x} y={b.y} width={b.bandW * done[i]} height={HEAD_H - 4} fill={DONE_COLOR} />
       {/if}
-      {#if b.open}
+      {#if isOpen(b.p.w)}
         <rect x={b.p.x} y={b.y} width={b.bandW} height={HEAD_H - 4} fill="none" stroke={NOW_COLOR} />
       {/if}
-      <text class="blk" x={b.p.x + 6} y={b.y + 13}>{label(b)}</text>
+      <text class="blk" x={b.p.x + 6} y={b.y + 13}>{label(b, done[i])}</text>
       {#each rects[i] as r, j (j)}
         <rect x={r.x} y={r.y} width={r.w} height={r.h} fill={r.fill} />
       {/each}
