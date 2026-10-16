@@ -2,9 +2,11 @@ import { getListEntryPath, restconfGetOrNull } from '$lib/core/restconf/client';
 import {
   CAMPAIGN_LIST_ROOT,
   countersOf,
-  parseCampaignState,
-  type Campaign,
-  type CampaignCounters
+  parseCampaignEntry,
+  parseStateNode,
+  type CampaignConfig,
+  type CampaignCounters,
+  type StateParts
 } from '$lib/software/model';
 
 // The state node carries the plan and one row per member (~150 B each),
@@ -13,17 +15,29 @@ import {
 // at any size.
 export const FAST_ENTRY_LIMIT = 600;
 
-function statePath(name: string): string {
-  return `${getListEntryPath(CAMPAIGN_LIST_ROOT, name)}/state`;
+function entryPath(name: string): string {
+  return getListEntryPath(CAMPAIGN_LIST_ROOT, name);
 }
 
-/** Fetch one campaign's state node onto `campaign`. Null when the campaign
- * has no state yet or no longer exists (404). */
-export async function fetchCampaignState(
-  campaign: Campaign,
+function statePath(name: string): string {
+  return `${entryPath(name)}/state`;
+}
+
+/** One campaign's entry, its state included unless `configOnly` (RFC 8040
+ * content=config); null when there is no such campaign (404). */
+export async function fetchCampaignEntry(
+  name: string,
+  configOnly: boolean,
   fetchFn: typeof fetch = fetch
-): Promise<Campaign | null> {
-  return parseCampaignState(await restconfGetOrNull<unknown>(statePath(campaign.name), fetchFn), campaign);
+): Promise<{ config: CampaignConfig; state: StateParts | null } | null> {
+  const path = configOnly ? `${entryPath(name)}?content=config` : entryPath(name);
+  return parseCampaignEntry(await restconfGetOrNull<unknown>(path, fetchFn));
+}
+
+/** One campaign's state node. Null (404) when it has published none yet,
+ * or when there is no such campaign. */
+export async function fetchCampaignState(name: string, fetchFn: typeof fetch = fetch): Promise<StateParts | null> {
+  return parseStateNode(await restconfGetOrNull<unknown>(statePath(name), fetchFn));
 }
 
 /** One counter leaf, {"software:total": 1000}; null when absent. */

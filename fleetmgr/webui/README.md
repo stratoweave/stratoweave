@@ -73,15 +73,20 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   the device rows and the plan, most of the subtree once a campaign has
   members. The campaigns list adds each campaign's counters and alarm
   lines from small GETs of its state leaves.
-- Polling is two-tier. The campaign page GETs its campaign's four
-  counter leaves (`.../state/total` and friends) every 1.5 s at any size,
-  and its `state` node (plan and per-device rows, ~150 B per member) every
-  1.5 s when it has up to 600 members, else every 12 s and when `failed`
-  moves. The config half comes from the loader snapshot, reloaded on open
-  and after the page's own writes. The list page GETs the counter leaves
-  of the first six running campaigns every 2 s, and reloads the list every
-  30 s. Nothing ever polls `GET /restconf/data` — it also hauls the full
-  yang-library.
+- Polling. The campaign page ticks every 1.5 s, one tick at a time and
+  none while the tab is hidden. A campaign with up to 600 members gets its
+  `state` node (plan and per-device rows, ~150 B per member) every tick; a
+  larger one its four counter leaves (`.../state/total` and friends) every
+  tick, and its `state` every 12 s, or 6 s after the last one when
+  `failed` moved. Every 12 s the page reads the campaign's config with
+  `content=config`, which is how a change made elsewhere or a deletion
+  shows. Until a campaign has published state, when its state paths 404,
+  the page reads the whole entry instead, which is small then. Each read
+  is numbered when it starts, and an answer older than what is shown,
+  than the page's last write, or for another campaign is dropped. The list
+  page GETs the counter leaves of the first six running campaigns every
+  2 s, and reloads the list every 30 s. Nothing ever polls
+  `GET /restconf/data` — it also hauls the full yang-library.
 - Schedules are the shared `maintenance:schedules` entries: a name, a
   `utc-offset` in minutes and a `window` list keyed by `at`, the local
   time of day a rule opens, with a `duration` and an optional `day`

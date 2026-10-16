@@ -3,44 +3,76 @@ export interface Poller {
   stop(): void;
 }
 
-/** Run tick on an interval. A tick is skipped while the previous one is in
- * flight or the tab is hidden; returning to the tab ticks immediately. */
+/** Run tick every intervalMs, counted from the end of the previous tick,
+ * so ticks never overlap and a slow server is not asked again at once. A
+ * hidden tab does not tick; coming back to it ticks at once. A tick that
+ * fails leaves what is shown and is retried on the next one. */
 export function createPoller(tick: () => Promise<unknown>, intervalMs: number): Poller {
-  let timer: ReturnType<typeof setInterval> | null = null;
-  let inFlight = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let running = false;
+  let started = false;
+
+  function clear(): void {
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+  }
+
+  function schedule(): void {
+    clear();
+    if (started && !document.hidden) {
+      timer = setTimeout(run, intervalMs);
+    }
+  }
 
   async function run(): Promise<void> {
-    if (inFlight || document.hidden) {
+    timer = null;
+    if (!started || running || document.hidden) {
       return;
     }
-    inFlight = true;
+    running = true;
     try {
       await tick();
+    } catch {
+      // the next tick tries again
     } finally {
-      inFlight = false;
+      running = false;
+      schedule();
     }
   }
 
   function onVisibility(): void {
-    if (!document.hidden) {
+    if (document.hidden) {
+      clear();
+    } else if (!running) {
+      clear();
       void run();
     }
   }
 
   return {
     start() {
-      if (timer !== null) {
+      if (started) {
         return;
       }
-      timer = setInterval(() => void run(), intervalMs);
+      started = true;
       document.addEventListener('visibilitychange', onVisibility);
+      schedule();
     },
     stop() {
-      if (timer !== null) {
-        clearInterval(timer);
-        timer = null;
-      }
+      started = false;
+      clear();
       document.removeEventListener('visibilitychange', onVisibility);
     }
   };
+}
+
+let lastSeq = 0;
+
+/** A number for a request about to start, above every one taken before.
+ * Data is only as new as the request that fetched it, so loaders and polls
+ * stamp what they read with these and the newest wins. */
+export function nextSeq(): number {
+  return ++lastSeq;
 }

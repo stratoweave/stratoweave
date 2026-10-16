@@ -94,6 +94,12 @@ export function restconfGetJson<T>(path: string, fetchFn: Fetch = fetch): Promis
   }, fetchFn);
 }
 
+/** `fetchFn` with `signal` on every request, so the caller can cancel
+ * reads it no longer needs. */
+export function withSignal(signal: AbortSignal, fetchFn: Fetch = fetch): Fetch {
+  return (input, init) => fetchFn(input, { ...init, signal });
+}
+
 /** A GET whose 404 means "nothing configured yet": null instead of an error. */
 export async function restconfGetOrNull<T>(path: string, fetchFn: Fetch = fetch): Promise<T | null> {
   try {
