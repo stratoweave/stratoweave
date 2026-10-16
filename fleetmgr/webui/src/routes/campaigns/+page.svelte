@@ -4,20 +4,31 @@
 
   import AdminStatePill from '$lib/software/AdminStatePill.svelte';
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
-  import { createPoller } from '$lib/core/polling/poller';
+  import { createPoller, nextSeq } from '$lib/core/polling/poller';
+  import { withSignal } from '$lib/core/restconf/client';
   import { fetchCounters } from '$lib/software/counters';
   import type { Campaign, CampaignCounters } from '$lib/software/model';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
 
-  // Discovery (config plus counters and alarms) refreshes slowly; running
-  // campaigns get fresh counters from the leaf GETs every tick.
-  let live = $state<Record<string, CampaignCounters>>({});
+  // Discovery (config plus counters and alarms) reloads every 30 s; up to
+  // six running campaigns, busy ones first, get fresh counters from the
+  // leaf GETs every tick. A live value shows only while it is newer than
+  // the last load, so one that stopped being polled gives way to the reload.
+  let live = $state.raw<Record<string, { seq: number; counters: CampaignCounters }>>({});
 
   let campaigns = $derived(
-    data.campaigns.map((c) => (live[c.name] ? { ...c, counters: live[c.name] } : c))
+    data.campaigns.map((c) => {
+      const l = live[c.name];
+      return l !== undefined && l.seq > data.seq ? { ...c, counters: l.counters } : c;
+    })
   );
+
+  /** Devices in flight or still to go. */
+  function busy(c: Campaign): boolean {
+    return c.counters !== null && (c.counters.inProgress > 0 || c.counters.remainder > 0);
+  }
 
   let kpis = $derived.by(() => {
     let running = 0;
@@ -38,17 +49,20 @@
   });
 
   onMount(() => {
+    const aborter = new AbortController();
     const fast = createPoller(async () => {
-      const running = data.campaigns
+      const running = campaigns
         .filter((c) => c.adminState === 'run' && c.counters !== null)
-        .map((c) => c.name)
-        .slice(0, 6);
+        .sort((a, b) => Number(busy(b)) - Number(busy(a)))
+        .slice(0, 6)
+        .map((c) => c.name);
       for (const name of running) {
+        const seq = nextSeq();
         try {
-          const counters = await fetchCounters(name);
-          if (counters) live = { ...live, [name]: counters };
+          const counters = await fetchCounters(name, withSignal(aborter.signal));
+          if (counters && !aborter.signal.aborted) live = { ...live, [name]: { seq, counters } };
         } catch {
-          // slow tick recovers
+          // the next tick or the reload catches up
         }
       }
     }, 2000);
@@ -58,6 +72,7 @@
     return () => {
       fast.stop();
       slow.stop();
+      aborter.abort();
     };
   });
 </script>

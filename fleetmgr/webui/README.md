@@ -84,8 +84,9 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   the page reads the whole entry instead, which is small then. Each read
   is numbered when it starts, and an answer older than what is shown,
   than the page's last write, or for another campaign is dropped. The list
-  page GETs the counter leaves of the first six running campaigns every
-  2 s, and reloads the list every 30 s. Nothing ever polls
+  page GETs the counter leaves of up to six running campaigns every 2 s,
+  busy ones first, and reloads the list every 30 s; a polled counter shows
+  only while it is newer than the reload. Nothing ever polls
   `GET /restconf/data` — it also hauls the full yang-library.
 - Schedules are the shared `maintenance:schedules` entries: a name, a
   `utc-offset` in minutes and a `window` list keyed by `at`, the local
