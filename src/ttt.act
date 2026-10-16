@@ -1126,13 +1126,16 @@ actor Transaction(impl: _Transaction):
         return impl.is_empty()
 
     def init_actor(node: Node, act: proc(TransformActorParams) -> TransformActor):
-        impl.init_actor(node, act, update_dynstate, update_oper)
+        impl.init_actor(node, act, update_dynstate, update_oper, update_config)
 
     def update_dynstate(dynstate: ?gdata.Node):
         impl.update_dynstate(self, dynstate)
 
     def update_oper(oper: ?gdata.Node):
         impl.update_oper(oper)
+
+    def update_config(config: gdata.Node):
+        impl.update_config(self, config)
 
 class _Transaction(object):
     path: Path
@@ -1173,13 +1176,16 @@ class _Transaction(object):
     def is_empty(self) -> bool:
         return True
 
-    proc def init_actor(self, node: Node, act: proc(TransformActorParams) -> TransformActor, update_dynstate: action(?gdata.Node)->None, update_oper: action(?gdata.Node)->None):
+    proc def init_actor(self, node: Node, act: proc(TransformActorParams) -> TransformActor, update_dynstate: action(?gdata.Node)->None, update_oper: action(?gdata.Node)->None, update_config: action(gdata.Node)->None):
         pass
 
     proc def update_dynstate(self, actself: Transaction, dynstate: ?gdata.Node) -> None:
         pass
 
     proc def update_oper(self, oper: ?gdata.Node) -> None:
+        pass
+
+    proc def update_config(self, actself: Transaction, config: gdata.Node) -> None:
         pass
 
 ####################### Layer ########################
@@ -3277,13 +3283,19 @@ class _TransformTransactionBase(_Transaction):
             self.oper_subscriptions[sid] = o
 
 class TransformActorParams:
-    def __init__(self, path: Path, update_dynstate: action(?gdata.Node) -> None, update_oper: action(?gdata.Node) -> None, dev: ?swdev.DeviceMgr, lower: ?Layer=None):
+    def __init__(self, path: Path, update_dynstate: action(?gdata.Node) -> None, update_oper: action(?gdata.Node) -> None, dev: ?swdev.DeviceMgr, lower: ?Layer=None, update_config: ?(action(gdata.Node) -> None)=None, last_config_output: ?gdata.Node=None, last_oper_output: ?gdata.Node=None):
         self.path = path
         self.update_dynstate = update_dynstate
         self.update_oper = update_oper
         self.dev = dev
         self.lower = lower
         self.lower_tree_provider = LayerTreeProvider(lower) if lower is not None else None
+        # The actor of a direct transform writes its configuration output
+        # with update_config, and resumes from its last outputs after a
+        # restart.
+        self.update_config = update_config
+        self.last_config_output = last_config_output
+        self.last_oper_output = last_oper_output
 
 class TransformActor:
     @property
@@ -3296,7 +3308,7 @@ class TransformActor:
 
 def Transform(function, act: ?(proc(TransformActorParams) -> TransformActor)=None, build_links: ?proc(gdata.Node) -> list[TaggedPath]=None, lower: ?Layer=None, log_handler: ?logging.Handler=None) -> proc(Path, ?Layer)->Node:
     proc def _create_transform_node(path, lower):
-        transform = _Transform(path, function, build_links, lower, log_handler)
+        transform = _Transform(path, function, build_links, lower, log_handler, False)
         node = Node(transform)
         if act is not None:
             transform.init_actor(node, act)
@@ -3304,31 +3316,43 @@ def Transform(function, act: ?(proc(TransformActorParams) -> TransformActor)=Non
     return _create_transform_node
 
 class _Transform(_TransformBase):
-    def __init__(self, path, function, build_links, lower, log_handler):
+    def __init__(self, path, function, build_links, lower, log_handler, direct: bool):
         self.path = path
-        self.transaction = TransformTransaction(path, function, build_links, lower, log_handler)
+        self.transaction = TransformTransaction(path, function, build_links, lower, log_handler, direct)
 
     proc def init_actor(self, node, act: proc(TransformActorParams) -> TransformActor):
         self.transaction.init_actor(node, act)
 
-def TransformTransaction(path, function, build_links, lower, log_handler):
-    return Transaction(_TransformTransaction(path, function, build_links, lower, log_handler))
+def TransformTransaction(path, function, build_links, lower, log_handler, direct: bool=False):
+    return Transaction(_TransformTransaction(path, function, build_links, lower, log_handler, direct))
 
 class _TransformTransaction(_TransformTransactionBase):
     function: TransformFunction
+    direct: bool
+    actor_config: ?gdata.Node
     delivered_conf: ?gdata.Node
     delivered_linked: ?gdata.Node
     delivered_memory: ?gdata.Node
 
-    def __init__(self, path, function: proc(?logging.Handler) -> TransformFunction, build_links, lower: ?Layer, log_handler):
+    def __init__(self, path, function: proc(?logging.Handler) -> TransformFunction, build_links, lower: ?Layer, log_handler, direct: bool):
         _TransformTransactionBase.__init__(self, path, build_links, lower)
         self.function = function(log_handler)
+        self.direct = direct
+        self.actor_config = None
         self.delivered_conf = None
         self.delivered_linked = None
         self.delivered_memory = None
 
     def compute(self, tid, merged, linked, out):
-        newoutmem = self.function.transform_wrapper(merged, linked, self.memory, self.dynstate, self.output)
+        if self.direct:
+            # The actor writes the output. Until it sends one, the output is
+            # the last one, which after a restart is the restored one.
+            config = self.actor_config
+            if config is None:
+                config = self.output
+            newoutmem = (config if config is not None else gdata.Container(), None)
+        else:
+            newoutmem = self.function.transform_wrapper(merged, linked, self.memory, self.dynstate, self.output)
         newout = newoutmem.0
         if out is not None:
             out.write_config(tid, self.me, newout)
@@ -3340,7 +3364,14 @@ class _TransformTransaction(_TransformTransactionBase):
             out.write_config(tid, self.me, gdata.Container())
 
     mut def db_ops(self, tid: str, essay) -> list[swdb.BufferOp]:
-        return _TransformTransactionBase.db_ops(self, tid, essay) + swdb.opt_ops(_db_path(self.path), swdb.ATTR_MEMORY, essay.1) + swdb.opt_ops(_db_path(self.path), swdb.ATTR_DYNSTATE, self.dynstate)
+        ops = _TransformTransactionBase.db_ops(self, tid, essay) + swdb.opt_ops(_db_path(self.path), swdb.ATTR_MEMORY, essay.1) + swdb.opt_ops(_db_path(self.path), swdb.ATTR_DYNSTATE, self.dynstate)
+        if self.direct:
+            # The actor of a direct transform resumes from its last oper
+            # output after a restart, so the oper is stored with the output.
+            # TODO: an oper update without a transaction is not stored until
+            # the next transaction of this node.
+            ops += swdb.opt_ops(_db_path(self.path), swdb.ATTR_OPER, self.oper)
+        return ops
 
     def restore(self, attr: str, qualifier: ?str, raw: bytes) -> None:
         if attr == swdb.ATTR_MEMORY:
@@ -3353,11 +3384,21 @@ class _TransformTransaction(_TransformTransactionBase):
                 raise ValueError("Unexpected persistence qualifier for transform dynstate at {_format_path(self.path)}")
             self.dynstate = swdb.decode_node_bytes(raw)
             return
+        if attr == swdb.ATTR_OPER:
+            if qualifier is not None:
+                raise ValueError("Unexpected persistence qualifier for transform oper at {_format_path(self.path)}")
+            self.oper = swdb.decode_node_bytes(raw)
+            return
         _TransformTransactionBase.restore(self, attr, qualifier, raw)
 
-    proc def init_actor(self, node, act: proc(TransformActorParams) -> TransformActor, update_dynstate, update_oper):
+    proc def init_actor(self, node, act: proc(TransformActorParams) -> TransformActor, update_dynstate, update_oper, update_config):
         self.node = node
-        self.function.init_actor(lambda: act(TransformActorParams(self.path, update_dynstate, update_oper, dev=None, lower=self.lower)))
+        # The actor starts at the first on_conf, after the restore, so the
+        # last outputs are the restored ones after a restart.
+        self.function.init_actor(lambda: act(TransformActorParams(self.path, update_dynstate, update_oper, dev=None, lower=self.lower,
+                                                                  update_config=update_config,
+                                                                  last_config_output=self.output,
+                                                                  last_oper_output=self.oper)))
 
     proc def update_dynstate(self, actself, dynstate):
         if self.dynstate == dynstate:
@@ -3366,6 +3407,16 @@ class _TransformTransaction(_TransformTransactionBase):
         _node = self.node
         if _node is not None:
             Session(self.me, actself, self.lower, self.db).recompute() # TODO: Verify that this always succeeds (due to no input diff)?
+
+    proc def update_config(self, actself, config):
+        """Take the configuration output of a direct transform actor, and
+        recompute this node to write it to the lower layer."""
+        if self.actor_config == config:
+            return
+        self.actor_config = config
+        _node = self.node
+        if _node is not None:
+            Session(self.me, actself, self.lower, self.db).recompute()
 
     def finalize(self, tid):
         #print('####', tid, '(_TransformTransaction)', _format_path(self.path), 'finalize', actorid(), err=True)
@@ -3382,6 +3433,7 @@ class _TransformTransaction(_TransformTransactionBase):
             self.delivered_conf = None
             self.delivered_linked = None
             self.delivered_memory = None
+            self.actor_config = None
             self.function.shutdown(self.memory)
 
 class TransformFunction(object):
@@ -3424,6 +3476,20 @@ class TransformFunction(object):
             inst = actgen()
             self.actinst = inst
             inst.shutdown(memory)
+
+
+def DirectTransform(act: proc(TransformActorParams) -> TransformActor, build_links: ?proc(gdata.Node) -> list[TaggedPath]=None, lower: ?Layer=None, log_handler: ?logging.Handler=None) -> proc(Path, ?Layer)->Node:
+    """Create a transform node whose actor writes the configuration output.
+
+    The node runs no transform function. Each transaction of the node outputs
+    the last configuration that the actor sent with update_config.
+    """
+    proc def _create_direct_transform_node(path, lower):
+        transform = _Transform(path, TransformFunction, build_links, lower, log_handler, True)
+        node = Node(transform)
+        transform.init_actor(node, act)
+        return node
+    return _create_direct_transform_node
 
 
 ################# RFSTransform ###################
@@ -3536,7 +3602,7 @@ class _RFSTransaction(_TransformTransactionBase):
             return
         _TransformTransactionBase.restore(self, attr, qualifier, raw)
 
-    proc def init_actor(self, node, act: proc(TransformActorParams) -> TransformActor, update_dynstate, update_oper):
+    proc def init_actor(self, node, act: proc(TransformActorParams) -> TransformActor, update_dynstate, update_oper, update_config):
         self.node = node
         self.function.init_actor(lambda: act(TransformActorParams(self.path, update_dynstate, update_oper, self.dev, lower=None)))
 

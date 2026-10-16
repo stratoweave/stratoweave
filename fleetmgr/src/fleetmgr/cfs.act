@@ -555,22 +555,38 @@ def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory
     return o
 
 
-class UpgradeCampaign(base.UpgradeCampaign):
-    def transform(self, i, linked, dynstate):
-        """Actuate exactly the released set.
-
-        Every campaign is paced: the companion actor plans against the
-        clock, decides which placed devices are released, and writes the
-        decision as dynstate. The released list is the whole decision,
-        so this function stays pure and needs no clock: it actuates the
-        released members and nothing else - a device never starts before
-        the controller says so.
-        """
-        released: set[str] = set()
-        if dynstate is not None:
-            for name in dynstate.released:
-                released.add(name)
-        return campaign_config(i, y_0.root.from_gdata(linked), released)
+def resume(config: ?ygdata.Node, oper: ?ygdata.Node) -> (released: set[str], released_at: dict[str, int],
+                                                         released_in: dict[str, (str, int, int)],
+                                                         done_at: dict[str, int]):
+    """Return the release bookkeeping of a run from the last configuration
+    and oper output of the campaign. The configuration names the released
+    devices. The oper plan gives the window, the start and the finish of
+    each released device."""
+    released: set[str] = set()
+    released_at: dict[str, int] = {}
+    released_in: dict[str, (str, int, int)] = {}
+    done_at: dict[str, int] = {}
+    if config is not None:
+        o = y_1_loose.root.from_gdata(config)
+        for shard in o.rfs:
+            for dev in shard.device:
+                released.add(dev.name)
+        for dev in o.device:
+            released.add(dev.name)
+    if oper is not None:
+        plan = y0_oper.software__software__upgrade_campaign_entry.from_gdata(oper).state.plan
+        for win in plan.window:
+            e = win.end
+            wend = int(e) if e is not None else OPEN_END
+            for pd in win.device:
+                started = pd.started
+                if pd.name in released and started is not None:
+                    released_at[pd.name] = int(started)
+                    released_in[pd.name] = (win.schedule, int(win.start), wend)
+                    finished = pd.finished
+                    if finished is not None:
+                        done_at[pd.name] = int(finished)
+    return (released=released, released_at=released_at, released_in=released_in, done_at=done_at)
 
 
 def imax(a: int, b: int) -> int:
@@ -578,9 +594,11 @@ def imax(a: int, b: int) -> int:
 
 
 actor UpgradeCampaignTransform(path: ttt.Path,
-                               update_dynstate: proc(?y_0.software__software__upgrade_campaign__dynstate) -> None,
+                               update_config: proc(ygdata.Node) -> None,
                                update_oper: proc(?y0_oper.software__software__upgrade_campaign_entry) -> None,
-                               lower_tree_provider: ?ygdata.TreeProvider):
+                               lower_tree_provider: ?ygdata.TreeProvider,
+                               last_config_output: ?ygdata.Node,
+                               last_oper_output: ?ygdata.Node):
     """Aggregate device telemetry and control the release of the plan.
 
     The actor plans for itself from the campaign and runs the core
@@ -589,8 +607,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     firing decides once for the whole batch; window openings and the
     projected shortfall crossing get exact timers of their own. Releases
     start small and double as upgrades complete. The actor writes the
-    decision as dynstate for the transform to actuate, and also sends the
-    configuration of the released devices directly.
+    configuration of the released devices as the output of the campaign.
+    After a restart, the actor resumes the run from its last outputs.
     """
     var members: list[str] = []
     var member_names: set[str] = set()
@@ -624,23 +642,20 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var campaign: ?y_0.software__software__upgrade_campaign_entry = None
     var inventory = y_0.root()
     var config: ygdata.Node = base.o_root().to_gdata()
-
-    def send_config(conf: ygdata.Node) -> None:
-        """Send conf to TTT as the configuration output of this transform.
-        TTT has no direct configuration output yet, so this does nothing."""
-        # TODO: replace with a callback that TTT gives the actor.
-        pass
+    # The release bookkeeping of the run before a restart. The first
+    # on_conf takes it over when the campaign runs.
+    var resumed = resume(last_config_output, last_oper_output)
 
     def patch_config(names: set[str]) -> None:
         """Patch the configuration of the devices in names into config and
-        send config."""
+        write config."""
         current = campaign
         if current is not None:
             patched = ygdata.patch(config, campaign_config(current, inventory, names).to_gdata())
             # None is an empty result: config stays empty.
             if patched is not None:
                 config = patched
-            send_config(config)
+            update_config(config)
 
     def publish() -> None:
         oper = base.UpgradeCampaign.new_state(path)
@@ -850,8 +865,6 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                     fresh.add(name)
                 idx += 1
         if len(fresh) > 0:
-            update_dynstate(y_0.software__software__upgrade_campaign__dynstate(
-                released=sorted(list(released))))
             patch_config(fresh)
         if next_edge >= 0:
             delay = float(next_edge - t)
@@ -895,18 +908,20 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         inventory = y_0.root.from_gdata(linked)
         run_now = conf.admin_state == "run"
         if run_now and not running:
-            released = set()
-            released_at = {}
-            released_in = {}
-            done_at = {}
+            # Empty for a new run; after a restart, the run that was going on.
+            released = resumed.released
+            released_at = resumed.released_at
+            released_in = resumed.released_in
+            done_at = resumed.done_at
             observed_s = estimated_duration(conf, inventory)
             rung = 1
             rung_target = 1
             alarmed = False
             controller_alarms = []
+        resumed = resume(None, None)
         running = run_now
         config = campaign_config(conf, inventory, released).to_gdata()
-        send_config(config)
+        update_config(config)
 
         # Released devices keep their window and real times in the replan.
         layout, alarms = plan_campaign(conf, inventory, time.time().unix_s(),
