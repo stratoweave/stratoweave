@@ -344,6 +344,23 @@ export interface Campaign {
   deviceStatus: DeviceStatusRow[];
 }
 
+/** The published half of a campaign: counters, plan and one row per
+ * member. */
+type CampaignState = Pick<Campaign, 'counters' | 'plan' | 'deviceStatus'>;
+
+/** A campaign without its published state. */
+export type CampaignConfig = Omit<Campaign, keyof CampaignState>;
+
+/** A campaign's published state as read, before it is joined with the
+ * member list: what the plan places, and one row per device it reports. */
+export interface StateParts {
+  counters: CampaignCounters | null;
+  windows: PlanWindow[];
+  alarms: string[];
+  placed: Set<string>;
+  rows: Map<string, DeviceStatusRow>;
+}
+
 // ── Parsing ──
 
 function firstAddress(entry: { address?: AddressJson[] }): string {
@@ -402,10 +419,21 @@ function num(value: unknown): number {
   return typeof n === 'number' && Number.isFinite(n) ? n : 0;
 }
 
-function parsePlan(state: CampaignStateJson | undefined, members: string[]): CampaignPlan | null {
-  if (!state) {
-    return null;
-  }
+function parseRow(row: DeviceStatusJson): DeviceStatusRow {
+  const raw = row.status ?? 'unknown';
+  return {
+    device: row.device,
+    status: normalizeStatus(raw),
+    raw,
+    runningRelease: row['running-release'] ?? '',
+    stage: parseStage(row.stage),
+    reason: row.reason ?? '',
+    precheck: parseCheck(row.precheck),
+    postcheck: parseCheck(row.postcheck)
+  };
+}
+
+function parseStateParts(state: CampaignStateJson): StateParts {
   const windows = (state.plan?.window ?? []).map((w) => ({
     start: num(w.start),
     end: w.end == null ? null : num(w.end),
@@ -419,68 +447,62 @@ function parsePlan(state: CampaignStateJson | undefined, members: string[]): Cam
     }))
   }));
   windows.sort((a, b) => a.start - b.start);
-  const placed = new Set(windows.flatMap((w) => w.devices.map((d) => d.name)));
-  return {
-    windows,
-    alarms: (state.plan?.alarm ?? []).filter((a) => !a.startsWith('unplannable: ')),
-    unplaced: members.filter((m) => !placed.has(m)).sort((a, b) => a.localeCompare(b))
-  };
-}
-
-/** The published half of a campaign: counters, plan and one row per
- * member. */
-type CampaignState = Pick<Campaign, 'counters' | 'plan' | 'deviceStatus'>;
-
-function parseState(state: CampaignStateJson | undefined, members: string[]): CampaignState {
-  const reported = new Map<string, DeviceStatusJson>();
-  for (const row of state?.['device-status'] ?? []) {
-    reported.set(row.device, row);
+  const rows = new Map<string, DeviceStatusRow>();
+  for (const row of state['device-status'] ?? []) {
+    rows.set(row.device, parseRow(row));
   }
-  // Configured members joined with reported rows; a member the state does
-  // not mention yet renders as unknown.
-  const memberSet = new Set(members);
-  const names = [...members, ...[...reported.keys()].filter((device) => !memberSet.has(device))];
   return {
     counters: parseCounters(state),
-    plan: parsePlan(state, members),
-    deviceStatus: names.map((device) => {
-      const row = reported.get(device);
-      const raw = row?.status ?? 'unknown';
-      return {
-        device,
-        status: normalizeStatus(raw),
-        raw,
-        runningRelease: row?.['running-release'] ?? '',
-        stage: parseStage(row?.stage),
-        reason: row?.reason ?? '',
-        precheck: parseCheck(row?.precheck),
-        postcheck: parseCheck(row?.postcheck)
-      };
-    })
+    windows,
+    alarms: (state.plan?.alarm ?? []).filter((a) => !a.startsWith('unplannable: ')),
+    placed: new Set(windows.flatMap((w) => w.devices.map((d) => d.name))),
+    rows
   };
 }
 
-function parseCampaign(entry: CampaignJson): Campaign {
-  const members = (entry.device ?? []).map((m) => m.name);
+/** The state joined with the members: one row per member, then the
+ * devices it reports that are not members; a member it does not mention
+ * yet renders as unknown. No state, no plan and no counters. */
+export function joinState(parts: StateParts | null, members: string[]): CampaignState {
+  const memberSet = new Set(members);
+  const extra = parts === null ? [] : [...parts.rows.keys()].filter((device) => !memberSet.has(device));
+  return {
+    counters: parts?.counters ?? null,
+    plan:
+      parts === null
+        ? null
+        : {
+            windows: parts.windows,
+            alarms: parts.alarms,
+            unplaced: members.filter((m) => !parts.placed.has(m)).sort((a, b) => a.localeCompare(b))
+          },
+    deviceStatus: [...members, ...extra].map((device) => parts?.rows.get(device) ?? parseRow({ device }))
+  };
+}
+
+function parseCampaignConfig(entry: CampaignJson): CampaignConfig {
   return {
     name: entry.name,
     targetRelease: entry['target-release'] ?? '',
-    devices: members,
+    devices: (entry.device ?? []).map((m) => m.name),
     imageUrl: entry['image-url'] ?? '',
     adminState: entry['admin-state'] === 'run' ? 'run' : 'plan',
     defaultSchedule: entry['default-schedule'] ?? '',
     deadline: typeof entry.deadline === 'number' ? entry.deadline : null,
     targetRate: entry['target-rate'] ?? DEFAULT_TARGET_RATE,
-    maxRate: entry['max-rate'] ?? DEFAULT_MAX_RATE,
-    ...parseState(entry.state, members)
+    maxRate: entry['max-rate'] ?? DEFAULT_MAX_RATE
   };
 }
 
-/** Parse a GET of one campaign's state node onto the campaign it belongs
- * to; null when the campaign has published nothing yet (404). */
-export function parseCampaignState(json: unknown, campaign: Campaign): Campaign | null {
+function parseCampaign(entry: CampaignJson): Campaign {
+  const config = parseCampaignConfig(entry);
+  return { ...config, ...joinState(entry.state ? parseStateParts(entry.state) : null, config.devices) };
+}
+
+/** Parse a GET of one campaign's state node; null when there is none. */
+export function parseStateNode(json: unknown): StateParts | null {
   const state = (json as { 'software:state'?: CampaignStateJson })?.['software:state'];
-  return state ? { ...campaign, ...parseState(state, campaign.devices) } : null;
+  return state ? parseStateParts(state) : null;
 }
 
 /** Parse a GET of data/fleetmgr:fleet (never poll data/ itself: it also
@@ -521,9 +543,11 @@ export function parseDeviceEntry(json: unknown): Device | null {
   return entries && entries.length > 0 ? parseDevice(entries[0]) : null;
 }
 
-export function parseCampaignEntry(json: unknown): Campaign | null {
-  const entries = (json as CampaignEntryJson)?.['software:upgrade-campaign'];
-  return entries && entries.length > 0 ? parseCampaign(entries[0]) : null;
+/** Parse a GET of one campaign entry: its config, and its state when the
+ * GET asked for it and the campaign has published one. */
+export function parseCampaignEntry(json: unknown): { config: CampaignConfig; state: StateParts | null } | null {
+  const entry = (json as CampaignEntryJson)?.['software:upgrade-campaign']?.[0];
+  return entry ? { config: parseCampaignConfig(entry), state: entry.state ? parseStateParts(entry.state) : null } : null;
 }
 
 // ── Patch builders ──

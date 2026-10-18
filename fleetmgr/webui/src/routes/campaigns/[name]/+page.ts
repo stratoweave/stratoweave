@@ -1,12 +1,8 @@
 import { errorText } from '$lib/core/errors';
-import { getListEntryPath, restconfGetJson, restconfGetOrNull } from '$lib/core/restconf/client';
-import {
-  CAMPAIGN_LIST_ROOT,
-  SCHEDULES_ROOT,
-  parseCampaignEntry,
-  parseSchedules,
-  type Schedule
-} from '$lib/software/model';
+import { nextSeq } from '$lib/core/polling/poller';
+import { restconfGetJson } from '$lib/core/restconf/client';
+import { fetchCampaignEntry } from '$lib/software/counters';
+import { SCHEDULES_ROOT, parseSchedules, type Schedule } from '$lib/software/model';
 
 import type { PageLoad } from './$types';
 
@@ -22,15 +18,14 @@ async function loadSchedules(fetch: typeof globalThis.fetch): Promise<Schedule[]
 
 export const load: PageLoad = async ({ fetch, depends, params }) => {
   depends('data:campaign');
+  const seq = nextSeq();
 
   try {
-    const [response, schedules] = await Promise.all([
-      restconfGetOrNull<unknown>(getListEntryPath(CAMPAIGN_LIST_ROOT, params.name), fetch),
-      loadSchedules(fetch)
-    ]);
-    return { name: params.name, campaign: parseCampaignEntry(response), schedules, loadError: '' };
+    const [entry, schedules] = await Promise.all([fetchCampaignEntry(params.name, false, fetch), loadSchedules(fetch)]);
+    return { name: params.name, seq, config: entry?.config ?? null, state: entry?.state ?? null, schedules, loadError: '' };
   } catch (loadError) {
+    // config undefined: unknown, unlike null for no such campaign.
     const message = errorText(loadError, 'Failed to load the campaign.');
-    return { name: params.name, campaign: null, schedules: [] as Schedule[], loadError: message };
+    return { name: params.name, seq, config: undefined, state: null, schedules: [] as Schedule[], loadError: message };
   }
 };

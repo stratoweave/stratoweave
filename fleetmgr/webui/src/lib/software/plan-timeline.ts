@@ -2,9 +2,15 @@
 // and inside each window one cell per device in a column at its start,
 // real once released, estimated before. Pure functions over the parsed
 // plan; the component draws what comes out.
+//
+// The work splits by what it depends on, so clock ticks and status polls
+// stay cheap: devices are sorted once per plan change, the geometry (axis,
+// lanes, columns) is redone when the plan's times, the width or the zoom
+// change, colours when statuses change, and the clock only moves the
+// marker.
 
 import { CELL_COLOR, gutter } from './cells';
-import { deviceDuration, deviceStart, type KnownStatus, type PlanWindow } from './model';
+import { deviceDuration, deviceStart, type KnownStatus, type PlanDevice, type PlanWindow } from './model';
 
 const HOUR = 3600;
 
@@ -26,6 +32,84 @@ export function windowEnd(w: PlanWindow): number {
   let last = w.start;
   for (const d of w.devices) last = Math.max(last, deviceStart(d) + deviceDuration(d));
   return Math.max(w.start + 60, last + Math.max(60, Math.round((last - w.start) * 0.05)));
+}
+
+function sameDevice(a: PlanDevice, b: PlanDevice): boolean {
+  return (
+    a.name === b.name &&
+    a.estimatedStart === b.estimatedStart &&
+    a.estimatedDuration === b.estimatedDuration &&
+    a.started === b.started &&
+    a.finished === b.finished
+  );
+}
+
+/** Whether two plans hold the same devices at the same times, which is
+ * all the geometry is built from. */
+export function sameWindows(a: PlanWindow[], b: PlanWindow[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const wa = a[i];
+    const wb = b[i];
+    if (
+      wa.start !== wb.start ||
+      wa.end !== wb.end ||
+      wa.schedule !== wb.schedule ||
+      wa.devices.length !== wb.devices.length
+    ) {
+      return false;
+    }
+    for (let j = 0; j < wa.devices.length; j++) {
+      if (!sameDevice(wa.devices[j], wb.devices[j])) return false;
+    }
+  }
+  return true;
+}
+
+/** Returns the windows it is given, or the ones it returned last when
+ * those are the same: every state poll parses a new plan, and only one
+ * whose times changed should rebuild the geometry. */
+export function holdWindows(): (windows: PlanWindow[]) => PlanWindow[] {
+  let held: PlanWindow[] | null = null;
+  return (windows) => {
+    if (held === null || !sameWindows(held, windows)) held = windows;
+    return held;
+  };
+}
+
+export interface OrderedWindow {
+  w: PlanWindow;
+  /** windowEnd(w). */
+  end: number;
+  /** The devices in the order cells fill: by start, then name. */
+  devices: PlanDevice[];
+  /** Each device's start, in that order. */
+  starts: Float64Array;
+}
+
+const byName = new Intl.Collator().compare;
+
+/** The windows by start, each with its devices sorted once; every cell
+ * size and zoom tried afterwards walks this order. */
+export function orderWindows(windows: PlanWindow[]): OrderedWindow[] {
+  return [...windows]
+    .sort((a, b) => a.start - b.start)
+    .map((w) => {
+      const keyed = w.devices.map((d) => ({ d, start: deviceStart(d) }));
+      keyed.sort((a, b) => a.start - b.start || byName(a.d.name, b.d.name));
+      return {
+        w,
+        end: windowEnd(w),
+        devices: keyed.map((k) => k.d),
+        starts: Float64Array.from(keyed, (k) => k.start)
+      };
+    });
+}
+
+export interface Span {
+  start: number;
+  end: number;
 }
 
 export interface Segment {
@@ -52,11 +136,10 @@ export interface Axis {
   xOf: (t: number) => number;
 }
 
-/** Merge overlapping or touching spans. `now` is always a span, so the
- * axis holds the marker even before the first window opens. */
-function merge(spans: { start: number; end: number }[], now: number): { start: number; end: number }[] {
-  const sorted = [{ start: now, end: now }, ...spans].sort((a, b) => a.start - b.start || a.end - b.end);
-  const out: { start: number; end: number }[] = [];
+/** Merge overlapping or touching spans. */
+function merge(spans: Span[]): Span[] {
+  const sorted = [...spans].sort((a, b) => a.start - b.start || a.end - b.end);
+  const out: Span[] = [];
   for (const s of sorted) {
     const last = out[out.length - 1];
     if (last && s.start <= last.end) last.end = Math.max(last.end, s.end);
@@ -65,16 +148,33 @@ function merge(spans: { start: number; end: number }[], now: number): { start: n
   return out;
 }
 
+/** How long a stretch the axis keeps for now when no window holds it: a
+ * fiftieth of the windows' time, a minute to an hour, so the marker
+ * crosses about 2% of the axis before the axis moves on. */
+export function anchorStep(spans: Span[]): number {
+  const total = merge(spans).reduce((acc, s) => acc + s.end - s.start, 0);
+  return Math.min(HOUR, Math.max(60, Math.round(total / 50)));
+}
+
+/** Where the axis's stretch for now starts: null while a window holds now,
+ * else now rounded down to `step`. It changes once per step, so a clock
+ * ticking inside it leaves the axis as it is. */
+export function nowAnchor(spans: Span[], now: number, step: number): number | null {
+  for (const s of spans) {
+    if (s.start <= now && now <= s.end) return null;
+  }
+  return Math.floor(now / step) * step;
+}
+
+/** The spans the axis covers: the windows, and the stretch for now. */
+export function axisSpans(spans: Span[], anchor: number | null, step: number): Span[] {
+  return anchor === null ? spans : [...spans, { start: anchor, end: anchor + step }];
+}
+
 /** Scale (px per hour) that fits everything into `width`. Gaps count as
  * breaks first; a second pass keeps the short ones at true scale. */
-export function fitScale(
-  spans: { start: number; end: number }[],
-  now: number,
-  width: number,
-  padLeft: number,
-  padRight: number
-): number {
-  const merged = merge(spans, now);
+export function fitScale(spans: Span[], width: number, padLeft: number, padRight: number): number {
+  const merged = merge(spans);
   const hours = merged.reduce((acc, s) => acc + (s.end - s.start) / HOUR, 0);
   const gaps = merged.slice(1).map((s, i) => (s.start - merged[i].end) / HOUR);
   const room = Math.max(120, width - padLeft - padRight);
@@ -91,14 +191,8 @@ export function fitScale(
   return Math.max(1, scale);
 }
 
-export function buildAxis(
-  spans: { start: number; end: number }[],
-  now: number,
-  pxPerHour: number,
-  padLeft: number,
-  padRight: number
-): Axis {
-  const merged = merge(spans, now);
+export function buildAxis(spans: Span[], pxPerHour: number, padLeft: number, padRight: number): Axis {
+  const merged = merge(spans);
   const segments: Segment[] = [];
   const breaks: Break[] = [];
   let x = padLeft;
@@ -139,48 +233,46 @@ export function buildAxis(
 
 export interface Placed {
   w: PlanWindow;
-  end: number;
+  /** The window's devices in fill order, and each one's x at its start. */
+  devices: PlanDevice[];
+  xs: Float64Array;
   x: number;
   xEnd: number;
   lane: number;
 }
 
-/** Windows in start order, stacked into lanes so overlapping ones sit
+/** Windows, in start order, stacked into lanes so overlapping ones sit
  * above each other; a lane's windows are at least minGap px apart. */
-export function assignLanes(windows: PlanWindow[], axis: Axis, minGap: number): Placed[] {
+export function assignLanes(windows: OrderedWindow[], axis: Axis, minGap: number): Placed[] {
   const laneEnds: number[] = [];
-  return [...windows]
-    .sort((a, b) => a.start - b.start)
-    .map((w) => {
-      const end = windowEnd(w);
-      const x = axis.xOf(w.start);
-      const xEnd = axis.xOf(end);
-      let lane = laneEnds.findIndex((e) => e + minGap <= x);
-      if (lane === -1) {
-        lane = laneEnds.length;
-        laneEnds.push(xEnd);
-      } else {
-        laneEnds[lane] = xEnd;
-      }
-      return { w, end, x, xEnd, lane };
-    });
+  return windows.map((o) => {
+    const x = axis.xOf(o.w.start);
+    const xEnd = axis.xOf(o.end);
+    let lane = laneEnds.findIndex((e) => e + minGap <= x);
+    if (lane === -1) {
+      lane = laneEnds.length;
+      laneEnds.push(xEnd);
+    } else {
+      laneEnds[lane] = xEnd;
+    }
+    const xs = new Float64Array(o.starts.length);
+    for (let i = 0; i < xs.length; i++) xs[i] = Math.round(axis.xOf(o.starts[i]));
+    return { w: o.w, devices: o.devices, xs, x, xEnd, lane };
+  });
 }
 
 export interface Column {
-  /** Pixel x of the column; its cells share one start. */
+  /** Pixel x of the column. */
   x: number;
-  start: number;
+  /** The column holds devices[first] to devices[first + count - 1] of its
+   * window, top to bottom. */
+  first: number;
   count: number;
 }
 
-export interface Cell {
-  name: string;
-  col: number;
-  row: number;
-}
-
 export interface WindowCells {
-  cells: Cell[];
+  /** The window's devices in fill order. */
+  devices: PlanDevice[];
   cols: Column[];
   /** Rows in the tallest column. */
   rows: number;
@@ -189,36 +281,66 @@ export interface WindowCells {
   displaced: number;
 }
 
+function rowsCap(size: number, pitch: number, maxStack: number): number {
+  return Math.max(1, Math.floor((maxStack + gutter(size)) / pitch));
+}
+
 /** Cells for one window: a column opens at a device's start and takes
- * every later start that falls within one pitch of it, so
- * starts a cell's width apart share a column instead of overlapping. A
- * full column spills into the next, so a crowded window degrades into a
- * packed fill instead of growing without bound. */
-function layoutCells(p: Placed, axis: Axis, size: number, pitch: number, rowsCap: number): WindowCells {
+ * every later start that falls within one pitch of it, so starts a cell's
+ * width apart share a column instead of overlapping. A full column spills
+ * into the next, so a crowded window degrades into a packed fill instead
+ * of growing without bound. */
+function layoutCells(p: Placed, size: number, pitch: number, cap: number): WindowCells {
   const maxX = p.xEnd - WINDOW_GAP - size;
-  const devices = [...p.w.devices].sort(
-    (a, b) => deviceStart(a) - deviceStart(b) || a.name.localeCompare(b.name)
-  );
-  const cells: Cell[] = [];
   const cols: Column[] = [];
   let rows = 0;
   let displaced = 0;
   let col: Column | null = null;
-  for (const d of devices) {
-    const start = deviceStart(d);
-    const wanted = Math.max(p.x, Math.min(maxX, Math.round(axis.xOf(start))));
-    if (col === null || wanted >= col.x + pitch || col.count >= rowsCap) {
-      const prevX: number | null = col === null ? null : col.x;
-      const x: number = prevX === null ? wanted : Math.max(wanted, prevX + pitch);
+  for (let i = 0; i < p.xs.length; i++) {
+    const wanted = Math.max(p.x, Math.min(maxX, p.xs[i]));
+    if (col === null || wanted >= col.x + pitch || col.count >= cap) {
+      const x: number = col === null ? wanted : Math.max(wanted, col.x + pitch);
       if (x !== wanted) displaced++;
-      col = { x, start, count: 0 };
+      col = { x, first: i, count: 0 };
       cols.push(col);
     }
-    cells.push({ name: d.name, col: cols.length - 1, row: col.count });
     col.count++;
     if (col.count > rows) rows = col.count;
   }
-  return { cells, cols, rows, displaced };
+  return { devices: p.devices, cols, rows, displaced };
+}
+
+/** layoutCells' walk without building anything: whether some device
+ * would be displaced at this size. */
+function displaces(p: Placed, size: number, pitch: number, cap: number): boolean {
+  const maxX = p.xEnd - WINDOW_GAP - size;
+  let open = false;
+  let colX = 0;
+  let count = 0;
+  for (let i = 0; i < p.xs.length; i++) {
+    const wanted = Math.max(p.x, Math.min(maxX, p.xs[i]));
+    if (!open || wanted >= colX + pitch || count >= cap) {
+      if (open && wanted < colX + pitch) return true;
+      open = true;
+      colX = wanted;
+      count = 0;
+    }
+    count++;
+  }
+  return false;
+}
+
+/** The largest cell from MAX_SIZE down whose columns stay under maxStack
+ * px with no device displaced; failing that, the smallest cell, with
+ * spills. Columns open at a device's own start, so evenly spaced rounds
+ * merge evenly at any size. */
+export function fitCellSize(placed: Placed[], maxStack: number): number {
+  for (let size = MAX_SIZE; size >= MIN_SIZE; size--) {
+    const pitch = size + gutter(size);
+    const cap = rowsCap(size, pitch, maxStack);
+    if (!placed.some((p) => displaces(p, size, pitch, cap))) return size;
+  }
+  return MIN_SIZE;
 }
 
 export interface CellLayout {
@@ -227,20 +349,55 @@ export interface CellLayout {
   windows: WindowCells[];
 }
 
-/** The largest cell from MAX_SIZE down whose columns stay under maxStack
- * px; failing that, the smallest cell with spills. Columns open at a
- * device's own start, so evenly spaced rounds merge evenly at any size. */
-export function chooseCells(placed: Placed[], axis: Axis, maxStack: number): CellLayout {
-  let fallback: CellLayout | null = null;
-  for (let size = MAX_SIZE; size >= MIN_SIZE; size--) {
-    const pitch = size + gutter(size);
-    const rowsCap = Math.max(1, Math.floor((maxStack + gutter(size)) / pitch));
-    const windows = placed.map((p) => layoutCells(p, axis, size, pitch, rowsCap));
-    const layout = { size, pitch, windows };
-    if (windows.every((w) => w.displaced === 0)) return layout;
-    fallback = layout;
+export function layoutAt(placed: Placed[], size: number, maxStack: number): CellLayout {
+  const pitch = size + gutter(size);
+  const cap = rowsCap(size, pitch, maxStack);
+  return { size, pitch, windows: placed.map((p) => layoutCells(p, size, pitch, cap)) };
+}
+
+export interface Fit {
+  axis: Axis;
+  placed: Placed[];
+  /** The cell size this zoom gives. */
+  size: number;
+}
+
+/** Fits of the windows into `width`, one per zoom, made when first asked
+ * for and kept: picking the zoom tries several, and the chosen one is
+ * then laid out without trying it again. */
+export function fitter(
+  windows: OrderedWindow[],
+  spans: Span[],
+  width: number,
+  padLeft: number,
+  padRight: number,
+  maxStack: number
+): (zoom: number) => Fit {
+  const scale = fitScale(spans, width, padLeft, padRight);
+  const fits = new Map<number, Fit>();
+  return (zoom) => {
+    let fit = fits.get(zoom);
+    if (fit === undefined) {
+      const axis = buildAxis(spans, scale * zoom, padLeft, padRight);
+      const placed = assignLanes(windows, axis, WINDOW_GAP);
+      fit = { axis, placed, size: fitCellSize(placed, maxStack) };
+      fits.set(zoom, fit);
+    }
+    return fit;
+  };
+}
+
+/** The least zoom whose cells are at least `readable` px; a crowded plan
+ * can stay small at every zoom, then the least zoom with the largest
+ * cells, so zooming in never costs the overview for nothing. */
+export function pickZoom(zooms: number[], readable: number, fit: (zoom: number) => Fit): number {
+  let best = { zoom: zooms[0], size: 0 };
+  for (const zoom of zooms) {
+    const size = fit(zoom).size;
+    if (size >= readable) return zoom;
+    if (size > best.size) best = { zoom, size };
   }
-  return fallback ?? { size: MIN_SIZE, pitch: MIN_SIZE + 1, windows: [] };
+  return best.zoom;
 }
 
 export interface Rect {
@@ -252,8 +409,7 @@ export interface Rect {
 }
 
 /** Cells of one window as rects, vertical runs of one colour collapsed;
- * the row gutter pattern re-cuts them into cells. Cells arrive column by
- * column, rows ascending. */
+ * the row gutter pattern re-cuts them into cells. */
 export function cellRects(
   layout: WindowCells,
   statuses: Map<string, KnownStatus>,
@@ -262,20 +418,17 @@ export function cellRects(
   pitch: number
 ): Rect[] {
   const out: Rect[] = [];
-  let run: Rect | null = null;
-  let runCol = -1;
-  let runRow = -1;
-  for (const c of layout.cells) {
-    const fill = CELL_COLOR[statuses.get(c.name) ?? 'pending'];
-    if (run && c.col === runCol && c.row === runRow + 1 && run.fill === fill) {
-      run.h += pitch;
-      runRow = c.row;
-      continue;
+  for (const col of layout.cols) {
+    let run: Rect | null = null;
+    for (let row = 0; row < col.count; row++) {
+      const fill = CELL_COLOR[statuses.get(layout.devices[col.first + row].name) ?? 'pending'];
+      if (run !== null && run.fill === fill) {
+        run.h += pitch;
+        continue;
+      }
+      run = { x: col.x, y: oy + row * pitch, w: size, h: size, fill };
+      out.push(run);
     }
-    run = { x: layout.cols[c.col].x, y: oy + c.row * pitch, w: size, h: size, fill };
-    out.push(run);
-    runCol = c.col;
-    runRow = c.row;
   }
   return out;
 }
@@ -292,6 +445,12 @@ export function columnAt(cols: Column[], x: number, size: number): number {
     else return mid;
   }
   return -1;
+}
+
+/** The device in column `col`, row `row` of a window, if there is one. */
+export function cellAt(layout: WindowCells, col: number, row: number): PlanDevice | null {
+  const c = layout.cols[col];
+  return c !== undefined && row >= 0 && row < c.count ? layout.devices[c.first + row] : null;
 }
 
 const TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400, 172800, 604800];

@@ -11,7 +11,7 @@
   import PlanTimeline from '$lib/software/PlanTimeline.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
   import { createPoller } from '$lib/core/polling/poller';
-  import { FAST_ENTRY_LIMIT, fetchCampaignState, fetchCounters } from '$lib/software/counters';
+  import { CampaignLive, FAST_MS, type LiveView } from '$lib/software/campaign-live';
   import {
     planningChanges,
     planningDraft,
@@ -22,7 +22,7 @@
     validatePlanningDraft,
     type PlanningDraft
   } from '$lib/software/planning-form';
-  import { RateTracker, formatEta } from '$lib/software/rate';
+  import { formatEta } from '$lib/software/rate';
   import { formatClock } from '$lib/core/time';
   import { nameMatcher } from '$lib/software/selection';
   import {
@@ -30,11 +30,9 @@
     DATA_ROOT,
     KNOWN_STATUSES,
     adminStatePatch,
+    joinState,
     maskUrlCredentials,
     unplacedText,
-    type Campaign,
-    type CampaignCounters,
-    type Schedule,
     type KnownStatus
   } from '$lib/software/model';
   import type { PageProps } from './$types';
@@ -56,91 +54,66 @@
   let filterStatus = $state<KnownStatus | ''>('');
   let searchText = $state('');
   let page = $state(1);
-  // Two tiers. The counters (four leaf GETs) refresh every 1.5 s at any
-  // campaign size. The state node (plan and per-device rows, ~150 B per
-  // member) refreshes every 1.5 s up to FAST_ENTRY_LIMIT members and
-  // every 12 s beyond, plus when failed moves. The loader snapshot carries
-  // the config and reloads on open and after this page's own writes.
-  let live = $state<Campaign | null>(null);
-  let liveCounters = $state<{ name: string; counters: CampaignCounters } | null>(null);
-  let lastFailed = -1;
-
-  /** Unix seconds, ticking, for the timeline's marker. */
-  let now = $state(Date.now() / 1000);
-
-  const tracker = new RateTracker();
-  let rate = $state<number | null>(null);
-  let eta = $state<number | null>(null);
-
-  async function refreshState(): Promise<void> {
-    const base = data.campaign;
-    // The state paths 404 until the campaign has published its first
-    // report; the fast tick reloads the snapshot until then.
-    if (base === null || base.counters === null) return;
-    const fresh = await fetchCampaignState(base);
-    if (fresh !== null) live = fresh;
-  }
-
-  onMount(() => {
-    const fast = createPoller(async () => {
-      const base = data.campaign;
-      if (base === null) return;
-      if (base.counters === null) {
-        // No state yet: an entry without state is small, so refresh the
-        // snapshot until the first report, so a new campaign's progress
-        // and plan do not wait for the slow tick.
-        void invalidate('data:campaign');
-        return;
-      }
-      try {
-        let c: CampaignCounters | null;
-        if (base.devices.length <= FAST_ENTRY_LIMIT) {
-          await refreshState();
-          c = live?.counters ?? null;
-        } else {
-          c = await fetchCounters(base.name);
-          liveCounters = c === null ? null : { name: base.name, counters: c };
-        }
-        if (c === null) return;
-        if (campaign?.adminState === 'run') {
-          tracker.push(c.succeeded + c.failed);
-          rate = tracker.ratePerMin();
-          const remaining = c.total - c.succeeded - c.failed;
-          eta = remaining > 0 ? tracker.etaMs(remaining) : null;
-        }
-        if (lastFailed !== -1 && c.failed !== lastFailed && base.devices.length > FAST_ENTRY_LIMIT) {
-          void refreshState();
-        }
-        lastFailed = c.failed;
-      } catch {
-        // keep the last state; the slow tick recovers
-      }
-    }, 1500);
-    const slow = createPoller(refreshState, 12000);
-    const clock = setInterval(() => (now = Date.now() / 1000), 1000);
-    fast.start();
-    slow.start();
-    return () => {
-      fast.stop();
-      slow.stop();
-      clearInterval(clock);
-    };
-  });
-
-  /** The fresh entry when there is one for this campaign, else the snapshot. */
-  let campaign = $derived(live !== null && live.name === data.name ? live : data.campaign);
-  let counters = $derived(
-    liveCounters !== null && liveCounters.name === data.name ? liveCounters.counters : (campaign?.counters ?? null)
-  );
-  let paceOpen = $derived(paceOpenChoice ?? campaign?.adminState === 'plan');
-  let statuses = $derived(
-    new Map<string, KnownStatus>((campaign?.deviceStatus ?? []).map((r) => [r.device, r.status]))
-  );
 
   // Schedule and pace: the fields follow the campaign until edited.
   let planningEdit = $state<PlanningDraft | null>(null);
   let planningSaving = $state(false);
   let planningMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  /** Unix seconds, ticking, for the timeline's marker. */
+  let now = $state(Date.now() / 1000);
+
+  // The loader's snapshot kept fresh by polling; campaign-live.ts decides
+  // what to read and which answers still count.
+  let view = $state.raw<LiveView | null>(null);
+  const live = new CampaignLive((v) => (view = v));
+
+  // Every load goes through it: open, navigation, Refresh and the reload
+  // after a write. Another campaign starts over, its form and filters too.
+  let shownName: string | null = null;
+  $effect.pre(() => {
+    live.load(data.name, data.seq, data.config, data.state);
+    if (data.name !== shownName) {
+      shownName = data.name;
+      actionError = '';
+      confirmAction = null;
+      devicesOpen = false;
+      paceOpenChoice = null;
+      unplacedOpen = false;
+      filterStatus = '';
+      searchText = '';
+      page = 1;
+      planningEdit = null;
+      planningMessage = null;
+    }
+  });
+
+  onMount(() => {
+    const poller = createPoller(() => live.tick(), FAST_MS);
+    const clock = setInterval(() => (now = Date.now() / 1000), 1000);
+    poller.start();
+    return () => {
+      poller.stop();
+      clearInterval(clock);
+      live.dispose();
+    };
+  });
+
+  let shown = $derived(view !== null && view.name === data.name ? view : null);
+  /** undefined while unknown (the load failed), null when there is no such campaign. */
+  let config = $derived(shown?.config);
+  let parts = $derived(shown?.state ?? null);
+  let campaign = $derived(config ? { ...config, ...joinState(parts, config.devices) } : null);
+  let counters = $derived(shown?.counters ?? null);
+  let rate = $derived(shown?.rate ?? null);
+  let eta = $derived(shown?.eta ?? null);
+  // A failed load stops showing once a later read got through.
+  let loadError = $derived((shown?.seq ?? 0) > data.seq ? '' : data.loadError);
+  let paceOpen = $derived(paceOpenChoice ?? campaign?.adminState === 'plan');
+  let statuses = $derived(
+    new Map<string, KnownStatus>((campaign?.deviceStatus ?? []).map((r) => [r.device, r.status]))
+  );
+
   let savedPlanning = $derived(campaign ? planningOf(campaign) : null);
   let savedDraft = $derived(savedPlanning ? planningDraft(savedPlanning) : null);
   let planningForm = $derived(planningEdit ?? savedDraft);
@@ -167,8 +140,7 @@
       planningSaving = true;
       planningMessage = null;
       await saveCampaignPlanning(data.name, savedPlanning, planningFromDraft(planningForm));
-      live = null;
-      liveCounters = null;
+      live.wrote();
       await invalidate('data:campaign');
       planningEdit = null;
       planningMessage = { type: 'success', text: 'Saved.' };
@@ -276,15 +248,14 @@
       actionError = '';
       if (action === 'delete') {
         await restconfDelete(getListEntryPath(CAMPAIGN_LIST_ROOT, data.name));
+        live.dispose();
         // Not a preload made before the delete.
         await goto('/campaigns', { invalidateAll: true });
         return;
       }
       await restconfPatchJson(DATA_ROOT, adminStatePatch(data.name, action));
-      // The fresh entry predates the change; the snapshot leads until the
-      // next fast tick.
-      live = null;
-      liveCounters = null;
+      // Reads still in flight may predate the change; the reload shows it.
+      live.wrote();
       await invalidate('data:campaign');
     } catch (error) {
       actionError = errorText(error, 'The action failed.');
@@ -294,14 +265,16 @@
   }
 </script>
 
-{#if actionError || data.loadError}
-  <div class="error-state status">{actionError || data.loadError}</div>
+{#if actionError || loadError}
+  <div class="error-state status">{actionError || loadError}</div>
 {/if}
 
 {#if campaign === null}
-  <section class="card">
-    <div class="empty-state">No campaign named {data.name}.</div>
-  </section>
+  {#if config === null}
+    <section class="card">
+      <div class="empty-state">No campaign named {data.name}.</div>
+    </section>
+  {/if}
 {:else}
   <div class="page-header">
     <div>
