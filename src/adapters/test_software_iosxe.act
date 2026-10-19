@@ -23,6 +23,7 @@ import yang
 import yang.gdata as ygdata
 
 import device as swdev
+import device_oper as swdevoper
 import adapters.netconf as swna
 import adapters.software_iosxe as swxe
 import adapters.software_iosxe_mock as swxemock
@@ -389,12 +390,30 @@ def _fast_adapter(dev: swdev.DeviceMgr, dmc: DeviceMetaConfig,
 
 
 def new_iosxe_mock_device_mgr(t: testing.EnvT, name: str,
-                              on_reconf: action(str) -> None) -> swdev.DeviceMgr:
+                              on_reconf: action(str) -> None,
+                              model: ?str=None) -> swdev.DeviceMgr:
+    """A mock IOS XE device. With `model`, a mock serving mock/hardware/model
+    is seeded on every connect, as the flotilla does; the upgrade tests attach
+    their own mock later."""
     schema = yang.compile(swxe_yang.models)
+
+    def adapter_with_mock(dev: swdev.DeviceMgr, dev_schema, dmc, registry,
+                          log_handler: logging.Handler,
+                          connect_cap: ?net.TCPConnectCap):
+        def seed_mock(server: swna.NetconfMockServer, cur: DeviceMetaConfig) -> None:
+            swxemock.IosXeSoftwareMock(server, log_handler,
+                                       model=cur.mock.hardware.model).attach()
+        if model is None:
+            return swna.NetconfAdapter(dev, dev_schema, dmc, registry,
+                                       log_handler, connect_cap)
+        return swna.NetconfAdapter(dev, dev_schema, dmc, registry,
+                                   log_handler, connect_cap,
+                                   on_mock_server=seed_mock)
+
     dev_types = {
         "iosxe": swdev.DeviceType(
             name="iosxe",
-            adapter_type=swna.NetconfAdapter,
+            adapter_type=adapter_with_mock,
             src_dnode=schema,
             oper_src_dnode=schema,
             software_adapter_type=_fast_adapter)
@@ -404,8 +423,88 @@ def new_iosxe_mock_device_mgr(t: testing.EnvT, name: str,
                           name, t.log_handler, on_reconf, swdev.SchemaRegistry())
     dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe")
     dmc.mock.enabled = True
+    m = model
+    if m is not None:
+        dmc.mock.hardware.model = m
     dev.set_dmc(dmc)
     return dev
+
+
+def _published_model(oper: ?ygdata.Node) -> ?str:
+    """The hardware model out of a published device entry oper tree."""
+    if oper is not None:
+        return swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).state.hardware.model
+    return None
+
+
+actor _test_iosxe_hardware_model_is_published_on_connect(t: testing.EnvT):
+    """The chassis the device serves is published on connect, with no
+    software intent involved."""
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if finished:
+            return
+        model = _published_model(oper)
+        if model is not None:
+            finished = True
+            try:
+                testing.assertEqual("C8000V", model,
+                                    "the model must be the chassis part-number")
+                t.success()
+            except Exception as e:
+                t.failure(e)
+
+    def report_timeout() -> None:
+        if not finished:
+            finished = True
+            t.failure(ValueError("timed out waiting for the hardware model"))
+
+    dev = new_iosxe_mock_device_mgr(t, "d-hw", on_reconf, model="C8000V")
+    dev.set_update_oper(on_state)
+    after 2.5: report_timeout()
+
+
+actor _test_iosxe_hardware_model_follows_a_reconnect(t: testing.EnvT):
+    """A change of mock/hardware/model reconnects the device, and the
+    published model follows."""
+    var dev_ref: ?swdev.DeviceMgr = None
+    var saw_model = False
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if finished:
+            return
+        model = _published_model(oper)
+        if not saw_model:
+            if model == "C8000V":
+                saw_model = True
+                dmc = DeviceMetaConfig("d-hw-re", Credentials("admin", "admin"),
+                                       type="iosxe")
+                dmc.mock.enabled = True
+                dmc.mock.hardware.model = "C8300-1N1S-4T2X"
+                d = dev_ref
+                if d is not None:
+                    d!.set_dmc(dmc)
+        elif model == "C8300-1N1S-4T2X":
+            finished = True
+            t.success()
+
+    def report_timeout() -> None:
+        if not finished:
+            finished = True
+            t.failure(ValueError("timed out, saw_model={saw_model}"))
+
+    d = new_iosxe_mock_device_mgr(t, "d-hw-re", on_reconf, model="C8000V")
+    dev_ref = d
+    d.set_update_oper(on_state)
+    after 2.5: report_timeout()
 
 
 actor _test_iosxe_upgrade_through_the_software_manager(t: testing.EnvT):
