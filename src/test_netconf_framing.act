@@ -304,3 +304,80 @@ actor _test_client_coalesces_back_to_back_restarts(t: testing.EnvT):
                             log_handler=log_handler,
                             pipe=pipes.client)
     after now 2.0: on_timeout()
+
+
+actor _test_client_keeps_message_ids_across_restarts(t: testing.EnvT):
+    """A late reply from the session before a restart does not answer a new RPC.
+
+    The server accepts a reply for the RPC that it runs. When the client
+    numbered the RPCs of each session from 1, a late reply to RPC 1 of the
+    session before answered RPC 1 of the new session.
+    """
+    pipes = netconf.actor_pipe_pair()
+    var client: ?netconf.Client = None
+    var held_id: ?str = None
+    var connects = 0
+    var done = False
+
+    def finish(error: ?Exception) -> None:
+        if done:
+            return
+        done = True
+        if error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    def on_first(c: netconf.Client, result: ?xml.Node,
+                 error: ?netconf.NetconfError) -> None:
+        if not isinstance(error, netconf.SessionClosedError):
+            finish(ValueError("Expected a SessionClosedError, got {error}"))
+
+    def on_second(c: netconf.Client, result: ?xml.Node,
+                  error: ?netconf.NetconfError) -> None:
+        if error is not None:
+            finish(error)
+        elif reply_value(result) != "fresh":
+            finish(ValueError("The new RPC got the reply of the session before"))
+        else:
+            finish(None)
+
+    def on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        old = held_id
+        if old is not None:
+            # The late reply to the RPC of the session before comes first
+            s.send_reply(old, data_reply("stale"))
+            s.send_reply(message_id, data_reply("fresh"))
+            return
+        held_id = message_id
+        cl = client
+        if cl is not None:
+            cl.restart()
+
+    def on_connect(c: netconf.Client, error: ?Exception) -> None:
+        if error is not None:
+            finish(error)
+            return
+        connects += 1
+        client = c
+        if connects == 1:
+            c.get(on_first)
+        else:
+            c.get(on_second)
+
+    def on_timeout() -> None:
+        finish(ValueError("Timed out waiting for the reply after the restart"))
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=on_server_rpc,
+                            log_handler=t.log_handler)
+    netconf.Client(None,
+                   address="actor-pipe",
+                   username="actor-pipe",
+                   key=None,
+                   password=None,
+                   port=0,
+                   on_connect=on_connect,
+                   on_notif=None,
+                   log_handler=t.log_handler,
+                   pipe=pipes.client)
+    after now 2.0: on_timeout()
