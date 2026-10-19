@@ -18,10 +18,14 @@ import adapters.netconf as swna
 import adapters.software_iosxe as swxe
 import adapters.software_iosxe_oper as ixoper
 
+from device_meta_config import stratoweave_rfs__device_entry as DeviceMetaConfig
+
 
 OLD_RELEASE = "17.18.02"
 NEW_REQUESTED = "17.18.03a"
 NEW_REPORTED = "17.18.3a"
+# The chassis a mock device reports when mock/hardware/model is absent.
+DEFAULT_MODEL = "C8000V"
 
 IMAGE_FILE = "c8000v-universalk9.17.18.03a.SPA.bin"
 IMAGE_URL = "scp://root:labpass@10.0.0.9:/images/" + IMAGE_FILE
@@ -100,6 +104,12 @@ def op_seconds(rpc: str, upgrade_duration: float) -> float:
     if upgrade_duration <= 0.0:
         return FAST
     return C8000V_SECONDS[rpc] * upgrade_duration / C8000V_UPGRADE_SECONDS
+
+
+def upgrade_seconds(dmc: DeviceMetaConfig) -> float:
+    """mock/software/upgrade-duration in seconds; absent means an instant upgrade."""
+    d = dmc.mock.software.upgrade_duration
+    return float(d!) if d is not None else 0.0
 
 
 def one_shot_seconds(upgrade_duration: float) -> float:
@@ -367,19 +377,23 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
     var last_one_shot: ?str = None
     var last_act_version: ?str = None
     var last_timer: ?str = None
+    # The knobs; reattach replaces them.
+    var _server: swna.NetconfMockServer = mock_server
+    var _duration: float = upgrade_duration
+    var _failure: str = failure
 
     if failure not in FAILURES:
         _log.error("IOS XE software mock: unknown failure, behaving as none",
                    {"failure": failure})
 
-    _inventory: list[ygdata.Node] = [chassis_entry(model!)] if model is not None else []
+    var _inventory: list[ygdata.Node] = [chassis_entry(model!)] if model is not None else []
 
     def _delay(rpc: str) -> float:
-        return delay_for(rpc, upgrade_duration, complete_after)
+        return delay_for(rpc, _duration, complete_after)
 
     def _one_shot_delay() -> float:
-        if upgrade_duration > 0.0:
-            return one_shot_seconds(upgrade_duration)
+        if _duration > 0.0:
+            return one_shot_seconds(_duration)
         return delay_for("install", 0.0, complete_after)
 
     def _publish() -> None:
@@ -389,8 +403,8 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         if a is not None and not swxe.releases_equal(a!, committed):
             vstates.append(version_state_info(
                 "install-version-state-provisioned-uncommitted", device_version(a!)))
-        mock_server.set_oper_ds(operational_datastore(
-            cur, history, vstates, bgp_up(failure, cur, committed),
+        _server.set_oper_ds(operational_datastore(
+            cur, history, vstates, bgp_up(_failure, cur, committed),
             inventory=_inventory))
 
     def _remember(record: ygdata.Node) -> None:
@@ -417,7 +431,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         rpcs = new
 
     def _finish_xcopy(uuid: str) -> None:
-        if failure == FAILURE_DOWNLOAD:
+        if _failure == FAILURE_DOWNLOAD:
             _fail(uuid, "1", _DOWNLOAD_STAGES, swxe.STAGE_DOWNLOAD, SUB_DOWNLOAD_FAIL)
         else:
             staged = last_destination
@@ -425,7 +439,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         _publish()
 
     def _finish_add(uuid: str, release: str) -> None:
-        if failure == FAILURE_ADD:
+        if _failure == FAILURE_ADD:
             _fail(uuid, "1", _ADD_STAGES, STAGE_ADD_PRECHK, SUB_VERIFY_FAIL)
         else:
             added = release
@@ -434,7 +448,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
 
     def _finish_install(uuid: str, release: str) -> None:
         """one-shot: add, activate, commit, reload as one operation."""
-        if failure == FAILURE_ADD:
+        if _failure == FAILURE_ADD:
             _fail(uuid, "1", _ADD_STAGES, STAGE_ADD_PRECHK, SUB_VERIFY_FAIL)
         else:
             _record(uuid, "1", _ADD_STAGES)
@@ -462,12 +476,12 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         cur = committed
 
     def _finish_commit(uuid: str) -> None:
-        if failure == FAILURE_REVERTS and cur != committed:
+        if _failure == FAILURE_REVERTS and cur != committed:
             # The timer beat the commit; a commit with nothing to do is marked
             # successful.
             _revert()
             _noop(uuid, _COMMIT_STAGES)
-        elif failure == FAILURE_COMMIT:
+        elif _failure == FAILURE_COMMIT:
             _fail(uuid, "1", _COMMIT_STAGES, STAGE_COMMIT, SUB_COMMIT_FAIL)
         elif cur == committed:
             _noop(uuid, _COMMIT_STAGES)
@@ -527,7 +541,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         if request.tag == "activate":
             last_act_version = _leaf_of(request, "version")
             last_timer = _leaf_of(request, "auto-abort-timer-val")
-            if failure == FAILURE_ACTIVATE_REFUSED:
+            if _failure == FAILURE_ACTIVATE_REFUSED:
                 respond(None, "operation-failed",
                         "install-smu-not-added: mock refuses to activate")
                 return
@@ -561,7 +575,22 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
 
     def attach() -> None:
         _publish()
-        mock_server.set_rpc_cb(_on_rpc)
+        _server.set_rpc_cb(_on_rpc)
+
+    def reattach(server: swna.NetconfMockServer, duration: float, fail: str,
+                 chassis: ?str, boot: ?str) -> None:
+        """Serve a new server, as after a reconnect, with the knobs in force.
+        Like a real box it keeps its release and history; `boot` makes it run
+        another release."""
+        _server = server
+        _duration = duration
+        _failure = fail
+        _inventory = [chassis_entry(chassis!)] if chassis is not None else []
+        b = boot
+        if b is not None:
+            cur = b
+            committed = b
+        attach()
 
     def get_rpcs() -> list[str]:
         return rpcs
@@ -577,3 +606,40 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         return (source=last_source, destination=last_destination,
                 path=last_path, one_shot=last_one_shot,
                 act_version=last_act_version, timer=last_timer)
+
+
+actor _Seeder(log_handler: logging.Handler):
+    var mock: ?IosXeSoftwareMock = None
+    var running_knob: ?str = None
+
+    def seed(server: swna.NetconfMockServer, dmc: DeviceMetaConfig) -> None:
+        if not dmc.mock.enabled:
+            return
+        sw = dmc.mock.software
+        knob = sw.running_release
+        running = knob if knob is not None else OLD_RELEASE
+        model = dmc.mock.hardware.model
+        chassis = model if model is not None else DEFAULT_MODEL
+        m = mock
+        if m is not None:
+            boot = running if knob != running_knob else None
+            m.reattach(server, upgrade_seconds(dmc), sw.failure, chassis, boot)
+        else:
+            first = IosXeSoftwareMock(server, log_handler,
+                                      upgrade_duration=upgrade_seconds(dmc),
+                                      failure=sw.failure, running=running,
+                                      model=chassis)
+            first.attach()
+            mock = first
+        running_knob = knob
+
+
+def seeder(log_handler: logging.Handler) -> proc(swna.NetconfMockServer, DeviceMetaConfig) -> None:
+    """The on_mock_server hook of an IOS XE NetconfAdapter, set from the mock
+    knobs. The adapter makes a new server on every connect, and a knob change
+    reconnects; one mock per adapter moves to each server, so the device keeps
+    the release it runs."""
+    s = _Seeder(log_handler)
+    def seed(server: swna.NetconfMockServer, dmc: DeviceMetaConfig) -> None:
+        s.seed(server, dmc)
+    return seed
