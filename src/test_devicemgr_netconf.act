@@ -10,7 +10,10 @@ import yang.schema as yschema
 
 import device as swdev
 import adapters.netconf as swna
+import netconf
 import swyang
+import yp
+from device_schema import DeviceSchema
 
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
@@ -1064,6 +1067,90 @@ actor _test_subscribe_on_change(t: testing.EnvT):
     start()
 
     after 2.0: fail("Timed out waiting for on-change subscription updates")
+
+
+actor _test_mock_restart_ends_subscriptions(t: testing.EnvT):
+    """A client restart on the mock's pipe ends the subscriptions of the
+    session before it.
+
+    1. Establish a periodic subscription, and restart the client on its
+       first push-update.
+    2. Establish a periodic subscription in the new session.
+    3. From the reply on, every push-update must have the id of the new
+       subscription. Both subscriptions push every 50 ms, so a live old
+       subscription pushes between the first three updates of the new one.
+    """
+    pipes = netconf.actor_pipe_pair()
+    schema = DeviceSchema("restart", yang.compile([IETF_SYSTEM_YANG]))
+    mock = swna.NetconfMockServer(pipes.server, t.log_handler, [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1], schema)
+    mock.set_oper_ds(_mock_oper_ds("2026-02-21T10:11:12Z", "2025-12-31T00:00:00Z"))
+
+    var sessions = 0
+    var restarted = False
+    var old_id: ?int = None
+    var new_id: ?int = None
+    var new_updates = 0
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_deleted(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is not None:
+            fail("delete-subscription failed: {err}")
+        elif not done:
+            done = True
+            c.close(None)
+            t.success()
+
+    def on_notif(c: netconf.Client, notif: xml.Node):
+        if done:
+            return
+        update = yp.parse_push_update(notif)
+        if update is not None:
+            sub_id = update.sub_id
+            if new_id is None:
+                # Before the reply in the new session, push-updates of the
+                # old subscription can still arrive.
+                if sub_id == old_id and not restarted:
+                    restarted = True
+                    c.restart()
+            elif sub_id == new_id:
+                new_updates += 1
+                if new_updates == 3:
+                    c.delete_subscription(on_deleted, sub_id!)
+            else:
+                fail("push-update for subscription {sub_id} after the restart, expected {new_id}")
+        else:
+            fail("Unexpected notification: {notif.encode()}")
+
+    def on_sub(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError):
+        if err is not None:
+            fail("establish-subscription failed: {err}")
+        elif sessions == 1:
+            old_id = sub_id
+        elif sub_id == old_id:
+            fail("New session reused subscription id {sub_id}")
+        else:
+            new_id = sub_id
+
+    def on_connect(c: netconf.Client, err: ?Exception):
+        if err is not None:
+            fail("Connect failed: {err}")
+            return
+        sessions += 1
+        if sessions <= 2:
+            # period is in centiseconds
+            c.establish_subscription(on_sub, period=5)
+        else:
+            fail("Unexpected session {sessions}")
+
+    client = netconf.Client(None, "mock", 0, "admin", "admin", None, on_connect,
+                            on_notif, True, t.log_handler, pipe=pipes.client)
+
+    after now 2.0: fail("Timed out (sessions={sessions} old={old_id} new={new_id} updates={new_updates})")
 
 
 actor _test_subscribe_periodic_yang_push(t: testing.EnvT):
