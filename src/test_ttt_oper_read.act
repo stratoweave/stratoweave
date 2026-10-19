@@ -1,8 +1,12 @@
+import logging
 import testing
 
 import device as swdev
+import device_oper as swdevoper
+import adapters.adapter as swada
 import adapters.software_mock as swmock
 import ttt as ttt
+import yang
 import yang.gdata as gdata
 
 TEST_NS = "urn:test-oper"
@@ -524,19 +528,111 @@ actor get_data_reads_each_content(t: testing.AsyncT):
     layer.edit_config(_service_cfg(), cont)
 
 
-def _device_status(data: ?gdata.Node, name: str) -> ?str:
-    """The published software status of one device entry, if any."""
+def _device_entry(data: ?gdata.Node, name: str) -> ?swdevoper.stratoweave_rfs__device_entry:
+    """One device entry's oper tree, if the layer holds it."""
     if data is not None and isinstance(data, gdata.Container):
         devs = data.children.get(dq("device"))
         if isinstance(devs, gdata.List):
             for e in devs.elements.values():
                 if isinstance(e, gdata.Container) and e.get_opt_str(dq("name")) == name:
-                    sw = e.children.get(dq("software"))
-                    if isinstance(sw, gdata.Container):
-                        st = sw.children.get(dq("state"))
-                        if isinstance(st, gdata.Container):
-                            return st.get_opt_str(dq("status"))
+                    return swdevoper.stratoweave_rfs__device_entry.from_gdata(e)
     return None
+
+
+def _device_status(data: ?gdata.Node, name: str) -> ?str:
+    """The published software status of one device entry, if any."""
+    e = _device_entry(data, name)
+    return e.software.state.status if e is not None else None
+
+
+def _device_model(data: ?gdata.Node, name: str) -> ?str:
+    """The published hardware model of one device entry, if any."""
+    e = _device_entry(data, name)
+    return e.state.hardware.model if e is not None else None
+
+
+def _chassis(root: ?gdata.Node) -> ?str:
+    return "C8000V"
+
+
+def _unparsable(root: ?gdata.Node) -> ?str:
+    raise ValueError("unparsable reply")
+
+
+# hw-ok finds a chassis, hw-bad fails.
+_HW_READS: list[(module: str, filt: gdata.FNode, parse: proc(?gdata.Node) -> ?str)] = [
+    (module="hw-ok", filt=gdata.FNode(gdata.Id("urn:hw-ok", "hw")), parse=_chassis),
+    (module="hw-bad", filt=gdata.FNode(gdata.Id("urn:hw-bad", "hw")), parse=_unparsable),
+]
+
+
+def _hw_type(module: str):
+    """A device type whose schema has only `module`. It has no real adapter,
+    so the device uses MockAdapter, which lists the schema's modules."""
+    def no_adapter(dev: swdev.DeviceMgr, schema, dmc, registry,
+                   log_handler: logging.Handler, env: ?Env):
+        return swada.NoAdapter(schema, log_handler, env)
+    schema = yang.compile(["""module {module} {{
+  yang-version 1.1;
+  namespace "urn:{module}";
+  prefix h;
+  container hw {{ config false; leaf x {{ type string; }} }}
+}}"""])
+    return swdev.DeviceType(name=module, adapter_type=no_adapter, src_dnode=schema)
+
+
+def _hw_device(device_type: str) -> gdata.Node:
+    return gdata.Container({
+        dq("device"): gdata.List([dq("name")], [
+            gdata.Container({
+                dq("name"): gdata.Leaf("d1"),
+                dq("type"): gdata.Leaf(device_type),
+                dq("credentials"): gdata.Container({dq("username"): gdata.Leaf("admin")}),
+            }),
+        ]),
+    })
+
+
+actor device_node_publishes_hardware_state(t: testing.EnvT):
+    """The device entry carries the model a hardware read finds, and drops it
+    when the read after a reconnect fails."""
+    registry = swdev.DeviceRegistry({"hw-ok": _hw_type("hw-ok"), "hw-bad": _hw_type("hw-bad")},
+                                    None, t.log_handler, hardware_reads=_HW_READS)
+    layer = ttt.Layer("rfs", ttt.Container({
+        dq("device"): ttt.List(ttt.Device(registry, t.log_handler), [dq("name")]),
+    }), None)
+    var done = False
+    var switched = False
+
+    def ignore(_r: value):
+        pass
+
+    def check():
+        if done:
+            return
+        model = _device_model(layer.get_data(), "d1")
+        if not switched:
+            if model == "C8000V":
+                # A new device type is a new adapter, so a new connect.
+                switched = True
+                layer.edit_config(_hw_device("hw-bad"), ignore)
+        elif model is None:
+            done = True
+            t.success()
+            return
+        after 0.01: check()
+
+    def fail():
+        if not done:
+            done = True
+            model = _device_model(layer.get_data(), "d1")
+            t.failure(ValueError("Timed out waiting for published hardware state, got {model} switched={switched}"))
+
+    def cont(_r: value):
+        check()
+        after 2: fail()
+
+    layer.edit_config(_hw_device("hw-ok"), cont)
 
 
 actor device_node_publishes_software_state(t: testing.EnvT):

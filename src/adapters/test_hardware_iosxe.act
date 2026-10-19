@@ -1,0 +1,119 @@
+#
+# IOS XE hardware read: the inventory filter, the chassis model out of a
+# reply, and the model DeviceMgr publishes from a mock device.
+#
+
+import testing
+import yang.gdata as ygdata
+
+import device as swdev
+import device_oper as swdevoper
+import adapters.hardware_iosxe as swxehw
+import adapters.software_iosxe_mock as swxemock
+import adapters.software_iosxe_oper as ixoper
+import adapters.test_software_iosxe as swxetest
+
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials
+
+OLD_RELEASE = swxemock.OLD_RELEASE
+
+
+def _test_inventory_filter_keeps_every_entry():
+    """The inventory read returns the type, index and part-number of every
+    entry, and nothing else."""
+    def q(n: str) -> ygdata.Id:
+        return ygdata.Id(ixoper.NS_Cisco_IOS_XE_device_hardware_oper, n)
+    # A real device sends more leaves per entry, like the serial number.
+    chassis = ygdata.Container({
+        q("hw-type"): ygdata.Leaf(swxehw.HW_TYPE_CHASSIS),
+        q("hw-dev-index"): ygdata.Leaf(u64(0)),
+        q("part-number"): ygdata.Leaf("C8000V"),
+        q("serial-number"): ygdata.Leaf("9ABCDEFGHIJ"),
+    })
+    root = swxemock.operational_datastore(OLD_RELEASE, [], inventory=[
+        swxemock.inventory_entry("hw-type-pim", 1, "C8000V"),
+        chassis,
+    ])
+    filt = ygdata.FNode(children=[swxehw.READ.filt])
+    got = ygdata.filter(root, filt)
+    testing.assertTrue(got is not None, "inventory filter returned no data")
+    hardware = ixoper.root.from_gdata(got).device_hardware_data.device_hardware
+    testing.assertEqual(2, len(hardware.device_inventory),
+                        "keyed inventory entries were lost")
+    testing.assertEqual(None, hardware.device_system_data.software_version,
+                        "filter returned an unrelated subtree")
+    testing.assertEqual("C8000V", swxehw.chassis_model(got),
+                        "the chassis entry must name the model")
+    testing.assertTrue("serial-number" not in got!.prsrc(),
+                       "the filter must select only the leaves the read uses")
+
+
+def _test_chassis_model_picks_the_chassis_entry():
+    """The model is the chassis part-number, whatever else the list holds."""
+    def inventory(entries: list[ygdata.Node]) -> ygdata.Node:
+        return swxemock.operational_datastore(OLD_RELEASE, [], inventory=entries)
+    testing.assertEqual("C8300-1N1S-4T2X", swxehw.READ.parse(inventory([
+        swxemock.inventory_entry("hw-type-pim", 1, "C8300-1N1S-4T2X"),
+        swxemock.inventory_entry("hw-type-cpu", 4, " AuthenticAMD"),
+        swxemock.chassis_entry("C8300-1N1S-4T2X"),
+    ])), "the chassis need not come first")
+    testing.assertEqual(None, swxehw.chassis_model(inventory([
+        swxemock.inventory_entry("hw-type-pim", 1, "C8000V"),
+    ])), "no chassis entry means no model")
+    testing.assertEqual(None, swxehw.chassis_model(inventory([
+        swxemock.inventory_entry(swxehw.HW_TYPE_CHASSIS, 0, ""),
+    ])), "an empty part-number is no model")
+    testing.assertEqual(None, swxehw.chassis_model(inventory([])),
+                        "an empty inventory means no model")
+    testing.assertEqual(None, swxehw.chassis_model(None), "no reply means no model")
+
+
+def _published_model(oper: ?ygdata.Node) -> ?str:
+    if oper is not None:
+        return swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).state.hardware.model
+    return None
+
+
+actor _test_iosxe_model_follows_a_reconnect(t: testing.EnvT):
+    """DeviceMgr publishes the chassis a mock device serves, and the new one
+    after a change of mock/hardware/model reconnects the device."""
+    var dev_ref: ?swdev.DeviceMgr = None
+    var saw_first = False
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if finished:
+            return
+        model = _published_model(oper)
+        if model is None:
+            return
+        if not saw_first:
+            saw_first = True
+            if model != swxemock.DEFAULT_MODEL:
+                finished = True
+                t.failure(ValueError("first model {model}, want {swxemock.DEFAULT_MODEL}"))
+                return
+            dmc = DeviceMetaConfig("d-hw", Credentials("admin", "admin"), type="iosxe")
+            dmc.mock.enabled = True
+            dmc.mock.hardware.model = "C8300-1N1S-4T2X"
+            d = dev_ref
+            if d is not None:
+                d.set_dmc(dmc)
+        elif model == "C8300-1N1S-4T2X":
+            finished = True
+            t.success()
+
+    def report_timeout() -> None:
+        if not finished:
+            finished = True
+            t.failure(ValueError("timed out, saw_first={saw_first}"))
+
+    d = swxetest.new_iosxe_mock_device_mgr(t, "d-hw", on_reconf, seed=True)
+    dev_ref = d
+    d.set_update_oper(on_state)
+    after 2.5: report_timeout()

@@ -22,6 +22,8 @@ import yang
 import yang.gdata as ygdata
 
 import device as swdev
+import device_oper as swdevoper
+import adapters.hardware_iosxe as swxehw
 import adapters.netconf as swna
 import adapters.software_iosxe as swxe
 import adapters.software_iosxe_mock as swxemock
@@ -388,22 +390,97 @@ def _fast_adapter(dev: swdev.DeviceMgr, dmc: DeviceMetaConfig,
 
 
 def new_iosxe_mock_device_mgr(t: testing.EnvT, name: str,
-                              on_reconf: action(str) -> None) -> swdev.DeviceMgr:
+                              on_reconf: action(str) -> None,
+                              seed: bool=False) -> swdev.DeviceMgr:
+    """A mock IOS XE device. With `seed`, the mock comes from the mock knobs,
+    as in the flotilla; without it a test attaches its own after the connect."""
     schema = yang.compile(swxe_yang.models)
+
+    def adapter_with_mock(dev: swdev.DeviceMgr, dev_schema, dmc, registry,
+                          log_handler: logging.Handler,
+                          env: ?Env):
+        hook: ?proc(swna.NetconfMockServer, DeviceMetaConfig) -> None = None
+        if seed:
+            hook = swxemock.seeder(log_handler)
+        return swna.NetconfAdapter(dev, dev_schema, dmc, registry, log_handler, env,
+                                   on_mock_server=hook)
+
     dev_types = {
         "iosxe": swdev.DeviceType(
             name="iosxe",
-            adapter_type=swna.NetconfAdapter,
+            adapter_type=adapter_with_mock,
             src_dnode=schema,
             oper_src_dnode=schema,
             software_adapter_type=_fast_adapter)
     }
     dev = swdev.DeviceMgr(dev_types, t.env,
-                          name, t.log_handler, on_reconf, swdev.SchemaRegistry())
+                          name, t.log_handler, on_reconf, swdev.SchemaRegistry(),
+                          hardware_reads=[swxehw.READ])
     dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe")
     dmc.mock.enabled = True
     dev.set_dmc(dmc)
     return dev
+
+
+def _seeded_dmc(name: str, intent: bool, model: ?str=None) -> DeviceMetaConfig:
+    dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe")
+    dmc.mock.enabled = True
+    dmc.mock.hardware.model = model
+    if intent:
+        dmc.software = Software("camp-1", NEW_REQUESTED, IMAGE_URL)
+    return dmc
+
+
+actor _test_iosxe_reconnect_keeps_the_release(t: testing.EnvT):
+    """A mock knob change reconnects the device, and the seeded mock keeps the
+    release it was upgraded to, so the intent finds it up to date."""
+    var dev_ref: ?swdev.DeviceMgr = None
+    var phase = 0
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def set_dmc(dmc: DeviceMetaConfig) -> None:
+        d = dev_ref
+        if d is not None:
+            d.set_dmc(dmc)
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if oper is not None and not finished:
+            step(swdevoper.stratoweave_rfs__device_entry.from_gdata(oper))
+
+    def step(entry: swdevoper.stratoweave_rfs__device_entry) -> None:
+        model = entry.state.hardware.model
+        status = entry.software.state.status
+        if phase == 0 and model == swxemock.DEFAULT_MODEL:
+            # Connected: upgrade.
+            phase = 1
+            set_dmc(_seeded_dmc("d-keep", True))
+        elif phase == 1 and status == "succeeded":
+            # Change a knob without the intent, so no read races the reconnect.
+            phase = 2
+            set_dmc(_seeded_dmc("d-keep", False, "C8300-1N1S-4T2X"))
+        elif phase == 2 and model == "C8300-1N1S-4T2X":
+            # Reconnected to the new server: the intent again.
+            phase = 3
+            set_dmc(_seeded_dmc("d-keep", True, "C8300-1N1S-4T2X"))
+        elif phase == 3 and status == "up-to-date":
+            finished = True
+            t.success()
+        elif phase == 3 and status == "in-progress":
+            finished = True
+            t.failure(ValueError("upgraded again after the reconnect"))
+
+    def report_timeout() -> None:
+        if not finished:
+            finished = True
+            t.failure(ValueError("timed out in phase {phase}"))
+
+    d = new_iosxe_mock_device_mgr(t, "d-keep", on_reconf, seed=True)
+    dev_ref = d
+    d.set_update_oper(on_state)
+    after 2.5: report_timeout()
 
 
 actor _test_iosxe_upgrade_through_the_software_manager(t: testing.EnvT):
