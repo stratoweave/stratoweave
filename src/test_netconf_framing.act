@@ -381,3 +381,68 @@ actor _test_client_keeps_message_ids_across_restarts(t: testing.EnvT):
                    log_handler=t.log_handler,
                    pipe=pipes.client)
     after now 2.0: on_timeout()
+
+
+actor _test_client_reports_framing_error_once(t: testing.EnvT):
+    """Bytes that break the chunked framing end the session with one error.
+
+    The bad bytes stayed in the receive buffer, so every later write failed on
+    them again, and the client reported one error for each write. The device
+    adapter restarts the session once for each error.
+    """
+    pipes = netconf.actor_pipe_pair()
+    var received: bytes = b""
+    var hello_sent = False
+    var errors = 0
+    var done = False
+
+    def finish(error: ?Exception) -> None:
+        if done:
+            return
+        done = True
+        if error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    def check() -> None:
+        if errors == 1:
+            finish(None)
+        else:
+            finish(ValueError("The client reported {errors} errors"))
+
+    def on_connect(c: netconf.Client, error: ?Exception) -> None:
+        if error is not None:
+            errors += 1
+            if errors == 1:
+                # The two writes after the bad one arrive well within this time
+                after now 0.3: check()
+        else:
+            # The session uses chunked framing now. Three writes without it:
+            for _ in range(3):
+                pipes.server.write(b"not chunked]]>]]>")
+
+    def on_server_data(error: ?Exception, data: ?bytes) -> None:
+        if data is not None:
+            received = received + data
+        else:
+            return
+        if not hello_sent and received.find(netconf.LEGACY_SEPARATOR) >= 0:
+            hello_sent = True
+            pipes.server.write(SERVER_HELLO_1_1)
+
+    def on_timeout() -> None:
+        finish(ValueError("Timed out, the client reported {errors} errors"))
+
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=on_connect,
+                            on_notif=None,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    pipes.server.read_cb(on_server_data)
+    after now 2.0: on_timeout()
