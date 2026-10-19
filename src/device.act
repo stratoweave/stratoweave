@@ -14,6 +14,7 @@ import yang.gdata as ygdata
 import yang.xml as yxml
 
 import logs as swlogs
+import adapters.hardware_iosxe as hwxe
 
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
@@ -23,7 +24,8 @@ from device_oper import \
     stratoweave_rfs__device_entry as DeviceOper, \
     stratoweave_rfs__device__software__state as SoftwareState, \
     stratoweave_rfs__device__software__state__precheck as PrecheckResult, \
-    stratoweave_rfs__device__software__state__postcheck as PostcheckResult
+    stratoweave_rfs__device__software__state__postcheck as PostcheckResult, \
+    stratoweave_rfs__device__state__hardware as HardwareState
 
 from device_schema import DeviceSchema, SchemaKey, SchemaTreeTransform
 
@@ -1005,6 +1007,23 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
         oper.software.state = state
         update_oper()
 
+    def on_hardware_state(model: ?str, err: ?Exception) -> None:
+        """None clears the leaf, so an earlier box's model does not outlive a
+        reconnect. Published only on a change."""
+        old = oper.state.hardware.model
+        if model is None:
+            if err is not None:
+                _log.warning("DeviceMgr: hardware model read failed",
+                             {"device": name, "error": str(err)})
+        elif old is not None and old != model:
+            _log.warning("DeviceMgr: hardware model changed",
+                         {"device": name, "old": old, "new": model})
+        else:
+            _log.info("DeviceMgr: hardware model", {"device": name, "model": model})
+        if old != model:
+            oper.state.hardware = HardwareState(model=model)
+            update_oper()
+
     # Per-device software manager. Statically instantiated: every device has
     # one, whether or not its device type can actually install software. It
     # stays idle until it is given both an adapter and a target release.
@@ -1038,6 +1057,14 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
 
     # Key of the fetched schema in the SchemaRegistry
     var schema_key: ?SchemaKey = None
+
+    # Hardware reads, tried in order: the first whose module the device lists
+    # runs. Picked from the device's modules, not its type, which is going away.
+    hardware_reads: list[(module: str, filt: ygdata.FNode,
+                          parse: proc(?ygdata.Node) -> ?str)] = [hwxe.READ]
+
+    # Bumped per connect; a hardware reply from an earlier connection is dropped.
+    var _hw_gen: int = 0
 
     # The device's current running configuration, as we know it.
     var running_conf: ?ygdata.Node = None
@@ -1158,6 +1185,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
     def on_connect(new_modset: dict[str, ModCap], new_schema_key: ?SchemaKey):
         _log.debug("Device connected", {"new_modset": new_modset, "schema_modules": len(new_schema_key.modules) if new_schema_key is not None else None})
         resync()
+        _read_hardware(new_modset)
         if modset_eq(modset, new_modset):
             _log.debug("Supported modules unchanged")
         else:
@@ -1167,6 +1195,40 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
             schema_key = new_schema_key
             on_reconf(name)
             return
+
+    def _read_hardware(new_modset: dict[str, ModCap]) -> None:
+        """Read the hardware model once per connect: it cannot change under a
+        live session, and a replaced box comes with a new connection. A listed
+        module is no proof the device implements it (the module set carries
+        schema dependencies too), so the read is tried, and no read, an empty
+        reply and a failed read are told apart in the log."""
+        _hw_gen += 1
+        gen = _hw_gen
+        for read in hardware_reads:
+            if read.module in new_modset:
+                _try_hardware_read(gen, read.module, read.filt, read.parse)
+                return
+        _log.debug("DeviceMgr: no hardware read for the device's modules", {"device": name})
+        on_hardware_state(None, None)
+
+    def _try_hardware_read(gen: int, module: str, filt: ygdata.FNode,
+                           parse: proc(?ygdata.Node) -> ?str) -> None:
+        def on_reply(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _hw_gen:
+                return
+            if err is not None:
+                on_hardware_state(None, err)
+                return
+            try:
+                model = parse(root)
+                if model is None:
+                    _log.info("DeviceMgr: hardware read found no chassis",
+                              {"device": name, "module": module})
+                on_hardware_state(model, None)
+            except Exception as e:
+                # An unparsable reply is a failed read, not a chassis-less device.
+                on_hardware_state(None, e)
+        get(on_reply, filt)
 
     def set_dmc(new_dmc: DeviceMetaConfig) -> None:
         def is_mock_device(new_dmc: DeviceMetaConfig) -> bool:
