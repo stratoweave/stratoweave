@@ -233,9 +233,15 @@ actor Client(
     # Dictionaries preserve insertion order, so this gives direct message-id
     # correlation while retaining the request order for protocol diagnostics.
     var rpc_cbs: dict[str, action(Client, ?xml.Node, ?NetconfError) -> None] = {}
+    # RPCs requested before the server's hello. The hello sets the framing of
+    # the session, so they are sent after it.
+    var unsent_rpcs: list[(message_id: str, content: xml.Node)] = []
 
     var p: ?Pipe = pipe
     var state = STATE_NONE
+    # True from asking the pipe to connect until it reports the result. The
+    # events that come before the result belong to the session before.
+    var connect_pending = False
     var active_fixups: list[Fixup] = []
 
     def _prune_inactive_fixups():
@@ -320,10 +326,13 @@ actor Client(
         for rpc_cb in rpc_cbs.values():
             rpc_cb(self, None, SessionClosedError("Session closed"))
         rpc_cbs = {}
+        unsent_rpcs = []
 
     # TODO: Close protocol
     def close(cb: ?action() -> None=None) -> None:
         _fail_pending_rpcs()
+        # A closed pipe reports nothing more, so a later restart must reopen it
+        connect_pending = False
 
         if p is not None:
             p.close(cb)
@@ -349,6 +358,13 @@ actor Client(
         active_fixups.clear()
 
         if p is not None:
+            if connect_pending:
+                # The pipe has not reported the previous connect yet. Its
+                # connected event starts the new session. A second restart of
+                # the pipe gives a second connected event, and a second hello
+                # in the same session.
+                return
+            connect_pending = True
             p.restart()
         else:
             _log.warning("Cannot restart, transport pipe is not running")
@@ -380,6 +396,16 @@ actor Client(
     def rpc(content: xml.Node, callback: action(Client, ?xml.Node, ?NetconfError) -> None) -> None:
         message_id_text = str(message_id)
         message_id += 1
+        rpc_cbs[message_id_text] = callback
+        if state == STATE_CONNECTED:
+            _send_rpc(message_id_text, content)
+        else:
+            # The server reads chunked framing from our hello on, but we know
+            # the framing only from its hello.
+            _log.debug("Holding RPC until the server's hello", {"message-id": message_id_text})
+            unsent_rpcs.append((message_id=message_id_text, content=content))
+
+    def _send_rpc(message_id_text: str, content: xml.Node) -> None:
         fixed_content = _apply_request_fixups(content)
 
         # If using an explicit namespace prefix, prepend it to the attribute name.
@@ -394,7 +420,6 @@ actor Client(
         buf: Buffer = Buffer()
         buf.write_str(xml.encode(root))
 
-        rpc_cbs[message_id_text] = callback
         _log.debug("Sending RPC", {"message-id": message_id_text, "content": content})
         _send_message(buf)
 
@@ -832,6 +857,12 @@ actor Client(
         try:
             root = xml.decode(msg)
 
+            if state != STATE_CONNECTED and root.tag != "hello":
+                # The server's hello comes first in a session. A message
+                # before it is left from the session before a restart.
+                _log.debug("Ignoring message before the server's hello", {"root.tag": root.tag})
+                return
+
             # Detect/update namespace prefix mode from server messages
             root_prefix = root.prefix
             if root_prefix is not None and root_prefix != nc_prefix:
@@ -853,8 +884,13 @@ actor Client(
             else:
                 _log.warning("Unhandled message type:", {"root.tag": root.tag})
         except Exception as exc:
-            _log.error("Failed to parse XML", {"msg": msg, "exc": exc})
-            # TODO: I think we need to disconnect and start over, no?
+            if state != STATE_CONNECTED:
+                # Left from the session before a restart, like the message
+                # before the server's hello in the try block
+                _log.debug("Ignoring malformed message before the server's hello", {"msg": msg, "exc": exc})
+            else:
+                _log.error("Failed to parse XML", {"msg": msg, "exc": exc})
+                # TODO: I think we need to disconnect and start over, no?
 
     def _on_msg_hello(root: xml.Node) -> None:
         for n in root.children:
@@ -869,7 +905,11 @@ actor Client(
             elif n.tag == "session-id": # TODO: check namespace as well?
                 session_id = n.text
         _activate_fixups()
-        state = "CONNECTED"
+        state = STATE_CONNECTED
+        held = unsent_rpcs
+        unsent_rpcs = []
+        for r in held:
+            _send_rpc(r.message_id, r.content)
         on_connect(self, None)
 
     def _on_capability(cap: xml.Node) -> None:
@@ -962,6 +1002,7 @@ actor Client(
                     _skip = recv_buf.skip_bytes(len(CHUNK_TAG_POSTFIX))
                     if _skip is not None:
                         if _len_text == CHUNK_TAG_END_OF_MSG:
+                            recv_buf.consume()
                             _msg_data = chunk_buf.read_all_bytes()
                             chunk_buf.consume()
                             handle_msg(_msg_data.decode())
@@ -993,8 +1034,14 @@ actor Client(
 
     def _on_pipe_event(err: ?Exception, data: ?bytes):
         if data is not None:
-            _on_receive(data)
+            if not connect_pending:
+                _on_receive(data)
             return
+        if err is None and not connect_pending:
+            # The peer started a new session. The requests of the session
+            # before get no reply.
+            _fail_pending_rpcs()
+        connect_pending = False
         _on_connect(err)
 
     def _on_connect(err: ?Exception):
@@ -1003,7 +1050,11 @@ actor Client(
             on_connect(self, err)
         else:
             _log.info("Connected", {"address": address, "port": port, "username": username})
-            state = STATE_CONNECTED
+            # Each session starts with the hello exchange in base:1.0 framing
+            framing = SEPARATOR_FRAMING
+            recv_buf = Buffer()
+            chunk_buf = Buffer()
+            state = STATE_CONNECTING
             _send_hello()
 
     def _connect():
@@ -1020,12 +1071,14 @@ actor Client(
                     subsystem="netconf",
                     host_key_check=sshpipe.HOST_KEY_CHECK_NONE if skip_host_key_check else sshpipe.HOST_KEY_CHECK_ACCEPT_NEW,
                     log_handler=log_handler)
+                connect_pending = True
                 sp.read_cb(_on_pipe_event)
                 p = sp
             else:
                 on_connect(self, ValueError("a TCP connect capability is required to establish an SSH connection"))
         else:
             if p is not None:
+                connect_pending = True
                 p.read_cb(_on_pipe_event)
 
     _connect()
@@ -1049,6 +1102,11 @@ actor Server(
     # later entries wait until its handler sends a reply. Concurrent dispatch is
     # available for tests that explicitly emulate a non-compliant peer.
     var rpc_queue: list[(message_id: str, op: ?xml.Node)] = []
+    # The sessions on this pipe so far. An actor pipe restarts the session on
+    # the same pipe.
+    var sessions = 0
+    # Whether the client's hello has come in this session
+    var hello_received = False
 
     def close(cb: ?action() -> None):
         rpc_queue = []
@@ -1122,6 +1180,11 @@ actor Server(
             _send_rpc_reply(message_id, children)
 
     def send_notification(notification: xml.Node):
+        if not hello_received:
+            # No subscription of this session exists yet, and the framing is
+            # known only after the client's hello
+            _log.debug("Dropping notification before the client's hello")
+            return
         _send_node(notification)
 
     def send_ok(message_id: str):
@@ -1155,6 +1218,7 @@ actor Server(
                             client_supports_1_1 = True
         if client_supports_1_1 and CAP_NC_1_1 in server_capabilities:
             framing = CHUNKED_FRAMING
+        hello_received = True
 
     def _dispatch_rpc(message_id: str, op: ?xml.Node):
         if op is None:
@@ -1217,6 +1281,7 @@ actor Server(
                     skip_ok = recv_buf.skip_bytes(len(CHUNK_TAG_POSTFIX))
                     if skip_ok is not None:
                         if len_text == CHUNK_TAG_END_OF_MSG:
+                            recv_buf.consume()
                             msg_data = chunk_buf.read_all_bytes()
                             chunk_buf.consume()
                             _handle_msg(msg_data.decode())
@@ -1255,6 +1320,14 @@ actor Server(
             recv_buf = Buffer()
             chunk_buf = Buffer()
             rpc_queue = []
+            hello_received = False
+            if sessions > 0:
+                # The client restarted the session on this pipe. What we wrote
+                # before this event can reach it after its restart. A
+                # separator ends those bytes, so our hello stays a message of
+                # its own.
+                pipe.write(LEGACY_SEPARATOR)
+            sessions += 1
             _send_hello()
             _on_connect = on_connect
             if _on_connect is not None:
