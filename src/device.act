@@ -647,7 +647,7 @@ class DeviceType(object):
         self.bundled_schema = DeviceSchema(name, src_dnode, oper_src_dnode, schema_transforms)
         self.software_adapter_type = software_adapter_type
 
-actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None):
+actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None, hardware_reads: list[(module: str, filt: ygdata.FNode, parse: proc(?ygdata.Node) -> ?str)]=[]):
     """Device Registry keeps track of all devices and hands out references to
     them based on name.
 
@@ -655,7 +655,8 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_ha
     name must always return the same Device instance.
 
     Each device logs to its own handler under log_handler. With device_logs,
-    that handler also writes the device's log file.
+    that handler also writes the device's log file. hardware_reads goes to
+    every DeviceMgr.
     """
     var devices = {}
 
@@ -674,7 +675,7 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_ha
 
     def get_or_create(name: str) -> DeviceMgr:
         if name not in devices:
-            devices[name] = DeviceMgr(dev_types, env, name, log_handler, reconf_cb, schema_registry, self, device_logs)
+            devices[name] = DeviceMgr(dev_types, env, name, log_handler, reconf_cb, schema_registry, self, device_logs, hardware_reads)
         dev = devices[name]
         return dev
 
@@ -900,7 +901,7 @@ class DeviceTreeProvider(ygdata.TreeProvider):
 
 
 
-actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None, device_logs: ?swlogs.DeviceLogs=None):
+actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None, device_logs: ?swlogs.DeviceLogs=None, hardware_reads: list[(module: str, filt: ygdata.FNode, parse: proc(?ygdata.Node) -> ?str)]=[]):
     """Device Manager manages a device and represents that device, as an
     abstract device, in the system. Platform specific handling is implemented in
     the DeviceAdapter, i.e.  in subclasses of DeviceAdapter, like NetconfAdapter
@@ -950,6 +951,11 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
     over the network. Tests can access the mock server and side-load data into
     it in order to verify the DeviceMgr's interaction with the device adapter
     and the adapter's interaction with the device.
+
+    ## Hardware model
+    On every connect a read from hardware_reads, picked by the device's
+    modules, fills state/hardware/model. The reads come from the caller, so
+    platform code stays out of here.
 
     ## Logging
     The device and its adapters log to one handler, named after the device.
@@ -1033,6 +1039,11 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
 
     # Key of the fetched schema in the SchemaRegistry
     var schema_key: ?SchemaKey = None
+
+    # Bumped per connect; a hardware reply from an earlier connection is dropped.
+    var _hw_gen: int = 0
+    # The last model a read found, kept across failed reads to spot a swap.
+    var _last_model: ?str = None
 
     # The device's current running configuration, as we know it.
     var running_conf: ?ygdata.Node = None
@@ -1153,6 +1164,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
     def on_connect(new_modset: dict[str, ModCap], new_schema_key: ?SchemaKey):
         _log.debug("Device connected", {"new_modset": new_modset, "schema_modules": len(new_schema_key.modules) if new_schema_key is not None else None})
         resync()
+        _read_hardware(new_modset, new_schema_key)
         if modset_eq(modset, new_modset):
             _log.debug("Supported modules unchanged")
         else:
@@ -1162,6 +1174,69 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
             schema_key = new_schema_key
             on_reconf(name)
             return
+
+    def _read_hardware(new_modset: dict[str, ModCap], new_schema_key: ?SchemaKey) -> None:
+        """Read the hardware model once per connect: it cannot change under a
+        live session, and a replaced box comes with a new connection. Picked
+        from the device's modules, not its type. A listed module is no proof
+        the device implements it (the module set carries schema dependencies
+        too), so the read is tried, and no read, an empty reply and a failed
+        read are told apart in the log."""
+        _hw_gen += 1
+        gen = _hw_gen
+        for read in hardware_reads:
+            if read.module in new_modset and _parses(read.module, new_schema_key):
+                def on_reply(root: ?ygdata.Node, err: ?Exception) -> None:
+                    if gen != _hw_gen or isinstance(err, NotConnectedError):
+                        # An earlier connection's reply, or the session dropped
+                        # mid-read: the next connect reads again.
+                        return
+                    if err is not None:
+                        _log.warning("DeviceMgr: hardware model read failed",
+                                     {"device": name, "module": read.module, "error": str(err)})
+                        _set_hardware_model(None)
+                        return
+                    try:
+                        model = read.parse(root)
+                        if model is None:
+                            _log.info("DeviceMgr: hardware read found no chassis",
+                                      {"device": name, "module": read.module})
+                        _set_hardware_model(model)
+                    except Exception as e:
+                        # An unparsable reply is a failed read, not a chassis-less device.
+                        _log.warning("DeviceMgr: hardware model read failed",
+                                     {"device": name, "module": read.module, "error": str(e)})
+                        _set_hardware_model(None)
+                get(on_reply, read.filt)
+                return
+        _log.debug("DeviceMgr: no hardware read for the device's modules", {"device": name})
+        _set_hardware_model(None)
+
+    def _parses(module: str, new_schema_key: ?SchemaKey) -> bool:
+        """Whether get replies are parsed with a schema that has `module`: the
+        fetched schema with runtime-schema-fetch, else the bundled oper schema,
+        as in NetconfDriver. Without it a reply parses to an empty tree."""
+        schema = schema_registry.get_schema(new_schema_key) if dmc.feature_flags.runtime_schema_fetch else bundled_schema.oper_src_dnode
+        if schema is not None:
+            for meta in schema.module_metadata.values():
+                if meta.module == module:
+                    return True
+        return False
+
+    def _set_hardware_model(model: ?str) -> None:
+        """Publish the model, on a change only. None clears it, so an earlier
+        box's model does not outlive a reconnect."""
+        if model is not None:
+            last = _last_model
+            if last is not None and last != model:
+                _log.warning("DeviceMgr: hardware model changed",
+                             {"device": name, "old": last, "new": model})
+            else:
+                _log.info("DeviceMgr: hardware model", {"device": name, "model": model})
+            _last_model = model
+        if oper.state.hardware.model != model:
+            oper.state.hardware.model = model
+            update_oper()
 
     def set_dmc(new_dmc: DeviceMetaConfig) -> None:
         def is_mock_device(new_dmc: DeviceMetaConfig) -> bool:
