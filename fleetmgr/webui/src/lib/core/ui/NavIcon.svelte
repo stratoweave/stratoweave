@@ -1,6 +1,7 @@
 <script lang="ts" module>
   export type NavIconName =
     | 'campaigns'
+    | 'images'
     | 'devices'
     | 'schedules'
     | 'refresh';
@@ -27,6 +28,9 @@
   {#if name === 'campaigns'}
     <path d="M12 16V4m-5 5 5-5 5 5" />
     <path d="M4 20h16" />
+  {:else if name === 'images'}
+    <path d="M12 3 3 7.5l9 4.5 9-4.5L12 3z" />
+    <path d="m3 12 9 4.5 9-4.5M3 16.5 12 21l9-4.5" />
   {:else if name === 'devices'}
     <rect x="3" y="4" width="18" height="6" rx="1.5" />
     <rect x="3" y="14" width="18" height="6" rx="1.5" />
