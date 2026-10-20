@@ -1,7 +1,7 @@
 # fleetmgr web UI
 
 A SvelteKit UI for the fleetmgr contract (see ../README.md): fleet
-inventory and software upgrade campaigns over RESTCONF.
+inventory, software images and software upgrade campaigns over RESTCONF.
 
 It is a static SPA served by the fleetmgr top itself, next to its RESTCONF
 API on the same origin, so there is no proxy and no CORS: `just gen-webui`
@@ -114,6 +114,16 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   campaign, so unbinding many devices takes minutes; leaving the page
   stops it. The leafref is not validated upstream, so the UI offers only
   existing schedules and flags bindings to a missing one.
+- Images are `software:software/images/image` entries keyed by `name`,
+  with `os`, `version` and a `model` leaf-list. Adding one PATCHes the
+  datastore root, which merges into an image of the same name rather than
+  fail, so the add reads the image names again first and refuses one that
+  exists; saving one PUTs the whole entry, so a model removed in the form
+  disappears (DELETE on a leaf returns 500); deleting one DELETEs the
+  entry. A write without `os`, `version` or a model fails with 500, so the
+  form requires all three. A model is added by Enter or by picking a
+  suggestion; other text left in the model field blocks the save, so a
+  half-typed model is neither lost nor saved.
 - Per-device status values: `pending`, `unknown`, `up-to-date`,
   `upgrade-needed`, `in-progress`, `succeeded`, `failed`, `rolled-back`.
   The `succeeded` counter includes `up-to-date`, `failed` includes
