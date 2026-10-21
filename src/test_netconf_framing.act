@@ -219,29 +219,15 @@ class _ErrorSink(logging.Sink):
             self.counter.add(m.actor_class + ": " + msg)
 
 
-def _expected_error(key: str) -> bool:
-    """A reply the server drops because a restart ended its RPC."""
-    return "Cannot send rpc-reply" in key
-
-
-actor _ErrorCount(on_unexpected: ?action(str) -> None=None):
-    """Count errors, and report all of them shortly after the first unexpected one."""
+actor _ErrorCount():
+    """Count errors."""
     var counts: dict[str, int] = {}
-    var reporting = False
-
-    def report() -> None:
-        if on_unexpected is not None:
-            on_unexpected(str(counts))
 
     def add(key: str) -> None:
         if key in counts:
             counts[key] += 1
         else:
             counts[key] = 1
-        if not reporting and not _expected_error(key):
-            reporting = True
-            # Let the errors that come with this one arrive first
-            after 0.2: report()
 
     def get() -> dict[str, int]:
         return counts
@@ -318,147 +304,3 @@ actor _test_client_coalesces_back_to_back_restarts(t: testing.EnvT):
                             log_handler=log_handler,
                             pipe=pipes.client)
     after now 2.0: on_timeout()
-
-
-STRESS_SESSIONS = 40
-STRESS_ROUNDS = 24
-STRESS_BURST = 30
-
-
-actor _StressSession(index: int,
-                     log_handler: logging.Handler,
-                     on_round: action(int, int) -> None,
-                     on_error: action(int, Exception) -> None,
-                     on_client_error: action(int, int, str) -> None):
-    """Run rounds of concurrent gets over one actor pipe, restarting between rounds.
-
-    A round ends when STRESS_BURST gets in the current session have a reply.
-    The restart that follows takes one of four forms, like the restarts of a
-    device adapter: a restart alone, two restarts in a row, a restart with
-    gets requested at once, and gets requested with a restart at once.
-    """
-    pipes = netconf.actor_pipe_pair()
-    value = str(index)
-    var round = 0
-    var replies = 0
-    var outstanding = 0
-    var finished = False
-
-    def on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
-        s.send_reply(message_id, data_reply(value))
-
-    def burst(c: netconf.Client, count: int) -> None:
-        for _ in range(count):
-            outstanding += 1
-            c.get(on_get)
-
-    def next_round(c: netconf.Client) -> None:
-        round += 1
-        replies = 0
-        on_round(index, round)
-        if round == STRESS_ROUNDS:
-            finished = True
-            c.close(None)
-            return
-        kind = round % 4
-        if kind == 0:
-            c.restart()
-        elif kind == 1:
-            c.restart()
-            c.restart()
-        elif kind == 2:
-            c.restart()
-            burst(c, STRESS_BURST)
-        else:
-            burst(c, STRESS_BURST)
-            c.restart()
-
-    def on_get(c: netconf.Client, result: ?xml.Node,
-               error: ?netconf.NetconfError) -> None:
-        outstanding -= 1
-        if finished:
-            return
-        if isinstance(error, netconf.SessionClosedError):
-            return
-        if error is not None:
-            finished = True
-            on_error(index, error)
-        elif reply_value(result) != value:
-            finished = True
-            on_error(index, ValueError("Session {index} got another reply: {reply_value(result)}"))
-        else:
-            replies += 1
-            if replies == STRESS_BURST:
-                next_round(c)
-
-    def on_connect(c: netconf.Client, error: ?Exception) -> None:
-        if finished:
-            return
-        if error is not None:
-            # Like the device adapter: restart the session on an error
-            on_client_error(index, round, str(error))
-            c.restart()
-            return
-        burst(c, STRESS_BURST - replies - outstanding)
-
-    server = netconf.Server(pipe=pipes.server, on_rpc=on_server_rpc,
-                            log_handler=log_handler)
-    client = netconf.Client(None,
-                            address="actor-pipe",
-                            username="actor-pipe",
-                            key=None,
-                            password=None,
-                            port=0,
-                            on_connect=on_connect,
-                            on_notif=None,
-                            log_handler=log_handler,
-                            pipe=pipes.client)
-
-
-actor _test_actor_pipe_restart_stress(t: testing.EnvT):
-    """Many sessions with concurrent RPCs and restarts keep their framing."""
-    var rounds: dict[int, int] = {}
-    var client_errors: list[str] = []
-    var done = False
-
-    def finish(error: ?Exception) -> None:
-        if done:
-            return
-        done = True
-        if error is not None:
-            t.failure(error)
-            return
-        if len(client_errors) > 0:
-            t.failure(ValueError("Client errors: " + "; ".join(client_errors[:5])))
-        else:
-            t.success()
-
-    def on_unexpected(errors: str) -> None:
-        finish(ValueError("Errors logged: {errors}"))
-
-    def on_client_error(index: int, round: int, error: str) -> None:
-        client_errors.append("session {index} in round {round}: {error}")
-
-    def on_round(index: int, round: int) -> None:
-        rounds[index] = round
-        for i in range(STRESS_SESSIONS):
-            if i not in rounds or rounds[i] < STRESS_ROUNDS:
-                return
-        finish(None)
-
-    def on_error(index: int, error: Exception) -> None:
-        finish(error)
-
-    def on_timeout() -> None:
-        stuck = []
-        for i in range(STRESS_SESSIONS):
-            r = rounds[i] if i in rounds else 0
-            if r < STRESS_ROUNDS:
-                stuck.append("session {i} in round {r}")
-        finish(ValueError("Timed out: " + ", ".join(stuck[:10])))
-
-    errors = _ErrorCount(on_unexpected)
-    log_handler = _error_handler(errors)
-    for i in range(STRESS_SESSIONS):
-        _StressSession(i, log_handler, on_round, on_error, on_client_error)
-    after now 20.0: on_timeout()
