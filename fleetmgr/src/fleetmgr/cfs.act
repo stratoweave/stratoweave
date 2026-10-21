@@ -541,39 +541,30 @@ def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_
         direct.allow_staging = i.allow_staging
 
 
-class UpgradeCampaign(base.UpgradeCampaign):
-    def transform(self, i, linked, dynstate):
-        """Actuate exactly the released set.
-
-        Every campaign is paced: the companion actor plans against the
-        clock, decides which placed devices are released, and writes the
-        decision as dynstate. The released list is the whole decision,
-        so this function stays pure and needs no clock: it actuates the
-        released members and nothing else - a device never starts before
-        the controller says so.
-        """
-        o = base.o_root()
-        released: set[str] = set()
-        if dynstate is not None:
-            for name in dynstate.released:
-                released.add(name)
-        if i.admin_state == "run":
-            inventory = y_0.root.from_gdata(linked)
-            for member in i.device:
-                if member.name not in released:
-                    continue
+def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory: y_0.root,
+                    released: set[str]) -> y_1_loose.root:
+    """Return the software intent of campaign i for its members in released.
+    A campaign that does not run has no configuration."""
+    o = base.o_root()
+    if i.admin_state == "run":
+        for member in i.device:
+            if member.name in released:
                 fleet_device = inventory.fleet.device.get(member.name)
                 if fleet_device is not None:
                     route_software(o, fleet_device, i)
-        return o
+    return o
+
+
+class UpgradeCampaign(base.UpgradeCampaign):
+    def transform(self, i, linked):
+        return base.o_root()
 
 
 def imax(a: int, b: int) -> int:
     return a if a > b else b
 
-
 actor UpgradeCampaignTransform(path: ttt.Path,
-                               update_dynstate: proc(?y_0.software__software__upgrade_campaign__dynstate) -> None,
+                               write_output: action(ygdata.Node) -> None,
                                update_oper: proc(?y0_oper.software__software__upgrade_campaign_entry) -> None,
                                lower_tree_provider: ?ygdata.TreeProvider):
     """Aggregate device telemetry and control the release of the plan.
@@ -583,8 +574,9 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     than a tick: on-change telemetry arms a debounce timer and the timer
     firing decides once for the whole batch; window openings and the
     projected shortfall crossing get exact timers of their own. Releases
-    start small and double as upgrades complete, and the decision is
-    written as dynstate for the transform to actuate.
+    start small and double as upgrades complete. The actor writes the
+    decision as dynstate for the transform to actuate, and also sends the
+    configuration of the released devices directly.
     """
     var members: list[str] = []
     var member_names: set[str] = set()
@@ -613,6 +605,21 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var rung_target: int = 1
     var target_rate: int = 0
     var max_rate: int = 0
+    # The campaign and the inventory from the last on_conf, and the
+    # configuration they give for the released devices.
+    var campaign: ?y_0.software__software__upgrade_campaign_entry = None
+    var inventory = y_0.root()
+    var output: ygdata.Node = base.o_root().to_gdata()
+
+    def patch_output(names: set[str]) -> None:
+        """Patch the configuration of the devices in names into output and emit it."""
+        current = campaign
+        if current is not None:
+            patched = ygdata.patch(output, campaign_config(current, inventory, names).to_gdata())
+            # None is an empty result: output stays empty.
+            if patched is not None:
+                output = patched
+            write_output(output)
 
     def publish() -> None:
         oper = base.UpgradeCampaign.new_state(path)
@@ -786,7 +793,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             rung = fs.ramp_next(rung, 2, target_c)
             rung_target = len(done_at) + rung
 
-        grew = False
+        fresh: set[str] = set()
         placed_total = 0
         next_edge = -1
         crossings: list[(int, int)] = []
@@ -819,11 +826,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                     released.add(name)
                     released_at[name] = t
                     released_in[name] = (win.0, wstart, wend)
-                    grew = True
+                    fresh.add(name)
                 idx += 1
-        if grew:
-            update_dynstate(y_0.software__software__upgrade_campaign__dynstate(
-                released=sorted(list(released))))
+        if len(fresh) > 0:
+            patch_output(fresh)
         if next_edge >= 0:
             delay = float(next_edge - t)
             after now delay: decide(next_gen)
@@ -862,6 +868,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         member_names = names
         debounce_s = campaign_debounce_s(len(members))
 
+        campaign = conf
         inventory = y_0.root.from_gdata(linked)
         run_now = conf.admin_state == "run"
         if run_now and not running:
@@ -875,6 +882,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             alarmed = False
             controller_alarms = []
         running = run_now
+        output = campaign_config(conf, inventory, released).to_gdata()
+        write_output(output)
 
         # Released devices keep their window and real times in the replan.
         layout, alarms = plan_campaign(conf, inventory, time.time().unix_s(),

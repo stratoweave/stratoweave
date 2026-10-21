@@ -1126,7 +1126,13 @@ actor Transaction(impl: _Transaction):
         return impl.is_empty()
 
     def init_actor(node: Node, act: proc(TransformActorParams) -> TransformActor):
-        impl.init_actor(node, act, update_dynstate, update_oper)
+        impl.init_actor(node, act, write_output, update_dynstate, update_oper)
+
+    def write_output(conf: gdata.Node):
+        impl.write_output(self, conf)
+
+    def write_output_cont(tid: str, out: Session, res: CfgResult):
+        impl.write_output_cont(tid, out, res)
 
     def update_dynstate(dynstate: ?gdata.Node):
         impl.update_dynstate(self, dynstate)
@@ -1173,7 +1179,18 @@ class _Transaction(object):
     def is_empty(self) -> bool:
         return True
 
-    proc def init_actor(self, node: Node, act: proc(TransformActorParams) -> TransformActor, update_dynstate: action(?gdata.Node)->None, update_oper: action(?gdata.Node)->None):
+    proc def init_actor(self,
+                        node: Node,
+                        act: proc(TransformActorParams) -> TransformActor,
+                        write_output: action(gdata.Node)->None,
+                        update_dynstate: action(?gdata.Node)->None,
+                        update_oper: action(?gdata.Node)->None):
+        pass
+
+    proc def write_output(self, actself: Transaction, conf: gdata.Node):
+        pass
+
+    proc def write_output_cont(self, tid, out, res):
         pass
 
     proc def update_dynstate(self, actself: Transaction, dynstate: ?gdata.Node) -> None:
@@ -3243,6 +3260,29 @@ class _TransformTransactionBase(_Transaction):
                 return _with_path_keys(path, out)
         return None
 
+    proc def write_output(self, actself: Transaction, conf: gdata.Node):
+        out = self.lower?.newsession()
+        if out is not None:
+            tid = 'tr' + actorid()
+            out.write_config(tid, self.me, conf)
+            res = out.apply(tid)
+            if res.errors:
+                self.write_output_cont(tid, out, res)
+            else:
+                out.lock(tid, lambda res: actself.write_output_cont(tid, out, res))
+
+    proc def write_output_cont(self, tid, out, res):
+        ok = not res.errors
+        await async out.commit(tid, ok)
+
+    proc def update_dynstate(self, actself, dynstate):
+        if self.dynstate == dynstate:
+            return
+        self.dynstate = dynstate
+        _node = self.node
+        if _node is not None:
+            Session(self.me, actself, self.lower, self.db).recompute() # TODO: Verify that this always succeeds (due to no input diff)?
+
     proc def subscribe_oper(self, sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
         """Keep the subscription and its filters, so every later update_oper
         pushes the subscriber the slice they select, and answer that slice
@@ -3277,8 +3317,15 @@ class _TransformTransactionBase(_Transaction):
             self.oper_subscriptions[sid] = o
 
 class TransformActorParams:
-    def __init__(self, path: Path, update_dynstate: action(?gdata.Node) -> None, update_oper: action(?gdata.Node) -> None, dev: ?swdev.DeviceMgr, lower: ?Layer=None):
+    def __init__(self,
+                 path: Path,
+                 write_output: action(gdata.Node) -> None,
+                 update_dynstate: action(?gdata.Node) -> None,
+                 update_oper: action(?gdata.Node) -> None,
+                 dev: ?swdev.DeviceMgr,
+                 lower: ?Layer=None):
         self.path = path
+        self.write_output = write_output
         self.update_dynstate = update_dynstate
         self.update_oper = update_oper
         self.dev = dev
@@ -3355,17 +3402,14 @@ class _TransformTransaction(_TransformTransactionBase):
             return
         _TransformTransactionBase.restore(self, attr, qualifier, raw)
 
-    proc def init_actor(self, node, act: proc(TransformActorParams) -> TransformActor, update_dynstate, update_oper):
+    proc def init_actor(self,
+                        node: Node,
+                        act: proc(TransformActorParams) -> TransformActor,
+                        write_output: action(gdata.Node)->None,
+                        update_dynstate: action(?gdata.Node)->None,
+                        update_oper: action(?gdata.Node)->None):
         self.node = node
-        self.function.init_actor(lambda: act(TransformActorParams(self.path, update_dynstate, update_oper, dev=None, lower=self.lower)))
-
-    proc def update_dynstate(self, actself, dynstate):
-        if self.dynstate == dynstate:
-            return
-        self.dynstate = dynstate
-        _node = self.node
-        if _node is not None:
-            Session(self.me, actself, self.lower, self.db).recompute() # TODO: Verify that this always succeeds (due to no input diff)?
+        self.function.init_actor(lambda: act(TransformActorParams(self.path, write_output, update_dynstate, update_oper, dev=None, lower=self.lower)))
 
     def finalize(self, tid):
         #print('####', tid, '(_TransformTransaction)', _format_path(self.path), 'finalize', actorid(), err=True)
@@ -3536,17 +3580,14 @@ class _RFSTransaction(_TransformTransactionBase):
             return
         _TransformTransactionBase.restore(self, attr, qualifier, raw)
 
-    proc def init_actor(self, node, act: proc(TransformActorParams) -> TransformActor, update_dynstate, update_oper):
+    proc def init_actor(self,
+                        node: Node,
+                        act: proc(TransformActorParams) -> TransformActor,
+                        write_output: action(gdata.Node)->None,
+                        update_dynstate: action(?gdata.Node)->None,
+                        update_oper: action(?gdata.Node)->None):
         self.node = node
-        self.function.init_actor(lambda: act(TransformActorParams(self.path, update_dynstate, update_oper, self.dev, lower=None)))
-
-    proc def update_dynstate(self, actself, dynstate):
-        if self.dynstate == dynstate:
-            return
-        self.dynstate = dynstate
-        _node = self.node
-        if _node is not None:
-            Session(self.me, actself, self.lower, self.db).recompute() # TODO: Verify that this always succeeds (due to no input diff)?
+        self.function.init_actor(lambda: act(TransformActorParams(self.path, write_output, update_dynstate, update_oper, self.dev, lower=None)))
 
     def finalize(self, tid):
         #print('####', tid, '(_TransformTransaction)', _format_path(self.path), 'finalize', actorid(), err=True)
@@ -3732,6 +3773,10 @@ class _DeviceConfigTransaction(_TransformTransactionBase):
 class PassThrough(TransformFunction):
     def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
         return (cfg, memory)
+
+class NoOutput(TransformFunction):
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        return gdata.Container(), None
 
 def Sink():
     return Layer('sink', Transform(PassThrough), None, None)
