@@ -633,8 +633,8 @@ export function imageToJson(image: CatalogImage): ImageJson {
   return { name: image.name, os: image.os, version: image.version, model: [...image.models] };
 }
 
-export function imageCreatePatch(image: CatalogImage): SoftwarePatchJson {
-  return { 'software:software': { images: { image: [imageToJson(image)] } } };
+export function imageCreatePatch(images: CatalogImage[]): SoftwarePatchJson {
+  return { 'software:software': { images: { image: images.map(imageToJson) } } };
 }
 
 // ── Validation ──

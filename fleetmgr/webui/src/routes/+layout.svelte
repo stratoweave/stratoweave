@@ -6,6 +6,7 @@
   import { page } from '$app/state';
   import type { Snippet } from 'svelte';
 
+  import { pageLabel } from '$lib/core/page-label.svelte';
   import { dropReadCache } from '$lib/core/restconf/client';
   import NavIcon from '$lib/core/ui/NavIcon.svelte';
   import logoUrl from '$lib/assets/stratoweave-logo.svg';
@@ -46,7 +47,7 @@
     }
     return null;
   });
-  let currentLabel = $derived(parent?.name ?? PAGE_LABELS[currentPathname] ?? 'Campaigns');
+  let currentLabel = $derived(pageLabel.text || (parent?.name ?? PAGE_LABELS[currentPathname] ?? 'Campaigns'));
   let pageTitle = $derived(`${currentLabel} · fleetmgr`);
 </script>
 

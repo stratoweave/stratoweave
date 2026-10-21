@@ -12,6 +12,9 @@ export type SortKey = 'name' | 'os' | 'models' | 'version';
 
 export const OS_NAMES = ['IOS XE', 'IOS XR', 'NX-OS', 'Junos', 'EOS'];
 
+/** What the file chooser offers: the image files of those systems. */
+export const IMAGE_FILE_TYPES = '.bin,.pkg,.iso,.tar,.tgz,.swi';
+
 /** Release-aware: 17.9.4a before 17.12.3, 7.11.2 before 23.4R2. */
 export function compareVersions(a: string, b: string): number {
   return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
@@ -61,6 +64,40 @@ export function versionFromName(name: string): string {
   let end = start;
   while (end < parts.length && /^\d/.test(parts[end])) end++;
   return end - start >= 2 ? parts.slice(start, end).join('.') : '';
+}
+
+const IOS_XE_IMAGE = /^[A-Za-z0-9][\w-]*\.(\d+\.\d+\.\d+[a-z]?)\.SPA\.bin$/;
+
+/** The OS and version an image file name carries. Only IOS XE names are
+ * recognized for now, <family>.<version>.SPA.bin; any other name leaves
+ * both empty rather than guess. */
+export function imageFromFileName(name: string): { os: string; version: string } {
+  const xe = IOS_XE_IMAGE.exec(name);
+  return xe ? { os: 'IOS XE', version: xe[1] } : { os: '', version: '' };
+}
+
+export type ImageErrors = Partial<Record<'name' | 'os' | 'version' | 'models', string>>;
+
+/** What keeps an image from being saved. `taken` holds the names already in
+ * the list; null skips the name, which an edit does not change. */
+export function imageErrors(image: CatalogImage, taken: Set<string> | null): ImageErrors {
+  const e: ImageErrors = {};
+  const name = image.name.trim();
+  if (taken !== null) {
+    if (!name) e.name = 'Required.';
+    else if (taken.has(name)) e.name = 'Already exists.';
+  }
+  if (!image.os.trim()) e.os = 'Required.';
+  if (!image.version.trim()) e.version = 'Required.';
+  if (image.models.length === 0) e.models = 'At least one model.';
+  return e;
+}
+
+/** A model typed but not added yet keeps the image from being saved, so
+ * that it is not lost. */
+export function withDraftError(errors: ImageErrors, draft: string): ImageErrors {
+  const d = draft.trim();
+  return d ? { ...errors, models: `Press Enter to add ${d}, or clear the field.` } : errors;
 }
 
 /** What a model's count in a pick list means. */

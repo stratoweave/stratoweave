@@ -142,8 +142,8 @@ Set `FLEETMGR_API` to point these targets at a top node on another address.
 
 `webui/` is a SvelteKit UI for the same northbound: fleet inventory,
 maintenance schedules, software images and upgrade campaigns over RESTCONF.
-The images page sorts and filters the image list and adds, edits and
-deletes images. The schedules
+The images page sorts and filters the image list, adds images by hand or
+from dropped image files, and edits and deletes them. The schedules
 page shows a week of every schedule's windows on a calendar and edits the
 schedules themselves: the local time zone, and rules of an opening time, a
 duration and weekdays, typed or dragged on the calendar. The devices page

@@ -1,6 +1,8 @@
 <script lang="ts">
+  import FileDrop from '$lib/core/ui/FileDrop.svelte';
   import Pager, { paginate } from '$lib/core/ui/Pager.svelte';
-  import { matchesFilter, sortImages, type SortKey } from '$lib/software/images';
+  import { addImageFiles } from '$lib/software/image-files';
+  import { IMAGE_FILE_TYPES, matchesFilter, sortImages, type SortKey } from '$lib/software/images';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -17,6 +19,7 @@
   let ascending = $state(false);
   let text = $state('');
   let pageNo = $state(1);
+  let dragging = $state(false);
 
   let rows = $derived(sortImages(data.images.filter((i) => matchesFilter(i, text)), sortKey, ascending));
   let paged = $derived(paginate(rows, pageNo, 50));
@@ -41,9 +44,13 @@
 <div class="page-header">
   <div>
     <h1>Images</h1>
-    <p>Software images by file name, with the OS each runs and the hardware models it is for.</p>
+    <p>
+      Software images by file name, with the OS each runs and the hardware
+      models it is for. Drop image files anywhere on this page to add them.
+    </p>
   </div>
   <div class="page-actions">
+    <FileDrop onfiles={(files) => void addImageFiles(files)} bind:dragging accept={IMAGE_FILE_TYPES} />
     <a class="btn btn-primary" href="/images/new">Add image</a>
   </div>
 </div>
@@ -51,9 +58,12 @@
 {#if data.loadError}
   <div class="error-state status">{data.loadError}</div>
 {:else}
-  <section class="card">
+  <section class="card" class:dropping={dragging}>
+    {#if dragging}
+      <span class="drop-hint">Drop to add these files as images</span>
+    {/if}
     {#if data.images.length === 0}
-      <div class="empty-state">No images yet.</div>
+      <div class="empty-state">No images yet. Add one by hand, or drop image files anywhere on this page.</div>
     {:else}
       <div class="filters">
         <input

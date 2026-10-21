@@ -123,7 +123,12 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   entry. A write without `os`, `version` or a model fails with 500, so the
   form requires all three. A model is added by Enter or by picking a
   suggestion; other text left in the model field blocks the save, so a
-  half-typed model is neither lost nor saved.
+  half-typed model is neither lost nor saved. Image files dropped on the
+  image pages, or picked with Upload images, open a table with one row per
+  file and are added in one PATCH. An IOS XE name
+  (`<family>.<version>.SPA.bin`) fills OS and version, in the table and in
+  the one-image form until they are typed; the operator picks the models.
+  Only the file names are read; nothing is uploaded yet.
 - Per-device status values: `pending`, `unknown`, `up-to-date`,
   `upgrade-needed`, `in-progress`, `succeeded`, `failed`, `rolled-back`.
   The `succeeded` counter includes `up-to-date`, `failed` includes

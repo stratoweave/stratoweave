@@ -13,9 +13,21 @@
   } from '$lib/core/restconf/client';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import FieldText from '$lib/core/ui/FieldText.svelte';
+  import FileDrop from '$lib/core/ui/FileDrop.svelte';
   import { focusFirstError } from '$lib/core/ui/focus';
   import TokenSelect from '$lib/core/ui/TokenSelect.svelte';
-  import { OS_NAMES, imageCountLabel, knownModels, versionFromName, type CatalogImage } from '$lib/software/images';
+  import {
+    IMAGE_FILE_TYPES,
+    OS_NAMES,
+    imageCountLabel,
+    imageErrors,
+    imageFromFileName,
+    knownModels,
+    versionFromName,
+    withDraftError,
+    type CatalogImage,
+    type ImageErrors
+  } from '$lib/software/images';
   import {
     DATA_ROOT,
     IMAGES_ROOT,
@@ -30,9 +42,11 @@
     image: CatalogImage | null;
     /** Every image, for the name check and the suggestions. */
     images: CatalogImage[];
+    /** Given, a new image can also come from dropped or chosen files. */
+    onfiles?: (files: File[]) => void;
   }
 
-  let { image, images }: Props = $props();
+  let { image, images, onfiles }: Props = $props();
 
   const uid = $props.id();
   const isNew = untrack(() => image === null);
@@ -43,7 +57,8 @@
   let version = $state(untrack(() => image?.version ?? ''));
   let models = $state<string[]>(untrack(() => [...(image?.models ?? [])]));
   let modelDraft = $state('');
-  // A new image takes its version from the name until the version is typed.
+  // A new image takes its OS and version from the name until they are typed.
+  let osTyped = $state(!isNew);
   let versionTyped = $state(!isNew);
   // Names read again just before an add, for one added since this page loaded.
   let lateNames = $state<string[]>([]);
@@ -57,27 +72,14 @@
   let modelOptions = $derived(knownModels(images).map(([value, count]) => ({ value, count })));
   let osOptions = $derived([...new Set([...OS_NAMES, ...images.map((i) => i.os)])]);
 
-  let errors = $derived.by(() => {
-    const e: Record<string, string> = {};
-    const n = name.trim();
-    if (isNew) {
-      if (!n) e.name = 'Required.';
-      else if (images.some((i) => i.name === n) || lateNames.includes(n)) e.name = 'Already exists.';
-    }
-    if (!os.trim()) e.os = 'Required.';
-    if (!version.trim()) e.version = 'Required.';
-    if (models.length === 0) e.models = 'At least one model.';
-    // A model typed but not added yet keeps the image from being saved, so
-    // that it is not lost.
-    const d = modelDraft.trim();
-    if (d) e.models = `Press Enter to add ${d}, or clear the field.`;
-    return e;
-  });
-  let shown = $derived(touched ? errors : ({} as Record<string, string>));
+  let taken = $derived(new Set([...images.map((i) => i.name), ...lateNames]));
+  let errors = $derived(withDraftError(imageErrors({ name, os, version, models }, isNew ? taken : null), modelDraft));
+  let shown = $derived(touched ? errors : ({} as ImageErrors));
   let modelsMeta = $derived(shown.models ?? (modelDraft.trim() ? 'Press Enter to add it.' : ''));
 
   function setName(next: string): void {
     name = next;
+    if (!osTyped) os = imageFromFileName(next.trim()).os;
     if (!versionTyped) version = versionFromName(next.trim());
   }
 
@@ -100,7 +102,7 @@
           await focusFirstError(form);
           return;
         }
-        await restconfPatchJson(DATA_ROOT, imageCreatePatch(saved));
+        await restconfPatchJson(DATA_ROOT, imageCreatePatch([saved]));
       } else {
         // PUT replaces the whole entry, so a removed model disappears.
         await restconfPutJson(
@@ -148,6 +150,9 @@
         Delete
       </button>
     {/if}
+    {#if isNew && onfiles}
+      <FileDrop {onfiles} disabled={saving} accept={IMAGE_FILE_TYPES} />
+    {/if}
     <a class="btn btn-secondary" href="/images">Cancel</a>
     <button class="btn btn-primary" type="button" disabled={saving || deleting} onclick={save}>
       {saving ? 'Saving…' : isNew ? 'Add image' : 'Save'}
@@ -179,7 +184,10 @@
       error={shown.os}
       suggestions={osOptions}
       placeholder="e.g. IOS XE"
-      onchange={(v) => (os = v)}
+      onchange={(v) => {
+        osTyped = true;
+        os = v;
+      }}
       ontouch={() => (touched = true)}
     />
     <FieldText
