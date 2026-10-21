@@ -7,7 +7,7 @@
 </script>
 
 <script lang="ts">
-  import { tick } from 'svelte';
+  import { tick, type Snippet } from 'svelte';
 
   // Pick any of a set of values. A short list shows every option as a
   // toggle; a long one shows the picked values, each with a remove button,
@@ -29,6 +29,9 @@
     /** Id of the element that describes the field, such as its error. */
     describedby?: string;
     onchange: (next: string[]) => void;
+    /** More controls in the same row, after the field. They are sized like
+     * the tokens. */
+    children?: Snippet;
   }
 
   let {
@@ -41,7 +44,8 @@
     required = false,
     invalid = false,
     describedby,
-    onchange
+    onchange,
+    children
   }: Props = $props();
 
   const uid = $props.id();
@@ -157,6 +161,7 @@
     }}
     onblur={left}
   />
+  {@render children?.()}
   {#if !toggles}
     <datalist id={listId}>
       {#each options as o (o.value)}
@@ -233,9 +238,11 @@
     outline: none;
   }
 
-  /* A type-ahead field: room for a whole value. */
+  /* A type-ahead field: room for a whole value, less when the row is
+     shared with other controls. */
   .tok-input.wide {
-    width: 14em;
+    flex: 1 1 8em;
+    max-width: 14em;
   }
 
   .tok-input::placeholder {
@@ -256,10 +263,17 @@
     box-shadow: 0 0 0 3px rgb(var(--sw-danger-rgb) / 0.4);
   }
 
+  .tokens > :global(.btn) {
+    padding: 3px 8px;
+    border-radius: var(--sw-radius-xs);
+    font-size: var(--sw-text-xs);
+  }
+
   /* Touch screens get targets a finger can hit, as app.css gives chips. */
   @media (pointer: coarse) {
     .tok,
-    .tok-input {
+    .tok-input,
+    .tokens > :global(.btn) {
       min-height: 32px;
     }
   }
