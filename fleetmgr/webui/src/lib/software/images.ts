@@ -66,14 +66,32 @@ export function versionFromName(name: string): string {
   return end - start >= 2 ? parts.slice(start, end).join('.') : '';
 }
 
-const IOS_XE_IMAGE = /^[A-Za-z0-9][\w-]*\.(\d+\.\d+\.\d+[a-z]?)\.SPA\.bin$/;
+const IOS_XE_IMAGE = /^([A-Za-z0-9][\w-]*)\.(\d+\.\d+\.\d+[a-z]?)\.SPA\.bin$/;
 
 /** The OS and version an image file name carries. Only IOS XE names are
  * recognized for now, <family>.<version>.SPA.bin; any other name leaves
  * both empty rather than guess. */
 export function imageFromFileName(name: string): { os: string; version: string } {
   const xe = IOS_XE_IMAGE.exec(name);
-  return xe ? { os: 'IOS XE', version: xe[1] } : { os: '', version: '' };
+  return xe ? { os: 'IOS XE', version: xe[2] } : { os: '', version: '' };
+}
+
+/** The newest image of the same IOS XE family (e.g. c8000v-universalk9) with
+ * an older version, to copy models from; null when there is none. */
+export function previousImage(image: CatalogImage, images: CatalogImage[]): CatalogImage | null {
+  const family = IOS_XE_IMAGE.exec(image.name)?.[1];
+  if (family === undefined) return null;
+  let previous: CatalogImage | null = null;
+  for (const i of images) {
+    if (IOS_XE_IMAGE.exec(i.name)?.[1] !== family || compareVersions(i.version, image.version) >= 0) continue;
+    if (previous === null || compareVersions(i.version, previous.version) > 0) previous = i;
+  }
+  return previous;
+}
+
+/** `models` plus those of `from` it lacks. */
+export function withModelsOf(models: string[], from: CatalogImage): string[] {
+  return [...models, ...from.models.filter((m) => !models.includes(m))];
 }
 
 /** An image as typed in a form, with a model typed but not added yet. */

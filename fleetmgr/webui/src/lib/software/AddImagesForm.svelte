@@ -15,7 +15,9 @@
     imageErrors,
     imageFromFileName,
     knownModels,
+    previousImage,
     withDraftError,
+    withModelsOf,
     type CatalogImage,
     type ImageErrors,
     type TypedImage
@@ -178,6 +180,7 @@
         <tbody>
           {#each rows as row, index (row.name)}
             {@const shown = touched ? errors[index] : ({ name: errors[index].name } as ImageErrors)}
+            {@const previous = previousImage(row, images)}
             {@const id = `${uid}-${index}`}
             {@const modelsMeta = shown.models ?? (row.draft.trim() ? 'Press Enter to add it.' : '')}
             <tr>
@@ -227,7 +230,19 @@
                   describedby={modelsMeta ? `${id}-models` : undefined}
                   bind:draft={row.draft}
                   onchange={(next) => (row.models = next)}
-                />
+                >
+                  {#if previous && previous.models.some((m) => !row.models.includes(m))}
+                    <button
+                      class="btn btn-secondary"
+                      type="button"
+                      title={previous.name}
+                      disabled={saving}
+                      onclick={() => (row.models = withModelsOf(row.models, previous))}
+                    >
+                      Copy models from {previous.version}
+                    </button>
+                  {/if}
+                </TokenSelect>
                 {#if modelsMeta}
                   <small id={`${id}-models`} class="field__meta" class:field__meta--error={!!shown.models}>
                     {modelsMeta}
@@ -265,7 +280,7 @@
 
   .files {
     table-layout: fixed;
-    min-width: 960px;
+    min-width: 860px;
   }
 
   .files td {
@@ -273,15 +288,15 @@
   }
 
   .col-name {
-    width: 34%;
+    width: 33%;
   }
 
   .col-os {
-    width: 12%;
+    width: 11%;
   }
 
   .col-version {
-    width: 12%;
+    width: 11%;
   }
 
   .col-action {

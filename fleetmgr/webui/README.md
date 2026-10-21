@@ -127,11 +127,12 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   image pages, or picked with Upload images, open a table with one row per
   file and are added in one PATCH. An IOS XE name
   (`<family>.<version>.SPA.bin`) fills OS and version, in the table and in
-  the one-image form until they are typed; the operator picks the models.
-  Files dropped on the one-image form replace it; what was typed there
-  goes to the row of the same file name, and with no such row the form
-  asks before it is lost. Only the file names are read; nothing is
-  uploaded yet.
+  the one-image form until they are typed; the operator picks the models
+  or copies them from the newest older image of the same family. Files
+  dropped on the one-image form replace it; what was typed there goes to
+  the row of the same file name, and with no such row the form asks
+  before it is lost. Only the file names are read; nothing is uploaded
+  yet.
 - Per-device status values: `pending`, `unknown`, `up-to-date`,
   `upgrade-needed`, `in-progress`, `succeeded`, `failed`, `rolled-back`.
   The `succeeded` counter includes `up-to-date`, `failed` includes

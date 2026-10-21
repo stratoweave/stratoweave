@@ -23,8 +23,10 @@
     imageErrors,
     imageFromFileName,
     knownModels,
+    previousImage,
     versionFromName,
     withDraftError,
+    withModelsOf,
     type CatalogImage,
     type ImageErrors,
     type TypedImage
@@ -80,6 +82,7 @@
   let errors = $derived(withDraftError(imageErrors({ name, os, version, models }, isNew ? taken : null), modelDraft));
   let shown = $derived(touched ? errors : ({} as ImageErrors));
   let modelsMeta = $derived(shown.models ?? (modelDraft.trim() ? 'Press Enter to add it.' : ''));
+  let previous = $derived(previousImage({ name: name.trim(), os, version, models }, images));
   // An OS or version taken from the name comes back from the name.
   let typedAnything = $derived(
     !!name.trim() ||
@@ -247,7 +250,18 @@
       describedby={modelsMeta ? `${uid}-models-meta` : undefined}
       bind:draft={modelDraft}
       onchange={(next) => (models = next)}
-    />
+    >
+      {#if previous && previous.models.some((m) => !models.includes(m))}
+        <button
+          class="btn btn-secondary"
+          type="button"
+          title={previous.name}
+          onclick={() => previous && (models = withModelsOf(models, previous))}
+        >
+          Copy models from {previous.version}
+        </button>
+      {/if}
+    </TokenSelect>
     <small id={`${uid}-models-meta`} class="field__meta" class:field__meta--error={!!shown.models}>
       {modelsMeta || ' '}
     </small>
