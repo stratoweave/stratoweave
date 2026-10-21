@@ -30,6 +30,8 @@
     describedby?: string;
     /** Id of the field, for a label that names it. */
     id?: string;
+    /** Sized like the compact inputs of a table row. */
+    compact?: boolean;
     onchange: (next: string[]) => void;
   }
 
@@ -44,6 +46,7 @@
     invalid = false,
     describedby,
     id,
+    compact = false,
     onchange
   }: Props = $props();
 
@@ -93,7 +96,7 @@
   }
 </script>
 
-<span bind:this={root} class="tokens" role="group" aria-label={label}>
+<span bind:this={root} class="tokens" class:compact role="group" aria-label={label}>
   {#each shown as value, index (value)}
     {@const count = counts.get(value)}
     {#if toggles}
@@ -135,6 +138,7 @@
     bind:this={input}
     {id}
     class="input mono tok-input"
+    class:compact
     class:wide={!toggles}
     class:has-error={invalid}
     {placeholder}

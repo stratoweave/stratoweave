@@ -636,8 +636,8 @@ export function imageToJson(image: CatalogImage): ImageJson {
   return { name: image.name, os: image.os, version: image.version, model: [...image.models] };
 }
 
-export function imageCreatePatch(image: CatalogImage): ImagesPatchJson {
-  return { 'stratoweave-images:images': { image: [imageToJson(image)] } };
+export function imageCreatePatch(images: CatalogImage[]): ImagesPatchJson {
+  return { 'stratoweave-images:images': { image: images.map(imageToJson) } };
 }
 
 // ── Validation ──

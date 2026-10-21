@@ -13,9 +13,22 @@
   } from '$lib/core/restconf/client';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import FieldText from '$lib/core/ui/FieldText.svelte';
+  import FileDrop from '$lib/core/ui/FileDrop.svelte';
   import { focusFirstError } from '$lib/core/ui/focus';
   import TokenSelect from '$lib/core/ui/TokenSelect.svelte';
-  import { OS_NAMES, imageCountLabel, knownModels, versionFromName, type CatalogImage } from '$lib/software/images';
+  import {
+    IMAGE_FILE_TYPES,
+    OS_NAMES,
+    imageCountLabel,
+    imageErrors,
+    imageFromFileName,
+    knownModels,
+    versionFromName,
+    withDraftError,
+    type CatalogImage,
+    type ImageErrors,
+    type TypedImage
+  } from '$lib/software/images';
   import {
     DATA_ROOT,
     IMAGES_ROOT,
@@ -30,9 +43,12 @@
     image: CatalogImage | null;
     /** Every image, for the name check and the suggestions. */
     images: CatalogImage[];
+    /** Given, a new image can also come from dropped or chosen files.
+     * `typed` is what this form held, for the file of the same name. */
+    onfiles?: (files: File[], typed: TypedImage | null) => void;
   }
 
-  let { image, images }: Props = $props();
+  let { image, images, onfiles }: Props = $props();
 
   const uid = $props.id();
   const isNew = untrack(() => image === null);
@@ -43,7 +59,8 @@
   let version = $state(untrack(() => image?.version ?? ''));
   let models = $state<string[]>(untrack(() => [...(image?.models ?? [])]));
   let modelDraft = $state('');
-  // A new image takes its version from the name until the version is typed.
+  // A new image takes its OS and version from the name until they are typed.
+  let osTyped = $state(!isNew);
   let versionTyped = $state(!isNew);
   // Names read again just before an add, for one added since this page loaded.
   let lateNames = $state<string[]>([]);
@@ -51,34 +68,46 @@
   let saving = $state(false);
   let deleting = $state(false);
   let confirmDelete = $state(false);
+  // Files that would take the place of what is typed here, until confirmed.
+  let pendingFiles = $state.raw<File[] | null>(null);
   let statusMessage = $state('');
   let form: HTMLElement | null = $state(null);
 
   let modelOptions = $derived(knownModels(images).map(([value, count]) => ({ value, count })));
   let osOptions = $derived([...new Set([...OS_NAMES, ...images.map((i) => i.os)])]);
 
-  let errors = $derived.by(() => {
-    const e: Record<string, string> = {};
-    const n = name.trim();
-    if (isNew) {
-      if (!n) e.name = 'Required.';
-      else if (images.some((i) => i.name === n) || lateNames.includes(n)) e.name = 'Already exists.';
-    }
-    if (!os.trim()) e.os = 'Required.';
-    if (!version.trim()) e.version = 'Required.';
-    if (models.length === 0) e.models = 'At least one model.';
-    // A model typed but not added yet keeps the image from being saved, so
-    // that it is not lost.
-    const d = modelDraft.trim();
-    if (d) e.models = `Press Enter to add ${d}, or clear the field.`;
-    return e;
-  });
-  let shown = $derived(touched ? errors : ({} as Record<string, string>));
+  let taken = $derived(new Set([...images.map((i) => i.name), ...lateNames]));
+  let errors = $derived(withDraftError(imageErrors({ name, os, version, models }, isNew ? taken : null), modelDraft));
+  let shown = $derived(touched ? errors : ({} as ImageErrors));
   let modelsMeta = $derived(shown.models ?? (modelDraft.trim() ? 'Press Enter to add it.' : ''));
+  // An OS or version taken from the name comes back from the name.
+  let typedAnything = $derived(
+    !!name.trim() ||
+      (osTyped && !!os.trim()) ||
+      (versionTyped && !!version.trim()) ||
+      models.length > 0 ||
+      !!modelDraft.trim()
+  );
 
   function setName(next: string): void {
     name = next;
+    if (!osTyped) os = imageFromFileName(next.trim()).os;
     if (!versionTyped) version = versionFromName(next.trim());
+  }
+
+  // Files take this page over, one row each. What is typed here goes to the
+  // row of the same name; with no such row it would be lost, so ask first.
+  function takeFiles(files: File[]): void {
+    const typed = { name: name.trim(), os: os.trim(), version: version.trim(), models: [...models], draft: modelDraft };
+    if (files.some((f) => f.name === typed.name)) onfiles?.(files, typed);
+    else if (typedAnything) pendingFiles = files;
+    else onfiles?.(files, null);
+  }
+
+  function takePendingFiles(): void {
+    const files = pendingFiles;
+    pendingFiles = null;
+    if (files) onfiles?.(files, null);
   }
 
   async function save(): Promise<void> {
@@ -100,7 +129,7 @@
           await focusFirstError(form);
           return;
         }
-        await restconfPatchJson(DATA_ROOT, imageCreatePatch(saved));
+        await restconfPatchJson(DATA_ROOT, imageCreatePatch([saved]));
       } else {
         // PUT replaces the whole entry, so a removed model disappears.
         await restconfPutJson(
@@ -148,6 +177,9 @@
         Delete
       </button>
     {/if}
+    {#if isNew && onfiles}
+      <FileDrop onfiles={takeFiles} disabled={saving} accept={IMAGE_FILE_TYPES} />
+    {/if}
     <a class="btn btn-secondary" href="/images">Cancel</a>
     <button class="btn btn-primary" type="button" disabled={saving || deleting} onclick={save}>
       {saving ? 'Saving…' : isNew ? 'Add image' : 'Save'}
@@ -179,7 +211,10 @@
       error={shown.os}
       suggestions={osOptions}
       placeholder="e.g. IOS XE"
-      onchange={(v) => (os = v)}
+      onchange={(v) => {
+        osTyped = true;
+        os = v;
+      }}
       ontouch={() => (touched = true)}
     />
     <FieldText
@@ -227,6 +262,19 @@
   confirmClass="btn-danger"
   oncancel={() => (confirmDelete = false)}
   onconfirm={remove}
+/>
+
+<ConfirmDialog
+  open={pendingFiles !== null}
+  title="Add these files instead?"
+  message={name.trim()
+    ? `No file is named ${name.trim()}, so what is typed in this form is not kept.`
+    : 'What is typed in this form is not kept.'}
+  confirmLabel="Add the files"
+  cancelLabel="Keep this form"
+  confirmClass="btn-primary"
+  oncancel={() => (pendingFiles = null)}
+  onconfirm={takePendingFiles}
 />
 
 <style>
