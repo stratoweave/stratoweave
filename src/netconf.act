@@ -242,6 +242,8 @@ actor Client(
     # True from asking the pipe to connect until it reports the result. The
     # events that come before the result belong to the session before.
     var connect_pending = False
+    # True from bytes that break the chunked framing until the next session
+    var framing_failed = False
     var active_fixups: list[Fixup] = []
 
     def _prune_inactive_fixups():
@@ -352,7 +354,8 @@ actor Client(
         session_id = None
         capabilities = []
 
-        message_id = 1
+        # message_id keeps counting. A late reply to an RPC of the session
+        # before must not match an RPC of the new session.
 
         state = STATE_NONE
         active_fixups.clear()
@@ -993,6 +996,13 @@ actor Client(
         m = recv_buf.match_bytes(CHUNK_TAG_PREFIX)
         if m is not None:
             if not m:
+                recv_buf.rewind()
+                head_len = recv_buf.unread_bytes if recv_buf.unread_bytes < 200 else 200
+                _log.error("Invalid NETCONF chunk framing", {"data": recv_buf.read_bytes(head_len)})
+                # The bad bytes stay in the way of every later write, so read
+                # nothing more and report the error once
+                framing_failed = True
+                recv_buf = Buffer()
                 on_connect(self, NetconfError("Invalid chunk framing data"))
                 return False
             _len_text_len = recv_buf.find_bytes(CHUNK_TAG_POSTFIX)
@@ -1034,7 +1044,7 @@ actor Client(
 
     def _on_pipe_event(err: ?Exception, data: ?bytes):
         if data is not None:
-            if not connect_pending:
+            if not connect_pending and not framing_failed:
                 _on_receive(data)
             return
         if err is None and not connect_pending:
@@ -1052,6 +1062,7 @@ actor Client(
             _log.info("Connected", {"address": address, "port": port, "username": username})
             # Each session starts with the hello exchange in base:1.0 framing
             framing = SEPARATOR_FRAMING
+            framing_failed = False
             recv_buf = Buffer()
             chunk_buf = Buffer()
             state = STATE_CONNECTING
