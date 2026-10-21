@@ -1,606 +1,202 @@
-# Software upgrades in StratoWeave
+# Software upgrades
 
-Status: draft. This document describes the current implementation and the work
-still needed before software upgrades are safe to run without manual recovery.
+StratoWeave upgrades the software of each device on its own. You set the
+release a device should run, and the device's software manager moves the
+device to it. Which devices to upgrade, and when is decided by fleetmgr.
 
-The current implementation supports an IOS XE upgrade with four NETCONF RPCs:
-copy the image to bootflash, add it, activate it with a 30 minute auto-abort
-timer, and commit it once the post-checks pass. It checks the running release
-before starting, runs the registered pre-checks before activating, waits for
-the device to return on the requested release, aborts when a post-check fails,
-publishes basic operational state, and resyncs the device schema.
+A release is one name per device, for example `17.18.03a`. Platforms that
+version parts of their software separately are not supported yet.
 
-CI runs the same path against an in-process NETCONF mock. A live-device run is
-still required before release because the mock cannot reproduce IOS XE reload,
-resource, and transport failures.
+## Parts
 
-## 1. Scope
+| Part | Where | Role |
+| --- | --- | --- |
+| `SoftwareManager` | `src/device.act` | One per device. Runs the upgrade steps in order and publishes their state. |
+| `SoftwareAdapter` | `src/device.act` | One per platform. Does the device work for each step. |
+| Checks | your application | Decide if an upgrade may start, and if the new release may stay. |
 
-`SoftwareManager` owns the sequence for one device. `SoftwareAdapter` implements
-the platform operations. The manager is declarative: configuration says which
-release the device should run, and the manager moves the device toward it.
+Every `DeviceMgr` owns one `SoftwareManager`. A device type names its adapter
+with `software_adapter_type`. A device type without one gets
+`NoSoftwareAdapter`, so its upgrades fail with "device type has no software
+adapter".
 
-Software is treated as one release string per device. Platforms with separately
-versioned components are not supported by this API.
+## Configuration
 
-The current manager implements:
+Set under `stratoweave-rfs:device=<name>/software`:
 
-```text
-check -> already running? -> up-to-date
-  |
-  +-> prepare -> pre-checks -> install -> post-checks -> commit -> check -> resync -> succeeded
-          |          |            |           |            |
-          |          |            |           +------------+-> rollback -> check -> rolled-back
-          |          |            |                              |
-          +----------+------------+------------------------------+-> failed
-```
+| Leaf | Meaning |
+| --- | --- |
+| `target-release` | Release the device should run. Setting it starts an upgrade. |
+| `image-url` | URL the device downloads the image from. The last part of the path is the file name on the device. |
+| `veto[holder]` | While any entry exists, no upgrade starts. An upgrade already running goes on. |
+| `upgrade-campaign` | Campaign that owns the device. Stored, not used by the manager. |
+| `allow-staging` | Stored, not used by the manager. |
 
-The following parts of the model and API are not implemented yet:
-
-- early staging controlled by `allow-staging`;
-- cleanup;
-- per-job progress and timestamps;
-- retry and recovery after a process restart;
-- fleet scheduling and maintenance-window capacity.
-
-A failed install leaves the device on the old release. A failed rollback needs
-an operator.
-
-## 2. Current manager behavior
-
-Every `DeviceMgr` owns one `SoftwareManager`. A device type supplies a
-`SoftwareAdapter`; device types without one use `NoSoftwareAdapter`, which
-reports unsupported operations.
-
-The current reconcile rules are:
-
-1. If no `target-release` is set, do nothing.
-2. If any veto exists, do nothing. The veto currently blocks the initial read,
-   staging, and installation.
-3. Read the running release with `check`.
-4. If the adapter says the running and requested releases match, publish
-   `up-to-date` and stop.
-5. If the read fails, log the error and continue. A failed read is not treated
-   as evidence that the device is already up to date.
-6. Publish `in-progress` and call `prepare`.
-7. Run every registered pre-check. Each gets a `done(ok, reason)` action. A
-   refusal, or a pre-check that has not answered within `PRECHECK_TIMEOUT`
-   (60 seconds), publishes `failed` with nothing activated. With no
-   pre-checks registered, or all passing, call `install`.
-8. After `install` succeeds, ask the adapter for the `commit_window`: seconds
-   left before the platform reverts on its own. With less than `COMMIT_MARGIN`
-   (2 minutes) left, roll back at once. Otherwise the post-check deadline is
-   the smaller of `POSTCHECK_TIMEOUT` (15 minutes) and what is left minus the
-   margin.
-9. Run every registered post-check, the same way. With no post-checks
-   registered, go straight to `commit`.
-10. When all post-checks pass, call `commit`, then read the release again. If
-    the device does not run the target, it reverted before the commit took:
-    publish `failed`. Otherwise resync the device and publish `succeeded`.
-11. When a post-check fails, a post-check has not answered within the
-    deadline, or `commit` fails, call `rollback` with the release read in
-    step 3, read the release again, and publish `rolled-back`.
-12. A `prepare`, `install`, or `rollback` error publishes `failed`, with the
-    adapter's error message as the `reason`.
-
-Every decision bumps an attempt counter. A check reply or timer that belongs
-to an earlier step is ignored. Checks registered during a run count from the
-next run. A check removed during its round no longer holds the round up.
-
-The manager sets `busy` before the initial read and clears it after the final
-read or an error. Repeated configuration while a run is active does not start a
-second sequence.
-
-`upgrade-campaign` and `allow-staging` are stored but do not affect the current
-sequence. In particular, `target-release` alone is enough to start work.
-
-Run state is held in memory. After a process restart, restored configuration can
-start a new reconcile. A later write to any part of the device meta
-configuration can also call `set_config` again. A failed run is not sticky: if
-the target still differs, a later reconcile can try again. These behaviors need
-to be made explicit and safe before automatic fleet use.
-
-### 2.1 Release comparison
-
-The manager delegates version equality to `SoftwareAdapter.matches_release`.
-The default is an exact string match. IOS XE compares numeric components so
-zero padding does not matter:
+## Upgrade steps
 
 ```text
-requested: 17.18.03a
-reported:  17.18.3a
+check ──> already on target ──> up-to-date
+  │
+  └─> prepare ─> pre-checks ─> install ─> post-checks ─> commit ─> succeeded
+         │           │            │            │            │
+         └───────────┴────────────┴─> failed   └────────────┴─> rollback ─> rolled-back
 ```
 
-Without this comparison, an already-correct device can be copied, installed,
-and reloaded only to return to the same release. IOS XE can report such a no-op
-as successful, so the check must happen before the impacting RPC.
+| Step | What happens |
+| --- | --- |
+| check | Read the running release. If it is the target, stop with `up-to-date`. If the read fails, go on. |
+| prepare | Copy the image to the device. No outage. |
+| pre-checks | Ask every pre-check. A refusal, or no answer within 60 seconds, ends with `failed`. Nothing is activated. |
+| install | Activate the new release. The device reboots. The step ends when the device runs the target. |
+| post-checks | Ask every post-check. A refusal, or no answer in time, starts a rollback. |
+| commit | Tell the device to keep the new release. Then read the release again and re-read the device config. |
+| rollback | Go back to the release the device ran before. |
 
-## 3. Configuration and operational state
+Rules:
 
-Software configuration is under `stratoweave-rfs:device/software`.
+- An error in prepare or install ends with `failed`. A failed install does
+  not roll back.
+- A failed commit starts a rollback. A failed rollback ends with `failed`.
+- If the device does not run the target after the commit, the run ends with
+  `failed`. This happens when the device went back on its own before the
+  commit arrived.
+- Post-checks get 15 minutes. When the platform goes back on its own after a
+  set time (IOS XE does), the limit is cut so the commit is sent at least 2
+  minutes before that. With less than 2 minutes left, the manager rolls back
+  at once.
+- A device runs one upgrade at a time.
+- Run state lives in memory. A failed run is not remembered: the next config
+  change for the device starts a new run if the target still differs. After a
+  restart, the stored config can start a new run.
 
-| Node | Current use |
-|---|---|
-| `upgrade-campaign` | records which campaign owns the device; not used to gate the current reconcile |
-| `target-release` | release the device should run; its presence starts reconciliation |
-| `image-url` | URL IOS XE uses as `xcopy/source-path` |
-| `allow-staging` | reserved for scheduling `prepare` ahead of the maintenance window; currently ignored |
-| `veto[holder]` | blocks the whole current reconcile while any entry exists |
+## Checks
 
-`image-url` is a full URL because the device pulls the image. The final path
-component becomes the bootflash filename. IOS XE supports SCP, FTP, HTTP, and
-HTTPS for this operation.
+Applications add checks by name. Every check must pass.
 
-SCP and FTP URLs may embed credentials. The leaf is readable anywhere device
-configuration is readable. Generic device and RPC debug logging also serializes
-configuration and RPC input today, so adapter-level URL redaction is not enough.
-Do not treat an embedded password as protected until the configuration and
-logging paths are changed.
+```acton
+def precheck(done: action(bool, str) -> None) -> None:
+    if peer_is_up:
+        done(True, "peer up")
+    else:
+        done(False, "redundant peer is down")
 
-### 3.1 Published state
-
-Operational state is published under:
-
-```text
-stratoweave-rfs:device=<name>/software/state
+swmgr = dev.get_swmgr()
+swmgr.add_precheck("my-app", precheck)
+swmgr.add_postcheck("my-app", postcheck)
 ```
 
-`SoftwareManager` sends a `SoftwareState` copy to `DeviceMgr` whenever `status`
-or `running-release` changes, whenever the run moves to its next step, and
-whenever a round of checks reaches a verdict. `DeviceMgr` merges it into the
-device entry's operational tree and calls the TTT device node's `update_oper`.
-Registration replays the current state, so a device node created after a state
-change still gets the latest value.
-
-The manager currently populates:
-
-| Node | Value |
-|---|---|
-| `status` | `unknown`, `up-to-date`, `in-progress`, `succeeded`, `rolled-back`, or `failed` |
-| `running-release` | last release returned by `check`, using the device's spelling |
-| `stage` | `prepare`, `precheck`, `install`, `postcheck`, `commit`, or `rollback`: the step the run is in, or the step it ended in |
-| `reason` | why the run failed or rolled back: the adapter's error, `pre-check failed: <detail>`, `post-check failed: <detail>`, or the manager's own cause (no time left to commit, target withdrawn, device reverted after the commit). A failed rollback adds its error after `; `. Set together with the status or stage it explains |
-| `precheck`, `postcheck` | one `check-result` each: `verdict` is `not-run`, `pass`, or `fail`; `detail` names the first refusing registrant and its reason, the registrants that did not answer, or each passing registrant with its reason; `at` is when the verdict was reached |
-
-When a new run starts, `stage` returns to `prepare`, `reason` is removed and
-both verdicts return to `not-run`. `up-to-date` removes `reason` too. The
-results are one aggregate per round, not one per registrant.
-
-The YANG model also contains `upgrade-needed` and `job`. The current manager
-does not publish those values.
-
-Operational reads return the current state. `update_oper` does not trigger a
-TTT recompute, so a northbound subscription does not receive these changes yet.
-State is not persisted and returns to `unknown` when the process restarts.
-
-## 4. Software adapter API
-
-The platform interface is defined in `src/device.act`.
-
-| Method | Contract |
-|---|---|
-| `supports_mocking()` | whether the adapter can use the device NETCONF mock |
-| `check(done)` | read the running release |
-| `matches_release(running, target)` | compare the device's release spelling with requested intent |
-| `prepare(done, release)` | stage and verify the image without activating it |
-| `install(done, release)` | perform the impacting activation and reboot |
-| `commit(done)` | confirm the activated release so the platform keeps it |
-| `commit_window(done)` | seconds left before the platform reverts on its own, None without such a timer |
-| `rollback(done, previous)` | return to the previous release |
-| `cleanup(done)` | remove superseded images |
-| `estimate(staged)` | estimated install time in seconds |
-
-Jobs are asynchronous and report through callbacks. `install` must call
-`done(None)` only after the device is reachable again and the requested release
-has been confirmed running. `rollback` likewise reports only once the device
-runs `previous`; with `previous` unknown it reports once the device runs
-anything other than the release it aborted. A job's error message is published
-as the run's `reason`, so it should name the platform operation and its cause.
-
-The intended contract says `install` rechecks its preparation because an image
-staged earlier may have been removed. The current manager always calls
-`prepare` immediately before `install`, and the IOS XE `install` method assumes
-that copy is still present. The adapter needs to verify bootflash and repeat
-staging when necessary.
-
-`IosXeSoftwareAdapter` is a class with no mutable run state. It forwards work to
-`IosXeSoftwareDriver`, an actor that owns the active phase, UUID, poll count,
-release, filename, and completion callback. This keeps mutable state behind one
-actor mailbox even though the adapter class can be referenced from more than one
-actor.
-
-## 5. Current IOS XE implementation
-
-The adapter uses five operations:
-
-| Manager step | IOS XE operation | Impacting |
-|---|---|---|
-| `prepare` | `xcopy` the image to bootflash | no |
-| `install` | `install` without `one-shot`, then `activate` with `auto-abort-timer-val=30` | yes |
-| `commit` | `install-commit` | no |
-| `rollback` | `abort` | yes |
-
-Without `one-shot`, `install` only adds the image. `activate` boots it and
-starts the device's auto-abort timer. Unless `install-commit` arrives within 30
-minutes, the smallest value the device accepts, the device reloads back onto the
-committed release on its own. The adapter counts the window from the moment it
-sent `activate` and reports what is left through `commit_window`, so the
-manager's post-check deadline never runs past it.
-
-### 5.1 Staging
-
-`prepare` sends:
-
-```xml
-<xcopy xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-xcopy-rpc">
-  <uuid>swi-stage-17.18.03a-1787894090-91366</uuid>
-  <source-path>https://images.example/c8000v.17.18.03a.bin</source-path>
-  <destination-path>c8000v.17.18.03a.bin</destination-path>
-</xcopy>
-```
-
-`source-path` is `image-url` verbatim. `destination-path` is only the filename;
-IOS XE prepends bootflash itself.
-
-The `xcopy` reply contains an echoed UUID but no completion result. After the
-RPC is accepted, the adapter polls `install-oper-data` for records with its UUID.
-Staging succeeds only when a completed successful record contains
-`install-txn-download`.
-
-### 5.2 Installation
-
-`install` first sends:
-
-```xml
-<install xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-install-rpc">
-  <uuid>swi-add-17.18.03a-1787894412-27718</uuid>
-  <one-shot>false</one-shot>
-  <path>bootflash:c8000v.17.18.03a.bin</path>
-</install>
-```
-
-and polls the operation records until a record with `install-txn-add-postchk`
-has completed. That add gives the image a device-assigned version, read from
-`install-oper-data/install-location-information/install-version-state-info` (the
-uncommitted entry whose version starts with the target release). `activate`
-names the image by that version, not by its bootflash path: activating an
-already-added image by path is refused with `install-smu-not-added`. Under a
-new UUID:
-
-```xml
-<activate xmlns="http://cisco.com/ns/yang/Cisco-IOS-XE-install-rpc">
-  <uuid>swi-activate-17.18.03a-1787894600-11402</uuid>
-  <auto-abort-timer-val>30</auto-abort-timer-val>
-  <version>17.18.03a.0.5540</version>
-</activate>
-```
-
-The install RPCs have no output. `<ok/>` means IOS XE accepted the request; it
-does not mean the operation completed.
-
-The activate phase watches the operation record until it either fails a
-precheck or the read fails because the session dropped, which is the reload
-starting. After activation, the device reloads. Reads and connections fail during this
-period and are not treated as job failures. The adapter polls
-`device-system-data/software-version` until it can read a release equivalent to
-the target. Only then does `install` report success to the manager.
-
-### 5.3 Commit and abort
-
-`commit` sends `install-commit` with a new UUID and polls the operation records
-until the record has completed. It is one record and no reload, so no stage is
-required. `install-op-marked-succ` is a failure here: nothing to commit means
-the device had already reverted.
-
-`rollback` sends `abort` with a new UUID. The device reloads onto the committed
-release. The adapter polls the running release until it equals `previous`.
-
-The manager performs one final `check` to refresh `running-release`. After a
-commit it also calls `DeviceMgr.resync` because the new release may expose a
-different module set. A failure of this final read is logged but does not undo
-an outcome that the adapter already confirmed.
-
-### 5.4 Operation records
-
-IOS XE keeps active and finished operations in sibling lists:
-
-```text
-Cisco-IOS-XE-install-oper:install-oper-data
-  install-oper, install-oper-hist
-    op-uuid, op-id, op-status, op-done
-    install-txn-summary-op        while op-done is op-not-complete
-      txn-cmd, txn-status, txn-sub-state
-    install-txn-sum-op-hist       once op-done is op-complete
-      txn-cmd, txn-status, txn-sub-state
-```
-
-One RPC can create several records with the same UUID. `op-id` restarts for each
-operation, so the adapter correlates by UUID and checks all matching records.
-A record moves from the active list to history when it finishes, and that move
-can happen between polls. A record that has finished but not moved yet already
-keeps its transactions in `install-txn-sum-op-hist`, so the adapter reads both
-transaction lists of both record lists.
-
-A failed operation's cause is the `txn-sub-state` of its first failed
-transaction, like `install-download-fail`. Without one it is that
-transaction's `txn-cmd` and `txn-status`, and without a failed transaction the
-`op-status`. The first, because the device records a notify transaction after
-the one that failed.
-install-oper has no free-text error; the device's own message, like
-`REMOTE_FILE_NOT_FOUND`, goes to its syslog. The adapter's error names the
-operation as the device does: `download failed: <cause>`, `add failed:
-<cause>`, `activate failed: <rpc-error message>`, `commit failed: nothing to
-do: install-op-marked-succ`, `abort failed: <message>`, or `<operation> did
-not finish in time` when polling runs out.
-
-`install-op-marked-succ` means IOS XE had nothing to do. It is not an error, but
-it is not proof that requested work happened. `op-done=op-reverted` and
-`op-status=install-op-fail-revert` mean the device undid the operation; the
-adapter treats both as a terminal failure. A reverted record has no
-transactions, so its cause is the `op-status`.
-
-### 5.5 Filters
-
-The version read selects only `software-version`. Operation polling selects the
-complete `install-oper` and `install-oper-hist` lists while excluding large
-siblings such as `install-packages`.
-
-Leaf selection inside these keyless lists is broken in the pinned
-`acton-yang`: every entry has the same empty key and filtering collapses them.
-Selecting an empty list with leaf children can also discard a matching sibling.
-The complete-list filter avoids both paths.
-
-TODO: Select only the required record leaves after `acton-yang` preserves all
-keyless-list entries and an empty selected list no longer drops matching sibling
-data. Measure the IOS XE reply size again after changing the filter.
-
-### 5.6 Time bounds and estimates
-
-The driver counts polls and fails when they run out. Operation records are
-polled every ten seconds, up to `MAX_POLLS`, roughly 30 minutes. The running
-release is polled every twenty seconds while waiting for a reload, up to
-`VERSION_MAX_POLLS`, roughly 35 minutes. Past the auto-abort timer the device
-has reverted, so waiting longer for the target release cannot help.
-
-Current estimates are based on a c8000v and a roughly 1 GB image:
-
-| Work | Estimate |
-|---|---|
-| transfer | 150 seconds |
-| install and reload | 390 seconds |
-
-The adapter does not retry and does not send an abort when polling expires.
-During install that is safe: the device's own timer reverts an uncommitted
-activation.
-
-## 6. IOS XE constraints
-
-These behaviors were observed on c8000v releases in the 17.11 to 17.18 range and
-are reflected in the adapter and mock.
-
-- Install RPCs return `<ok/>` within a second and continue working for minutes.
-- The device pulls the image and therefore needs network reachability to the
-  image server.
-- Progress is reported in active and historical operation records keyed by a
-  caller-supplied UUID.
-- The NETCONF session drops during installation. Several reconnect attempts can
-  occur before reads work again.
-- Port 830 can accept TCP before the NETCONF server sends a hello. A failed read
-  during reload is not a final result.
-- The running banner, installed inventory, requested release, and image filename
-  can use different spellings for the same release.
-- Adding a large image can exhaust memory and reload the device before
-  activation. Treat the add as impacting even though it often completes without
-  disruption.
-- `install-op-marked-succ` reports a no-op as successful.
-- Operation history is bounded. The adapter must not depend on old records
-  remaining indefinitely.
-- `activate` accepts `auto-abort-timer-val` from 30 to 1200 minutes. The
-  timer runs from activation, so the reload eats into it.
-
-The running release comes from:
-
-```text
-Cisco-IOS-XE-device-hardware-oper:
-  device-hardware-data/device-hardware/device-system-data/software-version
-```
-
-The leaf contains a banner such as:
-
-```text
-Cisco IOS XE Software, Version 17.18.02
-```
-
-The adapter extracts the value after `Version` and compares it by component.
-
-The pruned YANG in `src/adapters/software_iosxe_yang.act` contains only the RPCs
-and operational nodes used by the current adapter. Enumerations read from the
-device are modeled as strings so a new value does not make the whole reply fail
-to parse. The generated bindings are in
-`src/adapters/software_iosxe_rpc.act`.
-
-When adding another IOS XE operation, check its current schema with
-`get-schema`. A pruned local module can have the same revision as the complete
-module and is not evidence that an omitted node or RPC does not exist.
-
-## 7. Testing
-
-`IosXeSoftwareMock` runs behind `NetconfMockServer`, not behind a stubbed adapter.
-Tests exercise NETCONF framing, XML encoding and decoding, RPC validation,
-schema-driven parsing, operational reads, and RPC errors.
-
-The mock keeps the running and committed release, the staged and added image,
-and the operation history. It replies to an RPC before changing operational
-state, so an adapter that treats `<ok/>` as completion fails the tests. State
-changes are published through the mock operational datastore and observed by
-later `get` calls. The release after an install comes from the image file
-name, spelled as the device banner spells it.
-
-Two arguments make the mock behave like a particular device; a device entry
-carries them as `mock/software/upgrade-duration`, `mock/software/failure`
-and `mock/software/running-release` for the device type's adapter factory
-to pass on. A
-factory that passes `complete_after` instead gets a fixed delay per
-operation. `upgrade_duration` is the seconds a whole
-upgrade takes; the mock spreads it over the operations in the proportions
-measured on a c8000v with a 962 MB image (staging 130 s, add 20 s, a 240 s
-reload for activate and for abort, commit 5 s, 395 s in all), so 395 is as
-slow as the device and 0 completes each operation at once. `failure`
-reproduces one IOS XE failure:
-
-| failure | device behavior | manager ends | reason |
-|---|---|---|---|
-| `download-failed` | `xcopy` accepted, then the download stage fails | `failed`, nothing installed | `download failed: install-download-fail` |
-| `add-failed` | `install` accepted, then the add pre-check fails | `failed` | `add failed: install-verify-pkg-fail` |
-| `activate-refused` | `activate` rejected | `failed`, no abort | `activate failed: <rpc-error message>` |
-| `commit-failed` | `install-commit` accepted, then the commit stage fails | `rolled-back` after `abort` | `commit failed: install-img-commit-fail` |
-| `reverts` | the abort timer ran out before the commit, so the commit finds nothing to do | `failed`, nothing to abort | `commit failed: nothing to do: install-op-marked-succ; abort failed: nothing to abort` |
-| `bgp-down` | the BGP session is idle from the start | `failed` with a BGP pre-check, nothing installed | `pre-check failed: <detail>` |
-| `bgp-lost` | the BGP session is idle while the activated release runs | `rolled-back` with a BGP post-check, after `abort` | `post-check failed: <detail>` |
-
-A failed operation is recorded as the device records it: the stages that ran,
-the failed one marked with its `txn-sub-state`, then a notify. A c8000v
-17.18.02 reports the same sub-states for a missing file and a truncated image;
-the commit failure's is taken from the YANG. The mock also serves one BGP
-neighbor in `Cisco-IOS-XE-bgp-oper`, established and advertising three
-prefixes unless one of the BGP failures takes it down, for an application's
-pre-check and post-check to read.
-
-Current coverage includes:
-
-- version parsing and zero-padding comparison;
-- image filename and RPC input construction, including the abort timer;
-- credential redaction in the adapter's own log message;
-- record aggregation across UUIDs and multiple stages, and reverted records;
-- the failure cause from the first failed transaction, also of a finished
-  record still in `install-oper`;
-- preservation of multiple keyless history records, and of every transaction
-  in them, by the current filter;
-- a complete `xcopy`, `install`, `activate`, `install-commit` run through
-  `DeviceMgr` and `SoftwareManager`;
-- a failing post-check ending in `abort` and `rolled-back`;
-- a failed commit ending in `abort` and `rolled-back`;
-- a device that reverted before the commit ending in `failed`;
-- a refused `activate` ending in `failed` with no abort;
-- a download that fails after the copy was accepted, ending in `failed` with
-  nothing installed;
-- propagation of a device-side add failure to manager status `failed`;
-- the reason each failure publishes, naming the operation and the device's
-  cause;
-- no RPCs when the device already runs an equivalent release;
-- the running release following the image file name;
-- the choice of delay between the upgrade duration, a fixed delay and instant;
-- proof that RPC acceptance is not completion, and that a copy is still
-  running 0.2 s later under an upgrade duration;
-- publication of software status and running release as operational data.
-
-`src/test_swmgr.act` covers the manager against the in-memory adapter:
-pre-checks gate the install, a refused or silent pre-check ends `failed` with
-nothing installed, post-checks gate the commit, a failed or silent post-check
-rolls back, a late reply is ignored, a removed check is not consulted, both
-verdicts are published, a failed prepare, commit or rollback ends as designed,
-every failure publishes its reason, and the next run starts without one.
-
-The mock does not reproduce memory pressure, SSH and NETCONF startup timing,
-vendor bugs, or all RPC error details. Run at least one real upgrade with the
-exact image, IOS XE release, and transport intended for deployment.
-
-The hardware acceptance check is:
-
-1. A device already on the target receives no install RPC and reports
-   `up-to-date`.
-2. A device on the previous release receives exactly `xcopy`, `install`,
-   `activate`, `install-commit`.
-3. The image URL and destination filename are correct, `activate` names the
-   added image by its device version, and carries `auto-abort-timer-val` 30.
-4. The RPC replies arrive before completion and polling observes each stage.
-5. The device returns on the requested release, `show install summary` shows
-   it committed, and the manager reports `succeeded`.
-6. The device module set is resynced after reload.
-7. With a failing post-check registered, the device receives `abort` instead
-   of `install-commit`, returns on the previous release, and the manager
-   reports `rolled-back`.
-
-Images remain outside git. Test environments should resolve device and image
-server addresses at run time rather than storing deployment-specific addresses
-in the repository.
-
-## 8. Work still needed
-
-### 8.1 Safe intent and retries
-
-Run status is not durable, restored intent can start work after restart, and a
-later device-meta write can retry a failed run. Define which configuration
-change authorizes a new attempt, persist enough attempt state to survive a
-restart, and fence late callbacks from older attempts.
-
-The manager also needs a deadline around adapter jobs. The IOS XE driver has a
-poll limit, but the manager can still remain busy forever if an adapter never
-calls back. If the manager abandons a job, the adapter needs a way to clear its
-local state without implying that it aborted the device operation.
-
-### 8.2 Staging and maintenance windows
-
-Implement `allow-staging` so image transfer can run before the maintenance
-window while vetoes continue to block the impacting step. Re-check the veto
-immediately before activation.
-
-`install` must verify that the image staged by an earlier `prepare` still exists
-and repeat preparation if necessary. The current IOS XE implementation assumes
-the immediately preceding `xcopy` is still valid.
-
-### 8.3 Checks and cleanup
-
-Checks get no device evidence from the manager; a registrant that needs it
-must read the device itself. A check that answers from a subscription must
-judge a sample taken after the check began, or a post-check passes on numbers
-read before the reload. Periodic subscriptions deliver every sample, so
-counting deliveries is enough.
-
-The manager needs to know whether a platform supports rollback so it does not
-report recovery that the adapter cannot provide.
-
-Explore IOS XE `remove` before implementing cleanup. Until then, keep the previous image for
-manual recovery.
-
-### 8.4 Operational detail
-
-Populate the modeled `job` node. Decide whether check results stay one
-aggregate per round or become keyed by registrant. Make `update_oper` notify
-northbound subscribers as well as serving current values to reads.
-
-### 8.5 Credentials and verification
-
-Replace credential-bearing `image-url` values with a URL plus a credential
-reference resolved at transfer time, or define another secret-handling model.
-Redact device configuration and RPC input in generic logging paths, not only the
-adapter's own messages.
-
-The IOS XE `image-files/sha1sum` value observed during testing did not match the
-file's SHA-1. Determine what the device computes and add a reliable staged-image
-integrity check. File presence and successful add are not a substitute for
-checksum verification.
-
-### 8.6 Broader support
-
-Validate the adapter interface with a second platform. Decide whether release
-state remains monolithic or needs per-component versions. Fleet campaign order,
-parallelism, bandwidth limits, and window capacity belong above the per-device
-manager.
-
-## 9. References
-
-- `src/device.act` — `SoftwareAdapter`, `SoftwareManager`, and operational-state
-  publication through `DeviceMgr`.
-- `src/swyang.act` — software configuration and state model.
-- `src/adapters/software_iosxe.act` — IOS XE adapter and driver.
-- `src/adapters/software_iosxe_yang.act` — pruned IOS XE schema used by the
-  adapter.
-- `src/adapters/software_iosxe_rpc.act` — generated typed RPC bindings.
-- `src/adapters/software_iosxe_oper.act` — generated operational-data bindings
-  and filter paths.
-- `src/adapters/test_software_iosxe.act` — IOS XE NETCONF mock and adapter tests.
-- `src/test_swmgr.act` — platform-neutral manager tests.
-- `src/test_ttt_oper_read.act` — operational-state publication test.
-- Cisco C8000V upgrade guide, "Upgrading IOS XE Software":
-  <https://www.cisco.com/c/en/us/td/docs/routers/C8000V/Configuration/c8000v-installation-configuration-guide/upgrade-the-cisco-ios-xe-software/upgrading-ios-xe-software.html>
+A check gets a `done` action and calls it once it has decided, so it can do
+other work first. The manager passes it no device data; the check reads the
+device itself. A check added during a run counts from the next run.
+`remove_precheck` and `remove_postcheck` take a check out, also during a run.
+An answer that arrives after its round has ended is ignored.
+
+The BGP device-health check in `fleetmgr/src/flotilla/rfs.act` is a working
+example.
+
+## State
+
+Published under `stratoweave-rfs:device=<name>/software/state`:
+
+| Leaf | Value |
+| --- | --- |
+| `status` | `unknown`, `up-to-date`, `in-progress`, `succeeded`, `failed` or `rolled-back` |
+| `running-release` | Last release read from the device, spelled the way the device spells it |
+| `stage` | The step the run is in, or the step it ended in |
+| `reason` | Why the run failed or rolled back |
+| `precheck`, `postcheck` | `verdict` (`not-run`, `pass` or `fail`), `detail`, and `at`, the time of the verdict |
+
+Every change goes into the device's operational data, so reads and oper
+subscriptions see it right away. A new run removes `reason` and sets both
+verdicts back to `not-run`. State is not saved; after a restart it is
+`unknown`. The model also has `upgrade-needed` and a `job` list, which the
+manager does not set.
+
+## Adapter API
+
+A platform adapter is a subclass of `SoftwareAdapter` in `src/device.act`.
+
+| Method | Does |
+| --- | --- |
+| `check(done)` | Read the running release. |
+| `matches_release(running, target)` | Whether two names mean the same release. The default compares strings. |
+| `prepare(done, release)` | Copy the image to the device. |
+| `install(done, release)` | Activate the release. Call `done` only once the device runs it. |
+| `commit(done)` | Keep the activated release. |
+| `commit_window(done)` | Seconds left before the device goes back on its own, or `None`. |
+| `rollback(done, previous)` | Go back to `previous`. Call `done` only once the device runs it. |
+| `cleanup(done)` | Remove old images. The manager does not call it. |
+| `estimate(staged)` | Seconds an install takes. The manager does not call it. |
+| `plan_estimate()` | Seconds a whole upgrade takes, for planners. Static. |
+| `supports_mocking()` | Whether the adapter works with the device mock. |
+
+Jobs report through `done`. The error message becomes the run's `reason`, so
+it should name the operation and the device's cause, for example
+`add failed: install-verify-pkg-fail`.
+
+## IOS XE
+
+`IosXeSoftwareAdapter` in `src/adapters/software_iosxe.act` uses these
+NETCONF RPCs:
+
+| Step | RPC |
+| --- | --- |
+| prepare | `xcopy` from `image-url` to bootflash |
+| install | `install` (add only), then `activate` with a 30 minute auto-abort timer |
+| commit | `install-commit` |
+| rollback | `abort` |
+
+- An `<ok/>` reply only means the device accepted the RPC. The adapter then
+  reads `install-oper-data` for the records with its UUID until the
+  operation ends.
+- `activate` names the image by the version the device gave it during the
+  add, for example `17.18.03a.0.5540`.
+- The device reboots after `activate` and after `abort`. Read errors during
+  the reboot are expected. The adapter reads the running release until it is
+  the one it waits for.
+- Without `install-commit` within 30 minutes of `activate`, the device goes
+  back to the old release on its own. 30 is the lowest value IOS XE accepts.
+- The running release comes from the `software-version` banner in
+  `Cisco-IOS-XE-device-hardware-oper`. Releases are compared part by part,
+  so `17.18.03a` matches `17.18.3a`.
+- Operation records are read every 10 seconds for up to 30 minutes. During a
+  reboot the release is read every 20 seconds for up to 35 minutes. Nothing
+  is retried.
+- Old images stay on bootflash. `cleanup` does nothing.
+
+The YANG for these RPCs and oper nodes is a trimmed copy in
+`src/adapters/software_iosxe_yang.act`. The bindings generated from it are in
+`software_iosxe_rpc.act` and `software_iosxe_oper.act`.
+
+## Testing
+
+| File | Tests |
+| --- | --- |
+| `src/test_swmgr.act` | The manager, with the in-memory adapter from `src/adapters/software_mock.act` |
+| `src/adapters/test_software_iosxe.act` | The IOS XE adapter, against `IosXeSoftwareMock` |
+
+`IosXeSoftwareMock` in `src/adapters/software_iosxe_mock.act` runs behind the
+in-process NETCONF mock server. Like a real device, it answers an RPC before
+the work is done. It also serves one BGP neighbor for checks to read. A mock
+device sets these leaves under `mock/software`:
+
+| Leaf | Meaning |
+| --- | --- |
+| `upgrade-duration` | Seconds a whole upgrade takes. Absent or 0 ends each step at once. |
+| `failure` | One device failure to reproduce, see below. |
+| `running-release` | Release before the upgrade. Default `17.18.02`. |
+
+The upgrade duration is split in the shares measured on a lab c8000v with a
+962 MB image: copy 130 s, add 20 s, activate 240 s and commit 5 s, 395 s in
+all. An abort takes 240 s.
+
+| `failure` | What the device does | Run ends |
+| --- | --- | --- |
+| `download-failed` | The copy fails after `xcopy` was accepted | `failed` |
+| `add-failed` | The add fails after `install` was accepted | `failed` |
+| `activate-refused` | `activate` is rejected | `failed` |
+| `commit-failed` | The commit fails after `install-commit` was accepted | `rolled-back` |
+| `reverts` | The timer ran out before the commit | `failed` |
+| `bgp-down` | BGP is down from the start, so a BGP pre-check refuses | `failed` |
+| `bgp-lost` | BGP is down on the new release, so a BGP post-check refuses | `rolled-back` |
+
