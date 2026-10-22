@@ -1,0 +1,68 @@
+"""Compile SNMP MIBs to YANG and matching runtime metadata."""
+
+import file
+import snmp.mib.diag as mdiag
+import snmp.mib.meta as mmeta
+import snmp.mib.model as mmodel
+import snmp.mib.resolver as mresolver
+import snmp.mib.source as msource
+import snmp.mib.yang as myang
+import snmp.mib.yang_smiv2 as smiv2
+import swyang
+
+
+class Translation(object):
+    def __init__(self, models: dict[str, str], metadata: str):
+        self.models = models
+        self.metadata = metadata
+
+
+def translate(mibs: mmodel.MibSet, modules: list[str]) -> Translation:
+    """Translate requested modules and their YANG imports with one shared layout."""
+    if len(modules) == 0:
+        raise ValueError("An SNMP device type needs at least one MIB module")
+    errors = [str(d) for d in mibs.diags if d.level <= 2]
+    if len(mibs.not_found) > 0:
+        errors.append("Missing MIB modules: {', '.join(mibs.not_found)}")
+    if len(errors) > 0:
+        raise ValueError("MIB compilation failed:\n" + "\n".join(errors))
+    translator = myang.Translator(mibs)
+    pending = list(modules)
+    models: dict[str, str] = {}
+    metadata: list[mmeta.ModuleMeta] = []
+    standards = {
+        "ietf-yang-smiv2": smiv2.TEXT,
+        "ietf-yang-types": swyang.ietf_yang_types,
+        "ietf-inet-types": swyang.ietf_inet_types,
+    }
+    while len(pending) > 0:
+        name = pending.pop(0)
+        if name in models:
+            continue
+        if name in standards:
+            models[name] = standards[name]
+            continue
+        translated = translator.module(name)
+        if translated is not None:
+            if not translated.ok:
+                raise ValueError("MIB translation failed:\n" + "\n".join([str(d) for d in translated.diags if d.level <= 1]))
+            models[name] = translated.text
+            pending.extend(translated.imports)
+        else:
+            raise ValueError("MIB module {name} is not loaded")
+        meta = mmeta.module_meta(mibs, name, translator)
+        if meta is not None:
+            metadata.append(meta)
+        else:
+            raise ValueError("MIB metadata missing for {name}")
+    return Translation(models, mmeta.bundle_to_json(mmeta.MibBundle(metadata)))
+
+
+proc def from_dirs(fc: file.FileCap, dirs: list[str], modules: list[str]) -> Translation:
+    """Resolve MIB imports from directories and the SNMP package's base MIBs."""
+    path = msource.MibPath(dirs)
+    diagnostics = mdiag.Diagnostics()
+    msource.index_path(path, fc, diagnostics)
+    if diagnostics.has_errors():
+        raise ValueError("MIB source errors:\n" + "\n".join([str(d) for d in diagnostics.errors()]))
+    return translate(mresolver.resolve_path(fc, path, modules), modules)
