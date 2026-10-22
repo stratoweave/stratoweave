@@ -78,6 +78,10 @@ StratoWeave is designed to support various device types but at present,
 SORESPO only contains NETCONF/YANG-based device types. Each YANG-based device
 type is built from a directory of YANG models.
 
+For SNMP devices, `DeviceType.from_mibs(...)` resolves the selected MIB modules,
+translates them to YANG, and keeps the metadata needed to read their OIDs.
+See [SNMP devices](../reference/snmp.md) for the build and subscription API.
+
 ### Schema transforms
 Router vendors have made great efforts to model their entire devices with YANG,
 every knob and feature is configurable and observable through YANG. As a result,
