@@ -2,7 +2,6 @@ import diff
 import file
 import json
 import logging
-import net
 import process
 import time
 import std.xml as xml
@@ -634,7 +633,7 @@ class DeviceType(object):
     ## Adapter type, i.e. the DeviceAdapter subclass to use
     # TODO: why is @property needed here?
     @property
-    adapter_type: proc(DeviceMgr, DeviceSchema, DeviceMetaConfig, SchemaRegistry, logging.Handler, ?net.TCPConnectCap) -> DeviceAdapter
+    adapter_type: proc(DeviceMgr, DeviceSchema, DeviceMetaConfig, SchemaRegistry, logging.Handler, ?Env) -> DeviceAdapter
 
     bundled_schema: DeviceSchema
 
@@ -642,7 +641,7 @@ class DeviceType(object):
     ## platform. Optional: a device type with no software adapter simply has no
     ## upgrade capability, and its SoftwareManager stays idle.
     @property
-    software_adapter_type: ?proc(DeviceMgr, DeviceMetaConfig, logging.Handler, ?net.TCPConnectCap) -> SoftwareAdapter
+    software_adapter_type: ?proc(DeviceMgr, DeviceMetaConfig, logging.Handler, ?Env) -> SoftwareAdapter
 
     def __init__(self, name: str, adapter_type, src_dnode, oper_src_dnode: ?yschema.DRoot=None, schema_transforms: list[SchemaTreeTransform]=[], software_adapter_type=None):
         self.name = name
@@ -650,7 +649,7 @@ class DeviceType(object):
         self.bundled_schema = DeviceSchema(name, src_dnode, oper_src_dnode, schema_transforms)
         self.software_adapter_type = software_adapter_type
 
-actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnectCap=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None):
+actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None):
     """Device Registry keeps track of all devices and hands out references to
     them based on name.
 
@@ -677,7 +676,7 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPC
 
     def get_or_create(name: str) -> DeviceMgr:
         if name not in devices:
-            devices[name] = DeviceMgr(dev_types, connect_cap, name, log_handler, reconf_cb, schema_registry, self, device_logs)
+            devices[name] = DeviceMgr(dev_types, env, name, log_handler, reconf_cb, schema_registry, self, device_logs)
         dev = devices[name]
         return dev
 
@@ -906,7 +905,7 @@ class DeviceTreeProvider(ygdata.TreeProvider):
 
 
 
-actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnectCap=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None, device_logs: ?swlogs.DeviceLogs=None):
+actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None, device_logs: ?swlogs.DeviceLogs=None):
     """Device Manager manages a device and represents that device, as an
     abstract device, in the system. Platform specific handling is implemented in
     the DeviceAdapter, i.e.  in subclasses of DeviceAdapter, like NetconfAdapter
@@ -937,7 +936,8 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
     A device can be configured to be in mock mode through the DeviceMetaConfig,
     which is useful for testing and development, set mock/enabled=True under the
     device. The whole system can also run in mock mode which forces all devices
-    to be mocked regardless of their individual configuration.
+    to be mocked regardless of their individual configuration. That is the
+    case when env is None.
 
     MockAdapter is the generic adapter for mocked devices, which pretends to be
     a device and accepts configuration but doesn't actually do anything with it.
@@ -975,7 +975,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
         evaluated at the call, so a whole config dump costs the same at info."""
         return logging.DEBUG <= _log_handler.get_level()
 
-    system_mock = True if connect_cap is None else False
+    system_mock = env is None
     _log.debug("DeviceMgr starting up", {"name": name, "system_mock": system_mock})
 
     # The device entry's oper tree, in the adata generated from the same
@@ -1030,7 +1030,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
 
     # The bundled schema is compiled at build time and bundled with stratoweave
     var bundled_schema: DeviceSchema = DeviceSchema.mock()
-    var adapter: DeviceAdapter = MockAdapter(self.on_connect, bundled_schema, _log_handler, connect_cap) if system_mock else NoAdapter(bundled_schema, _log_handler, connect_cap)
+    var adapter: DeviceAdapter = MockAdapter(self.on_connect, bundled_schema, _log_handler, env) if system_mock else NoAdapter(bundled_schema, _log_handler, env)
 
     # The modules supported by the device.
     var modset: dict[str, ModCap] = {}
@@ -1177,9 +1177,9 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
             return False
 
         def build_adapter(device_type: DeviceType, new_dmc: DeviceMetaConfig, effective_mock: bool) -> DeviceAdapter:
-            candidate = device_type.adapter_type(self, device_type.bundled_schema, new_dmc, schema_registry, _log_handler, connect_cap)
+            candidate = device_type.adapter_type(self, device_type.bundled_schema, new_dmc, schema_registry, _log_handler, env)
             if effective_mock and not candidate.supports_mocking():
-                return MockAdapter(self.on_connect, device_type.bundled_schema, _log_handler, connect_cap)
+                return MockAdapter(self.on_connect, device_type.bundled_schema, _log_handler, env)
             return candidate
 
         _log_handler.set_output_level(_device_log_level(new_dmc, _default_log_level))
@@ -1212,7 +1212,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, connect_cap: ?net.TCPConnec
                 if type_changed:
                     sw_type = device_type.software_adapter_type
                     if sw_type is not None:
-                        swmgr.set_adapter(sw_type(self, new_dmc, _log_handler, connect_cap))
+                        swmgr.set_adapter(sw_type(self, new_dmc, _log_handler, env))
                 sw = new_dmc.software
                 sw_vetoes = {}
                 for v in sw.veto:
