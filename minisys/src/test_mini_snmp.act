@@ -1,0 +1,169 @@
+"""MIB-generated subscriptions feed a real mini RFS transform."""
+
+import testing
+import snmp.oid as oid
+import snmp.values as values
+import yang.gdata as gdata
+import stratoweave.adapters.snmp as swsnmp
+import stratoweave.device as swdev
+import stratoweave.snmp_mock as snmp_mock
+import stratoweave.ttt as ttt
+import mini.layers.t_1 as t_1
+import mini.layers.y_1 as y1
+import mini.layers.y_1_oper as y1_oper
+import mini.sysspec as sysspec
+from stratoweave.device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials, \
+    stratoweave_rfs__device__mock as Mock
+
+NS_RFS = "http://stratoweave.org/yang/stratoweave-rfs"
+NS_MINI = "http://example.com/mini-rfs"
+
+
+def _oid(column: int, index: int) -> oid.Oid:
+    return oid.Oid([1, 3, 6, 1, 2, 1, 2, 2, 1, column, index])
+
+
+def _extended_oid(column: int, index: int) -> oid.Oid:
+    return oid.Oid([1, 3, 6, 1, 2, 1, 31, 1, 1, 1, column, index])
+
+
+def _interface(index: int, descr: bytes, status: int, in_octets: u64,
+               out_octets: u64) -> list[values.VarBind]:
+    return [
+        values.VarBind(_oid(1, index), values.Integer(index)),
+        values.VarBind(_oid(2, index), values.OctetString(descr)),
+        values.VarBind(_oid(8, index), values.Integer(status)),
+        values.VarBind(_extended_oid(6, index), values.Counter64(in_octets)),
+        values.VarBind(_extended_oid(10, index), values.Counter64(out_octets)),
+    ]
+
+
+def _seed() -> list[values.VarBind]:
+    # ifXEntry AUGMENTS ifEntry: both tables form one generated YANG row.
+    # A second row verifies that the keyed subscription selects only ifIndex 7.
+    return _interface(7, b"uplink", 1, u64(4294967301), u64(8589934602)) + \
+           _interface(9, b"other interface", 2, u64(900), u64(901))
+
+
+def _config() -> gdata.Node:
+    raw = gdata.Container({
+        gdata.Id(NS_RFS, "rfs"): gdata.List([gdata.Id(NS_RFS, "name")], [
+            gdata.Container({
+                gdata.Id(NS_RFS, "name"): gdata.Leaf("snmp-device"),
+                gdata.Id(NS_MINI, "snmp-interface"): gdata.List([gdata.Id(NS_MINI, "if-index")], [
+                    gdata.Container({
+                        gdata.Id(NS_MINI, "if-index"): gdata.Leaf(7),
+                        gdata.Id(NS_MINI, "period-ms"): gdata.Leaf(u64(10)),
+                    }),
+                ]),
+            }),
+        ]),
+    })
+    # Use the strict generated schema conversion. A telemetry-only RFS entry
+    # must validate without creating unrelated NETCONF base configuration.
+    return y1.root.from_gdata(raw).to_gdata()
+
+
+def _test_snmp_interface_configuration_schema():
+    modeled = y1.root.from_gdata(_config())
+    device = modeled.rfs.get("snmp-device")!
+    testing.assertTrue(device.base_config is None)
+    interface = device.snmp_interface.get(7)!
+    testing.assertEqual(interface.period_ms, u64(10))
+
+
+actor _test_snmp_interface_periodic_transform(t: testing.AsyncT):
+    registry: swdev.DeviceRegistry = swdev.DeviceRegistry(sysspec.device_types, None, t.log_handler)
+    dev: swdev.DeviceMgr = registry.get_or_create("snmp-device")
+    dev.set_dmc(DeviceMetaConfig("snmp-device", Credentials(""), type="ietf_snmp", mock=Mock(enabled=True)))
+    sink = ttt.Sink()
+    layer = ttt.Layer("rfs", t_1.get_ttt(sink, registry, t.log_handler), sink)
+    downstream = gdata.SubscriptionManager(layer.tree_provider(), "snmp-test")
+    var mock: ?snmp_mock.SnmpMockServer = None
+    var adapter: ?swsnmp.SnmpAdapter = None
+    var phase = 0
+    var done = False
+    var progress = "waiting for adapter"
+
+    def finish(error: ?Exception):
+        if done:
+            return
+        done = True
+        downstream.close()
+        if adapter is not None:
+            adapter.close()
+        if error is None:
+            t.success()
+        else:
+            t.failure(error!)
+
+    def observed(tree: ?y1_oper.root, error: ?Exception):
+        if done:
+            return
+        if error is not None:
+            finish(error)
+            return
+        if tree is None:
+            return
+        progress = "received RFS state"
+        rfs = tree!.rfs.get("snmp-device")
+        if rfs is None:
+            return
+        interface = rfs!.snmp_interface.get(7)
+        if interface is None:
+            return
+        state = interface!.state
+        if state.error is not None:
+            finish(ValueError(state.error!))
+            return
+        if state.in_octets is None:
+            return
+        try:
+            testing.assertEqual(len(rfs!.snmp_interface), 1)
+            testing.assertEqual(state.descr, "uplink")
+            if phase == 0:
+                testing.assertEqual(state.in_octets, u64(4294967301))
+                testing.assertEqual(state.out_octets, u64(8589934602))
+                testing.assertEqual(state.oper_status, "up")
+                phase = 1
+                await async mock!.set_bindings(_interface(
+                    7, b"uplink", 2, u64(4294967311), u64(8589934612)))
+            elif phase == 1 and state.in_octets == u64(4294967311):
+                testing.assertEqual(state.out_octets, u64(8589934612))
+                testing.assertEqual(state.oper_status, "down")
+                finish(None)
+        except Exception as err:
+            finish(err)
+
+    def configured(result: value):
+        progress = "configured transform"
+        path = y1_oper.subs.rfs.entry("snmp-device").snmp_interface.entry(7)
+        downstream.declare({y1_oper.dst(observed).deliver({path.state.subscribe()})})
+
+    def start():
+        if done:
+            return
+        current = dev.get_adapter()
+        if isinstance(current, swsnmp.SnmpAdapter):
+            progress = "waiting for mock and module inventory"
+            server = current.get_mock_server()
+            modules, module_id = dev.get_modules()
+            progress = "mock=" + str(server is not None) + ", modules=" + str(len(modules)) + ", module-id=" + str(module_id)
+            if server is not None and module_id is not None:
+                adapter = current
+                mock = server
+                await async server.set_bindings(_seed())
+                progress = "configuring transform"
+                layer.edit_config(_config(), configured, None)
+            else:
+                after 0.01: start()
+        else:
+            after 0.01: start()
+
+    def deadline():
+        finish(AssertionError("SNMP interface telemetry did not cross the mini RFS transform: " + progress))
+
+    after 0: start()
+    after 5: deadline()
