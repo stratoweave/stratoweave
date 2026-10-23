@@ -1,0 +1,126 @@
+import file
+import testing
+import yang
+import yang.gdata as gdata
+import snmp.mib.meta as mmeta
+import snmp.mib.resolver as mresolver
+import snmp.oid as oid
+import snmp.values as values
+import snmp_schema
+
+import build as swbuild
+import snmp_build
+
+
+IMPORTED_TC = r"""TEST-MIB DEFINITIONS ::= BEGIN
+IMPORTS
+    MODULE-IDENTITY, OBJECT-TYPE, experimental FROM SNMPv2-SMI
+    DisplayString FROM SNMPv2-TC;
+testMib MODULE-IDENTITY
+    LAST-UPDATED "202610130000Z"
+    ORGANIZATION "StratoWeave"
+    CONTACT-INFO "https://github.com/stratoweave/stratoweave"
+    DESCRIPTION "Import closure test."
+    REVISION "202610130000Z"
+    DESCRIPTION "Initial revision."
+    ::= { experimental 424243 }
+testName OBJECT-TYPE
+    SYNTAX DisplayString
+    MAX-ACCESS read-only
+    STATUS current
+    DESCRIPTION "A name using an imported textual convention."
+    ::= { testMib 1 }
+END
+"""
+
+
+def _test_snmp_build_imported_textual_convention():
+    translated = snmp_build.translate(mresolver.resolve_texts([IMPORTED_TC]), ["TEST-MIB"])
+    testing.assertTrue("SNMPv2-TC" in translated.models)
+    schema = yang.compile(list(translated.models.values()))
+    testing.assertTrue(len(schema.children) > 0)
+    metadata = mmeta.MetaIndex(mmeta.bundle_from_json(translated.metadata))
+    name = metadata.find("TEST-MIB::testName")
+    testing.assertNotNone(name)
+    if name is not None:
+        testing.assertEqual(name.oid, [1, 3, 6, 1, 3, 424243, 1])
+        testing.assertEqual(name.kind, "scalar")
+        syntax = name.syntax
+        if syntax is not None:
+            testing.assertEqual(syntax.hint, "255a")
+        else:
+            raise AssertionError("The imported textual convention lost its wire syntax")
+
+
+def _test_snmp_build_missing_import():
+    source = IMPORTED_TC.replace("FROM SNMPv2-TC", "FROM MISSING-MIB")
+    try:
+        snmp_build.translate(mresolver.resolve_texts([source]), ["TEST-MIB"])
+    except ValueError as error:
+        testing.assertTrue("MISSING-MIB" in str(error))
+    else:
+        raise AssertionError("A missing imported MIB must fail generation")
+
+
+def _test_snmp_build_unknown_requested_module():
+    try:
+        snmp_build.translate(mresolver.resolve_texts([IMPORTED_TC]), ["MISSING-MIB"])
+    except ValueError as error:
+        testing.assertTrue("MISSING-MIB" in str(error))
+    else:
+        raise AssertionError("An unknown requested MIB must fail generation")
+
+
+def _test_snmp_build_empty_selection():
+    try:
+        snmp_build.translate(mresolver.resolve_texts([IMPORTED_TC]), [])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("An empty MIB selection must fail generation")
+
+
+def _test_snmp_build_ietf_mini_fixture(t: testing.EnvT):
+    device = swbuild.DeviceType.from_mibs(file.FileCap(t.env.cap), "ietf_snmp", ["minisys/gen/mibs/ietf-snmp"], ["SNMPv2-MIB", "IF-MIB"])
+    testing.assertNotNone(device.snmp_metadata)
+    compiled = swbuild.SysSpec("test", [], [device]).compile().dev_types["ietf_snmp"]
+    testing.assertEqual(compiled.snmp_metadata, device.snmp_metadata)
+    oper = compiled.print(loose=True, gen_json=False, include_state=True, include_subs=True)
+    testing.assertTrue("sysName" in oper)
+    testing.assertTrue("ifHCInOctets" in oper)
+    testing.assertTrue("SubscriptionPath" in oper)
+    metadata_json = device.snmp_metadata
+    if metadata_json is not None:
+        bundle = mmeta.bundle_from_json(metadata_json)
+        metadata = mmeta.MetaIndex(bundle)
+        row = metadata.find("IF-MIB::ifEntry")
+        testing.assertNotNone(row)
+        if row is not None:
+            testing.assertEqual(len(row.index), 1)
+            testing.assertEqual(row.index[0].key, "ifIndex")
+            testing.assertEqual(row.index[0].enc, "int")
+        counter = metadata.find("IF-MIB::ifHCInOctets")
+        testing.assertNotNone(counter)
+        if counter is not None:
+            testing.assertEqual(counter.oid, [1, 3, 6, 1, 2, 1, 31, 1, 1, 1, 6])
+            testing.assertEqual(counter.yang, "/if-mib:IF-MIB/if-mib:ifTable/if-mib:ifEntry/if-mib:ifHCInOctets")
+        # The real IF-MIB combines ifXEntry counters with the base ifEntry.
+        # This also checks imported DisplayString and numeric enum conversion.
+        tree = snmp_schema.Schema(compiled.root, bundle).to_tree([
+            values.VarBind(oid.Oid.parse("1.3.6.1.2.1.1.5.0"), values.OctetString(b"edge-router")),
+            values.VarBind(oid.Oid.parse("1.3.6.1.2.1.2.2.1.2.7"), values.OctetString(b"uplink")),
+            values.VarBind(oid.Oid.parse("1.3.6.1.2.1.2.2.1.8.7"), values.Integer(1)),
+            values.VarBind(oid.Oid.parse("1.3.6.1.2.1.31.1.1.1.6.7"), values.Counter64(4294967317)),
+        ])
+        system_ns = "urn:ietf:params:xml:ns:yang:smiv2:SNMPv2-MIB"
+        interface_ns = "urn:ietf:params:xml:ns:yang:smiv2:IF-MIB"
+        system = tree.get_cnt(gdata.Id(system_ns, "SNMPv2-MIB")).get_cnt(gdata.Id(system_ns, "system"))
+        testing.assertEqual(system.get_str(gdata.Id(system_ns, "sysName")), "edge-router")
+        entries = tree.get_cnt(gdata.Id(interface_ns, "IF-MIB")).get_cnt(gdata.Id(interface_ns, "ifTable")).get_list(gdata.Id(interface_ns, "ifEntry")).entries()
+        testing.assertEqual(len(entries), 1)
+        interface = entries[0]
+        testing.assertEqual(interface.get_int(gdata.Id(interface_ns, "ifIndex")), 7)
+        testing.assertEqual(interface.get_str(gdata.Id(interface_ns, "ifDescr")), "uplink")
+        testing.assertEqual(interface.get_str(gdata.Id(interface_ns, "ifOperStatus")), "up")
+        testing.assertEqual(interface.get_u64(gdata.Id(interface_ns, "ifHCInOctets")), u64(4294967317))
+    t.success()

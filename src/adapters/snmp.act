@@ -1,0 +1,415 @@
+"""MIB-backed device reads and periodic YANG subscriptions over SNMPv2c."""
+
+import logging
+import net
+import std.xml as xml
+import snmp.client as client
+import snmp.errors as errors
+import snmp.mib.meta as mibmeta
+import snmp.oid as oid
+import snmp.security as security
+import snmp.values as values
+import yang.gdata as gdata
+
+import device as swdev
+import snmp_schema
+import snmp_mock
+import subscriptions
+from device_meta_config import stratoweave_rfs__device_entry as DeviceMetaConfig
+from device_schema import DeviceSchema
+from adapters.adapter import DeviceAdapter, DeviceStream, Subscription, ModCap, ConfigError, \
+    NotConnectedError, SubscriptionStatus, SUBSCRIPTION_POLL, subscription_delay, merge_subscription_tree
+
+
+# A table walk stops at this many values and reports an error.
+MAX_VARBINDS = 100000
+
+
+def _udp(env: ?Env) -> ?net.UDPConnectCap:
+    if env is not None:
+        return net.UDPConnectCap(net.UDPCap(net.NetCap(env.cap)))
+    return None
+
+
+actor _Read(c: client.Client, schema: snmp_schema.Schema, plan: snmp_schema.Plan, filt: ?gdata.FNode,
+            done: action(?gdata.Node, ?Exception) -> None):
+    """Send the GET and the table walks of plan at once, then build the tree."""
+    var bindings: dict[oid.Oid, values.VarBind] = {}
+    var pending = len(plan.walks) + (1 if len(plan.get_oids) > 0 else 0)
+    var failed = False
+
+    def received(batch: list[values.VarBind], error: ?Exception):
+        if failed:
+            return
+        if error is not None:
+            failed = True
+            done(None, error)
+            return
+        # Folded subscriptions can read an OID twice, by GET and by a walk.
+        for vb in batch:
+            bindings[vb.oid] = vb
+        pending -= 1
+        if pending == 0:
+            try:
+                tree = schema.to_tree([bindings[o] for o in sorted(bindings.keys())], filt)
+            except Exception as err:
+                done(None, err)
+            else:
+                done(tree, None)
+
+    def got(cl: client.Client, response: ?client.Response, error: ?errors.SnmpError):
+        if error is not None:
+            received([], error)
+        elif response is None:
+            received([], ValueError("SNMP read completed without a response"))
+        else:
+            received(response!.varbinds, None)
+
+    def walked(cl: client.Client, table: ?client.Table, error: ?errors.SnmpError):
+        if error is not None:
+            received([], error)
+        elif table is None:
+            received([], ValueError("SNMP table walk completed without a table"))
+        elif table!.truncated:
+            received([], ValueError("SNMP table exceeded {MAX_VARBINDS} values"))
+        else:
+            batch: list[values.VarBind] = []
+            for row in table!.rows:
+                for i, cell in enumerate(row.cells):
+                    if cell is not None:
+                        batch.append(values.VarBind(oid.Oid(table!.columns[i].arcs + row.index), cell!))
+            received(batch, None)
+
+    def start():
+        if len(plan.get_oids) > 0:
+            c.get(got, plan.get_oids)
+        for walk in plan.walks:
+            c.get_table(walked, walk.oids, index_prefix=walk.index_prefix)
+        if pending == 0:
+            done(schema.to_tree([], filt), None)
+
+    after 0: start()
+
+
+actor SnmpDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, metadata: mibmeta.MibBundle,
+                 modules: dict[str, ModCap], timeout: float, retries: int,
+                 log_handler: logging.Handler, env: ?Env):
+    schema = snmp_schema.Schema(bundled_schema.oper_src_dnode, metadata)
+    udp = _udp(env)
+    var c: ?client.Client = None
+    var mock: ?snmp_mock.SnmpMockServer = None
+    var settings: ?gdata.Node = None
+    var configured = False
+    var generation = 0
+    var closed = False
+    var streams: dict[gdata.SubscriptionSpec, DeviceStream] = {}
+    var subscribers: dict[str, Subscription] = {}
+
+    def _owner_synced(owner_id: str):
+        owner = subscribers.get(owner_id)
+        if owner is not None and owner.owed and len(owner.pending) == 0:
+            owner.owed = False
+            s = owner.synced
+            if s is not None:
+                s(owner_id)
+
+    def _owner_publish(owner_id: str, err: ?Exception=None):
+        owner = subscribers.get(owner_id)
+        if owner is not None:
+            owner.cb(merge_subscription_tree(owner.want, streams), err)
+
+    def _stream_error(st: DeviceStream, err: Exception):
+        st.done = True
+        st.error = err
+        for owner_id in list(st.owners):
+            owner = subscribers.get(owner_id)
+            if owner is not None:
+                if st.instances is not None:
+                    owner.cb(None, err)
+                else:
+                    _owner_publish(owner_id, err)
+                owner.pending.discard(st.spec)
+                _owner_synced(owner_id)
+
+    def _rooted_publish(owner: Subscription, st: DeviceStream, trees: list[gdata.Node]):
+        for tree in trees:
+            owner.cb(tree, None)
+        if len(owner.previous) > 0:
+            point = gdata.root_names(st.spec.root)
+            present = {i.0 for tree in trees for i in gdata.instances(tree, point)}
+            for tree in owner.previous:
+                for i in gdata.instances(tree, point):
+                    if i.0 not in present:
+                        owner.cb(gdata.gone(i.1, point), None)
+            owner.previous = []
+
+    def _snapshot(st: DeviceStream, tree: ?gdata.Node):
+        rooted = st.instances
+        deliveries: list[gdata.Node] = []
+        if rooted is not None:
+            before = rooted.spines()
+            rooted.replace(tree)
+            deliveries = rooted.spines()
+            point = rooted.point
+            was = {i.0: i.1 for n in before for i in gdata.instances(n, point)}
+            present = {i.0: i.1 for n in deliveries for i in gdata.instances(n, point)}
+            for key, n in was.items():
+                if key not in present:
+                    gone = gdata.gone(n, point)
+                    if gone is not None:
+                        deliveries.append(gone)
+        else:
+            st.latest = tree
+        st.done = True
+        st.error = None
+        for owner_id in list(st.owners):
+            owner = subscribers.get(owner_id)
+            if owner is not None:
+                if rooted is not None:
+                    _rooted_publish(owner, st, deliveries)
+                else:
+                    _owner_publish(owner_id)
+                owner.pending.discard(st.spec)
+                _owner_synced(owner_id)
+
+    def get(cb: action(?gdata.Node, ?Exception) -> None, filt: ?gdata.FNode=None):
+        current = c
+        gen = generation
+        if current is None:
+            cb(None, NotConnectedError("SNMP device has no configured transport"))
+            return
+        def completed(tree: ?gdata.Node, error: ?Exception):
+            if gen != generation:
+                cb(None, NotConnectedError("SNMP device changed during read"))
+            else:
+                cb(tree, error)
+        try:
+            _Read(current!, schema, schema.plan(filt), filt, completed)
+        except Exception as err:
+            cb(None, err)
+
+    def _tick(st: DeviceStream):
+        if not st.active or closed:
+            return
+        gen = generation
+        def received(tree: ?gdata.Node, error: ?Exception):
+            if not st.active or closed:
+                return
+            if gen == generation:
+                if error is not None:
+                    _stream_error(st, error)
+                else:
+                    _snapshot(st, tree)
+            after now subscription_delay(st.spec): _tick(st)
+        get(received, st.spec.filt)
+
+    def _remove_owner_spec(owner_id: str, spec: gdata.SubscriptionSpec):
+        st = streams.get(spec)
+        if st is not None:
+            st.owners.discard(owner_id)
+            if len(st.owners) == 0:
+                st.active = False
+                del streams[spec]
+
+    def declare_subscriptions(owner_id: str, cb: proc(?gdata.Node, ?Exception) -> None,
+                              want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None):
+        root: ?gdata.FNode = None
+        point: list[gdata.Id] = []
+        folded: set[gdata.SubscriptionSpec] = set()
+        try:
+            root, point = subscriptions.delivery_root(want)
+            if any([spec.period is None for spec in want]):
+                raise ValueError("SNMP subscriptions require a polling period")
+            folded = {gdata.SubscriptionSpec(f, period=p, root=root)
+                      for p, f in subscriptions.fold(want).items()}
+            for spec in folded:
+                schema.plan(spec.filt)
+        except Exception as err:
+            cb(None, err)
+            if synced is not None:
+                synced(owner_id)
+            return
+        old = subscribers.get(owner_id)
+        old_want = old.want if old is not None else set()
+        same_root = all([spec.root == root for spec in old_want])
+        owner = Subscription(cb, folded, synced)
+        if old is not None and same_root:
+            owner.previous = old.previous
+        if old is not None and same_root and folded != old_want and len(point) > 0:
+            for spec in old_want:
+                st = streams.get(spec)
+                if st is not None and st.instances is not None:
+                    owner.previous.extend(st.instances!.spines())
+        subscribers[owner_id] = owner
+        for spec in old_want:
+            if spec not in folded:
+                _remove_owner_spec(owner_id, spec)
+        for spec in folded:
+            st = streams.get(spec)
+            if st is None:
+                st = DeviceStream(spec)
+                streams[spec] = st!
+                st!.owners.add(owner_id)
+                after 0: _tick(st!)
+            elif spec in old_want and owner_id in st!.owners:
+                if st!.done:
+                    owner.pending.discard(spec)
+            else:
+                st!.owners.add(owner_id)
+                if st!.done:
+                    if st!.error is not None and st!.instances is not None:
+                        cb(None, st!.error)
+                    elif st!.error is not None:
+                        _owner_publish(owner_id, st!.error)
+                    elif st!.instances is not None:
+                        _rooted_publish(owner, st!, st!.instances!.spines())
+                    else:
+                        _owner_publish(owner_id)
+                    owner.pending.discard(spec)
+        if same_root and len(old_want - folded) > 0 and len(point) == 0:
+            _owner_publish(owner_id)
+        _owner_synced(owner_id)
+
+    def remove_subscriptions(owner_id: str):
+        owner = subscribers.get(owner_id)
+        if owner is not None:
+            del subscribers[owner_id]
+            for spec in owner.want:
+                _remove_owner_spec(owner_id, spec)
+
+    def close(on_close: ?action() -> None=None):
+        closed = True
+        generation += 1
+        for st in streams.values():
+            st.active = False
+        streams = {}
+        subscribers = {}
+        if c is not None:
+            c!.close()
+            c = None
+        if mock is not None:
+            mock!.close()
+            mock = None
+        if on_close is not None:
+            on_close()
+
+    def get_mock_server() -> ?snmp_mock.SnmpMockServer:
+        return mock
+
+    def set_dmc(dmc: DeviceMetaConfig):
+        if closed:
+            return
+        tree = dmc.to_gdata()
+        selected = gdata.FNode(children=[gdata.FNode(gdata.Id("http://stratoweave.org/yang/stratoweave-rfs", name))
+                                       for name in ["address", "credentials", "mock"]])
+        new_settings = gdata.filter(tree, selected)
+        if configured and settings == new_settings:
+            return
+        configured = True
+        settings = new_settings
+        generation += 1
+        gen = generation
+        previous = c
+        previous_mock = mock
+        c = None
+        mock = None
+        if previous is not None:
+            previous.close()
+        if previous_mock is not None:
+            previous_mock.close()
+        mocked = dmc.mock.enabled or len(dmc.mock.module) > 0 or env is None
+        community = dmc.credentials.password
+        if community is None:
+            if mocked:
+                community = "public"
+            else:
+                return
+        opts = client.Options(timeout=timeout, retries=retries, max_walk_varbinds=MAX_VARBINDS, max_queued=64,
+                              check_community=True)
+        candidate: ?client.Client = None
+        candidate_mock: ?snmp_mock.SnmpMockServer = None
+        if mocked:
+            server = snmp_mock.SnmpMockServer(community=community!)
+            transport = server.transport()
+            if closed or gen != generation:
+                server.close()
+                return
+            candidate_mock = server
+            candidate = client.Client(None, snmp_mock.ADDRESS, security.Community(community!), log_handler,
+                                      port=snmp_mock.PORT, opts=opts, transport=transport)
+        elif udp is not None and len(dmc.address) > 0:
+            address = list(dmc.address)[0]
+            port = address.port
+            candidate = client.Client(udp, address.address, security.Community(community!),
+                                      log_handler, port=int(port) if port is not None else 161, opts=opts)
+        if closed or gen != generation:
+            if candidate is not None:
+                candidate.close()
+            if candidate_mock is not None:
+                candidate_mock.close()
+            return
+        c = candidate
+        mock = candidate_mock
+        if c is not None:
+            async dev.on_connect(modules, None)
+
+
+class SnmpAdapter(DeviceAdapter):
+    def __init__(self, dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc: DeviceMetaConfig,
+                 schema_registry: swdev.SchemaRegistry, log_handler, env: ?Env,
+                 metadata: mibmeta.MibBundle, timeout: float=1.0, retries: int=2):
+        """Read the device described by metadata, waiting timeout seconds per request attempt."""
+        self._log_handler = log_handler
+        self._env = env
+        self._modules = {meta.module: ModCap(meta.module, ns, meta.revision)
+                         for ns, meta in bundled_schema.module_inventory().items()}
+        self._driver = SnmpDriver(dev, bundled_schema, metadata, self._modules, timeout, retries, log_handler, env)
+
+    def supports_mocking(self) -> bool:
+        return True
+
+    def set_dmc(self, new_dmc: DeviceMetaConfig):
+        self._driver.set_dmc(new_dmc)
+
+    def configure(self, done, new_diff, new_conf, running_conf):
+        done(ConfigError("SNMP adapters currently support reads only", new_diff, new_conf), None)
+
+    def get_capabilities(self) -> list[str]:
+        return []
+
+    def get_modules(self) -> dict[str, ModCap]:
+        return self._modules
+
+    def subscription_method(self) -> str:
+        return SUBSCRIPTION_POLL
+
+    def subscription_status(self) -> SubscriptionStatus:
+        return SubscriptionStatus(SUBSCRIPTION_POLL, emulated=True)
+
+    def fetch_config(self, done: action(?gdata.Node, ?Exception) -> None):
+        done(gdata.Container({}), None)
+
+    def get_config(self) -> ?gdata.Node:
+        return gdata.Container({})
+
+    def get(self, cb: action(?gdata.Node, ?Exception) -> None, filt: ?gdata.FNode=None):
+        self._driver.get(cb, filt)
+
+    def rpc(self, cb: action(?gdata.Node, ?Exception) -> None, gdata_rpc: gdata.Node):
+        cb(None, ConfigError("SNMP adapters do not support YANG RPCs"))
+
+    def rpc_xml(self, cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node):
+        cb(None, ConfigError("SNMP adapters do not support XML RPCs"))
+
+    def declare_subscriptions(self, owner_id: str, cb: proc(?gdata.Node, ?Exception) -> None,
+                              want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None):
+        self._driver.declare_subscriptions(owner_id, cb, want, synced)
+
+    def remove_subscriptions(self, owner_id: str):
+        self._driver.remove_subscriptions(owner_id)
+
+    def close(self, on_close: ?action() -> None=None):
+        self._driver.close(on_close)
+
+    proc def get_mock_server(self) -> ?snmp_mock.SnmpMockServer:
+        return self._driver.get_mock_server()

@@ -1,0 +1,175 @@
+import testing
+import snmp.mib.meta as meta
+import snmp.values as values
+from snmp.oid import Oid
+from snmp.values import VarBind
+import yang.gdata as gdata
+import yang.schema as ys
+import snmp_schema as mapping
+
+NS = "urn:ietf:params:xml:ns:yang:smiv2:TEST-MIB"
+BASE = "1.3.6.1.4.1.424242"
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id(NS, name)
+
+
+def _ext(oid: str) -> list[ys.DExt]:
+    return [ys.DExt("ietf-yang-smiv2", mapping.SMIV2_NS, "smiv2", "oid", oid)]
+
+
+def _uint() -> ys.DType:
+    return ys.DTypeIntegerUnsigned("uint32", None, None, None, [], "uint32", None, None)
+
+
+def _string() -> ys.DType:
+    return ys.DTypeString("string", None, None, None, [], "string", None, None, [])
+
+
+def fixture_data(string_index=False) -> (ys.DRoot, meta.MibBundle):
+    index_type = _string() if string_index else _uint()
+    leafs = [
+        ys.DLeaf("TEST-MIB", NS, "t", "index", False, type=index_type, exts=_ext(BASE + ".2.1.1")),
+        ys.DLeaf("TEST-MIB", NS, "t", "name", False, type=_string(), exts=_ext(BASE + ".2.1.2")),
+        ys.DLeaf("TEST-MIB", NS, "t", "reading", False, type=_uint(), exts=_ext(BASE + ".2.1.3")),
+        ys.DLeaf("TEST-MIB", NS, "t", "status", False, type=ys.DTypeEnum("enumeration", None, None, None, [], "enumeration", None, {"ok": 1, "alarm": 2}), exts=_ext(BASE + ".2.1.4")),
+    ]
+    schema = ys.DRoot(children=[ys.DContainer("TEST-MIB", NS, "t", "TEST-MIB", False, presence=False, children=[
+        ys.DLeaf("TEST-MIB", NS, "t", "uptime", False, type=_uint(), exts=_ext(BASE + ".1")),
+        ys.DList("TEST-MIB", NS, "t", "sensor", ["index"], False, exts=_ext(BASE + ".2.1"), children=leafs),
+    ])])
+    module = meta.ModuleMeta("TEST-MIB", "v2")
+    uptime = meta.NodeMeta("uptime", "TEST-MIB", Oid.parse(BASE + ".1").arcs, "scalar")
+    uptime.access = "read-only"
+    uptime.syntax = meta.SyntaxMeta("TimeTicks", "", "uint", "")
+    table = meta.NodeMeta("sensorTable", "TEST-MIB", Oid.parse(BASE + ".2").arcs, "table")
+    row = meta.NodeMeta("sensor", "TEST-MIB", Oid.parse(BASE + ".2.1").arcs, "row")
+    index_syntax = meta.SyntaxMeta("OCTET STRING", "", "string-hint", "64a") if string_index else meta.SyntaxMeta("Unsigned32", "", "uint", "")
+    row.index = [meta.IndexPart("TEST-MIB::index", "index", "var" if string_index else "int", 0, index_syntax)]
+    module.nodes = [uptime, table, row]
+    syntaxes = [index_syntax, meta.SyntaxMeta("OCTET STRING", "", "string-hint", "64a"), meta.SyntaxMeta("Gauge32", "", "uint", ""), meta.SyntaxMeta("INTEGER", "", "enum", "")]
+    syntaxes[3].enums = [("ok", 1), ("alarm", 2)]
+    for i, name in enumerate(["index", "name", "reading", "status"]):
+        column = meta.NodeMeta(name, "TEST-MIB", Oid.parse(BASE + ".2.1." + str(i + 1)).arcs, "column")
+        column.access = "not-accessible" if i == 0 else "read-only"
+        column.syntax = syntaxes[i]
+        module.nodes.append(column)
+    return (schema, meta.MibBundle([module]))
+
+
+def fixture(string_index=False) -> mapping.Schema:
+    root, metadata = fixture_data(string_index)
+    return mapping.Schema(root, metadata)
+
+
+def _filt(children: list[gdata.FNode]) -> gdata.FNode:
+    return gdata.FNode(children=[gdata.FNode(q("TEST-MIB"), children=[gdata.FNode(q("sensor"), children=children)])])
+
+
+def bindings() -> list[VarBind]:
+    return [
+        VarBind(Oid.parse(BASE + ".1.0"), values.TimeTicks(1234)),
+        VarBind(Oid.parse(BASE + ".2.1.2.7"), values.OctetString(b"temperature")),
+        VarBind(Oid.parse(BASE + ".2.1.3.7"), values.Gauge32(42)),
+        VarBind(Oid.parse(BASE + ".2.1.4.7"), values.Integer(2)),
+        VarBind(Oid.parse(BASE + ".2.1.3.8"), values.Gauge32(18)),
+    ]
+
+
+def _strs(oids: list[Oid]) -> list[str]:
+    return [str(o) for o in oids]
+
+
+def _rows(tree: gdata.Node):
+    return tree.get_cnt(q("TEST-MIB")).get_list(q("sensor")).entries()
+
+
+def _test_snmp_plan_narrows_columns():
+    plan = fixture().plan(_filt([gdata.FNode(q("reading"))]))
+    testing.assertEqual(plan.get_oids, [])
+    testing.assertEqual([_strs(w.oids) for w in plan.walks], [[BASE + ".2.1.3"]])
+    all_data = fixture().plan()
+    testing.assertEqual(_strs(all_data.get_oids), [BASE + ".1.0"])
+    testing.assertEqual([_strs(w.oids) for w in all_data.walks], [[BASE + ".2.1.2", BASE + ".2.1.3", BASE + ".2.1.4"]])
+
+
+def _test_snmp_plan_fetches_predicate_columns():
+    plan = fixture().plan(_filt([gdata.FNode(q("name"), value_match="temperature"), gdata.FNode(q("reading"))]))
+    testing.assertEqual([_strs(w.oids) for w in plan.walks], [[BASE + ".2.1.2", BASE + ".2.1.3"]])
+
+
+def _test_snmp_plan_gets_a_keyed_row():
+    plan = fixture().plan(_filt([gdata.FNode(q("index"), value_match=u64(7)), gdata.FNode(q("reading"))]))
+    testing.assertEqual(_strs(plan.get_oids), [BASE + ".2.1.3.7"])
+    testing.assertEqual(len(plan.walks), 0)
+
+
+def _test_snmp_plan_encodes_string_keys():
+    plan = fixture(string_index=True).plan(_filt([gdata.FNode(q("index"), value_match="fan"), gdata.FNode(q("reading"))]))
+    # A variable-length string key starts with its length: "fan" is 3.102.97.110.
+    testing.assertEqual(_strs(plan.get_oids), [BASE + ".2.1.3.3.102.97.110"])
+
+
+def _test_snmp_tree_converts_and_filters_rows():
+    tree = fixture().to_tree(bindings(), _filt([gdata.FNode(q("index"), value_match=u64(7)), gdata.FNode(q("reading")), gdata.FNode(q("status"))]))
+    rows = _rows(tree)
+    testing.assertEqual(len(rows), 1)
+    testing.assertEqual(rows[0].get_u64(q("index")), u64(7))
+    testing.assertEqual(rows[0].get_u64(q("reading")), u64(42))
+    testing.assertEqual(rows[0].get_str(q("status")), "alarm")
+    testing.assertTrue(rows[0].get_opt_str(q("name")) is None)
+    testing.assertTrue(tree.get_cnt(q("TEST-MIB")).get_opt_u64(q("uptime")) is None)
+
+
+def _test_snmp_tree_string_index_uses_mib_metadata():
+    tree = fixture(string_index=True).to_tree([VarBind(Oid.parse(BASE + ".2.1.3.3.102.97.110"), values.Gauge32(12))])
+    rows = _rows(tree)
+    testing.assertEqual(len(rows), 1)
+    testing.assertEqual(rows[0].get_str(q("index")), "fan")
+    testing.assertEqual(rows[0].get_u64(q("reading")), u64(12))
+
+
+def _test_snmp_absent_objects_produce_empty_tree():
+    tree = fixture().to_tree([VarBind(Oid.parse(BASE + ".1.0"), values.NoSuchInstance())])
+    testing.assertEqual(tree, gdata.Container())
+
+
+def _test_snmp_malformed_sample_is_rejected():
+    schema = fixture()
+    for binding in [
+        VarBind(Oid.parse(BASE + ".2.1.3.7.8"), values.Gauge32(1)),
+        VarBind(Oid.parse(BASE + ".2.1.4.7"), values.Integer(99)),
+        VarBind(Oid.parse(BASE + ".2.1.3.7"), values.OctetString(b"bad")),
+    ]:
+        failed = False
+        try:
+            schema.to_tree([binding])
+        except ValueError:
+            failed = True
+        testing.assertTrue(failed)
+
+
+def _test_snmp_foreign_index_without_oid_can_be_selected():
+    root, metadata = fixture_data()
+    # RFC 6643 external INDEX leaves are leafrefs and have no smiv2:oid.
+    root.get("TEST-MIB").get("sensor").get("index").exts = []
+    schema = mapping.Schema(root, metadata)
+    filt = _filt([gdata.FNode(q("index"))])
+    testing.assertEqual([len(w.oids) for w in schema.plan(filt).walks], [1])
+    rows = _rows(schema.to_tree(bindings(), filt))
+    testing.assertEqual([r.get_u64(q("index")) for r in rows], [u64(7), u64(8)])
+    testing.assertTrue(all([r.get_opt_u64(q("reading")) is None for r in rows]))
+
+
+def _test_snmp_pruned_schema_can_enumerate_only_index_keys():
+    root, metadata = fixture_data()
+    table = root.get("TEST-MIB").get("sensor")
+    if isinstance(table, ys.DList):
+        table.children = [table.get("index")]
+    schema = mapping.Schema(root, metadata)
+    filt = _filt([gdata.FNode(q("index"))])
+    testing.assertEqual([_strs(w.oids) for w in schema.plan(filt).walks], [[BASE + ".2.1.2"]])
+    rows = _rows(schema.to_tree([VarBind(Oid.parse(BASE + ".2.1.2.7"), values.OctetString(b"temperature"))], filt))
+    testing.assertEqual([r.get_u64(q("index")) for r in rows], [u64(7)])
+    testing.assertTrue(rows[0].get_opt_str(q("name")) is None)

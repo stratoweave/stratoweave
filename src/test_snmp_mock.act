@@ -1,0 +1,139 @@
+"""The device mock serves the normal SNMP client over MemNet and UDP."""
+
+import net
+import snmp.client as client
+import snmp.errors as errors
+import snmp.oid as oid
+import snmp.security as security
+import snmp.transport as transport
+import snmp.values as values
+import snmp_mock
+import testing
+
+
+def _oid(index: int) -> oid.Oid:
+    return oid.Oid([1, 3, 6, 1, 4, 1, 99999, index])
+
+
+def _bindings() -> list[values.VarBind]:
+    # Numeric OID order differs from lexicographic string order.
+    return [values.VarBind(_oid(i), values.Integer(i)) for i in [10, 2, 1]]
+
+
+actor _test_mock_read_walk_update_and_close(t: testing.AsyncT):
+    mock = snmp_mock.SnmpMockServer(bindings=_bindings())
+    c = client.Client(None, "127.0.0.1", security.Community("public"), None,
+                       port=mock.local_port(), transport=mock.transport(),
+                       opts=client.Options(timeout=0.1, retries=1))
+    var finished = False
+
+    def finish(error: ?Exception):
+        if finished:
+            return
+        finished = True
+        c.close()
+        mock.close()
+        if error is None:
+            t.success()
+        else:
+            t.failure(error!)
+
+    def updated(c: client.Client, response: ?client.Response, error: ?errors.SnmpError):
+        if error is not None:
+            finish(error)
+            return
+        try:
+            testing.assertEqual(response!.varbinds, [values.VarBind(_oid(2), values.Integer(42))])
+            mock.close()
+            mock.close()
+            testing.assertEqual(mock.local_port(), 0)
+            finish(None)
+        except Exception as err:
+            finish(err)
+
+    def walked(c: client.Client, bindings: list[values.VarBind], error: ?errors.SnmpError):
+        if error is not None:
+            finish(error)
+            return
+        try:
+            testing.assertEqual(bindings, [values.VarBind(_oid(i), values.Integer(i)) for i in [1, 2, 10]])
+            await async mock.set_value(_oid(2), values.Integer(42))
+            c.get(updated, [_oid(2)])
+        except Exception as err:
+            finish(err)
+
+    def next_read(c: client.Client, response: ?client.Response, error: ?errors.SnmpError):
+        if error is not None:
+            finish(error)
+            return
+        try:
+            testing.assertEqual(response!.varbinds,
+                                [values.VarBind(_oid(10), values.Integer(10)), values.VarBind(oid.Oid([2, 0]), values.EndOfMibView())])
+            c.walk(walked, oid.Oid([1, 3, 6, 1, 4, 1, 99999]))
+        except Exception as err:
+            finish(err)
+
+    def got(c: client.Client, response: ?client.Response, error: ?errors.SnmpError):
+        if error is not None:
+            finish(error)
+            return
+        try:
+            testing.assertEqual(response!.varbinds,
+                                [values.VarBind(_oid(2), values.Integer(2)), values.VarBind(_oid(7), values.NoSuchInstance())])
+            c.get_next(next_read, [_oid(2), oid.Oid([2, 0])])
+        except Exception as err:
+            finish(err)
+
+    def deadline():
+        finish(AssertionError("SNMP mock integration timed out"))
+
+    c.get(got, [_oid(2), _oid(7)])
+    after 3.0: deadline()
+
+
+actor _test_mock_udp_ephemeral_port(t: testing.EnvT):
+    udp = net.UDPCap(net.NetCap(t.env.cap))
+    var mock: ?snmp_mock.SnmpMockServer = None
+    var c: ?client.Client = None
+    var finished = False
+
+    def finish(error: ?Exception):
+        if finished:
+            return
+        finished = True
+        if c is not None:
+            c.close()
+        if mock is not None:
+            mock.close()
+        if error is None:
+            t.success()
+        else:
+            t.failure(error!)
+
+    def got(c: client.Client, response: ?client.Response, error: ?errors.SnmpError):
+        if error is not None:
+            finish(error)
+            return
+        try:
+            testing.assertEqual(response!.varbinds, [values.VarBind(_oid(1), values.Integer(1))])
+            finish(None)
+        except Exception as err:
+            finish(err)
+
+    def listening(endpoint: transport.ServerTransport, error: ?str):
+        if error is not None:
+            finish(ValueError(error))
+            return
+        if finished:
+            endpoint.close()
+            return
+        mock = snmp_mock.SnmpMockServer(bindings=_bindings(), server_transport=endpoint)
+        c = client.Client(net.UDPConnectCap(udp), "127.0.0.1", security.Community("public"), None,
+                           port=mock!.local_port(), opts=client.Options(timeout=0.1, retries=1))
+        c!.get(got, [_oid(1)])
+
+    def deadline():
+        finish(AssertionError("SNMP UDP mock timed out"))
+
+    transport.udp_server_transport(net.UDPListenCap(udp), "127.0.0.1", 0, listening)
+    after 3.0: deadline()

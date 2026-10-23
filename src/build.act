@@ -7,6 +7,7 @@ import ttt_gen as ttt_gen
 import swyang as swyang
 import yang.transform_unions as transform_unions
 import yang.parser as yparser
+import snmp_build
 
 from device_schema import SchemaTreeTransform
 
@@ -70,7 +71,7 @@ class SysSpec(object):
             root = yang.compile(dev_type.models, strict_quoting=False, allow_failure=allow_failure)
             for t in dev_type.transforms:
                 t.apply(root)
-            r = CompiledDeviceType(root, dev_type.models, dev_type.name, dev_type.transforms)
+            r = CompiledDeviceType(root, dev_type.models, dev_type.name, dev_type.transforms, dev_type.snmp_metadata)
             print(" {sw.elapsed().to_float():.3f}s")
             return r
         compiled_layers = [_compile_layer(l, idx) for (idx, l) in enumerate(self.layers)]
@@ -220,10 +221,21 @@ class CompiledSysSpec(object):
 
             dev_alias = "dev_{dev_type.name}"
             dev_oper_alias = "dev_{dev_type.name}_oper"
+            adapter_type = "swna.NetconfAdapter"
             syssrc += "import {modname} as {dev_alias}\n"
             syssrc += "import {modname}_oper as {dev_oper_alias}\n"
+            if dev_type.snmp_metadata is not None:
+                mib_source = "# Generated from the same MIBs as the device YANG schema.\n"
+                mib_source += "import snmp.mib.meta as mmeta\n"
+                mib_source += "import stratoweave.adapters.snmp as swsa\n\n"
+                mib_source += "METADATA = mmeta.bundle_from_json({repr(dev_type.snmp_metadata)})\n\n\n"
+                mib_source += "def adapter(dev, schema, dmc, registry, log_handler, env):\n"
+                mib_source += "    return swsa.SnmpAdapter(dev, schema, dmc, registry, log_handler, env, METADATA)\n"
+                _maybe_write_file(fc, "{output_dir}/{self.name}/devices/{dev_type.name}_mib.act", mib_source)
+                syssrc += "import {modname}_mib as {dev_alias}_mib\n"
+                adapter_type = "{dev_alias}_mib.adapter"
             syssrc_devtypes += """    "{dev_type.name}": swdev.DeviceType(name="{dev_type.name}",
-            adapter_type=swna.NetconfAdapter,
+            adapter_type={adapter_type},
             src_dnode={dev_alias}.SRC_DNODE,
             oper_src_dnode={dev_oper_alias}.SRC_DNODE,
 """
@@ -360,11 +372,12 @@ class CompiledLayer(CompiledLayerBase):
         self.name = name
 
 class CompiledDeviceType(CompiledLayerBase):
-    def __init__(self, root: yschema.DRoot, src: list[str], name: str, transforms: list[SchemaTreeTransform]=[]):
+    def __init__(self, root: yschema.DRoot, src: list[str], name: str, transforms: list[SchemaTreeTransform]=[], snmp_metadata: ?str=None):
         self.root = root
         self.src = src
         self.name = name
         self.transforms = transforms
+        self.snmp_metadata = snmp_metadata
 
 def apply_schema_transforms_to_dir(fc: file.FileCap, dir: str, transforms: list[SchemaTransformChain]=[]) -> None:
     """Apply schema transformations to YANG files in a directory.
@@ -398,10 +411,27 @@ def apply_schema_transforms_to_dir(fc: file.FileCap, dir: str, transforms: list[
             await async wf.write(yang_text.encode())
 
 class DeviceType(object):
-    def __init__(self, name: str, models: list[str], transforms: list[SchemaTreeTransform]=[]):
+    def __init__(self, name: str, models: list[str], transforms: list[SchemaTreeTransform]=[], snmp_metadata: ?str=None):
+        """A device type from YANG models. from_mibs also sets snmp_metadata, which selects the SNMP adapter."""
         self.name = name
         self.models = models
         self.transforms = transforms
+        self.snmp_metadata = snmp_metadata
+
+    @staticmethod
+    proc def from_mibs(fc: file.FileCap, name: str, dirs: list[str], modules: list[str], yang_dir: ?str=None, transforms: list[SchemaTreeTransform]=[]) -> DeviceType:
+        """Build an SNMP device from MIB modules, their imports, and wire metadata.
+
+        Optional yang_dir records the translated YANG for inspection. The same
+        in-memory translation supplies both the Acton schema and SNMP metadata.
+        """
+        translation = snmp_build.from_dirs(fc, dirs, modules)
+        if yang_dir is not None:
+            fs = file.FS(fc)
+            await async fs.mkdir(yang_dir)
+            for modname, text in translation.models.items():
+                _maybe_write_file(fc, file.join_path([yang_dir, modname + ".yang"]), text)
+        return DeviceType(name, list(translation.models.values()), transforms, translation.metadata)
 
     @staticmethod
     def from_dir(fc: file.FileCap, name: str, dir: str, transforms: list[SchemaTreeTransform]=[]) -> DeviceType:

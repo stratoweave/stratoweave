@@ -1,0 +1,118 @@
+"""The device registry passes its Env to the real SNMP adapter, which reads over UDP."""
+
+import net
+import testing
+import snmp.errors as errors
+import snmp.transport as transport
+import yang.gdata as gdata
+
+import adapters.adapter as base
+import adapters.snmp as snmp
+import device
+import snmp_mock
+import test_snmp_adapter
+import test_snmp_schema as fixture
+from device_meta_config import stratoweave_rfs__device_entry as DMC, \
+    stratoweave_rfs__device__credentials as Credentials, \
+    stratoweave_rfs__device__address_entry as Address
+
+
+actor _test_snmp_registry_real_udp_password_change_and_close(t: testing.EnvT):
+    udp = net.UDPCap(net.NetCap(t.env.cap))
+    registry = device.DeviceRegistry(test_snmp_adapter.device_types(), t.env, t.log_handler)
+    dev = registry.get_or_create("udp-sensor")
+    var server: ?snmp_mock.SnmpMockServer = None
+    var adapter: ?snmp.SnmpAdapter = None
+    var finished = False
+    var attempts = 0
+    var corrected_password = False
+
+    def finish(error: ?Exception=None):
+        if finished:
+            return
+        finished = True
+        if adapter is not None:
+            adapter.close()
+        if server is not None:
+            await async server.close()
+        if error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    def closed_read(tree: ?gdata.Node, error: ?Exception):
+        if finished:
+            return
+        try:
+            testing.assertTrue(isinstance(error, base.NotConnectedError))
+            testing.assertTrue(tree is None)
+            testing.assertTrue(adapter!.get_mock_server() is None)
+            await async server!.close()
+            testing.assertEqual(server!.local_port(), 0)
+            finish()
+        except Exception as err:
+            finish(err)
+
+    def verify_closed():
+        dev.get(closed_read, None)
+
+    def closed():
+        after 0: verify_closed()
+
+    def got(tree: ?gdata.Node, error: ?Exception):
+        if finished:
+            return
+        if isinstance(error, base.NotConnectedError) and attempts < 100:
+            after 0.01: read()
+            return
+        try:
+            if not corrected_password:
+                testing.assertTrue(isinstance(error, errors.TimeoutError))
+                testing.assertTrue(tree is None)
+                corrected_password = True
+                # Keep the endpoint unchanged. Only credentials/password
+                # may trigger the client replacement.
+                configure("adapter-test")
+                after 0.01: read()
+                return
+            if error is not None:
+                raise error
+            testing.assertEqual(tree, fixture.fixture().to_tree(fixture.bindings()))
+            # This is a separately listening UDP peer. The real adapter must
+            # never construct its in-process mock for the configured device.
+            testing.assertTrue(adapter!.get_mock_server() is None)
+            adapter!.close(closed)
+        except Exception as err:
+            finish(err)
+
+    def read():
+        if finished:
+            return
+        attempts += 1
+        a = dev.get_adapter()
+        if isinstance(a, snmp.SnmpAdapter):
+            adapter = a
+            dev.get(got, None)
+        elif attempts < 100:
+            after 0.01: read()
+        else:
+            finish(AssertionError("SNMP adapter did not start"))
+
+    def configure(password: str):
+        dev.set_dmc(DMC("udp-sensor", Credentials("", password), type="snmp",
+                       address=[Address("loopback", "127.0.0.1", u64(server!.local_port()))]))
+
+    def listening(endpoint: transport.ServerTransport, error: ?str):
+        if error is not None:
+            finish(ValueError(error))
+            return
+        if finished:
+            endpoint.close()
+            return
+        server = snmp_mock.SnmpMockServer(community="adapter-test", bindings=fixture.bindings(),
+                                          server_transport=endpoint, log_handler=t.log_handler)
+        configure("wrong-community")
+        after 0: read()
+
+    transport.udp_server_transport(net.UDPListenCap(udp), "127.0.0.1", 0, listening, t.log_handler)
+    after 5: finish(AssertionError("SNMP UDP adapter test timed out"))

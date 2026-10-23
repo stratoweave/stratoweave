@@ -1,0 +1,269 @@
+"""Map translated MIB schemas and SNMP observations to YANG data trees.
+
+The MIB metadata carries INDEX encodings and textual conventions that cannot be
+recovered from YANG alone. actsnmp owns their conversion, read planning and
+table assembly.
+"""
+
+import snmp.conv as conv
+import snmp.mib.meta as meta
+import snmp.tables as tables
+from snmp.oid import Oid
+from snmp.values import VarBind
+import yang.gdata as gdata
+import yang.schema as ys
+
+SMIV2_NS = "urn:ietf:params:xml:ns:yang:ietf-yang-smiv2"
+
+
+def _extension(exts: list[ys.DExt], name: str) -> ?str:
+    for ext in exts:
+        if ext.namespace == SMIV2_NS and ext.name == name:
+            return ext.arg
+    return None
+
+
+def _id(node: ys.DNode) -> gdata.Id:
+    return gdata.Id(node.namespace, node.name)
+
+
+def _key(node: ys.DNode) -> str:
+    return "{node.namespace}:{node.name}"
+
+
+def _matches(f: gdata.FNode, node: ys.DNode) -> bool:
+    name = f.name
+    if name is not None:
+        return name.name in [node.name, "*"] and name.q in ["", node.namespace]
+    return True
+
+
+def _whole(f: gdata.FNode) -> bool:
+    """Return True when f selects its complete subtree.
+
+    A selection node has no children. A node with only content matches
+    selects the complete matched subtree.
+    """
+    return all([c.value_match is not None for c in f.children])
+
+
+def _keys(f: gdata.FNode, names: list[str]) -> list[value]:
+    """Return the leading INDEX values that the children of f match exactly."""
+    found: dict[str, value] = {}
+    for c in f.children:
+        name = c.name
+        v = c.value_match
+        if name is not None and v is not None and not isinstance(v, gdata.ValueMatch):
+            found[name.name] = v
+    keys: list[value] = []
+    for name in names:
+        if name not in found:
+            break
+        keys.append(found[name])
+    return keys
+
+
+def _type(t: ys.DType) -> ys.DType:
+    if isinstance(t, ys.DTypeLeafref):
+        target = t.target_type
+        if target is None:
+            raise ValueError("SNMP schema has an unresolved leafref")
+        return _type(target!)
+    return t
+
+
+def _leaf(node: ys.DLeaf, result: ?conv.Result) -> ?gdata.Node:
+    if result is None:
+        return None
+    converted = result!
+    if converted.status == conv.ABSENT:
+        return None
+    v = converted.value
+    if converted.status != conv.OK or v is None:
+        raise ValueError("Cannot decode SNMP object {node.name}: {converted.code}: {converted.diag}")
+    if not _type(node.type).validate_value(v!):
+        raise ValueError("SNMP object {node.name} does not match its YANG type")
+    return gdata.Leaf(v!, ns=node.namespace, module=node.module)
+
+
+class _Table(object):
+    """The MIB names of one YANG list, as tables.plan_table takes them."""
+    row: str
+    keys: list[str]
+    columns: dict[str, str]
+    enumerate_by: list[str]
+
+    def __init__(self, row: str, keys: list[str], columns: dict[str, str], enumerate_by: list[str]):
+        self.row = row
+        self.keys = keys
+        self.columns = columns
+        self.enumerate_by = enumerate_by
+
+
+class Plan(object):
+    """The reads for one filter: one GET of get_oids, and one Client.get_table per walk."""
+    get_oids: list[Oid]
+    walks: list[tables.TablePlan]
+
+    def __init__(self, get_oids: list[Oid], walks: list[tables.TablePlan]):
+        self.get_oids = get_oids
+        self.walks = walks
+
+
+class Schema(object):
+    root: ys.DRoot
+    index: meta.MetaIndex
+    scalars: dict[str, Oid]
+    tables: dict[str, _Table]
+
+    def __init__(self, root: ys.DRoot, metadata: meta.MibBundle):
+        self.root = root
+        self.index = meta.MetaIndex(metadata)
+        self.scalars = {}
+        self.tables = {}
+        self._scan(root)
+
+    def _object(self, node: ys.DNode) -> ?meta.NodeMeta:
+        oid = _extension(node.exts, "oid")
+        if oid is None:
+            return None
+        obj = self.index.object_at(Oid.parse(oid!).arcs, node.module)
+        if obj is None:
+            raise ValueError("MIB metadata missing for {node.module}:{node.name}")
+        return obj
+
+    def _table(self, node: ys.DList) -> _Table:
+        oid = _extension(node.exts, "oid")
+        if oid is None:
+            raise ValueError("SNMP table {node.name} has no OID annotation")
+        rows = [n for n in self.index.exact(Oid.parse(oid!).arcs) if n.kind == "row" and n.module == node.module]
+        if len(rows) == 0:
+            raise ValueError("MIB metadata missing for {node.module}:{node.name}")
+        if len(node.key) == 0:
+            raise ValueError("SNMP table requires INDEX keys")
+        row = rows[0]
+        columns: dict[str, str] = {}
+        for child in node.children:
+            if isinstance(child, ys.DList):
+                raise ValueError("Nested SNMP tables are unsupported")
+            if child.name not in node.key:
+                obj = self._object(child)
+                if obj is not None:
+                    columns[_key(child)] = obj.qname()
+        # A filter that selects only INDEX leaves still needs one readable
+        # column to enumerate the rows, also when the YANG schema has none.
+        readable = [c.qname() for c in self.index.columns(row, augments=True) if tables.readable(c)]
+        return _Table(row.qname(), [p.key for p in self.index.index_of(row)], columns, readable[:1])
+
+    def _scan(self, node: ys.DNode):
+        if isinstance(node, ys.DList):
+            self.tables[_key(node)] = self._table(node)
+        elif isinstance(node, ys.DLeaf):
+            obj = self._object(node)
+            if obj is not None and tables.readable(obj!):
+                self.scalars[_key(node)] = Oid(obj!.oid + [0])
+        elif isinstance(node, ys.DNodeInner):
+            if not (isinstance(node, ys.DRoot) or isinstance(node, ys.DContainer)):
+                return
+            for child in node.children:
+                self._scan(child)
+
+    def plan(self, filt: ?gdata.FNode=None) -> Plan:
+        """Plan the reads for the data that filt selects.
+
+        A row with a value for every INDEX key is read with GET. Leading key
+        values narrow the walk of their table.
+        """
+        get: set[Oid] = set()
+        walks: list[tables.TablePlan] = []
+        f = filt
+        if f is not None and f.name is not None:
+            f = gdata.FNode(children=[f])
+        self._plan(self.root, f, get, walks)
+        return Plan(sorted(get), walks)
+
+    def _plan(self, node: ys.DNode, f: ?gdata.FNode, get: set[Oid], walks: list[tables.TablePlan]):
+        whole = f is None or _whole(f!)
+        if isinstance(node, ys.DList):
+            table = self.tables[_key(node)]
+            keys: list[value] = []
+            columns: list[str] = []
+            if f is not None:
+                keys = _keys(f!, table.keys)
+                if not whole:
+                    for child in node.children:
+                        column = table.columns.get(_key(child))
+                        if column is not None and any([_matches(c, child) for c in f!.children]):
+                            columns.append(column!)
+                    if len(columns) == 0:
+                        columns = table.enumerate_by
+            p = tables.plan_table(self.index, table.row, columns, keys)
+            if p.complete:
+                get.update(p.get_oids())
+            else:
+                walks.append(p)
+        elif isinstance(node, ys.DLeaf):
+            oid = self.scalars.get(_key(node))
+            if oid is not None:
+                get.add(oid!)
+        elif isinstance(node, ys.DNodeInner):
+            if not (isinstance(node, ys.DRoot) or isinstance(node, ys.DContainer)):
+                return
+            for child in node.children:
+                if whole:
+                    self._plan(child, None, get, walks)
+                elif f is not None:
+                    for c in f!.children:
+                        if _matches(c, child):
+                            self._plan(child, c, get, walks)
+
+    def _build(self, node: ys.DNode, data: tables.Assembly, row: ?tables.TableRow=None, row_namespace: ?str=None) -> ?gdata.Node:
+        oid_text = _extension(node.exts, "oid")
+        oid = Oid.parse(oid_text).arcs if oid_text is not None else []
+        if isinstance(node, ys.DLeaf):
+            if row is not None:
+                if node.namespace == row_namespace:
+                    key = row.key(node.name)
+                    if key is not None:
+                        return _leaf(node, key.result)
+                cell = row.cell_at(oid)
+                return _leaf(node, cell.result if cell is not None else None)
+            scalar = data.scalar_at(oid)
+            return _leaf(node, scalar.result if scalar is not None else None)
+        elif isinstance(node, ys.DList):
+            table = data.table_at(oid)
+            if table is None:
+                return None
+            entries: list[gdata.Node] = []
+            for entry in table!.rows:
+                if not entry.keys_ok():
+                    raise ValueError("Invalid SNMP INDEX for {node.name}")
+                children: dict[gdata.Id, gdata.Node] = {}
+                for child in node.children:
+                    n = self._build(child, data, entry, node.namespace)
+                    if n is not None:
+                        children[_id(child)] = n
+                entries.append(gdata.Container(children, ns=node.namespace, module=node.module))
+            return gdata.List([_id(node.get(k)) for k in node.key], entries, ns=node.namespace, module=node.module)
+        elif isinstance(node, ys.DNodeInner):
+            if not (isinstance(node, ys.DRoot) or isinstance(node, ys.DContainer)):
+                return None
+            children: dict[gdata.Id, gdata.Node] = {}
+            for child in node.children:
+                n = self._build(child, data, row, row_namespace)
+                if n is not None:
+                    children[_id(child)] = n
+            if len(children) == 0 and not isinstance(node, ys.DRoot):
+                return None
+            if isinstance(node, ys.DRoot):
+                return gdata.Container(children)
+            return gdata.Container(children, ns=node.namespace, module=node.module)
+        return None
+
+    def to_tree(self, bindings: list[VarBind], filt: ?gdata.FNode=None) -> gdata.Node:
+        data = tables.assemble(self.index, bindings, tables.Options(convert=conv.Options(strict=True)))
+        if len(data.issues) > 0:
+            issue = data.issues[0]
+            raise ValueError("Invalid SNMP observation {issue.oid}: {issue.code}: {issue.reason}")
+        result = gdata.filter(self._build(self.root, data), filt)
+        return result if result is not None else gdata.Container()

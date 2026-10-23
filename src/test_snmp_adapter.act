@@ -1,0 +1,264 @@
+import testing
+import snmp.oid as oid
+import snmp.values as values
+import yang.gdata as gdata
+import yang.schema as schema
+
+import adapters.snmp as adapter
+import adapters.adapter as base
+import device
+import device_schema
+import snmp_mock
+import test_snmp_schema as fixture
+from device_meta_config import stratoweave_rfs__device_entry as DMC, \
+    stratoweave_rfs__device__credentials as Credentials
+
+POINT = [fixture.q("TEST-MIB"), fixture.q("sensor")]
+ROOT = gdata.FNode(fixture.q("TEST-MIB"), children=[gdata.FNode(fixture.q("sensor"))])
+
+
+def snmp_adapter(dev: device.DeviceMgr, bundled_schema, dmc, registry, log_handler, env):
+    """Make an SNMP adapter for the fixture schema that gives up on a request after 0.5 s."""
+    return adapter.SnmpAdapter(dev, bundled_schema, dmc, registry, log_handler, env,
+                               fixture.fixture_data().1, timeout=0.5, retries=0)
+
+
+def device_types() -> dict[str, device.DeviceType]:
+    return {"snmp": device.DeviceType("snmp", snmp_adapter, schema.DRoot(), fixture.fixture_data().0)}
+
+
+actor _Device(t: testing.AsyncT, ready: action(adapter.SnmpAdapter, snmp_mock.SnmpMockServer) -> None):
+    """Start a mocked SNMP device, seed the fixture bindings and call ready."""
+    registry = device.DeviceRegistry(device_types(), None, t.log_handler)
+    dev = registry.get_or_create("sensor")
+    dev.set_dmc(DMC("sensor", Credentials("", None), type="snmp"))
+    var attempts = 0
+
+    def start():
+        a = dev.get_adapter()
+        if isinstance(a, adapter.SnmpAdapter):
+            mock = a.get_mock_server()
+            if mock is not None:
+                await async mock.set_bindings(fixture.bindings())
+                ready(a, mock)
+                return
+        attempts += 1
+        if attempts > 100:
+            t.failure(AssertionError("SNMP adapter did not start"))
+            return
+        after 0.01: start()
+
+    after 0: start()
+
+
+def _selected() -> gdata.FNode:
+    return gdata.FNode(children=[gdata.FNode(fixture.q("TEST-MIB"), children=[
+        gdata.FNode(fixture.q("sensor"), children=[
+            gdata.FNode(fixture.q("index"), value_match=u64(7)),
+            gdata.FNode(fixture.q("reading")),
+        ])])])
+
+
+actor _test_snmp_poll_keeps_snapshot_on_error_and_recovers(t: testing.AsyncT):
+    var a: ?adapter.SnmpAdapter = None
+    var mock: ?snmp_mock.SnmpMockServer = None
+    var finished = False
+    var phase = 0
+    var deliveries = 0
+    var last: ?gdata.Node = None
+    var synced = 0
+
+    def finish(error: ?Exception=None):
+        if finished:
+            return
+        finished = True
+        if a is not None:
+            a.close()
+        if error is None:
+            t.success()
+        else:
+            t.failure(error!)
+
+    def on_synced(owner: str):
+        synced += 1
+
+    def stopped():
+        try:
+            testing.assertEqual(deliveries, 3)
+            testing.assertEqual(synced, 1)
+            finish()
+        except Exception as err:
+            finish(err)
+
+    def received(tree: ?gdata.Node, error: ?Exception):
+        if finished:
+            return
+        deliveries += 1
+        try:
+            if phase == 0:
+                if error is not None:
+                    raise error
+                testing.assertEqual(tree, fixture.fixture().to_tree(fixture.bindings(), _selected()))
+                last = tree
+                phase = 1
+                await async mock!.set_value(oid.Oid.parse(fixture.BASE + ".2.1.3.7"), values.OctetString(b"bad"))
+            elif phase == 1:
+                testing.assertTrue(error is not None)
+                testing.assertEqual(tree, last)
+                phase = 2
+                await async mock!.set_value(oid.Oid.parse(fixture.BASE + ".2.1.3.7"), values.Gauge32(99))
+            elif phase == 2:
+                if error is not None:
+                    raise error
+                rows = tree!.get_cnt(fixture.q("TEST-MIB")).get_list(fixture.q("sensor")).entries()
+                testing.assertEqual([(r.get_u64(fixture.q("index")), r.get_u64(fixture.q("reading"))) for r in rows],
+                                    [(u64(7), u64(99))])
+                phase = 3
+                a!.remove_subscriptions("watch")
+                after 0.08: stopped()
+            else:
+                raise AssertionError("Removed subscription delivered another snapshot")
+        except Exception as err:
+            finish(err)
+
+    def ready(value: adapter.SnmpAdapter, server: snmp_mock.SnmpMockServer):
+        a = value
+        mock = server
+        testing.assertEqual(value.subscription_method(), base.SUBSCRIPTION_POLL)
+        value.declare_subscriptions("watch", received, {gdata.SubscriptionSpec(_selected(), period=0.01)}, on_synced)
+
+    _Device(t, ready)
+    after 5: finish(AssertionError("SNMP polling test timed out"))
+
+
+actor _test_snmp_rejects_on_change_and_writes(t: testing.AsyncT):
+    var a: ?adapter.SnmpAdapter = None
+    var finished = False
+    var replies = 0
+
+    def finish(error: ?Exception=None):
+        if finished:
+            return
+        finished = True
+        if a is not None:
+            a.close()
+        if error is None:
+            t.success()
+        else:
+            t.failure(error!)
+
+    def result(tree: ?gdata.Node, error: ?Exception):
+        try:
+            testing.assertTrue(error is not None)
+            replies += 1
+            if replies == 2:
+                finish()
+        except Exception as err:
+            finish(err)
+
+    def ready(value: adapter.SnmpAdapter, mock: snmp_mock.SnmpMockServer):
+        a = value
+        value.declare_subscriptions("watch", result, {gdata.SubscriptionSpec(_selected())}, None)
+        value.configure(lambda err, tree: result(tree, err), gdata.Container(), gdata.Container(), None)
+
+    _Device(t, ready)
+    after 5: finish(AssertionError("SNMP rejection test timed out"))
+
+
+def _test_snmp_community_is_redacted():
+    dmc = DMC("sensor", Credentials("", "secret-community"), type="snmp")
+    testing.assertFalse("secret-community" in base.dmc_for_log(dmc))
+    testing.assertFalse('"password"' in base.dmc_for_log(dmc))
+
+
+actor _test_snmp_rooted_poll_reports_removed_rows(t: testing.AsyncT):
+    initial = [i.1 for i in gdata.instances(fixture.fixture().to_tree(fixture.bindings()), POINT)]
+    remaining = [vb for vb in fixture.bindings() if str(vb.oid) != fixture.BASE + ".2.1.3.8"]
+    retained = gdata.instances(fixture.fixture().to_tree(remaining), POINT)[0].1
+    removed = gdata.gone([n for n in initial if n != retained][0], POINT)
+    var a: ?adapter.SnmpAdapter = None
+    var server: ?snmp_mock.SnmpMockServer = None
+    var finished = False
+    var received_initial: list[gdata.Node] = []
+    var phase = 0
+
+    def finish(error: ?Exception=None):
+        if finished:
+            return
+        finished = True
+        if a is not None:
+            a.remove_subscriptions("rooted")
+            a.close()
+        if error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    def received(tree: ?gdata.Node, error: ?Exception):
+        if finished:
+            return
+        try:
+            if error is not None:
+                raise error
+            if phase == 0:
+                testing.assertNotNone(tree)
+                received_initial.append(tree!)
+                if len(received_initial) == 2:
+                    testing.assertEqual(sorted([n.prsrc(deterministic=True) for n in received_initial]),
+                                        sorted([n.prsrc(deterministic=True) for n in initial]))
+                    phase = 1
+                    # Remove one device row. The next complete poll must retain
+                    # the unchanged row and report the removed rooted instance.
+                    await async server!.set_bindings(remaining)
+            elif tree == removed:
+                finish()
+            else:
+                testing.assertEqual(tree, retained)
+        except Exception as err:
+            finish(err)
+
+    def ready(value: adapter.SnmpAdapter, mock: snmp_mock.SnmpMockServer):
+        a = value
+        server = mock
+        value.declare_subscriptions("rooted", received, {gdata.SubscriptionSpec(ROOT, period=0.01, root=ROOT)}, None)
+
+    _Device(t, ready)
+    after 5: finish(AssertionError("SNMP rooted removal test timed out"))
+
+
+actor _test_snmp_close_rejects_late_meta_config(t: testing.AsyncT):
+    root, metadata = fixture.fixture_data()
+    registry = device.DeviceRegistry({}, None, t.log_handler)
+    dev = registry.get_or_create("sensor")
+    bundled = device_schema.DeviceSchema("snmp", schema.DRoot(), root)
+    driver = adapter.SnmpDriver(dev, bundled, metadata, {}, 0.5, 0, t.log_handler, None)
+    dmc = DMC("sensor", Credentials("", None), type="snmp")
+    var finished = False
+
+    def finish(error: ?Exception=None):
+        if finished:
+            return
+        finished = True
+        driver.close()
+        if error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    def verify():
+        try:
+            testing.assertTrue(driver.get_mock_server() is None)
+            finish()
+        except Exception as err:
+            finish(err)
+
+    def start():
+        driver.set_dmc(dmc)
+        driver.close()
+        # A delayed configuration update from a replaced adapter must not open
+        # another mock transport after close has completed.
+        driver.set_dmc(dmc)
+        after 0.03: verify()
+
+    after 0: start()
+    after 5: finish(AssertionError("SNMP close test timed out"))
