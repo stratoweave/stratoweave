@@ -46,11 +46,17 @@
     <h1>Images</h1>
     <p>
       Software images by file name, with the OS each runs and the hardware
-      models it is for. Drop image files anywhere on this page to add them.
+      models it is for. Drop image files anywhere on this page to upload them.
     </p>
   </div>
   <div class="page-actions">
-    <FileDrop onfiles={(files) => void addImageFiles(files)} bind:dragging accept={IMAGE_FILE_TYPES} />
+    <!-- An upload checks its names against the list, so it needs the list. -->
+    <FileDrop
+      onfiles={(files) => void addImageFiles(files)}
+      bind:dragging
+      disabled={!!data.loadError}
+      accept={IMAGE_FILE_TYPES}
+    />
     <a class="btn btn-primary" href="/images/new">Add image</a>
   </div>
 </div>

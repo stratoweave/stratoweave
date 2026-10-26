@@ -1,9 +1,11 @@
 <script lang="ts">
-  // An Upload images button for the file chooser, and the whole window as a
-  // drop target for files. Only the File objects are passed on; nothing here
-  // reads their contents.
+  // A button for the file chooser, and the whole window as a drop target for
+  // files. Only the File objects are passed on; nothing here reads their
+  // contents.
   interface Props {
     onfiles: (files: File[]) => void;
+    /** The button's text. */
+    label?: string;
     /** True while files that would be taken are dragged over the window. */
     dragging?: boolean;
     disabled?: boolean;
@@ -12,7 +14,7 @@
     accept?: string;
   }
 
-  let { onfiles, dragging = $bindable(false), disabled = false, accept }: Props = $props();
+  let { onfiles, label = 'Upload images', dragging = $bindable(false), disabled = false, accept }: Props = $props();
 
   let button: HTMLButtonElement | null = $state(null);
   let input: HTMLInputElement | null = $state(null);
@@ -84,7 +86,7 @@
 />
 
 <button bind:this={button} class="btn btn-secondary" type="button" {disabled} onclick={() => input?.click()}>
-  Upload images
+  {label}
 </button>
 <input
   bind:this={input}
