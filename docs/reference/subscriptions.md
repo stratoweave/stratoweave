@@ -38,8 +38,7 @@ Repeated identical files are deduplicated. When several revisions are
 available, select `--module name@YYYY-MM-DD`, or let an import/include's
 `revision-date` select the revision. Ambiguous sources, conflicting
 revision requests, missing modules, and unreadable or malformed files
-are errors. Loading errors stop the command before it connects. Parsed
-YANG sources are cached under `~/.cache/ayang`.
+are errors. Loading errors stop the command before it connects.
 
 ## Declaring Subscriptions
 
