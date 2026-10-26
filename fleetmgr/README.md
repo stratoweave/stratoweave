@@ -59,7 +59,8 @@ runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
 campaign over the 99 devices `upgrade.xml` does not use, bound to a
 `nightly` schedule with a one-hour window at midnight UTC, so the web UI
 has a plan to show; it does nothing until set to `run`, and then waits
-for the window. The processes use these ports:
+for the window. `demo-images.xml` fills the image list with test IOS XE
+images; `just demo-fleet` loads it too. The processes use these ports:
 
     process          HTTP          NETCONF
     fleetmgr         18200         12900
