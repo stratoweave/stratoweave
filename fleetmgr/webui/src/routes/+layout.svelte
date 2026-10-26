@@ -22,13 +22,16 @@
     '/devices': 'Devices',
     '/campaigns': 'Campaigns',
     '/campaigns/new': 'New campaign',
+    '/images': 'Images',
+    '/images/new': 'Add image',
     '/schedules': 'Schedules',
     '/schedules/new': 'New schedule'
   };
   // Detail pages sit under their list: /campaigns/<name>, /devices/<name>,
-  // /schedules/<name>.
+  // /images/<name>, /schedules/<name>.
   const PARENTS: Record<string, string> = {
     '/campaigns/': 'Campaigns',
+    '/images/': 'Images',
     '/devices/': 'Devices',
     '/schedules/': 'Schedules'
   };
@@ -75,6 +78,14 @@
         >
           <span class="nav-icon"><NavIcon name="campaigns" /></span>
           Campaigns
+        </a>
+        <a
+          class="nav-item"
+          class:active={currentPathname.startsWith('/images')}
+          href="/images"
+        >
+          <span class="nav-icon"><NavIcon name="images" /></span>
+          Images
         </a>
       </div>
       <div class="nav-section">
