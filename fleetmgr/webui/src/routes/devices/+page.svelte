@@ -626,15 +626,6 @@
 />
 
 <style>
-  .success-banner {
-    padding: 10px 14px;
-    border-radius: var(--sw-radius-md);
-    border: 1px solid rgb(var(--sw-accent-rgb) / 0.35);
-    background: var(--sw-accent-glow);
-    color: var(--sw-text-primary);
-    font-size: 13px;
-  }
-
   .filter-row {
     display: flex;
     align-items: center;

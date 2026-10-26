@@ -1,8 +1,21 @@
 <script lang="ts">
+  import { onMount, tick } from 'svelte';
+  import { invalidate } from '$app/navigation';
+
+  import { errorText } from '$lib/core/errors';
+  import { takeNotice } from '$lib/core/notice';
+  import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import FileDrop from '$lib/core/ui/FileDrop.svelte';
   import Pager, { paginate } from '$lib/core/ui/Pager.svelte';
+  import { deleteImage } from '$lib/software/delete-image';
   import { addImageFiles } from '$lib/software/image-files';
-  import { IMAGE_FILE_TYPES, matchesFilter, sortImages, type SortKey } from '$lib/software/images';
+  import {
+    IMAGE_FILE_TYPES,
+    matchesFilter,
+    sortImages,
+    type CatalogImage,
+    type SortKey
+  } from '$lib/software/images';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -20,6 +33,15 @@
   let text = $state('');
   let pageNo = $state(1);
   let dragging = $state(false);
+  let deleteTarget = $state<CatalogImage | null>(null);
+  let deleting = $state(false);
+  let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
+  let table: HTMLTableElement | null = $state(null);
+  let filter: HTMLInputElement | null = $state(null);
+  let drop: ReturnType<typeof FileDrop> | undefined = $state();
+  // What the add or edit page that sent us here did. Taken now, shown once
+  // the status region is in place, so that a screen reader reads it.
+  const notice = takeNotice();
 
   let rows = $derived(sortImages(data.images.filter((i) => matchesFilter(i, text)), sortKey, ascending));
   let paged = $derived(paginate(rows, pageNo, 50));
@@ -35,9 +57,41 @@
     pageNo = 1;
   }
 
+  onMount(() => {
+    if (notice) statusMessage = { type: 'success', text: notice };
+  });
+
   function ariaSort(key: SortKey): 'ascending' | 'descending' | 'none' {
     if (key !== sortKey) return 'none';
     return ascending ? 'ascending' : 'descending';
+  }
+
+  async function handleDelete(): Promise<void> {
+    const target = deleteTarget;
+    if (!target) return;
+    const index = paged.rows.findIndex((i) => i.name === target.name);
+    try {
+      deleting = true;
+      statusMessage = null;
+      await deleteImage(target.name);
+      statusMessage = { type: 'success', text: `Deleted image ${target.name}.` };
+    } catch (deleteError) {
+      statusMessage = { type: 'error', text: errorText(deleteError, 'Failed to delete the image.') };
+    } finally {
+      deleting = false;
+      deleteTarget = null;
+    }
+    // Also after an error: the entry can be gone while its file is not.
+    await invalidate('data:images');
+    await tick();
+    // The dialog gave focus back to the row's Delete; when that went with
+    // its row, focus goes to the row that took its place.
+    if (document.activeElement && document.activeElement !== document.body) return;
+    const names = table?.querySelectorAll<HTMLAnchorElement>('a.name') ?? [];
+    const next = names[Math.min(index, names.length - 1)];
+    if (next) next.focus();
+    else if (filter) filter.focus();
+    else drop?.focus();
   }
 </script>
 
@@ -52,6 +106,7 @@
   <div class="page-actions">
     <!-- An upload checks its names against the list, so it needs the list. -->
     <FileDrop
+      bind:this={drop}
       onfiles={(files) => void addImageFiles(files)}
       bind:dragging
       disabled={!!data.loadError}
@@ -59,6 +114,15 @@
     />
     <a class="btn btn-primary" href="/images/new">Add image</a>
   </div>
+</div>
+
+<!-- In place before any message, so that a screen reader reads each one. -->
+<div role="status">
+  {#if statusMessage}
+    <div class={statusMessage.type === 'error' ? 'error-state status' : 'success-banner status'}>
+      {statusMessage.text}
+    </div>
+  {/if}
 </div>
 
 {#if data.loadError}
@@ -73,6 +137,7 @@
     {:else}
       <div class="filters">
         <input
+          bind:this={filter}
           class="input compact"
           placeholder="Filter"
           aria-label="Filter"
@@ -83,7 +148,7 @@
       </div>
 
       <div class="table-wrap">
-        <table class="images">
+        <table bind:this={table} class="images">
           <thead>
             <tr>
               {#each COLUMNS as c (c.key)}
@@ -114,6 +179,7 @@
                   </button>
                 </th>
               {/each}
+              <th class="col-action"><span class="sr-only">Actions</span></th>
             </tr>
           </thead>
           <tbody>
@@ -129,9 +195,20 @@
                   </span>
                 </td>
                 <td class="version-cell mono nowrap">{image.version}</td>
+                <td class="col-action action-cell">
+                  <button
+                    class="btn btn-ghost btn-sm row-remove on-row"
+                    type="button"
+                    aria-label={`Delete ${image.name}`}
+                    disabled={deleting}
+                    onclick={() => (deleteTarget = image)}
+                  >
+                    Delete
+                  </button>
+                </td>
               </tr>
             {:else}
-              <tr class="empty-row"><td colspan="4" class="dim">No images match.</td></tr>
+              <tr class="empty-row"><td colspan="5" class="dim">No images match.</td></tr>
             {/each}
           </tbody>
         </table>
@@ -140,6 +217,16 @@
     {/if}
   </section>
 {/if}
+
+<ConfirmDialog
+  open={deleteTarget !== null}
+  title="Delete image"
+  message={`Delete ${deleteTarget?.name ?? ''} and its file?`}
+  confirmLabel={deleting ? 'Deleting…' : 'Delete'}
+  confirmClass="btn-danger"
+  oncancel={() => (deleteTarget = null)}
+  onconfirm={handleDelete}
+/>
 
 <style>
   .filters {
@@ -176,6 +263,11 @@
 
   .col-version {
     width: 12%;
+  }
+
+  .col-action {
+    width: 96px;
+    text-align: right;
   }
 
   .sort {
@@ -283,6 +375,7 @@
     }
 
     .images tbody tr {
+      position: relative;
       display: grid;
       grid-template-columns: auto minmax(0, 1fr);
       grid-template-areas:
@@ -303,8 +396,17 @@
       border: none;
     }
 
-    .name-cell {
+    /* Clear of Delete, which sits at the top right. */
+    .images .name-cell {
       grid-area: name;
+      padding-right: 80px;
+    }
+
+    .action-cell {
+      position: absolute;
+      top: 8px;
+      right: 0;
+      width: auto;
     }
 
     .version-cell {

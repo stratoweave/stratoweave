@@ -119,11 +119,12 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   datastore root, which merges into an image of the same name rather than
   fail, so the add reads the image names again first and refuses one that
   exists; saving one PUTs the whole entry, so a model removed in the form
-  disappears (DELETE on a leaf returns 500); deleting one DELETEs the
-  entry. The form requires `os`, `version` and a model, though the YANG
-  does not. A model is added by Enter or by picking a suggestion; other
-  text left in the model field blocks the save, so a half-typed model is
-  neither lost nor saved.
+  disappears (DELETE on a leaf returns 500); deleting one, from its row in
+  the list or on its page, DELETEs the entry and then its file at
+  `/image-file/{name}`, where a 404 counts as removed. The form requires
+  `os`, `version` and a model, though the YANG does not. A model is added
+  by Enter or by picking a suggestion; other text left in the model field
+  blocks the save, so a half-typed model is neither lost nor saved.
 - Image files dropped on the image pages, or picked with Upload images,
   open a table with one row per file. An IOS XE name
   (`<family>.<version>.SPA.bin`) fills OS and version, in the table and in

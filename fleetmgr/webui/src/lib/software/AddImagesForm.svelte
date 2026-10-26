@@ -4,6 +4,7 @@
 
   import { errorText } from '$lib/core/errors';
   import { imageFileError, imageFilesOn, uploadImageFile } from '$lib/core/image-file';
+  import { leaveNotice } from '$lib/core/notice';
   import { pageLabel } from '$lib/core/page-label.svelte';
   import { restconfGetOrNull, restconfPatchJson } from '$lib/core/restconf/client';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
@@ -65,6 +66,8 @@
   let card: HTMLElement | null = $state(null);
   let drop: ReturnType<typeof FileDrop> | undefined = $state();
   let running: AbortController | null = null;
+  // Names uploaded and added, over every press of Upload.
+  const added: string[] = [];
   // Where the operator asked to go while an upload runs.
   let leaveTo = $state<URL | null>(null);
   let leaving = false;
@@ -199,8 +202,9 @@
         };
         await uploadImageFile(row.name, row.file, onSent, controller.signal);
         row.upload = { state: 'adding' };
-        const added = { name: row.name, os: row.os.trim(), version: row.version.trim(), models: row.models };
-        await restconfPatchJson(DATA_ROOT, imageCreatePatch([added]));
+        const image = { name: row.name, os: row.os.trim(), version: row.version.trim(), models: row.models };
+        await restconfPatchJson(DATA_ROOT, imageCreatePatch([image]));
+        added.push(row.name);
         rows.splice(
           rows.findIndex((r) => r.name === row.name),
           1
@@ -213,6 +217,7 @@
     running = null;
     saving = false;
     if (rows.length === 0) {
+      leaveNotice(added.length === 1 ? `Uploaded image ${added[0]}.` : `Uploaded ${added.length} images.`);
       // Not a preload made before the write (hovering Cancel makes one).
       await goto('/images', { invalidateAll: true });
     } else {

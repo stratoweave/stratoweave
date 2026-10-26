@@ -3,9 +3,9 @@
   import { goto } from '$app/navigation';
 
   import { errorText } from '$lib/core/errors';
+  import { leaveNotice } from '$lib/core/notice';
   import {
     getListEntryPath,
-    restconfDelete,
     restconfGetOrNull,
     restconfPatchJson,
     restconfPutJson,
@@ -16,6 +16,7 @@
   import FileDrop from '$lib/core/ui/FileDrop.svelte';
   import { focusFirstError } from '$lib/core/ui/focus';
   import TokenSelect from '$lib/core/ui/TokenSelect.svelte';
+  import { deleteImage } from '$lib/software/delete-image';
   import {
     IMAGE_FILE_TYPES,
     OS_NAMES,
@@ -140,6 +141,7 @@
           wrapListEntryBody(IMAGE_LIST_ROOT, imageToJson(saved))
         );
       }
+      leaveNotice(stored === null ? `Added image ${saved.name}.` : `Saved image ${saved.name}.`);
       // Not a preload made before the write (hovering Cancel makes one).
       await goto('/images', { invalidateAll: true });
     } catch (saveError) {
@@ -155,7 +157,8 @@
     try {
       deleting = true;
       statusMessage = '';
-      await restconfDelete(getListEntryPath(IMAGE_LIST_ROOT, stored));
+      await deleteImage(stored);
+      leaveNotice(`Deleted image ${stored}.`);
       await goto('/images', { invalidateAll: true });
     } catch (deleteError) {
       statusMessage = errorText(deleteError, 'Failed to delete the image.');
@@ -271,7 +274,7 @@
 <ConfirmDialog
   open={confirmDelete}
   title="Delete image"
-  message={`Delete ${stored}?`}
+  message={`Delete ${stored} and its file?`}
   confirmLabel="Delete"
   confirmClass="btn-danger"
   oncancel={() => (confirmDelete = false)}
