@@ -1,0 +1,100 @@
+import file
+import http
+import http_router
+import json
+import logging
+import testing
+
+import image_dir as swimg
+import image_file_api as swimgapi
+
+
+def _files(method: str, reply: dict[str, ?value]) -> list[(str, int)]:
+    """The name and size of each file in a reply: the saved file for a PUT,
+    the folder for a GET. Each file must have a modified time."""
+    entries: list[?value] = [reply]
+    if method == "GET":
+        listed = reply["files"]
+        if isinstance(listed, list):
+            entries = listed
+    files = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            name = entry.get("name")
+            size = entry.get("size")
+            modified = entry.get("modified")
+            if isinstance(name, str) and isinstance(size, int) and isinstance(modified, float) and modified > 0.0:
+                files.append((name, size))
+                continue
+        raise ValueError("Not a file: {entry}")
+    return files
+
+
+actor _test_image_file_requests(t: testing.EnvT):
+    """Each request, in order, gets its status and reply."""
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    directory = fs.mktmpdir("test_image_file_api_")
+    router = http_router.Router()
+    swimgapi.install(router, swimgapi.ImageFileApi(swimg.ImageDir(fc, directory), logging.Logger(t.log_handler)))
+    # files: the name and size of each file a 200 reply lists. error: a part
+    # of the error in other replies.
+    steps: list[(method: str, path: str, body: bytes, status: int, files: list[(str, int)], error: str)] = [
+        (method="PUT", path="/image-file/.x", body=b"ab", status=400, files=[], error="Invalid image file name"),
+        (method="PUT", path="/image-file/a.bin", body=b"", status=400, files=[], error="no body"),
+        (method="PUT", path="/image-file/a.bin", body=b"\x00\xff\r\n", status=200, files=[("a.bin", 4)], error=""),
+        (method="GET", path="/image-file", body=b"", status=200, files=[("a.bin", 4)], error=""),
+        (method="DELETE", path="/image-file/a.bin", body=b"", status=204, files=[], error=""),
+        (method="DELETE", path="/image-file/a.bin", body=b"", status=404, files=[], error="No image file named a.bin"),
+    ]
+    var current = 0
+
+    def _done(error: ?Exception):
+        await async fs.rmtree(directory)
+        await async fs.rmdir(directory)
+        if error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    def _send():
+        step = steps[current]
+        router.serve(http.Request(step.method, step.path, b"1.1", {}, step.body), _on_response)
+
+    # Runs in the ImageFileApi actor's turn: check and send the next request.
+    def _on_response(status: int, headers: dict[str, str], body: str):
+        step = steps[current]
+        try:
+            testing.assertEqual(status, step.status)
+            if status == 200:
+                testing.assertEqual(_files(step.method, json.decode(body)), step.files)
+            elif status != 204:
+                testing.assertIn(step.error, str(json.decode(body)["error"]))
+        except Exception as e:
+            _done(ValueError("{step.method} {step.path} returned {status}: {body}: {e}"))
+            return
+        current += 1
+        if current < len(steps):
+            _send()
+        else:
+            _done(None)
+
+    _send()
+
+
+actor _test_image_file_unreadable_folder(t: testing.EnvT):
+    """A folder that cannot be read is a server error."""
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    directory = fs.mktmpdir("test_image_file_api_missing_")
+    router = http_router.Router()
+    swimgapi.install(router, swimgapi.ImageFileApi(swimg.ImageDir(fc, directory + "/missing"), logging.Logger(t.log_handler)))
+
+    def _on_response(status: int, headers: dict[str, str], body: str):
+        await async fs.rmdir(directory)
+        if status == 500 and "Cannot read image folder" in body:
+            t.success()
+        else:
+            t.failure(ValueError("GET /image-file returned {status}: {body}"))
+
+    router.serve(http.Request("GET", "/image-file", b"1.1", {}, b""), _on_response)
