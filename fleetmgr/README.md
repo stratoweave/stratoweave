@@ -140,7 +140,9 @@ Set `FLEETMGR_API` to point these targets at a top node on another address.
 ## Web UI
 
 `webui/` is a SvelteKit UI for the same northbound: fleet inventory,
-maintenance schedules and upgrade campaigns over RESTCONF. The schedules
+maintenance schedules, software images and upgrade campaigns over RESTCONF.
+The images page sorts and filters the image list and adds, edits and
+deletes images. The schedules
 page shows a week of every schedule's windows on a calendar and edits the
 schedules themselves: the local time zone, and rules of an opening time, a
 duration and weekdays, typed or dragged on the calendar. The devices page
@@ -190,6 +192,11 @@ The generic `software` model remains separate from inventory. Each campaign
 device list entry links its name to the referenced `/fleet/device` entry,
 resolving each member's shard before merging all software intent into the same
 device entry that the inventory transform writes.
+
+`/images` is the StratoWeave image list (`swyang.images`): software images
+by file name, each with its `os`, `version` and the hardware `model`s it is
+for. Nothing reads it yet. Like `/schedules`, the container is a transform
+that produces no configuration, so campaigns can link the whole list later.
 
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription to the device's
