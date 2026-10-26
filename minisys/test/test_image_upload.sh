@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Checks what the unit tests can't: a file sent through the real HTTP server
-# of a running mini lands intact in its --software.image-dir folder.
+# Checks what the unit tests can't, against a running mini: a file sent
+# through the real HTTP server lands intact in its --software.image-dir
+# folder, and /images keeps the entry added for it.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ACTON_BIN="${ACTON:-acton}"
@@ -60,6 +61,17 @@ upload() {
     BODY="$(cat "$WORK_DIR/reply")"
 }
 
+# Send a RESTCONF request under /restconf/data, the way the web UI does
+restconf() {
+    local method="$1" path="$2" data="${3:-}"
+    local args=(-sS --connect-timeout 1 --max-time 10 -o "$WORK_DIR/reply" -w '%{http_code}' -X "$method" -H 'Accept: application/yang-data+json')
+    if [[ -n "$data" ]]; then
+        args+=(-H 'Content-Type: application/yang-data+json' --data-binary "$data")
+    fi
+    STATUS="$("$CURL_BIN" "${args[@]}" "http://127.0.0.1:${PORT}/restconf/data${path}")"
+    BODY="$(cat "$WORK_DIR/reply")"
+}
+
 expect() {
     [[ "$STATUS" == "$1" && "$BODY" == *"$2"* ]] || fail "expected $1 with '$2', got $STATUS: $BODY"
 }
@@ -81,5 +93,16 @@ start_mini
 upload "/image-file/$NAME" "$WORK_DIR/source.bin"
 expect 200 ""
 cmp "$WORK_DIR/source.bin" "$IMAGE_DIR/$NAME" || fail "the uploaded file differs from the source"
+
+# The web UI then adds the file's image list entry
+ENTRY="{\"name\":\"$NAME\",\"os\":\"IOS XE\",\"version\":\"17.18.03a\",\"model\":[\"C8000V\"]}"
+restconf PATCH "" "{\"stratoweave-images:images\":{\"image\":[$ENTRY]}}"
+expect 204 ""
+restconf GET "/stratoweave-images:images"
+expect 200 "$ENTRY"
+restconf DELETE "/stratoweave-images:images/image=$NAME"
+expect 204 ""
+restconf GET "/stratoweave-images:images"
+[[ "$BODY" != *"$NAME"* ]] || fail "the image list entry is still there after DELETE: $BODY"
 
 echo "Image upload test passed on port ${PORT}"
