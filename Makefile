@@ -63,11 +63,13 @@ check-dep-consistency:
 test-mini: check-mini-is-up-to-date
 	cd minisys && acton test
 	bash minisys/test/test_persistence_restart.sh
+	bash minisys/test/test_image_upload.sh
 
 .PHONY: test-mini-ldep
 test-mini-ldep: check-mini-is-up-to-date
 	cd minisys && acton test --dep yang=../../acton-yang --dep http_router=../../http-router --dep actmf=../../actmf
 	ACTON_BUILD_ARGS="--dep yang=../acton-yang --dep http_router=../http-router --dep actmf=../actmf" bash minisys/test/test_persistence_restart.sh
+	ACTON_BUILD_ARGS="--dep yang=../acton-yang --dep http_router=../http-router --dep actmf=../actmf" bash minisys/test/test_image_upload.sh
 
 .PHONY: check-mini-is-up-to-date
 check-mini-is-up-to-date:

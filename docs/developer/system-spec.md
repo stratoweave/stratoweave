@@ -66,6 +66,10 @@ modules that are shipped with StratoWeave:
 * `swyang.ssh` provides reusable SSH client types and the `ssh-client-config`
  grouping used by the RFS device model and application inventory models.
 * `swyang.ietf_yang_types` supplies the date and time types used by RFS.
+* `swyang.images` adds the image list, `/images`: software images by file
+ name, with OS, version and hardware models. Add it to the top layer. The
+ files themselves go into the image folder (`--software.image-dir`) over
+ `/image-file`.
 * `tmf.yang.ietf_yang_tmf_map` includes the TMF mapping schema, which is used
  to annotate YANG with TMF Service/Resource mapping instructions.
 * `tmf.yang.swtmf` and `tmf.yang.swtmf640` include the TMF640 store transform
