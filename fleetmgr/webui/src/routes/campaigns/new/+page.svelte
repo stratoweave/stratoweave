@@ -10,8 +10,8 @@
   import { restconfPatchJson } from '$lib/core/restconf/client';
   import {
     DATA_ROOT,
-    DEFAULT_MAX_RATE,
-    DEFAULT_TARGET_RATE,
+    DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_TARGET_CONCURRENCY,
     campaignCreatePatch,
     validateNewCampaign
   } from '$lib/software/model';
@@ -63,8 +63,8 @@
           allowStaging,
           defaultSchedule: p.defaultSchedule || undefined,
           deadline: p.deadline,
-          targetRate: p.targetRate === DEFAULT_TARGET_RATE ? null : p.targetRate,
-          maxRate: p.maxRate === DEFAULT_MAX_RATE ? null : p.maxRate
+          targetConcurrency: p.targetConcurrency === DEFAULT_TARGET_CONCURRENCY ? null : p.targetConcurrency,
+          maxConcurrency: p.maxConcurrency === DEFAULT_MAX_CONCURRENCY ? null : p.maxConcurrency
         })
       );
       await goto(`/campaigns/${encodeURIComponent(campaign)}`, { invalidateAll: true });

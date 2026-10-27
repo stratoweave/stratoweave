@@ -115,8 +115,8 @@ export interface CampaignJson {
   'admin-state'?: AdminState;
   'default-schedule'?: string;
   deadline?: number;
-  'target-rate'?: number;
-  'max-rate'?: number;
+  'target-concurrency'?: number;
+  'max-concurrency'?: number;
   state?: CampaignStateJson;
 }
 
@@ -265,8 +265,8 @@ export interface CampaignCounters {
 }
 
 /** YANG defaults; a GET omits leaves left at their default. */
-export const DEFAULT_TARGET_RATE = 100;
-export const DEFAULT_MAX_RATE = 500;
+export const DEFAULT_TARGET_CONCURRENCY = 10;
+export const DEFAULT_MAX_CONCURRENCY = 50;
 
 export interface MaintenanceWindow {
   /** Local time of day the window opens, seconds after midnight. */
@@ -349,9 +349,9 @@ export interface Campaign {
   defaultSchedule: string;
   /** Seconds since the Unix epoch; null when the campaign has none. */
   deadline: number | null;
-  /** Devices per hour; 0 means no preference / no cap. */
-  targetRate: number;
-  maxRate: number;
+  /** Devices upgrading at the same time. */
+  targetConcurrency: number;
+  maxConcurrency: number;
   counters: CampaignCounters | null;
   plan: CampaignPlan | null;
   deviceStatus: DeviceStatusRow[];
@@ -501,8 +501,8 @@ function parseCampaignConfig(entry: CampaignJson): CampaignConfig {
     adminState: entry['admin-state'] === 'run' ? 'run' : 'plan',
     defaultSchedule: entry['default-schedule'] ?? '',
     deadline: typeof entry.deadline === 'number' ? entry.deadline : null,
-    targetRate: entry['target-rate'] ?? DEFAULT_TARGET_RATE,
-    maxRate: entry['max-rate'] ?? DEFAULT_MAX_RATE
+    targetConcurrency: entry['target-concurrency'] ?? DEFAULT_TARGET_CONCURRENCY,
+    maxConcurrency: entry['max-concurrency'] ?? DEFAULT_MAX_CONCURRENCY
   };
 }
 
@@ -586,9 +586,9 @@ export interface NewCampaign {
   defaultSchedule?: string;
   /** Seconds since the Unix epoch. */
   deadline?: number | null;
-  /** Devices per hour; null leaves the model default. */
-  targetRate?: number | null;
-  maxRate?: number | null;
+  /** Devices upgrading at the same time; null leaves the model default. */
+  targetConcurrency?: number | null;
+  maxConcurrency?: number | null;
 }
 
 export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
@@ -607,8 +607,8 @@ export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
   if (input.allowStaging) entry['allow-staging'] = true;
   if (input.defaultSchedule) entry['default-schedule'] = input.defaultSchedule;
   if (input.deadline != null) entry.deadline = input.deadline;
-  if (input.targetRate != null) entry['target-rate'] = input.targetRate;
-  if (input.maxRate != null) entry['max-rate'] = input.maxRate;
+  if (input.targetConcurrency != null) entry['target-concurrency'] = input.targetConcurrency;
+  if (input.maxConcurrency != null) entry['max-concurrency'] = input.maxConcurrency;
   return patch;
 }
 
