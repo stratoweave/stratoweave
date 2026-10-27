@@ -65,14 +65,14 @@ over the flotillas by name hash, with quick eight-second installs, three
 regional schedules, europe, americas and asia, whose one-hour windows open
 half a minute, a minute and a half and two and a half minutes after the top
 starts, and `fleet-upgrade`, a planned campaign over all of them. The
-positional knobs are the device count, the target and maximum rate in
-devices per hour, the failing share in percent, the install duration in
-seconds or a range, the window length in seconds, and which schedules open
-soon rather than at their local midnight. `just demo-big` is `just
-demo-fleet 1000 250 500 10 120-150 14400 europe`: a thousand devices with
-`demo.xml`'s knobs, 120 to 150 s installs and a tenth failing one of the
-seven ways, picked by a fixed shuffle so the grids show no pattern, in
-four-hour windows at a quarter of the fleet per hour, where only europe
+positional knobs are the device count, the target and maximum number of
+devices upgrading at once, the failing share in percent, the install
+duration in seconds or a range, the window length in seconds, and which
+schedules open soon rather than at their local midnight. `just demo-big`
+is `just demo-fleet 1000 10 20 10 120-150 14400 europe`: a thousand
+devices with `demo.xml`'s knobs, 120 to 150 s installs and a tenth failing
+one of the seven ways, picked by a fixed shuffle so the grids show no
+pattern, in four-hour windows with ten devices at once, where only europe
 opens right away and americas and asia wait for their midnight, as a real
 fleet's windows would. The files land in `out/`; a thousand devices come up
 in about half a minute and take about a gigabyte of memory. `just
@@ -146,11 +146,11 @@ campaign page draws the plan as a timeline: each window is a band as wide
 as its duration, with one cell per device at its start on the wall
 clock, the real one once the controller has released the device; a marker
 shows now, and once the campaign runs the cells take the devices' live
-status; the same page changes the campaign's default
-schedule and its pace, set by a deadline or a target rate, plus the max
-rate. The top serves the UI itself: the static build is embedded in the
-`fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so with `just demo`
-running the UI is at http://127.0.0.1:18200/. After a UI change,
+status; the same page changes the campaign's default schedule and its
+pace, set by a deadline or by how many devices upgrade at once, plus the
+most at once. The top serves the UI itself: the static build is embedded
+in the `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so with
+`just demo` running the UI is at http://127.0.0.1:18200/. After a UI change,
 `just gen-webui` rebuilds the UI and regenerates that module (needs Node),
 then `just build` picks it up. For UI work,
 
