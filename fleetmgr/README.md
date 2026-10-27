@@ -59,7 +59,9 @@ runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
 campaign over the 99 devices `upgrade.xml` does not use, bound to a
 `nightly` schedule with a one-hour window at midnight UTC, so the web UI
 has a plan to show; it does nothing until set to `run`, and then waits
-for the window. The processes use these ports:
+for the window. `demo-images.xml` fills the image list with test IOS XE
+images; `just demo-fleet` loads it too. Both demos keep image files
+uploaded in the web UI in `out/images`. The processes use these ports:
 
     process          HTTP          NETCONF
     fleetmgr         18200         12900
@@ -140,7 +142,10 @@ Set `FLEETMGR_API` to point these targets at a top node on another address.
 ## Web UI
 
 `webui/` is a SvelteKit UI for the same northbound: fleet inventory,
-maintenance schedules and upgrade campaigns over RESTCONF. The schedules
+maintenance schedules, software images and upgrade campaigns over RESTCONF.
+The images page sorts and filters the image list, uploads dropped image
+files and adds their entries, adds entries by hand, and edits and deletes
+them. The schedules
 page shows a week of every schedule's windows on a calendar and edits the
 schedules themselves: the local time zone, and rules of an opening time, a
 duration and weekdays, typed or dragged on the calendar. The devices page
@@ -190,6 +195,13 @@ The generic `software` model remains separate from inventory. Each campaign
 device list entry links its name to the referenced `/fleet/device` entry,
 resolving each member's shard before merging all software intent into the same
 device entry that the inventory transform writes.
+
+`/images` is the StratoWeave image list (`swyang.images`): software images
+by file name, each with its `os`, `version` and the hardware `model`s it is
+for. The web UI uploads the image files into the top's image folder,
+`--software.image-dir`, and adds their entries; nothing else reads the list
+yet. Like `/schedules`, the container is a transform that produces no
+configuration, so campaigns can link the whole list later.
 
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription to the device's

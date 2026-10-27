@@ -1,4 +1,5 @@
 import type { ValidationResult } from '$lib/core/validation/types';
+import type { CatalogImage } from '$lib/software/images';
 
 // RESTCONF paths. Writes always PATCH the datastore root: the backend
 // rejects a PATCH whose target resource does not exist yet (RFC 8040),
@@ -10,6 +11,8 @@ export const SOFTWARE_CONFIG = `${SOFTWARE_ROOT}?content=config`;
 export const SCHEDULES_ROOT = 'data/maintenance:schedules';
 export const SCHEDULE_LIST_ROOT = 'data/maintenance:schedules/schedule';
 export const CAMPAIGN_LIST_ROOT = 'data/software:software/upgrade-campaign';
+export const IMAGES_ROOT = 'data/stratoweave-images:images';
+export const IMAGE_LIST_ROOT = `${IMAGES_ROOT}/image`;
 export const FLEET_ROOT = 'data/fleetmgr:fleet';
 export const FLEET_DEVICE_LIST_ROOT = 'data/fleetmgr:fleet/device';
 
@@ -123,6 +126,14 @@ export interface CampaignJson {
   state?: CampaignStateJson;
 }
 
+/** /stratoweave-images:images/image entry. */
+export interface ImageJson {
+  name: string;
+  os?: string;
+  version?: string;
+  model?: string[];
+}
+
 /** GET data merges every module; this UI reads three of them. */
 interface DataTreeJson {
   'fleetmgr:fleet'?: {
@@ -142,11 +153,22 @@ interface CampaignEntryJson {
   'software:upgrade-campaign'?: CampaignJson[];
 }
 
+/** GET data/stratoweave-images:images */
+interface ImagesJson {
+  'stratoweave-images:images'?: {
+    image?: ImageJson[];
+  };
+}
+
 export interface FleetPatchJson {
   'fleetmgr:fleet': {
     node?: NodeJson[];
     device?: DeviceJson[];
   };
+}
+
+interface ImagesPatchJson {
+  'stratoweave-images:images': { image: ImageJson[] };
 }
 
 interface SoftwarePatchJson {
@@ -543,6 +565,21 @@ export function parseDeviceEntry(json: unknown): Device | null {
   return entries && entries.length > 0 ? parseDevice(entries[0]) : null;
 }
 
+function parseImage(entry: ImageJson): CatalogImage {
+  return { name: entry.name, os: entry.os ?? '', models: entry.model ?? [], version: entry.version ?? '' };
+}
+
+/** Parse a GET of data/stratoweave-images:images. */
+export function parseImages(json: unknown): CatalogImage[] {
+  return ((json as ImagesJson)?.['stratoweave-images:images']?.image ?? []).map(parseImage);
+}
+
+/** Parse a GET of data/stratoweave-images:images/image={name}. */
+export function parseImageEntry(json: unknown): CatalogImage | null {
+  const entries = (json as { 'stratoweave-images:image'?: ImageJson[] })?.['stratoweave-images:image'];
+  return entries && entries.length > 0 ? parseImage(entries[0]) : null;
+}
+
 /** Parse a GET of one campaign entry: its config, and its state when the
  * GET asked for it and the campaign has published one. */
 export function parseCampaignEntry(json: unknown): { config: CampaignConfig; state: StateParts | null } | null {
@@ -592,6 +629,15 @@ export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
  * leaves the rest of the campaign intact. */
 export function adminStatePatch(name: string, state: AdminState): SoftwarePatchJson {
   return { 'software:software': { 'upgrade-campaign': [{ name, 'admin-state': state }] } };
+}
+
+/** Every leaf, since a PUT replaces the whole entry. */
+export function imageToJson(image: CatalogImage): ImageJson {
+  return { name: image.name, os: image.os, version: image.version, model: [...image.models] };
+}
+
+export function imageCreatePatch(images: CatalogImage[]): ImagesPatchJson {
+  return { 'stratoweave-images:images': { image: images.map(imageToJson) } };
 }
 
 // ── Validation ──

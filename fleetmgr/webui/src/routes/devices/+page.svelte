@@ -534,7 +534,7 @@
               </td>
               <td class="col-action">
                 <button
-                  class="btn btn-ghost btn-sm row-remove"
+                  class="btn btn-ghost btn-sm row-remove on-row"
                   type="button"
                   aria-label={`Remove ${device.name}`}
                   disabled={saving || deleting || applying}
@@ -626,15 +626,6 @@
 />
 
 <style>
-  .success-banner {
-    padding: 10px 14px;
-    border-radius: var(--sw-radius-md);
-    border: 1px solid rgb(var(--sw-accent-rgb) / 0.35);
-    background: var(--sw-accent-glow);
-    color: var(--sw-text-primary);
-    font-size: 13px;
-  }
-
   .filter-row {
     display: flex;
     align-items: center;
@@ -675,40 +666,6 @@
   .col-action {
     width: 1%;
     text-align: right;
-    white-space: nowrap;
-  }
-
-  /* One quiet action per row: it takes the danger colour only when its row
-     is pointed at or focused, so a page of devices is not a page of red. */
-  .row-remove {
-    color: var(--sw-text-muted);
-    opacity: 0;
-  }
-
-  tbody tr:hover .row-remove,
-  tbody tr:focus-within .row-remove {
-    opacity: 1;
-  }
-
-  .row-remove:hover:not(:disabled),
-  .row-remove:focus-visible {
-    color: var(--sw-danger-text);
-    background: var(--sw-danger-dim);
-    opacity: 1;
-  }
-
-  @media (hover: none) {
-    .row-remove {
-      opacity: 1;
-    }
-  }
-
-  .sr-only {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
     white-space: nowrap;
   }
 

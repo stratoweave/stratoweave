@@ -1,7 +1,7 @@
 # fleetmgr web UI
 
 A SvelteKit UI for the fleetmgr contract (see ../README.md): fleet
-inventory and software upgrade campaigns over RESTCONF.
+inventory, software images and software upgrade campaigns over RESTCONF.
 
 It is a static SPA served by the fleetmgr top itself, next to its RESTCONF
 API on the same origin, so there is no proxy and no CORS: `just gen-webui`
@@ -22,7 +22,7 @@ after devices finish applying — a real install takes minutes.
 
     # UI development, from ../
     just webui
-    # -> http://localhost:3000, /restconf proxied to FLEETMGR_API
+    # -> http://localhost:3000, /restconf and /image-file proxied to FLEETMGR_API
 
 Type check: `npm run check`. After UI changes: `just gen-webui`, then
 `just build` and commit the regenerated module.
@@ -114,6 +114,33 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   campaign, so unbinding many devices takes minutes; leaving the page
   stops it. The leafref is not validated upstream, so the UI offers only
   existing schedules and flags bindings to a missing one.
+- Images are `stratoweave-images:images/image` entries keyed by `name`,
+  with `os`, `version` and a `model` leaf-list. Adding one PATCHes the
+  datastore root, which merges into an image of the same name rather than
+  fail, so the add reads the image names again first and refuses one that
+  exists; saving one PUTs the whole entry, so a model removed in the form
+  disappears (DELETE on a leaf returns 500); deleting one, from its row in
+  the list or on its page, DELETEs the entry and then its file at
+  `/image-file/{name}`, where a 404 counts as removed. The form requires
+  `os`, `version` and a model, though the YANG does not. A model is added
+  by Enter or by picking a suggestion; other text left in the model field
+  blocks the save, so a half-typed model is neither lost nor saved.
+- Image files dropped on the image pages, or picked with Upload images,
+  open a table with one row per file. An IOS XE name
+  (`<family>.<version>.SPA.bin`) fills OS and version, in the table and in
+  the one-image form until they are typed; the operator picks the models
+  or copies them from the newest older image of the same family. Upload
+  sends the files one at a time, each in one PUT to `/image-file/{name}`,
+  which stores it in the top's image folder (`--software.image-dir`), and
+  then PATCHes that file's entry. A row that is done leaves the table; a
+  failed one shows why, and Upload sends it again from the start. Leaving
+  the page stops the upload, so while one runs the page asks first. Names
+  the folder refuses and empty files are flagged before any upload. Files
+  dropped on the one-image form replace it; what was typed there goes to
+  the row of the same file name, and with no such row the form asks
+  before it is lost.
+  Without an image folder `/image-file` answers 404, and the page says so
+  and uploads nothing.
 - Per-device status values: `pending`, `unknown`, `up-to-date`,
   `upgrade-needed`, `in-progress`, `succeeded`, `failed`, `rolled-back`.
   The `succeeded` counter includes `up-to-date`, `failed` includes
