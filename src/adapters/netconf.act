@@ -165,6 +165,104 @@ def _test_event_notifs_xpath_filter_rejects_wildcard():
         testing.assertIn("wildcard", e.error_message)
 
 
+def filter_missing_node(schema: yschema.DRoot, filt: ygdata.FNode) -> ?str:
+    """Return the path of the first node in filt that a reply parsed with
+    schema would not have, or None when it would have all of them.
+
+    A get reply is parsed with the device's schema. The parse keeps only the
+    containers, lists, leaves and leaf-lists that the schema has. It drops
+    other nodes and gives no error, so a get for such a node gives no data.
+    """
+    # TODO: upstream to acton-yang filter_xpath
+    tops = filt.children if filt.name is None else [filt]
+    for c in tops:
+        missing = _missing_node(schema, schema, c, "")
+        if missing is not None:
+            return missing
+    return None
+
+
+def _missing_node(root: yschema.DRoot, parent: yschema.DNodeInner, fn: ygdata.FNode, path: str) -> ?str:
+    s = _child_schema(parent, fn)
+    if s is not None:
+        here = path + "/" + _path_step(parent, s.module, s.namespace, s.name)
+        if isinstance(s, yschema.DNodeInner):
+            for c in fn.children:
+                missing = _missing_node(root, s, c, here)
+                if missing is not None:
+                    return missing
+        return None
+    name = fn.name
+    if name is not None:
+        meta = root.module_metadata.get(name.q)
+        if meta is not None:
+            return path + "/" + _path_step(parent, meta.module, name.q, name.name)
+        # The schema has no module with this namespace.
+        return "{path}/{name.name} in namespace {name.q}"
+    return None
+
+
+def _child_schema(parent: yschema.DNodeInner, fn: ygdata.FNode) -> ?yschema.DNode:
+    # Only the nodes that the parse keeps: not anydata, anyxml or operations.
+    try:
+        s = filter_xpath.child_schema(parent, fn)
+        if isinstance(s, yschema.DContainer) or isinstance(s, yschema.DList) or isinstance(s, yschema.DNodeLeaf):
+            return s
+    except ValueError:
+        pass
+    return None
+
+
+def _path_step(parent: yschema.DNodeInner, module: str, namespace: str, name: str) -> str:
+    # A node from another module than its parent: name the module.
+    if namespace != parent.namespace:
+        return "{module}:{name}"
+    return name
+
+
+def _test_filter_missing_node():
+    ns = "urn:ietf:params:xml:ns:yang:ietf-yang-library"
+    other = "urn:example:other"
+
+    def q(name: str) -> ygdata.Id:
+        return ygdata.Id(ns, name)
+
+    cases: list[(label: str, filt: ygdata.FNode, want: ?str)] = [
+        (label="every-node-known",
+         filt=ygdata.FNode(children=[
+             ygdata.FNode(q("yang-library"), children=[
+                 ygdata.FNode(q("module-set"), children=[
+                     ygdata.FNode(q("name"), value_match="default"),
+                     ygdata.FNode(q("module"), children=[ygdata.FNode(q("revision"))])
+                 ])
+             ])
+         ]),
+         want=None),
+        (label="top-node-given-directly",
+         filt=ygdata.FNode(q("yang-library"), children=[ygdata.FNode(q("content-id"))]),
+         want=None),
+        (label="whole-datastore", filt=ygdata.FNode(), want=None),
+        (label="unknown-module",
+         filt=ygdata.FNode(children=[ygdata.FNode(ygdata.Id(other, "box"))]),
+         want="/box in namespace urn:example:other"),
+        (label="unknown-leaf",
+         filt=ygdata.FNode(children=[
+             ygdata.FNode(q("yang-library"), children=[
+                 ygdata.FNode(q("module-set"), children=[ygdata.FNode(q("serial"))])
+             ])
+         ]),
+         want="/ietf-yang-library:yang-library/module-set/serial"),
+        (label="second-top-node-unknown",
+         filt=ygdata.FNode(children=[
+             ygdata.FNode(q("yang-library")),
+             ygdata.FNode(q("platform"))
+         ]),
+         want="/ietf-yang-library:platform"),
+    ]
+    for c in cases:
+        testing.assertEqual(c.want, filter_missing_node(yl.SRC_DNODE, c.filt), c.label)
+
+
 def _mock_capabilities_from_dmc(new_dmc: DeviceMetaConfig) -> list[str]:
     """True protocol capabilities for the mock device hello exchange.
     """
@@ -1608,11 +1706,16 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             except Exception as e:
                 cb(None, e)
 
-        if _oper_schema() is None:
+        schema = _oper_schema()
+        if schema is None:
             cb(None, ValueError("Schema for operational data not found"))
             return
         filt_xml: ?xml.Node = None
         if filt is not None:
+            missing = filter_missing_node(schema!, filt)
+            if missing is not None:
+                cb(None, ValueError("Filter node {missing} not found in device schema"))
+                return
             filt_xml = _build_subtree_filter(filt)
         if client is not None:
             client.get(on_get, filt_xml)
