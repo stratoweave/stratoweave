@@ -10,22 +10,22 @@ NS_YANG_LIBRARY = "urn:ietf:params:xml:ns:yang:ietf-yang-library"
 NS_NETCONF_MONITORING = "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring"
 
 
-def build_yang_library(schema: yschema.DRoot, modules: list[(name: str, namespace: str, revision: ?str, implemented: bool, features: list[str])]=[]) -> (root: ygdata.Node, content_id: str):
+def build_yang_library(schema: yschema.DRoot, modules: dict[str, yschema.ModuleMetadata]={}, implemented: dict[str, list[str]]={}) -> (root: ygdata.Node, content_id: str):
     """Build an ietf-yang-library datastore view (as gdata) plus its content-id.
 
-    It lists the modules of `schema`, with the submodules that their
-    module_metadata lists, and `modules`, in /yang-library (RFC 8525) and in
+    It lists the modules of `schema` and `modules`, with the submodules that
+    their module_metadata lists, in /yang-library (RFC 8525) and in
     /modules-state (RFC 7895), which RESTCONF (RFC 8040) requires. Those
     marked implemented are listed under `module`, with conformance-type
     `implement`, and the others under `import-only-module`, with
     conformance-type `import`.
 
-    `modules` lists the modules that the server implements in its own code,
-    rather than with a compiled schema, with the features it supports, and
-    the modules they import. Compiled into `schema`, a module that they only
-    import, such as ietf-interfaces, would be marked implemented. Where
-    `schema` holds a module with the same namespace, its module_metadata is
-    listed.
+    `modules` is the module_metadata of the modules that the server
+    implements in its own code, and of the modules they import. `implemented` names the ones that it implements,
+    with the features it supports. Whether `modules` marks a module
+    implemented is not used: compiled with them, a module that they only
+    import, such as ietf-interfaces, is marked implemented. Where `schema`
+    holds a module with the same namespace, its module_metadata is listed.
 
     `content-id` is a deterministic hash of the assembled tree, with
     placeholders for content-id and module-set-id, so it changes whenever any
@@ -34,10 +34,12 @@ def build_yang_library(schema: yschema.DRoot, modules: list[(name: str, namespac
     the matching `yang-library` NETCONF capability.
     """
     merged_meta = {}
-    features = {}
-    for m in modules:
-        merged_meta[m.namespace] = (name=m.name, revision=m.revision, submodules=[], implemented=m.implemented)
-        features[m.namespace] = m.features
+    for ns, meta in modules.items():
+        merged_meta[ns] = (name=meta.name, revision=meta.revision, submodules=meta.submodules, implemented=meta.name in implemented)
+    names = set([meta.name for meta in modules.values()])
+    for name in implemented.keys():
+        if name not in names:
+            raise ValueError("No module_metadata for implemented module {name}")
     for ns, meta in schema.module_metadata.items():
         merged_meta[ns] = meta
 
@@ -56,7 +58,7 @@ def build_yang_library(schema: yschema.DRoot, modules: list[(name: str, namespac
             revision=rev_opt if rev_opt is not None else "",
             namespace=ns,
             conformance_type="implement" if meta.implemented else "import",
-            feature=features.get_def(ns, []),
+            feature=implemented.get_def(meta.name, []),
             submodule=modules_state_submodules,
         ))
         if meta.implemented:
@@ -65,7 +67,7 @@ def build_yang_library(schema: yschema.DRoot, modules: list[(name: str, namespac
                 namespace=ns,
                 revision=rev_opt,
                 submodule=[yl.ietf_yang_library__yang_library__module_set__module__submodule_entry(name=sub.name, revision=sub.revision) for sub in meta.submodules],
-                feature=features.get_def(ns, []),
+                feature=implemented.get_def(meta.name, []),
             ))
         else:
             import_only_modules.append(yl.ietf_yang_library__yang_library__module_set__import_only_module_entry(
@@ -104,13 +106,16 @@ def build_yl_view(schema: yschema.DRoot) -> ?(root: ygdata.Node, content_id: str
 class ModuleInventory(object):
     """The compiled schema that a server serves, the modules that it
     implements in its own code, and its YANG library, see
-    build_yang_library."""
+    build_yang_library. `sources` holds `yang_sources`, the YANG sources that
+    the server serves, see get_schema_sources."""
     schema: yschema.DRoot
     yl_view: (root: ygdata.Node, content_id: str)
+    sources: dict[str, dict[str, str]]
 
-    def __init__(self, schema: yschema.DRoot, modules: list[(name: str, namespace: str, revision: ?str, implemented: bool, features: list[str])]=[]):
+    def __init__(self, schema: yschema.DRoot, modules: dict[str, yschema.ModuleMetadata]={}, implemented: dict[str, list[str]]={}, yang_sources: list[yschema.YangSource]=[]):
         self.schema = schema
-        self.yl_view = build_yang_library(schema, modules)
+        self.yl_view = build_yang_library(schema, modules, implemented)
+        self.sources = get_schema_sources(yang_sources)
 
 
 def bundled_module_caps(module_metadata: dict[str, yschema.ModuleMetadata]) -> list[str]:
@@ -136,22 +141,62 @@ def module_capabilities(schema: yschema.DRoot,
     return bundled_module_caps(schema.module_metadata)
 
 
-def get_schema_identifier(op: xml.Node) -> ?str:
-    """The <identifier> (module name) of a <get-schema> request, or None."""
+class GetSchemaError(Exception):
+    """A <get-schema> that get_schema_reply does not answer, with the
+    error-tag and error-app-tag of its rpc-error"""
+    error_tag: str
+    error_app_tag: ?str
+
+    def __init__(self, error_tag: str, error_message: str, error_app_tag: ?str=None):
+        self.error_tag = error_tag
+        self.error_message = error_message
+        self.error_app_tag = error_app_tag
+
+
+def get_schema_sources(yang_sources: list[yschema.YangSource]) -> dict[str, dict[str, str]]:
+    """The sources of `yang_sources` by identifier and version, for
+    get_schema_reply. The identifier of a source is the name of its module or
+    submodule, and its version is its revision, or empty when it has no
+    revision statement, as in /netconf-state/schemas (RFC 6022). A name and
+    revision that repeats in `yang_sources`, such as that of ietf-yang-types,
+    which several schemas import, is held once."""
+    res = {}
+    for s in yang_sources:
+        rev = s.revision
+        if s.name not in res:
+            res[s.name] = {}
+        res[s.name][rev if rev is not None else ""] = s.src
+    return res
+
+
+def get_schema_reply(op: xml.Node, sources: dict[str, dict[str, str]]) -> xml.Node:
+    """The <data> reply to a <get-schema> (RFC 6022, ietf-netconf-monitoring),
+    carrying the source of the requested identifier and version, see
+    get_schema_sources.
+
+    A request without version matches every version of the identifier.
+    Raises GetSchemaError with error-tag invalid-value when no source
+    matches, and operation-failed with error-app-tag data-not-unique when
+    more than one does. The <format> is not looked at."""
+    ident: ?str = None
+    version: ?str = None
     for c in op.children:
         if c.tag == "identifier":
-            return c.text
-    return None
-
-
-def get_schema_reply(op: xml.Node, sources: dict[str, str]) -> ?xml.Node:
-    """The <data> reply node for a <get-schema> (RFC 6022, ietf-netconf-monitoring),
-    given a module-name -> YANG source map, or None when the requested module is
-    unknown (the caller then sends an rpc-error). get-schema is otherwise unserved in
-    this codebase, so this lets any mock/server answer it from a source corpus."""
-    ident = get_schema_identifier(op)
+            ident = c.text
+        elif c.tag == "version":
+            # <version/> requests the empty version
+            text = c.text
+            version = text if text is not None else ""
     if ident is not None:
-        src = sources.get(ident)
-        if src is not None:
-            return xml.Node("data", nsdefs=[(None, NS_NETCONF_MONITORING)], text=src)
-    return None
+        versions = sources.get_def(ident, {})
+        requested = ident
+        matches = list(versions.values())
+        if version is not None:
+            requested = ident + "@" + version
+            matches = [versions[version]] if version in versions else []
+        if len(matches) == 0:
+            raise GetSchemaError("invalid-value", "No schema {requested}")
+        if len(matches) > 1:
+            raise GetSchemaError("operation-failed", "More than one schema {requested}, request a version", error_app_tag="data-not-unique")
+        return xml.Node("data", nsdefs=[(None, NS_NETCONF_MONITORING)], text=matches[0])
+    raise GetSchemaError("missing-element", "Missing <identifier> in <get-schema>")
