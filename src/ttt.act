@@ -1738,14 +1738,18 @@ actor ContainerState(path, keys: set[gdata.Id]):
     # Children are fixed for the lifetime of the container. Unlike ListState,
     # no committed membership index or provisional-node cleanup is needed.
     var candidates: dict[str, dict[str, set[gdata.Id]]] = {}
+    # Latest configure input per source, not the effective configuration.
+    var configs: dict[str, dict[str, gdata.Node]] = {}
     var erasures: dict[str, set[str]] = {}
     var pending: list[(str, action(dict[str, set[gdata.Id]]) -> None)] = []
     var locked: dict[str, str] = {}
 
-    def acquire(tid: str, candidate: dict[str, set[gdata.Id]], erasure: set[str]):
+    def acquire(tid: str, candidate: dict[str, set[gdata.Id]], erasure: set[str], cfg_by_src: dict[str, gdata.Node]):
         if tid not in candidates:
             candidates[tid] = {}
+            configs[tid] = {}
             erasures[tid] = set()
+        configs[tid].update(cfg_by_src.items())
         #print('====', tid, path, 'container acquire', candidate, 'erasure:', erasure, err=True)
         # Repeated configure calls replace the supplied sources' fragments,
         # while retaining the other sources already seen in this transaction.
@@ -1758,7 +1762,7 @@ actor ContainerState(path, keys: set[gdata.Id]):
         # Locking may be the first operation of an empty transaction. Register
         # it so both deletion acquisition and the later release have state.
         if tid not in candidates:
-            acquire(tid, {}, set())
+            acquire(tid, {}, set(), {})
         erasure = erasures[tid]
         if any([src in locked and locked[src] != tid for src in erasure]):
             pending.append((tid, reply))
@@ -1773,6 +1777,7 @@ actor ContainerState(path, keys: set[gdata.Id]):
         erasure = erasures[tid]
         del erasures[tid]
         del candidates[tid]
+        del configs[tid]
         # An abort before acquiring the locks must not unlock another tid.
         for src in erasure:
             if locked.get(src) == tid:
@@ -1839,7 +1844,7 @@ class _ContainerTransaction(_Transaction):
             if keys or not differential or isinstance(cfg, gdata.Absent):
                 cfg_keys[src] = keys
 
-        self.containerstate.acquire(tid, cfg_keys, erasure)
+        self.containerstate.acquire(tid, cfg_keys, erasure, cfg_by_src)
         if differential and not cfg_by_child and all([isinstance(cfg, gdata.Container) for cfg in cfg_by_src.values()]):
             cfg_by_child = {child: {} for child in self.elems}
         msgs = {}
@@ -1872,7 +1877,7 @@ class _ContainerTransaction(_Transaction):
         if self.reset:
             self.results = {}
             self.reset = False
-        self.containerstate.acquire(tid, {}, set())
+        self.containerstate.acquire(tid, {}, set(), {})
         # Group the messages by the child they name, so that each message
         # is looked at once rather than once per child
         reqs_by_child: dict[gdata.Id, list[LinkRequest]] = {}
@@ -2207,6 +2212,8 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
     var provisional = set()
     var active: dict[str, set[str]] = {}
     var candidates: dict[str, dict[str, set[str]]] = {}
+    # Latest configure input per source, not the effective configuration.
+    var configs: dict[str, dict[str, gdata.Node]] = {}
     var touched: dict[str, dict[str, set[str]]] = {}
     var erasures: dict[str, set[str]] = {}
     var pending: list[(str, action(dict[str, set[str]], dict[str, Node]) -> None)] = []
@@ -2287,11 +2294,13 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
             active[src] = set()
         active[src].add(key)
 
-    def acquire(tid, candidate: dict[str, set[str]], erasure: set[str], leaves_by_key: dict[str, dict[gdata.Id, gdata.Leaf]]):
+    def acquire(tid, candidate: dict[str, set[str]], erasure: set[str], leaves_by_key: dict[str, dict[gdata.Id, gdata.Leaf]], cfg_by_src: dict[str, gdata.Node]):
         if tid not in candidates:
             candidates[tid] = {}
+            configs[tid] = {}
             touched[tid] = {}
             erasures[tid] = set()
+        configs[tid].update(cfg_by_src.items())
         # Keep the source contributions already sent to child transactions,
         # including keys omitted by a later configure in this transaction.
         for src, keys in candidate.items():
@@ -2321,6 +2330,7 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
             candidates[tid][LINK_SRC] = keys1
         else:
             candidates[tid] = {LINK_SRC: keys1}
+            configs[tid] = {}
             touched[tid] = {}
             erasures[tid] = set()
         return {k: elems[k] for k in keys1}
@@ -2328,7 +2338,7 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
     def acquire_deletes(tid, reply: action(dict[str, set[str]], dict[str, Node]) -> None):
         # Register empty transactions even when no configure or linkage ran.
         if tid not in candidates:
-            acquire(tid, {}, set(), {})
+            acquire(tid, {}, set(), {}, {})
         erasure = erasures[tid]
         if any([src in locked and locked[src] != tid for src in erasure]):
             pending.append((tid, reply))
@@ -2351,6 +2361,7 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
         candidate = candidates[tid]
         erasure = erasures[tid]
         del candidates[tid]
+        del configs[tid]
         del touched[tid]
         del erasures[tid]
         if ok:
@@ -2443,7 +2454,7 @@ class _ListTransaction(_Transaction):
                 cfg_keys[src] = keys
 
         self.key_leaves.update(leaves_by_key.items())
-        nodes = self.liststate.acquire(tid, cfg_keys, erasure, leaves_by_key)
+        nodes = self.liststate.acquire(tid, cfg_keys, erasure, leaves_by_key, cfg_by_src)
         refresh = differential and not cfg_by_key and all([isinstance(cfg, gdata.List) for cfg in cfg_by_src.values()])
         if refresh:
             # Refresh the selected subtree, including committed entries in a
