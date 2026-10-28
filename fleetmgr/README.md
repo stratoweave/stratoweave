@@ -106,8 +106,8 @@ one of the seven failures: `cpe-034` fails its commit, so the campaign
 aborts it and it ends `rolled-back`, while `cpe-007` fails its download and
 ends `failed`. `cpe-039` refuses on its pre-check and `cpe-016` rolls back
 on its post-check. `cpe-003` already runs the target and ends `up-to-date`.
-The leaves are read when the device is created; change them by deleting and
-re-creating the device.
+A change takes effect at once. The device keeps the release it runs unless
+`running-release` changes, and its next upgrade uses the new values.
 
 Inspect the top CFS and the bottom RFS independently:
 

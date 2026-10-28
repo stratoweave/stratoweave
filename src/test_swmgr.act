@@ -13,8 +13,14 @@ import testing
 
 import device as swdev
 import device_oper as swdevoper
+import adapters.netconf as swna
 import adapters.software_mock as swmock
 import yang.gdata as ygdata
+import yang.schema as yschema
+
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials
 
 OLD = "17.15.01a"
 NEW = "17.18.03a"
@@ -852,3 +858,89 @@ actor _test_reverted_device_is_not_succeeded(t: testing.EnvT):
     dev.set_update_oper(on_state)
     mgr.set_adapter(adapter)
     mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_new_adapter_waits_for_the_run(t: testing.EnvT):
+    """An adapter handed over during a run takes over at the next run."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    first = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    second = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var swapped = False
+    var second_run = False
+
+    def precheck(done: action(bool, str) -> None) -> None:
+        if not swapped:
+            swapped = True
+            mgr.set_adapter(second)
+        done(True, "")
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if _pub_status(oper) != "succeeded":
+            return
+        if not second_run:
+            second_run = True
+            testing.assertEqual(["check", "prepare", "install", "commit", "check"],
+                                first.calls(), "the run must finish on its adapter")
+            testing.assertEqual([], second.calls(), "the new adapter waits for the next run")
+            mgr.set_config("camp-1", "17.18.04", False, {})
+        elif _pub_running(oper) == "17.18.04":
+            testing.assertEqual(["check", "prepare", "install", "commit", "check"],
+                                second.calls(), "the next run must use the new adapter")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.add_precheck("swap", precheck)
+    mgr.set_adapter(first)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+def _knob_adapter(dev: swdev.DeviceMgr, dmc: DeviceMetaConfig,
+                  log_handler: logging.Handler, env: ?Env) -> swdev.SoftwareAdapter:
+    """Runs the release mock/software/running-release names."""
+    return swmock.MockSoftwareAdapter(log_handler, dmc.mock.software.running_release)
+
+
+actor _test_mock_knob_change_rebuilds_the_adapter(t: testing.EnvT):
+    """A software adapter factory may read the mock knobs, so changing one
+    gives the manager a new adapter."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    dev = swdev.DeviceMgr({"t": swdev.DeviceType(name="t", adapter_type=swna.NetconfAdapter,
+                                                 src_dnode=yschema.DRoot(),
+                                                 software_adapter_type=_knob_adapter)},
+                          t.env, "test-device", t.log_handler, noop_on_reconf,
+                          swdev.SchemaRegistry())
+    var changed = False
+    var finished = False
+
+    def dmc_running(release: str) -> DeviceMetaConfig:
+        dmc = DeviceMetaConfig("test-device", Credentials("admin", "admin"), type="t")
+        dmc.mock.enabled = True
+        dmc.mock.software.running_release = release
+        dmc.software.target_release = NEW
+        return dmc
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if finished:
+            return
+        status = _pub_status(oper)
+        if status == "up-to-date" and not changed:
+            changed = True
+            dev.set_dmc(dmc_running(OLD))
+        elif status == "succeeded" and changed:
+            finished = True
+            t.success()
+
+    def report_timeout() -> None:
+        if not finished:
+            finished = True
+            t.failure(ValueError("timed out, changed={changed}"))
+
+    dev.set_update_oper(on_state)
+    dev.set_dmc(dmc_running(NEW))
+    after 2.5: report_timeout()
