@@ -191,6 +191,11 @@ PRECHECK_TIMEOUT = 60.0
 POSTCHECK_TIMEOUT = 900.0
 COMMIT_MARGIN = 120.0
 
+# Seconds before the first retry of a failed platform read. Each retry waits
+# twice as long as the one before, up to PLATFORM_RETRY_MAX.
+PLATFORM_RETRY_FIRST = 5.0
+PLATFORM_RETRY_MAX = 300.0
+
 
 def _now() -> str:
     """The current UTC time as a yang:date-and-time."""
@@ -613,12 +618,115 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             _fail("device runs {got} after the commit, not {want}", got)
             return
         # New software may mean a different modset, so the device has to be
-        # re-discovered before anything trusts its schema again.
+        # re-discovered before anything trusts its schema again. The release
+        # can change without a reconnect, so read the platform again too.
         devmgr.resync()
+        devmgr.read_platform()
         _record(running, ST_SUCCEEDED)
 
     # Report the initial state, so the DeviceMgr's entry oper starts complete.
     devmgr.on_software_state(state.copy())
+
+
+#############################################################################
+# Platform discovery
+#
+# A platform probe reads what a device is: its OS family, release, chassis
+# model and serial number. On every connect, DeviceMgr runs the first probe
+# that applies to the device's modules. It tries the device type's own probes
+# first, then the app's list, SysSpec.platform_probes. That list is
+# platform_probes.PROBES unless the app gives its own.
+#############################################################################
+
+class Platform(object):
+    """What a device is. A probe leaves a field None when it does not know it."""
+    os: ?str
+    version: ?str
+    model: ?str
+    serial_number: ?str
+
+    def __init__(self, os: ?str=None, version: ?str=None, model: ?str=None,
+                 serial_number: ?str=None):
+        self.os = os
+        self.version = version
+        self.model = model
+        self.serial_number = serial_number
+
+
+class PlatformMismatch(Exception):
+    """A probe gives this to done when it has read the device and found that
+    the device is not its case. DeviceMgr then runs the next probe that
+    applies."""
+
+
+class PlatformProbe(object):
+    """Reads what a device is. A subclass sets name and implements applies
+    and read.
+
+    applies looks only at the module set, so the same modules always pick the
+    same probe. read reads the device through dev and calls done once:
+
+    - done(platform, None): the answer. DeviceMgr publishes it.
+    - done(None, PlatformMismatch()): the device is not the probe's case.
+      DeviceMgr runs the next probe that applies.
+    - done(None, error): the read failed. DeviceMgr keeps the values if
+      this probe read them, else removes them, and runs the probe again
+      later. A read that gives no values is a failure too: right after a
+      reload a device can answer with no data.
+
+    A probe reads through the device's schema, so the device type's schema
+    must have the nodes that the probe reads.
+
+    read runs in the DeviceMgr, so it must not wait for the result of a call
+    to dev: that call would wait for read to end. A reply from dev must go to
+    an action, so a probe that waits for one starts an actor to receive it.
+    GetPlatformProbe does this for a probe that needs one get.
+
+    The device type's probes run before the app's, so an app cannot put its
+    own probe before them. To change them, give the device type other probes.
+    """
+    name: str
+
+    ## Whether the probe can read a device with these modules.
+    applies: proc(modset: dict[str, ModCap]) -> bool
+
+    ## Read the device and call done once, as the class description says.
+    read: proc(dev: DeviceMgr, done: action(?Platform, ?Exception) -> None) -> None
+
+
+class GetPlatformProbe(PlatformProbe):
+    """A probe that reads the device with one get.
+
+    A subclass sets name and filt, and implements applies and parse. parse
+    gives the platform, None when the reply has no values, or raises
+    PlatformMismatch when the reply shows that the device is not its case.
+    """
+    filt: ygdata.FNode
+
+    ## The platform in a reply. See the class description.
+    parse: proc(root: ?ygdata.Node) -> ?Platform
+
+    def read(self, dev: DeviceMgr, done: action(?Platform, ?Exception) -> None) -> None:
+        _GetPlatformRead(dev, self, done)
+
+
+actor _GetPlatformRead(dev: DeviceMgr, probe: GetPlatformProbe,
+                       done: action(?Platform, ?Exception) -> None):
+    """One read of a GetPlatformProbe: the get, then the probe's parse."""
+    def on_reply(root: ?ygdata.Node, err: ?Exception) -> None:
+        if err is not None:
+            done(None, err)
+            return
+        try:
+            p = probe.parse(root)
+            if p is not None:
+                done(p, None)
+            else:
+                done(None, ValueError("the reply has no platform values"))
+        except Exception as e:
+            done(None, e)
+
+    dev.get(on_reply, probe.filt)
 
 
 ## DeviceType represents a type of device, i.e. a specific platform or
@@ -641,13 +749,19 @@ class DeviceType(object):
     @property
     software_adapter_type: ?proc(DeviceMgr, DeviceMetaConfig, logging.Handler, ?Env) -> SoftwareAdapter
 
-    def __init__(self, name: str, adapter_type, src_dnode, oper_src_dnode: ?yschema.DRoot=None, schema_transforms: list[SchemaTreeTransform]=[], software_adapter_type=None):
+    ## Platform probes for devices of this type. They run before the app's
+    ## probes, so an adapter package can bring the probe for its own devices,
+    ## like a CLI adapter that knows which commands name the model.
+    platform_probes: list[PlatformProbe]
+
+    def __init__(self, name: str, adapter_type, src_dnode, oper_src_dnode: ?yschema.DRoot=None, schema_transforms: list[SchemaTreeTransform]=[], software_adapter_type=None, platform_probes: list[PlatformProbe]=[]):
         self.name = name
         self.adapter_type = adapter_type
         self.bundled_schema = DeviceSchema(name, src_dnode, oper_src_dnode, schema_transforms)
         self.software_adapter_type = software_adapter_type
+        self.platform_probes = platform_probes
 
-actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None):
+actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None, platform_probes: list[PlatformProbe]=[]):
     """Device Registry keeps track of all devices and hands out references to
     them based on name.
 
@@ -655,7 +769,8 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_ha
     name must always return the same Device instance.
 
     Each device logs to its own handler under log_handler. With device_logs,
-    that handler also writes the device's log file.
+    that handler also writes the device's log file. Every device gets
+    platform_probes, the app's list.
     """
     var devices = {}
 
@@ -674,7 +789,7 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_ha
 
     def get_or_create(name: str) -> DeviceMgr:
         if name not in devices:
-            devices[name] = DeviceMgr(dev_types, env, name, log_handler, reconf_cb, schema_registry, self, device_logs)
+            devices[name] = DeviceMgr(dev_types, env, name, log_handler, reconf_cb, schema_registry, self, device_logs, platform_probes)
         dev = devices[name]
         return dev
 
@@ -900,7 +1015,7 @@ class DeviceTreeProvider(ygdata.TreeProvider):
 
 
 
-actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None, device_logs: ?swlogs.DeviceLogs=None):
+actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None, device_logs: ?swlogs.DeviceLogs=None, platform_probes: list[PlatformProbe]=[]):
     """Device Manager manages a device and represents that device, as an
     abstract device, in the system. Platform specific handling is implemented in
     the DeviceAdapter, i.e.  in subclasses of DeviceAdapter, like NetconfAdapter
@@ -950,6 +1065,16 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
     over the network. Tests can access the mock server and side-load data into
     it in order to verify the DeviceMgr's interaction with the device adapter
     and the adapter's interaction with the device.
+
+    ## Platform
+    On every connect the DeviceMgr runs the first platform probe that applies
+    to the device's modules and publishes its answer under state/platform.
+    The device type's probes come first, then platform_probes, the app's
+    list. A probe can give the device to the next probe (PlatformMismatch).
+    A failed read keeps the values if the same probe read them, else removes
+    them, and runs again after a delay that doubles each time, so a replaced
+    box shows once a read succeeds. When no probe applies, the values are
+    removed.
 
     ## Logging
     The device and its adapters log to one handler, named after the device.
@@ -1033,6 +1158,16 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
 
     # Key of the fetched schema in the SchemaRegistry
     var schema_key: ?SchemaKey = None
+
+    # The device type's platform probes, run before the app's.
+    var type_probes: list[PlatformProbe] = []
+    # Bumped on every connect and adapter change, so a probe reply or retry
+    # from an earlier connection is dropped.
+    var platform_gen: int = 0
+    # Bumped for every probe read and every answer, so a probe that calls done
+    # twice gets only its first call handled.
+    var platform_read: int = 0
+    var platform_retry_first: float = PLATFORM_RETRY_FIRST
 
     # The device's current running configuration, as we know it.
     var running_conf: ?ygdata.Node = None
@@ -1153,6 +1288,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
     def on_connect(new_modset: dict[str, ModCap], new_schema_key: ?SchemaKey):
         _log.debug("Device connected", {"new_modset": new_modset, "schema_modules": len(new_schema_key.modules) if new_schema_key is not None else None})
         resync()
+        _read_platform(new_modset)
         if modset_eq(modset, new_modset):
             _log.debug("Supported modules unchanged")
         else:
@@ -1162,6 +1298,119 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
             schema_key = new_schema_key
             on_reconf(name)
             return
+
+    def _read_platform(mods: dict[str, ModCap]) -> None:
+        """Start a new probe walk. An empty module set says nothing about the
+        device, so the last values stay."""
+        platform_gen += 1
+        if len(mods) == 0:
+            _log.debug("DeviceMgr: no modules, platform not read", {"device": name})
+            return
+        _probe_platform(platform_gen, type_probes + platform_probes, 0, mods, platform_retry_first)
+
+    def read_platform() -> None:
+        """Read the platform again on the current connection. SoftwareManager
+        calls this after an install, which can change the release without a
+        reconnect."""
+        _read_platform(modset)
+
+    def _end_platform_read() -> None:
+        platform_read += 1
+
+    def _probe_platform(gen: int, probes: list[PlatformProbe], start: int,
+                        mods: dict[str, ModCap], retry: float) -> None:
+        """Run the first probe in probes[start:] that applies to mods.
+
+        gen is the connection the walk belongs to; retry is the delay before
+        the probe runs again if its read fails.
+        """
+        if gen != platform_gen:
+            return
+        i = start
+        while i < len(probes):
+            fits = False
+            try:
+                fits = probes[i].applies(mods)
+            except Exception as e:
+                _log.error("DeviceMgr: platform probe failed to match",
+                           {"device": name, "probe": probes[i].name, "error": e})
+            if fits:
+                break
+            i += 1
+        if i >= len(probes):
+            _log.debug("DeviceMgr: no platform probe applies", {"device": name})
+            _set_platform(None, None)
+            return
+        probe = probes[i]
+        idx = i
+        platform_read += 1
+        step = platform_read
+
+        def on_read(p: ?Platform, err: ?Exception) -> None:
+            if gen != platform_gen or step != platform_read:
+                # A reply from an earlier connection or read, or a second
+                # call of done.
+                return
+            _end_platform_read()
+            if isinstance(err, NotConnectedError):
+                # The session dropped mid-read: the next connect reads again.
+                return
+            if isinstance(err, PlatformMismatch):
+                _log.info("DeviceMgr: platform probe gave the device to the next one",
+                          {"device": name, "probe": probe.name})
+                _probe_platform(gen, probes, idx + 1, mods, platform_retry_first)
+                return
+            if p is not None and err is None:
+                _set_platform(p, probe.name)
+                return
+            published = oper.state.platform.probe
+            if published is not None and published != probe.name:
+                # Values another probe read do not describe this device.
+                _set_platform(None, None)
+            details = {"device": name, "probe": probe.name,
+                       "error": str(err) if err is not None else "no answer",
+                       "retry_in": retry}
+            if retry == platform_retry_first:
+                _log.warning("DeviceMgr: platform read failed", details)
+            else:
+                _log.info("DeviceMgr: platform read failed again", details)
+            after retry: _probe_platform(gen, probes, idx, mods, min([retry * 2.0, PLATFORM_RETRY_MAX]))
+
+        try:
+            probe.read(self, on_read)
+        except Exception as e:
+            on_read(None, e)
+
+    def _set_platform(p: ?Platform, probe: ?str) -> None:
+        """Publish the platform, on a change only. None clears it."""
+        st = oper.state.platform
+        os: ?str = None
+        version: ?str = None
+        model: ?str = None
+        serial: ?str = None
+        if p is not None:
+            os = p.os
+            version = p.version
+            model = p.model
+            serial = p.serial_number
+        if st.os == os and st.version == version and st.model == model and st.serial_number == serial and st.probe == probe:
+            return
+        old_serial = st.serial_number
+        if old_serial is not None and serial is not None and old_serial != serial:
+            _log.warning("DeviceMgr: platform serial number changed",
+                         {"device": name, "old": old_serial, "new": serial})
+        _log.info("DeviceMgr: platform", {"device": name, "os": os, "version": version,
+                                           "model": model, "serial_number": serial, "probe": probe})
+        st.os = os
+        st.version = version
+        st.model = model
+        st.serial_number = serial
+        st.probe = probe
+        update_oper()
+
+    def set_platform_retry(secs: float) -> None:
+        """Test hook."""
+        platform_retry_first = secs
 
     def set_dmc(new_dmc: DeviceMetaConfig) -> None:
         def is_mock_device(new_dmc: DeviceMetaConfig) -> bool:
@@ -1208,6 +1457,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
                     sw_type = device_type.software_adapter_type
                     if sw_type is not None:
                         swmgr.set_adapter(sw_type(self, new_dmc, _log_handler, env))
+                type_probes = device_type.platform_probes
                 sw = new_dmc.software
                 sw_vetoes = {}
                 for v in sw.veto:
@@ -1225,6 +1475,8 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
                     })
                     previous_adapter = adapter
                     adapter = new_adapter
+                    # A probe read or retry on the old adapter is dropped.
+                    platform_gen += 1
                     after 0: previous_adapter.close()
                     _log.info("DeviceMgr.set_dmc: using adapter", {"adapter": adapter})
                     bundled_schema = device_type.bundled_schema

@@ -1,0 +1,190 @@
+#
+# Platform discovery in DeviceMgr: which probe runs, in which order, and what
+# a failed read or a mismatch does. Fake probes stand in for real ones; the
+# devices are mocked, so a device connects when it gets its modules.
+#
+
+import logging
+import testing
+import yang.gdata as ygdata
+import yang.schema as yschema
+
+import device as swdev
+import device_oper as swdevoper
+from adapters.adapter import DeviceAdapter, NoAdapter, ModCap, NotConnectedError
+from device_schema import DeviceSchema
+
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials, \
+    stratoweave_rfs__device__mock as Mock, \
+    stratoweave_rfs__device__mock__module_entry as MockModule
+
+# What a fake probe does on one read.
+ANSWER = "answer"
+MISMATCH = "mismatch"
+FAIL = "fail"
+NOT_CONNECTED = "not-connected"
+EMPTY = "empty"
+
+
+class FakeProbe(swdev.PlatformProbe):
+    """Applies when the device lists `needs`. Read number n does outcomes[n];
+    the last outcome repeats. An answer names the probe in its os, model and
+    serial number. EMPTY calls done with neither a platform nor an error."""
+    needs: str
+    outcomes: list[str]
+    calls: int
+
+    def __init__(self, name: str, needs: str, outcomes: list[str]):
+        self.name = name
+        self.needs = needs
+        self.outcomes = outcomes
+        self.calls = 0
+
+    def applies(self, modset: dict[str, ModCap]) -> bool:
+        return self.needs in modset
+
+    def read(self, dev: swdev.DeviceMgr, done: action(?swdev.Platform, ?Exception) -> None) -> None:
+        n = self.calls
+        if n >= len(self.outcomes):
+            n = len(self.outcomes) - 1
+        self.calls += 1
+        outcome = self.outcomes[n]
+        if outcome == ANSWER:
+            done(swdev.Platform("os-" + self.name, "1.0", "model-" + self.name,
+                                "serial-" + self.name), None)
+        elif outcome == MISMATCH:
+            done(None, swdev.PlatformMismatch())
+        elif outcome == NOT_CONNECTED:
+            done(None, NotConnectedError())
+        elif outcome == EMPTY:
+            done(None, None)
+        else:
+            done(None, ValueError("read failed"))
+
+
+def _no_adapter(dev: swdev.DeviceMgr, schema: DeviceSchema, dmc: DeviceMetaConfig,
+                registry: swdev.SchemaRegistry, log_handler: logging.Handler,
+                env: ?Env) -> DeviceAdapter:
+    """No real adapter: the device is mocked, so DeviceMgr uses MockAdapter."""
+    return NoAdapter(schema, log_handler, env)
+
+
+def _dmc(name: str, mods: list[str]) -> DeviceMetaConfig:
+    return DeviceMetaConfig(name, Credentials("admin", "admin"), type="t",
+                            mock=Mock(module=[MockModule(m, "urn:" + m) for m in mods]))
+
+
+actor _Case(t: testing.EnvT, label: str,
+            type_probes: list[swdev.PlatformProbe],
+            app_probes: list[swdev.PlatformProbe],
+            mods: list[str], reconnect: bool,
+            report: action(str, list[str], ?str) -> None):
+    """Connect one mocked device and report, after half a second, the probes
+    whose answers it published, in order, and the last published model.
+
+    With reconnect, the device connects again with one more module, mod-new,
+    once the first answer is published.
+    """
+    var published: list[str] = []
+    var model: ?str = None
+    var reconnected = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    dev_types = {"t": swdev.DeviceType("t", _no_adapter, yschema.DRoot(),
+                                       platform_probes=type_probes)}
+    dev = swdev.DeviceMgr(dev_types, None, label, t.log_handler, on_reconf,
+                          swdev.SchemaRegistry(), platform_probes=app_probes)
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if oper is not None:
+            platform = swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).state.platform
+            model = platform.model
+            p = platform.probe
+            if p is not None:
+                if len(published) == 0 or published[-1] != p:
+                    published.append(p)
+                if reconnect and not reconnected:
+                    reconnected = True
+                    dev.set_dmc(_dmc(label, mods + ["mod-new"]))
+
+    def finish() -> None:
+        report(label, published, model)
+
+    dev.set_platform_retry(0.01)
+    dev.set_update_oper(on_state)
+    dev.set_dmc(_dmc(label, mods))
+    after 0.5: finish()
+
+
+actor _test_platform_probe_selection(t: testing.EnvT):
+    """Each case connects a mocked device with fake probes and checks which
+    probes' answers DeviceMgr published, in order, and the model it shows at
+    the end."""
+    var want: dict[str, (probes: list[str], model: ?str)] = {}
+    var got: dict[str, (probes: list[str], model: ?str)] = {}
+    var finished = False
+
+    def report(label: str, published: list[str], model: ?str) -> None:
+        got[label] = (probes=published, model=model)
+        if finished or len(got) < len(want):
+            return
+        finished = True
+        bad: list[str] = []
+        for l, w in want.items():
+            g = got[l]
+            if g.probes != w.probes or g.model != w.model:
+                bad.append("{l}: want {w.probes} {w.model}, got {g.probes} {g.model}")
+        if len(bad) > 0:
+            t.failure(ValueError("; ".join(bad)))
+        else:
+            t.success()
+
+    def case(label: str, type_probes: list[swdev.PlatformProbe],
+             app_probes: list[swdev.PlatformProbe], mods: list[str],
+             probes: list[str], model: ?str, reconnect: bool=False) -> None:
+        want[label] = (probes=probes, model=model)
+        _Case(t, label, type_probes, app_probes, mods, reconnect, report)
+
+    case("first-applicable-wins",
+         [], [FakeProbe("mine", "mod-a", [ANSWER]), FakeProbe("default", "mod-a", [ANSWER])],
+         ["mod-a"], ["mine"], "model-mine")
+    case("not-applicable-is-skipped",
+         [], [FakeProbe("a", "mod-x", [ANSWER]), FakeProbe("b", "mod-b", [ANSWER])],
+         ["mod-b"], ["b"], "model-b")
+    case("device-type-probes-first",
+         [FakeProbe("type", "mod-a", [ANSWER])], [FakeProbe("app", "mod-a", [ANSWER])],
+         ["mod-a"], ["type"], "model-type")
+    case("mismatch-gives-to-next",
+         [], [FakeProbe("a", "mod-a", [MISMATCH]), FakeProbe("b", "mod-a", [ANSWER])],
+         ["mod-a"], ["b"], "model-b")
+    case("failure-retries-same-probe",
+         [], [FakeProbe("a", "mod-a", [FAIL, ANSWER]), FakeProbe("b", "mod-a", [ANSWER])],
+         ["mod-a"], ["a"], "model-a")
+    case("every-connect-reads-again",
+         [], [FakeProbe("b", "mod-new", [ANSWER]), FakeProbe("a", "mod-a", [ANSWER])],
+         ["mod-a"], ["a", "b"], "model-b", reconnect=True)
+    case("failure-keeps-last-values",
+         [], [FakeProbe("a", "mod-a", [ANSWER, FAIL])],
+         ["mod-a"], ["a"], "model-a", reconnect=True)
+    case("mismatch-removes-values",
+         [], [FakeProbe("a", "mod-a", [ANSWER, MISMATCH])],
+         ["mod-a"], ["a"], None, reconnect=True)
+    case("failure-removes-another-probes-values",
+         [], [FakeProbe("a", "mod-a", [ANSWER, MISMATCH]), FakeProbe("b", "mod-a", [FAIL])],
+         ["mod-a"], ["a"], None, reconnect=True)
+    case("not-connected-waits-for-the-next-connect",
+         [], [FakeProbe("a", "mod-a", [NOT_CONNECTED, ANSWER])],
+         ["mod-a"], [], None)
+    case("no-values-is-a-failure",
+         [], [FakeProbe("a", "mod-a", [EMPTY, ANSWER])],
+         ["mod-a"], ["a"], "model-a")
+    case("no-probe-applies",
+         [], [FakeProbe("a", "mod-x", [ANSWER])],
+         ["mod-a"], [], None)
+    case("no-probes",
+         [], [],
+         ["mod-a"], [], None)

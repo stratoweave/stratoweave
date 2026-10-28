@@ -878,6 +878,92 @@ actor _test_get(t: testing.EnvT):
     after 2.0: fail("Timed out waiting for the device data read")
 
 
+def _test_filter_missing_node_data_nodes_only():
+    """The parse keeps no anydata or anyxml, so the check counts them as
+    absent."""
+    ns = "urn:example:ex"
+    schema = yang.compile([r"""module ex {
+  yang-version "1.1";
+  namespace "urn:example:ex";
+  prefix ex;
+  container box {
+    leaf name { type string; }
+    anydata payload;
+    anyxml blob;
+  }
+}"""])
+    cases: list[(label: str, child: str, want: ?str)] = [
+        (label="leaf", child="name", want=None),
+        (label="anydata", child="payload", want="/ex:box/payload"),
+        (label="anyxml", child="blob", want="/ex:box/blob"),
+    ]
+    for c in cases:
+        filt = ygdata.FNode(children=[
+            ygdata.FNode(ygdata.Id(ns, "box"), children=[ygdata.FNode(ygdata.Id(ns, c.child))])
+        ])
+        testing.assertEqual(c.want, swna.filter_missing_node(schema, filt), c.label)
+
+
+actor _test_get_missing_from_schema(t: testing.EnvT):
+    """A get whose filter names a node absent from the device schema is
+    rejected before transport. The error gives the path of the node."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-get-missing-schema", noop_on_reconf)
+    var done = False
+
+    def fail(msg: str):
+        if done:
+            return
+        done = True
+        t.failure(ValueError(msg))
+
+    def on_get(r: ?ygdata.Node, err: ?Exception):
+        if done:
+            return
+        if r is not None:
+            fail("get for an unknown node returned data: {r}")
+        elif err is None:
+            fail("get for an unknown node unexpectedly succeeded")
+        elif "/ietf-system:system-state/clock/timezone not found in device schema" not in str(err):
+            fail("get for an unknown node returned an unexpected error: {err}")
+        else:
+            def succeed_if_not_sent():
+                if not done:
+                    done = True
+                    t.success()
+            after 0.05: succeed_if_not_sent()
+
+    def start():
+        if done:
+            return
+        if IETF_SYSTEM_MODULE not in dev.get_modules().0:
+            after 0.01: start()
+            return
+        msg = async dev.get_adapter()
+        adapter = await msg
+        if isinstance(adapter, swna.NetconfAdapter):
+            mock_server = adapter.get_mock_server()
+            if mock_server is not None:
+                def on_rpc(request: xml.Node, reply: action(?list[xml.Node], ?str, ?str) -> None) -> None:
+                    fail("get for an unknown node reached the NETCONF server")
+                mock_server.set_rpc_cb(on_rpc, overrides={"get"})
+                dev.get(on_get, ygdata.FNode(None, None, [
+                    ygdata.FNode(_q("system-state"), children=[
+                        ygdata.FNode(_q("clock"), children=[
+                            ygdata.FNode(_q("timezone"))
+                        ])
+                    ])
+                ]))
+            else:
+                fail("Expected NetconfMockServer from NetconfAdapter")
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    start()
+    after 2.0: fail("Timed out waiting for the get callback")
+
+
 actor _test_subscribe_periodic(t: testing.EnvT):
     """Periodic subscription via NETCONF mock server.
 
