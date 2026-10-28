@@ -112,6 +112,24 @@ verdicts back to `not-run`. State is not saved; after a restart it is
 `unknown`. The model also has `upgrade-needed` and a `job` list, which the
 manager does not set.
 
+## Hardware model
+
+Published under `stratoweave-rfs:device=<name>/state/hardware/model`: the
+chassis model the device reports, for example `C8000V`, so an image can be
+picked per model.
+
+- `DeviceMgr` reads it on every connect. Nothing polls: a chassis changes
+  only with a new connection.
+- A failed read removes the leaf, so the model of an earlier box does not
+  outlive a reconnect. While the device is down, the last value stays.
+- A model that differs from the last one found is logged as a warning.
+- Not saved; after a restart it is absent until the device connects.
+
+Each read names the module it needs. The app runner gives every `DeviceMgr`
+the IOS XE read, and on connect the first read runs whose module the device
+lists and the device type's schema has. The leaf is absent when no read fits,
+the read fails or it finds no chassis; the log tells these apart.
+
 ## Adapter API
 
 A platform adapter is a subclass of `SoftwareAdapter` in `src/device.act`.
@@ -163,6 +181,12 @@ NETCONF RPCs:
   reboot the release is read every 20 seconds for up to 35 minutes. Nothing
   is retried.
 - Old images stay on bootflash. `cleanup` does nothing.
+- The hardware model is the `part-number` of the chassis entry in the
+  `device-inventory` list of `Cisco-IOS-XE-device-hardware-oper`, read by
+  `src/adapters/hardware_iosxe.act`. It reads the type, index and
+  part-number of every entry, because the chassis need not be index 0.
+  `Cisco-IOS-XE-platform-oper` names the chassis too, but a lab c8000v
+  returned invalid UTF-8 there.
 
 The YANG for these RPCs and oper nodes is a trimmed copy in
 `src/adapters/software_iosxe_yang.act`. The bindings generated from it are in
@@ -174,6 +198,7 @@ The YANG for these RPCs and oper nodes is a trimmed copy in
 | --- | --- |
 | `src/test_swmgr.act` | The manager, with the in-memory adapter from `src/adapters/software_mock.act` |
 | `src/adapters/test_software_iosxe.act` | The IOS XE adapter, against `IosXeSoftwareMock` |
+| `src/adapters/test_hardware_iosxe.act` | The IOS XE hardware read, and the model `DeviceMgr` publishes from it |
 
 `IosXeSoftwareMock` in `src/adapters/software_iosxe_mock.act` runs behind the
 in-process NETCONF mock server. Like a real device, it answers an RPC before
@@ -185,6 +210,13 @@ device sets these leaves under `mock/software`:
 | `upgrade-duration` | Seconds a whole upgrade takes. Absent or 0 ends each step at once. |
 | `failure` | One device failure to reproduce, see below. |
 | `running-release` | Release before the upgrade. Default `17.18.02`. |
+
+`mock/hardware/model` is the chassis model the mock serves, `C8000V` when
+absent. A device type gets the mock from these leaves by passing `seeder` from
+the same file to its `NetconfAdapter` as `on_mock_server`. A leaf change
+reconnects the device: the mock moves to the new server and keeps its release
+and history, and the software adapter is rebuilt, so the next upgrade uses
+the new values.
 
 The upgrade duration is split in the shares measured on a lab c8000v with a
 962 MB image: copy 130 s, add 20 s, activate 240 s and commit 5 s, 395 s in
