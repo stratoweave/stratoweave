@@ -1,0 +1,213 @@
+#
+# IOS XE platform probe: the filter, the parse, a device type without the
+# hardware module, and what DeviceMgr publishes from a mocked device.
+#
+
+import testing
+import yang
+import yang.gdata as ygdata
+
+import device as swdev
+import device_oper as swdevoper
+import platform_probes
+import adapters.netconf as swna
+import adapters.platform_iosxe as swxeplat
+import adapters.software_iosxe_mock as swxemock
+import adapters.software_iosxe_oper as ixoper
+import adapters.software_iosxe_yang as swxe_yang
+from adapters.adapter import ModCap
+
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials
+
+OLD_RELEASE = swxemock.OLD_RELEASE
+CHASSIS = swxeplat.HW_TYPE_CHASSIS
+
+
+def _ds(inventory: list[ygdata.Node]) -> ygdata.Node:
+    """The mock's operational datastore with these inventory entries."""
+    return swxemock.operational_datastore(OLD_RELEASE, [], inventory=inventory)
+
+
+def _test_filter_selects_inventory_and_version():
+    """The filter returns every inventory entry and the version banner, and
+    nothing from the install tree."""
+    # The local filter drops an entry that lacks a selected leaf, so the PIM
+    # entry has a serial number too.
+    root = _ds([
+        swxemock.inventory_entry("hw-type-pim", 1, "C8000V", "P1"),
+        swxemock.inventory_entry(CHASSIS, 0, "C8000V", swxemock.SERIAL),
+    ])
+    got = ygdata.filter(root, ygdata.FNode(children=[swxeplat.platform_filter()]))
+    testing.assertTrue(got is not None, "the filter returned no data")
+    hardware = ixoper.root.from_gdata(got).device_hardware_data.device_hardware
+    testing.assertEqual(2, len(hardware.device_inventory), "inventory entries were lost")
+    testing.assertTrue(hardware.device_system_data.software_version is not None,
+                       "the version banner was lost")
+    testing.assertTrue("install-oper-data" not in got!.prsrc(),
+                       "the filter returned the install tree")
+
+
+def _test_platform_from_reply():
+    """The model and serial number come from the chassis entry with the lowest
+    index; the version comes from the banner."""
+    cases: list[(label: str, inventory: list[ygdata.Node], model: ?str, serial: ?str)] = [
+        (label="chassis-not-first",
+         inventory=[swxemock.inventory_entry("hw-type-pim", 1, "C8300-1N1S-4T2X"),
+                    swxemock.inventory_entry("hw-type-cpu", 4, " AuthenticAMD"),
+                    swxemock.inventory_entry(CHASSIS, 0, "C8300-1N1S-4T2X", "S0")],
+         model="C8300-1N1S-4T2X", serial="S0"),
+        (label="lowest-chassis-index-last",
+         inventory=[swxemock.inventory_entry(CHASSIS, 2, "C9300-48P", "S2"),
+                    swxemock.inventory_entry(CHASSIS, 1, "C9300-24T", "S1")],
+         model="C9300-24T", serial="S1"),
+        (label="lowest-chassis-index-first",
+         inventory=[swxemock.inventory_entry(CHASSIS, 1, "C9300-24T", "S1"),
+                    swxemock.inventory_entry(CHASSIS, 2, "C9300-48P", "S2")],
+         model="C9300-24T", serial="S1"),
+        (label="no-chassis-entry",
+         inventory=[swxemock.inventory_entry("hw-type-pim", 1, "C8000V")],
+         model=None, serial=None),
+        (label="empty-part-number",
+         inventory=[swxemock.inventory_entry(CHASSIS, 0, "")],
+         model=None, serial=None),
+        (label="no-inventory", inventory=[], model=None, serial=None),
+    ]
+    for c in cases:
+        p = swxeplat.platform(_ds(c.inventory))
+        if p is not None:
+            testing.assertEqual("ios-xe", p.os, "{c.label}: os")
+            testing.assertEqual(OLD_RELEASE, p.version, "{c.label}: version")
+            testing.assertEqual(c.model, p.model, "{c.label}: model")
+            testing.assertEqual(c.serial, p.serial_number, "{c.label}: serial number")
+        else:
+            testing.error("{c.label}: no platform")
+
+
+def _test_platform_without_values():
+    """A reply with neither a version nor a chassis entry is no platform."""
+    testing.assertTrue(swxeplat.platform(None) is None, "no reply")
+    testing.assertTrue(swxeplat.platform(ygdata.Container({})) is None, "an empty reply")
+
+
+def _test_probe_applies_on_its_module():
+    m = swxeplat.MODULE
+    testing.assertTrue(swxeplat.PROBE.applies({m: ModCap(m, "urn:x")}),
+                       "the device lists the module")
+    testing.assertTrue(not swxeplat.PROBE.applies({"Cisco-IOS-XE-native": ModCap("Cisco-IOS-XE-native", "urn:y")}),
+                       "the device does not list the module")
+
+
+actor _test_probe_without_the_module_in_the_schema(t: testing.EnvT):
+    """The device type's schema lacks Cisco-IOS-XE-device-hardware-oper. The
+    probe's get fails and names the node that the schema does not have."""
+    var finished = False
+
+    def end(err: ?Exception) -> None:
+        if finished:
+            return
+        finished = True
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    # Only install-oper: the device type knows nothing of the hardware tree.
+    schema = yang.compile([swxe_yang.install_oper])
+    dev_types = {
+        "iosxe": swdev.DeviceType(name="iosxe", adapter_type=swna.NetconfAdapter,
+                                  src_dnode=schema, oper_src_dnode=schema)
+    }
+    dev = swdev.DeviceMgr(dev_types, t.env, "d-no-module", t.log_handler, on_reconf,
+                          swdev.SchemaRegistry())
+
+    def on_probe(p: ?swdev.Platform, err: ?Exception) -> None:
+        want = "/device-hardware-data in namespace {ixoper.NS_Cisco_IOS_XE_device_hardware_oper} not found in device schema"
+        if p is not None:
+            end(ValueError("the probe found a platform: {p.model}"))
+        elif err is None:
+            end(ValueError("the probe gave neither a platform nor an error"))
+        elif want not in str(err):
+            end(ValueError("got {err}, want {want}"))
+        else:
+            end(None)
+
+    def start() -> None:
+        if "Cisco-IOS-XE-install-oper" not in dev.get_modules().0:
+            after 0.01: start()
+            return
+        swxeplat.PROBE.read(dev, on_probe)
+
+    def timeout() -> None:
+        end(ValueError("timed out"))
+
+    dmc = DeviceMetaConfig("d-no-module", Credentials("admin", "admin"), type="iosxe")
+    dmc.mock.enabled = True
+    dev.set_dmc(dmc)
+    start()
+    after 2.5: timeout()
+
+
+actor _test_platform_published_on_connect(t: testing.EnvT):
+    """A mocked IOS XE device connects and DeviceMgr publishes what the IOS XE
+    probe from the default list reads. The mock is attached after the
+    connect, so the first read can find no data; the retry then finds it."""
+    var finished = False
+
+    def end(err: ?Exception) -> None:
+        if finished:
+            return
+        finished = True
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if oper is not None:
+            p = swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).state.platform
+            if p.model is not None:
+                got = "{p.os} {p.version} {p.model} {p.serial_number} {p.probe}"
+                want = "ios-xe {OLD_RELEASE} C8300-1N1S-4T2X {swxemock.SERIAL} ios-xe"
+                if got != want:
+                    end(ValueError("published {got}, want {want}"))
+                else:
+                    end(None)
+
+    schema = yang.compile(swxe_yang.models)
+    dev_types = {
+        "iosxe": swdev.DeviceType(name="iosxe", adapter_type=swna.NetconfAdapter,
+                                  src_dnode=schema, oper_src_dnode=schema)
+    }
+    dev = swdev.DeviceMgr(dev_types, t.env, "d-published", t.log_handler, on_reconf,
+                          swdev.SchemaRegistry(), platform_probes=platform_probes.PROBES)
+
+    def start() -> None:
+        if "Cisco-IOS-XE-install-oper" not in dev.get_modules().0:
+            after 0.01: start()
+            return
+        a = dev.get_adapter()
+        if isinstance(a, swna.NetconfAdapter):
+            ms = a.get_mock_server()
+            if ms is not None:
+                swxemock.IosXeSoftwareMock(ms, t.log_handler, model="C8300-1N1S-4T2X").attach()
+                return
+        end(ValueError("no mock server"))
+
+    def timeout() -> None:
+        end(ValueError("timed out"))
+
+    dev.set_platform_retry(0.05)
+    dev.set_update_oper(on_state)
+    dmc = DeviceMetaConfig("d-published", Credentials("admin", "admin"), type="iosxe")
+    dmc.mock.enabled = True
+    dev.set_dmc(dmc)
+    start()
+    after 2.5: timeout()
