@@ -1,0 +1,94 @@
+"""EtcdClient error responses, using a local TCP server instead of etcd."""
+
+import http
+import net
+import testing
+
+import db.etcd as swetcd
+
+
+actor http_error_bodies_complete_callbacks(t: testing.EnvT):
+    tcp_cap = net.TCPCap(net.NetCap(t.env.cap))
+    var client: ?swetcd.EtcdClient = None
+    var listener: ?net.TCPListener = None
+    var connection: ?net.TCPListenConnection = None
+    var finished = False
+    var requests = 0
+    var callbacks = 0
+    parser = http.MessageParser()
+    replies = [(500, b"\xff"), (503, b"etcd unavailable"), (200, b"{\"kvs\":[]}")]
+    expected_errors = ["Etcd request failed with HTTP 500",
+                       "Etcd request failed with HTTP 503: etcd unavailable"]
+
+    def closed(error: ?Exception):
+        pass
+
+    def finish(error: ?Exception=None):
+        if finished:
+            return
+        finished = True
+        if client is not None:
+            client.close(closed)
+        if connection is not None:
+            connection.close()
+        if listener is not None:
+            listener.close()
+        if error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    def verify():
+        try:
+            testing.assertEqual(callbacks, 3)
+            testing.assertEqual(requests, 3)
+            finish()
+        except Exception as err:
+            finish(err)
+
+    def received(data: ?value, error: ?Exception):
+        try:
+            testing.assertTrue(callbacks < 3, "A callback fired more than once")
+            if callbacks < 2:
+                testing.assertTrue(data is None)
+                testing.assertTrue(isinstance(error, ValueError))
+                testing.assertEqual(error!.error_message, expected_errors[callbacks])
+            else:
+                testing.assertTrue(error is None)
+                testing.assertTrue(isinstance(data, dict))
+            callbacks += 1
+            if callbacks == 3:
+                after 0.05: verify()
+        except Exception as err:
+            finish(err)
+
+    def server_error(conn: net.TCPListenConnection, error: str):
+        finish(ValueError(error))
+
+    def server_receive(conn: net.TCPListenConnection, data: bytes):
+        for msg in parser.feed(data):
+            if requests >= len(replies):
+                finish(AssertionError("Unexpected extra request"))
+                return
+            status, body = replies[requests]
+            requests += 1
+            conn.write(b"HTTP/1.1 " + str(status).encode() + b" Test\r\nContent-Length: " +
+                       str(len(body)).encode() + b"\r\n\r\n" + body)
+        if parser.error is not None:
+            finish(ValueError(parser.error!))
+
+    def accepted(conn: net.TCPListenConnection):
+        connection = conn
+        conn.cb_install(server_receive, server_error)
+
+    def listening(server: net.TCPListener, error: ?str):
+        if error is not None:
+            finish(ValueError(error))
+            return
+        c = swetcd.EtcdClient(net.TCPConnectCap(tcp_cap), "127.0.0.1", server.local_port())
+        client = c
+        for i in range(len(replies)):
+            c.post("/v3/kv/range", {"key": "YQ=="}, received)
+
+    listener = net.TCPListener(net.TCPListenCap(tcp_cap), "127.0.0.1", 0, listening, accepted)
+    after 2: finish(AssertionError("Timed out waiting for error and success callbacks"))
