@@ -24,7 +24,7 @@ persisted: after a restart it is empty until the device connects.
 | Leaf | Meaning |
 | --- | --- |
 | `os` | Operating system family, for example `ios-xe`. The probe sets it; it is not read from the device. |
-| `version` | Release as the device reports it, for example `17.18.02`. |
+| `version` | Release as the device reports it, for example `17.18.2`. |
 | `model` | Chassis product id, for example `C8000V`. |
 | `serial-number` | Chassis serial number. |
 | `probe` | Name of the probe that read the values. |
@@ -182,8 +182,9 @@ The `ios-xe` probe in `src/adapters/platform_iosxe.act`:
 - Takes the model and serial number from the chassis entry with the lowest
   `hw-dev-index`, so a stack gives the same answer whatever order the
   entries come in.
-- Takes the version out of the banner, as the software adapter does:
-  `Cisco IOS XE Software, Version 17.18.02` gives `17.18.02`.
+- Takes the version out of the banner, as the software adapter does: a lab
+  c8000v on 17.18.02 says `... Version 17.18.2, RELEASE SOFTWARE (fc3)`,
+  which gives `17.18.2`. The CLI `show version` says `17.18.02`.
 - Needs the pruned IOS XE YANG in `src/adapters/software_iosxe_yang.act` in
   the device type's schema, as the software adapter does.
 

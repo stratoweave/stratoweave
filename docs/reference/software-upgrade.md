@@ -184,7 +184,7 @@ device sets these leaves under `mock/software`:
 | --- | --- |
 | `upgrade-duration` | Seconds a whole upgrade takes. Absent or 0 ends each step at once. |
 | `failure` | One device failure to reproduce, see below. |
-| `running-release` | Release before the upgrade. Default `17.18.02`. |
+| `running-release` | Release before the upgrade. Default `17.18.02`, which the mock reports as `17.18.2`, as a device does. |
 
 The upgrade duration is split in the shares measured on a lab c8000v with a
 962 MB image: copy 130 s, add 20 s, activate 240 s and commit 5 s, 395 s in
