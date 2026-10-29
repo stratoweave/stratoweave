@@ -12,6 +12,9 @@ them.
 | `PlatformProbe` | `src/device.act` | Reads the platform of a device. |
 | `GetPlatformProbe` | `src/device.act` | A probe that needs one get. Most probes are one. |
 | `platform_probes.PROBES` | `src/platform_probes.act` | The probes that come with StratoWeave. |
+| `platform_probes.MODELS` | `src/platform_probes.act` | The YANG those probes read, for a device type that does not know the OS. |
+| The probes | `src/adapters/platform_<os>.act` | One module per OS, with its pruned YANG in `platform_<os>_yang.act`. |
+| `ncurl platform` | `src/ncurl.act` | Reads one device with `PROBES` and prints its platform. |
 | `SysSpec.platform_probes` | `src/app.act` | The app's list of probes. `PROBES` unless the app gives its own. |
 | `DeviceType.platform_probes` | `src/device.act` | Probes for devices of one type. They run before the app's list. |
 | `DeviceMgr` | `src/device.act` | Picks the probe, runs it and publishes the answer. |
@@ -23,15 +26,17 @@ persisted: after a restart it is empty until the device connects.
 
 | Leaf | Meaning |
 | --- | --- |
-| `os` | Operating system family, for example `ios-xe`. The probe sets it; it is not read from the device. |
-| `version` | Release as the device reports it, for example `17.18.02`. |
-| `model` | Chassis product id, for example `C8000V`. |
+| `os` | Operating system family: `ios-xe`, `ios-xr`, `junos`, `srlinux`, `sros` or `arcos`. The probe sets it; it is not read from the device. |
+| `version` | Release as the device reports it, for example `17.18.2`. |
+| `model` | Chassis model, for example `C8000V`. |
 | `serial-number` | Chassis serial number. |
 | `probe` | Name of the probe that read the values. |
 
-The version is spelled the way the device spells it. Compare it with a
-release name through the platform's `SoftwareAdapter.matches_release`, not
-with `==`: IOS XE reports `17.18.3a` for an image called `17.18.03a`.
+The version is the release as the device spells it, without what the device
+puts around it: the IOS XE banner, the `v` and the build of SR Linux, the
+image type of SR OS. Compare it with a release name through the platform's
+`SoftwareAdapter.matches_release`, not with `==`: IOS XE reports `17.18.3a`
+for an image called `17.18.03a`.
 
 ## When the platform is read
 
@@ -154,7 +159,7 @@ When the schema lacks a node that the filter names, the get fails with
 `Filter node <path> not found in device schema`. The probe then runs again
 later, as after any failure.
 
-### Anything else: `PlatformProbe`
+### More than one read: `PlatformProbe`
 
 For a probe that needs an RPC or more than one read, subclass
 `PlatformProbe` and implement `applies` and `read(dev, done)`. `read` calls
@@ -168,45 +173,110 @@ For a probe that needs an RPC or more than one read, subclass
 
 `read` runs in the `DeviceMgr`, so it must not wait for the result of a call
 to `dev`: that call would wait for `read` to end. A reply from `dev` must go
-to an action, and a nested function in a class method is not one. So start
-an actor that sends the requests and receives the replies, as
-`_GetPlatformRead` in `src/device.act` does.
+to an action, and a nested function in a class method is not one. So `read`
+starts an actor that sends the requests and receives the replies, one step
+after the other. The IOS XR probe's `_IosXrRead` and the SR Linux probe's
+`_SrLinuxRead` send two gets, the Junos probe's `_JunosRead` two RPCs.
 
-## IOS XE
+Give each get one subtree. Some devices take only one subtree in a filter,
+so a probe that reads two subtrees sends two gets.
 
-The `ios-xe` probe in `src/adapters/platform_iosxe.act`:
+## The probes
 
-- Applies when the device lists `Cisco-IOS-XE-device-hardware-oper`.
-- Reads, in one get, the type, index, part-number and serial number of every
-  `device-inventory` entry, and `device-system-data/software-version`.
+| Probe | Applies when the device lists | Reads | Model | Serial number |
+| --- | --- | --- | --- | --- |
+| `ios-xe` | `Cisco-IOS-XE-device-hardware-oper` | one get: inventory and version banner | chassis part number | chassis entry |
+| `ios-xr` | `Cisco-IOS-XR-install-oper` | two gets: `install/version`, the rack inventory | `chassis-pid`, else the rack's model | the rack with the lowest name |
+| `junos` | `junos-rpc-version` | RPCs `get-software-information`, `get-system-information` | `product-model` | `serial-number` of system information |
+| `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis |
+| `sros` | `nokia-state` | one get: `/state/system` and `/state/chassis` | `system/platform` | router chassis with the lowest number |
+| `arcos` | `arcos-openconfig-system-augments` | one get: `system/version/state` | `platform` | `serial-number` |
+
+Each probe but Junos reads through YANG that its module ships pruned in
+`platform_<os>_yang.act` (`software_iosxe_yang.act` for IOS XE), with the
+namespaces and node names of the real modules. A device type for that OS
+adds those models, unless its schema has the real modules. The probes apply
+to different modules, so a device's modules pick one of them.
+
+### IOS XE
+
 - Takes the model and serial number from the chassis entry with the lowest
   `hw-dev-index`, so a stack gives the same answer whatever order the
   entries come in.
-- Takes the version out of the banner, as the software adapter does:
-  `Cisco IOS XE Software, Version 17.18.02` gives `17.18.02`.
-- Needs the pruned IOS XE YANG in `src/adapters/software_iosxe_yang.act` in
-  the device type's schema, as the software adapter does.
+- Takes the version out of the banner, as the software adapter does: the
+  text after the first `Version ` up to the comma. A c8000v 17.18.2 reports
+  `Cisco IOS Software [IOSXE], Virtual XE Software (...), Version 17.18.2,
+  RELEASE SOFTWARE (fc3)` and three more lines.
 
 `Cisco-IOS-XE-platform-oper` names the chassis too, but a lab c8000v
 returned invalid UTF-8 in that tree.
 
 `IosXeSoftwareMock` serves a chassis entry: part-number `C8000V`, or the
-`model` it is given, and serial number `SERIAL`. The mock's subtree filter
-returns no data when a list the filter selects is absent, so without the
-entry the read would get nothing, not even the version.
+`model` it is given, and serial number `SERIAL`.
+
+### IOS XR
+
+`install/version` holds what `show version` prints: the release `label` and,
+on some devices, the `chassis-pid`. The rack inventory in
+`Cisco-IOS-XR-invmgr-oper` holds what `show inventory` prints for `Rack 0`:
+its model and serial number.
+
+- An XRd has a `chassis-pid`, `XRd-CP-C-01`, and no inventory: the inventory
+  get answers no data, so it has no serial number.
+- An XRv 9000 has no `chassis-pid`. Its model, `R-IOSXRV9000-CC`, and its
+  serial number come from the inventory.
+- The inventory get is optional: when it fails, the probe still answers from
+  `install/version`.
+
+### Junos
+
+Junos serves no state in YANG for what it is, so the probe calls the RPCs
+that `show version` and `show system information` call. Junos does not put
+an RPC's reply in the namespace of its YANG module, and runtime schema fetch
+skips the `junos-rpc-*` modules. So the probe sends the RPCs with `rpc_xml`
+and reads the replies by element name, and needs no YANG in the device
+type's schema.
+
+- The model and the release come from `get-software-information`; a device
+  with two routing engines answers for each, and the probe takes the first.
+- The serial number comes from `get-system-information`. When that RPC
+  fails, the probe still answers, without a serial number. A cRPD has no
+  serial number and leaves `os-version` empty.
+
+### SR Linux
+
+The version is `v25.3.2-312-ga0c5002f15`: the probe drops the `v` and the
+build, which gives `25.3.2`.
+
+### SR OS
+
+The probe applies to a model-driven or mixed mode SR OS, which serves
+`nokia-state`. The version number starts with the image type: `B-25.10.R7`
+on an SR-SIM gives `25.10.R7`, `C-23.10.R1` on a 7950 XRS vSIM `23.10.R1`. A system of two chassis, like a 7950 XRS-40, lists both;
+the serial number comes from the router chassis with the lowest number.
+
+### ArcOS
+
+`system/version/state` holds what `show version` prints. On a container the
+platform is `Virtual` and there is no serial number. The OpenConfig chassis
+component has neither part nor serial number there.
 
 ## Testing
 
 | Test | Covers |
 | --- | --- |
 | `src/test_platform.act` | Which probe runs and what `DeviceMgr` publishes, with fake probes: order, device type first, mismatch, failure, removal, every connect. |
-| `src/adapters/test_platform_iosxe.act` | The IOS XE filter and parse, the error for a device type without the hardware module, and the platform a mocked IOS XE device publishes. |
+| `src/adapters/test_platform_lab.act` | What virtual devices of each platform answered, recorded in `test_platform_lab_data.act`: which probe each device's module list picks, what each probe makes of the device's replies, and what `DeviceMgr` publishes when a mock NETCONF server serves them. |
+| `src/adapters/test_platform_<os>.act` | Each probe's parse of replies not recorded there, like hardware with serial numbers and Junos with two routing engines, and `applies`. |
+| `src/adapters/test_platform_iosxe.act` | Also the IOS XE filter and the error for a device type without the hardware module. |
+
+To add a platform, record a device's module list and its replies in
+`test_platform_lab_data.act`, and add it to `test_platform_lab.act`. The selection test then checks that no other
+probe applies to its modules, and that the new probe applies to no other
+device's.
 
 ## Limits
 
-- A Junos probe would call `get-system-information`, an RPC in a
-  `junos-rpc-*` module. Runtime schema fetch skips those modules, so with it
-  on, such a probe has to use `rpc_xml` and parse the XML itself.
 - Retries have no jitter: devices that connected together retry together.
 - A probe that applies but cannot read retries every 300 seconds while the
   device stays connected: when the device never serves the data, or when the
@@ -214,3 +284,10 @@ entry the read would get nothing, not even the version.
   `IosXeSoftwareMock` never serve it.
 - An IOS XE reply with a version but no chassis entry is an answer, so it
   removes the model and serial number.
+- The mock NETCONF server's subtree filter returns no data at all when a node
+  the filter selects is absent, where a device returns the other nodes. A
+  mocked device must serve every node that the probe selects.
+- With runtime schema fetch on, SR OS 23.10 and ArcOS 8.2.1A get
+  no schema, so no probe reads them. SR OS sends `nokia-conf`, about 20 MB of
+  YANG, in one text node, which the XML parser refuses above 10 MB. An ArcOS
+  module imports `tailf-rollback`, which ArcOS does not list.
