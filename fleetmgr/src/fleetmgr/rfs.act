@@ -12,10 +12,11 @@ import fleetmgr.devices.flotilla_oper as flotilla_oper
 import yang.identityref
 
 
-def status_subscription(name: str) -> ygdata.SubscriptionSpec:
-    """Return the on-change subscription to the software state that the
-    flotilla reports for one device."""
-    return flotilla_oper.subs.device.entry(name).software.state.subscribe()
+def device_subscription(name: str) -> ygdata.SubscriptionSpec:
+    """Return the on-change subscription to the software state and the
+    platform that the flotilla reports for one device."""
+    device = flotilla_oper.subs.device.entry(name)
+    return device.subscribe(select=[device.software.state, device.state.platform])
 
 
 actor DeviceTransform(
@@ -23,41 +24,27 @@ actor DeviceTransform(
     update_oper: proc(?y1_oper.stratoweave_rfs__rfs__device_entry) -> None,
     dev: swdev.DeviceMgr,
 ):
-    """Publish the software state that the flotilla reports for one device.
+    """Publish the software state and platform that the flotilla reports for
+    one device.
 
     The actor subscribes to the flotilla for this device only. It publishes
-    the status, running release, stage, reason and check verdicts as the
-    oper state of its own entry, so a change on one device publishes one
-    entry."""
+    the status, running release, stage, reason, check verdicts and platform
+    as the oper state of its own entry, so a change on one device publishes
+    one entry. One subscription takes both."""
     var subscriptions: ?ygdata.SubscriptionManager = None
     var latest: ?(status: ?str, running_release: ?str, stage: ?str, reason: ?str,
                   precheck: (verdict: ?str, detail: ?str, at: ?str),
                   postcheck: (verdict: ?str, detail: ?str, at: ?str)) = None
-    var generation = 0
+    var platform: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
 
-    def on_state(gen: int, keys: ?(device_name: str),
-                 state: ?flotilla_oper.stratoweave_rfs__device__software__state,
-                 error: ?Exception) -> None:
-        # A callback from an earlier subscription may already be queued.
-        if gen != generation:
+    def publish() -> None:
+        value = latest
+        p = platform
+        if value is None and p is None:
+            update_oper(None)
             return
-        value: ?(status: ?str, running_release: ?str, stage: ?str, reason: ?str,
-                 precheck: (verdict: ?str, detail: ?str, at: ?str),
-                 postcheck: (verdict: ?str, detail: ?str, at: ?str)) = None
-        if error is not None:
-            print("device status subscription failed at {path}: {error}", err=True)
-        elif state is not None and (state.status is not None or state.running_release is not None):
-            pre = state.precheck
-            post = state.postcheck
-            value = (status=state.status, running_release=state.running_release,
-                     stage=state.stage, reason=state.reason,
-                     precheck=(verdict=pre.verdict, detail=pre.detail, at=pre.at),
-                     postcheck=(verdict=post.verdict, detail=post.detail, at=post.at))
-        if value == latest:
-            return
-        latest = value
+        oper = base.Device.new_state(path)
         if value is not None:
-            oper = base.Device.new_state(path)
             s = oper.software.state
             s.status = value.status
             s.running_release = value.running_release
@@ -69,13 +56,47 @@ actor DeviceTransform(
             s.postcheck.verdict = value.postcheck.verdict
             s.postcheck.detail = value.postcheck.detail
             s.postcheck.at = value.postcheck.at
-            update_oper(oper)
-        else:
-            update_oper(None)
+        if p is not None:
+            o = oper.state.platform
+            o.os = p.os
+            o.version = p.version
+            o.model = p.model
+            o.serial_number = p.serial_number
+        update_oper(oper)
+
+    def on_device(keys: ?(device_name: str),
+                  device: ?flotilla_oper.stratoweave_rfs__device_entry,
+                  error: ?Exception) -> None:
+        # A call can still arrive after shutdown closed the subscription.
+        if subscriptions is None:
+            return
+        value: ?(status: ?str, running_release: ?str, stage: ?str, reason: ?str,
+                 precheck: (verdict: ?str, detail: ?str, at: ?str),
+                 postcheck: (verdict: ?str, detail: ?str, at: ?str)) = None
+        p: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+        if error is not None:
+            print("device state subscription failed at {path}: {error}", err=True)
+        elif device is not None:
+            state = device.software.state
+            if state.status is not None or state.running_release is not None:
+                pre = state.precheck
+                post = state.postcheck
+                value = (status=state.status, running_release=state.running_release,
+                         stage=state.stage, reason=state.reason,
+                         precheck=(verdict=pre.verdict, detail=pre.detail, at=pre.at),
+                         postcheck=(verdict=post.verdict, detail=post.detail, at=post.at))
+            pl = device.state.platform
+            if (pl.os is not None or pl.version is not None or
+                    pl.model is not None or pl.serial_number is not None):
+                p = (os=pl.os, version=pl.version, model=pl.model, serial_number=pl.serial_number)
+        if value != latest or p != platform:
+            latest = value
+            platform = p
+            publish()
 
     def shutdown() -> None:
-        generation += 1
         latest = None
+        platform = None
         if subscriptions is not None:
             subscriptions!.close()
             subscriptions = None
@@ -83,14 +104,12 @@ actor DeviceTransform(
 
     def on_conf(conf: y_1.stratoweave_rfs__rfs__device_entry) -> None:
         if subscriptions is None:
-            generation += 1
-            gen = generation
             subscriptions = ygdata.SubscriptionManager(dev.tree_provider(), str(path))
-            state = flotilla_oper.subs.device.software.state
-            destination = state.dst(lambda keys, value, error: self.on_state(gen, keys, value, error))
-            subscriptions!.declare({destination.deliver({
-                status_subscription(conf.name),
-            })})
+            subscriptions!.declare({
+                flotilla_oper.subs.device.dst(on_device).deliver({
+                    device_subscription(conf.name),
+                }),
+            })
 
 
 class Device(base.Device):

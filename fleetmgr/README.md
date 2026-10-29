@@ -15,9 +15,12 @@ an IOS XE device.
         -> IOS XE adapter -> physical or mock IOS XE device
 
     flotilla operational datastore /device{cpe}/software/state
+    and /device{cpe}/state/platform
         -> one on-change subscription per device
         -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}/software/state
+           and /rfs{flotilla-1}/device{cpe}/state/platform
         -> fleetmgr CFS /software/upgrade-campaign/state
+           and /fleet/device{cpe}/state/platform
 
     flotilla RFS /rfs{cpe}/device-health
         -> a periodic BGP state subscription while a check runs
@@ -200,12 +203,15 @@ yet. Like `/schedules`, the container is a transform that produces no
 configuration, so campaigns can link the whole list later.
 
 The RFS transform renders that entry directly into the flotilla's standard
-`/device` schema. Its actor keeps one on-change subscription to the device's
-`/device/software/state` on the flotilla, and publishes the status, running
-release, stage, reason and check verdicts as the entry's own `software/state`.
-A change on one device publishes one entry. Removing the entry closes the subscription
+`/device` schema. Its actor keeps one on-change subscription on the flotilla
+to the device's `/device/software/state` and `/device/state/platform`, and
+publishes the status, running release, stage, reason and check verdicts as the
+entry's own `software/state` and the platform as its `state/platform`. A change
+on one device publishes one entry. Removing the entry closes the subscription
 and clears the state. Campaign transforms subscribe to these entries and
-aggregate their own members.
+aggregate their own members. Each `/fleet/device` actor subscribes to its RFS
+entry's platform and publishes it as its own `state/platform`: OS, version,
+model and serial number.
 
 `flotilla` supplies one modeled layer, the standard RFS plus the
 `flotilla-rfs` augment below. StratoWeave adds the implicit device layer
@@ -244,7 +250,7 @@ with its numbers, except on the `bgp-down` and `bgp-lost` devices.
 
 The focused tests cover device placement by name, the top's flotilla
 entries, precise campaign links, campaign aggregation, the stage, reason and
-check verdicts reaching the campaign, the parent RFS-to-flotilla render, direct `/device` configuration at
+check verdicts reaching the campaign, the platform reaching the top, the parent RFS-to-flotilla render, direct `/device` configuration at
 the RFS-only bottom, the mock leaves reaching the flotilla, reading the BGP
 neighbors, and a complete mock IOS XE software upgrade gated by the
 device-health checks, which the mock's BGP failures refuse or roll back. The
