@@ -1,0 +1,237 @@
+#
+# The platform probes against what virtual devices of each platform told
+# StratoWeave, recorded in test_platform_lab_data: which probe each device's
+# modules pick, what that probe makes of the device's replies, and what
+# DeviceMgr publishes when a mock NETCONF server serves the replies.
+#
+# To add a platform: record its modules and its replies in
+# test_platform_lab_data, and add it to WANT and to the cases below.
+#
+
+import testing
+import std.xml as xml
+import yang
+import yang.gdata as ygdata
+import yang.xml as yxml
+
+import device as swdev
+import device_oper as swdevoper
+import platform_probes
+import adapters.netconf as swna
+import adapters.platform_arcos as arcos
+import adapters.platform_arcos_yang as arcos_yang
+import adapters.platform_iosxe as iosxe
+import adapters.platform_iosxr as iosxr
+import adapters.platform_iosxr_yang as xr_yang
+import adapters.platform_junos as junos
+import adapters.platform_srlinux as srlinux
+import adapters.platform_srlinux_yang as srl_yang
+import adapters.platform_sros as sros
+import adapters.platform_sros_yang as sros_yang
+import adapters.software_iosxe_yang as xe_yang
+import adapters.test_platform_lab_data as lab
+from adapters.adapter import ModCap
+
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials
+
+# What each lab device is: os, version, model and serial number.
+WANT: dict[str, str] = {
+    "crpd": "junos 24.4R1.9 cRPD None",
+    "xrd": "ios-xr 25.3.1 XRd-CP-C-01 None",
+    "xrv9k": "ios-xr 24.1.1 R-IOSXRV9000-CC 4324DA46063",
+    "srl": "srlinux 25.3.2 7220 IXR-D2L Sim Serial No.",
+    "c8000v": "ios-xe 17.18.2 C8000V 9KSKL403GG7",
+    "sros": "sros 23.10.R1 7950 XRS-20 vSIM",
+    "srsim": "sros 25.10.R7 7750 SR-1 SRSIM",
+    "arcos": "arcos 8.2.1A.P4 Virtual None",
+}
+
+# The Junos probe reads no YANG, but the mock lists the modules of its
+# schema, and the probe applies to a device that lists this one.
+JUNOS_RPC_VERSION = r"""module junos-rpc-version {
+  namespace "http://yang.juniper.net/junos/rpc/version";
+  prefix version;
+}
+"""
+
+
+def _modset(names: str) -> dict[str, ModCap]:
+    mods = {}
+    for line in names.split("\n"):
+        m = line.strip()
+        if m != "":
+            mods[m] = ModCap(m, "urn:" + m)
+    return mods
+
+
+def _data(models: list[str], replies: list[str]) -> ygdata.Node:
+    """The recorded get replies, parsed as the NETCONF adapter parses a reply.
+    Several replies make one tree, as the mock server serves them."""
+    children: list[xml.Node] = []
+    for r in replies:
+        children.extend(xml.decode(r).children)
+    return yxml.from_xml(yang.compile(models), xml.Node("data", children=children), loose=True)
+
+
+def _show(p: ?swdev.Platform) -> str:
+    if p is not None:
+        return "{p.os} {p.version} {p.model} {p.serial_number}"
+    return "no platform"
+
+
+def _test_lab_probe_selection():
+    """Each device's modules pick its own probe, and no other probe in
+    PROBES applies to them. A new probe that would take another platform's
+    devices fails here."""
+    cases: list[(device: str, modules: str, probes: list[str])] = [
+        (device="crpd", modules=lab.CRPD_MODULES, probes=[junos.OS]),
+        (device="xrd", modules=lab.XRD_MODULES, probes=[iosxr.OS]),
+        (device="xrv9k", modules=lab.XRV9K_MODULES, probes=[iosxr.OS]),
+        (device="srl", modules=lab.SRL_MODULES, probes=[srlinux.OS]),
+        (device="c8000v", modules=lab.C8000V_MODULES, probes=[iosxe.OS]),
+        (device="sros", modules=lab.SROS_MODULES, probes=[sros.OS]),
+        (device="srsim", modules=lab.SRSIM_MODULES, probes=[sros.OS]),
+        (device="arcos", modules=lab.ARCOS_MODULES, probes=[arcos.OS]),
+    ]
+    for c in cases:
+        mods = _modset(c.modules)
+        got = [p.name for p in platform_probes.PROBES if p.applies(mods)]
+        testing.assertEqual(c.probes, got, "{c.device}: the probes that apply")
+
+
+def _test_lab_replies():
+    """Each probe makes its device's platform of the device's replies."""
+    got: dict[str, ?swdev.Platform] = {
+        "crpd": junos.platform(xml.decode(lab.CRPD_SOFTWARE_INFORMATION),
+                               xml.decode(lab.CRPD_SYSTEM_INFORMATION)),
+        "xrd": iosxr.platform(_data(xr_yang.models, [lab.XRD_VERSION]),
+                              _data(xr_yang.models, [lab.XRD_INVENTORY])),
+        "xrv9k": iosxr.platform(_data(xr_yang.models, [lab.XRV9K_VERSION]),
+                                _data(xr_yang.models, [lab.XRV9K_INVENTORY])),
+        "srl": srlinux.platform(_data(srl_yang.models, [lab.SRL_VERSION]),
+                                _data(srl_yang.models, [lab.SRL_CHASSIS])),
+        "c8000v": iosxe.platform(_data(xe_yang.models, [lab.C8000V_HARDWARE])),
+        "sros": sros.platform(_data(sros_yang.models, [lab.SROS_STATE])),
+        "srsim": sros.platform(_data(sros_yang.models, [lab.SRSIM_STATE])),
+        "arcos": arcos.platform(_data(arcos_yang.models, [lab.ARCOS_VERSION])),
+    }
+    for device, want in WANT.items():
+        testing.assertEqual(want, _show(got[device]), device)
+
+
+actor _OverNetconf(t: testing.EnvT, device: str, models: list[str],
+                   replies: list[str], rpcs: dict[str, str], want: str):
+    """A mock NETCONF server serves the device's recorded replies: replies
+    to a get, rpcs by the name of the RPC. DeviceMgr with the default probes
+    must publish want.
+
+    The replies are attached after the connect, so the first read can find
+    none; the retry then finds them."""
+    var finished = False
+
+    def end(err: ?Exception) -> None:
+        if finished:
+            return
+        finished = True
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if oper is not None:
+            p = swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).state.platform
+            if p.probe is not None:
+                got = "{p.os} {p.version} {p.model} {p.serial_number}"
+                if got != want:
+                    end(ValueError("{device}: published {got}, want {want}"))
+                elif p.probe != p.os:
+                    end(ValueError("{device}: published by probe {p.probe}"))
+                else:
+                    end(None)
+
+    def on_rpc(request: xml.Node,
+               respond: action(children: ?list[xml.Node], tag: ?str,
+                               message: ?str) -> None) -> None:
+        if request.tag in rpcs:
+            respond(xml.decode(rpcs[request.tag]).children, None, None)
+        else:
+            respond(None, "operation-not-supported", "no recorded reply to {request.tag}")
+
+    schema = yang.compile(models)
+    dev_types = {
+        device: swdev.DeviceType(name=device, adapter_type=swna.NetconfAdapter,
+                                 src_dnode=schema, oper_src_dnode=schema)
+    }
+    dev = swdev.DeviceMgr(dev_types, t.env, device, t.log_handler, on_reconf,
+                          swdev.SchemaRegistry(), platform_probes=platform_probes.PROBES)
+
+    def start() -> None:
+        if len(dev.get_modules().0) == 0:
+            after 0.01: start()
+            return
+        a = dev.get_adapter()
+        if isinstance(a, swna.NetconfAdapter):
+            ms = a.get_mock_server()
+            if ms is not None:
+                if len(replies) > 0:
+                    ms.set_oper_ds(_data(models, replies))
+                ms.set_rpc_cb(on_rpc)
+                return
+        end(ValueError("no mock server"))
+
+    def timeout() -> None:
+        end(ValueError("{device}: timed out"))
+
+    dev.set_platform_retry(0.05)
+    dev.set_update_oper(on_state)
+    dmc = DeviceMetaConfig(device, Credentials("admin", "admin"), type=device)
+    dmc.mock.enabled = True
+    dev.set_dmc(dmc)
+    start()
+    after 2.5: timeout()
+
+
+actor _test_lab_crpd_over_netconf(t: testing.EnvT):
+    _OverNetconf(t, "crpd", [JUNOS_RPC_VERSION], [],
+                 {"get-software-information": lab.CRPD_SOFTWARE_INFORMATION,
+                  "get-system-information": lab.CRPD_SYSTEM_INFORMATION},
+                 WANT["crpd"])
+
+
+actor _test_lab_xrd_over_netconf(t: testing.EnvT):
+    # The mock has no inventory, as XRd has none.
+    _OverNetconf(t, "xrd", xr_yang.models, [lab.XRD_VERSION], {}, WANT["xrd"])
+
+# No XRv 9000 over NETCONF: its install/version has no chassis-pid, and the
+# mock's subtree filter gives no data at all when a leaf it selects is absent.
+# The XRd case covers the IOS XR probe's reads.
+
+
+actor _test_lab_srl_over_netconf(t: testing.EnvT):
+    _OverNetconf(t, "srl", srl_yang.models, [lab.SRL_VERSION, lab.SRL_CHASSIS], {}, WANT["srl"])
+
+
+actor _test_lab_c8000v_over_netconf(t: testing.EnvT):
+    _OverNetconf(t, "c8000v", xe_yang.models, [lab.C8000V_HARDWARE], {}, WANT["c8000v"])
+
+
+actor _test_lab_sros_over_netconf(t: testing.EnvT):
+    _OverNetconf(t, "sros", sros_yang.models, [lab.SROS_STATE], {}, WANT["sros"])
+
+
+actor _test_lab_srsim_over_netconf(t: testing.EnvT):
+    _OverNetconf(t, "srsim", sros_yang.models, [lab.SRSIM_STATE], {}, WANT["srsim"])
+
+
+actor _test_lab_arcos_over_netconf(t: testing.EnvT):
+    # The mock's subtree filter gives no data at all when a leaf it selects is
+    # absent, unlike a device, and an ArcOS container has no serial number. So
+    # the mock serves the reply with a serial number, as ArcOS on hardware has.
+    reply = lab.ARCOS_VERSION.replace("<sw-version>", "<serial-number>AR1</serial-number><sw-version>")
+    _OverNetconf(t, "arcos", arcos_yang.models, [reply], {}, "arcos 8.2.1A.P4 Virtual AR1")
