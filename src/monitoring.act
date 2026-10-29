@@ -10,77 +10,43 @@ NS_YANG_LIBRARY = "urn:ietf:params:xml:ns:yang:ietf-yang-library"
 NS_NETCONF_MONITORING = "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring"
 
 
-def build_yang_library(schemas: list[yschema.DRoot]) -> (root: ygdata.Node, content_id: str):
+def build_yang_library(schema: yschema.DRoot) -> (root: ygdata.Node, content_id: str):
     """Build an ietf-yang-library datastore view (as gdata) plus its content-id.
 
-    Walks every provided schema to construct a unified library view so that the
-    advertised set reflects every top-level subtree this server actually serves,
-    not just a single schema.
-
-    A module is classified as `implement` iff any schema has a top-level node
-    (data node, RPC, or notification) in that namespace; everything else goes
-    under `import-only-module`. This keeps purely imported modules
-    (ietf-inet-types, ietf-yang-types, ietf-datastores, ...) from being
-    misadvertised as implemented.
+    It lists the modules of `schema` with the submodules that their
+    module_metadata lists: under `module` those that it marks implemented,
+    and under `import-only-module` the others.
 
     `content-id` is a deterministic hash of the assembled `yang-library`
     subtree using a fixed placeholder content-id, so it changes whenever any
     served YANG library content changes. It is returned alongside the tree so
     callers can advertise the matching `yang-library` NETCONF capability.
     """
-    merged_meta = {}
-    implemented_ns = set()
-    for schema in schemas:
-        for ns, meta in schema.module_metadata.items():
-            merged_meta[ns] = meta
-        for child in schema.children:
-            implemented_ns.add(child.namespace)
-        for rpc in schema.rpcs:
-            implemented_ns.add(rpc.namespace)
-        # TODO: notifications?
-
-    modules = []
+    implemented_modules = []
     import_only_modules = []
-    for ns in sorted(merged_meta.keys()):
-        meta = merged_meta[ns]
+    for ns in sorted(schema.module_metadata.keys()):
+        meta = schema.module_metadata[ns]
         rev_opt = meta.revision
-        if ns in implemented_ns:
-            modules.append(yl.ietf_yang_library__yang_library__module_set__module_entry(
+        if meta.implemented:
+            implemented_modules.append(yl.ietf_yang_library__yang_library__module_set__module_entry(
                 name=meta.name,
                 namespace=ns,
                 revision=rev_opt,
+                submodule=[yl.ietf_yang_library__yang_library__module_set__module__submodule_entry(name=sub.name, revision=sub.revision) for sub in meta.submodules],
             ))
         else:
             import_only_modules.append(yl.ietf_yang_library__yang_library__module_set__import_only_module_entry(
                 name=meta.name,
                 revision=rev_opt if rev_opt is not None else "",
                 namespace=ns,
+                submodule=[yl.ietf_yang_library__yang_library__module_set__import_only_module__submodule_entry(name=sub.name, revision=sub.revision) for sub in meta.submodules],
             ))
 
-    module_set = [
-        yl.ietf_yang_library__yang_library__module_set_entry(
-            name="default",
-            module=modules,
-            import_only_module=import_only_modules,
-        ),
-    ]
-    schema = [
-        yl.ietf_yang_library__yang_library__schema_entry(
-            name="default",
-            module_set=["default"],
-        ),
-    ]
-    datastore = [
-        yl.ietf_yang_library__yang_library__datastore_entry(
-            name=yl.ietf_datastores_running,
-            schema="default",
-        ),
-    ]
     yang_library = yl.ietf_yang_library__yang_library(
         content_id="__content_id_placeholder__",
-        module_set=module_set,
-        schema=schema,
-        datastore=datastore,
+        module_set=[yl.ietf_yang_library__yang_library__module_set_entry(name="default", module=implemented_modules, import_only_module=import_only_modules)],
+        schema=[yl.ietf_yang_library__yang_library__schema_entry(name="default", module_set=["default"])],
+        datastore=[yl.ietf_yang_library__yang_library__datastore_entry(name=yl.ietf_datastores_running, schema="default")],
     )
     root = yl.root(yang_library=yang_library)
     content_id = str(wyhash.hash(0, root.to_gdata().prsrc(deterministic=True).encode()))
@@ -88,22 +54,24 @@ def build_yang_library(schemas: list[yschema.DRoot]) -> (root: ygdata.Node, cont
     return (root=root.to_gdata(), content_id=content_id)
 
 
-def merge_module_metadata(schemas: list[yschema.DRoot]) -> dict[str, yschema.ModuleMetadata]:
-    """The merged module inventory (namespace -> module, revision) of every schema."""
-    merged = {}
-    for s in schemas:
-        for ns, meta in s.module_metadata.items():
-            merged[ns] = meta
-    return merged
-
-
-def build_yl_view(schemas: list[yschema.DRoot]) -> ?(root: ygdata.Node, content_id: str):
+def build_yl_view(schema: yschema.DRoot) -> ?(root: ygdata.Node, content_id: str):
     """The ietf-yang-library view to serve (gdata tree + content-id), or None when
     the inventory doesn't implement ietf-yang-library. Recompute whenever the served
     schema changes so the library and its content-id track the current module set."""
-    if NS_YANG_LIBRARY in merge_module_metadata(schemas):
-        return build_yang_library(schemas)
+    if NS_YANG_LIBRARY in schema.module_metadata:
+        return build_yang_library(schema)
     return None
+
+
+class ModuleInventory(object):
+    """The compiled schema that a server serves and its YANG library, see
+    build_yang_library."""
+    schema: yschema.DRoot
+    yl_view: (root: ygdata.Node, content_id: str)
+
+    def __init__(self, schema: yschema.DRoot):
+        self.schema = schema
+        self.yl_view = build_yang_library(schema)
 
 
 def bundled_module_caps(module_metadata: dict[str, yschema.ModuleMetadata]) -> list[str]:
@@ -118,7 +86,7 @@ def bundled_module_caps(module_metadata: dict[str, yschema.ModuleMetadata]) -> l
     return caps
 
 
-def module_capabilities(schemas: list[yschema.DRoot],
+def module_capabilities(schema: yschema.DRoot,
                         yl_view: ?(root: ygdata.Node, content_id: str)) -> list[str]:
     """The module-inventory capabilities for a <hello>: a single yang-library:1.1
     capability carrying the content-id when the inventory implements
@@ -126,7 +94,7 @@ def module_capabilities(schemas: list[yschema.DRoot],
     if yl_view is not None:
         yl_rev = yl.SRC_DNODE.module_metadata[NS_YANG_LIBRARY].revision
         return ["urn:ietf:params:netconf:capability:yang-library:1.1?{"revision={yl_rev}&" if yl_rev is not None else ""}content-id={yl_view.content_id}"]
-    return bundled_module_caps(merge_module_metadata(schemas))
+    return bundled_module_caps(schema.module_metadata)
 
 
 def get_schema_identifier(op: xml.Node) -> ?str:
