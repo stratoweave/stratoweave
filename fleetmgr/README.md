@@ -98,7 +98,10 @@ names one IOS XE failure to reproduce: `download-failed`, `add-failed`,
 check: `bgp-down` keeps the session idle from the start, so the pre-check
 refuses, and `bgp-lost` keeps it idle on the new release, so the post-check
 fails and the activation is aborted. `running-release` is the release the
-device runs before any upgrade. In the demo fourteen devices each reproduce
+device runs before any upgrade. `mock/platform` takes `model` and
+`serial-number`, the chassis the device reports, C8000V and 9ABCDEFGHIJ when
+absent; the demo devices report ten IOS XE models in a rough field mix, each
+with its own serial number. In the demo fourteen devices each reproduce
 one of the seven failures: `cpe-034` fails its commit, so the campaign
 aborts it and it ends `rolled-back`, while `cpe-007` fails its download and
 ends `failed`. `cpe-039` refuses on its pre-check and `cpe-016` rolls back
