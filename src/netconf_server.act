@@ -11,6 +11,9 @@ import yang.gdata as ygdata
 import yang.schema as yschema
 import yang.xml as yxml
 
+import ietf_yang_library as yl
+import monitoring
+import northbound
 import yp
 import yp_ttt
 
@@ -19,30 +22,32 @@ import yp_ttt
 NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
 CAP_WRITABLE_RUNNING = "urn:ietf:params:netconf:capability:writable-running:1.0"
 
-# YANG-push / subscribed-notifications module capabilities (RFC 8639 / 8641),
-# advertised in <hello> so a client can discover dynamic-subscription support.
-CAP_SUBSCRIBED_NOTIFICATIONS = "urn:ietf:params:xml:ns:yang:ietf-subscribed-notifications?module=ietf-subscribed-notifications"
-CAP_YANG_PUSH = "urn:ietf:params:xml:ns:yang:ietf-yang-push?module=ietf-yang-push&features=on-change"
+# The modules that the server implements in its own code, for dynamic
+# subscriptions (RFC 8639 / 8641), and the modules that they import beyond
+# those of ietf-yang-library, for its YANG library
+SERVER_MODULES: list[(name: str, namespace: str, revision: ?str, implemented: bool, features: list[str])] = [
+    (name="ietf-subscribed-notifications", namespace=yp.NS_SN, revision="2019-09-09", implemented=True, features=["subtree", "xpath"]),
+    (name="ietf-yang-push", namespace=yp.NS_YP, revision="2019-09-09", implemented=True, features=["on-change"]),
+    (name="ietf-restconf", namespace="urn:ietf:params:xml:ns:yang:ietf-restconf", revision="2017-01-26", implemented=False, features=[]),
+    (name="ietf-yang-patch", namespace="urn:ietf:params:xml:ns:yang:ietf-yang-patch", revision="2017-02-22", implemented=False, features=[]),
+    (name="ietf-interfaces", namespace="urn:ietf:params:xml:ns:yang:ietf-interfaces", revision="2018-02-20", implemented=False, features=[]),
+    (name="ietf-ip", namespace="urn:ietf:params:xml:ns:yang:ietf-ip", revision="2018-02-22", implemented=False, features=[]),
+    (name="ietf-netconf-acm", namespace="urn:ietf:params:xml:ns:yang:ietf-netconf-acm", revision="2018-02-14", implemented=False, features=[]),
+    (name="ietf-network-instance", namespace="urn:ietf:params:xml:ns:yang:ietf-network-instance", revision="2019-01-21", implemented=False, features=[]),
+    (name="ietf-yang-schema-mount", namespace="urn:ietf:params:xml:ns:yang:ietf-yang-schema-mount", revision="2019-01-14", implemented=False, features=[]),
+]
 
 
-def build_capabilities(schema: yschema.DRoot) -> list[str]:
-    """Build the NETCONF <hello> capability list for a top-level schema.
+def module_inventory(top_oper_schema: yschema.DRoot) -> monitoring.ModuleInventory:
+    """The modules of a NETCONF server for top_oper_schema: those of
+    top_oper_schema and ietf-yang-library, and SERVER_MODULES."""
+    return monitoring.ModuleInventory(yschema.DRoot.merge([yl.SRC_DNODE, top_oper_schema]), SERVER_MODULES)
 
-    Advertises NETCONF base 1.0/1.1 and writable-running, plus one module
-    capability URI (namespace?module=NAME[&revision=REV]) per module in the
-    schema's metadata, so a client can discover every served namespace from the
-    hello exchange.
-    """
-    caps = [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1, CAP_WRITABLE_RUNNING,
-            CAP_SUBSCRIBED_NOTIFICATIONS, CAP_YANG_PUSH]
-    for ns in sorted(schema.module_metadata.keys()):
-        meta = schema.module_metadata[ns]
-        uri = "{ns}?module={meta.name}"
-        rev = meta.revision
-        if rev is not None:
-            uri = uri + "&revision={rev}"
-        caps.append(uri)
-    return caps
+
+def build_capabilities(inventory: monitoring.ModuleInventory) -> list[str]:
+    """The <hello> capabilities: NETCONF base 1.0/1.1, writable-running, and
+    yang-library:1.1, see monitoring.module_capabilities."""
+    return [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1, CAP_WRITABLE_RUNNING] + monitoring.module_capabilities(inventory.schema, inventory.yl_view)
 
 
 actor StaticAuthChecker(expected_user: str, expected_password: str, log_handler: ?logging.Handler=None):
@@ -74,7 +79,7 @@ actor StaticAuthChecker(expected_user: str, expected_password: str, log_handler:
             respond(False)
 
 
-actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRoot, top_oper_schema: yschema.DRoot, cfs: ttt.Layer, capabilities: ?list[str]=None, on_close: ?action(NetconfSession) -> None=None, session_seq: int=0):
+actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRoot, top_oper_schema: yschema.DRoot, cfs: ttt.Layer, inventory: monitoring.ModuleInventory, on_close: ?action(NetconfSession) -> None=None, session_seq: int=0):
     """A single NETCONF session driving the configuration tree.
 
     Wraps a netconf.Server bound to `pipe` (one transport channel) and handles
@@ -84,9 +89,9 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
     lock/unlock -- is rejected with operation-not-supported rather than faked.
     Incoming <config> is parsed against `top_schema`, carrying per-node NETCONF
     operation= semantics (merge/create/delete/remove/replace) into the edit.
-    A <get> filter is parsed against `top_oper_schema`, which allows <get> to
-    also select operational state. A <get-config> filter or <edit-config>
-    request is parsed against `top_schema` for config only.
+    A <get> or <get-config> filter is parsed against `inventory.schema`, so it
+    may select operational state and the YANG library, which <get-config>
+    leaves out.
 
     YANG-push (RFC 8641) periodic subscriptions are served from the same cfs
     datastore via a per-session TttSubscriptionService, which drives TTT's native
@@ -95,6 +100,9 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
     may carry a datastore-subtree-filter or datastore-xpath-filter, parsed
     against `top_oper_schema` so oper nodes can be selected. session_seq makes
     the per-session subscription owner ids unique on the shared cfs.
+
+    `inventory` holds the schema and the YANG library that the server serves,
+    see module_inventory.
 
     `on_close`, if given, is called with this session when its transport drops,
     so the owner can release its reference and let the session be reclaimed.
@@ -137,14 +145,8 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
                         return ds.tag
         return None
 
-    def _read(filter_node: ?xml.Node, schema: yschema.DRoot, content: ttt.Content) -> list[xml.Node]:
-        filt: ?ygdata.FNode = None
-        if filter_node is not None:
-            filt = yxml.from_filter_xml(schema, filter_node)
-        data = cfs.newsession().get_data(filt, content)
-        if data is not None:
-            return data.to_xml(deterministic=True)
-        return []
+    # The data of the YANG library, see northbound.read_data
+    _monitoring_gdata = {monitoring.NS_YANG_LIBRARY: inventory.yl_view.root}
 
     def _parse_config(config_node: xml.Node) -> ygdata.Container:
         # Wrap the <config> children in a <data> root and parse against the top
@@ -177,10 +179,10 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
                 return
             data_children: list[xml.Node] = []
             try:
-                if op.tag == "get":
-                    data_children = _read(filter_node, top_oper_schema, ttt.CONTENT_ALL)
-                else:
-                    data_children = _read(filter_node, top_schema, ttt.CONTENT_CONFIG)
+                filt = yxml.from_filter_xml(inventory.schema, filter_node) if filter_node is not None else None
+                data = northbound.read_data(cfs, _monitoring_gdata, filt, ttt.CONTENT_ALL if op.tag == "get" else ttt.CONTENT_CONFIG)
+                if data is not None:
+                    data_children = data.to_xml(deterministic=True)
             except Exception as e:
                 s.send_error(message_id, "invalid-value", "Failed to read datastore: {e}")
                 return
@@ -230,7 +232,7 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
             if cb is not None:
                 cb(self)
 
-    var server: netconf.Server = netconf.Server(pipe=pipe, on_connect=_on_conn, on_rpc=on_rpc, capabilities=capabilities, log_handler=log_handler)
+    var server: netconf.Server = netconf.Server(pipe=pipe, on_connect=_on_conn, on_rpc=on_rpc, capabilities=build_capabilities(inventory), log_handler=log_handler)
     # owner_prefix must be unique per session: TTT keys subscriptions by owner id,
     # so sessions sharing this cfs must not collide on "yp-<sub_id>".
     service = yp_ttt.TttSubscriptionService(server, cfs, top_oper_schema, owner_prefix="yp-" + str(session_seq), log_handler=log_handler)
@@ -265,7 +267,7 @@ actor NetconfServer(
     service over the network before responding.
     """
     _log = logging.Logger(log_handler)
-    _capabilities = build_capabilities(top_schema)
+    _inventory = module_inventory(top_oper_schema)
     _auth = auth_check if auth_check is not None else StaticAuthChecker(username, password, log_handler).check
     var _sessions: list[NetconfSession] = []
     var _session_seq: int = 0
@@ -295,7 +297,7 @@ actor NetconfServer(
     def _on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
         _session_seq += 1
         _log.info("NETCONF session accepted", {"session": _session_seq})
-        _sessions.append(NetconfSession(p, log_handler, top_schema, top_oper_schema, cfs, _capabilities, on_close=_session_closed, session_seq=_session_seq))
+        _sessions.append(NetconfSession(p, log_handler, top_schema, top_oper_schema, cfs, _inventory, on_close=_session_closed, session_seq=_session_seq))
 
     listener = sshpipe.SshPipeListener(
         listen_cap,
