@@ -218,7 +218,8 @@ returned invalid UTF-8 in that tree.
 
 `IosXeSoftwareMock` serves a chassis entry: part-number `C8000V` and serial
 number `9ABCDEFGHIJ`, or the `model` and `serial` it is given. A mock device
-sets them as `mock/platform/model` and `mock/platform/serial-number`.
+sets them as `mock/platform/model` and `mock/platform/serial-number`, and the
+release it starts on as `mock/platform/version`.
 
 ### IOS XR
 
