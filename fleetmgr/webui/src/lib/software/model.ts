@@ -36,6 +36,7 @@ export interface DeviceJson {
   address?: AddressJson[];
   credentials?: { username?: string; password?: string };
   mock?: { enabled?: boolean };
+  state?: { platform?: { version?: string; model?: string; 'serial-number'?: string } };
 }
 
 interface CampaignMemberJson {
@@ -215,6 +216,10 @@ export interface Device {
   approvalRequired: boolean;
   /** First address entry as `host[:port]`; empty for a mock. */
   address: string;
+  /** What the device reports when it connects; empty until then. */
+  model: string;
+  version: string;
+  serialNumber: string;
 }
 
 export type Verdict = 'not-run' | 'pass' | 'fail';
@@ -391,7 +396,10 @@ function parseDevice(entry: DeviceJson): Device {
     description: entry.description ?? '',
     schedule: entry.schedule ?? '',
     approvalRequired: entry['approval-required'] === true,
-    address: firstAddress(entry)
+    address: firstAddress(entry),
+    model: entry.state?.platform?.model ?? '',
+    version: entry.state?.platform?.version ?? '',
+    serialNumber: entry.state?.platform?.['serial-number'] ?? ''
   };
 }
 
