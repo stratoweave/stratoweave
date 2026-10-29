@@ -216,8 +216,9 @@ to different modules, so a device's modules pick one of them.
 `Cisco-IOS-XE-platform-oper` names the chassis too, but a lab c8000v
 returned invalid UTF-8 in that tree.
 
-`IosXeSoftwareMock` serves a chassis entry: part-number `C8000V`, or the
-`model` it is given, and serial number `SERIAL`.
+`IosXeSoftwareMock` serves a chassis entry: part-number `C8000V` and serial
+number `9ABCDEFGHIJ`, or the `model` and `serial` it is given. A mock device
+sets them as `mock/platform/model` and `mock/platform/serial-number`.
 
 ### IOS XR
 
