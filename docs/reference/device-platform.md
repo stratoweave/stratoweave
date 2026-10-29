@@ -27,7 +27,7 @@ persisted: after a restart it is empty until the device connects.
 | Leaf | Meaning |
 | --- | --- |
 | `os` | Operating system family: `ios-xe`, `ios-xr`, `junos`, `srlinux`, `sros` or `arcos`. The probe sets it; it is not read from the device. |
-| `version` | Release as the device reports it, for example `17.18.2`. |
+| `version` | Release the device runs, as it reports it, for example `17.18.2`. |
 | `model` | Chassis model, for example `C8000V`. |
 | `serial-number` | Chassis serial number. |
 | `probe` | Name of the probe that read the values. |
@@ -41,8 +41,8 @@ for an image called `17.18.03a`.
 ## When the platform is read
 
 - On every connect.
-- After a software install, because the release can change without a
-  reconnect.
+- When a software install ends, also in a rollback, because the release can
+  change without a reconnect.
 
 Nothing polls. A box that is replaced comes with a new connection.
 

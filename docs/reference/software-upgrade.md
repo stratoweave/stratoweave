@@ -101,10 +101,13 @@ Published under `stratoweave-rfs:device=<name>/software/state`:
 | Leaf | Value |
 | --- | --- |
 | `status` | `unknown`, `up-to-date`, `in-progress`, `succeeded`, `failed` or `rolled-back` |
-| `running-release` | Last release read from the device, spelled the way the device spells it |
 | `stage` | The step the run is in, or the step it ended in |
 | `reason` | Why the run failed or rolled back |
 | `precheck`, `postcheck` | `verdict` (`not-run`, `pass` or `fail`), `detail`, and `at`, the time of the verdict |
+
+The release the device runs is `state/platform/version` (see
+`device-platform.md`). The manager reads the platform again when an install
+ends, also after a rollback.
 
 Every change goes into the device's operational data, so reads and oper
 subscriptions see it right away. A new run removes `reason` and sets both
