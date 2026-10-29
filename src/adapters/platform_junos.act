@@ -1,0 +1,114 @@
+"""Junos platform probe.
+
+It applies to a device that lists junos-rpc-version. Junos serves no
+operational state in YANG for what it is, so the probe calls RPCs:
+get-software-information, which 'show version' prints, for the model and the
+release, then get-system-information, which 'show system information'
+prints, for the serial number.
+
+Junos does not put an RPC's reply in the namespace of its YANG module, and
+runtime schema fetch skips the junos-rpc-* modules. So the probe sends the
+RPCs with rpc_xml and reads the replies by element name. It needs nothing in
+the device type's schema.
+
+A cRPD has no serial number and leaves os-version empty. When
+get-system-information fails, the probe still answers from
+get-software-information.
+"""
+
+import std.xml as xml
+
+import device as swdev
+from adapters.adapter import ModCap, NotConnectedError
+
+OS = "junos"
+MODULE = "junos-rpc-version"
+
+
+def _find(n: ?xml.Node, tag: str) -> ?xml.Node:
+    """The first element named tag in n, n included, depth first."""
+    if n is not None:
+        if n.tag == tag:
+            return n
+        for c in n.children:
+            f = _find(c, tag)
+            if f is not None:
+                return f
+    return None
+
+
+def _text(n: ?xml.Node, tag: str) -> ?str:
+    """The text of the first child of n named tag, without the whitespace
+    around it."""
+    if n is not None:
+        for c in n.children:
+            if c.tag == tag:
+                t = c.text
+                if t is not None:
+                    return swdev.nonempty(t.strip())
+                return None
+    return None
+
+
+def platform(software: ?xml.Node, system: ?xml.Node) -> ?swdev.Platform:
+    """Return the platform in the replies to get-software-information and
+    get-system-information, or None when they have neither a model nor a
+    release. system is None when its RPC failed.
+
+    A device with two routing engines answers for each of them in a
+    multi-routing-engine-item; the probe takes the first.
+    """
+    sw = _find(software, "software-information")
+    si = _find(system, "system-information")
+    model = _text(sw, "product-model")
+    if model is None:
+        model = _text(si, "hardware-model")
+    version = _text(sw, "junos-version")
+    if version is None:
+        version = _text(si, "os-version")
+    serial = _text(si, "serial-number")
+    if model is None and version is None:
+        return None
+    return swdev.Platform(OS, version, model, serial)
+
+
+class JunosProbe(swdev.PlatformProbe):
+    """The Junos probe. Two RPCs per read."""
+    def __init__(self):
+        self.name = OS
+
+    def applies(self, modset: dict[str, ModCap]) -> bool:
+        return MODULE in modset
+
+    def read(self, dev: swdev.DeviceMgr, done: action(?swdev.Platform, ?Exception) -> None) -> None:
+        _JunosRead(dev, done)
+
+
+actor _JunosRead(dev: swdev.DeviceMgr, done: action(?swdev.Platform, ?Exception) -> None):
+    """One read: get-software-information, then get-system-information."""
+    var software: ?xml.Node = None
+
+    def on_system(r: ?xml.Node, err: ?Exception) -> None:
+        if isinstance(err, NotConnectedError):
+            done(None, err)
+            return
+        try:
+            p = platform(software, r if err is None else None)
+            if p is not None:
+                done(p, None)
+            else:
+                done(None, ValueError("the replies have no platform values"))
+        except Exception as e:
+            done(None, e)
+
+    def on_software(r: ?xml.Node, err: ?Exception) -> None:
+        if err is not None:
+            done(None, err)
+            return
+        software = r
+        dev.rpc_xml(on_system, xml.Node("get-system-information"))
+
+    dev.rpc_xml(on_software, xml.Node("get-software-information"))
+
+
+PROBE = JunosProbe()

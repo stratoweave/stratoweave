@@ -1,0 +1,106 @@
+"""IOS XR platform probe.
+
+It applies to a device that lists Cisco-IOS-XR-install-oper. A get of
+install/version, which 'show version' prints from, reads the release label
+and, where there is one, the chassis product id. A get of the rack
+inventory, which 'show inventory' prints from, reads the rack's model and
+serial number. The device type's schema must have the pruned YANG in
+adapters.platform_iosxr_yang, or the real modules.
+
+An XRd has a chassis-pid but no inventory, so it has no serial number. An
+XRv 9000 has no chassis-pid, so its model comes from the inventory. A device
+without the inventory still gets the release and the chassis-pid.
+"""
+
+import yang.gdata as ygdata
+
+import device as swdev
+import adapters.platform_iosxr_oper as xroper
+from adapters.adapter import ModCap, NotConnectedError
+
+OS = "ios-xr"
+MODULE = "Cisco-IOS-XR-install-oper"
+
+
+def version_filter() -> ygdata.FNode:
+    """Select the release label and the chassis product id."""
+    v = xroper.subs.install.version
+    return v.subscribe(select=[v.label, v.chassis_pid]).filt!
+
+
+def inventory_filter() -> ygdata.FNode:
+    """Select the name, model and serial number of every rack."""
+    rack = xroper.subs.inventory.racks.rack
+    bag = rack.attributes.inv_basic_bag
+    return xroper.subs.inventory.subscribe(select=[rack.name, bag.model_name,
+                                                   bag.serial_number]).filt!
+
+
+def platform(version_root: ?ygdata.Node, inventory_root: ?ygdata.Node) -> ?swdev.Platform:
+    """Return the platform in the replies to the two gets, or None when they
+    have neither a release nor a model. inventory_root is None when the
+    inventory get failed.
+
+    The inventory's model and serial number come from the rack with the
+    lowest name, rack 0 in a single-rack system. The chassis-pid, when the
+    device has one, is the model.
+    """
+    v = xroper.root.from_gdata(version_root).install.version
+    version = swdev.nonempty(v.label)
+    model = swdev.nonempty(v.chassis_pid)
+    rack_name: ?str = None
+    rack_model: ?str = None
+    serial: ?str = None
+    for r in xroper.root.from_gdata(inventory_root).inventory.racks.rack:
+        if rack_name is not None and r.name >= rack_name:
+            continue
+        rack_name = r.name
+        rack_model = swdev.nonempty(r.attributes.inv_basic_bag.model_name)
+        serial = swdev.nonempty(r.attributes.inv_basic_bag.serial_number)
+    if model is None:
+        model = rack_model
+    if version is None and model is None:
+        return None
+    return swdev.Platform(OS, version, model, serial)
+
+
+class IosXrProbe(swdev.PlatformProbe):
+    """The IOS XR probe. Two gets per read."""
+    def __init__(self):
+        self.name = OS
+
+    def applies(self, modset: dict[str, ModCap]) -> bool:
+        return MODULE in modset
+
+    def read(self, dev: swdev.DeviceMgr, done: action(?swdev.Platform, ?Exception) -> None) -> None:
+        _IosXrRead(dev, done)
+
+
+actor _IosXrRead(dev: swdev.DeviceMgr, done: action(?swdev.Platform, ?Exception) -> None):
+    """One read: install/version, then the inventory."""
+    var version_root: ?ygdata.Node = None
+
+    def on_inventory(root: ?ygdata.Node, err: ?Exception) -> None:
+        if isinstance(err, NotConnectedError):
+            done(None, err)
+            return
+        try:
+            p = platform(version_root, root if err is None else None)
+            if p is not None:
+                done(p, None)
+            else:
+                done(None, ValueError("the replies have no platform values"))
+        except Exception as e:
+            done(None, e)
+
+    def on_version(root: ?ygdata.Node, err: ?Exception) -> None:
+        if err is not None:
+            done(None, err)
+            return
+        version_root = root
+        dev.get(on_inventory, inventory_filter())
+
+    dev.get(on_version, version_filter())
+
+
+PROBE = IosXrProbe()
