@@ -1,0 +1,182 @@
+"""Cost of a transform's output with the size of that output.
+
+    acton test perf  --module test_ttt_output_perf
+    acton test perf  --module test_ttt_output_perf --name output_add --scale 10000
+    acton test scale --module test_ttt_output_perf --name output_add --end-scale 10000
+
+A transform writes its whole output into the layer below each time it
+computes, not a diff. Here the top layer is one transform, whose output
+is the /device list of its input, and the layer below holds one
+transform per /device entry. Scale is the number of /device entries.
+Each loop body commits WRITES transactions, each a small edit of the
+top transform's input, and each starts when the one before it has
+committed. A body's growth is the growth of one transaction with the
+size of the output: flat when it costs what it changes, linear when it
+pays for every entry the output carries.
+
+- output_add: each edit adds an entry and removes the oldest. The
+  transform gives the /device list of its input, which the edit
+  patched, so the other entries are the same instances as in the last
+  output.
+- output_add_fresh: the same edits, with a transform that builds every
+  entry of its output anew.
+- output_unchanged: each edit sets only /round, so the transform gives
+  the same /device list instance again.
+"""
+
+import testing
+
+import ttt
+import yang.gdata as gdata
+
+
+NS = "urn:test:ttt-output-perf"
+
+# Transactions per loop body. Fixed, so that a body's growth is the
+# growth of one transaction with the size of the output.
+WRITES = 16
+
+# Leaves per entry beyond its key.
+LEAVES = 4
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id(NS, name)
+
+
+def dev_name(i: int) -> str:
+    return "dev-" + str(1000000000 + i)[1:]
+
+
+def entry(i: int) -> gdata.Node:
+    """One /device entry: key `name` and LEAVES leaves."""
+    children: dict[gdata.Id, gdata.Node] = {q("name"): gdata.Leaf(dev_name(i))}
+    for j in range(LEAVES):
+        children[q("leaf" + str(j))] = gdata.Leaf("value-" + str(j))
+    return gdata.Container(children)
+
+
+def device_list(first: int, count: int) -> gdata.Node:
+    """A /device list of `count` entries from index `first`."""
+    elements: list[gdata.Node] = []
+    for i in range(first, first + count):
+        elements.append(entry(i))
+    return gdata.List([q("name")], elements)
+
+
+class DeviceOut(ttt.TransformFunction):
+    """Give the /device list of the input as the output."""
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        return (gdata.Container({q("device"): cfg.children[q("device")]}), memory)
+
+
+class DeviceOutFresh(ttt.TransformFunction):
+    """Give the /device entries of the input as the output, each built anew."""
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        elements: list[gdata.Node] = []
+        devices = cfg.children[q("device")]
+        if isinstance(devices, gdata.List):
+            for e in devices.elements.values():
+                children: dict[gdata.Id, gdata.Node] = {}
+                for k, c in e.children.items():
+                    if isinstance(c, gdata.Leaf):
+                        children[k] = gdata.Leaf(c.val)
+                elements.append(gdata.Container(children))
+        return (gdata.Container({q("device"): gdata.List([q("name")], elements)}), memory)
+
+
+def patched_top(below: ttt.Layer) -> ttt.Layer:
+    return ttt.Layer("top", ttt.Transform(DeviceOut), below, None)
+
+
+def fresh_top(below: ttt.Layer) -> ttt.Layer:
+    return ttt.Layer("top", ttt.Transform(DeviceOutFresh), below, None)
+
+
+# Edits of the top transform's input. Each takes the index of the oldest
+# entry, the number of entries and the number of the edit. Each gives
+# the edit and the index of the oldest entry after it.
+
+def add(first: int, count: int, round: int) -> (gdata.Node, int):
+    """Add entry first + count, and remove entry first."""
+    edit = gdata.Container({q("device"): gdata.List([q("name")], [
+        entry(first + count),
+        gdata.Absent({q("name"): gdata.Leaf(dev_name(first))}),
+    ])})
+    return (edit, first + 1)
+
+
+def set_round(first: int, count: int, round: int) -> (gdata.Node, int):
+    """Set /round, and leave the /device list as it is."""
+    return (gdata.Container({q("round"): gdata.Leaf(round)}), first)
+
+
+actor OutputWriter(t: testing.AsyncT, make_top: proc(ttt.Layer) -> ttt.Layer, step: proc(int, int, int) -> (gdata.Node, int)):
+    """Load N entries, then per loop body commit WRITES edits from `step`.
+
+    An edit starts only once the one before it has committed in both
+    layers, which is when edit_config reports it done.
+    """
+    scale = t.scale()
+    iterations = t.loop()
+    out = ttt.Layer("out", ttt.Container({
+        q("device"): ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]),
+    }), None, None)
+    top = make_top(out)
+    # The index of the oldest entry.
+    var first = 0
+    # The number of the last edit.
+    var round = 0
+    var left = 0
+
+    def completed(result: value) -> None:
+        if isinstance(result, Exception):
+            t.failure(result)
+            return
+        submit()
+
+    def submit() -> None:
+        if left == 0:
+            body()
+            return
+        left -= 1
+        round += 1
+        nxt = step(first, scale, round)
+        first = nxt.1
+        top.edit_config(nxt.0, completed, None)
+
+    def body() -> None:
+        nxt = next(iterations)
+        if isinstance(nxt, just):
+            left = WRITES
+            submit()
+        else:
+            check()
+
+    def check() -> None:
+        """Check that the layer below holds the N entries of the last output."""
+        n = 0
+        got = out.get_data(gdata.FNode(q("device")))
+        if got is not None:
+            n = len(got.get_list(q("device")).elements)
+        if n != scale:
+            t.failure(ValueError("The layer below holds {n} /device entries, not {scale}"))
+            return
+        t.success()
+
+    top.edit_config(gdata.Container({q("device"): device_list(0, scale)}), None, completed)
+
+
+actor output_add(t: testing.AsyncT):
+    """With N entries in the output, add an entry and remove the oldest"""
+    OutputWriter(t, patched_top, add)
+
+
+actor output_add_fresh(t: testing.AsyncT):
+    """With N entries in the output, add an entry and remove the oldest, with every entry built anew"""
+    OutputWriter(t, fresh_top, add)
+
+
+actor output_unchanged(t: testing.AsyncT):
+    """With N entries in the output, set only /round, so the /device list stays the same instance"""
+    OutputWriter(t, patched_top, set_round)
