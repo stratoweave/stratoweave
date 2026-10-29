@@ -54,7 +54,10 @@ interface CheckResultJson {
 interface DeviceStatusJson {
   device: string;
   status?: string;
-  'running-release'?: string;
+  /** What the device runs, from its platform. */
+  version?: string;
+  /** The chassis model, from its platform. */
+  model?: string;
   stage?: string;
   reason?: string;
   precheck?: CheckResultJson;
@@ -250,7 +253,8 @@ export interface DeviceStatusRow {
   device: string;
   status: KnownStatus;
   raw: string;
-  runningRelease: string;
+  version: string;
+  model: string;
   /** The step the run is in or ended in; null before any run. */
   stage: Stage | null;
   /** Why the run failed or rolled back; '' otherwise. */
@@ -445,7 +449,8 @@ function parseRow(row: DeviceStatusJson): DeviceStatusRow {
     device: row.device,
     status: normalizeStatus(raw),
     raw,
-    runningRelease: row['running-release'] ?? '',
+    version: row.version ?? '',
+    model: row.model ?? '',
     stage: parseStage(row.stage),
     reason: row.reason ?? '',
     precheck: parseCheck(row.precheck),
