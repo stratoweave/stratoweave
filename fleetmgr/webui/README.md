@@ -56,7 +56,7 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   install time / 3600, rounded up, at least one); with a plan, the campaign
   page shows them that way too, from the plan's install estimates.
 - Progress is config-false `state` under each campaign, merged into GET
-  responses; each `device-status` row also carries `running-release`,
+  responses; each `device-status` row also carries `version`,
   `stage`, `reason` and the `precheck` and `postcheck` verdicts.
   `state/plan` is the planner's layout: the windows it places devices into
   (`start`/`end` as seconds since the Unix epoch, one `device` entry per

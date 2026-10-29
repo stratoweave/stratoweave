@@ -183,10 +183,6 @@
               <span class="mono">{campaign.targetRelease}</span>
             </span>
             <span class="fact">
-              <span class="fact-label">Running release</span>
-              <span class="mono">{row?.runningRelease || '—'}</span>
-            </span>
-            <span class="fact">
               <span class="fact-label">Planned start</span>
               <span class="mono">{plannedStart(campaign)}</span>
             </span>
