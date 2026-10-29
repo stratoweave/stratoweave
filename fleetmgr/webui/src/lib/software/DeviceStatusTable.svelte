@@ -18,7 +18,7 @@
         <th class="device">Device</th>
         <th class="status">Status</th>
         <th><StageChain /></th>
-        <th>Running release</th>
+        <th>Version</th>
         <th>Detail</th>
       </tr>
     </thead>
@@ -28,7 +28,7 @@
           <td><a class="device-name" href={`/devices/${encodeURIComponent(row.device)}`}>{row.device}</a></td>
           <td><StatusPill status={row.status} raw={row.raw} /></td>
           <td><StageChain {row} /></td>
-          <td class="mono">{row.runningRelease || '—'}</td>
+          <td class="mono">{row.version || '—'}</td>
           <td class="detail">{stageDetail(row) || '—'}</td>
         </tr>
       {/each}

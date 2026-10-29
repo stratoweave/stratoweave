@@ -19,6 +19,12 @@ an IOS XE device.
         -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}/software/state
         -> fleetmgr CFS /software/upgrade-campaign/state
 
+    flotilla operational datastore /device{cpe}/state/platform
+        -> one more on-change subscription per device
+        -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}/state/platform
+        -> fleetmgr CFS /fleet/device{cpe}/state/platform
+           and the version in /software/upgrade-campaign/state
+
     flotilla RFS /rfs{cpe}/device-health
         -> a periodic BGP state subscription while a check runs
         -> the device's software upgrade pre-check and post-check
@@ -83,7 +89,7 @@ big demo.
 For bottom-node development, `just flotilla` still starts one standalone
 instance on the first flotilla's ports. Do not run it alongside `just demo`.
 
-Mock devices take three leaves under `mock/software`. `upgrade-duration` is how many
+Mock devices take two leaves under `mock/software`. `upgrade-duration` is how many
 seconds a whole software upgrade takes; the mock spreads it over the
 operations as measured on a lab c8000v (the numbers are in
 `docs/reference/software-upgrade.md`), and absent or 0 completes each
@@ -92,8 +98,11 @@ names one IOS XE failure to reproduce: `download-failed`, `add-failed`,
 `activate-refused`, `commit-failed` or `reverts`, or one that fails a BGP
 check: `bgp-down` keeps the session idle from the start, so the pre-check
 refuses, and `bgp-lost` keeps it idle on the new release, so the post-check
-fails and the activation is aborted. `running-release` is the release the
-device runs before any upgrade. In the demo fourteen devices each reproduce
+fails and the activation is aborted. `mock/platform` takes `version`, the
+release the device runs before any upgrade, 17.18.02 when absent, and `model`
+and `serial-number`, the chassis the device reports, C8000V and 9ABCDEFGHIJ
+when absent; the demo devices report ten IOS XE models in a rough field mix,
+each with its own serial number. In the demo fourteen devices each reproduce
 one of the seven failures: `cpe-034` fails its commit, so the campaign
 aborts it and it ends `rolled-back`, while `cpe-007` fails its download and
 ends `failed`. `cpe-039` refuses on its pre-check and `cpe-016` rolls back
@@ -120,7 +129,7 @@ and follow its state from the top:
 The watcher starts before the intent is submitted and stops when every device
 has settled, after about three minutes: the controller releases the two
 devices that need work one after the other, so `cpe-001` ends `succeeded`
-with `running_release` `17.18.3a` first, `cpe-003` is `up-to-date` at once,
+with `version` `17.18.3a` first, `cpe-003` is `up-to-date` at once,
 and `cpe-007` ends `failed` last.
 
 The submission and observation steps are also available separately:
@@ -197,12 +206,15 @@ yet. Like `/schedules`, the container is a transform that produces no
 configuration, so campaigns can link the whole list later.
 
 The RFS transform renders that entry directly into the flotilla's standard
-`/device` schema. Its actor keeps one on-change subscription to the device's
-`/device/software/state` on the flotilla, and publishes the status, running
-release, stage, reason and check verdicts as the entry's own `software/state`.
-A change on one device publishes one entry. Removing the entry closes the subscription
-and clears the state. Campaign transforms subscribe to these entries and
-aggregate their own members.
+`/device` schema. Its actor keeps two on-change subscriptions on the flotilla,
+to the device's `/device/software/state` and `/device/state/platform`, and
+publishes the status, stage, reason and check verdicts as the entry's own
+`software/state` and the platform as its `state/platform`. A change on one
+device publishes one entry. Removing the entry closes the subscriptions and
+clears the state. Campaign transforms subscribe to both and aggregate their own
+members, each with the version its platform reports. Each `/fleet/device` actor
+subscribes to its RFS entry's platform and publishes it as its own
+`state/platform`: OS, version, model and serial number.
 
 `flotilla` supplies one modeled layer, the standard RFS plus the
 `flotilla-rfs` augment below. StratoWeave adds the implicit device layer
@@ -241,7 +253,7 @@ with its numbers, except on the `bgp-down` and `bgp-lost` devices.
 
 The focused tests cover device placement by name, the top's flotilla
 entries, precise campaign links, campaign aggregation, the stage, reason and
-check verdicts reaching the campaign, the parent RFS-to-flotilla render, direct `/device` configuration at
+check verdicts reaching the campaign, the platform reaching the top, the parent RFS-to-flotilla render, direct `/device` configuration at
 the RFS-only bottom, the mock leaves reaching the flotilla, reading the BGP
 neighbors, and a complete mock IOS XE software upgrade gated by the
 device-health checks, which the mock's BGP failures refuse or roll back. The

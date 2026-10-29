@@ -24,7 +24,7 @@ persisted: after a restart it is empty until the device connects.
 | Leaf | Meaning |
 | --- | --- |
 | `os` | Operating system family, for example `ios-xe`. The probe sets it; it is not read from the device. |
-| `version` | Release as the device reports it, for example `17.18.02`. |
+| `version` | Release the device runs, as it reports it, for example `17.18.2`. The software state does not repeat it. |
 | `model` | Chassis product id, for example `C8000V`. |
 | `serial-number` | Chassis serial number. |
 | `probe` | Name of the probe that read the values. |
@@ -36,8 +36,8 @@ with `==`: IOS XE reports `17.18.3a` for an image called `17.18.03a`.
 ## When the platform is read
 
 - On every connect.
-- After a software install, because the release can change without a
-  reconnect.
+- When a software install ends, also in a rollback, because the release can
+  change without a reconnect.
 
 Nothing polls. A box that is replaced comes with a new connection.
 
@@ -182,18 +182,22 @@ The `ios-xe` probe in `src/adapters/platform_iosxe.act`:
 - Takes the model and serial number from the chassis entry with the lowest
   `hw-dev-index`, so a stack gives the same answer whatever order the
   entries come in.
-- Takes the version out of the banner, as the software adapter does:
-  `Cisco IOS XE Software, Version 17.18.02` gives `17.18.02`.
+- Takes the version out of the banner, as the software adapter does: a lab
+  c8000v on 17.18.02 says `... Version 17.18.2, RELEASE SOFTWARE (fc3)`,
+  which gives `17.18.2`. The CLI `show version` says `17.18.02`.
 - Needs the pruned IOS XE YANG in `src/adapters/software_iosxe_yang.act` in
   the device type's schema, as the software adapter does.
 
 `Cisco-IOS-XE-platform-oper` names the chassis too, but a lab c8000v
 returned invalid UTF-8 in that tree.
 
-`IosXeSoftwareMock` serves a chassis entry: part-number `C8000V`, or the
-`model` it is given, and serial number `SERIAL`. The mock's subtree filter
-returns no data when a list the filter selects is absent, so without the
-entry the read would get nothing, not even the version.
+`IosXeSoftwareMock` serves a chassis entry: part-number `C8000V` and serial
+number `9ABCDEFGHIJ`, or the `model` and `serial` it is given. A mock device
+sets them as `mock/platform/model` and `mock/platform/serial-number`, and the
+release it starts on as `mock/platform/version`. The
+mock's subtree filter returns no data when a list the filter selects is
+absent, so without the entry the read would get nothing, not even the
+version.
 
 ## Testing
 

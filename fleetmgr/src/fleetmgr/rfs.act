@@ -18,49 +18,42 @@ def status_subscription(name: str) -> ygdata.SubscriptionSpec:
     return flotilla_oper.subs.device.entry(name).software.state.subscribe()
 
 
+def platform_subscription(name: str) -> ygdata.SubscriptionSpec:
+    """Return the on-change subscription to the platform that the flotilla
+    reads for one device."""
+    return flotilla_oper.subs.device.entry(name).state.platform.subscribe()
+
+
 actor DeviceTransform(
     path,
     update_oper: proc(?y1_oper.stratoweave_rfs__rfs__device_entry) -> None,
     dev: swdev.DeviceMgr,
 ):
-    """Publish the software state that the flotilla reports for one device.
+    """Publish the software state and platform that the flotilla reports for
+    one device.
 
     The actor subscribes to the flotilla for this device only. It publishes
-    the status, running release, stage, reason and check verdicts as the
-    oper state of its own entry, so a change on one device publishes one
-    entry."""
+    the status, stage, reason, check verdicts and platform as the oper state
+    of its own entry, so a change on one device publishes one entry. The
+    software state and the platform are two subscriptions: a subtree filter
+    with both drops the device while either is absent."""
     var subscriptions: ?ygdata.SubscriptionManager = None
-    var latest: ?(status: ?str, running_release: ?str, stage: ?str, reason: ?str,
+    var latest: ?(status: ?str, stage: ?str, reason: ?str,
                   precheck: (verdict: ?str, detail: ?str, at: ?str),
                   postcheck: (verdict: ?str, detail: ?str, at: ?str)) = None
+    var platform: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
     var generation = 0
 
-    def on_state(gen: int, keys: ?(device_name: str),
-                 state: ?flotilla_oper.stratoweave_rfs__device__software__state,
-                 error: ?Exception) -> None:
-        # A callback from an earlier subscription may already be queued.
-        if gen != generation:
+    def publish() -> None:
+        value = latest
+        p = platform
+        if value is None and p is None:
+            update_oper(None)
             return
-        value: ?(status: ?str, running_release: ?str, stage: ?str, reason: ?str,
-                 precheck: (verdict: ?str, detail: ?str, at: ?str),
-                 postcheck: (verdict: ?str, detail: ?str, at: ?str)) = None
-        if error is not None:
-            print("device status subscription failed at {path}: {error}", err=True)
-        elif state is not None and (state.status is not None or state.running_release is not None):
-            pre = state.precheck
-            post = state.postcheck
-            value = (status=state.status, running_release=state.running_release,
-                     stage=state.stage, reason=state.reason,
-                     precheck=(verdict=pre.verdict, detail=pre.detail, at=pre.at),
-                     postcheck=(verdict=post.verdict, detail=post.detail, at=post.at))
-        if value == latest:
-            return
-        latest = value
+        oper = base.Device.new_state(path)
         if value is not None:
-            oper = base.Device.new_state(path)
             s = oper.software.state
             s.status = value.status
-            s.running_release = value.running_release
             s.stage = value.stage
             s.reason = value.reason
             s.precheck.verdict = value.precheck.verdict
@@ -69,13 +62,55 @@ actor DeviceTransform(
             s.postcheck.verdict = value.postcheck.verdict
             s.postcheck.detail = value.postcheck.detail
             s.postcheck.at = value.postcheck.at
-            update_oper(oper)
-        else:
-            update_oper(None)
+        if p is not None:
+            o = oper.state.platform
+            o.os = p.os
+            o.version = p.version
+            o.model = p.model
+            o.serial_number = p.serial_number
+        update_oper(oper)
+
+    def on_state(gen: int, keys: ?(device_name: str),
+                 state: ?flotilla_oper.stratoweave_rfs__device__software__state,
+                 error: ?Exception) -> None:
+        # A callback from an earlier subscription may already be queued.
+        if gen != generation:
+            return
+        value: ?(status: ?str, stage: ?str, reason: ?str,
+                 precheck: (verdict: ?str, detail: ?str, at: ?str),
+                 postcheck: (verdict: ?str, detail: ?str, at: ?str)) = None
+        if error is not None:
+            print("device status subscription failed at {path}: {error}", err=True)
+        elif state is not None and state.status is not None:
+            pre = state.precheck
+            post = state.postcheck
+            value = (status=state.status, stage=state.stage, reason=state.reason,
+                     precheck=(verdict=pre.verdict, detail=pre.detail, at=pre.at),
+                     postcheck=(verdict=post.verdict, detail=post.detail, at=post.at))
+        if value != latest:
+            latest = value
+            publish()
+
+    def on_platform(gen: int, keys: ?(device_name: str),
+                    state: ?flotilla_oper.stratoweave_rfs__device__state__platform,
+                    error: ?Exception) -> None:
+        if gen != generation:
+            return
+        value: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+        if error is not None:
+            print("device platform subscription failed at {path}: {error}", err=True)
+        elif state is not None and (state.os is not None or state.version is not None or
+                                    state.model is not None or state.serial_number is not None):
+            value = (os=state.os, version=state.version, model=state.model,
+                     serial_number=state.serial_number)
+        if value != platform:
+            platform = value
+            publish()
 
     def shutdown() -> None:
         generation += 1
         latest = None
+        platform = None
         if subscriptions is not None:
             subscriptions!.close()
             subscriptions = None
@@ -87,10 +122,15 @@ actor DeviceTransform(
             gen = generation
             subscriptions = ygdata.SubscriptionManager(dev.tree_provider(), str(path))
             state = flotilla_oper.subs.device.software.state
-            destination = state.dst(lambda keys, value, error: self.on_state(gen, keys, value, error))
-            subscriptions!.declare({destination.deliver({
-                status_subscription(conf.name),
-            })})
+            platform_state = flotilla_oper.subs.device.state.platform
+            subscriptions!.declare({
+                state.dst(lambda keys, value, error: self.on_state(gen, keys, value, error)).deliver({
+                    status_subscription(conf.name),
+                }),
+                platform_state.dst(lambda keys, value, error: self.on_platform(gen, keys, value, error)).deliver({
+                    platform_subscription(conf.name),
+                }),
+            })
 
 
 class Device(base.Device):
@@ -144,7 +184,9 @@ class Device(base.Device):
         dev.mock.enabled = i.mock.enabled
         dev.mock.software.upgrade_duration = i.mock.software.upgrade_duration
         dev.mock.software.failure = i.mock.software.failure
-        dev.mock.software.running_release = i.mock.software.running_release
+        dev.mock.platform.version = i.mock.platform.version
+        dev.mock.platform.model = i.mock.platform.model
+        dev.mock.platform.serial_number = i.mock.platform.serial_number
         for module in i.mock.module:
             out_module = dev.mock.module.create(
                 module.name,

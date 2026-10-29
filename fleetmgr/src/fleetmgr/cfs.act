@@ -95,7 +95,9 @@ class Device(base.Device):
         dev.mock.enabled = i.mock.enabled
         dev.mock.software.upgrade_duration = i.mock.software.upgrade_duration
         dev.mock.software.failure = i.mock.software.failure
-        dev.mock.software.running_release = i.mock.software.running_release
+        dev.mock.platform.version = i.mock.platform.version
+        dev.mock.platform.model = i.mock.platform.model
+        dev.mock.platform.serial_number = i.mock.platform.serial_number
         for module in i.mock.module:
             out_module = dev.mock.module.create(
                 module.name,
@@ -111,6 +113,64 @@ class Device(base.Device):
         dev.upgrade_checks.precheck_wait = i.upgrade_checks.precheck_wait
         dev.upgrade_checks.postcheck_wait = i.upgrade_checks.postcheck_wait
         return o
+
+
+actor DeviceTransform(path: ttt.Path,
+                      update_oper: proc(?y0_oper.fleetmgr__fleet__device_entry) -> None,
+                      lower_tree_provider: ?ygdata.TreeProvider):
+    """Publish the platform of one device, as its RFS entry relays it from
+    the device's flotilla."""
+    var subscriptions: ?ygdata.SubscriptionManager = None
+    var platform: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+    var generation = 0
+
+    def on_platform(gen: int, keys: ?(rfs_name: str, device_name: str),
+                    state: ?y1_oper.stratoweave_rfs__rfs__device__state__platform,
+                    error: ?Exception) -> None:
+        # A callback from an earlier subscription may already be queued.
+        if gen != generation:
+            return
+        value: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+        if error is not None:
+            print("device platform subscription failed at {path}: {error}", err=True)
+        elif state is not None and (state.os is not None or state.version is not None or
+                                    state.model is not None or state.serial_number is not None):
+            value = (os=state.os, version=state.version, model=state.model,
+                     serial_number=state.serial_number)
+        if value == platform:
+            return
+        platform = value
+        if value is not None:
+            oper = base.Device.new_state(path)
+            o = oper.state.platform
+            o.os = value.os
+            o.version = value.version
+            o.model = value.model
+            o.serial_number = value.serial_number
+            update_oper(oper)
+        else:
+            update_oper(None)
+
+    def shutdown() -> None:
+        generation += 1
+        if subscriptions is not None:
+            subscriptions!.close()
+            subscriptions = None
+        if platform is not None:
+            platform = None
+            update_oper(None)
+
+    def on_conf(conf: y_0.fleetmgr__fleet__device_entry) -> None:
+        # The flotilla follows from the name, so it never changes.
+        tp = lower_tree_provider
+        if subscriptions is None and tp is not None:
+            gen = generation
+            subscriptions = ygdata.SubscriptionManager(tp, "device-platform:{path}")
+            platform_state = y1_oper.subs.rfs.device.state.platform
+            destination = platform_state.dst(lambda keys, value, error: self.on_platform(gen, keys, value, error))
+            subscriptions!.declare({destination.deliver({
+                y1_oper.subs.rfs.entry(flotilla_of(conf.name)).device.entry(conf.name).state.platform.subscribe(),
+            })})
 
 
 def device_estimate(dev: ?y_0.fleetmgr__fleet__device_entry) -> int:
@@ -467,12 +527,14 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     """
     var members: list[str] = []
     var member_names: set[str] = set()
-    var latest: dict[str, (status: ?str, running_release: ?str, stage: ?str,
-                           reason: ?str,
+    var latest: dict[str, (status: ?str, stage: ?str, reason: ?str,
                            precheck: (verdict: ?str, detail: ?str, at: ?str),
                            postcheck: (verdict: ?str, detail: ?str, at: ?str))] = {}
+    # The release each device runs, from its platform.
+    var versions: dict[str, str] = {}
     var subscriptions: ?ygdata.SubscriptionManager = None
     var subscriptions_synced = False
+    var publish_armed = False
     var plan_layout: list[(str, int, int, list[(str, int, int)])] = []
     var plan_alarms: list[str] = []
     var running = False
@@ -517,15 +579,13 @@ actor UpgradeCampaignTransform(path: ttt.Path,
 
         for d in members:
             status: ?str = None
-            running_release: ?str = None
             observed = latest.get(d)
             if observed is not None:
                 status = observed.status
-                running_release = observed.running_release
 
             ds = st.device_status.create(d)
             ds.status = status if status is not None else "pending"
-            ds.running_release = running_release
+            ds.version = versions.get(d)
             if observed is not None:
                 ds.stage = observed.stage
                 ds.reason = observed.reason
@@ -571,13 +631,12 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             st.plan.alarm.append(alarm)
         update_oper(oper)
 
-    def observe(name: str, status: ?str, running_release: ?str, stage: ?str,
-                reason: ?str,
+    def observe(name: str, status: ?str, stage: ?str, reason: ?str,
                 precheck: (verdict: ?str, detail: ?str, at: ?str),
                 postcheck: (verdict: ?str, detail: ?str, at: ?str)) -> None:
         """Keep the state of one device, as its flotilla reports it."""
-        latest[name] = (status=status, running_release=running_release,
-                        stage=stage, reason=reason, precheck=precheck, postcheck=postcheck)
+        latest[name] = (status=status, stage=stage, reason=reason,
+                        precheck=precheck, postcheck=postcheck)
 
     def forget(name: str) -> None:
         if name in latest:
@@ -605,13 +664,49 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             if state is not None:
                 pre = state.precheck
                 post = state.postcheck
-                observe(keys.device_name, state.status, state.running_release,
-                        state.stage, state.reason,
+                observe(keys.device_name, state.status, state.stage, state.reason,
                         (verdict=pre.verdict, detail=pre.detail, at=pre.at),
                         (verdict=post.verdict, detail=post.detail, at=post.at))
             else:
                 forget(keys.device_name)
         changed(relevant)
+
+    def republish(relevant: bool) -> None:
+        """Publish a member's new version. A running campaign publishes it
+        with its next decision; otherwise wait out the debounce, so devices
+        that connect together publish once."""
+        if not relevant or not subscriptions_synced:
+            return
+        if active:
+            changed(True)
+        elif not publish_armed:
+            publish_armed = True
+            gen = generation
+            after now debounce_s: publish_settled(gen)
+
+    def publish_settled(gen: int) -> None:
+        publish_armed = False
+        if gen == generation and not active:
+            publish()
+
+    def on_platform(
+        keys: ?(rfs_name: str, device_name: str),
+        state: ?y1_oper.stratoweave_rfs__rfs__device__state__platform,
+        error: ?Exception,
+    ) -> None:
+        relevant = error is not None
+        if error is not None:
+            print("campaign platform subscription failed at {path}: {error}", err=True)
+            versions = {}
+        elif keys is not None:
+            name = keys.device_name
+            relevant = name in member_names
+            version = state.version if state is not None else None
+            if version is not None:
+                versions[name] = version
+            elif name in versions:
+                del versions[name]
+        republish(relevant)
 
     def on_subscriptions_synced() -> None:
         subscriptions_synced = True
@@ -781,10 +876,17 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 want.add(statuses.dst(on_rfs).deliver({
                     statuses.subscribe(),
                 }))
+                # A second subscription: a subtree filter with both drops a
+                # device while either is absent.
+                platforms = y1_oper.subs.rfs.device.state.platform
+                want.add(platforms.dst(on_platform).deliver({
+                    platforms.subscribe(),
+                }))
             else:
                 # A later subscription starts with a fresh rooted replay. Do
                 # not retain entries that may disappear while unsubscribed.
                 latest = {}
+                versions = {}
             subscriptions_synced = False
             subscriptions!.declare(want, synced=on_subscriptions_synced)
         else:

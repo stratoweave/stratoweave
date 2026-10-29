@@ -37,6 +37,9 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `{name, admin-state: run}`.
 - Campaign members are a list of `{name}` entries whose names reference
   `/fleetmgr:fleet/device`.
+- Each fleet device entry carries config-false `state/platform`: `os`,
+  `version`, `model` and `serial-number` as the device reports them, absent
+  until it has connected. The devices list shows them and filters by model.
 - Pacing is campaign config: `default-schedule` naming a shared
   `maintenance:schedules` entry, `deadline` (seconds since the Unix epoch),
   `target-rate` and `max-rate` (devices per hour, defaults 100 and 500). A
@@ -53,7 +56,7 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   install time / 3600, rounded up, at least one); with a plan, the campaign
   page shows them that way too, from the plan's install estimates.
 - Progress is config-false `state` under each campaign, merged into GET
-  responses; each `device-status` row also carries `running-release`,
+  responses; each `device-status` row also carries `version`,
   `stage`, `reason` and the `precheck` and `postcheck` verdicts.
   `state/plan` is the planner's layout: the windows it places devices into
   (`start`/`end` as seconds since the Unix epoch, one `device` entry per

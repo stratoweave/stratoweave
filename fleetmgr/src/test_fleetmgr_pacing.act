@@ -7,6 +7,9 @@ plan, checks that the plan places everyone and nothing starts, flips it
 to run, and then watches the rollout: the first release is small,
 releases arrive in several steps, devices in flight never exceed what
 max-rate allows, and everyone succeeds with both upgrade checks passed.
+Every device then reports the new version in the campaign and its platform
+on its fleet entry, one of them the model and serial number its mock is
+set to.
 
 Run from fleetmgr/:
     acton test --module test_fleetmgr_pacing --tag fleetmgr-system
@@ -20,6 +23,12 @@ import time
 import test_scale
 
 
+def mock_platform(i: int) -> ?(model: str, serial: str):
+    """The model and serial number device i's mock is set to; None for the
+    mock's defaults, C8000V and 9ABCDEFGHIJ."""
+    return (model="C8300-1N1S-4T2X", serial="FGL2231L0AB") if i == 1 else None
+
+
 actor PacingRollout(size: int, client: http.Client, done: action(?Exception) -> None):
     path = "/restconf/data/software:software/upgrade-campaign=pacing"
     # Pacing is a behavior test, not a scale test: ten slow devices show
@@ -31,6 +40,7 @@ actor PacingRollout(size: int, client: http.Client, done: action(?Exception) -> 
     var max_ip = 0
     var polls = 0
     var plan_tries = 0
+    var version_tries = 0
 
     def parse_status(body: str) -> ?(int, int, int, int, int, int):
         """(in-progress, succeeded, failed, placed, alarms, devices whose
@@ -84,6 +94,25 @@ actor PacingRollout(size: int, client: http.Client, done: action(?Exception) -> 
                         return (ip, ok, bad, placed, alarms, checked)
         return None
 
+    def parse_versions(body: str) -> list[str]:
+        """The version of each device-status row, "None" where it has none."""
+        versions = []
+        data = json.decode(body)
+        if isinstance(data, dict):
+            campaigns = data.get("software:upgrade-campaign")
+            if isinstance(campaigns, list) and len(campaigns) == 1:
+                campaign = campaigns[0]
+                if isinstance(campaign, dict):
+                    state = campaign.get("state")
+                    if isinstance(state, dict):
+                        rows = state.get("device-status")
+                        if isinstance(rows, list):
+                            for row in rows:
+                                if isinstance(row, dict):
+                                    v = row.get("version")
+                                    versions.append(v if isinstance(v, str) else "None")
+        return versions
+
     def campaign_payload(admin: str) -> bytes:
         return json.encode({"software:upgrade-campaign": [{
             "name": "pacing",
@@ -127,7 +156,7 @@ actor PacingRollout(size: int, client: http.Client, done: action(?Exception) -> 
                     done(ValueError("{n - parsed.5} device(s) succeeded without both checks passed"))
                 else:
                     print("pacing: ramped from {first}, {steps} release steps, peak in-flight {max_ip}, {ok} of {n} succeeded")
-                    done(None)
+                    client.get(path, versions_checked, {"Accept": "application/yang-data+json"})
                 return
             polls += 1
             if polls > 360:
@@ -139,6 +168,57 @@ actor PacingRollout(size: int, client: http.Client, done: action(?Exception) -> 
 
     def watch() -> None:
         client.get(path, watched, {"Accept": "application/yang-data+json"})
+
+    def versions_checked(client: http.Client, response: http.Response) -> None:
+        # The new version is read after the status is published, so it can
+        # reach the campaign a moment later.
+        if response.status != 200:
+            done(test_scale.status_error(response, 200))
+            return
+        versions = parse_versions(response.body.decode())
+        upgraded = len(versions) == n
+        for v in versions:
+            if v != "17.18.3a":
+                upgraded = False
+        if upgraded:
+            client.get("/restconf/data/fleetmgr:fleet", platforms_checked,
+                       {"Accept": "application/yang-data+json"})
+        elif version_tries >= 40:
+            done(ValueError("campaign versions after the rollout: {versions}"))
+        else:
+            version_tries += 1
+            after 0.5: client.get(path, versions_checked, {"Accept": "application/yang-data+json"})
+
+    def platforms_checked(client: http.Client, response: http.Response) -> None:
+        if response.status != 200:
+            done(test_scale.status_error(response, 200))
+            return
+        platforms: dict[str, str] = {}
+        data = json.decode(response.body.decode())
+        if isinstance(data, dict):
+            fleet = data.get("fleetmgr:fleet")
+            if isinstance(fleet, dict):
+                devices = fleet.get("device")
+                if isinstance(devices, list):
+                    for d in devices:
+                        if isinstance(d, dict):
+                            name = d.get("name")
+                            state = d.get("state")
+                            if isinstance(name, str) and isinstance(state, dict):
+                                platform = state.get("platform")
+                                if isinstance(platform, dict):
+                                    platforms[name] = "{platform.get('model')} {platform.get('serial-number')}"
+        wrong = []
+        for i in range(n):
+            name = test_scale.device_name(i)
+            p = mock_platform(i)
+            want = "{p.model} {p.serial}" if p is not None else "C8000V 9ABCDEFGHIJ"
+            if platforms.get(name) != want:
+                wrong.append("{name}={platforms.get(name)}")
+        if len(wrong) > 0:
+            done(ValueError("platform not reported: {wrong}"))
+        else:
+            done(None)
 
     def running(client: http.Client, response: http.Response) -> None:
         # The flip is asked for asynchronously: the controller's first
@@ -202,13 +282,17 @@ actor PacingRollout(size: int, client: http.Client, done: action(?Exception) -> 
         devices = []
         for i in range(n):
             name = test_scale.device_name(i)
+            # Slow installs, so the ramp is observable in the counters.
+            mock = {"enabled": True, "software": {"upgrade-duration": 8}}
+            p = mock_platform(i)
+            if p is not None:
+                mock["platform"] = {"model": p.model, "serial-number": p.serial}
             entry = {
                 "name": name,
                 "type": "iosxe",
                 "description": "Pacing {name}",
                 "credentials": {"username": "admin", "password": "admin"},
-                # Slow installs, so the ramp is observable in the counters.
-                "mock": {"enabled": True, "software": {"upgrade-duration": 8}},
+                "mock": mock,
             }
             devices.append(entry)
         payload = json.encode({"fleetmgr:fleet": {"device": devices}}).encode()
