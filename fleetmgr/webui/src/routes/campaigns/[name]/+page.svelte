@@ -121,16 +121,16 @@
     planningForm && savedDraft ? validatePlanningDraft(planningForm, Date.now() / 1000, savedDraft) : {}
   );
   // Compared with what is stored, not with the form as loaded: a campaign
-  // with both a deadline and a target rate opens paced by the deadline and
-  // can be saved as is, which sets its target rate to 0.
+  // with a deadline and a target-concurrency other than 1 opens paced by
+  // the deadline and can be saved as is, which sets it to 1.
   let planningDirty = $derived.by(() => {
     if (!planningForm || !savedPlanning || Object.keys(planningErrors).length > 0) return false;
     const { set, remove } = planningChanges(savedPlanning, planningFromDraft(planningForm));
     return Object.keys(set).length > 0 || remove.length > 0;
   });
-  let alsoTargetRate = $derived(
-    planningForm?.paceBy === 'deadline' && savedPlanning?.deadline != null && savedPlanning.targetRate !== 0
-      ? savedPlanning.targetRate
+  let alsoTargetConcurrency = $derived(
+    planningForm?.paceBy === 'deadline' && savedPlanning?.deadline != null && savedPlanning.targetConcurrency !== 1
+      ? savedPlanning.targetConcurrency
       : null
   );
 
@@ -471,7 +471,7 @@
           Schedule and pace
         </button>
         {#if !paceOpen}
-          <span class="hint">{planningDirty ? 'unsaved changes' : 'change the default schedule, a deadline or the rates'}</span>
+          <span class="hint">{planningDirty ? 'unsaved changes' : 'change the default schedule, a deadline or how many at once'}</span>
         {/if}
       </h2>
       {#if paceOpen}
@@ -490,8 +490,8 @@
           <div class="planning-actions">
             {#if planningMessage}
               <span class={planningMessage.type === 'error' ? 'save-error' : 'save-ok'}>{planningMessage.text}</span>
-            {:else if alsoTargetRate !== null}
-              <span class="save-ok">Target rate {alsoTargetRate}/h also applies; saving sets it to 0.</span>
+            {:else if alsoTargetConcurrency !== null}
+              <span class="save-ok">{alsoTargetConcurrency} at once also applies; saving sets it to 1.</span>
             {/if}
             <button
               class="btn btn-secondary"

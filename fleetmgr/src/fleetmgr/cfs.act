@@ -131,8 +131,7 @@ def device_estimate(dev: ?y_0.fleetmgr__fleet__device_entry) -> int:
 def estimated_duration(i: y_0.software__software__upgrade_campaign_entry,
                        inventory: y_0.root) -> int:
     """The average estimated upgrade duration over the campaign's
-    members, in seconds. The rates convert to concurrency through it,
-    and the observed duration starts from it."""
+    members, in seconds. The observed duration starts from it."""
     total = 0
     n = 0
     for member in i.device:
@@ -197,15 +196,15 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
                   released_in: dict[str, (str, int, int)] = {},
                   released_at: dict[str, int] = {},
                   done_at: dict[str, int] = {}) -> (list[(str, int, int, list[(str, int, int)])], list[str]):
-    """Plan the campaign into its windows at the rate the deadline demands.
+    """Plan the campaign into its windows at the concurrency the deadline
+    demands.
 
     A campaign without windows gets one synthetic window that opens at
     launch and never closes, and the controller paces it like any other.
     The deadline cuts off the window supply - the synthetic window
-    included - and the required rate is computed backwards from what
-    remains, raised to target-rate and capped at max-rate, with alarms
-    rather than overruns. Rates are devices per hour; the core's
-    concurrency is rate times estimated duration.
+    included - and the concurrency it needs is computed backwards from
+    what remains, raised to target-concurrency and capped at
+    max-concurrency, with alarms rather than overruns.
 
     Devices the controller has released stay in the window they were
     released in (released_in: schedule, start, end), at their real
@@ -250,8 +249,8 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
     if dl is not None:
         deadline = int(dl)
 
-    target = int(i.target_rate)
-    cap = int(i.max_rate)
+    target = int(i.target_concurrency)
+    cap = imax(target, int(i.max_concurrency))
 
     default_scheds: list[str] = []
     ds = i.default_schedule
@@ -289,35 +288,19 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
         wins.append(("default", 0, deadline if deadline > 0 else OPEN_END))
         default_scheds = ["default"]
 
-    available = 0
-    for we in wins:
-        available += we.2 - imax(we.1, now)
-    # The planner keeps a margin; plan the rate against what it will use.
-    usable = available * 95 // 100
-    needed = 0
     needed_c = 0
     if deadline > 0:
-        # The rate the deadline demands, with the ramp-up inverted rather
-        # than assumed away: the smallest concurrency whose waves finish
-        # the fleet within the windows, converted back to a rate.
+        # The concurrency the deadline demands, with the ramp-up inverted
+        # rather than assumed away: the smallest concurrency whose waves
+        # finish the fleet within the windows. The planner keeps a margin,
+        # so it plans against what it will use.
         spans = [(we.2 - imax(we.1, now)) * 95 // 100 for we in wins]
         needed_c = fs.needed_concurrency(spans, n, estimate, debounce)
-        needed = fs.ceil_div(needed_c * 3600, estimate)
-    rate = needed
-    if target > rate:
-        rate = target
-    if cap > 0 and rate > cap:
-        rate = cap
-        # Rates quantize to whole devices in flight, so the shortfall
-        # test happens in concurrency, not in rates.
-        max_c = imax(1, fs.ceil_div(cap * estimate, 3600))
-        if needed_c > max_c:
-            alarms.append("deadline needs {needed} devices/hour but max-rate "
-                          + "is {cap}; not all devices will be placed in time")
-    if rate == 0:
-        rate = fs.ceil_div(n * 3600, usable) if usable > 0 else n * 3600
-
-    conc = imax(1, fs.ceil_div(rate * estimate, 3600))
+    conc = needed_c if needed_c > target else target
+    if conc > cap:
+        conc = cap
+        alarms.append("deadline needs {needed_c} devices at once but "
+                      + "max-concurrency is {cap}; not all devices will be placed in time")
 
     # A window already open gets only the time it has left, so the core
     # does not fill it as if it were whole.
@@ -332,13 +315,9 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
         alarms.append(a)
 
     # Estimated starts come from the controller's own logic: simulate each
-    # window on estimate, with target and max concurrency derived exactly
-    # as the live controller derives them. Prediction and execution then
-    # disagree only where reality disagrees with the estimate.
-    tr = int(i.target_rate)
-    pred_target = imax(1, fs.ceil_div(tr * estimate, 3600)) if tr > 0 else 1
-    mr = int(i.max_rate)
-    pred_max = imax(pred_target, fs.ceil_div(mr * estimate, 3600)) if mr > 0 else 1000000
+    # window on estimate, with the target and max concurrency the live
+    # controller uses. Prediction and execution then disagree only where
+    # reality disagrees with the estimate.
 
     # Released devices by the window they were released in. Windows the
     # schedules no longer produce, closed since or changed, come first.
@@ -377,7 +356,7 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
                     if a.schedule == we.0 and a.start == imax(we.1, now):
                         placed.append(a.device)
         if len(placed) > 0:
-            pcamp = fs.Campaign(i.name, [we.0], pred_target, pred_max, 1, 2, 0,
+            pcamp = fs.Campaign(i.name, [we.0], target, cap, 1, 2, 0,
                                 "spread", admin_state="run")
             durations = [est_of.get_def(d, estimate) for d in placed]
             # A window already open predicts from now, not from its past
@@ -387,7 +366,6 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
                                         fs.Window(we.0, imax(we.1, now), we.2, 1000000),
                                         pcamp, imax(1, len(running)), debounce,
                                         durations=durations,
-                                        target_rate=tr, max_rate=mr,
                                         running=running)
             idx = 0
             for d in placed:
@@ -407,7 +385,7 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
     # window closes are shown at the close; say so out loud too.
     if overflow > 0:
         alarms.append("{overflow} device(s) will not complete before their "
-                      + "window closes at the planned rate")
+                      + "window closes at the planned concurrency")
     return (layout, alarms)
 
 
@@ -494,8 +472,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var observed_s: int = 1
     var rung: int = 1
     var rung_target: int = 1
-    var target_rate: int = 0
-    var max_rate: int = 0
+    var target_c: int = 1
+    var max_c: int = 1
     # The campaign and the inventory from the last on_conf, and the
     # configuration they give for the released devices.
     var campaign: ?y_0.software__software__upgrade_campaign_entry = None
@@ -649,12 +627,6 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                         took = imax(1, t - released_at.get_def(name, 0))
                         observed_s = (observed_s * 3 + took) // 4
 
-        # The rates convert through what we observe now, not through the
-        # estimate we started with, so target-rate holds when upgrades
-        # run slower or faster than believed.
-        target_c = imax(1, fs.ceil_div(target_rate * observed_s, 3600)) if target_rate > 0 else 1
-        max_c = imax(target_c, fs.ceil_div(max_rate * observed_s, 3600)) if max_rate > 0 else 1000000
-
         if len(done_at) >= rung_target and rung < target_c:
             rung = fs.ramp_next(rung, 2, target_c)
             rung_target = len(done_at) + rung
@@ -757,10 +729,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         plan_layout = layout
         plan_alarms = alarms
 
-        # The controller spends concurrency, but the intent is the rates;
-        # each decision converts them through the observed duration.
-        target_rate = int(conf.target_rate)
-        max_rate = int(conf.max_rate)
+        target_c = int(conf.target_concurrency)
+        max_c = imax(target_c, int(conf.max_concurrency))
 
         paced = len(plan_layout) > 0
         # New intent invalidates every armed timer. The first decision after

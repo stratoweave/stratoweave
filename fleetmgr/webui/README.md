@@ -39,19 +39,20 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `/fleetmgr:fleet/device`.
 - Pacing is campaign config: `default-schedule` naming a shared
   `maintenance:schedules` entry, `deadline` (seconds since the Unix epoch),
-  `target-rate` and `max-rate` (devices per hour, defaults 100 and 500). A
-  GET omits leaves left at their default, so the UI fills the defaults in.
-  The UI paces by a deadline or by a target rate, not both: `target-rate` is
-  a floor under the deadline's pace, so pacing by the deadline sets it to 0
-  and pacing by the rate removes the deadline. A campaign that has both
-  opens paced by the deadline. The wizard sets them at create time and the
-  campaign page changes them later. A change PATCHes the leaves; clearing
-  the default schedule or the deadline PUTs the entry back without the leaf
-  and without `state`, since DELETE on a leaf returns 500. The controller
-  keeps the devices it has already released, so a running campaign can be
-  edited too. The controller enforces the rates as devices at once (rate ×
-  install time / 3600, rounded up, at least one); with a plan, the campaign
-  page shows them that way too, from the plan's install estimates.
+  `target-concurrency` and `max-concurrency` (devices upgrading at the same
+  time, defaults 10 and 50). A GET omits leaves left at their default, so
+  the UI fills the defaults in. The UI paces by a deadline or by a number
+  of devices at once, not both: `target-concurrency` is a floor under the
+  deadline's pace, so pacing by the deadline sets it to 1, the slowest
+  pace, and pacing by concurrency removes the deadline. A campaign that
+  has a deadline opens paced by it. The wizard sets them at create time
+  and the campaign page changes them later. A change PATCHes the leaves;
+  clearing the default schedule or the deadline PUTs the entry back
+  without the leaf and without `state`, since DELETE on a leaf returns
+  500. The controller keeps the devices it has already released, so a
+  running campaign can be edited too. With a plan, the campaign page also
+  shows the devices at once as devices per hour, from the plan's install
+  estimates.
 - Progress is config-false `state` under each campaign, merged into GET
   responses; each `device-status` row also carries `running-release`,
   `stage`, `reason` and the `precheck` and `postcheck` verdicts.
@@ -152,9 +153,10 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
 
 Campaigns are the model's own concept and nothing more: created in plan,
 launched by merging `{name, admin-state: run}`. The planner fits the members
-into the configured windows at the rate the deadline demands, capped at
-`max-rate`; the plan is published in plan and in run alike, so the layout
-and its alarms are visible before anything is actuated. In run the
+into the configured windows with as many devices at once as the deadline
+demands, at least `target-concurrency` and at most `max-concurrency`; the
+plan is published in plan and in run alike, so the layout and its alarms
+are visible before anything is actuated. In run the
 controller releases devices a few at a time as their window opens and
 completions come in; the estimated starts follow that release schedule, and
 the campaign page draws them on a timeline, one cell per device, that takes
@@ -166,9 +168,9 @@ adds no semantics the model does not carry —
 anything done here can be done identically over NETCONF or plain RESTCONF.
 Two rules go beyond the model, in the wizard and on the campaign page: a
 newly set deadline must lie ahead, and the pace comes from a deadline or a
-target rate, not both. Rate and ETA are measured since page open, and
-nothing is latched: status tracks live device state and regresses when a
-campaign goes back to plan.
+number of devices at once, not both. Rate and ETA are measured since page
+open, and nothing is latched: status tracks live device state and
+regresses when a campaign goes back to plan.
 
 Sharding is internal: the top places each device on a flotilla by its
 name, and nothing in the UI shows the placement.

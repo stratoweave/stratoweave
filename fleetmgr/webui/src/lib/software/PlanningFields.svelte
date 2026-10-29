@@ -3,18 +3,18 @@
   import FieldSelect from '$lib/core/ui/FieldSelect.svelte';
   import FieldText from '$lib/core/ui/FieldText.svelte';
   import { scheduleRulesText } from '$lib/maintenance/schedule-form';
-  import { DEFAULT_MAX_RATE, DEFAULT_TARGET_RATE, type Schedule } from './model';
-  import { atOnceText, type PaceBy, type PlanningDraft } from './planning-form';
+  import { DEFAULT_MAX_CONCURRENCY, DEFAULT_TARGET_CONCURRENCY, type Schedule } from './model';
+  import { perHourText, type PaceBy, type PlanningDraft } from './planning-form';
   import { formatDuration, toLocalInput } from '$lib/core/time';
 
   interface Props {
     schedules: Schedule[];
     draft: PlanningDraft;
-    /** By field: deadline, target-rate, max-rate. */
+    /** By field: deadline, target-concurrency, max-concurrency. */
     errors: Record<string, string>;
     disabled?: boolean;
-    /** Mean install time in seconds, from the plan; without it the rates
-     * are not shown as devices at once. */
+    /** Mean install time in seconds, from the plan; without it the devices
+     * at once are not shown as devices per hour. */
     installSeconds?: number | null;
     onchange: (next: PlanningDraft) => void;
   }
@@ -25,7 +25,7 @@
 
   const PACES: { value: PaceBy; label: string; help: string }[] = [
     { value: 'deadline', label: 'Deadline', help: 'Slowest pace that meets the deadline.' },
-    { value: 'rate', label: 'Target rate', help: 'No deadline; the target rate sets the pace.' }
+    { value: 'concurrency', label: 'At once', help: 'No deadline; this many devices upgrade at the same time.' }
   ];
 
   let scheduleOptions = $derived.by(() => {
@@ -41,7 +41,7 @@
 
   let minDeadline = toLocalInput(Date.now() / 1000);
 
-  let atOnce = $derived(installSeconds ? atOnceText(draft, installSeconds) : '');
+  let perHour = $derived(installSeconds ? perHourText(draft, installSeconds) : '');
 
   let deadlineHint = $derived.by(() => {
     if (!draft.deadline) return '';
@@ -97,29 +97,29 @@
       />
     {:else}
       <FieldText
-        label="Target rate"
-        value={draft.targetRate}
-        error={errors['target-rate']}
+        label="At once"
+        value={draft.targetConcurrency}
+        error={errors['target-concurrency']}
         mono={true}
         {disabled}
-        placeholder={`${DEFAULT_TARGET_RATE}`}
-        help="Devices per hour; 0 = spread over the windows."
-        onchange={(v) => patch({ targetRate: v })}
+        placeholder={`${DEFAULT_TARGET_CONCURRENCY}`}
+        help="Devices upgrading at the same time."
+        onchange={(v) => patch({ targetConcurrency: v })}
       />
     {/if}
     <FieldText
-      label="Max rate"
-      value={draft.maxRate}
-      error={errors['max-rate']}
+      label="Max at once"
+      value={draft.maxConcurrency}
+      error={errors['max-concurrency']}
       mono={true}
       {disabled}
-      placeholder={`${DEFAULT_MAX_RATE}`}
-      help="Devices per hour; 0 = no cap."
-      onchange={(v) => patch({ maxRate: v })}
+      placeholder={`${DEFAULT_MAX_CONCURRENCY}`}
+      help="Only when a window or the deadline falls behind."
+      onchange={(v) => patch({ maxConcurrency: v })}
     />
   </div>
-  {#if atOnce}
-    <p class="at-once">{atOnce}</p>
+  {#if perHour}
+    <p class="per-hour">{perHour}</p>
   {/if}
 </div>
 
@@ -135,7 +135,7 @@
     gap: 12px;
   }
 
-  .at-once {
+  .per-hour {
     margin: 0;
     font-size: 12px;
     color: var(--sw-text-secondary);
