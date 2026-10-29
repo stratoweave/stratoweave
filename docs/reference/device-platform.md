@@ -58,6 +58,11 @@ A probe's `applies` looks only at the device's module set. So the same
 modules always pick the same probe, and no read is needed to pick it. There
 are no scores: when two probes apply, the one earlier in the list runs.
 
+A device that lists its modules in its NETCONF hello, without yang-library
+or netconf-monitoring, also gets its other hello capabilities in its module
+set, named by their URI, but not the NETCONF protocol ones. A device from
+before YANG lists no modules, so these are what a probe can apply to.
+
 | The probe | `DeviceMgr` |
 | --- | --- |
 | does not apply | tries the next probe in the list |
@@ -187,7 +192,7 @@ so a probe that reads two subtrees sends two gets.
 | --- | --- | --- | --- | --- |
 | `ios-xe` | `Cisco-IOS-XE-device-hardware-oper` | one get: inventory and version banner | chassis part number | chassis entry |
 | `ios-xr` | `Cisco-IOS-XR-install-oper` | two gets: `install/version`, the rack inventory | `chassis-pid`, else the rack's model | the rack with the lowest name |
-| `junos` | `junos-rpc-version` | RPCs `get-software-information`, `get-system-information` | `product-model` | `serial-number` of system information |
+| `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information` | `product-model` | `serial-number` of system information |
 | `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis |
 | `sros` | `nokia-state` | one get: `/state/system` and `/state/chassis` | `system/platform` | router chassis with the lowest number |
 | `arcos` | `arcos-openconfig-system-augments` | one get: `system/version/state` | `platform` | `serial-number` |
@@ -235,7 +240,8 @@ that `show version` and `show system information` call. Junos does not put
 an RPC's reply in the namespace of its YANG module, and runtime schema fetch
 skips the `junos-rpc-*` modules. So the probe sends the RPCs with `rpc_xml`
 and reads the replies by element name, and needs no YANG in the device
-type's schema.
+type's schema. That also lets it read a Junos from before YANG, which lists
+no modules but has the Junos capability in its hello.
 
 - The model and the release come from `get-software-information`; a device
   with two routing engines answers for each, and the probe takes the first.
@@ -287,7 +293,6 @@ device's.
 - The mock NETCONF server's subtree filter returns no data at all when a node
   the filter selects is absent, where a device returns the other nodes. A
   mocked device must serve every node that the probe selects.
-- With runtime schema fetch on, SR OS 23.10 and ArcOS 8.2.1A get
-  no schema, so no probe reads them. SR OS sends `nokia-conf`, about 20 MB of
-  YANG, in one text node, which the XML parser refuses above 10 MB. An ArcOS
-  module imports `tailf-rollback`, which ArcOS does not list.
+- With runtime schema fetch on, ArcOS 8.2.1A gets no schema, so no probe
+  reads it: an ArcOS module imports `tailf-rollback`, which ArcOS does not
+  list.
