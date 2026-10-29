@@ -302,6 +302,18 @@ actor Client(
         _prune_inactive_fixups()
         return out
 
+    def _apply_raw_message_fixups(msg: str) -> str:
+        out = msg
+        # The text comes before the parsed reply, so the same order as the
+        # response hooks
+        for fx in reversed(active_fixups):
+            try:
+                out = fx.on_raw_message(out)
+            except Exception as exc:
+                _log.error("NETCONF raw message fixup failed", {"fixup": fx.name, "exception": exc})
+        _prune_inactive_fixups()
+        return out
+
     def _parse_rpc_errors(rpc_reply: xml.Node) -> ?NetconfError:
         """Parse <rpc-error> elements from an rpc-reply and return NetconfError if found"""
         errors = []
@@ -858,7 +870,8 @@ actor Client(
             return
         _log.trace("MSG:", {"msg": msg})
         try:
-            root = xml.decode(msg)
+            # Fixups are active from the server's hello on
+            root = xml.decode(_apply_raw_message_fixups(msg))
 
             if state != STATE_CONNECTED and root.tag != "hello":
                 # The server's hello comes first in a session. A message
@@ -1707,6 +1720,95 @@ actor _test_client_uses_oldest_rpc_for_reply_without_message_id(t: testing.EnvT)
                     on_notif=None,
                     log_handler=t.log_handler,
                     pipe=pipes.client)
+
+
+actor _test_client_reply_with_repeated_xmlns(t: testing.EnvT):
+    """A reply that repeats the xmlns of its <rpc-reply>, as Junos 10.4 sends
+    it, reaches the callback through the default fixups."""
+    pipes = actor_pipe_pair()
+
+    def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            t.failure(error)
+            return
+        value = _test_reply_value(result)
+        if value != "junos":
+            t.failure(ValueError("Unexpected reply value: {value}"))
+            return
+        c.close(None)
+        t.success()
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        buf = Buffer()
+        buf.write_str("<rpc-reply xmlns=\"{NS_NC_1_0}\" xmlns:junos=\"http://xml.juniper.net/junos/10.4R5/junos\" xmlns=\"{NS_NC_1_0}\" message-id=\"{message_id}\"><data><value>junos</value></data></rpc-reply>")
+        buf.write_bytes(LEGACY_SEPARATOR)
+        pipes.server.write(buf.read_all_bytes())
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            t.failure(ValueError("Failed to connect to in-process NETCONF server: {e}"))
+        else:
+            c.get(_on_get)
+
+    server = Server(pipe=pipes.server, on_rpc=_on_server_rpc,
+                    capabilities=[CAP_NC_1_0], log_handler=t.log_handler)
+    client = Client(None,
+                    address="actor-pipe",
+                    username="actor-pipe",
+                    key=None,
+                    password=None,
+                    port=0,
+                    on_connect=_on_connect,
+                    on_notif=None,
+                    log_handler=t.log_handler,
+                    pipe=pipes.client)
+
+
+class _TestRawValueFixup(Fixup):
+    def __init__(self):
+        Fixup.__init__(self, "test-raw-value")
+
+    mut def on_raw_message(self, msg: str) -> str:
+        return msg.replace("<value>wrong</value>", "<value>right</value>")
+
+
+actor _test_client_raw_message_fixup_on_parsable_reply(t: testing.EnvT):
+    """A raw message fixup also rewrites a reply that parses as it is."""
+    pipes = actor_pipe_pair()
+    test_fixups: list[proc() -> Fixup] = [_TestRawValueFixup]
+
+    def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
+        if error is not None:
+            t.failure(error)
+            return
+        value = _test_reply_value(result)
+        if value != "right":
+            t.failure(ValueError("Unexpected reply value: {value}"))
+            return
+        c.close(None)
+        t.success()
+
+    def _on_server_rpc(s: Server, message_id: str, op: xml.Node):
+        s.send_reply(message_id, _test_data_reply("wrong"))
+
+    def _on_connect(c: Client, e: ?Exception):
+        if e is not None:
+            t.failure(ValueError("Failed to connect to in-process NETCONF server: {e}"))
+        else:
+            c.get(_on_get)
+
+    server = Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    client = Client(None,
+                    address="actor-pipe",
+                    username="actor-pipe",
+                    key=None,
+                    password=None,
+                    port=0,
+                    on_connect=_on_connect,
+                    on_notif=None,
+                    log_handler=t.log_handler,
+                    pipe=pipes.client,
+                    fixups=test_fixups)
 
 
 actor _test_client_restart_fails_pending_rpc(t: testing.EnvT):
