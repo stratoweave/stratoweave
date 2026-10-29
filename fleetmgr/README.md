@@ -88,7 +88,7 @@ big demo.
 For bottom-node development, `just flotilla` still starts one standalone
 instance on the first flotilla's ports. Do not run it alongside `just demo`.
 
-Mock devices take three leaves under `mock/software`. `upgrade-duration` is how many
+Mock devices take two leaves under `mock/software`. `upgrade-duration` is how many
 seconds a whole software upgrade takes; the mock spreads it over the
 operations as measured on a lab c8000v (the numbers are in
 `docs/reference/software-upgrade.md`), and absent or 0 completes each
@@ -97,11 +97,11 @@ names one IOS XE failure to reproduce: `download-failed`, `add-failed`,
 `activate-refused`, `commit-failed` or `reverts`, or one that fails a BGP
 check: `bgp-down` keeps the session idle from the start, so the pre-check
 refuses, and `bgp-lost` keeps it idle on the new release, so the post-check
-fails and the activation is aborted. `running-release` is the release the
-device runs before any upgrade. `mock/platform` takes `model` and
-`serial-number`, the chassis the device reports, C8000V and 9ABCDEFGHIJ when
-absent; the demo devices report ten IOS XE models in a rough field mix, each
-with its own serial number. In the demo fourteen devices each reproduce
+fails and the activation is aborted. `mock/platform` takes `version`, the
+release the device runs before any upgrade, 17.18.02 when absent, and `model`
+and `serial-number`, the chassis the device reports, C8000V and 9ABCDEFGHIJ
+when absent; the demo devices report ten IOS XE models in a rough field mix,
+each with its own serial number. In the demo fourteen devices each reproduce
 one of the seven failures: `cpe-034` fails its commit, so the campaign
 aborts it and it ends `rolled-back`, while `cpe-007` fails its download and
 ends `failed`. `cpe-039` refuses on its pre-check and `cpe-016` rolls back
