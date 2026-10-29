@@ -22,6 +22,8 @@ import yang.gdata as ygdata
 import yang.schema as yschema
 import yang.xml as yxml
 import device as swdev
+import device_oper as swdevoper
+import platform_probes as swplat
 import adapters.adapter as swadapter
 import adapters.netconf as swna
 import schema_filter
@@ -1189,6 +1191,75 @@ actor CmdMonitor(env, args, log_handler):
             dev = device
 
 
+actor CmdPlatform(env, args, log_handler):
+    """Read what a device is with the platform probes.
+
+    Connects through a stratoweave DeviceMgr with the probes in
+    platform_probes.PROBES, as an app does, and prints what the DeviceMgr
+    publishes under state/platform. The device's schema is the YANG of the
+    probes, platform_probes.MODELS, or with --fetch the schema fetched from
+    the device.
+    """
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    password = args.get_str("password")
+    fetch = args.get_bool("fetch")
+    timeout = args.get_int("timeout")
+
+    var dev: ?swdev.DeviceMgr = None
+    var done = False
+
+    def _finish(code: int):
+        if not done:
+            done = True
+            env.exit(code)
+
+    def _on_state(oper: ?ygdata.Node) -> None:
+        if oper is not None and not done:
+            p = swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).state.platform
+            if p.probe is not None:
+                print("os: {p.os}")
+                print("version: {p.version}")
+                print("model: {p.model}")
+                print("serial-number: {p.serial_number}")
+                print("probe: {p.probe}")
+                _finish(0)
+
+    def _on_connect(name: str):
+        d = dev
+        if d is not None and not done:
+            mods = d.get_modules().0
+            if len(mods) > 0 and not any([pr.applies(mods) for pr in swplat.PROBES]):
+                print("Error: no platform probe applies to the device's modules", err=True)
+                _finish(1)
+
+    def _on_timeout():
+        print("Error: no platform read in {timeout} s; --verbose shows why", err=True)
+        _finish(1)
+
+    try:
+        bundled = yschema.DRoot() if fetch else yang.compile(swplat.MODELS)
+    except Exception as e:
+        print("Error: cannot compile the platform probe YANG: {e}", err=True)
+        env.exit(1)
+    else:
+        dev_types = {
+            "netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter,
+                                        src_dnode=bundled, oper_src_dnode=bundled)
+        }
+        dmc = DeviceMetaConfig(name="ncurl-target", credentials=Credentials(username, password), type="netconf")
+        dmc.address.create("primary", host, u64(port))
+        dmc.ssh = ssh_settings(args)
+        dmc.feature_flags.runtime_schema_fetch = fetch
+        device = swdev.DeviceMgr(dev_types, env, "ncurl-target", log_handler, _on_connect,
+                                 swdev.SchemaRegistry(), platform_probes=swplat.PROBES)
+        device.set_update_oper(_on_state)
+        device.set_dmc(dmc)
+        dev = device
+        after float(timeout): _on_timeout()
+
+
 actor main(env):
     logh = logging.Handler()
     # The arguments of a command waiting for its password.
@@ -1264,12 +1335,19 @@ actor main(env):
             logh.add_sink(logging.ConsoleSink())
         CmdMonitor(env, args, logh)
 
+    def cmd_platform(args):
+        """Command handler for platform"""
+        if args.get_bool("verbose"):
+            logh.set_output_level(logging.TRACE)
+            logh.add_sink(logging.ConsoleSink())
+        CmdPlatform(env, args, logh)
+
     def _parse_args():
         p = argparse.Parser()
 
         # Global options
         p.add_option("host", "str", "?", "localhost", "NETCONF server hostname")
-        p.add_option("port", "int", "?", 42830, "NETCONF server port")
+        p.add_option("port", "int", "?", 830, "NETCONF server port")
         p.add_option("username", "str", "?", "admin", "Username for authentication")
         p.add_option("password", "str", "?", None, "Password for authentication; asked for when not given")
         p.add_bool("verbose", "Verbose logging from SSH / NETCONF client")
@@ -1336,6 +1414,10 @@ actor main(env):
         monitor_module_sets_help = "Module set(s) to compile from --yang-dir ({schema_filter.get_module_set_names()})"
         p_monitor.add_option("module-set", "strlist", "+", [], monitor_module_sets_help)
         p_monitor.add_option("module", "strlist", "+", [], "Module(s) to compile from --yang-dir, optionally module@revision, with import/include dependencies")
+
+        p_platform = p.add_cmd("platform", "Read the device's OS, release, model and serial number with the platform probes", cmd_platform)
+        p_platform.add_bool("fetch", "Read through the schema fetched from the device, not the YANG of the probes")
+        p_platform.add_option("timeout", "int", "?", 60, "Seconds to wait for a probe to read the device")
 
         return p.parse(env.argv)
 

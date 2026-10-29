@@ -1,0 +1,101 @@
+"""SR Linux platform probe.
+
+It applies to a device that lists srl_nokia-system-info and
+srl_nokia-platform-chassis. It reads the software version from
+system/information and the chassis type and serial number from
+platform/chassis, one get each. The device type's schema must have the
+pruned YANG in adapters.platform_srlinux_yang, or the real modules.
+"""
+
+import yang.gdata as ygdata
+
+import device as swdev
+import adapters.platform_srlinux_oper as srloper
+from adapters.adapter import ModCap
+
+OS = "srlinux"
+MODULES = ["srl_nokia-system-info", "srl_nokia-platform-chassis"]
+
+
+def version_filter() -> ygdata.FNode:
+    """Select the software version."""
+    info = srloper.subs.system.information
+    return info.subscribe(select=[info.version]).filt!
+
+
+def chassis_filter() -> ygdata.FNode:
+    """Select the chassis type and serial number."""
+    ch = srloper.subs.platform.chassis
+    return ch.subscribe(select=[ch.type, ch.serial_number]).filt!
+
+
+def release(version: ?str) -> ?str:
+    """The release in an SR Linux version, which ends in the build:
+    v25.3.2-312-ga0c5002f15 gives 25.3.2."""
+    v = swdev.nonempty(version)
+    if v is not None:
+        r = v
+        if r.startswith("v"):
+            r = r[1:]
+        dash = r.find("-")
+        if dash >= 0:
+            r = r[:dash]
+        return swdev.nonempty(r)
+    return None
+
+
+def platform(version_root: ?ygdata.Node, chassis_root: ?ygdata.Node) -> ?swdev.Platform:
+    """Return the platform in the replies to the two gets, or None when they
+    have neither a version nor a chassis type."""
+    version = release(srloper.root.from_gdata(version_root).system.information.version)
+    ch = srloper.root.from_gdata(chassis_root).platform.chassis
+    model = swdev.nonempty(ch.type)
+    serial = swdev.nonempty(ch.serial_number)
+    if version is None and model is None:
+        return None
+    return swdev.Platform(OS, version, model, serial)
+
+
+class SrLinuxProbe(swdev.PlatformProbe):
+    """The SR Linux probe. Two gets per read."""
+    def __init__(self):
+        self.name = OS
+
+    def applies(self, modset: dict[str, ModCap]) -> bool:
+        for m in MODULES:
+            if m not in modset:
+                return False
+        return True
+
+    def read(self, dev: swdev.DeviceMgr, done: action(?swdev.Platform, ?Exception) -> None) -> None:
+        _SrLinuxRead(dev, done)
+
+
+actor _SrLinuxRead(dev: swdev.DeviceMgr, done: action(?swdev.Platform, ?Exception) -> None):
+    """One read: the version, then the chassis."""
+    var version_root: ?ygdata.Node = None
+
+    def on_chassis(root: ?ygdata.Node, err: ?Exception) -> None:
+        if err is not None:
+            done(None, err)
+            return
+        try:
+            p = platform(version_root, root)
+            if p is not None:
+                done(p, None)
+            else:
+                done(None, ValueError("the replies have no platform values"))
+        except Exception as e:
+            done(None, e)
+
+    def on_version(root: ?ygdata.Node, err: ?Exception) -> None:
+        if err is not None:
+            done(None, err)
+            return
+        version_root = root
+        dev.get(on_chassis, chassis_filter())
+
+    dev.get(on_version, version_filter())
+
+
+PROBE = SrLinuxProbe()
