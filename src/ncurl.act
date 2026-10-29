@@ -72,6 +72,37 @@ def ssh_transport(args: argparse.Args) -> ssh.TransportConfig:
     return swadapter.ssh_transport_config(ssh_settings(args))
 
 
+def reads_stdin(args: argparse.Args) -> bool:
+    """Whether the command reads its input from stdin, where it would read
+    the password too."""
+    for name in ["config", "request"]:
+        if name in args.options and args.get_str(name) == "-":
+            return True
+    return False
+
+
+actor PasswordPrompt(env, prompt: str, on_password: action(str) -> None):
+    """Ask for a password on stdin, without echo when stdin is a terminal.
+
+    The password is the first line read, or all of the first read when it has
+    no newline, as from printf.
+    """
+    var answered = False
+
+    def _on_stdin(s: str):
+        if not answered:
+            answered = True
+            env.stdio.set_stdin(echo=True)
+            env.stdio.err("\n")
+            nl = s.find("\n")
+            line = s[:nl] if nl >= 0 else s
+            on_password(line[:-1] if line.endswith("\r") else line)
+
+    env.stdio.set_stdin(echo=False)
+    env.stdio.err(prompt)
+    env.stdio.stdin_install(on_stdin=_on_stdin)
+
+
 def _node_text(node) -> str:
     if node.text is None:
         return ""
@@ -1152,6 +1183,8 @@ actor CmdMonitor(env, args, log_handler):
 
 actor main(env):
     logh = logging.Handler()
+    # The arguments of a command waiting for its password.
+    var prompted: ?argparse.Args = None
 
     def cmd_list_schemas(args):
         """Command handler for list-schemas"""
@@ -1230,7 +1263,7 @@ actor main(env):
         p.add_option("host", "str", "?", "localhost", "NETCONF server hostname")
         p.add_option("port", "int", "?", 42830, "NETCONF server port")
         p.add_option("username", "str", "?", "admin", "Username for authentication")
-        p.add_option("password", "str", "?", "admin", "Password for authentication")
+        p.add_option("password", "str", "?", None, "Password for authentication; asked for when not given")
         p.add_bool("verbose", "Verbose logging from SSH / NETCONF client")
         p.add_bool("insecure", "Disable SSH host key verification")
         p.add_option("ssh-cipher", "strlist", "+", [], "SSH cipher to offer instead of the defaults, like aes128-cbc; repeat for more")
@@ -1298,13 +1331,30 @@ actor main(env):
 
         return p.parse(env.argv)
 
+    def _on_password(password: str):
+        a = prompted
+        if a is not None:
+            a.options["password"] = ("type"="str", "value"=password)
+            run = a.cmd
+            if run is not None:
+                run(a)
+
     try:
         args = _parse_args()
         cmd = args.cmd
         if cmd is not None:
             # Fail on an unknown algorithm here, not in the command's actor.
             ssh_transport(args)
-            cmd(args)
+            if "password" in args.options:
+                cmd(args)
+            elif reads_stdin(args):
+                print("Error: give --password when the input comes from stdin", err=True)
+                env.exit(1)
+            else:
+                prompted = args
+                user = args.get_str("username")
+                host = args.get_str("host")
+                PasswordPrompt(env, "Password for {user}@{host}: ", _on_password)
         else:
             env.exit(0)
     except argparse.ArgumentError as exc:
