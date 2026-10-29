@@ -57,7 +57,7 @@ In another terminal, from `../..`:
 
 Then:
 
-    just add-devices                            # onboard ce1-ce3 into flotilla-1 as c8000v-ce1 and so on
+    just add-devices                            # onboard ce1-ce3 as c8000v-ce1 and so on
 
 A campaign shows each CE's upgrade stage, why a failed run stopped, and its
 pre-check and post-check verdicts in `just state`.

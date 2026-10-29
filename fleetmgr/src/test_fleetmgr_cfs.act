@@ -23,8 +23,6 @@ from fleetmgr.layers.y_0 import \
     fleetmgr__fleet__device__credentials as InputCredentials, \
     fleetmgr__fleet__device__mock__module_entry as InputMockModule, \
     fleetmgr__fleet__device_entry as InputDevice, \
-    fleetmgr__fleet__node__credentials as NodeCredentials, \
-    fleetmgr__fleet__node_entry as InputNode, \
     software__software__upgrade_campaign_entry as InputCampaign
 from fleetmgr.layers.y_1_loose import \
     stratoweave_rfs__device_entry as OutputNode, \
@@ -36,40 +34,6 @@ from fleetmgr.layers.y_1_loose import \
     stratoweave_rfs__rfs__device_entry as OutputDevice
 
 
-actor _test_node_transform(t: testing.AsyncT):
-    i = InputNode(
-        name="flotilla-1",
-        description="Stockholm flotilla",
-        credentials=NodeCredentials(username="admin", password="admin"),
-    )
-    address = i.address.create("primary", address="127.0.0.1", port=u64(12031))
-    i.ssh.cipher = ["aes256-ctr", "aes128-ctr"]
-    i.ssh.key_exchange = ["curve25519-sha256"]
-    i.ssh.minimum_rsa_bits = u64(3072)
-    i.ssh.rekey_after_seconds = u64(0)
-
-    transform: cfs.Node = cfs.Node()
-    o: y_1.root = y_1.root.from_gdata(transform.transform(i).to_gdata())
-    dev: OutputNode = o.device.get("flotilla-1")!
-    out_address = dev.address.get("primary")!
-
-    if dev.type != "flotilla" or dev.description != "Stockholm flotilla":
-        t.failure(ValueError("flotilla identity was not preserved"))
-    elif out_address.address != "127.0.0.1" or out_address.port != u64(12031):
-        t.failure(ValueError("flotilla address was not preserved"))
-    elif dev.credentials.username != "admin" or dev.credentials.password != "admin":
-        t.failure(ValueError("flotilla credentials were not preserved"))
-    elif dev.sync_check != False:
-        t.failure(ValueError("flotilla sync-check did not default to false"))
-    elif dev.ssh.cipher != ["aes256-ctr", "aes128-ctr"] or \
-         dev.ssh.key_exchange != ["curve25519-sha256"] or \
-         dev.ssh.minimum_rsa_bits != u64(3072) or \
-         dev.ssh.rekey_after_seconds != u64(0):
-        t.failure(ValueError("flotilla SSH options were not preserved"))
-    else:
-        t.success()
-
-
 def _test_device_ssh_propagation():
     """CFS SSH options survive both transforms and the flotilla XML boundary."""
     config = xml.decode("""<config>
@@ -77,7 +41,6 @@ def _test_device_ssh_propagation():
         <device>
           <name>configured</name>
           <type>iosxe</type>
-          <shard>flotilla-1</shard>
           <credentials><username>admin</username></credentials>
           <ssh>
             <cipher>aes256-ctr</cipher>
@@ -101,7 +64,6 @@ def _test_device_ssh_propagation():
         <device>
           <name>defaults</name>
           <type>iosxe</type>
-          <shard>flotilla-1</shard>
           <credentials><username>admin</username></credentials>
         </device>
       </fleet>
@@ -116,7 +78,7 @@ def _test_device_ssh_propagation():
     devices: dict[str, DeviceMetaConfig] = {}
     for i in inputs.fleet.device:
         lower = y_1_config.root.from_gdata(cfs.Device().transform(i).to_gdata())
-        entry = lower.rfs.get("flotilla-1")!.device.get(i.name)!
+        entry = lower.rfs.get(cfs.flotilla_of(i.name))!.device.get(i.name)!
         rendered = rfs.Device().transform(entry, di).to_gdata()
         wire = xml.Node("config", children=rendered.to_xml())
         received = flotilla_rfs.root.from_gdata(
@@ -162,7 +124,6 @@ actor _test_campaign_transform(t: testing.AsyncT):
     inventory.fleet.device.create(
         "cpe-1",
         type="iosxe",
-        shard="flotilla-1",
         credentials=InputCredentials(username="admin"),
     )
     campaign = InputCampaign(
@@ -179,13 +140,13 @@ actor _test_campaign_transform(t: testing.AsyncT):
     o: y_1.root = y_1.root.from_gdata(
         cfs.campaign_config(campaign, inventory, released).to_gdata()
     )
-    dev = o.rfs.get("flotilla-1")!.device.get("cpe-1")!
+    dev = o.rfs.get(cfs.flotilla_of("cpe-1"))!.device.get("cpe-1")!
 
     if dev.software.target_release != "17.18.03a" or \
        dev.software.upgrade_campaign != "xe-upgrade" or \
        dev.software.image_url != "https://images.example/xe.bin" or \
        not dev.software.allow_staging!:
-        t.failure(ValueError("campaign was not routed through the device shard"))
+        t.failure(ValueError("campaign was not routed to the device's flotilla"))
     else:
         t.success()
 
@@ -193,14 +154,9 @@ actor _test_campaign_transform(t: testing.AsyncT):
 actor _test_campaign_link_routes_existing_inventory(t: testing.AsyncT):
     """A later campaign resolves and augments an existing inventory device."""
     root = y_0.root()
-    root.fleet.node.create(
-        "flotilla-1",
-        credentials=NodeCredentials(username="admin"),
-    )
     root.fleet.device.create(
         "cpe-1",
         type="iosxe",
-        shard="flotilla-1",
         credentials=InputCredentials(username="admin"),
     )
     tr = stratoweave.test_main(sysspec.SYSSPEC, t.log_handler)
@@ -218,9 +174,9 @@ actor _test_campaign_link_routes_existing_inventory(t: testing.AsyncT):
             return
         lower = y_1.root.from_gdata(tr.cfs.below().newsession().get_data())
         found = False
-        shard = lower.rfs.get("flotilla-1")
-        if shard is not None:
-            out = shard.device.get("cpe-1")
+        flotilla = lower.rfs.get(cfs.flotilla_of("cpe-1"))
+        if flotilla is not None:
+            out = flotilla.device.get("cpe-1")
             if out is not None:
                 if out.software.target_release == "17.18.03a":
                     found = True
@@ -255,7 +211,7 @@ actor _test_campaign_link_routes_existing_inventory(t: testing.AsyncT):
     after 8.0: fail("timed out waiting for linked campaign")
 
 
-mut def _lab_device(shard: ?str) -> InputDevice:
+mut def _lab_device() -> InputDevice:
     """Return a device with every option set."""
     credentials: InputCredentials = InputCredentials(
         username="netops",
@@ -266,7 +222,6 @@ mut def _lab_device(shard: ?str) -> InputDevice:
     i: InputDevice = InputDevice(
         name="cpe-1",
         type="iosxe",
-        shard=shard,
         description="Lab CPE",
         credentials=credentials,
         approval_required=True,
@@ -309,9 +264,9 @@ mut def _lab_device(shard: ?str) -> InputDevice:
 
 actor _test_device_transform(t: testing.AsyncT):
     transform: cfs.Device = cfs.Device()
-    o: y_1.root = y_1.root.from_gdata(transform.transform(_lab_device("flotilla-1")).to_gdata())
-    shard = o.rfs.get("flotilla-1")!
-    dev: OutputDevice = shard.device.get("cpe-1")!
+    o: y_1.root = y_1.root.from_gdata(transform.transform(_lab_device()).to_gdata())
+    flotilla = o.rfs.get(cfs.flotilla_of("cpe-1"))!
+    dev: OutputDevice = flotilla.device.get("cpe-1")!
     out_address: OutputAddress = dev.address.get("oob")!
     address_credentials: ?AddressCredentials = out_address.initial_credentials.get((
         username="address-bootstrap",
@@ -354,58 +309,32 @@ actor _test_device_transform(t: testing.AsyncT):
         t.success()
 
 
-def _test_direct_device_transform():
-    """A device without a shard gets the device entry in this instance, with
-    the meta config that a flotilla would give it."""
-    di = ttt.DeviceInfo("flotilla-1", {
-        "stratoweave-rfs": swadapt.ModCap(
-            "stratoweave-rfs",
-            "http://stratoweave.org/yang/stratoweave-rfs",
-        )
-    })
-    tiered = y_1_config.root.from_gdata(cfs.Device().transform(_lab_device("flotilla-1")).to_gdata())
-    entry = tiered.rfs.get("flotilla-1")!.device.get("cpe-1")!
-    rendered = flotilla_rfs.root.from_gdata(rfs.Device().transform(entry, di).to_gdata())
-    want = DeviceMetaConfig.from_gdata(rendered.device.get("cpe-1")!.to_gdata())
-
-    direct = y_1_config.root.from_gdata(cfs.Device().transform(_lab_device(None)).to_gdata())
-    testing.assertEqual(len(list(direct.rfs)), 0, "a direct device must not go to a flotilla")
-    got = DeviceMetaConfig.from_gdata(direct.device.get("cpe-1")!.to_gdata())
-    testing.assertEqual(got.to_gdata(), want.to_gdata())
+def _test_device_writes_its_flotilla():
+    """A device's transform also writes the top's entry for its flotilla, with
+    the flotilla's local NETCONF port and the flotillas' default login."""
+    o: y_1.root = y_1.root.from_gdata(cfs.Device().transform(_lab_device()).to_gdata())
+    name = cfs.flotilla_of("cpe-1")
+    testing.assertEqual([d.name for d in o.device], [name])
+    dev: OutputNode = o.device.get(name)!
+    testing.assertEqual(dev.type, "flotilla")
+    testing.assertEqual(dev.sync_check, False)
+    address = dev.address.get("primary")!
+    testing.assertEqual(address.address, "127.0.0.1")
+    testing.assertEqual(address.port, u64(12901 + cfs.flotilla_index("cpe-1")))
+    testing.assertEqual(dev.credentials.username, "admin")
+    testing.assertEqual(dev.credentials.password, "admin")
 
 
-def _test_campaign_routes_by_shard():
-    """The campaign writes the software intent of a device with a shard to its
-    flotilla, and of a device without one to its own device entry."""
-    inventory = y_0.root()
-    inventory.fleet.device.create("cpe-1", type="iosxe", shard="flotilla-1",
-                                  credentials=InputCredentials(username="admin"))
-    inventory.fleet.device.create("cpe-2", type="iosxe",
-                                  credentials=InputCredentials(username="admin"))
-    campaign = InputCampaign(
-        name="xe-upgrade",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
-        allow_staging=True,
-        admin_state="run",
-    )
-    campaign.device.create("cpe-1")
-    campaign.device.create("cpe-2")
-    released = {"cpe-1", "cpe-2"}
-    o: y_1.root = y_1.root.from_gdata(
-        cfs.campaign_config(campaign, inventory, released).to_gdata()
-    )
-
-    testing.assertEqual([d.name for shard in o.rfs for d in shard.device], ["cpe-1"])
-    testing.assertEqual([d.name for d in o.device], ["cpe-2"])
-    tiered = o.rfs.get("flotilla-1")!.device.get("cpe-1")!.software
-    testing.assertEqual(tiered.target_release, "17.18.03a")
-    testing.assertEqual(tiered.upgrade_campaign, "xe-upgrade")
-    direct = o.device.get("cpe-2")!.software
-    testing.assertEqual(direct.target_release, "17.18.03a")
-    testing.assertEqual(direct.upgrade_campaign, "xe-upgrade")
-    testing.assertEqual(direct.image_url, "https://images.example/xe.bin")
-    testing.assertEqual(direct.allow_staging, True)
+def _test_flotilla_placement():
+    """A device's name picks its flotilla, the same on every run, and a fleet
+    spreads over all ten. A change in Acton's hash would move devices to
+    other flotillas; the pinned names catch that."""
+    testing.assertEqual(cfs.flotilla_of("cpe-001"), "flotilla-8")
+    testing.assertEqual(cfs.flotilla_of("cpe-002"), "flotilla-9")
+    seen: set[str] = set()
+    for i in range(1, 101):
+        seen.add(cfs.flotilla_of("cpe-{i:03d}"))
+    testing.assertEqual(sorted(list(seen)), sorted(["flotilla-{n}" for n in range(1, 11)]))
 
 
 def _paced_campaign(names: list[str]) -> InputCampaign:
@@ -434,7 +363,6 @@ def _flat_inventory(names: list[str], upgrade_duration: ?int = None) -> y_0.root
         dev = linked.fleet.device.create(
             name,
             type="iosxe",
-            shard="flotilla-1",
             credentials=InputCredentials(username="admin"),
         )
         dev.mock.enabled = True
@@ -554,8 +482,8 @@ def _campaign_path(name: str) -> ttt.Path:
 
 actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
     """Each device's stage, reason and check verdicts reach the campaign next
-    to its status, from a flotilla and from the top alike. A device not heard
-    from has none."""
+    to its status, as its flotilla reports them. A device not heard from has
+    none."""
     var done = False
 
     def row(o: y0_oper.software__software__upgrade_campaign_entry, name: str) -> str:
@@ -600,25 +528,25 @@ actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
     campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
     campaign.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
 
-    sharded = y1_oper.stratoweave_rfs__rfs__device__software__state(
+    rolled_back = y1_oper.stratoweave_rfs__rfs__device__software__state(
         status="rolled-back", running_release="17.18.02", stage="rollback",
         reason="post-check failed: rfs-device-health: not back to the baseline")
-    sharded.precheck.verdict = "pass"
-    sharded.precheck.detail = "rfs-device-health: 1/1 sessions established"
-    sharded.precheck.at = "2026-10-07T12:00:00Z"
-    sharded.postcheck.verdict = "fail"
-    sharded.postcheck.detail = "rfs-device-health: not back to the baseline"
-    sharded.postcheck.at = "2026-10-07T12:12:00Z"
-    campaign.on_rfs((rfs_name="flotilla-1", device_name="cpe-1"), sharded, None)
+    rolled_back.precheck.verdict = "pass"
+    rolled_back.precheck.detail = "rfs-device-health: 1/1 sessions established"
+    rolled_back.precheck.at = "2026-10-07T12:00:00Z"
+    rolled_back.postcheck.verdict = "fail"
+    rolled_back.postcheck.detail = "rfs-device-health: not back to the baseline"
+    rolled_back.postcheck.at = "2026-10-07T12:12:00Z"
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), rolled_back, None)
 
-    direct = y1_oper.stratoweave_rfs__device__software__state(
+    refused = y1_oper.stratoweave_rfs__rfs__device__software__state(
         status="failed", running_release="17.18.02", stage="precheck",
         reason="pre-check failed: did not answer: rfs-device-health")
-    direct.precheck.verdict = "fail"
-    direct.precheck.detail = "did not answer: rfs-device-health"
-    direct.precheck.at = "2026-10-07T12:01:00Z"
-    direct.postcheck.verdict = "not-run"
-    campaign.on_device((device_name="cpe-2"), direct, None)
+    refused.precheck.verdict = "fail"
+    refused.precheck.detail = "did not answer: rfs-device-health"
+    refused.precheck.at = "2026-10-07T12:01:00Z"
+    refused.postcheck.verdict = "not-run"
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-2"), device_name="cpe-2"), refused, None)
 
     # The replay is in. A campaign in plan publishes once it is synced.
     campaign.on_subscriptions_synced()
@@ -726,7 +654,7 @@ def _test_snapshot_plan_estimates_mixed_fleet():
     )
     linked = _flat_inventory(["dev-{i}" for i in range(9)])
     real = linked.fleet.device.create(
-        "dev-real", type="iosxe", shard="flotilla-1",
+        "dev-real", type="iosxe",
         credentials=InputCredentials(username="admin"))
     for i in range(9):
         campaign.device.create("dev-{i}")
@@ -769,10 +697,10 @@ actor _test_campaign_estimate_from_the_adapter(t: testing.AsyncT):
     duration; a mocked one at its configured duration."""
     linked = y_0.root()
     real = linked.fleet.device.create(
-        "real-1", type="iosxe", shard="flotilla-1",
+        "real-1", type="iosxe",
         credentials=InputCredentials(username="admin"))
     mocked = linked.fleet.device.create(
-        "mock-1", type="iosxe", shard="flotilla-1",
+        "mock-1", type="iosxe",
         credentials=InputCredentials(username="admin"))
     mocked.mock.enabled = True
     mocked.mock.software.upgrade_duration = u64(120)
@@ -942,7 +870,7 @@ actor _test_campaign_replan_keeps_released_devices(t: testing.AsyncT):
         cc = controller
         if cc is not None:
             state = y1_oper.stratoweave_rfs__rfs__device__software__state(status="succeeded", running_release="17.18.03a")
-            cc.on_rfs((rfs_name="flotilla-1", device_name=name), state, None)
+            cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name), state, None)
 
     def replan() -> None:
         cc = controller
@@ -960,20 +888,20 @@ actor _test_campaign_replan_keeps_released_devices(t: testing.AsyncT):
                 check(oper)
 
     def on_output(conf: gdata.Node):
-        l = conf.get_opt_list(gdata.Id('http://stratoweave.org/yang/stratoweave-rfs', 'rfs'))
-        if l is not None:
-            devs = l.get_list_entry('flotilla-1').get_list(gdata.Id('urn:fleetmgr:rfs', 'device'))
-            released = set(devs.elements.keys())
-            if released == {"d0"}:
-                after 0.0: finish("d0")
-            elif released == {"d0", "d1"}:
-                after 0.0: finish("d1")
-            elif released == {"d0", "d1", "d2"} and not ready:
-                # Output is delivered asynchronously, after this decision's
-                # oper publication. Queue the replan here; on_conf emits
-                # this same released set again, so request it only once.
-                ready = True
-                after 0.0: replan()
+        released: set[str] = set()
+        for flotilla in y_1.root.from_gdata(conf).rfs:
+            for d in flotilla.device:
+                released.add(d.name)
+        if released == {"d0"}:
+            after 0.0: finish("d0")
+        elif released == {"d0", "d1"}:
+            after 0.0: finish("d1")
+        elif released == {"d0", "d1", "d2"} and not ready:
+            # Output is delivered asynchronously, after this decision's
+            # oper publication. Queue the replan here; on_conf emits
+            # this same released set again, so request it only once.
+            ready = True
+            after 0.0: replan()
 
     def check(oper: y0_oper.software__software__upgrade_campaign_entry) -> None:
         window: dict[str, str] = {}

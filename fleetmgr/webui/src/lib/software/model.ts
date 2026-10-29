@@ -30,18 +30,12 @@ interface AddressJson {
 export interface DeviceJson {
   name: string;
   type?: string;
-  shard?: string;
   description?: string;
   schedule?: string;
   'approval-required'?: boolean;
   address?: AddressJson[];
   credentials?: { username?: string; password?: string };
   mock?: { enabled?: boolean };
-}
-
-interface NodeJson {
-  name: string;
-  address?: AddressJson[];
 }
 
 interface CampaignMemberJson {
@@ -137,7 +131,6 @@ export interface ImageJson {
 /** GET data merges every module; this UI reads three of them. */
 interface DataTreeJson {
   'fleetmgr:fleet'?: {
-    node?: NodeJson[];
     device?: DeviceJson[];
   };
   'software:software'?: {
@@ -162,7 +155,6 @@ interface ImagesJson {
 
 export interface FleetPatchJson {
   'fleetmgr:fleet': {
-    node?: NodeJson[];
     device?: DeviceJson[];
   };
 }
@@ -217,7 +209,6 @@ export const STATUS_TONE: Record<KnownStatus, StatusTone> = {
 export interface Device {
   name: string;
   type: string;
-  shard: string;
   description: string;
   /** Maintenance schedule binding, by name; empty when unbound. */
   schedule: string;
@@ -397,7 +388,6 @@ function parseDevice(entry: DeviceJson): Device {
   return {
     name: entry.name,
     type: entry.type ?? '',
-    shard: entry.shard ?? '',
     description: entry.description ?? '',
     schedule: entry.schedule ?? '',
     approvalRequired: entry['approval-required'] === true,
@@ -529,12 +519,9 @@ export function parseStateNode(json: unknown): StateParts | null {
 
 /** Parse a GET of data/fleetmgr:fleet (never poll data/ itself: it also
  * hauls the full yang-library). */
-export function parseFleet(json: unknown): { nodes: string[]; devices: Device[] } {
+export function parseFleet(json: unknown): { devices: Device[] } {
   const fleet = (json as DataTreeJson)?.['fleetmgr:fleet'];
-  return {
-    nodes: (fleet?.node ?? []).map((n) => n.name),
-    devices: (fleet?.device ?? []).map(parseDevice)
-  };
+  return { devices: (fleet?.device ?? []).map(parseDevice) };
 }
 
 /** Parse a GET of data/software:software. */

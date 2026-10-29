@@ -30,7 +30,7 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
 ## How it reads and writes
 
 - Creates and updates PATCH `/restconf/data` with module-qualified
-  wrappers: `"fleetmgr:fleet"` for inventory (nodes and devices),
+  wrappers: `"fleetmgr:fleet"` for inventory (devices),
   `"software:software"` for campaigns. The backend rejects a PATCH whose
   target does not exist yet, so nothing PATCHes list entries directly.
   RESTCONF PATCH merges: launching a campaign sends only
@@ -170,5 +170,5 @@ target rate, not both. Rate and ETA are measured since page open, and
 nothing is latched: status tracks live device state and regresses when a
 campaign goes back to plan.
 
-Sharding is internal: device creation places entries on the least-loaded
-flotilla node silently, and nothing in the UI shows the placement.
+Sharding is internal: the top places each device on a flotilla by its
+name, and nothing in the UI shows the placement.

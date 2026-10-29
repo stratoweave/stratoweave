@@ -1,28 +1,22 @@
 # fleetmgr — layered fleet management
 
 `fleetmgr` is the top of the layered deployment. It owns the complete
-per-device inventory and generic software upgrade campaigns. It assigns each
-device to a manually named shard, or manages a device without a shard itself.
+per-device inventory and generic software upgrade campaigns. It places each
+device on one of its ten flotillas, `flotilla-1` to `flotilla-10`, by a hash
+of the device name, so a device always lands on the same flotilla.
 
 `flotilla` is the bottom. It has no application CFS layer: its northbound is
 the standard StratoWeave RFS, and every `/device` entry is managed directly as
 an IOS XE device.
 
-    fleetmgr CFS /fleet/device{cpe, shard=flotilla-1, type=iosxe}
-        -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}
+    fleetmgr CFS /fleet/device{cpe, type=iosxe}
+        -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}, flotilla-1 from hash(cpe)
         -> NETCONF -> flotilla RFS /device{cpe}
-        -> IOS XE adapter -> physical or mock IOS XE device
-
-    fleetmgr CFS /fleet/device{cpe, type=iosxe}, no shard
-        -> fleetmgr RFS /device{cpe}
         -> IOS XE adapter -> physical or mock IOS XE device
 
     flotilla operational datastore /device{cpe}/software/state
         -> one on-change subscription per device
         -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}/software/state
-        -> fleetmgr CFS /software/upgrade-campaign/state
-
-    fleetmgr RFS /device{cpe}/software/state, no shard
         -> fleetmgr CFS /software/upgrade-campaign/state
 
     flotilla RFS /rfs{cpe}/device-health
@@ -49,13 +43,11 @@ Start the top:
     just demo
 
 The top starts ten `flotilla` subprocesses and waits for every NETCONF listener
-before starting its own runtime. The demo declares `flotilla-1` through
-`flotilla-10` and assigns ten complete mock IOS XE entries to each, `cpe-001`
-to `cpe-100`. `cpe-101` and `cpe-102` have no shard, so the top manages them
-itself. Every device takes 120 to 150 s to upgrade, fourteen of them,
-picked at random when the file was generated so the grids show no pattern,
-fail in one of the mock's seven ways, two per kind, and `cpe-003` already
-runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
+before starting its own runtime. The demo has 102 complete mock IOS XE
+entries, `cpe-001` to `cpe-102`, six to fourteen on each flotilla. Every
+device takes 120 to 150 s to upgrade, fourteen of them, picked at random
+when the file was generated so the grids show no pattern, fail in one of
+the mock's seven ways, two per kind, and `cpe-003` already runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
 campaign over the 99 devices `upgrade.xml` does not use, bound to a
 `nightly` schedule with a one-hour window at midnight UTC, so the web UI
 has a plan to show; it does nothing until set to `run`, and then waits
@@ -69,7 +61,7 @@ uploaded in the web UI in `out/images`. The processes use these ports:
 
 `just demo-fleet` is the same demo with a generated fleet, a hundred devices
 by default or `just demo-fleet 1000` for more: `cpe-0001` onwards, spread
-round-robin over the flotillas with quick eight-second installs, three
+over the flotillas by name hash, with quick eight-second installs, three
 regional schedules, europe, americas and asia, whose one-hour windows open
 half a minute, a minute and a half and two and a half minutes after the top
 starts, and `fleet-upgrade`, a planned campaign over all of them. The
@@ -117,8 +109,8 @@ Inspect the top CFS and the bottom RFS independently:
     curl -H "Accept: application/yang-data+json" \
       http://127.0.0.1:18201/restconf/data
 
-The second response should contain the two `stratoweave-rfs:device` entries
-assigned to `flotilla-1` and rendered by the top.
+The second response should contain the `stratoweave-rfs:device` entries the
+top placed on `flotilla-1` and rendered there, nine in the demo.
 
 Run the three-device IOS XE campaign over `cpe-001`, `cpe-003` and `cpe-007`
 and follow its state from the top:
@@ -176,25 +168,26 @@ BGP sessions give the devices real routing state. See `test/lab/README.md`.
 
 ## Models and transforms
 
-The `fleetmgr` CFS has two inventory lists:
+The `fleetmgr` CFS inventory is `/fleet/device`: complete device
+configuration plus an explicit device `type`. The top starts ten flotillas,
+`flotilla-1` to `flotilla-10`, and a device goes to `flotilla-N`, where N is
+the device name's hash modulo ten, plus one. Acton hashes a string the same
+way on every run, so the placement survives restarts. The device's transform
+writes its entry under `/rfs{flotilla-N}/device`, and the top's own
+`/device{flotilla-N}` entry with device type `flotilla`, the flotilla's local
+NETCONF port and the flotillas' default `admin`/`admin` NETCONF login.
+Every device on a flotilla writes the same entry, so the top connects to a
+flotilla once it has a device.
 
-- `/fleet/node`: connection configuration for a flotilla. Its transform creates
-  the top's managed `/device` entry with device type `flotilla`.
-- `/fleet/device`: complete device configuration plus an optional string
-  `shard` and an explicit device `type`. Its transform writes the entry under
-  `/rfs{shard}/device`. Without a shard it writes the top's own `/device`
-  entry, and the top manages the device with the device types a flotilla uses.
-
-Both lists expose an `ssh` container using the shared
+The device list exposes an `ssh` container using the shared
 `stratoweave-ssh:ssh-client-config` grouping. Set SSH client options under
-`/fleet/device/ssh` to pass them through to the device's owning flotilla, or
-under `/fleet/node/ssh` to configure the top's connection to that flotilla.
+`/fleet/device/ssh` to pass them through to the device's owning flotilla.
 Algorithm preference order is preserved through both transforms.
 
 The generic `software` model remains separate from inventory. Each campaign
 device list entry links its name to the referenced `/fleet/device` entry,
-resolving each member's shard before merging all software intent into the same
-device entry that the inventory transform writes.
+routing each member to its flotilla before merging all software intent into the
+same device entry that the inventory transform writes.
 
 `/images` is the StratoWeave image list (`swyang.images`): software images
 by file name, each with its `os`, `version` and the hardware `model`s it is
@@ -208,9 +201,8 @@ The RFS transform renders that entry directly into the flotilla's standard
 `/device/software/state` on the flotilla, and publishes the status, running
 release, stage, reason and check verdicts as the entry's own `software/state`.
 A change on one device publishes one entry. Removing the entry closes the subscription
-and clears the state. For a device without a shard, the top's own device
-manager publishes `/device/software/state`. Campaign transforms subscribe to
-both and aggregate their own members.
+and clears the state. Campaign transforms subscribe to these entries and
+aggregate their own members.
 
 `flotilla` supplies one modeled layer, the standard RFS plus the
 `flotilla-rfs` augment below. StratoWeave adds the implicit device layer
@@ -247,9 +239,9 @@ with its numbers, except on the `bgp-down` and `bgp-lost` devices.
 
     just test
 
-The focused tests cover node creation, per-device sharding, precise campaign
-links, campaign aggregation, the stage, reason and check verdicts reaching the
-campaign, the parent RFS-to-flotilla render, direct `/device` configuration at
+The focused tests cover device placement by name, the top's flotilla
+entries, precise campaign links, campaign aggregation, the stage, reason and
+check verdicts reaching the campaign, the parent RFS-to-flotilla render, direct `/device` configuration at
 the RFS-only bottom, the mock leaves reaching the flotilla, reading the BGP
 neighbors, and a complete mock IOS XE software upgrade gated by the
 device-health checks, which the mock's BGP failures refuse or roll back. The
