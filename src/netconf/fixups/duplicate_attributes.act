@@ -1,0 +1,196 @@
+import testing
+import std.xml as xml
+from netconf.fixups.base import Fixup
+
+
+def _is_space(c: str) -> bool:
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
+
+
+def first_tag(msg: str) -> int:
+    """The index of the "<" that opens the first element of msg, or -1"""
+    i = msg.find("<")
+    while i >= 0:
+        if msg.startswith("<?", i):
+            end = msg.find("?>", i)
+            if end < 0:
+                return -1
+            i = msg.find("<", end + 2)
+        elif msg.startswith("<!--", i):
+            end = msg.find("-->", i)
+            if end < 0:
+                return -1
+            i = msg.find("<", end + 3)
+        else:
+            return i
+    return -1
+
+
+def first_tag_repeats(msg: str) -> (str, list[(int, int)]):
+    """The name of the first tag of msg, and the spans of its attributes that
+    repeat an earlier attribute with the same value. No spans when there are
+    none, or the first tag does not read as a start tag.
+    """
+    start = first_tag(msg)
+    if start < 0:
+        return ("", [])
+    n = len(msg)
+    i = start + 1
+    while i < n and not _is_space(msg[i]) and msg[i] != ">" and msg[i] != "/":
+        i += 1
+    tag = msg[start + 1:i]
+
+    seen: dict[str, str] = {}
+    spans: list[(int, int)] = []
+    while i < n:
+        # A span takes the space before the attribute along with it
+        attr_start = i
+        while i < n and _is_space(msg[i]):
+            i += 1
+        if i == n or msg[i] == ">" or msg[i] == "/":
+            break
+        name_start = i
+        while i < n and not _is_space(msg[i]) and msg[i] != "=" and msg[i] != ">" and msg[i] != "/":
+            i += 1
+        name = msg[name_start:i]
+        while i < n and _is_space(msg[i]):
+            i += 1
+        if name == "" or i == n or msg[i] != "=":
+            return (tag, [])
+        i += 1
+        while i < n and _is_space(msg[i]):
+            i += 1
+        if i == n or (msg[i] != "\"" and msg[i] != "'"):
+            return (tag, [])
+        value_end = msg.find(msg[i], i + 1)
+        if value_end < 0:
+            return (tag, [])
+        value = msg[i + 1:value_end]
+        i = value_end + 1
+        if name in seen:
+            if seen[name] == value:
+                spans.append((attr_start, i))
+        else:
+            seen[name] = value
+    return (tag, spans)
+
+
+def cut(msg: str, spans: list[(int, int)]) -> str:
+    """msg without spans, which are in order and do not overlap"""
+    parts: list[str] = []
+    pos = 0
+    for span_start, span_end in spans:
+        parts.append(msg[pos:span_start])
+        pos = span_end
+    parts.append(msg[pos:])
+    return "".join(parts)
+
+
+def drop_repeated_attributes(msg: str) -> str:
+    """msg without the attributes of its first tag that repeat an earlier
+    attribute with the same value. msg as it is when there are none, or the
+    first tag does not read as a start tag.
+    """
+    tag, spans = first_tag_repeats(msg)
+    if len(spans) == 0:
+        return msg
+    return cut(msg, spans)
+
+
+class DuplicateAttributesFixup(Fixup):
+    """Drop repeated attributes from the first tag of a message.
+
+    Junos 10.4 copies the attributes of the <rpc> onto its <rpc-reply>, as
+    RFC 6241 says it must, including the xmlns the <rpc-reply> already has:
+
+      <rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0"
+                 xmlns:junos="http://xml.juniper.net/junos/10.4R5/junos"
+                 xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="1">
+
+    An attribute may appear only once in XML, so the reply does not parse.
+    A repeat with the same value means what the attribute means once, so
+    dropping it changes nothing. A repeat with another value is left for the
+    parser to reject, as there is no telling which value is meant.
+
+    The fixup is active for every device until the first <rpc-reply> without
+    repeats. A device that copies the attributes of the <rpc> does so in every
+    reply, so one without repeats shows the device does not need the fixup.
+    """
+    def __init__(self):
+        Fixup.__init__(self, "duplicate-attributes")
+
+    mut def on_raw_message(self, msg: str) -> str:
+        tag, spans = first_tag_repeats(msg)
+        if len(spans) > 0:
+            return cut(msg, spans)
+        if tag == "rpc-reply" or tag.endswith(":rpc-reply"):
+            self.active = False
+            self.deactivate_reason = "observed rpc-reply without repeated attributes"
+        return msg
+
+
+JUNOS_10_4_REPLY = """
+<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:junos="http://xml.juniper.net/junos/10.4R5/junos" xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="1">
+<data/>
+</rpc-reply>"""
+
+def _test_junos_10_4_reply():
+    parsed = True
+    try:
+        xml.decode(JUNOS_10_4_REPLY)
+    except xml.XmlParseError:
+        parsed = False
+    testing.assertFalse(parsed, "the reply as Junos 10.4 sends it parses")
+
+    fixed = drop_repeated_attributes(JUNOS_10_4_REPLY)
+    testing.assertEqual(fixed, """
+<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" xmlns:junos="http://xml.juniper.net/junos/10.4R5/junos" message-id="1">
+<data/>
+</rpc-reply>""")
+    root = xml.decode(fixed)
+    testing.assertEqual(root.tag, "rpc-reply")
+    testing.assertEqual(root.attributes, [("message-id", "1")])
+
+def _test_no_repeat():
+    msg = """<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="1"><data/></rpc-reply>"""
+    testing.assertEqual(drop_repeated_attributes(msg), msg)
+
+def _test_repeat_with_other_value():
+    msg = """<a x="1" x="2"/>"""
+    testing.assertEqual(drop_repeated_attributes(msg), msg)
+
+def _test_first_tag_only():
+    msg = """<a x="1"><b y="1" y="1"/></a>"""
+    testing.assertEqual(drop_repeated_attributes(msg), msg)
+
+def _test_declaration_comment_and_quoting():
+    msg = """<?xml version="1.0"?>
+<!-- <a x="2" x="2"/> -->
+<a x='1>2' y = "3" x="1>2"/>"""
+    testing.assertEqual(drop_repeated_attributes(msg), """<?xml version="1.0"?>
+<!-- <a x="2" x="2"/> -->
+<a x='1>2' y = "3"/>""")
+
+def _test_unterminated_value():
+    msg = """<a x="1" x="1"""
+    testing.assertEqual(drop_repeated_attributes(msg), msg)
+
+mut def _test_fixup_stays_on_for_repeats():
+    fx = DuplicateAttributesFixup()
+    testing.assertNotEqual(fx.on_raw_message(JUNOS_10_4_REPLY), JUNOS_10_4_REPLY)
+    testing.assertTrue(fx.active, "off after a reply with repeats")
+    testing.assertNotEqual(fx.on_raw_message(JUNOS_10_4_REPLY), JUNOS_10_4_REPLY)
+    testing.assertTrue(fx.active, "off after a second reply with repeats")
+
+mut def _test_fixup_turns_off_after_clean_reply():
+    for reply in ["""<rpc-reply xmlns="urn:ietf:params:xml:ns:netconf:base:1.0" message-id="1"><ok/></rpc-reply>""",
+                  """<nc:rpc-reply xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0" nc:message-id="1"><nc:ok/></nc:rpc-reply>"""]:
+        fx = DuplicateAttributesFixup()
+        testing.assertEqual(fx.on_raw_message(reply), reply)
+        testing.assertFalse(fx.active, "on after a clean reply: {reply}")
+
+mut def _test_fixup_stays_on_after_clean_notification():
+    fx = DuplicateAttributesFixup()
+    msg = """<notification xmlns="urn:ietf:params:xml:ns:netconf:notification:1.0"><eventTime>2026-10-29T12:00:00Z</eventTime></notification>"""
+    testing.assertEqual(fx.on_raw_message(msg), msg)
+    testing.assertTrue(fx.active, "off after a notification, which copies no attributes")
