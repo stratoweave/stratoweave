@@ -14,8 +14,8 @@
   import { nameMatcher } from '$lib/software/selection';
   import {
     IMPORT_BATCH,
-    assignNodes,
     chunk,
+    deviceEntries,
     devicesPatch,
     parseImport,
     validateNewDevice,
@@ -245,7 +245,7 @@
       saving = true;
       statusMessage = null;
       const name = draft.name.trim();
-      const entries = assignNodes([draft], data.devices, data.nodes);
+      const entries = deviceEntries([draft]);
       await restconfPatchJson(DATA_ROOT, devicesPatch(entries));
       statusMessage = { type: 'success', text: `Added device ${name}.` };
       closeEditor();
@@ -283,7 +283,7 @@
         };
         return;
       }
-      const entries = assignNodes(result.inputs, data.devices, data.nodes);
+      const entries = deviceEntries(result.inputs);
       for (const batch of chunk(entries, IMPORT_BATCH)) {
         await restconfPatchJson(DATA_ROOT, devicesPatch(batch));
       }

@@ -14,10 +14,10 @@ export const load: PageLoad = async ({ fetch, depends, url }) => {
       restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch),
       restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch)
     ]);
-    const { nodes, devices } = parseFleet(response);
-    return { nodes, devices, schedules: parseSchedules(schedules), scheduleFilter, loadError: '' };
+    const { devices } = parseFleet(response);
+    return { devices, schedules: parseSchedules(schedules), scheduleFilter, loadError: '' };
   } catch (loadError) {
     const message = errorText(loadError, 'Failed to load devices.');
-    return { nodes: [], devices: [], schedules: [], scheduleFilter, loadError: message };
+    return { devices: [], schedules: [], scheduleFilter, loadError: message };
   }
 };
