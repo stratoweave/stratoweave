@@ -17,7 +17,7 @@ For example, from the repository root, monitor a minisys server using
 its CFS models:
 
 ```sh
-out/bin/ncurl --port 8830 monitor --yang-dir minisys/gen/yang/cfs
+out/bin/ncurl --port 8830 --password admin monitor --yang-dir minisys/gen/yang/cfs
 ```
 
 All local modules are selected by default. To select particular roots,

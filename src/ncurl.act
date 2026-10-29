@@ -22,13 +22,16 @@ import yang.gdata as ygdata
 import yang.schema as yschema
 import yang.xml as yxml
 import device as swdev
+import adapters.adapter as swadapter
 import adapters.netconf as swna
 import schema_filter
+import ssh
 import yang_dir as local_yang
 
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
-    stratoweave_rfs__device__credentials as Credentials
+    stratoweave_rfs__device__credentials as Credentials, \
+    stratoweave_rfs__device__ssh as DeviceMetaConfigSsh
 
 
 def build_explicit_schemas_list(explicit_modules: list[str], format: str) -> list[(identifier: str, version: ?str, format: ?str)]:
@@ -52,6 +55,60 @@ def resolve_client_fixups(args, log_handler):
         return []
     log.info("NETCONF fixups: enabled (default)")
     return fixups.FIXUPS
+
+
+def ssh_settings(args: argparse.Args) -> DeviceMetaConfigSsh:
+    """The SSH settings of the --ssh-* options, as a device's ssh container
+    holds them. An option not given leaves the SSH library's default list."""
+    return DeviceMetaConfigSsh(cipher=args.get_strlist("ssh-cipher"),
+                               mac=args.get_strlist("ssh-mac"),
+                               key_exchange=args.get_strlist("ssh-key-exchange"),
+                               host_key_algorithm=args.get_strlist("ssh-host-key-algorithm"))
+
+
+def ssh_transport(args: argparse.Args) -> ssh.TransportConfig:
+    """The SSH transport of the --ssh-* options. Raises ValueError on an
+    algorithm the SSH library does not have."""
+    return swadapter.ssh_transport_config(ssh_settings(args))
+
+
+def connect_error(e: Exception) -> str:
+    """The message for a failed connect. When the device and ncurl share no
+    SSH algorithm, it points at the --ssh-* options."""
+    if isinstance(e, ssh.KeyExchangeError):
+        return "Error: Failed to connect: {e}\nHint: offer an algorithm the device lists with --ssh-key-exchange, --ssh-host-key-algorithm, --ssh-cipher or --ssh-mac"
+    return "Error: Failed to connect: {e}"
+
+
+def reads_stdin(args: argparse.Args) -> bool:
+    """Whether the command reads its input from stdin, where it would read
+    the password too."""
+    for name in ["config", "request"]:
+        if name in args.options and args.get_str(name) == "-":
+            return True
+    return False
+
+
+actor PasswordPrompt(env, prompt: str, on_password: action(str) -> None):
+    """Ask for a password on stdin, without echo when stdin is a terminal.
+
+    The password is the first line read, or all of the first read when it has
+    no newline, as from printf.
+    """
+    var answered = False
+
+    def _on_stdin(s: str):
+        if not answered:
+            answered = True
+            env.stdio.set_stdin(echo=True)
+            env.stdio.err("\n")
+            nl = s.find("\n")
+            line = s[:nl] if nl >= 0 else s
+            on_password(line[:-1] if line.endswith("\r") else line)
+
+    env.stdio.set_stdin(echo=False)
+    env.stdio.err(prompt)
+    env.stdio.stdin_install(on_stdin=_on_stdin)
 
 
 def _node_text(node) -> str:
@@ -193,7 +250,7 @@ actor CmdListSchemas(env, args, log_handler):
 
     def _on_connect(c: netconf.Client, e: ?Exception):
         if e is not None:
-            print("Error: Failed to connect: {e}", err=True)
+            print(connect_error(e), err=True)
             env.exit(1)
         else:
             c.list_schemas(_on_list_schemas)
@@ -232,7 +289,8 @@ actor CmdListSchemas(env, args, log_handler):
                       port=port,
                       skip_host_key_check=skip_host_key_check,
                       log_handler=log_handler,
-                      fixups=client_fixups)
+                      fixups=client_fixups,
+                      ssh_transport=ssh_transport(args))
 
 
 actor CmdHello(env, args, log_handler):
@@ -263,7 +321,7 @@ actor CmdHello(env, args, log_handler):
 
     def _on_connect(c: netconf.Client, e: ?Exception):
         if e is not None:
-            print("Error: Failed to connect: {e}", err=True)
+            print(connect_error(e), err=True)
             env.exit(1)
         else:
             capabilities = c.get_capabilities()
@@ -295,7 +353,8 @@ actor CmdHello(env, args, log_handler):
                    port=port,
                    skip_host_key_check=skip_host_key_check,
                    log_handler=log_handler,
-                   fixups=client_fixups)
+                   fixups=client_fixups,
+                   ssh_transport=ssh_transport(args))
 
 
 actor CmdGetData(env, args, log_handler, use_get_config: bool):
@@ -325,7 +384,7 @@ actor CmdGetData(env, args, log_handler, use_get_config: bool):
 
     def _on_connect(c: netconf.Client, e: ?Exception):
         if e is not None:
-            print("Error: Failed to connect: {e}", err=True)
+            print(connect_error(e), err=True)
             env.exit(1)
 
         # Validate that module-set and module are mutually exclusive
@@ -549,7 +608,8 @@ actor CmdGetData(env, args, log_handler, use_get_config: bool):
                       port=port,
                       skip_host_key_check=skip_host_key_check,
                       log_handler=log_handler,
-                      fixups=client_fixups)
+                      fixups=client_fixups,
+                      ssh_transport=ssh_transport(args))
 
 
 actor CmdEditConfig(env, args, log_handler):
@@ -573,7 +633,7 @@ actor CmdEditConfig(env, args, log_handler):
 
     def _on_connect(c: netconf.Client, e: ?Exception):
         if e is not None:
-            print("Error: Failed to connect: {e}", err=True)
+            print(connect_error(e), err=True)
             env.exit(1)
 
         client = c
@@ -605,7 +665,8 @@ actor CmdEditConfig(env, args, log_handler):
                           port=port,
                           skip_host_key_check=skip_host_key_check,
                           log_handler=log_handler,
-                          fixups=client_fixups)
+                          fixups=client_fixups,
+                          ssh_transport=ssh_transport(args))
 
     def _do_edit_config():
         if client is not None:
@@ -682,7 +743,7 @@ actor CmdRpc(env, args, log_handler):
 
     def _on_connect(c: netconf.Client, e: ?Exception):
         if e is not None:
-            print("Error: Failed to connect: {e}", err=True)
+            print(connect_error(e), err=True)
             env.exit(1)
             return
 
@@ -738,7 +799,8 @@ actor CmdRpc(env, args, log_handler):
                        port=port,
                        skip_host_key_check=skip_host_key_check,
                        log_handler=log_handler,
-                       fixups=client_fixups)
+                       fixups=client_fixups,
+                       ssh_transport=ssh_transport(args))
 
     def _on_stdin(input: str):
         # Check for empty input (just newline) or special marker
@@ -782,7 +844,7 @@ actor CmdCommit(env, args, log_handler):
 
     def _on_connect(c: netconf.Client, e: ?Exception):
         if e is not None:
-            print("Error: Failed to connect: {e}", err=True)
+            print(connect_error(e), err=True)
             env.exit(1)
         else:
             c.commit(_on_commit)
@@ -809,7 +871,8 @@ actor CmdCommit(env, args, log_handler):
                       port=port,
                       skip_host_key_check=skip_host_key_check,
                       log_handler=log_handler,
-                      fixups=client_fixups)
+                      fixups=client_fixups,
+                      ssh_transport=ssh_transport(args))
 
 
 actor CmdDiscardChanges(env, args, log_handler):
@@ -824,7 +887,7 @@ actor CmdDiscardChanges(env, args, log_handler):
 
     def _on_connect(c: netconf.Client, e: ?Exception):
         if e is not None:
-            print("Error: Failed to connect: {e}", err=True)
+            print(connect_error(e), err=True)
             env.exit(1)
         else:
             c.discard_changes(_on_discard_changes)
@@ -851,7 +914,8 @@ actor CmdDiscardChanges(env, args, log_handler):
                       port=port,
                       skip_host_key_check=skip_host_key_check,
                       log_handler=log_handler,
-                      fixups=client_fixups)
+                      fixups=client_fixups,
+                      ssh_transport=ssh_transport(args))
 
 
 actor CmdGetSchema(env, args, log_handler):
@@ -873,7 +937,7 @@ actor CmdGetSchema(env, args, log_handler):
 
     def _on_connect(c: netconf.Client, e: ?Exception):
         if e is not None:
-            print("Error: Failed to connect: {e}", err=True)
+            print(connect_error(e), err=True)
             env.exit(1)
 
         # Validate that module-set and module are mutually exclusive
@@ -985,7 +1049,8 @@ actor CmdGetSchema(env, args, log_handler):
                   port=port,
                   skip_host_key_check=skip_host_key_check,
                   log_handler=log_handler,
-                  fixups=client_fixups)
+                  fixups=client_fixups,
+                  ssh_transport=ssh_transport(args))
 
 
 actor CmdMonitor(env, args, log_handler):
@@ -1117,6 +1182,7 @@ actor CmdMonitor(env, args, log_handler):
             }
             dmc = DeviceMetaConfig(name="ncurl-target", credentials=Credentials(username, password), type="netconf")
             dmc.address.create("primary", host, u64(port))
+            dmc.ssh = ssh_settings(args)
             dmc.feature_flags.runtime_schema_fetch = sch is None
             device = swdev.DeviceMgr(dev_types, env, "ncurl-target", log_handler, _on_connect, schema_registry)
             device.set_dmc(dmc)
@@ -1125,6 +1191,8 @@ actor CmdMonitor(env, args, log_handler):
 
 actor main(env):
     logh = logging.Handler()
+    # The arguments of a command waiting for its password.
+    var prompted: ?argparse.Args = None
 
     def cmd_list_schemas(args):
         """Command handler for list-schemas"""
@@ -1203,9 +1271,13 @@ actor main(env):
         p.add_option("host", "str", "?", "localhost", "NETCONF server hostname")
         p.add_option("port", "int", "?", 42830, "NETCONF server port")
         p.add_option("username", "str", "?", "admin", "Username for authentication")
-        p.add_option("password", "str", "?", "admin", "Password for authentication")
+        p.add_option("password", "str", "?", None, "Password for authentication; asked for when not given")
         p.add_bool("verbose", "Verbose logging from SSH / NETCONF client")
         p.add_bool("insecure", "Disable SSH host key verification")
+        p.add_option("ssh-cipher", "strlist", "+", [], "SSH cipher to offer instead of the defaults, like aes128-cbc; repeat for more")
+        p.add_option("ssh-mac", "strlist", "+", [], "SSH MAC to offer instead of the defaults, like hmac-sha1; repeat for more")
+        p.add_option("ssh-key-exchange", "strlist", "+", [], "SSH key exchange to offer instead of the defaults, like diffie-hellman-group14-sha1; repeat for more")
+        p.add_option("ssh-host-key-algorithm", "strlist", "+", [], "SSH host key algorithm to accept instead of the defaults, like ssh-rsa; repeat for more")
         p.add_bool("no-fixups", "Disable NETCONF client fixups/workarounds")
 
         # Commands
@@ -1267,13 +1339,35 @@ actor main(env):
 
         return p.parse(env.argv)
 
+    def _on_password(password: str):
+        a = prompted
+        if a is not None:
+            a.options["password"] = ("type"="str", "value"=password)
+            run = a.cmd
+            if run is not None:
+                run(a)
+
     try:
         args = _parse_args()
         cmd = args.cmd
         if cmd is not None:
-            cmd(args)
+            # Fail on an unknown algorithm here, not in the command's actor.
+            ssh_transport(args)
+            if "password" in args.options:
+                cmd(args)
+            elif reads_stdin(args):
+                print("Error: give --password when the input comes from stdin", err=True)
+                env.exit(1)
+            else:
+                prompted = args
+                user = args.get_str("username")
+                host = args.get_str("host")
+                PasswordPrompt(env, "Password for {user}@{host}: ", _on_password)
         else:
             env.exit(0)
     except argparse.ArgumentError as exc:
         print(str(exc), err=True)
+        env.exit(1)
+    except ValueError as exc:
+        print("Error: {exc}", err=True)
         env.exit(1)
