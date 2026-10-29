@@ -37,6 +37,9 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `{name, admin-state: run}`.
 - Campaign members are a list of `{name}` entries whose names reference
   `/fleetmgr:fleet/device`.
+- Each fleet device entry carries config-false `state/platform`: `os`,
+  `version`, `model` and `serial-number` as the device reports them, absent
+  until it has connected. The devices list shows them and filters by model.
 - Pacing is campaign config: `default-schedule` naming a shared
   `maintenance:schedules` entry, `deadline` (seconds since the Unix epoch),
   `target-rate` and `max-rate` (devices per hour, defaults 100 and 500). A
