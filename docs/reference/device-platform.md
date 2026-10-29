@@ -190,10 +190,12 @@ The `ios-xe` probe in `src/adapters/platform_iosxe.act`:
 `Cisco-IOS-XE-platform-oper` names the chassis too, but a lab c8000v
 returned invalid UTF-8 in that tree.
 
-`IosXeSoftwareMock` serves a chassis entry: part-number `C8000V`, or the
-`model` it is given, and serial number `SERIAL`. The mock's subtree filter
-returns no data when a list the filter selects is absent, so without the
-entry the read would get nothing, not even the version.
+`IosXeSoftwareMock` serves a chassis entry: part-number `C8000V` and serial
+number `9ABCDEFGHIJ`, or the `model` and `serial` it is given. A mock device
+sets them as `mock/platform/model` and `mock/platform/serial-number`. The
+mock's subtree filter returns no data when a list the filter selects is
+absent, so without the entry the read would get nothing, not even the
+version.
 
 ## Testing
 
