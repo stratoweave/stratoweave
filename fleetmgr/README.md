@@ -23,6 +23,7 @@ an IOS XE device.
         -> one more on-change subscription per device
         -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}/state/platform
         -> fleetmgr CFS /fleet/device{cpe}/state/platform
+           and the version in /software/upgrade-campaign/state
 
     flotilla RFS /rfs{cpe}/device-health
         -> a periodic BGP state subscription while a check runs
@@ -128,7 +129,7 @@ and follow its state from the top:
 The watcher starts before the intent is submitted and stops when every device
 has settled, after about three minutes: the controller releases the two
 devices that need work one after the other, so `cpe-001` ends `succeeded`
-with `running_release` `17.18.3a` first, `cpe-003` is `up-to-date` at once,
+with `version` `17.18.3a` first, `cpe-003` is `up-to-date` at once,
 and `cpe-007` ends `failed` last.
 
 The submission and observation steps are also available separately:
@@ -207,13 +208,13 @@ configuration, so campaigns can link the whole list later.
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps two on-change subscriptions on the flotilla,
 to the device's `/device/software/state` and `/device/state/platform`, and
-publishes the status, running release, stage, reason and check verdicts as the
-entry's own `software/state` and the platform as its `state/platform`. A change
-on one device publishes one entry. Removing the entry closes the subscriptions
-and clears the state. Campaign transforms subscribe to these entries and
-aggregate their own members. Each `/fleet/device` actor subscribes to its RFS
-entry's platform and publishes it as its own `state/platform`: OS, version,
-model and serial number.
+publishes the status, stage, reason and check verdicts as the entry's own
+`software/state` and the platform as its `state/platform`. A change on one
+device publishes one entry. Removing the entry closes the subscriptions and
+clears the state. Campaign transforms subscribe to both and aggregate their own
+members, each with the version its platform reports. Each `/fleet/device` actor
+subscribes to its RFS entry's platform and publishes it as its own
+`state/platform`: OS, version, model and serial number.
 
 `flotilla` supplies one modeled layer, the standard RFS plus the
 `flotilla-rfs` augment below. StratoWeave adds the implicit device layer
