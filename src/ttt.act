@@ -2212,11 +2212,11 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
     var provisional = set()
     var active: dict[str, set[str]] = {}
     var candidates: dict[str, dict[str, set[str]]] = {}
-    # Latest configure input per source, not the effective configuration.
-    var configs: dict[str, dict[str, gdata.Node]] = {}
+    # Latest input and whether it is differential, per transaction/source.
+    var configs: dict[str, dict[str, (gdata.Node, bool)]] = {}
     var touched: dict[str, dict[str, set[str]]] = {}
-    # Retain committed inputs for comparison with later full replacements.
-    # Differential inputs remain raw fragments, not reconstructed configs.
+    # Full committed inputs only. Differential commits invalidate the baseline
+    # rather than retaining a fragment as if it were a complete configuration.
     var committed_configs: dict[str, gdata.Node] = {}
     var erasures: dict[str, set[str]] = {}
     var pending: list[(str, action(dict[str, set[str]], dict[str, Node]) -> None)] = []
@@ -2298,18 +2298,21 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
         active[src].add(key)
 
     def get_configs() -> dict[str, gdata.Node]:
-        """Snapshot the latest committed input per source, preserving node identity."""
+        """Snapshot known full committed inputs, preserving node identity."""
         return dict(committed_configs.items())
 
-    def acquire(tid, candidate: dict[str, set[str]], erasure: set[str], leaves_by_key: dict[str, dict[gdata.Id, gdata.Leaf]], cfg_by_src: dict[str, gdata.Node]):
+    def acquire(tid, candidate: dict[str, set[str]], erasure: set[str], leaves_by_key: dict[str, dict[gdata.Id, gdata.Leaf]], cfg_by_src: dict[str, gdata.Node], differential=False):
         if tid not in candidates:
             candidates[tid] = {}
             configs[tid] = {}
             touched[tid] = {}
             erasures[tid] = set()
-        configs[tid].update(cfg_by_src.items())
-        # Keep the source contributions already sent to child transactions,
-        # including keys omitted by a later configure in this transaction.
+        is_diff = False
+        if differential:
+            is_diff = True
+        configs[tid].update([(src, (cfg, is_diff)) for src, cfg in cfg_by_src.items()])
+        # Keep configured membership, including keys omitted by a later call.
+        # Unchanged committed contributions may not need child transactions.
         for src, keys in candidate.items():
             touched[tid][src] = touched[tid].get_def(src, set()) | keys
         # Replace only the supplied sources' key sets, retaining the last
@@ -2319,8 +2322,17 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
         erasures[tid] = (erasures[tid] - set(candidate.keys())) | erasure
         #print('====', tid, path, 'list acquire', candidate, 'erasure:', erasure, err=True)
         result = {}
-        for keys in candidates[tid].values():
+        # Only select work for this call. Earlier participants remain in the
+        # transaction, independently of the complete membership recorded above.
+        for src, keys in candidate.items():
+            cfg = cfg_by_src.get(src)
+            old = committed_configs.get(src)
+            active_keys = active.get_def(src, set())
             for k in keys:
+                if not differential and isinstance(cfg, gdata.List) and isinstance(old, gdata.List):
+                    if k in elems and k not in provisional and k in active_keys:
+                        if k in old.elements and same_node(cfg.elements[k], old.elements[k]):
+                            continue
                 if k not in elems:
                     node = template(PathKey(k, path, leaves_by_key[k]), lower)
                     node.bind_db(db)
@@ -2373,7 +2385,12 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
         del touched[tid]
         del erasures[tid]
         if ok:
-            committed_configs.update(config.items())
+            for src, entry in config.items():
+                cfg, differential = entry
+                if differential:
+                    committed_configs.pop(src)
+                else:
+                    committed_configs[src] = cfg
             for src in erasure:
                 del active[src]
             for src, keys in candidate.items():
@@ -2462,8 +2479,7 @@ class _ListTransaction(_Transaction):
             if keys or not differential or isinstance(cfg, gdata.Absent):
                 cfg_keys[src] = keys
 
-        self.key_leaves.update(leaves_by_key.items())
-        nodes = self.liststate.acquire(tid, cfg_keys, erasure, leaves_by_key, cfg_by_src)
+        nodes = self.liststate.acquire(tid, cfg_keys, erasure, leaves_by_key, cfg_by_src, differential)
         refresh = differential and not cfg_by_key and all([isinstance(cfg, gdata.List) for cfg in cfg_by_src.values()])
         if refresh:
             # Refresh the selected subtree, including committed entries in a
@@ -2482,7 +2498,14 @@ class _ListTransaction(_Transaction):
         msgs = {}
         for key, subcfg in cfg_by_key.items():
             #print('   #', tid, '(List)', _format_path(self.path), 'CONFIGURE ELEMENT', key, '\n' + per_src(subcfg), err=True)
-            msgs[key] = async self.elems[key].configure(tid, subcfg, out, dbuf, differential)
+            if key in self.elems:
+                msgs[key] = async self.elems[key].configure(tid, subcfg, out, dbuf, differential)
+                if key in leaves_by_key:
+                    self.key_leaves[key] = leaves_by_key[key]
+            else:
+                # An unchanged committed child is still nonempty, although it
+                # needs no transaction, persistence write, lock, or commit.
+                self.results[key] = CfgOk()
         results = {}
         for key, msg in msgs.items():
             results[key] = await msg
@@ -2501,6 +2524,8 @@ class _ListTransaction(_Transaction):
         # existing record intact rather than deleting the element's index entry.
         ops = []
         for key, res in self.results.items():
+            if key not in self.elems:
+                continue
             path = _db_path(self.path)
             if res.empty:
                 ops.append(swdb.del_op(path, swdb.ATTR_KEYS, key))
@@ -2510,12 +2535,11 @@ class _ListTransaction(_Transaction):
 
     def _analyze(self, results: dict[str, CfgResult]):
         self.results.update(results.items())
-        empty = True
+        empty = all([r.empty for r in self.results.values()])
         requests = []
         updates = []
         errors = []
         for k, r in results.items():
-            empty = empty and r.empty
             requests += r.requests
             updates += r.updates
             errors += r.errors
@@ -2618,7 +2642,7 @@ class _ListTransaction(_Transaction):
             tr.lock(tid, out, actself.lock_cont2, dbuf)                  # yield await
         else:
             #print('   #', tid, '(List)', _format_path(self.path), 'LOCK IMMEDIATELY DONE', err=True)
-            done(CfgOk())
+            done(self._analyze({}))
 
     def lock_cont2(self, actself, res):
         state = self.state2
@@ -2668,7 +2692,7 @@ class _ListTransaction(_Transaction):
     # yield action
     def wait_complete(self, actself, tid, done):
         #print('####', tid, '(List)', _format_path(self.path), 'wait_complete', list(self.results.keys()), err=True)
-        it = iter(sorted(self.results.keys()))
+        it = iter(sorted(self.elems.keys()))
         nxt = next(it)
         if isinstance(nxt, just):
             key = nxt.val

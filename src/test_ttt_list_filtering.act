@@ -1,0 +1,373 @@
+import testing
+
+import ttt
+import yang.gdata as gdata
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id("urn:test:list-filtering", name)
+
+
+def entry(name: str, value: int, field: str="value") -> gdata.Node:
+    return gdata.Container({q("name"): gdata.Leaf(name), q(field): gdata.Leaf(value)})
+
+
+def items(entries: dict[str, gdata.Node]) -> gdata.List:
+    return gdata.List([q("name")], by_key=entries)
+
+
+def nested(cfg: gdata.Node) -> gdata.List:
+    # Rebuild the outer entry so the inner list, rather than the outer list,
+    # has to establish that its skipped children still make it nonempty.
+    return items({"outer": gdata.Container({q("name"): gdata.Leaf("outer"), q("items"): cfg})})
+
+
+actor Calls():
+    var counts: dict[(str, str), int] = {}
+    var previous: dict[str, int] = {}
+
+    def record(key: str, computes: int):
+        counts[(key, "compute")] = computes - previous.get_def(key, 0)
+        counts[(key, "commit")] = counts.get_def((key, "commit"), 0) + 1
+        previous[key] = computes
+
+    def reset():
+        counts = {}
+
+    def get():
+        return dict(counts.items())
+
+
+class CountedFunction(ttt.TransformFunction):
+    calls: Calls
+    key: str
+    computes: int
+
+    def __init__(self, log_handler, key, calls):
+        ttt.TransformFunction.__init__(self, log_handler)
+        self.calls = calls
+        self.key = key
+        self.computes = 0
+
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        self.computes += 1
+        # Memory is telemetry only: it makes each participating commit visible
+        # through the public callback, even for equal configuration values.
+        return cfg, gdata.Leaf(self.computes)
+
+    proc def on_conf(self, conf, linked, memory):
+        await async self.calls.record(self.key, self.computes)
+
+    proc def shutdown(self, memory):
+        await async self.calls.record(self.key, self.computes)
+
+
+def visits(keys: list[str], computes: int=1, deleted: ?set[str]=None) -> dict[(str, str), int]:
+    result: dict[(str, str), int] = {}
+    for key in keys:
+        result[(key, "compute")] = 0 if deleted is not None and key in deleted else computes
+        result[(key, "commit")] = 1
+    return result
+
+
+class Input(object):
+    cfg: dict[str, gdata.Node]
+    differential: bool
+
+    def __init__(self, cfg, differential=False):
+        self.cfg = cfg
+        self.differential = differential
+
+
+class Phase(object):
+    inputs: list[Input]
+    expected: gdata.Node
+    counts: dict[(str, str), int]
+    ok: bool
+    empty: bool
+
+    def __init__(self, inputs, expected, counts, ok=True, empty=False):
+        self.inputs = inputs
+        self.expected = expected
+        self.counts = counts
+        self.ok = ok
+        self.empty = empty
+
+
+actor Scenario(t: testing.AsyncT, phases: list[Phase], inner: bool=False):
+    calls = Calls()
+    def counted(path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
+        return ttt.Transform(lambda log: CountedFunction(log, path.name, calls))(path, lower)
+
+    leaf_list = ttt.List(counted, [q("name")])
+    template = ttt.List(ttt.Container({q("items"): leaf_list}), [q("name")]) if inner else leaf_list
+    root = template(ttt.PathRoot("receiver"), None)
+    var index = 0
+    var tx = root.newtrans()
+    var session = ttt.Session("receiver", tx, None, None)
+
+    def locked(result: ttt.CfgResult):
+        try:
+            phase = phases[index]
+            testing.assertEqual(len(result.errors), 0)
+            testing.assertEqual(result.empty, phase.empty)
+            await async session.commit(str(index), phase.ok)
+            testing.assertEqual(root.get(), phase.expected)
+            if phase.ok:
+                testing.assertEqual(calls.get(), phase.counts)
+            index += 1
+            if index == len(phases):
+                t.success()
+            else:
+                run()
+        except Exception as error:
+            t.failure(error)
+
+    def run():
+        try:
+            tx = root.newtrans()
+            session = ttt.Session("receiver", tx, None, None)
+            calls.reset()
+            result = ttt.CfgOk()
+            for part in phases[index].inputs:
+                if part.differential:
+                    result = tx.configure(str(index), part.cfg, None, differential=True)
+                else:
+                    for source, cfg in part.cfg.items():
+                        session.write_config(str(index), source, cfg)
+                    result = session.apply(str(index))
+                testing.assertEqual(len(result.errors), 0)
+            testing.assertEqual(result.empty, phases[index].empty)
+            session.lock(str(index), locked)
+        except Exception as error:
+            t.failure(error)
+
+    run()
+
+
+actor one_change_among_thousand(t: testing.AsyncT):
+    entries = {str(i): entry(str(i), 0) for i in range(1000)}
+    original = items(entries)
+    changed_entries = dict(entries.items())
+    changed_entries["500"] = entry("500", 1)
+    changed = items(changed_entries)
+    Scenario(t, [
+        Phase([Input({"producer": original})], original, visits(list(entries.keys()))),
+        Phase([Input({"producer": changed})], changed, visits(["500"])),
+        Phase([Input({"producer": changed})], changed, {}),
+    ])
+
+
+actor equal_value_different_pointer(t: testing.AsyncT):
+    first = items({"x": entry("x", 0)})
+    second = items({"x": entry("x", 0)})
+    Scenario(t, [
+        Phase([Input({"producer": first})], first, visits(["x"])),
+        Phase([Input({"producer": second})], second, visits(["x"])),
+    ])
+
+
+actor deletion_keeps_skipped_sibling(t: testing.AsyncT):
+    x = entry("x", 0)
+    first = items({"x": x, "y": entry("y", 0)})
+    second = items({"x": x})
+    Scenario(t, [
+        Phase([Input({"producer": first})], first, visits(["x", "y"])),
+        Phase([Input({"producer": second})], second, visits(["y"], deleted={"y"})),
+        Phase([Input({"producer": items({})})], items({}), visits(["x"], deleted={"x"}), empty=True),
+    ])
+
+
+actor nested_unchanged_list_stays_nonempty(t: testing.AsyncT):
+    cfg = items({"x": entry("x", 0)})
+    first = nested(cfg)
+    second = nested(cfg)
+    Scenario(t, [
+        Phase([Input({"producer": first})], first, visits(["x"])),
+        Phase([Input({"producer": second})], second, {}),
+        Phase([Input({"producer": nested(items({}))})], items({}), visits(["x"], deleted={"x"}), empty=True),
+    ], inner=True)
+
+
+actor differential_commit_invalidates_baseline(t: testing.AsyncT):
+    original = items({"x": entry("x", 0), "y": entry("y", 0)})
+    x = entry("x", 1)
+    fragment = items({"x": x})
+    patched = items({"x": x, "y": original.elements["y"]})
+    Scenario(t, [
+        Phase([Input({"producer": original})], original, visits(["x", "y"])),
+        Phase([Input({"producer": fragment}, differential=True)], patched, visits(["x"])),
+        # Reusing the fragment as a full replacement must visit x, and delete y.
+        Phase([Input({"producer": fragment})], fragment, visits(["x", "y"], deleted={"y"})),
+        Phase([Input({"producer": fragment})], fragment, {}),
+    ])
+
+
+actor differential_abort_keeps_baseline(t: testing.AsyncT):
+    original = items({"x": entry("x", 0)})
+    fragment = items({"x": entry("x", 1)})
+    Scenario(t, [
+        Phase([Input({"producer": original})], original, visits(["x"])),
+        Phase([Input({"producer": fragment}, differential=True)], original, visits(["x"]), ok=False),
+        Phase([Input({"producer": original})], original, {}),
+    ])
+
+
+actor differential_refresh_visits_children(t: testing.AsyncT):
+    original = items({"x": entry("x", 0)})
+    Scenario(t, [
+        Phase([Input({"producer": original})], original, visits(["x"])),
+        Phase([Input({"producer": items({})}, differential=True)], original, visits(["x"])),
+        # Conservatively rebuild the baseline after any differential commit.
+        Phase([Input({"producer": original})], original, visits(["x"])),
+        Phase([Input({"producer": original})], original, {}),
+    ])
+
+
+actor earlier_participant_receives_restored_input(t: testing.AsyncT):
+    original = items({"x": entry("x", 0)})
+    changed = items({"x": entry("x", 1)})
+    Scenario(t, [
+        Phase([Input({"producer": original})], original, visits(["x"])),
+        Phase([Input({"producer": changed}), Input({"producer": original})], original, visits(["x"], computes=2)),
+        Phase([Input({"producer": original})], original, {}),
+    ])
+
+
+actor any_changed_source_selects_element(t: testing.AsyncT):
+    a = items({"x": entry("x", 0, "a")})
+    b0 = items({"x": entry("x", 0, "b")})
+    b1 = items({"x": entry("x", 1, "b")})
+    merged0 = items({"x": gdata.Container({q("name"): gdata.Leaf("x"), q("a"): gdata.Leaf(0), q("b"): gdata.Leaf(0)})})
+    merged1 = items({"x": gdata.Container({q("name"): gdata.Leaf("x"), q("a"): gdata.Leaf(0), q("b"): gdata.Leaf(1)})})
+    Scenario(t, [
+        Phase([Input({"a": a, "b": b0})], merged0, visits(["x"])),
+        Phase([Input({"a": a, "b": b1})], merged1, visits(["x"])),
+        Phase([Input({"a": a, "b": b1})], merged1, {}),
+    ])
+
+
+actor Nodes():
+    var nodes: dict[str, ttt.Node] = {}
+
+    def add(key: str, node: ttt.Node):
+        nodes[key] = node
+
+    def get(key: str) -> ttt.Node:
+        return nodes[key]
+
+
+actor skipped_child_is_not_locked(t: testing.AsyncT):
+    nodes = Nodes()
+    def captured(path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
+        node = ttt.Transform(ttt.PassThrough)(path, lower)
+        await async nodes.add(path.name, node)
+        return node
+
+    layer = ttt.Layer("receiver", ttt.List(captured, [q("name")]), None)
+    seed = layer.newsession()
+    repeat = layer.newsession()
+    cfg = items({"x": entry("x", 0)})
+    var blocker: ?ttt.Transaction = None
+
+    def repeated(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            testing.assertEqual(result.empty, False)
+            await async repeat.commit("repeat", True)
+            held_tx = blocker
+            if held_tx is not None:
+                await async held_tx.commit("blocker", False)
+            testing.assertEqual(layer.get(), cfg)
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    def held(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            repeat.write_config("repeat", "producer", cfg)
+            testing.assertEqual(repeat.apply("repeat").empty, False)
+            # This must finish while x's transform lock is still held. Any
+            # attempt to lock that skipped child would wait until test timeout.
+            repeat.lock("repeat", repeated)
+        except Exception as error:
+            t.failure(error)
+
+    def seeded(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            await async seed.commit("seed", True)
+            child = nodes.get("x").newtrans()
+            blocker = child
+            child.lock("blocker", None, held)
+        except Exception as error:
+            t.failure(error)
+
+    seed.write_config("seed", "producer", cfg)
+    testing.assertEqual(len(seed.apply("seed").errors), 0)
+    seed.lock("seed", seeded)
+
+
+class SharedOutput(ttt.TransformFunction):
+    output: list[gdata.Node]
+
+    def __init__(self, log_handler, output):
+        ttt.TransformFunction.__init__(self, log_handler)
+        self.output = output
+
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        return self.output[cfg.get_int(q("mode"))], None
+
+
+def passive_actor(params: ttt.TransformActorParams) -> ttt.TransformActor:
+    return ttt.TransformActor(lambda conf, linked, memory: None, lambda memory: None)
+
+
+actor ProducerScenario(t: testing.AsyncT, actor_output: bool=False):
+    calls = Calls()
+    def counted(path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
+        return ttt.Transform(lambda log: CountedFunction(log, path.name, calls))(path, lower)
+
+    receiver = ttt.Layer("receiver", ttt.List(counted, [q("name")]), None)
+    x = entry("x", 0)
+    first = items({"x": x, "y": entry("y", 0)})
+    second = items({"x": x, "y": entry("y", 1)})
+    output: list[gdata.Node] = [first, second, second]
+    template = ttt.Transform(lambda log: SharedOutput(log, output), passive_actor) if actor_output else ttt.Transform(lambda log: SharedOutput(log, output))
+    producer = ttt.Layer("producer", template, receiver)
+    var mode = 0
+
+    def committed(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            testing.assertEqual(producer.get(), gdata.Container({q("mode"): gdata.Leaf(mode)}))
+            testing.assertEqual(receiver.get(), output[mode])
+            count = visits(["x", "y"])
+            if mode == 1:
+                count = visits(["y"])
+            elif mode == 2:
+                count = {}
+            testing.assertEqual(calls.get(), count)
+            mode += 1
+            if mode == len(output):
+                t.success()
+            else:
+                calls.reset()
+                run()
+        except Exception as error:
+            t.failure(error)
+
+    def run():
+        producer.newsession().edit_config(gdata.Container({q("mode"): gdata.Leaf(mode)}), complete=committed)
+
+    run()
+
+
+actor producer_output_enables_filtering(t: testing.AsyncT):
+    ProducerScenario(t)
+
+
+actor actor_backed_output_filters_unchanged_children(t: testing.AsyncT):
+    ProducerScenario(t, actor_output=True)
