@@ -1,0 +1,340 @@
+import testing
+
+import ttt
+import yang.gdata as gdata
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id("urn:test:list-producers", name)
+
+
+def control(mode: str) -> gdata.Container:
+    return gdata.Container({q("mode"): gdata.Leaf(mode)})
+
+
+def plans(p0: dict[str, int], pa: dict[str, int],
+          q0: dict[str, int], qa: dict[str, int], qb: dict[str, int],
+          r0: dict[str, int], rb: dict[str, int]) -> dict[str, dict[str, dict[str, int]]]:
+    return {"p": {"seed": p0, "a": pa},
+            "q": {"seed": q0, "a": qa, "b": qb},
+            "r": {"seed": r0, "b": rb}}
+
+
+def outputs(producer: str, plan: dict[str, dict[str, int]]) -> dict[str, gdata.Node]:
+    # The element cache makes unchanged contributions pointer-identical,
+    # including when a new list contains a change to a different element.
+    cache: dict[(str, int), gdata.Node] = {}
+    result: dict[str, gdata.Node] = {}
+    for mode, values in plan.items():
+        entries: dict[str, gdata.Node] = {}
+        for name, value in values.items():
+            pair = (name, value)
+            if pair not in cache:
+                cache[pair] = gdata.Container({
+                    q("name"): gdata.Leaf(name), q(producer): gdata.Leaf(value)})
+            entries[name] = cache[pair]
+        result[mode] = gdata.List([q("name")], by_key=entries)
+    # Check the identity preconditions, independently of any future filtering.
+    for mode, cfg in result.items():
+        if isinstance(cfg, gdata.List):
+            for other, old in result.items():
+                if isinstance(old, gdata.List):
+                    for name in set(cfg.elements.keys()) & set(old.elements.keys()):
+                        unchanged = plan[mode][name] == plan[other][name]
+                        testing.assertEqual(ttt.same_node(cfg.elements[name], old.elements[name]), unchanged)
+    return result
+
+
+def expected(plan: dict[str, dict[str, dict[str, int]]], modes: dict[str, str]) -> gdata.List:
+    # Independent oracle: assemble disjoint source fields directly, without
+    # using TTT's merging, candidates, or committed configuration cache.
+    children: dict[str, dict[gdata.Id, gdata.Node]] = {}
+    for producer, mode in modes.items():
+        for name, value in plan[producer][mode].items():
+            if name not in children:
+                children[name] = {q("name"): gdata.Leaf(name)}
+            children[name][q(producer)] = gdata.Leaf(value)
+    return gdata.List([q("name")], by_key={name: gdata.Container(fields) for name, fields in children.items()})
+
+
+actor ProducerTrace():
+    var histories: dict[str, list[str]] = {}
+
+    def record(producer: str, history: list[str]):
+        histories[producer] = history
+
+    def get():
+        return dict(histories.items())
+
+
+class Producer(ttt.TransformFunction):
+    producer: str
+    output: dict[str, gdata.Node]
+    trace: ProducerTrace
+    history: list[str]
+
+    def __init__(self, log_handler, producer, output, trace):
+        ttt.TransformFunction.__init__(self, log_handler)
+        self.producer = producer
+        self.output = output
+        self.trace = trace
+        self.history = []
+
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        mode = cfg.get_str(q("mode"))
+        # Membership cases deliberately change the losing producer's output
+        # when it is recomputed against the winner's committed output.
+        if mode == "b" and "b_after" in self.output and prev_output is not None:
+            if ttt.same_node(prev_output, self.output["a"]):
+                mode = "b_after"
+        self.history.append(mode)
+        return self.output[mode], None
+
+    proc def on_conf(self, conf, linked, memory):
+        # Observe producer execution only. Receiving child call counts are
+        # deliberately unconstrained so filtering can be added independently.
+        await async self.trace.record(self.producer, list(self.history))
+
+
+actor Scenario(t: testing.AsyncT, plan: dict[str, dict[str, dict[str, int]]],
+               a_steps: list[dict[str, str]], b_steps: list[dict[str, str]],
+               reverse: bool=False, abort_loser: bool=False):
+    trace = ProducerTrace()
+    receiver = ttt.Layer("receiver", ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]), None)
+    po = outputs("p", plan["p"])
+    qo = outputs("q", plan["q"])
+    ro = outputs("r", plan["r"])
+    root = ttt.Container({
+        q("p"): ttt.Transform(lambda log: Producer(log, "p", po, trace)),
+        q("q"): ttt.Transform(lambda log: Producer(log, "q", qo, trace)),
+        q("r"): ttt.Transform(lambda log: Producer(log, "r", ro, trace)),
+    })(ttt.PathRoot("producer"), receiver)
+    seed = root.newtrans()
+    seed_out = receiver.newsession()
+    a = root.newtrans()
+    b = root.newtrans()
+    a_out = receiver.newsession()
+    b_out = receiver.newsession()
+    winner = b if reverse else a
+    loser = a if reverse else b
+    winner_out = b_out if reverse else a_out
+    loser_out = a_out if reverse else b_out
+    winner_tid = "B" if reverse else "A"
+    loser_tid = "A" if reverse else "B"
+    var winner_done = False
+    var loser_done = False
+    var final_modes: dict[str, str] = {"p": "seed", "q": "seed", "r": "seed"}
+
+    def check(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        testing.assertEqual(len(result.requests), 0)
+        testing.assertEqual(len(result.updates), 0)
+
+    def check_state(modes: dict[str, str]):
+        testing.assertEqual(root.get(), gdata.Container({q(p): control(mode) for p, mode in modes.items()}))
+        receiving_modes = dict(modes.items())
+        if not reverse and not abort_loser and "b_after" in plan["q"] and modes["q"] == "b":
+            receiving_modes["q"] = "b_after"
+        testing.assertEqual(receiver.get(), expected(plan, receiving_modes))
+
+    def finish():
+        if winner_done and loser_done:
+            try:
+                check_state(final_modes)
+                if not abort_loser:
+                    history = trace.get()["q"]
+                    replay = "a" if reverse else "b_after" if "b_after" in plan["q"] else "b"
+                    testing.assertEqual(history, ["seed", "a", "b", replay])
+                t.success()
+            except Exception as error:
+                t.failure(error)
+
+    def loser_receiver_locked(result: ttt.CfgResult):
+        try:
+            check(result)
+            await async loser_out.commit(loser_tid, not abort_loser)
+            await async loser.commit(loser_tid, not abort_loser)
+            loser_done = True
+            finish()
+        except Exception as error:
+            t.failure(error)
+
+    def loser_producers_locked(result: ttt.CfgResult):
+        try:
+            check(result)
+            # lock() applies any output regenerated under the producer locks
+            # before it locks the receiving list.
+            loser_out.lock(loser_tid, loser_receiver_locked)
+        except Exception as error:
+            t.failure(error)
+
+    def winner_receiver_locked(result: ttt.CfgResult):
+        try:
+            check(result)
+            # Both transactions were applied before either locked. Start the
+            # loser while the winner holds Q; it cannot win by scheduling luck.
+            loser.lock(loser_tid, loser_out, loser_producers_locked)
+            # Match Session.commit: receiving commits precede producer unlocks.
+            await async winner_out.commit(winner_tid, True)
+            winner_modes = {"p": "seed", "q": "seed", "r": "seed"}
+            for step in b_steps if reverse else a_steps:
+                winner_modes.update(step.items())
+            testing.assertEqual(receiver.get(), expected(plan, winner_modes))
+            await async winner.commit(winner_tid, True)
+            winner_done = True
+            finish()
+        except Exception as error:
+            t.failure(error)
+
+    def winner_producers_locked(result: ttt.CfgResult):
+        try:
+            check(result)
+            winner_out.lock(winner_tid, winner_receiver_locked)
+        except Exception as error:
+            t.failure(error)
+
+    def apply_steps(tx: ttt.Transaction, out: ttt.Session, tid: str, steps: list[dict[str, str]]):
+        for step in steps:
+            # Partial producer selection is differential at the fixture's
+            # upper container. Every producer output is a FULL replacement at
+            # the receiving list, via Session.apply(differential=False).
+            check(tx.configure(tid, {"input": gdata.Container({q(p): control(mode) for p, mode in step.items()})}, out, differential=True))
+            check(out.apply(tid))
+
+    def seeded(result: ttt.CfgResult):
+        try:
+            check(result)
+            await async seed_out.commit("seed", True)
+            await async seed.commit("seed", True)
+            check_state(final_modes)
+            apply_steps(a, a_out, "A", a_steps)
+            apply_steps(b, b_out, "B", b_steps)
+            # Configuration alone must not publish speculative state.
+            check_state(final_modes)
+            first = b_steps if reverse else a_steps
+            last = a_steps if reverse else b_steps
+            for step in first:
+                final_modes.update(step.items())
+            if not abort_loser:
+                for step in last:
+                    final_modes.update(step.items())
+            winner.lock(winner_tid, winner_out, winner_producers_locked)
+        except Exception as error:
+            t.failure(error)
+
+    def seed_producers_locked(result: ttt.CfgResult):
+        try:
+            check(result)
+            seed_out.lock("seed", seeded)
+        except Exception as error:
+            t.failure(error)
+
+    try:
+        check(seed.configure("seed", {"input": gdata.Container({q(p): control("seed") for p in ["p", "q", "r"]})}, seed_out))
+        check(seed_out.apply("seed"))
+        seed.lock("seed", seed_out, seed_producers_locked)
+    except Exception as error:
+        t.failure(error)
+
+
+def ordinary_steps() -> (list[dict[str, str]], list[dict[str, str]]):
+    return ([{"p": "a", "q": "a"}], [{"q": "b", "r": "b"}])
+
+
+# Case 1: independent elements, with stable elements included in replacements.
+actor exclusive_elements(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    Scenario(t, plans({"x": 0, "stable": 7}, {"x": 1, "stable": 7},
+                      {"z": 0}, {"z": 1}, {"z": 2},
+                      {"y": 0, "stable": 7}, {"y": 1, "stable": 7}), a, b)
+
+
+def shared_plan() -> dict[str, dict[str, dict[str, int]]]:
+    return plans({"p_only": 0}, {"p_only": 1},
+                 {"x": 0, "y": 0, "stable": 7},
+                 {"x": 1, "y": 0, "stable": 7},
+                 {"x": 0, "y": 1, "stable": 7},
+                 {"r_only": 0}, {"r_only": 1})
+
+
+# Case 2: both initial replacements reuse one now-stale element node.
+actor shared_producer(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    Scenario(t, shared_plan(), a, b)
+
+
+actor shared_producer_reverse(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    Scenario(t, shared_plan(), a, b, reverse=True)
+
+
+# Case 3: P and R overlap at x; Q serializes the transactions elsewhere.
+actor independent_sources_same_element(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    Scenario(t, plans({"x": 0}, {"x": 1}, {"z": 0}, {"z": 1}, {"z": 2}, {"x": 0}, {"x": 1}), a, b)
+
+
+actor independent_source_p_unchanged(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    Scenario(t, plans({"x": 0}, {"x": 0}, {"z": 0}, {"z": 1}, {"z": 2}, {"x": 0}, {"x": 1}), a, b)
+
+
+actor independent_source_r_unchanged(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    Scenario(t, plans({"x": 0}, {"x": 1}, {"z": 0}, {"z": 1}, {"z": 2}, {"x": 0}, {"x": 0}), a, b)
+
+
+def overlapping_plan() -> dict[str, dict[str, dict[str, int]]]:
+    return plans({"x": 0}, {"x": 1},
+                 {"x": 0, "y": 0}, {"x": 1, "y": 0}, {"x": 0, "y": 1},
+                 {"x": 0}, {"x": 1})
+
+
+# Case 4: all three source contributions meet at x.
+actor shared_and_exclusive_sources(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    Scenario(t, overlapping_plan(), a, b)
+
+
+actor shared_and_exclusive_sources_reverse(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    Scenario(t, overlapping_plan(), a, b, reverse=True)
+
+
+def membership_plan() -> dict[str, dict[str, dict[str, int]]]:
+    p = plans({"x": 10}, {"x": 11},
+              {"x": 0, "y": 0}, {"x": 1, "y": 0, "transient": 5},
+              {"x": 0, "y": 1, "early": 9}, {"x": 20}, {"x": 21})
+    p["q"]["b_after"] = {"new": 2}
+    return p
+
+
+# Case 5: replay adds an element and clears both committed and speculative
+# elements, while P/R keep x alive after Q withdraws its contribution.
+actor recomputed_membership(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    Scenario(t, membership_plan(), a, b)
+
+
+actor recomputed_membership_withdraw_all(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    p = membership_plan()
+    p["q"]["b_after"] = {}
+    Scenario(t, p, a, b)
+
+
+actor changed_then_unchanged(t: testing.AsyncT):
+    p = plans({"x": 0}, {"x": 1}, {"z": 0}, {"z": 1}, {"z": 2}, {"y": 0}, {"y": 1})
+    p["p"]["a2"] = {"x": 1}
+    Scenario(t, p, [{"p": "a", "q": "a"}, {"p": "a2"}], [{"q": "b", "r": "b"}])
+
+
+actor changed_then_restored(t: testing.AsyncT):
+    p = plans({"x": 0}, {"x": 1}, {"z": 0}, {"z": 1}, {"z": 2}, {"y": 0}, {"y": 1})
+    p["p"]["a2"] = {"x": 0}
+    Scenario(t, p, [{"p": "a", "q": "a"}, {"p": "a2"}], [{"q": "b", "r": "b"}])
+
+
+actor abort_losing_transaction(t: testing.AsyncT):
+    a, b = ordinary_steps()
+    Scenario(t, membership_plan(), a, b, abort_loser=True)
