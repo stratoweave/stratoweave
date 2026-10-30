@@ -1,4 +1,6 @@
 <script lang="ts">
+  import type { HTMLInputAttributes } from 'svelte/elements';
+
   interface Props {
     label?: string;
     value?: string;
@@ -12,6 +14,7 @@
     /** Render as a password input: the value round-trips through the draft
      * but is never displayed as text. */
     password?: boolean;
+    autocomplete?: HTMLInputAttributes['autocomplete'];
     /** Values the field suggests as it is typed in; any other is allowed. */
     suggestions?: string[];
     onchange?: (next: string) => void;
@@ -29,6 +32,7 @@
     disabled = false,
     mono = false,
     password = false,
+    autocomplete,
     suggestions = [],
     onchange,
     ontouch
@@ -57,6 +61,7 @@
     {value}
     {placeholder}
     {disabled}
+    {autocomplete}
     oninput={(event) => onchange?.((event.currentTarget as HTMLInputElement).value)}
     onblur={() => ontouch?.()}
   />
