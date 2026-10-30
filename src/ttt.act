@@ -225,24 +225,30 @@ class CfgResult():
 
     errors collects transform failures. A transaction with errors is aborted
     rather than committed.
+
+    nonempty_sources identifies sources known to contribute configuration to
+    this subtree. This is positive evidence, potentially incomplete: a missing
+    source means unknown, not necessarily empty.
     """
     empty: bool
     requests: list[LinkRequest]
     updates: list[LinkUpdate]
     errors: list[Exception]
-    def __init__(self, empty=False, requests=[], updates=[], errors=[]):
+    nonempty_sources: set[str]
+    def __init__(self, empty=False, requests=[], updates=[], errors=[], nonempty_sources: ?set[str]=None):
         self.empty = empty
         self.requests = requests
         self.updates = updates
         self.errors = errors
+        self.nonempty_sources = nonempty_sources if nonempty_sources is not None else set()
     def __str__(self):
         if self.errors:
             return 'CfgError(' + str(self.errors) + ')'
         else:
             return 'CfgOk(empty=True)' if self.empty else 'CfgOk()'
 
-def CfgOk(empty=False, requests=[], updates=[]):
-    return CfgResult(empty, requests, updates, [])
+def CfgOk(empty=False, requests=[], updates=[], nonempty_sources: ?set[str]=None):
+    return CfgResult(empty, requests, updates, [], nonempty_sources)
 
 def CfgError(exception: Exception):
     return CfgResult(empty=False, requests=[], updates=[], errors=[exception])
@@ -1089,8 +1095,8 @@ actor Transaction(impl: _Transaction):
     def lock_cont1(keys_by_src, nodes):
         impl.lock_cont1(self, keys_by_src, nodes)
 
-    def lock_container_cont1(keys_by_src):
-        impl.lock_container_cont1(self, keys_by_src)
+    def lock_container_cont1(children_by_src):
+        impl.lock_container_cont1(self, children_by_src)
 
     def lock_cont2(res):
         impl.lock_cont2(self, res)
@@ -1162,7 +1168,7 @@ class _Transaction(object):
             return None
         return gdata.filter(self.get(), filt)
 
-    proc def lock_container_cont1(self, actself: Transaction, keys_by_src: dict[str, set[gdata.Id]]) -> None:
+    proc def lock_container_cont1(self, actself: Transaction, children_by_src: dict[str, set[gdata.Id]]) -> None:
         pass
 
     proc def subscribe_oper(self, sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
@@ -1473,7 +1479,7 @@ actor Session(name: str, root: Transaction, lowerlayer: ?Layer, db: ?swdb.Store,
         if not res.errors and lower is not None:
             lowres = lower.apply(tid)
             if lowres.errors:
-                res = CfgResult(res.empty, res.requests, res.updates, res.errors+lowres.errors)
+                res = CfgResult(res.empty, res.requests, res.updates, res.errors+lowres.errors, res.nonempty_sources)
         return res
 
     # yield action
@@ -1611,19 +1617,19 @@ actor ContainerRestore(
 
     def each_child(record: (key: bytes, value: bytes), proceed: action(?Exception) -> None) -> None:
         try:
-            child = swdb.child_from_key(db_path, record.key, codec)
+            stored_child = swdb.child_from_key(db_path, record.key, codec)
             child_node = None
-            for key, node in elems.items():
-                if key.name == child.name or swdb.qualified_name(key) == child.name:
+            for child, node in elems.items():
+                if child.name == stored_child.name or swdb.qualified_name(child) == stored_child.name:
                     child_node = node
                     break
             if child_node is not None:
-                children!.skip_to(child.next_key)
+                children!.skip_to(stored_child.next_key)
                 node1 = child_node
                 window.launch(lambda finished: node1.restore_from_db(reader, codec, window, finished))
                 proceed(None)
             else:
-                raise ValueError("Unable to route persisted child {child.name} at {_format_path(path)}")
+                raise ValueError("Unable to route persisted child {stored_child.name} at {_format_path(path)}")
         except Exception as e:
             proceed(e)
 
@@ -1655,7 +1661,7 @@ class _Container(_Node):
 
     def __init__(self, path, template: dict[gdata.Id, proc(Path, ?Layer)->Node], ns, module, lower: ?Layer):
         self.path = path
-        self.elems = {key: templ(PathElem(key,path), lower) for key, templ in template.items()}
+        self.elems = {child: templ(PathElem(child,path), lower) for child, templ in template.items()}
         self.containerstate = ContainerState(path, set(self.elems.keys()))
         self.ns = ns
         self.module = module
@@ -1700,7 +1706,7 @@ class _Container(_Node):
         any other predicate at this level would span producers, so it is
         refused."""
         path = self.path
-        keys = path_key_data(path)
+        list_keys = path_key_data(path)
         branches: dict[gdata.Id, list[gdata.FNode]] = {}
         whole = len(filts) == 0
         for f in filts:
@@ -1708,13 +1714,13 @@ class _Container(_Node):
             rest: list[gdata.FNode] = []
             for c in f.children:
                 n = c.name
-                if n is not None and n in keys.children and c.value_match is not None:
+                if n is not None and n in list_keys.children and c.value_match is not None:
                     preds.append(c)
                 elif c.value_match is not None:
                     raise ValueError("a content predicate at {_format_path(path)} would span producers; put it under one transform")
                 else:
                     rest.append(c)
-            if len(preds) > 0 and gdata.filter(keys, gdata.FNode(children=preds)) is None:
+            if len(preds) > 0 and gdata.filter(list_keys, gdata.FNode(children=preds)) is None:
                 continue                                    # this alternative does not select this entry
             b = filter_transpose(gdata.FNode(children=rest))
             if b is not None:
@@ -1753,22 +1759,33 @@ class _Container(_Node):
         return True
 
 
-actor ContainerState(path, keys: set[gdata.Id]):
+actor ContainerState(path, children: set[gdata.Id]):
     # Children are fixed for the lifetime of the container. Unlike ListState,
     # no committed membership index or provisional-node cleanup is needed.
+    # Latest supplied child membership per transaction/source.
     var candidates: dict[str, dict[str, set[gdata.Id]]] = {}
-    # Latest configure input per source, not the effective configuration.
-    var configs: dict[str, dict[str, gdata.Node]] = {}
+    # Pending baseline updates: full inputs replace it; None invalidates it.
+    var config_updates: dict[str, dict[str, ?gdata.Node]] = {}
+    # Known full committed inputs; differential commits invalidate them.
+    var committed_configs: dict[str, gdata.Node] = {}
+    # Per-source children proven nonempty when the full baseline committed.
+    # Evidence comes from child results, without inspecting their node types.
+    var committed_nonempty: dict[str, set[gdata.Id]] = {}
+    # Sources whose omitted child contributions must be cleared.
     var erasures: dict[str, set[str]] = {}
+    # Deletion acquisitions waiting for source locks, with their replies.
     var pending: list[(str, action(dict[str, set[gdata.Id]]) -> None)] = []
+    # Transaction currently holding each source's deletion lock.
     var locked: dict[str, str] = {}
 
-    def acquire(tid: str, candidate: dict[str, set[gdata.Id]], erasure: set[str], cfg_by_src: dict[str, gdata.Node]):
+    # Return participants and source witnesses for any skipped children.
+    def acquire(tid: str, candidate: dict[str, set[gdata.Id]], erasure: set[str], cfg_by_src: dict[str, gdata.Node], differential=False) -> (set[gdata.Id], dict[gdata.Id, set[str]]):
         if tid not in candidates:
             candidates[tid] = {}
-            configs[tid] = {}
+            config_updates[tid] = {}
             erasures[tid] = set()
-        configs[tid].update(cfg_by_src.items())
+        for src, cfg in cfg_by_src.items():
+            config_updates[tid][src] = None if differential else cfg
         #print('====', tid, path, 'container acquire', candidate, 'erasure:', erasure, err=True)
         # Repeated configure calls replace the supplied sources' fragments,
         # while retaining the other sources already seen in this transaction.
@@ -1776,6 +1793,21 @@ actor ContainerState(path, keys: set[gdata.Id]):
         # Erasure intent is replaced per supplied source as well.
         erasures[tid] = (erasures[tid] - set(candidate.keys())) | erasure
         #print('====', tid, path, 'container acquire erasures:', erasures[tid], err=True)
+        selected = set()
+        retained: dict[gdata.Id, set[str]] = {}
+        for src, source_children in candidate.items():
+            cfg = cfg_by_src.get(src)
+            old = committed_configs.get(src)
+            nonempty = committed_nonempty.get_def(src, set())
+            for child in source_children:
+                if not differential and child in nonempty and isinstance(cfg, gdata.Container) and isinstance(old, gdata.Container):
+                    if child in old.children and same_node(cfg.children[child], old.children[child]):
+                        if child not in retained:
+                            retained[child] = set()
+                        retained[child].add(src)
+                        continue
+                selected.add(child)
+        return selected, retained
 
     def acquire_deletes(tid: str, reply: action(dict[str, set[gdata.Id]]) -> None):
         # Locking may be the first operation of an empty transaction. Register
@@ -1790,13 +1822,27 @@ actor ContainerState(path, keys: set[gdata.Id]):
                 locked[src] = tid
             candidate = candidates[tid]
             #print('====', tid, path, 'container acquire_deletes', candidate, 'erasure:', erasure, err=True)
-            reply({src: keys - candidate.get_def(src, set()) for src in erasure})
+            # Keep the fixed-child sweep: even a known-absent contribution may
+            # share a child with another source whose data determines emptiness.
+            # It also covers every child touched by an earlier configure call.
+            reply({src: children - candidate.get_def(src, set()) for src in erasure})
 
-    def release(tid: str):
+    def release(tid: str, ok: bool, results: dict[gdata.Id, CfgResult]):
+        updates = config_updates[tid]
+        candidate = candidates[tid]
         erasure = erasures[tid]
         del erasures[tid]
         del candidates[tid]
-        del configs[tid]
+        del config_updates[tid]
+        if ok:
+            for src, cfg in updates.items():
+                if cfg is not None:
+                    committed_configs[src] = cfg
+                    committed_nonempty[src] = {child for child in candidate.get_def(src, set())
+                                               if child in results and src in results[child].nonempty_sources}
+                else:
+                    committed_configs.pop(src)
+                    committed_nonempty.pop(src)
         # An abort before acquiring the locks must not unlock another tid.
         for src in erasure:
             if locked.get(src) == tid:
@@ -1814,6 +1860,8 @@ def ContainerTransaction(path, contents, containerstate: ContainerState, ns: ?st
 
 class _ContainerTransaction(_Transaction):
     containerstate: ContainerState
+    # Fixed nodes for reads and lazy acquisition; elems holds participants only.
+    contents: dict[gdata.Id, Node]
     elems: dict[gdata.Id, Transaction]
     results: dict[gdata.Id, CfgResult]
     state1: ?YieldState1
@@ -1830,70 +1878,88 @@ class _ContainerTransaction(_Transaction):
         self.state2 = None
         self.reset = False
         self.ns = ns
-        self.elems = {key: node.newtrans() for key, node in contents.items()}
+        self.contents = contents
+        self.elems = {}
         self.module = module
 
     def configure(self, tid, cfg_by_src, out, dbuf: ?swdb.Buffer=None, differential=False):
         #print('####', tid, '(Container)', _format_path(self.path), 'configure\n', per_src(cfg_by_src), 'differential:', differential, err=True)
         if self.reset:
+            self.elems = {}
             self.results = {}
             self.reset = False
 
-        cfg_keys = {}
+        children_by_src = {}
         erasure = set()
         cfg_by_child = {}
         for src, cfg in cfg_by_src.items():
             if isinstance(cfg, gdata.Absent) or not differential:
                 erasure.add(src)
-            keys = set()
+            children = set()
             if isinstance(cfg, gdata.Container):
-                for key, subcfg in cfg.children.items():
+                for child, subcfg in cfg.children.items():
                     # Key leaves and other nodes outside our fixed children
                     # belong to the enclosing configuration, not this container.
-                    if key in self.elems:
-                        keys.add(key)
-                        if key in cfg_by_child:
-                            cfg_by_child[key][src] = subcfg
+                    if child in self.contents:
+                        children.add(child)
+                        if child in cfg_by_child:
+                            cfg_by_child[child][src] = subcfg
                         else:
-                            cfg_by_child[key] = {src: subcfg}
+                            cfg_by_child[child] = {src: subcfg}
             elif not isinstance(cfg, gdata.Absent):
                 raise NotImplementedError("Cannot configure container with configuration type {type(cfg)}")
             # An empty differential fragment requests a refresh, without
             # replacing this source's earlier membership or erasure intent.
-            if keys or not differential or isinstance(cfg, gdata.Absent):
-                cfg_keys[src] = keys
+            if children or not differential or isinstance(cfg, gdata.Absent):
+                children_by_src[src] = children
 
-        self.containerstate.acquire(tid, cfg_keys, erasure, cfg_by_src)
+        selected, retained = self.containerstate.acquire(tid, children_by_src, erasure, cfg_by_src, differential)
         if differential and not cfg_by_child and all([isinstance(cfg, gdata.Container) for cfg in cfg_by_src.values()]):
-            cfg_by_child = {child: {} for child in self.elems}
+            selected = set(self.contents.keys())
+            cfg_by_child = {child: {} for child in self.contents}
+        for child in selected:
+            if child not in self.elems:
+                self.elems[child] = self.contents[child].newtrans()
         msgs = {}
+        results = {}
         for child, subcfg in cfg_by_child.items():
             #print('   #', tid, '(Container)', _format_path(self.path), 'CONFIGURE CHILD', child, '\n' + per_src(subcfg), err=True)
-            msgs[child] = async self.elems[child].configure(tid, subcfg, out, dbuf, differential)
-        results = {}
+            if child in self.elems:
+                msgs[child] = async self.elems[child].configure(tid, subcfg, out, dbuf, differential)
+            else:
+                # Only proven nonempty contributions can be filtered out.
+                results[child] = CfgOk(nonempty_sources=retained[child])
         for child, msg in msgs.items():
             results[child] = await msg
             #print('   #', tid, '(Container)', _format_path(self.path), 'RESULT CONFIGURE CHILD', child, ':', results[child], err=True)
         return self._analyze(results)
 
-    def _analyze(self, results):
+    def _analyze(self, results, accumulated=False):
         self.results.update(results.items())
+        # Preserve configure's operation-level result, including an explicit
+        # clear before deferred deletion. Final locking must also account for
+        # skipped children and results retained from earlier configure calls.
+        values = self.results.values() if accumulated else results.values()
         empty = True
+        nonempty_sources = set()
+        for r in values:
+            empty = empty and r.empty
+            nonempty_sources |= r.nonempty_sources
         requests = []
         updates = []
         errors = []
         for r in results.values():
-            empty = empty and r.empty
             requests += r.requests
             updates += r.updates
             errors += r.errors
-        r = CfgResult(empty, requests, updates, errors)
+        r = CfgResult(empty, requests, updates, errors, nonempty_sources)
         #print('   # ...... (Container)', _format_path(self.path), 'ANALYZE RESULT:', r, len(requests), len(updates), len(errors), err=True)
         return r
 
     def linkage(self, tid, requests, updates, out, dbuf):
         #print('####', tid, '(Container)', _format_path(self.path), 'linkage', len(requests), len(updates), err=True)
         if self.reset:
+            self.elems = {}
             self.results = {}
             self.reset = False
         self.containerstate.acquire(tid, {}, set(), {})
@@ -1916,12 +1982,14 @@ class _ContainerTransaction(_Transaction):
                 else:
                     upds_by_child[uname] = [u.tail()]
         results = {}
-        for child, elem in self.elems.items():
+        for child in self.contents:
             reqs = reqs_by_child.get_def(child, [])
             upds = upds_by_child.get_def(child, [])
             #print('   #', tid, '(Container)', _format_path(self.path), 'LINKAGE CHILD', child, len(reqs), len(upds), err=True)
             if reqs or upds:
-                results[child] = elem.linkage(tid, reqs, upds, out, dbuf)
+                if child not in self.elems:
+                    self.elems[child] = self.contents[child].newtrans()
+                results[child] = self.elems[child].linkage(tid, reqs, upds, out, dbuf)
         return self._analyze(results)
 
     # yield action
@@ -1929,39 +1997,43 @@ class _ContainerTransaction(_Transaction):
         self.state1 = YieldState1(tid, out, dbuf, done)
         self.containerstate.acquire_deletes(tid, actself.lock_container_cont1)
 
-    def lock_container_cont1(self, actself, keys_by_src):
+    def lock_container_cont1(self, actself, children_by_src):
         state = self.state1
         if state is not None:
             del_by_child = {}
-            for src, keys in keys_by_src.items():
-                for key in keys:
-                    if key in del_by_child:
-                        del_by_child[key][src] = gdata.Container()
+            for src, children in children_by_src.items():
+                for child in children:
+                    if child in del_by_child:
+                        del_by_child[child][src] = gdata.Container()
                     else:
-                        del_by_child[key] = {src: gdata.Container()}
+                        del_by_child[child] = {src: gdata.Container()}
             msgs = {}
-            for key, empty in del_by_child.items():
-                msgs[key] = async self.elems[key].configure(state.tid, empty, state.out, state.dbuf, differential=False)
+            for child, empty in del_by_child.items():
+                if child not in self.elems:
+                    self.elems[child] = self.contents[child].newtrans()
+                msgs[child] = async self.elems[child].configure(state.tid, empty, state.out, state.dbuf, differential=False)
             results = {}
-            for key, msg in msgs.items():
-                results[key] = await msg
+            for child, msg in msgs.items():
+                results[child] = await msg
             self._analyze(results)
             self.state1 = None
             self.lock_elems(actself, state.tid, state.out, state.done, state.dbuf)
 
     def lock_elems(self, actself, tid, out: ?Session, done, dbuf: ?swdb.Buffer=None):
         #print('####', tid, '(Container)', _format_path(self.path), 'lock', sorted(self.results.keys()), err=True)
-        it = iter(sorted(self.results.keys()))
+        it = iter(sorted(self.elems.keys()))
         nxt = next(it)
         if isinstance(nxt, just):
-            key = nxt.val
-            self.state2 = YieldState2(it, key, tid, out, done, dbuf)
-            tr = self.elems[key]
-            #print('   #', tid, '(Container)', _format_path(self.path), 'LOCK CHILD', key, err=True)
+            child = nxt.val
+            self.state2 = YieldState2(it, child, tid, out, done, dbuf)
+            tr = self.elems[child]
+            #print('   #', tid, '(Container)', _format_path(self.path), 'LOCK CHILD', child, err=True)
             tr.lock(tid, out, actself.lock_cont2, dbuf)              # yield await
         else:
             #print('   #', tid, '(Container)', _format_path(self.path), 'LOCK IMMEDIATELY DONE', err=True)
-            done(CfgOk())
+            # With no configured children, preserve the existing conservative
+            # result: other sources may still keep the container nonempty.
+            done(self._analyze({}, accumulated=True) if self.results else CfgOk())
 
     def lock_cont1(self, actself, keys_by_src, nodes):
         pass
@@ -1969,19 +2041,20 @@ class _ContainerTransaction(_Transaction):
     def lock_cont2(self, actself, res):
         state = self.state2
         if state is not None:
-            #print('   #', state.tid, '(Container)', _format_path(self.path), 'LOCK CHILD', state.key, 'RESULT:', res, err=True)
-            state.results[state.key] = res
+            child = state.key
+            #print('   #', state.tid, '(Container)', _format_path(self.path), 'LOCK CHILD', child, 'RESULT:', res, err=True)
+            state.results[child] = res
             nxt = next(state.it)
             if isinstance(nxt, just):
-                key = nxt.val
-                state.key = key
-                tr = self.elems[key]
-                #print('   #', state.tid, '(Container)', _format_path(self.path), 'LOCK CHILD', key, err=True)
+                child = nxt.val
+                state.key = child
+                tr = self.elems[child]
+                #print('   #', state.tid, '(Container)', _format_path(self.path), 'LOCK CHILD', child, err=True)
                 tr.lock(state.tid, state.out, actself.lock_cont2, state.dbuf)
             else:
                 self.state2 = None
                 #print('   #', state.tid, '(Container)', _format_path(self.path), 'LOCK DONE', err=True)
-                state.done(self._analyze(state.results))
+                state.done(self._analyze(state.results, accumulated=True))
         else:
             #print('#### ...... (Container)', _format_path(self.path), 'lock_cont2 empty state!!!', err=True)
             pass
@@ -1991,25 +2064,25 @@ class _ContainerTransaction(_Transaction):
         # The children commit concurrently. Return when all of them, and
         # the release of the container state, are done (see Session.commit).
         msgs = []
-        for child in self.results.keys():
+        for child in self.elems:
             #print('   #', tid, '(Container)', _format_path(self.path), 'COMMIT CHILD', child, err=True)
             msgs.append(async self.elems[child].commit(tid, ok))
         for msg in msgs:
             await msg
         #print('   #', tid, '(Container)', _format_path(self.path), 'COMMIT DONE', err=True)
-        await async self.containerstate.release(tid)
+        await async self.containerstate.release(tid, ok, self.results)
         self.reset = True       # Retain results for wait_complete.
 
     # yield action
     def wait_complete(self, actself, tid, done):
         #print('####', tid, '(Container)', _format_path(self.path), 'wait_complete', list(self.results.keys()), err=True)
-        it = iter(sorted(self.results.keys()))
+        it = iter(sorted(self.elems.keys()))
         nxt = next(it)
         if isinstance(nxt, just):
-            key = nxt.val
-            self.state2 = YieldState2(it, key, tid, None, done)
-            tr = self.elems[key]
-            #print('   #', tid, '(Container)', _format_path(self.path), 'COMPLETE CHILD', key, err=True)
+            child = nxt.val
+            self.state2 = YieldState2(it, child, tid, None, done)
+            tr = self.elems[child]
+            #print('   #', tid, '(Container)', _format_path(self.path), 'COMPLETE CHILD', child, err=True)
             tr.wait_complete(tid, actself.wait_complete_cont)               # yield await
         else:
             #print('   #', tid, '(Container)', _format_path(self.path), 'COMPLETION IMMEDIATELY DONE', err=True)
@@ -2018,26 +2091,27 @@ class _ContainerTransaction(_Transaction):
     proc def wait_complete_cont(self, actself, res):
         state = self.state2
         if state is not None:
-            #print('   #', state.tid, '(Container)', _format_path(self.path), 'COMPLETE CHILD', state.key, 'RESULT:', res, err=True)
-            state.results[state.key] = CfgError(res) if isinstance(res, Exception) else CfgOk()
+            child = state.key
+            #print('   #', state.tid, '(Container)', _format_path(self.path), 'COMPLETE CHILD', child, 'RESULT:', res, err=True)
+            state.results[child] = CfgError(res) if isinstance(res, Exception) else CfgOk()
             nxt = next(state.it)
             if isinstance(nxt, just):
-                key = nxt.val
-                state.key = key
-                tr = self.elems[key]
-                #print('   #', state.tid, '(Container)', _format_path(self.path), 'COMPLETE CHILD', key, err=True)
+                child = nxt.val
+                state.key = child
+                tr = self.elems[child]
+                #print('   #', state.tid, '(Container)', _format_path(self.path), 'COMPLETE CHILD', child, err=True)
                 tr.wait_complete(state.tid, actself.wait_complete_cont)
             else:
                 self.state2 = None
                 #print('   #', state.tid, '(Container)', _format_path(self.path), 'COMPLETION DONE', err=True)
-                state.done(self._analyze(state.results))
+                state.done(self._analyze(state.results, accumulated=True))
         else:
             #print('#### ...... (Container)', _format_path(self.path), 'wait_complete_cont empty state!!!', err=True)
             pass
 
     def get(self):
         #print('####', '(Container)', _format_path(self.path), actorid(), 'GET', err=True)
-        res = {tag: node.get() for tag, node in self.elems.items()}
+        res = {tag: self.elems[tag].get() if tag in self.elems else node.get() for tag, node in self.contents.items()}
         path = self.path
         if isinstance(path, PathKey):
             res.update(path.keyvals.items())
@@ -2048,13 +2122,16 @@ class _ContainerTransaction(_Transaction):
         res = {}
         if branches is not None:
             for tag, child_filter in branches.items():
-                if tag in self.elems:
-                    data = self.elems[tag].get_data(child_filter, content)
+                if tag in self.contents:
+                    if tag in self.elems:
+                        data = self.elems[tag].get_data(child_filter, content)
+                    else:
+                        data = self.contents[tag].get_data(child_filter, content)
                     if data is not None:
                         res[tag] = data
         else:
-            for tag, elem in self.elems.items():
-                data = elem.get_data(None, content)
+            for tag, elem in self.contents.items():
+                data = self.elems[tag].get_data(None, content) if tag in self.elems else elem.get_data(None, content)
                 if data is not None:
                     res[tag] = data
         if isinstance(content, ContentOper) and len(res) == 0:
@@ -2581,7 +2658,10 @@ class _ListTransaction(_Transaction):
             requests += r.requests
             updates += r.updates
             errors += r.errors
-        res = CfgResult(empty, requests, updates, errors)
+        nonempty_sources = set()
+        for result in self.results.values():
+            nonempty_sources |= result.nonempty_sources
+        res = CfgResult(empty, requests, updates, errors, nonempty_sources)
         #print('   # ...... (List)', _format_path(self.path), 'ANALYZE RESULT:', res, len(requests), len(updates), len(errors), err=True)
         return res
 
@@ -3003,7 +3083,7 @@ class _TransformTransactionBase(_Transaction):
         if out is not None:
             out.write_config(tid, self.me, conf)
         self.stage_db_state(tid, dbuf)
-        return CfgOk(empty = not self.running)
+        return CfgOk(empty = not self.running, nonempty_sources=set(self.running.keys()))
 
     def configure(self, tid, cfg_by_src, out, dbuf: ?swdb.Buffer=None, differential=False):
         #print('####', tid, '(Transform)', _format_path(self.path), 'configure\n', per_src(cfg_by_src), err=True)
@@ -3079,7 +3159,7 @@ class _TransformTransactionBase(_Transaction):
                 return CfgError(e)
             else:
                 self.stage_db_state(tid, dbuf)
-                return CfgOk(requests=req, updates=upd)
+                return CfgOk(requests=req, updates=upd, nonempty_sources=set(newconf.keys()))
 
     def link_requests(self, tid, merged):
         req = []
@@ -3175,7 +3255,7 @@ class _TransformTransactionBase(_Transaction):
                     rooted = make_rooted(self.path, self.merged_running)
                     for s in new_subscribers:
                         upd.append(LinkUpdate(s.tag, self.filter_fpath, s.path, rooted))
-                return CfgOk(empty = not self.running, updates=upd)
+                return CfgOk(empty = not self.running, updates=upd, nonempty_sources=set(self.running.keys()))
         ###
         if updates:
             self.candidate_link_updates[tid] = self.candidate_link_updates.get_def(tid, []) + updates
@@ -3183,7 +3263,7 @@ class _TransformTransactionBase(_Transaction):
         if output is not None:
             res = self.configure_output(tid, output, out, dbuf)
             if requests:
-                return CfgResult(res.empty, res.requests, self.link_updates(tid, self.merged_running), res.errors)
+                return CfgResult(res.empty, res.requests, self.link_updates(tid, self.merged_running), res.errors, res.nonempty_sources)
             return res
         # Self refresh this transform after updating its links. The empty
         # differential input retains its configuration sources.
@@ -3215,7 +3295,7 @@ class _TransformTransactionBase(_Transaction):
             done(res)
         else:
             #print('   #', tid, '(Transform)', _format_path(self.path), 'LOCKED', err=True)
-            done(CfgOk(empty = not self.candidates[tid].0))
+            done(CfgOk(empty = not self.candidates[tid].0, nonempty_sources=set(self.candidates[tid].0.keys())))
 
     def lock_cont1(self, actself, keys_by_src, nodes):
         pass

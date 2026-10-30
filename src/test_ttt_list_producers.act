@@ -20,7 +20,7 @@ def plans(p0: dict[str, int], pa: dict[str, int],
             "r": {"seed": r0, "b": rb}}
 
 
-def outputs(producer: str, plan: dict[str, dict[str, int]]) -> dict[str, gdata.Node]:
+def outputs(producer: str, plan: dict[str, dict[str, int]], container: bool=False) -> dict[str, gdata.Node]:
     # The element cache makes unchanged contributions pointer-identical,
     # including when a new list contains a change to a different element.
     cache: dict[(str, int), gdata.Node] = {}
@@ -42,7 +42,7 @@ def outputs(producer: str, plan: dict[str, dict[str, int]]) -> dict[str, gdata.N
                     for name in set(cfg.elements.keys()) & set(old.elements.keys()):
                         unchanged = plan[mode][name] == plan[other][name]
                         testing.assertEqual(ttt.same_node(cfg.elements[name], old.elements[name]), unchanged)
-    return result
+    return container_outputs(result) if container else result
 
 
 def expected(plan: dict[str, dict[str, dict[str, int]]], modes: dict[str, str]) -> gdata.List:
@@ -55,6 +55,43 @@ def expected(plan: dict[str, dict[str, dict[str, int]]], modes: dict[str, str]) 
                 children[name] = {q("name"): gdata.Leaf(name)}
             children[name][q(producer)] = gdata.Leaf(value)
     return gdata.List([q("name")], by_key={name: gdata.Container(fields) for name, fields in children.items()})
+
+
+def container_keys(plan: dict[str, dict[str, dict[str, int]]]) -> set[str]:
+    keys = set()
+    for producer in plan.values():
+        for cfg in producer.values():
+            keys |= set(cfg.keys())
+    return keys
+
+
+def container_outputs(output: dict[str, gdata.Node]) -> dict[str, gdata.Node]:
+    # Preserve element node identity when using the same scenarios with a
+    # fixed container instead of a dynamic list as their receiving root.
+    result: dict[str, gdata.Node] = {}
+    for mode, cfg in output.items():
+        if isinstance(cfg, gdata.List):
+            result[mode] = gdata.Container({q(key): node for key, node in cfg.elements.items()})
+    return result
+
+
+def expected_receiver(plan: dict[str, dict[str, dict[str, int]]], modes: dict[str, str], container: bool) -> gdata.Node:
+    cfg = expected(plan, modes)
+    if container:
+        # A container retains an empty node for each fixed child absent from
+        # the merged source configuration; a list removes the corresponding key.
+        return gdata.Container({q(key): cfg.elements.get_def(key, gdata.Container()) for key in container_keys(plan)})
+    return cfg
+
+
+def receiver_leaf(path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
+    return ttt.Transform(ttt.PassThrough)(path, lower)
+
+
+def receiver_layer(plan: dict[str, dict[str, dict[str, int]]], container: bool) -> ttt.Layer:
+    if container:
+        return ttt.Layer("receiver", ttt.Container({q(key): receiver_leaf for key in container_keys(plan)}), None)
+    return ttt.Layer("receiver", ttt.List(receiver_leaf, [q("name")]), None)
 
 
 actor ProducerTrace():
@@ -98,12 +135,12 @@ class Producer(ttt.TransformFunction):
 
 actor Scenario(t: testing.AsyncT, plan: dict[str, dict[str, dict[str, int]]],
                a_steps: list[dict[str, str]], b_steps: list[dict[str, str]],
-               reverse: bool=False, abort_loser: bool=False):
+               reverse: bool=False, abort_loser: bool=False, container: bool=False):
     trace = ProducerTrace()
-    receiver = ttt.Layer("receiver", ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]), None)
-    po = outputs("p", plan["p"])
-    qo = outputs("q", plan["q"])
-    ro = outputs("r", plan["r"])
+    receiver = receiver_layer(plan, container)
+    po = outputs("p", plan["p"], container)
+    qo = outputs("q", plan["q"], container)
+    ro = outputs("r", plan["r"], container)
     root = ttt.Container({
         q("p"): ttt.Transform(lambda log: Producer(log, "p", po, trace)),
         q("q"): ttt.Transform(lambda log: Producer(log, "q", qo, trace)),
@@ -135,7 +172,7 @@ actor Scenario(t: testing.AsyncT, plan: dict[str, dict[str, dict[str, int]]],
         receiving_modes = dict(modes.items())
         if not reverse and not abort_loser and "b_after" in plan["q"] and modes["q"] == "b":
             receiving_modes["q"] = "b_after"
-        testing.assertEqual(receiver.get(), expected(plan, receiving_modes))
+        testing.assertEqual(receiver.get(), expected_receiver(plan, receiving_modes, container))
 
     def finish():
         if winner_done and loser_done:
@@ -179,7 +216,7 @@ actor Scenario(t: testing.AsyncT, plan: dict[str, dict[str, dict[str, int]]],
             winner_modes = {"p": "seed", "q": "seed", "r": "seed"}
             for step in b_steps if reverse else a_steps:
                 winner_modes.update(step.items())
-            testing.assertEqual(receiver.get(), expected(plan, winner_modes))
+            testing.assertEqual(receiver.get(), expected_receiver(plan, winner_modes, container))
             await async winner.commit(winner_tid, True)
             winner_done = True
             finish()
