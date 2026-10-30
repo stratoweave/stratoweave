@@ -31,6 +31,8 @@
   let importOpen = $state(false);
   let importText = $state('');
   let importType = $state('iosxe');
+  let importUsername = $state('');
+  let importPassword = $state('');
   let touched = $state(false);
   let saving = $state(false);
   let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -215,7 +217,7 @@
   let errors = $derived(touched ? validation.errors : ({} as Record<string, string>));
 
   function openNew(): void {
-    draft = { name: '', type: 'iosxe', address: '', port: '' };
+    draft = { name: '', type: 'iosxe', address: '', port: '', username: '', password: '' };
     importOpen = false;
     touched = false;
     statusMessage = null;
@@ -265,7 +267,8 @@
       saving = true;
       statusMessage = null;
       const existing = new Set(data.devices.map((d) => d.name));
-      const result = parseImport(importText, importType.trim() || 'iosxe', existing);
+      const shared = { type: importType.trim() || 'iosxe', username: importUsername, password: importPassword };
+      const result = parseImport(importText, shared, existing);
       if (result.errors.length > 0) {
         statusMessage = {
           type: 'error',
@@ -291,6 +294,7 @@
         result.skippedExisting.length > 0 ? `, ${result.skippedExisting.length} already existed` : '';
       statusMessage = { type: 'success', text: `Imported ${entries.length} devices${skipped}.` };
       importText = '';
+      importPassword = '';
       closeEditor();
       await invalidate('data:software');
     } catch (importError) {
@@ -328,8 +332,7 @@
   <div>
     <h1>Devices</h1>
     <p>
-      The fleet inventory. Devices added here use the lab credentials
-      (admin/admin); lab deploys usually onboard them over RESTCONF.
+      The fleet inventory. Lab deploys usually onboard devices over RESTCONF.
     </p>
   </div>
   <div class="page-actions">
@@ -401,6 +404,26 @@
           onchange={(value) => patch({ port: value })}
           ontouch={() => (touched = true)}
         />
+        <FieldText
+          label="Username"
+          required={true}
+          value={draft.username}
+          error={errors['username']}
+          yangType="string"
+          autocomplete="off"
+          onchange={(value) => patch({ username: value })}
+          ontouch={() => (touched = true)}
+        />
+        <FieldText
+          label="Password"
+          value={draft.password}
+          error={errors['password']}
+          yangType="string"
+          password={true}
+          autocomplete="new-password"
+          onchange={(value) => patch({ password: value })}
+          ontouch={() => (touched = true)}
+        />
       </div>
       <div class="editor-actions">
         <button class="btn btn-secondary" type="button" onclick={closeEditor} disabled={saving}>
@@ -421,14 +444,32 @@
       description="One device per line: name[,address[,port]]. Lines starting with # are ignored; existing names are skipped."
       yangPath="fleetmgr:fleet/device"
     >
-      <FieldText
-        label="Type for all imported devices"
-        value={importType}
-        yangType="string"
-        mono={true}
-        placeholder="iosxe"
-        onchange={(value) => (importType = value)}
-      />
+      <div class="grid-2">
+        <FieldText
+          label="Type for all imported devices"
+          value={importType}
+          yangType="string"
+          mono={true}
+          placeholder="iosxe"
+          onchange={(value) => (importType = value)}
+        />
+        <FieldText
+          label="Username"
+          required={true}
+          value={importUsername}
+          yangType="string"
+          autocomplete="off"
+          onchange={(value) => (importUsername = value)}
+        />
+        <FieldText
+          label="Password"
+          value={importPassword}
+          yangType="string"
+          password={true}
+          autocomplete="new-password"
+          onchange={(value) => (importPassword = value)}
+        />
+      </div>
       <textarea
         class="input mono"
         rows="10"
