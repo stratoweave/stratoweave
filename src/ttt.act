@@ -1076,6 +1076,9 @@ actor Transaction(impl: _Transaction):
     def configure(tid, cfg_by_src, out, dbuf: ?swdb.Buffer=None, differential=False):
         return impl.configure(tid, cfg_by_src, out, dbuf, differential)
 
+    def configure_output(tid: str, conf: gdata.Node, out: ?Session, dbuf: ?swdb.Buffer=None):
+        return impl.configure_output(tid, conf, out, dbuf)
+
     def linkage(tid, requests, updates, out, dbuf: ?swdb.Buffer=None):
         return impl.linkage(tid, requests, updates, out, dbuf)
 
@@ -1131,9 +1134,6 @@ actor Transaction(impl: _Transaction):
     def write_output(conf: gdata.Node):
         impl.write_output(self, conf)
 
-    def write_output_cont(tid: str, out: Session, res: CfgResult):
-        impl.write_output_cont(tid, out, res)
-
     def update_dynstate(dynstate: ?gdata.Node):
         impl.update_dynstate(self, dynstate)
 
@@ -1153,6 +1153,10 @@ class _Transaction(object):
     wait_complete: proc(actself: Transaction, tid: str, done: action(value) -> None) -> None
     wait_complete_cont: proc(actself: Transaction, res: value) -> None
     get: proc() -> gdata.Node
+
+    proc def configure_output(self, tid: str, conf: gdata.Node, out: ?Session, dbuf: ?swdb.Buffer) -> CfgResult:
+        raise NotImplementedError("Output transactions require a transform root")
+
     def get_data(self, filt: ?gdata.FNode, content: Content) -> ?gdata.Node:
         if isinstance(content, ContentOper):
             return None
@@ -1188,9 +1192,6 @@ class _Transaction(object):
         pass
 
     proc def write_output(self, actself: Transaction, conf: gdata.Node):
-        pass
-
-    proc def write_output_cont(self, tid, out, res):
         pass
 
     proc def update_dynstate(self, actself: Transaction, dynstate: ?gdata.Node) -> None:
@@ -1404,6 +1405,24 @@ actor Session(name: str, root: Transaction, lowerlayer: ?Layer, db: ?swdb.Store,
             comp_cont = complete
             lock(tid, edit_config_cont)                                     # yield await
         else:
+            if done is not None:
+                done(res.errors[0])
+            if complete is not None:
+                complete(res.errors[0])
+
+    def write_output(conf: gdata.Node, done: ?action(value) -> None=None, complete: ?action(value) -> None=None):
+        """Replace this transform's output, retaining its input configuration."""
+        tid = 'tr' + actorid()
+        res = root.configure_output(tid, conf, lower, dbuf)
+        res = _apply(tid, res)
+        if not res.errors:
+            done_cont = done
+            comp_cont = complete
+            lock(tid, edit_config_cont)
+        else:
+            # Staging may have reached children before one rejected the output.
+            # Discard both their state and the producer's retained output intent.
+            commit(tid, False)
             if done is not None:
                 done(res.errors[0])
             if complete is not None:
@@ -2881,6 +2900,7 @@ class _TransformTransactionBase(_Transaction):
     diffs: dict[str, dict[str, list[gdata.Node]]]
     candidates: dict[str, (dict[str, gdata.Node], ?gdata.Node)]
     essays: dict[str, (?gdata.Node, ?gdata.Node)]
+    output_intents: dict[str, gdata.Node]
     running: dict[str, gdata.Node]
     merged_running: gdata.Node
     merge_memo: dict[(str, str), (left: gdata.Node, right: gdata.Node, result: gdata.Node)]
@@ -2920,6 +2940,7 @@ class _TransformTransactionBase(_Transaction):
         self.diffs = {}
         self.candidates = {}
         self.essays = {}
+        self.output_intents = {}
         self.path = path
         self.running = {}
         self.merged_running = gdata.Container()
@@ -2949,6 +2970,18 @@ class _TransformTransactionBase(_Transaction):
         self.db = None
         self.me = ''  # Initialize first before any self reference
         self.me = '(src_' + str(self)[-10:-1] + ')'  # Now safe to use str(self)
+
+    def configure_output(self, tid, conf, out, dbuf):
+        # Retain intent across candidate invalidation. Replay against current
+        # input/memory/link state, without treating output as transform input.
+        self.output_intents[tid] = conf
+        self.candidates[tid] = (dict(self.running.items()), self.merged_running)
+        self.candidate_linked[tid] = self.linked_for(tid)
+        self.essays[tid] = (conf, self.memory)
+        if out is not None:
+            out.write_config(tid, self.me, conf)
+        self.stage_db_state(tid, dbuf)
+        return CfgOk(empty = not self.running)
 
     def configure(self, tid, cfg_by_src, out, dbuf: ?swdb.Buffer=None, differential=False):
         #print('####', tid, '(Transform)', _format_path(self.path), 'configure\n', per_src(cfg_by_src), err=True)
@@ -3124,6 +3157,12 @@ class _TransformTransactionBase(_Transaction):
         ###
         if updates:
             self.candidate_link_updates[tid] = self.candidate_link_updates.get_def(tid, []) + updates
+        output = self.output_intents.get(tid)
+        if output is not None:
+            res = self.configure_output(tid, output, out, dbuf)
+            if requests:
+                return CfgResult(res.empty, res.requests, self.link_updates(tid, self.merged_running), res.errors)
+            return res
         # Self refresh this transform after updating its links. The empty
         # differential input retains its configuration sources.
         return self.configure(tid, {}, out, dbuf, differential=True)
@@ -3146,7 +3185,11 @@ class _TransformTransactionBase(_Transaction):
             # Self refresh this transform under the lock. If another commit
             # discarded its candidate, rebuild it from the current committed
             # configuration and this transaction's retained fragments.
-            res = self.configure(tid, {}, out, dbuf, differential=True)
+            output = self.output_intents.get(tid)
+            if output is not None:
+                res = self.configure_output(tid, output, out, dbuf)
+            else:
+                res = self.configure(tid, {}, out, dbuf, differential=True)
             done(res)
         else:
             #print('   #', tid, '(Transform)', _format_path(self.path), 'LOCKED', err=True)
@@ -3186,6 +3229,9 @@ class _TransformTransactionBase(_Transaction):
 
     def commit(self, tid, ok):
         #print('####', tid, '(Transform)', _format_path(self.path), 'commit', ok, err=True)
+        output_only = tid in self.output_intents
+        self.output_intents.pop(tid)
+        self.pending = [p for p in self.pending if p.1 != tid]
         # The pops must tolerate a missing tid: a transform reached only by
         # subscription bookkeeping has no config state for the transaction if
         # it is aborted before its lock-time re-configure runs.
@@ -3215,7 +3261,10 @@ class _TransformTransactionBase(_Transaction):
                     #print('   #', tid, '(Transform)', _format_path(self.path), 'INVALIDATING', set(self.candidates.keys()), err=True)
                     self.candidates = {}
                     self.candidate_linked = {}
-                self.finalize(tid)
+                # Output replacement did not change the actor's input or
+                # memory. Avoid reflecting its own write back through on_conf.
+                if not output_only:
+                    self.finalize(tid)
             else:
                 #print('   #', tid, '(Transform)', _format_path(self.path), 'ABORTING', err=True)
                 pass
@@ -3302,19 +3351,7 @@ class _TransformTransactionBase(_Transaction):
         return None
 
     proc def write_output(self, actself: Transaction, conf: gdata.Node):
-        out = self.lower?.newsession()
-        if out is not None:
-            tid = 'tr' + actorid()
-            out.write_config(tid, self.me, conf)
-            res = out.apply(tid)
-            if res.errors:
-                self.write_output_cont(tid, out, res)
-            else:
-                out.lock(tid, lambda res: actself.write_output_cont(tid, out, res))
-
-    proc def write_output_cont(self, tid, out, res):
-        ok = not res.errors
-        await async out.commit(tid, ok)
+        Session(self.me, actself, self.lower, self.db).write_output(conf)
 
     proc def update_dynstate(self, actself, dynstate):
         if self.dynstate == dynstate:

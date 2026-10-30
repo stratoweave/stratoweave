@@ -1,0 +1,549 @@
+import testing
+import file
+import lmdb
+
+import ttt
+import db as swdb
+import db.lmdb as swlmdb
+import yang.gdata as gdata
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id("urn:test:output-session", name)
+
+
+def entry(name: str, value: int) -> gdata.Node:
+    return gdata.Container({q("name"): gdata.Leaf(name), q("value"): gdata.Leaf(value)})
+
+
+def items(entries: dict[str, gdata.Node]) -> gdata.List:
+    return gdata.List([q("name")], by_key=entries)
+
+
+def input_cfg(mode: int) -> gdata.Container:
+    return gdata.Container({q("mode"): gdata.Leaf(mode)})
+
+
+def with_other_source(cfg: gdata.List) -> gdata.List:
+    children: dict[str, gdata.Node] = dict(cfg.elements.items())
+    x = children.get("x")
+    fields = dict(x.children.items()) if x is not None else {q("name"): gdata.Leaf("x")}
+    fields[q("other")] = gdata.Leaf(7)
+    children["x"] = gdata.Container(fields)
+    children["z"] = gdata.Container({q("name"): gdata.Leaf("z"), q("other"): gdata.Leaf(9)})
+    return items(children)
+
+
+actor Trace():
+    var events: list[(int, gdata.Node, ?gdata.Node, ?gdata.Node, ?gdata.Node)] = []
+
+    def record(runs: int, cfg: gdata.Node, memory: ?gdata.Node, prior_memory: ?gdata.Node, prior_output: ?gdata.Node):
+        events.append((runs, cfg, memory, prior_memory, prior_output))
+
+    def get() -> list[(int, gdata.Node, ?gdata.Node, ?gdata.Node, ?gdata.Node)]:
+        return list(events)
+
+
+class Producer(ttt.TransformFunction):
+    output: list[gdata.Node]
+    trace: Trace
+    runs: int
+    prior_memory: ?gdata.Node
+    prior_output: ?gdata.Node
+
+    def __init__(self, log_handler, output: list[gdata.Node], trace: Trace):
+        ttt.TransformFunction.__init__(self, log_handler)
+        self.output = output
+        self.trace = trace
+        self.runs = 0
+        self.prior_memory = None
+        self.prior_output = None
+
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        self.runs += 1
+        self.prior_memory = memory
+        self.prior_output = prev_output
+        return self.output[cfg.get_int(q("mode"))], gdata.Leaf(self.runs)
+
+    proc def on_conf(self, conf, linked, memory):
+        await async self.trace.record(self.runs, conf, memory, self.prior_memory, self.prior_output)
+
+
+actor Race(t: testing.AsyncT, kind: str="outputs", reverse: bool=False,
+           membership: bool=False, abort_loser: bool=False, abort_pending: bool=False):
+    trace: Trace = Trace()
+    receiver: ttt.Layer = ttt.Layer("receiver", ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]), None)
+    x0 = entry("x", 0)
+    y0 = entry("y", 0)
+    initial = items({"x": x0, "y": y0})
+    a_cfg = items({"x": entry("x", 1), "y": y0, "transient": entry("transient", 8)}) if membership else items({"x": entry("x", 1), "y": y0})
+    b_cfg = items({"x": x0, "new": entry("new", 2)}) if membership else items({"x": x0, "y": entry("y", 1)})
+    output: list[gdata.Node] = [initial, a_cfg, b_cfg]
+    node = ttt.Transform(lambda log: Producer(log, output, trace))(ttt.PathRoot("producer"), receiver)
+    source: ttt.Transaction = node.newtrans()
+    seed = ttt.Session("producer", source, receiver, None)
+    a = ttt.Session("producer", source, receiver, None)
+    b = ttt.Session("producer", source, receiver, None)
+    a_out = a.below()
+    b_out = b.below()
+    winner = b if reverse else a
+    loser = a if reverse else b
+    winner_tid = "B" if reverse else "A"
+    loser_tid = "A" if reverse else "B"
+    winner_cfg = b_cfg if reverse else a_cfg
+    loser_cfg = a_cfg if reverse else b_cfg
+    var winner_done = False
+    var loser_done = False
+    var loser_locks = 0
+
+    def check(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+
+    def recomputed(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            mode = 1 if kind == "input_first" else 2 if kind == "input_last" else 0
+            previous_runs = 2 if kind == "input_first" else 3 if kind == "input_last" else 1
+            testing.assertEqual(source.get(), input_cfg(mode))
+            testing.assertEqual(receiver.get(), with_other_source(a_cfg if mode == 1 else b_cfg if mode == 2 else initial))
+            events = trace.get()
+            event = events[-1]
+            testing.assertEqual(event.0, previous_runs + 1)
+            testing.assertEqual(event.3, gdata.Leaf(previous_runs))
+            previous_output = event.4
+            testing.assertTrue(previous_output is not None)
+            if previous_output is not None:
+                testing.assertTrue(ttt.same_node(previous_output, winner_cfg if abort_loser or abort_pending else loser_cfg))
+            testing.assertEqual(len(events), 3 if kind != "outputs" else 2)
+            if abort_pending:
+                testing.assertEqual(loser_locks, 0)
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    def finish():
+        if winner_done and loser_done:
+            try:
+                mode = 1 if kind == "input_first" else 2 if kind == "input_last" else 0
+                testing.assertEqual(source.get(), input_cfg(mode))
+                testing.assertEqual(receiver.get(), with_other_source(winner_cfg if abort_loser or abort_pending else loser_cfg))
+                # Output-only commits neither compute nor notify the producer.
+                testing.assertEqual(len(trace.get()), 2 if kind != "outputs" else 1)
+                ttt.Session("producer", source, receiver, None).recompute(complete=recomputed)
+            except Exception as error:
+                t.failure(error)
+
+    def loser_locked(result: ttt.CfgResult):
+        loser_locks += 1
+        try:
+            if abort_pending:
+                raise AssertionError("An aborted output transaction was resumed")
+            check(result)
+            await async loser.commit(loser_tid, not abort_loser)
+            loser_done = True
+            finish()
+        except Exception as error:
+            t.failure(error)
+
+    def winner_locked(result: ttt.CfgResult):
+        try:
+            check(result)
+            if abort_pending:
+                # Queue directly at the producer so the round trip below
+                # guarantees the pending lock exists before it is aborted.
+                source.lock(loser_tid, loser.below(), loser_locked)
+                source.get()
+                await async loser.commit(loser_tid, False)
+                loser_done = True
+            else:
+                loser.lock(loser_tid, loser_locked)
+            await async winner.commit(winner_tid, True)
+            winner_done = True
+            finish()
+        except Exception as error:
+            t.failure(error)
+
+    def seeded(result: ttt.CfgResult):
+        try:
+            check(result)
+            await async seed.commit("seed", True)
+            testing.assertEqual(receiver.get(), with_other_source(initial))
+            if kind == "input_first":
+                check(source.configure("A", {"north": input_cfg(1)}, a_out))
+            else:
+                check(source.configure_output("A", a_cfg, a_out))
+            check(a_out.apply("A"))
+            if kind == "input_last":
+                check(source.configure("B", {"north": input_cfg(2)}, b_out))
+            else:
+                check(source.configure_output("B", b_cfg, b_out))
+            check(b_out.apply("B"))
+            testing.assertEqual(receiver.get(), with_other_source(initial))
+            winner.lock(winner_tid, winner_locked)
+        except Exception as error:
+            t.failure(error)
+
+    # Seed an unrelated source, including a contribution to the same x entry.
+    seed.below().write_config("seed", "other", items({
+        "x": gdata.Container({q("name"): gdata.Leaf("x"), q("other"): gdata.Leaf(7)}),
+        "z": gdata.Container({q("name"): gdata.Leaf("z"), q("other"): gdata.Leaf(9)}),
+    }))
+    check(source.configure("seed", {"north": input_cfg(0)}, seed.below()))
+    check(seed.below().apply("seed"))
+    seed.lock("seed", seeded)
+
+
+actor output_replay_after_invalidation(t: testing.AsyncT):
+    Race(t)
+
+
+actor output_replay_reverse_order(t: testing.AsyncT):
+    Race(t, reverse=True)
+
+
+actor output_replay_replaces_membership(t: testing.AsyncT):
+    Race(t, membership=True)
+
+
+actor output_replay_preserves_new_input_and_memory(t: testing.AsyncT):
+    Race(t, kind="input_first")
+
+
+actor output_commit_invalidates_input_transaction(t: testing.AsyncT):
+    Race(t, kind="input_last")
+
+
+actor abort_output_after_lock(t: testing.AsyncT):
+    Race(t, abort_loser=True)
+
+
+actor abort_output_while_waiting(t: testing.AsyncT):
+    Race(t, abort_pending=True)
+
+
+class RejectNegative(ttt.TransformFunction):
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        if cfg.get_int(q("value")) < 0:
+            raise ValueError("Rejected negative output")
+        return cfg, None
+
+
+actor rejected_output_can_be_retried(t: testing.AsyncT):
+    trace = Trace()
+    receiver = ttt.Layer("receiver", ttt.List(ttt.Transform(RejectNegative), [q("name")]), None)
+    initial = items({"x": entry("x", 0)})
+    node = ttt.Transform(lambda log: Producer(log, [initial], trace))(ttt.PathRoot("producer"), receiver)
+    source = node.newtrans()
+    seed = ttt.Session("producer", source, receiver, None)
+    good = items({"x": entry("x", 3)})
+
+    def replaced(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            testing.assertEqual(receiver.get(), good)
+            testing.assertEqual(source.get(), input_cfg(0))
+            testing.assertEqual(len(trace.get()), 1)
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    def rejected(result: value):
+        try:
+            testing.assertTrue(isinstance(result, ValueError))
+            testing.assertEqual(receiver.get(), initial)
+            testing.assertEqual(source.get(), input_cfg(0))
+            ttt.Session("producer", source, receiver, None).write_output(good, complete=replaced)
+        except Exception as error:
+            t.failure(error)
+
+    def seeded(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            ttt.Session("producer", source, receiver, None).write_output(items({"x": entry("x", -1)}), complete=rejected)
+        except Exception as error:
+            t.failure(error)
+
+    seed.edit_config(input_cfg(0), complete=seeded)
+
+
+actor OutputCallback():
+    var write: ?action(gdata.Node) -> None = None
+    var notifications = 0
+
+    def attach(callback: action(gdata.Node) -> None):
+        write = callback
+
+    def publish(cfg: gdata.Node):
+        callback = write
+        if callback is not None:
+            callback(cfg)
+
+    def on_conf(conf: gdata.Node, linked: gdata.Node, memory: ?gdata.Node):
+        notifications += 1
+
+    def shutdown(memory: ?gdata.Node):
+        pass
+
+    def count():
+        return notifications
+
+
+class ReceiverSignal(ttt.TransformFunction):
+    @property
+    report: action() -> None
+
+    def __init__(self, log_handler, report):
+        ttt.TransformFunction.__init__(self, log_handler)
+        self.report = report
+
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        return cfg, None
+
+    proc def on_conf(self, conf, linked, memory):
+        self.report()
+
+
+actor Notification():
+    var callback: ?action() -> None = None
+
+    def set(handler: action() -> None):
+        callback = handler
+
+    def fire():
+        handler = callback
+        if handler is not None:
+            handler()
+
+
+actor actor_callback_uses_producer_session(t: testing.AsyncT):
+    handle: OutputCallback = OutputCallback()
+    notification: Notification = Notification()
+    cfg = items({"x": entry("x", 7)})
+    input = input_cfg(0)
+
+    def make_actor(params: ttt.TransformActorParams) -> ttt.TransformActor:
+        await async handle.attach(params.write_output)
+        return ttt.TransformActor(handle.on_conf, handle.shutdown)
+
+    def receiver_node(path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
+        return ttt.Transform(lambda log: ReceiverSignal(log, notification.fire))(path, lower)
+
+    receiver = ttt.Layer("receiver", ttt.List(receiver_node, [q("name")]), None)
+    node = ttt.Transform(ttt.PassThrough, make_actor)(ttt.PathRoot("producer"), receiver)
+    source: ttt.Transaction = node.newtrans()
+
+    def finished(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            await async source.commit("barrier", False)
+            testing.assertEqual(receiver.get(), cfg)
+            testing.assertEqual(source.get(), input)
+            testing.assertEqual(handle.count(), 1)
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    def received():
+        # The receiver reports during commit. Waiting for the producer lock
+        # also waits for the output Session to finish committing its root.
+        source.lock("barrier", None, finished)
+
+    def seeded(result: value):
+        if isinstance(result, Exception):
+            t.failure(result)
+        else:
+            handle.publish(cfg)
+
+    await async notification.set(received)
+    ttt.Session("producer", source, receiver, None).edit_config(input, complete=seeded)
+
+
+actor output_without_input_and_empty_replacement(t: testing.AsyncT):
+    trace = Trace()
+    receiver = ttt.Layer("receiver", ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]), None)
+    cfg = items({"x": entry("x", 7)})
+    source = ttt.Transform(lambda log: Producer(log, [cfg], trace))(ttt.PathRoot("producer"), receiver).newtrans()
+
+    def cleared(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            testing.assertEqual(source.get(), gdata.Container())
+            testing.assertEqual(receiver.get(), items({}))
+            testing.assertEqual(len(trace.get()), 0)
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    def written(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            testing.assertEqual(source.get(), gdata.Container())
+            testing.assertEqual(receiver.get(), cfg)
+            testing.assertEqual(len(trace.get()), 0)
+            ttt.Session("producer", source, receiver, None).write_output(items({}), complete=cleared)
+        except Exception as error:
+            t.failure(error)
+
+    ttt.Session("producer", source, receiver, None).write_output(cfg, complete=written)
+
+
+class PreserveOutput(ttt.TransformFunction):
+    initial: gdata.Node
+
+    def __init__(self, log_handler, initial):
+        ttt.TransformFunction.__init__(self, log_handler)
+        self.initial = initial
+
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        return (prev_output if prev_output is not None else self.initial,
+                memory if memory is not None else gdata.Leaf(17))
+
+
+def stored_node(tx: lmdb.ReadTransaction, codec: swdb.KeyCodec, attr: str, source: ?str=None) -> ?gdata.Node:
+    raw = tx.get(swdb.to_attr_key(["producer"], attr, source, codec))
+    if raw is not None:
+        return swdb.decode_node_bytes(raw)
+    return None
+
+
+actor persist_and_restore_output_session(t: testing.EnvT):
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    path = fs.mktmpdir("test_ttt_output_session_")
+    cap = file.WriteFileCap(fc)
+    var store = swlmdb.LmdbStore(cap, path)
+    initial = items({"x": entry("x", 0), "y": entry("y", 0)})
+    written = items({"x": entry("x", 7), "new": entry("new", 8)})
+    var source: ?ttt.Transaction = None
+
+    def source_node(root_path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
+        node = ttt.Transform(lambda log: PreserveOutput(log, initial))(root_path, lower)
+        source = node.newtrans()
+        return node
+
+    var receiver = ttt.Layer("receiver", ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]), None, store)
+    var producer = ttt.Layer("producer", source_node, receiver, store)
+
+    def recomputed(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            # The function returns prev_output: a recompute after restore must
+            # retain the explicitly written output, rather than the initial one.
+            testing.assertEqual(producer.get(), input_cfg(0))
+            testing.assertEqual(receiver.get(), written)
+            await async store.db.close()
+            await async fs.rmtree(path)
+            await async fs.rmdir(path)
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    def restored(error: ?Exception):
+        try:
+            if error is not None:
+                raise error
+            testing.assertEqual(producer.get(), input_cfg(0))
+            testing.assertEqual(receiver.get(), written)
+            producer.newsession().recompute(complete=recomputed)
+        except Exception as error1:
+            t.failure(error1)
+
+    def committed(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            testing.assertEqual(producer.get(), input_cfg(0))
+            testing.assertEqual(receiver.get(), written)
+            tx = store.db.begin_read()
+            codec = swdb.decode_key_codec(tx.get(swdb.META_KEY))
+            testing.assertEqual(stored_node(tx, codec, swdb.ATTR_RUNNING, "_"), input_cfg(0))
+            testing.assertEqual(stored_node(tx, codec, swdb.ATTR_OUTPUT), written)
+            testing.assertEqual(stored_node(tx, codec, swdb.ATTR_MEMORY), gdata.Leaf(17))
+            await async tx.commit()
+            await async store.db.close()
+            store = swlmdb.LmdbStore(cap, path)
+            receiver = ttt.Layer("receiver", ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]), None, store)
+            producer = ttt.Layer("producer", source_node, receiver, store)
+            producer.load_from_db(restored)
+        except Exception as error:
+            t.failure(error)
+
+    def seeded(result: value):
+        if isinstance(result, Exception):
+            t.failure(result)
+        else:
+            ttt.Session("producer", source!, receiver, store).write_output(written, complete=committed)
+
+    producer.newsession().edit_config(input_cfg(0), complete=seeded)
+
+
+actor failed_output_flush_preserves_source_and_receiver(t: testing.EnvT):
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    path = fs.mktmpdir("test_ttt_output_session_full_")
+    cap = file.WriteFileCap(fc)
+    store = swlmdb.LmdbStore(cap, path, 256 * 1024)
+    initial = items({"x": entry("x", 0)})
+    good = items({"x": entry("x", 2)})
+    huge = items({"x": gdata.Container({q("name"): gdata.Leaf("x"), q("payload"): gdata.Leaf("x" * (1024 * 1024))})})
+    var source: ?ttt.Transaction = None
+
+    def source_node(root_path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
+        node = ttt.Transform(lambda log: PreserveOutput(log, initial))(root_path, lower)
+        source = node.newtrans()
+        return node
+
+    receiver = ttt.Layer("receiver", ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]), None, store)
+    producer = ttt.Layer("producer", source_node, receiver, store)
+
+    def recovered(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            testing.assertEqual(receiver.get(), good)
+            testing.assertEqual(producer.get(), input_cfg(0))
+            await async store.db.close()
+            await async fs.rmtree(path)
+            await async fs.rmdir(path)
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    def recomputed(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            testing.assertEqual(receiver.get(), initial)
+            ttt.Session("producer", source!, receiver, store).write_output(good, complete=recovered)
+        except Exception as error:
+            t.failure(error)
+
+    def rejected(result: value):
+        try:
+            testing.assertTrue(isinstance(result, lmdb.MapFullError))
+            testing.assertEqual(receiver.get(), initial)
+            testing.assertEqual(producer.get(), input_cfg(0))
+            tx = store.db.begin_read()
+            codec = swdb.decode_key_codec(tx.get(swdb.META_KEY))
+            testing.assertEqual(stored_node(tx, codec, swdb.ATTR_OUTPUT), initial)
+            testing.assertEqual(stored_node(tx, codec, swdb.ATTR_MEMORY), gdata.Leaf(17))
+            await async tx.commit()
+            # This function reuses the source's committed prev_output. A
+            # recompute also detects an accidental in-memory commit on failure.
+            producer.newsession().recompute(complete=recomputed)
+        except Exception as error:
+            t.failure(error)
+
+    def seeded(result: value):
+        if isinstance(result, Exception):
+            t.failure(result)
+        else:
+            ttt.Session("producer", source!, receiver, store).write_output(huge, complete=rejected)
+
+    producer.newsession().edit_config(input_cfg(0), complete=seeded)
