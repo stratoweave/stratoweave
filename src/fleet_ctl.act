@@ -1,20 +1,26 @@
 #
-# The release decisions of one campaign run.
+# The release decisions of a campaign, now and ahead.
 #
-# The controller takes the campaign's layout, the reports of its devices
-# and the time, and decides which devices start. It has no clock and no
-# I/O: the caller passes the time in, starts the devices that a step
-# returns, and steps again at the wake time that the step returns or
-# after a report. The campaign actor runs it on the clock; tests run it
-# on times of their own.
+# One piece of logic decides which devices start: Controller.step. The
+# campaign actor steps the controller on the clock. plan() runs the same
+# step ahead of time, from the controller's state and at the expected
+# upgrade durations, to say where and when each waiting device starts:
+# the plan is the run, ahead of time. The controller runs at the
+# smallest concurrency at which that run keeps its promises. It has no
+# clock and no I/O: the caller passes the time in.
 #
 
-import fleet_sched as fs
-from fleet_sched import imax
+from fleet_sched import imax, imin
 
 # End of a window that never closes: the year 2100 as seconds since the
 # Unix epoch, far beyond any campaign.
 OPEN_END = 4102444800
+
+# How many device names an alarm gives.
+ALARM_NAMES = 5
+
+# How many times plan() runs ahead until its promises stop changing.
+PLAN_ROUNDS = 3
 
 
 def is_final(status: ?str) -> bool:
@@ -24,179 +30,782 @@ def is_final(status: ?str) -> bool:
     return status == "failed" or status == "rolled-back"
 
 
+def names_text(names: list[str]) -> str:
+    """The first names of a list, for an alarm."""
+    shown = ", ".join(names[:ALARM_NAMES])
+    if len(names) > ALARM_NAMES:
+        return shown + " and {len(names) - ALARM_NAMES} more"
+    return shown
+
+
+def copy_set(s: set[str]) -> set[str]:
+    out: set[str] = set()
+    for x in s:
+        out.add(x)
+    return out
+
+
+class Plan(object):
+    """A run of the controller ahead of time.
+
+    c is the concurrency the run uses. starts gives each waiting device
+    that starts the window it starts in, as an index into the
+    controller's windows, and the time. alarms says which promises the
+    run breaks."""
+    c: int
+    starts: dict[str, (int, int)]
+    alarms: list[str]
+
+    def __init__(self, c: int, starts: dict[str, (int, int)], alarms: list[str]):
+        self.c = c
+        self.starts = starts
+        self.alarms = alarms
+
+
 class Step(object):
-    """What one step decided.
+    """What one decision did.
 
     started holds the devices to start now. wake is the next time to
     decide if no report comes first, or -1 when only a report can change
-    what starts. finished is true when every device in the layout is
-    done."""
+    what starts. finished is true when every device is done. plan is
+    the plan the decision followed."""
     started: list[str]
     wake: int
     finished: bool
+    plan: Plan
 
-    def __init__(self, started: list[str], wake: int, finished: bool):
+    def __init__(self, started: list[str], wake: int, finished: bool, plan: Plan):
         self.started = started
         self.wake = wake
         self.finished = finished
+        self.plan = plan
 
 
 class Controller(object):
-    """The release decisions of one campaign run.
+    """The release decisions of one campaign.
 
-    start() begins a run from the estimated upgrade duration. configure()
-    takes the layout, the target and the max concurrency; it can come
-    again during a run with a new layout. report() takes the latest status
-    of a device, and step() decides at a time.
+    configure() takes the windows, the devices and the limits; it can
+    come again with new ones during a run. start() begins a run.
+    report() takes the latest status of a device and the time it came.
+    decide() plans and takes the first step of the plan; plan() only
+    plans.
 
-    A step marks each released device that last reported a final status
-    as done at the time of the step, and adds the time since its release
-    to the observed duration. The ramp starts at one device and doubles,
-    up to the target, each time the devices done reach the rung target.
-    In each open window, the step starts what fs.launch_count allows for
-    the devices waiting there. The next decision is at the next opening of
-    a window with devices waiting, or at the moment a window can no longer
-    take its waiting devices at max concurrency, whichever comes first.
-    That moment raises an alarm once per run."""
-    # The windows of the layout: schedule, start, end, and the devices
-    # placed in it as (name, estimated start, estimated duration).
-    layout: list[(str, int, int, list[(str, int, int)])]
+    A device can start in the windows of its schedule. A report counts one
+    debounce after it came. A step marks the released devices whose final
+    report counts as done at the time of the report, or at the step when
+    the report came before the release, and grows the ramp: one device,
+    doubling each time the campaign's devices done reach the ramp's
+    target, up to the concurrency. Then it starts waiting devices, window by window in the
+    order the windows open, while fewer devices than the ramp are in
+    flight. A window starts only a device whose upgrade fits before the
+    window closes, at the observed pace and with a fifth to spare. A
+    device whose report could have counted and has not is late: it is
+    expected to take one more upgrade from then. The next decision is
+    when the next report counts, when an upgrade is expected to end and
+    its report to count, or at the next opening or close of a window with
+    devices waiting.
+
+    The observed pace is kept at the scale of the campaign's estimate: an
+    upgrade that took twice its device's estimate counts as twice the
+    campaign's estimate, and each device's expected duration is its
+    estimate at that pace. An upgrade that ends when it was expected to
+    leaves the pace as it is.
+
+    A plan runs the step ahead, from the current state, every upgrade
+    ending when it is expected to, until nothing more starts. During a
+    run, the controller promises each waiting device the window that the
+    plan starts it in. A window starts the devices promised to it first,
+    in the order of the promises, then the others in their order. A
+    device that misses its window keeps its place in that order and is
+    promised the next window of its schedule. The plan runs at
+    target-concurrency, or else at the smallest concurrency up to
+    max-concurrency that breaks no more promises than max-concurrency
+    does, counting each window a device misses, and, with a deadline,
+    leaves no more devices without a start before it. During a run the
+    concurrency only rises until the limits change. The promises a plan
+    breaks are its alarms.
+
+    When every upgrade takes its expected time, a run whose plan has no
+    alarm starts every device where and when the plan said. A plan holds
+    one concurrency for the whole run ahead; when it breaks promises, a
+    later decision can find that rising then keeps some of them, and the
+    run follows that later plan."""
+    # Configuration.
+    # The windows: schedule, start, end, by start. They include the
+    # windows that released devices were released in, also when the
+    # schedules no longer give them; such a window takes no new devices.
+    windows: list[(str, int, int)]
+    index: dict[(str, int, int), int]
+    # The devices as configure() took them, in the order they start, and
+    # their estimates and schedules.
+    devices: list[(str, int, str)]
+    order: list[str]
+    est: dict[str, int]
+    schedule_of: dict[str, str]
+    # The windows the schedules give.
+    current: list[(str, int, int)]
     target: int
     maxc: int
-    # Devices whose last report has a final status.
-    final: set[str]
+    # True when every device must start in a window: a deadline that the
+    # windows show in full.
+    must_place: bool
+    debounce: int
+    # The campaign's estimated duration: the scale of observed_s.
+    estimate_s: int
+
+    # Derived from the configuration and the state by rebuild().
+    # Per window: the devices that can start in it, in order and by
+    # estimate; the devices promised to it, in the order of the promises;
+    # each with the place where the devices not looked at yet begin; and
+    # how many devices that can start in it wait. A device that did not
+    # fit is looked at again when the observed pace falls.
+    queue: list[list[str]]
+    by_est: list[list[str]]
+    pqueue: list[list[str]]
+    qcur: list[int]
+    ecur: list[int]
+    pcur: list[int]
+    waiting: list[int]
+    # Per window: whether the schedules give it, and whether its promises
+    # have moved on since it closed or the schedules stopped giving it.
+    is_current: list[bool]
+    moved: list[bool]
+    # The windows each device can start in, by start.
+    windows_of: dict[str, list[int]]
+    # How many devices of the campaign are done.
+    devices_done: int
+
+    # State.
+    running: bool
+    final_at: dict[str, int]
+    # Released devices that are not done and have a final status: a step
+    # marks them done once their report counts.
+    reported: set[str]
     released: set[str]
     released_at: dict[str, int]
-    # The window each device was released in, as (schedule, start, end).
     released_in: dict[str, (str, int, int)]
+    # The estimate of each device at its release, and when its upgrade
+    # is expected to end.
+    released_est: dict[str, int]
+    due: dict[str, int]
+    # The devices of the campaign in flight.
+    flying: set[str]
     done_at: dict[str, int]
+    # The window promised to each waiting device during a run, and the
+    # order of the promises.
+    promised: dict[str, (str, int, int)]
+    promise_seq: dict[str, int]
+    seq: int
+    # How many promises moved on, or ended with no window left: a run
+    # ahead counts its own.
+    moves: int
     observed_s: int
     rung: int
     rung_target: int
-    alarmed: bool
-    alarms: list[str]
+    c: int
 
     def __init__(self):
-        self.layout = []
+        self.windows = []
+        self.index = {}
+        self.devices = []
+        self.order = []
+        self.est = {}
+        self.schedule_of = {}
+        self.current = []
         self.target = 1
         self.maxc = 1
-        self.final = set()
+        self.must_place = False
+        self.debounce = 0
+        self.estimate_s = 1
+        self.queue = []
+        self.by_est = []
+        self.pqueue = []
+        self.qcur = []
+        self.ecur = []
+        self.pcur = []
+        self.waiting = []
+        self.is_current = []
+        self.moved = []
+        self.windows_of = {}
+        self.devices_done = 0
+        self.running = False
+        self.final_at = {}
+        self.reported = set()
         self.released = set()
         self.released_at = {}
         self.released_in = {}
+        self.released_est = {}
+        self.due = {}
+        self.flying = set()
         self.done_at = {}
+        self.promised = {}
+        self.promise_seq = {}
+        self.seq = 0
+        self.moves = 0
         self.observed_s = 1
         self.rung = 1
         self.rung_target = 1
-        self.alarmed = False
-        self.alarms = []
+        self.c = 1
 
-    def start(self, estimate_s: int) -> None:
-        """Begin a run: nothing is released, the observed duration is the
-        estimate, and the ramp is at one device. The reports stay."""
+    def configure(self, windows: list[(str, int, int)], devices: list[(str, int, str)],
+                  target: int, maxc: int, must_place: bool, debounce: int,
+                  estimate_s: int) -> None:
+        """Take the windows the schedules give, the devices as (name,
+        estimated duration, schedule) in the order they start, the target
+        and the max concurrency, whether every device must start in a
+        window, the debounce in seconds and the campaign's estimated
+        duration. New limits start the concurrency over at the target."""
+        m = imax(target, maxc)
+        e = imax(1, estimate_s)
+        if windows == self.current and devices == self.devices and target == self.target \
+           and m == self.maxc and must_place == self.must_place \
+           and debounce == self.debounce and e == self.estimate_s:
+            return
+        if target != self.target or m != self.maxc:
+            self.c = target
+        if e != self.estimate_s:
+            # Keep the observed pace at the scale of the new estimate.
+            self.observed_s = imax(1, self.observed_s * e // self.estimate_s)
+            self.estimate_s = e
+        self.current = windows
+        self.devices = devices
+        self.order = [d.0 for d in devices]
+        est: dict[str, int] = {}
+        schedule_of: dict[str, str] = {}
+        for d in devices:
+            est[d.0] = imax(1, d.1)
+            schedule_of[d.0] = d.2
+        self.est = est
+        self.schedule_of = schedule_of
+        self.target = target
+        self.maxc = m
+        self.must_place = must_place
+        self.debounce = debounce
+        self.rebuild()
+
+    def start(self, rung: int=1, observed_s: ?int=None) -> None:
+        """Begin a run: nothing is released or promised, the observed
+        pace is observed_s or else the campaign's estimate, the ramp is at
+        rung devices and the concurrency at the target. The reports and
+        the configuration stay."""
+        self.running = True
         self.released = set()
         self.released_at = {}
         self.released_in = {}
+        self.released_est = {}
+        self.due = {}
         self.done_at = {}
-        self.observed_s = estimate_s
-        self.rung = 1
-        self.rung_target = 1
-        self.alarmed = False
-        self.alarms = []
+        self.reported = set()
+        self.promised = {}
+        self.promise_seq = {}
+        self.observed_s = self.estimate_s
+        if observed_s is not None:
+            self.observed_s = imax(1, observed_s)
+        self.rung = rung
+        self.rung_target = rung
+        self.c = self.target
+        self.rebuild()
 
-    def configure(self, layout: list[(str, int, int, list[(str, int, int)])],
-                  target: int, maxc: int) -> None:
-        """Take the layout, the target and the max concurrency."""
-        self.layout = layout
-        self.target = target
-        self.maxc = maxc
+    def stop(self) -> None:
+        """End the run: no promises are kept. The released devices stay
+        released."""
+        self.running = False
+        self.promised = {}
+        self.promise_seq = {}
+        self.rebuild()
 
-    def report(self, name: str, status: ?str) -> None:
-        """Take the latest status of a device."""
+    def resume(self, name: str, at: int, win: (str, int, int)) -> None:
+        """Take a device that was released at time at, in the window win,
+        before the first step of the run. It holds its slot until it is
+        done."""
+        i = self.index.get(win)
+        if i is not None:
+            self.release(name, at, i)
+
+    def rebuild(self) -> None:
+        """Derive the windows, queues and counts from the configuration
+        and the state."""
+        current: set[(str, int, int)] = set()
+        keys: set[(str, int, int)] = set()
+        for w in self.current:
+            current.add(w)
+            keys.add(w)
+        for name in self.released:
+            keys.add(self.released_in[name])
+        for name, p in self.promised.items():
+            if name not in self.released and p not in current \
+               and p.0 == self.schedule_of.get_def(name, ""):
+                keys.add(p)
+        windows = [(k.1, k.0, k.2) for k in sorted([(w.1, w.0, w.2) for w in keys])]
+        index: dict[(str, int, int), int] = {}
+        queue: list[list[str]] = []
+        waiting: list[int] = []
+        by_schedule: dict[str, list[int]] = {}
+        for i in range(len(windows)):
+            w = windows[i]
+            index[w] = i
+            queue.append([])
+            waiting.append(0)
+            if w in current:
+                if w.0 not in by_schedule:
+                    by_schedule[w.0] = []
+                by_schedule[w.0].append(i)
+        windows_of: dict[str, list[int]] = {}
+        promised: dict[str, (str, int, int)] = {}
+        by_promise: list[list[(int, str)]] = [[] for _w in windows]
+        for name in self.order:
+            wins = by_schedule.get_def(self.schedule_of[name], [])
+            windows_of[name] = wins
+            for i in wins:
+                queue[i].append(name)
+                if name not in self.released:
+                    waiting[i] += 1
+            # A promise holds to a window of the device's schedule; one to
+            # a window the schedules no longer give moves on at the next
+            # step.
+            p = self.promised.get(name)
+            if p is not None and name not in self.released and p.0 == self.schedule_of[name]:
+                i = index[p]
+                promised[name] = p
+                by_promise[i].append((self.promise_seq.get_def(name, 0), name))
+        flying: set[str] = set()
+        devices_done = 0
+        for name in self.released:
+            if name in self.est:
+                if name in self.done_at:
+                    devices_done += 1
+                else:
+                    flying.add(name)
+        self.windows = windows
+        self.index = index
+        self.queue = queue
+        self.by_est = [[n.1 for n in sorted([(self.est[name], name) for name in q])] for q in queue]
+        self.pqueue = [[n.1 for n in sorted(b)] for b in by_promise]
+        self.qcur = [0 for _w in windows]
+        self.ecur = [0 for _w in windows]
+        self.pcur = [0 for _w in windows]
+        self.waiting = waiting
+        self.is_current = [w in current for w in windows]
+        self.moved = [False for _w in windows]
+        self.windows_of = windows_of
+        self.promised = promised
+        self.flying = flying
+        self.devices_done = devices_done
+
+    def report(self, name: str, status: ?str, at: int) -> None:
+        """Take the latest status of a device, which came at time at. A
+        final report after another final report keeps the time of the
+        first."""
         if is_final(status):
-            self.final.add(name)
-        else:
-            self.final.discard(name)
+            if name not in self.final_at:
+                self.final_at[name] = at
+                if name in self.released and name not in self.done_at:
+                    self.reported.add(name)
+        elif name in self.final_at:
+            del self.final_at[name]
+            self.reported.discard(name)
 
     def lost(self, name: str) -> None:
         """Forget the status of a device."""
-        self.final.discard(name)
+        if name in self.final_at:
+            del self.final_at[name]
+            self.reported.discard(name)
 
     def lost_all(self) -> None:
         """Forget the status of every device."""
-        self.final = set()
+        self.final_at = {}
+        self.reported = set()
 
-    def step(self, t: int) -> Step:
-        """Decide at time t: note the devices that are done, grow the
-        ramp, start what fits in each open window, and say when to decide
-        next."""
-        for name in self.released:
-            if name not in self.done_at and name in self.final:
-                self.done_at[name] = t
-                took = imax(1, t - self.released_at.get_def(name, 0))
-                self.observed_s = (self.observed_s * 3 + took) // 4
+    def duration(self, name: str) -> int:
+        """The expected duration of a device's upgrade at the observed
+        pace."""
+        return imax(1, self.est.get_def(name, self.estimate_s) * self.observed_s // self.estimate_s)
 
-        if len(self.done_at) >= self.rung_target and self.rung < self.target:
-            self.rung = fs.ramp_next(self.rung, 2, self.target)
-            self.rung_target = len(self.done_at) + self.rung
+    def fits(self, name: str, t: int, end: int) -> bool:
+        """True when the device's upgrade, started at t, fits before end
+        with a fifth to spare."""
+        return end == OPEN_END or (end - t) * 10 >= self.duration(name) * 12
 
-        started: list[str] = []
-        placed_total = 0
-        next_edge = -1
-        crossings: list[(int, int)] = []
-        for win in self.layout:
-            wstart = win.1
-            wend = win.2
-            placed_total += len(win.3)
-            inflight = 0
-            waiting = []
-            for entry in win.3:
-                if entry.0 in self.released:
-                    if entry.0 not in self.done_at:
-                        inflight += 1
-                else:
-                    waiting.append(entry.0)
-            if len(waiting) > 0 and wend != OPEN_END and t < wend:
-                crossings.append((wend, len(waiting)))
-            if wstart > t and len(waiting) > 0:
-                if next_edge < 0 or wstart < next_edge:
-                    next_edge = wstart
-            if t < wstart or t >= wend:
+    def promise(self, name: str, t: int) -> int:
+        """The window promised to a device, as an index, while that window
+        is open or yet to open; -1 without one."""
+        p = self.promised.get(name)
+        if p is not None:
+            i = self.index.get(p)
+            if i is not None and t < self.windows[i].2:
+                return i
+        return -1
+
+    def release(self, name: str, t: int, i: int) -> None:
+        """Release the device name at time t in window i: it waits in no
+        window any more and holds a slot until it is done."""
+        self.released.add(name)
+        self.released_at[name] = t
+        self.released_in[name] = self.windows[i]
+        self.released_est[name] = self.est.get_def(name, self.estimate_s)
+        self.due[name] = t + self.duration(name)
+        if name in self.est:
+            self.flying.add(name)
+        for j in self.windows_of.get_def(name, []):
+            self.waiting[j] -= 1
+        if name in self.final_at:
+            self.reported.add(name)
+
+    def move_promises(self, t: int) -> None:
+        """Promise the devices still waiting for a window that has closed,
+        or that the schedules no longer give, the next window of their
+        schedule, in the same place in the order of the promises."""
+        moves: dict[int, list[(int, str)]] = {}
+        for i in range(len(self.windows)):
+            win = self.windows[i]
+            if self.moved[i] or (t < win.2 and self.is_current[i]):
                 continue
-            n_new = fs.launch_count(len(waiting), inflight, self.observed_s, wend - t,
-                                    self.target, self.maxc, self.rung, 1000000)
-            idx = 0
-            for name in waiting:
-                if idx < n_new:
-                    self.released.add(name)
-                    self.released_at[name] = t
-                    self.released_in[name] = (win.0, wstart, wend)
-                    started.append(name)
-                idx += 1
+            self.moved[i] = True
+            for name in self.pqueue[i]:
+                if name not in self.released and self.promised.get(name) == win:
+                    nxt = -1
+                    for j in self.windows_of.get_def(name, []):
+                        if nxt < 0 and j != i and t < self.windows[j].2:
+                            nxt = j
+                    if nxt >= 0:
+                        self.promised[name] = self.windows[nxt]
+                        if nxt not in moves:
+                            moves[nxt] = []
+                        moves[nxt].append((self.promise_seq.get_def(name, 0), name))
+                    else:
+                        del self.promised[name]
+                    self.moves += 1
+        for j, ms in moves.items():
+            # Both lists are in the order of the promises.
+            q = self.pqueue[j]
+            merged: list[str] = []
+            first = -1
+            a = 0
+            for m in sorted(ms):
+                while a < len(q) and self.promise_seq.get_def(q[a], 0) < m.0:
+                    merged.append(q[a])
+                    a += 1
+                if first < 0:
+                    first = len(merged)
+                merged.append(m.1)
+            while a < len(q):
+                merged.append(q[a])
+                a += 1
+            self.pqueue[j] = merged
+            self.pcur[j] = imin(self.pcur[j], first)
 
-        wake = next_edge
-        if not self.alarmed:
-            # The moment a window stops being makeable is plain arithmetic
-            # in time: decide then rather than at the next completion.
-            t_alarm = -1
-            sf_now = 0
-            for c in crossings:
-                g_need = fs.ceil_div(c.1, self.maxc)
-                t_need = (g_need - 1) * self.observed_s + (self.observed_s * 12) // 10
-                t_x = c.0 - t_need + 1
-                if t_x <= t:
-                    sf_now += fs.shortfall(c.1, self.observed_s, c.0 - t, self.maxc)
-                elif t_alarm < 0 or t_x < t_alarm:
-                    t_alarm = t_x
-            if sf_now > 0:
-                self.alarmed = True
-                self.alarms.append("{sf_now} device(s) cannot make their "
-                                   + "window even at max concurrency - deferral projected")
-            elif t_alarm >= 0:
-                if wake < 0 or t_alarm < wake:
-                    wake = t_alarm
+    def fill(self, i: int, t: int, slots: int, started: list[str]) -> int:
+        """Start devices in the open window i at time t, at most slots of
+        them: first the devices promised to it, then the ones promised no
+        window. Return the slots left. A device that does not fit is not
+        looked at again in this window until the pace falls."""
+        end = self.windows[i].2
+        # Nothing fits when the shortest waiting device does not.
+        q = self.by_est[i]
+        k = self.ecur[i]
+        while k < len(q) and q[k] in self.released:
+            k += 1
+        self.ecur[i] = k
+        if k >= len(q) or not self.fits(q[k], t, end):
+            return slots
+        n = slots
+        q = self.pqueue[i]
+        k = self.pcur[i]
+        while n > 0 and k < len(q):
+            name = q[k]
+            k += 1
+            if name not in self.released and self.promise(name, t) == i and self.fits(name, t, end):
+                self.release(name, t, i)
+                started.append(name)
+                n -= 1
+        self.pcur[i] = k
+        q = self.queue[i]
+        k = self.qcur[i]
+        while n > 0 and k < len(q):
+            name = q[k]
+            k += 1
+            if name not in self.released and self.promise(name, t) < 0 and self.fits(name, t, end):
+                self.release(name, t, i)
+                started.append(name)
+                n -= 1
+        self.qcur[i] = k
+        return n
 
-        finished = False
-        if placed_total > 0 and len(self.done_at) >= placed_total:
-            finished = True
-        return Step(started, wake, finished)
+    def step(self, t: int, c: int) -> (list[str], int, bool):
+        """Decide at time t at concurrency c: mark the devices that are
+        done, grow the ramp, start what fits, and say when to decide next.
+        Returns the started devices, the wake and whether every device is
+        done."""
+        pace = self.observed_s
+        # The reports that count by now, in the order they came.
+        due_reports: list[(int, str)] = []
+        for name in self.reported:
+            at = self.final_at[name]
+            if at + self.debounce <= t:
+                due_reports.append((at, name))
+        for fr in sorted(due_reports):
+            name = fr.1
+            self.reported.discard(name)
+            at = self.released_at.get_def(name, 0)
+            end = fr.0
+            if end < at:
+                end = t
+            self.done_at[name] = end
+            # At the scale of the campaign's estimate; an upgrade that
+            # ends when it was expected to leaves the pace as it is.
+            took = self.observed_s
+            if end != self.due.get_def(name, end + 1):
+                took = imax(1, end - at) * self.estimate_s // self.released_est.get_def(name, self.estimate_s)
+            self.observed_s = (self.observed_s * 3 + imax(1, took)) // 4
+            if name in self.flying:
+                self.flying.discard(name)
+                self.devices_done += 1
+
+        if self.observed_s < pace:
+            # Devices that did not fit may fit now.
+            self.qcur = [0 for _w in self.windows]
+            self.ecur = [0 for _w in self.windows]
+            self.pcur = [0 for _w in self.windows]
+
+        if self.devices_done >= self.rung_target and self.rung < c:
+            self.rung = imin(self.rung * 2, c)
+            self.rung_target = self.devices_done + self.rung
+
+        self.move_promises(t)
+        started: list[str] = []
+        slots = imin(self.rung, c) - len(self.flying)
+        wake = -1
+        for i in range(len(self.windows)):
+            if self.waiting[i] == 0:
+                continue
+            win = self.windows[i]
+            if win.1 > t:
+                if wake < 0 or win.1 < wake:
+                    wake = win.1
+            elif t < win.2:
+                if slots > 0:
+                    slots = self.fill(i, t, slots, started)
+                if win.2 != OPEN_END and self.waiting[i] > 0:
+                    if wake < 0 or win.2 < wake:
+                        wake = win.2
+        for name in self.flying:
+            if name in self.reported:
+                # Its report counts one debounce after it came.
+                w = imax(self.final_at[name] + self.debounce, t + 1)
+            else:
+                due = self.due[name]
+                if due + self.debounce < t:
+                    # Late: one more upgrade from now.
+                    due = t + self.duration(name)
+                    self.due[name] = due
+                w = imax(due + self.debounce, t + 1)
+            if wake < 0 or w < wake:
+                wake = w
+        return (started, wake, self.devices_done >= len(self.est))
+
+    def copy(self) -> Controller:
+        """A controller with this one's configuration and a copy of its
+        state, to run ahead without changing this one."""
+        c = Controller()
+        c.windows = self.windows
+        c.index = self.index
+        c.devices = self.devices
+        c.order = self.order
+        c.est = self.est
+        c.schedule_of = self.schedule_of
+        c.current = self.current
+        c.target = self.target
+        c.maxc = self.maxc
+        c.must_place = self.must_place
+        c.debounce = self.debounce
+        c.estimate_s = self.estimate_s
+        c.queue = self.queue
+        c.by_est = self.by_est
+        c.windows_of = self.windows_of
+        c.pqueue = [list(q) for q in self.pqueue]
+        c.qcur = list(self.qcur)
+        c.ecur = list(self.ecur)
+        c.pcur = list(self.pcur)
+        c.waiting = list(self.waiting)
+        c.is_current = self.is_current
+        c.moved = list(self.moved)
+        c.devices_done = self.devices_done
+        c.running = self.running
+        c.final_at = {k: v for k, v in self.final_at.items()}
+        c.reported = copy_set(self.reported)
+        c.released = copy_set(self.released)
+        c.released_at = {k: v for k, v in self.released_at.items()}
+        c.released_in = {k: v for k, v in self.released_in.items()}
+        c.released_est = {k: v for k, v in self.released_est.items()}
+        c.due = {k: v for k, v in self.due.items()}
+        c.flying = copy_set(self.flying)
+        c.done_at = {k: v for k, v in self.done_at.items()}
+        c.promised = {k: v for k, v in self.promised.items()}
+        c.promise_seq = {k: v for k, v in self.promise_seq.items()}
+        c.seq = self.seq
+        c.moves = self.moves
+        c.observed_s = self.observed_s
+        c.rung = self.rung
+        c.rung_target = self.rung_target
+        c.c = self.c
+        return c
+
+    def project(self, t: int, c: int) -> (dict[str, (int, int)], int):
+        """Run ahead from time t at concurrency c, every upgrade ending
+        when it is expected to. Return where and when each device that
+        the run starts starts, as (window index, time), and how many
+        promises move on in the run."""
+        s = self.copy()
+        s.moves = 0
+        starts: dict[str, (int, int)] = {}
+        now = t
+        while True:
+            started, wake, finished = s.step(now, c)
+            for name in started:
+                starts[name] = (s.index[s.released_in[name]], now)
+            if wake < 0 or finished:
+                break
+            now = wake
+            for name in s.flying:
+                due = s.due[name]
+                if due <= now:
+                    s.report(name, "succeeded", due)
+        return (starts, s.moves)
+
+    def breaks(self, run: (dict[str, (int, int)], int), t: int) -> (list[str], list[str], int):
+        """The promises a run breaks: the waiting devices that do not
+        start in their promised window, the ones that start in no window,
+        and how many times promises move on in the run: once for each
+        window a device misses."""
+        missed: list[str] = []
+        unplaced: list[str] = []
+        for name in self.order:
+            if name not in self.released:
+                s = run.0.get(name)
+                p = self.promise(name, t)
+                if s is not None:
+                    if p >= 0 and s.0 != p:
+                        missed.append(name)
+                else:
+                    unplaced.append(name)
+                    if p >= 0:
+                        missed.append(name)
+        return (missed, unplaced, run.1)
+
+    def worse(self, a: (list[str], list[str], int), b: (list[str], list[str], int)) -> bool:
+        """True when the run with breaks a breaks more promises than the
+        run with breaks b."""
+        if a.2 > b.2:
+            return True
+        return self.must_place and len(a.1) > len(b.1)
+
+    def choose(self, t: int) -> (int, dict[str, (int, int)], (list[str], list[str], int)):
+        """The run ahead at the concurrency the plan uses: the current
+        one, or else the smallest up to max-concurrency that breaks no
+        more promises than max-concurrency does. The search assumes that
+        a run at a higher concurrency breaks no more promises."""
+        none: (list[str], list[str], int) = ([], [], 0)
+        c = self.target
+        if self.running:
+            c = imin(imax(self.c, self.target), self.maxc)
+        run = self.project(t, c)
+        b = self.breaks(run, t)
+        if self.worse(b, none) and self.maxc > c:
+            top_run = self.project(t, self.maxc)
+            top = self.breaks(top_run, t)
+            if self.worse(b, top):
+                lo = c + 1
+                hi = self.maxc
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if self.worse(self.breaks(self.project(t, mid), t), top):
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                c = lo
+                run = top_run if c == self.maxc else self.project(t, c)
+                b = self.breaks(run, t)
+        return (c, run.0, b)
+
+    def promise_starts(self, starts: dict[str, (int, int)], t: int) -> int:
+        """Promise each waiting device without a promise the window that
+        starts gives it, and return how many promises that makes."""
+        n = 0
+        for name in self.order:
+            if name not in self.released and self.promise(name, t) < 0:
+                s = starts.get(name)
+                if s is not None:
+                    self.promised[name] = self.windows[s.0]
+                    self.promise_seq[name] = self.seq
+                    self.seq += 1
+                    self.pqueue[s.0].append(name)
+                    n += 1
+        return n
+
+    def plan(self, t: int) -> Plan:
+        """Plan from time t: the run ahead, at the concurrency choose()
+        gives, with the promises the plan makes. It runs ahead again until
+        its promises stop changing. During a run the controller keeps the
+        promises and the concurrency."""
+        self.move_promises(t)
+        s = self.copy()
+        c, starts, b = s.choose(t)
+        for _round in range(PLAN_ROUNDS):
+            if s.promise_starts(starts, t) == 0:
+                break
+            c, starts, b = s.choose(t)
+        if self.running:
+            self.promised = s.promised
+            self.promise_seq = s.promise_seq
+            self.seq = s.seq
+            self.pqueue = s.pqueue
+            self.c = c
+
+        alarms: list[str] = []
+        at_max = " even at max-concurrency {self.maxc}" if c >= self.maxc else ""
+        missed = b.0
+        if len(missed) > 0:
+            alarms.append("{len(missed)} device(s) will miss the window they were "
+                          + "promised{at_max}: {names_text(missed)}")
+        # The devices with no promise that start in no window.
+        unplaced = [name for name in b.1 if s.promise(name, t) < 0]
+        if len(unplaced) > 0:
+            if self.must_place:
+                alarms.append("{len(unplaced)} device(s) cannot start before the deadline"
+                              + "{at_max}: {names_text(unplaced)}")
+            else:
+                alarms.append("{len(unplaced)} device(s) are in no window yet: "
+                              + names_text(unplaced))
+        return Plan(c, starts, alarms)
+
+    def decide(self, t: int) -> Step:
+        """Plan at time t and take the plan's first step."""
+        p = self.plan(t)
+        started, wake, finished = self.step(t, p.c)
+        return Step(started, wake, finished, p)
+
+    def layout(self, p: Plan) -> list[(str, int, int, list[(str, int, int)])]:
+        """The windows with their devices, by start: one (schedule, start,
+        end, devices) entry per window that has devices, each device as
+        (name, start, estimated duration), with its real start when it was
+        released and the plan's start when it waits."""
+        released: list[list[(int, str)]] = [[] for _w in self.windows]
+        planned: list[list[(int, str)]] = [[] for _w in self.windows]
+        for name in self.released:
+            i = self.index.get(self.released_in[name])
+            if i is not None:
+                released[i].append((self.released_at[name], name))
+        for name, s in p.starts.items():
+            if name not in self.released:
+                planned[s.0].append((s.1, name))
+        out: list[(str, int, int, list[(str, int, int)])] = []
+        for i in range(len(self.windows)):
+            entries: list[(str, int, int)] = []
+            for d in sorted(released[i]):
+                entries.append((d.1, d.0, self.released_est.get_def(d.1, self.estimate_s)))
+            for d in sorted(planned[i]):
+                entries.append((d.1, d.0, self.est.get_def(d.1, self.estimate_s)))
+            if len(entries) > 0:
+                w = self.windows[i]
+                out.append((w.0, w.1, w.2, entries))
+        return out

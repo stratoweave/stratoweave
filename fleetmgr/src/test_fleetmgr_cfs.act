@@ -9,6 +9,8 @@ import stratoweave.ttt as ttt
 from stratoweave.device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig
 
+import stratoweave.fleet_ctl as fctl
+import stratoweave.fleet_sched_sim as fsim
 import fleetmgr.cfs as cfs
 import fleetmgr.rfs as rfs
 import fleetmgr.layers.y_0 as y_0
@@ -357,6 +359,28 @@ def _with_nightly(linked: y_0.root) -> y_0.root:
     return linked
 
 
+def _plan(campaign: InputCampaign, linked: y_0.root,
+          now: int) -> (list[(str, int, int, list[(str, int, int)])], list[str], int):
+    """The campaign's plan at time now, before a run: the layout, the
+    alarms and the concurrency."""
+    ctl = fctl.Controller()
+    cfs.configure_campaign(ctl, campaign, linked, now)
+    p = ctl.plan(now)
+    return (ctl.layout(p), p.alarms, p.c)
+
+
+def _replanned(campaign: InputCampaign, linked: y_0.root, now: int) -> fctl.Controller:
+    """A run of the campaign in which cpe-1 was released at 10 in last
+    night's window and reported done at 14, planned again at time now."""
+    ctl = fctl.Controller()
+    cfs.configure_campaign(ctl, campaign, linked, 0)
+    ctl.start()
+    ctl.resume("cpe-1", 10, ("nightly", 0, 600))
+    ctl.report("cpe-1", "succeeded", 14)
+    cfs.configure_campaign(ctl, campaign, linked, now)
+    return ctl
+
+
 def _flat_inventory(names: list[str], upgrade_duration: ?int = None) -> y_0.root:
     linked = y_0.root()
     for name in names:
@@ -391,7 +415,7 @@ actor _test_campaign_without_windows_gets_default_window(t: testing.AsyncT):
         admin_state="run",
     )
     campaign.device.create("cpe-1")
-    layout, alarms = cfs.plan_campaign(campaign, linked, 0)
+    layout, alarms, conc = _plan(campaign, linked, 0)
     testing.assertEqual(_window_names(layout, "default"), ["cpe-1"], None)
     out = cfs.campaign_config(campaign, linked, set())
     o: y_1.root = y_1.root.from_gdata(out.to_gdata())
@@ -420,7 +444,7 @@ actor _test_campaign_deadline_without_windows_plans(t: testing.AsyncT):
     )
     for name in ["d1", "d2"]:
         campaign.device.create(name)
-    layout, alarms = cfs.plan_campaign(campaign, _flat_inventory(["d1", "d2"]), 0)
+    layout, alarms, conc = _plan(campaign, _flat_inventory(["d1", "d2"]), 0)
     testing.assertEqual(_window_names(layout, "default"), ["d1", "d2"], None)
     testing.assertEqual(len(alarms), 0, "a meetable deadline must not alarm")
     for win in layout:
@@ -432,7 +456,7 @@ actor _test_campaign_plan_state_plans_without_actuating(t: testing.AsyncT):
     """In plan admin-state the layout exists and nothing is emitted."""
     campaign = _paced_campaign(["cpe-1", "cpe-2"])
     campaign.admin_state = "plan"
-    layout, alarms = cfs.plan_campaign(campaign, _with_nightly(_flat_inventory(["cpe-1", "cpe-2"])), 0)
+    layout, alarms, conc = _plan(campaign, _with_nightly(_flat_inventory(["cpe-1", "cpe-2"])), 0)
     testing.assertEqual(_window_names(layout, "nightly"), ["cpe-1", "cpe-2"], None)
     out = cfs.campaign_config(campaign, _with_nightly(_flat_inventory(["cpe-1", "cpe-2"])), set())
     o: y_1.root = y_1.root.from_gdata(out.to_gdata())
@@ -604,17 +628,17 @@ def _test_snapshot_plan_estimates():
     for i in range(10):
         campaign.device.create("dev-{i}")
         names.append("dev-{i}")
-    layout, alarms = cfs.plan_campaign(campaign, _flat_inventory(names), 0)
+    layout, alarms, conc = _plan(campaign, _flat_inventory(names), 0)
     return _render_layout("10 mock devices, no windows, target 4, max 8 at once: "
                           + "4s nominal estimates, ramp to 4 in flight",
                           layout, alarms)
 
 def _test_campaign_debounce_scales_with_members():
-    testing.assertEqual(cfs.campaign_debounce_s(10), 0.1)
-    testing.assertEqual(cfs.campaign_debounce_s(100), 0.1)
-    testing.assertEqual(cfs.campaign_debounce_s(1000), 1.0)
-    testing.assertEqual(cfs.campaign_debounce_s(10000), 10.0)
-    testing.assertEqual(cfs.campaign_debounce_s(100000), 30.0)
+    testing.assertEqual(cfs.campaign_debounce_s(10), 1)
+    testing.assertEqual(cfs.campaign_debounce_s(100), 1)
+    testing.assertEqual(cfs.campaign_debounce_s(1000), 1)
+    testing.assertEqual(cfs.campaign_debounce_s(10000), 10)
+    testing.assertEqual(cfs.campaign_debounce_s(100000), 30)
 
 
 def _test_snapshot_plan_estimates_slow_devices():
@@ -633,7 +657,7 @@ def _test_snapshot_plan_estimates_slow_devices():
     for i in range(10):
         campaign.device.create("dev-{i}")
         names.append("dev-{i}")
-    layout, alarms = cfs.plan_campaign(campaign, _flat_inventory(names, upgrade_duration=8), 0)
+    layout, alarms, conc = _plan(campaign, _flat_inventory(names, upgrade_duration=8), 0)
     return _render_layout("10 mock devices at a configured 8s duration, "
                           + "target 8, max 16 at once",
                           layout, alarms)
@@ -659,7 +683,7 @@ def _test_snapshot_plan_estimates_mixed_fleet():
     for i in range(9):
         campaign.device.create("dev-{i}")
     campaign.device.create("dev-real")
-    layout, alarms = cfs.plan_campaign(campaign, linked, 0)
+    layout, alarms, conc = _plan(campaign, linked, 0)
     return _render_layout("nine 4s mocks and one real device at the adapter's "
                           + "395s nominal, target 8, max 16 at once",
                           layout, alarms)
@@ -667,8 +691,8 @@ def _test_snapshot_plan_estimates_mixed_fleet():
 
 actor _test_campaign_deadline_honors_ramp_up(t: testing.AsyncT):
     """A deadline the steady-state division calls makeable but the ramp
-    cannot make: the ramp-aware math alarms, the even-spread math did
-    not."""
+    cannot make: ten 8 s devices in 40 s need four at once, and max is
+    three. The plan alarms."""
     names = []
     for i in range(10):
         names.append("r{i}")
@@ -683,13 +707,10 @@ actor _test_campaign_deadline_honors_ramp_up(t: testing.AsyncT):
     )
     for name in names:
         campaign.device.create(name)
-    layout, alarms = cfs.plan_campaign(campaign, _flat_inventory(names, upgrade_duration=8), 0)
-    found = False
-    for alarm in alarms:
-        if "deadline needs" in alarm:
-            found = True
-    testing.assertEqual(found, True,
-                        "the ramp makes this deadline unmakeable; the plan must say so")
+    layout, alarms, conc = _plan(campaign, _flat_inventory(names, upgrade_duration=8), 0)
+    testing.assertEqual(alarms, ["1 device(s) cannot start before the deadline even at "
+                                 + "max-concurrency 3: r9"])
+    testing.assertEqual(conc, 3)
     t.success()
 
 
@@ -713,7 +734,7 @@ actor _test_campaign_estimate_from_the_adapter(t: testing.AsyncT):
     )
     campaign.device.create("real-1")
     campaign.device.create("mock-1")
-    layout, alarms = cfs.plan_campaign(campaign, linked, 0)
+    layout, alarms, conc = _plan(campaign, linked, 0)
     ests: dict[str, int] = {}
     for win in layout:
         for entry in win.3:
@@ -755,7 +776,7 @@ def _test_campaign_open_window_takes_only_its_rest():
     )
     for name in names:
         campaign.device.create(name)
-    layout, alarms = cfs.plan_campaign(campaign, linked, 12600)
+    layout, alarms, conc = _plan(campaign, linked, 12600)
     by_start: dict[int, list[str]] = {}
     for win in layout:
         by_start[win.1] = sorted([entry.0 for entry in win.3])
@@ -764,6 +785,138 @@ def _test_campaign_open_window_takes_only_its_rest():
     testing.assertEqual(by_start.get_def(86400, []), ["o2", "o3", "o4", "o5"],
                         "the rest go to tomorrow")
     testing.assertEqual(alarms, [], None)
+
+
+def _daily_campaign(name: str, devices: int, deadline: ?int, target: int,
+                    maxc: int) -> (InputCampaign, y_0.root):
+    """devices 10 min devices d0, d1, ... in a 1 h window every day."""
+    names = ["d{i}" for i in range(devices)]
+    linked = _flat_inventory(names, upgrade_duration=600)
+    linked.schedules.schedule.create("day").window.create(u64(0), duration=u64(3600))
+    campaign = InputCampaign(
+        name=name,
+        target_release="17.18.03a",
+        image_url="https://images.example/xe.bin",
+        admin_state="plan",
+        default_schedule="day",
+        target_concurrency=u64(target),
+        max_concurrency=u64(maxc),
+    )
+    if deadline is not None:
+        campaign.deadline = u64(deadline)
+    for n in names:
+        campaign.device.create(n)
+    return (campaign, linked)
+
+
+def _window_sizes(layout: list[(str, int, int, list[(str, int, int)])]) -> list[int]:
+    return [len(win.3) for win in layout]
+
+
+def _test_campaign_window_takes_what_the_ramp_starts():
+    """100 devices of 10 min, a 1 h window every day, 10 at once. The
+    first window ramps 1, 2, 4, 8, 10 and has no time for a sixth round:
+    it takes 25. The ramp belongs to the campaign, so the next window runs
+    five rounds of 10 and takes 50, and the third the last 25."""
+    campaign, linked = _daily_campaign("ramp", 100, None, 10, 10)
+    layout, alarms, conc = _plan(campaign, linked, 0)
+    testing.assertEqual(_window_sizes(layout), [25, 50, 25])
+    testing.assertEqual([win.1 for win in layout], [0, 86400, 172800])
+    testing.assertEqual(alarms, [])
+    testing.assertEqual(conc, 10)
+
+
+def _test_campaign_deadline_raises_the_planned_concurrency():
+    """The same fleet with a deadline at the end of the second window. At
+    14 at once the two windows take 29 and 70, one short; at 15 they take
+    30 and 70, so the plan runs at 15."""
+    campaign, linked = _daily_campaign("deadline", 100, 86400 + 3600, 10, 50)
+    layout, alarms, conc = _plan(campaign, linked, 0)
+    testing.assertEqual(conc, 15)
+    testing.assertEqual(_window_sizes(layout), [30, 70])
+    testing.assertEqual(alarms, [])
+
+
+def _test_campaign_replan_keeps_the_ramp():
+    """The fleet with the deadline, run through the first window on the
+    estimates and planned again between the windows. The run's ramp is
+    at 15, so the second window still takes its 70 at 15 at once. A plan
+    that ramped from one again would take 31 and leave 39 devices out."""
+    campaign, linked = _daily_campaign("deadline", 100, 86400 + 3600, 10, 50)
+    campaign.admin_state = "run"
+    ctl = fctl.Controller()
+    cfs.configure_campaign(ctl, campaign, linked, 0)
+    ctl.start()
+    fsim.drive(ctl, 0, {}, 50000)
+    cfs.configure_campaign(ctl, campaign, linked, 50000)
+    p = ctl.plan(50000)
+    testing.assertEqual(_window_sizes(ctl.layout(p)), [30, 70])
+    testing.assertEqual(p.alarms, [])
+    testing.assertEqual(p.c, 15)
+
+
+def _test_campaign_long_device_waits_for_a_window_it_fits():
+    """Two devices of 30 min and ten of 1 min share a 1 h window every day,
+    one at a time. The first long device fills half the window, and the
+    second does not fit in the half left, so it goes to the next day,
+    and the short ones take the rest of the first window."""
+    linked = y_0.root()
+    linked.schedules.schedule.create("day").window.create(u64(0), duration=u64(3600))
+    names: list[str] = []
+    for group in [("a", 2, 1800), ("b", 10, 60)]:
+        for i in range(group.1):
+            name = "{group.0}{i}"
+            dev = linked.fleet.device.create(name, type="iosxe",
+                                             credentials=InputCredentials(username="admin"))
+            dev.mock.enabled = True
+            dev.mock.software.upgrade_duration = u64(group.2)
+            names.append(name)
+    campaign = InputCampaign(
+        name="long",
+        target_release="17.18.03a",
+        image_url="https://images.example/xe.bin",
+        admin_state="plan",
+        default_schedule="day",
+        target_concurrency=u64(1),
+        max_concurrency=u64(1),
+    )
+    for name in names:
+        campaign.device.create(name)
+    layout, alarms, conc = _plan(campaign, linked, 0)
+    by_start: dict[int, list[str]] = {}
+    for win in layout:
+        by_start[win.1] = sorted([entry.0 for entry in win.3])
+    testing.assertEqual(by_start.get_def(0, []),
+                        ["a0", "b0", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8", "b9"])
+    testing.assertEqual(by_start.get_def(86400, []), ["a1"])
+    testing.assertEqual(alarms, [])
+
+
+def _test_campaign_device_without_a_window_keeps_the_concurrency():
+    """A device bound to a schedule that opens only after the deadline fits
+    no window at any concurrency. The other 99 fit at 10 at once, so the
+    plan stays at 10 and only that device raises an alarm."""
+    campaign, linked = _daily_campaign("unfit", 100, 2 * 86400 + 3600, 10, 50)
+    sunday = linked.schedules.schedule.create("sunday").window.create(u64(0),
+                                                                     duration=u64(3600))
+    sunday.day = ["sun"]
+    _bind(linked, "d99", "sunday")
+    layout, alarms, conc = _plan(campaign, linked, 0)
+    testing.assertEqual(conc, 10)
+    testing.assertEqual(_window_sizes(layout), [25, 50, 24])
+    testing.assertEqual(alarms, ["1 device(s) cannot start before the deadline: d99"])
+
+
+def _test_campaign_deadline_beyond_the_horizon_keeps_the_concurrency():
+    """500 devices that need more windows than the planner looks ahead,
+    and a deadline 30 days out. The planner does not see the windows
+    that reach the deadline, so it does not raise the concurrency for
+    it."""
+    campaign, linked = _daily_campaign("far", 500, 30 * 86400, 10, 50)
+    layout, alarms, conc = _plan(campaign, linked, 0)
+    testing.assertEqual(conc, 10)
+    testing.assertEqual(len(alarms), 1)
+    testing.assertTrue(alarms[0].startswith("75 device(s) are in no window yet: "), alarms[0])
 
 
 def _bind(linked: y_0.root, name: str, schedule: str) -> None:
@@ -791,7 +944,7 @@ actor _test_campaign_devices_follow_their_own_schedule(t: testing.AsyncT):
     )
     for name in ["n1", "w1", "w2"]:
         campaign.device.create(name)
-    layout, alarms = cfs.plan_campaign(campaign, linked, 0)
+    layout, alarms, conc = _plan(campaign, linked, 0)
     testing.assertEqual(len(alarms), 0, None)
     testing.assertEqual(_window_names(layout, "night"), ["n1"],
                         "the unbound member follows the campaign default")
@@ -801,8 +954,10 @@ actor _test_campaign_devices_follow_their_own_schedule(t: testing.AsyncT):
 
 
 def _test_snapshot_plan_two_schedules():
-    """The layout across two schedules: five nightly devices ramp in the
-    first window, five weekend bound devices in the later one."""
+    """The layout across two schedules: five nightly devices ramp from
+    one in the first window. The ramp belongs to the campaign, so the five
+    weekend bound devices in the later window start at the four it
+    reached."""
     linked = _flat_inventory(["n0", "n1", "n2", "n3", "n4",
                               "w0", "w1", "w2", "w3", "w4"], upgrade_duration=8)
     sch = linked.schedules.schedule.create("night")
@@ -822,7 +977,7 @@ def _test_snapshot_plan_two_schedules():
     )
     for name in ["n0", "n1", "n2", "n3", "n4", "w0", "w1", "w2", "w3", "w4"]:
         campaign.device.create(name)
-    layout, alarms = cfs.plan_campaign(campaign, linked, 0)
+    layout, alarms, conc = _plan(campaign, linked, 0)
     return _render_layout("two schedules, ten 8s devices, half bound to the "
                           + "weekend window at +2h",
                           layout, alarms)
@@ -842,12 +997,53 @@ def _test_released_device_keeps_a_closed_window():
     start after the window closed; the waiting one goes to tonight's."""
     linked = _with_nightly(_flat_inventory(["cpe-1", "cpe-2"]))
     campaign = _paced_campaign(["cpe-1", "cpe-2"])
-    layout, alarms = cfs.plan_campaign(campaign, linked, 1000,
-                                       {"cpe-1": ("nightly", 0, 600)},
-                                       {"cpe-1": 10}, {"cpe-1": 14})
-    testing.assertEqual(_layout_lines(layout),
+    ctl = _replanned(campaign, linked, 1000)
+    p = ctl.plan(1000)
+    testing.assertEqual(_layout_lines(ctl.layout(p)),
                         ["nightly@0: cpe-1@10", "nightly@86400: cpe-2@86400"])
+    testing.assertEqual(p.alarms, [])
+
+
+def _test_mixed_fleet_runs_its_plan_without_alarm():
+    """200 devices of 30 s bound to a 20 minute window and 20 of 1800 s
+    bound to a 4 h window plan without alarms. Started the way the
+    campaign actor starts a run, the controller's first decision starts
+    the ramp's one device and raises no alarm either: it judges each
+    device by its own estimate, not by the campaign's average of 191 s."""
+    linked = y_0.root()
+    linked.schedules.schedule.create("fast").window.create(u64(0), duration=u64(1200))
+    linked.schedules.schedule.create("slow").window.create(u64(0), duration=u64(14400))
+    names: list[str] = []
+    # (name prefix, devices, upgrade duration, schedule)
+    for group in [("f", 200, 30, "fast"), ("s", 20, 1800, "slow")]:
+        for i in range(group.1):
+            name = "{group.0}{i}"
+            dev = linked.fleet.device.create(name, type="iosxe",
+                                             credentials=InputCredentials(username="admin"))
+            dev.mock.enabled = True
+            dev.mock.software.upgrade_duration = u64(group.2)
+            dev.schedule = group.3
+            names.append(name)
+    campaign = InputCampaign(
+        name="mixed",
+        target_release="17.18.03a",
+        image_url="https://images.example/xe.bin",
+        admin_state="run",
+        target_concurrency=u64(10),
+        max_concurrency=u64(20),
+    )
+    for name in names:
+        campaign.device.create(name)
+    layout, alarms, conc = _plan(campaign, linked, 0)
     testing.assertEqual(alarms, [])
+    testing.assertEqual(conc, 10)
+    testing.assertEqual(cfs.estimated_duration(campaign, linked), 191)
+    ctl = fctl.Controller()
+    cfs.configure_campaign(ctl, campaign, linked, 0)
+    ctl.start()
+    s = ctl.decide(0)
+    testing.assertEqual(s.started, ["f0"])
+    testing.assertEqual(s.plan.alarms, [])
 
 
 def _test_closed_window_takes_no_new_devices():
@@ -856,19 +1052,21 @@ def _test_closed_window_takes_no_new_devices():
     once, in tonight's window, with no false overflow."""
     linked = _with_nightly(_flat_inventory(["cpe-1", "cpe-2"]))
     campaign = _paced_campaign(["cpe-1", "cpe-2"])
-    layout, alarms = cfs.plan_campaign(campaign, linked, 86500,
-                                       {"cpe-1": ("nightly", 0, 600)},
-                                       {"cpe-1": 10}, {"cpe-1": 14})
-    testing.assertEqual(_layout_lines(layout),
+    ctl = _replanned(campaign, linked, 86500)
+    p = ctl.plan(86500)
+    testing.assertEqual(_layout_lines(ctl.layout(p)),
                         ["nightly@0: cpe-1@10", "nightly@86400: cpe-2@86500"])
-    testing.assertEqual(alarms, [])
+    testing.assertEqual(p.alarms, [])
 
 
 actor _test_campaign_replan_keeps_released_devices(t: testing.AsyncT):
     """Run a campaign one device at a time, let two finish, then raise
     target-concurrency. The replan keeps the finished devices in their window
     with started and finished, and predicts the waiting ones from the
-    device in flight instead of behind the finished ones."""
+    device in flight instead of behind the finished ones: d3 takes the
+    second slot, and d4 starts when d2 is expected to finish. The plan
+    expects the pace the run observed, which is faster than the 600 s
+    estimate, since d0 and d1 report done right away."""
     names = ["d0", "d1", "d2", "d3", "d4"]
     linked = _flat_inventory(names, upgrade_duration=600)
     ns = y0_oper.NS_software
@@ -954,7 +1152,10 @@ actor _test_campaign_replan_keeps_released_devices(t: testing.AsyncT):
             t.failure(ValueError("finished devices lost started or finished"))
         elif "d2" not in started or "d2" in finished:
             t.failure(ValueError("d2 must be in flight"))
-        elif estimated.get_def("d4", 0) != started["d2"] + 600:
+        elif "d3" not in started:
+            t.failure(ValueError("d3 must take the second slot: {started}"))
+        elif estimated.get_def("d4", 0) <= started["d2"] or \
+             estimated.get_def("d4", 0) > started["d2"] + 601:
             t.failure(ValueError("d4 must start when d2 is expected to finish: "
                                  + "{estimated} {started}"))
         else:
