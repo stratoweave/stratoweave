@@ -1,0 +1,151 @@
+"""Tests of the controller's release decisions, on times the tests give."""
+
+import testing
+
+import fleet_ctl
+from fleet_ctl import Controller
+
+
+def window(start: int, end: int, n: int) -> list[(str, int, int, list[(str, int, int)])]:
+    """One window with n devices d0, d1, ... placed at its start, 600 s each."""
+    return [("w", start, end, [("d{i}", start, 600) for i in range(n)])]
+
+
+def controller(layout: list[(str, int, int, list[(str, int, int)])],
+               target: int, maxc: int) -> Controller:
+    """A controller at the start of a run, on a 600 s estimate."""
+    c = Controller()
+    c.start(600)
+    c.configure(layout, target, maxc)
+    return c
+
+
+def _test_final_statuses():
+    """Only the statuses that end an attempt are final."""
+    cases = [
+        ("succeeded", True),
+        ("up-to-date", True),
+        ("failed", True),
+        ("rolled-back", True),
+        ("in-progress", False),
+        ("pending", False),
+    ]
+    for case in cases:
+        testing.assertEqual(fleet_ctl.is_final(case.0), case.1, case.0)
+    testing.assertEqual(fleet_ctl.is_final(None), False, "no status")
+
+
+def _test_first_step_starts_one_device():
+    """The ramp starts at one device, and in a window that never closes
+    only a report can change what starts."""
+    c = controller(window(0, fleet_ctl.OPEN_END, 10), 4, 8)
+    s = c.step(0)
+    testing.assertEqual(s.started, ["d0"])
+    testing.assertEqual(s.wake, -1)
+    testing.assertEqual(s.finished, False)
+
+
+def _test_ramp_doubles_as_devices_finish():
+    """Each time the devices done reach the rung target, the rung doubles
+    up to the target. At the target the ramp stops binding, and the
+    target holds."""
+    c = controller(window(0, fleet_ctl.OPEN_END, 10), 4, 8)
+    testing.assertEqual(c.step(0).started, ["d0"])
+    c.report("d0", "succeeded")
+    testing.assertEqual(c.step(600).started, ["d1", "d2"])
+    testing.assertEqual((c.rung, c.rung_target), (2, 3))
+    c.report("d1", "succeeded")
+    c.report("d2", "failed")
+    testing.assertEqual(c.step(1200).started, ["d3", "d4", "d5", "d6"])
+    testing.assertEqual((c.rung, c.rung_target), (4, 7))
+
+
+def _test_done_at_the_step_after_the_report():
+    """A device is done at the step that sees its final report, and the
+    time from its release to that step goes into the observed duration."""
+    c = controller(window(0, fleet_ctl.OPEN_END, 2), 1, 1)
+    c.step(0)
+    c.report("d0", "succeeded")
+    c.step(700)
+    testing.assertEqual(c.done_at, {"d0": 700})
+    testing.assertEqual(c.observed_s, (600 * 3 + 700) // 4)
+
+
+def _test_lost_or_later_status_is_not_done():
+    """A device whose report was lost, or whose later report is not
+    final, is not done, and keeps its slot."""
+    c = controller(window(0, fleet_ctl.OPEN_END, 3), 1, 1)
+    c.step(0)
+    c.report("d0", "succeeded")
+    c.lost("d0")
+    s = c.step(600)
+    testing.assertEqual(c.done_at, {})
+    testing.assertEqual(s.started, [])
+    c.report("d0", "succeeded")
+    c.report("d0", "in-progress")
+    c.step(1200)
+    testing.assertEqual(c.done_at, {})
+
+
+def _test_waits_for_the_window_to_open():
+    """Before its window opens nothing starts, and the next decision is at
+    the opening."""
+    c = controller(window(1000, fleet_ctl.OPEN_END, 3), 1, 1)
+    s = c.step(0)
+    testing.assertEqual(s.started, [])
+    testing.assertEqual(s.wake, 1000)
+    testing.assertEqual(c.step(1000).started, ["d0"])
+
+
+def _test_wakes_when_the_window_stops_being_makeable():
+    """With 9 devices waiting at max 2, five rounds of 600 s, the last
+    with its 1.2x launch cutoff, need 3120 s: the window that closes at
+    10000 stops being makeable at 6881."""
+    c = controller(window(0, 10000, 10), 1, 2)
+    s = c.step(0)
+    testing.assertEqual(s.started, ["d0"])
+    testing.assertEqual(s.wake, 6881)
+    testing.assertEqual(c.alarms, [])
+
+
+def _test_alarm_once_when_the_window_is_too_short():
+    """A window that one round fills cannot take 10 devices at max 1: the
+    step raises the alarm for the 9 that do not fit, and later steps do
+    not raise it again. The count is over the devices waiting before the
+    step, so the device the step starts is in it."""
+    c = controller(window(0, 1000, 10), 1, 1)
+    s = c.step(0)
+    testing.assertEqual(s.started, ["d0"])
+    testing.assertEqual(s.wake, -1)
+    testing.assertEqual(c.alarms, ["9 device(s) cannot make their window even at "
+                                   + "max concurrency - deferral projected"])
+    c.step(10)
+    testing.assertEqual(len(c.alarms), 1)
+
+
+def _test_finished_when_every_device_is_done():
+    """The run is finished at the step that sees the last device done."""
+    c = controller(window(0, fleet_ctl.OPEN_END, 2), 2, 2)
+    c.step(0)
+    c.report("d0", "succeeded")
+    s = c.step(600)
+    testing.assertEqual(s.started, ["d1"])
+    testing.assertEqual(s.finished, False)
+    c.report("d1", "succeeded")
+    testing.assertEqual(c.step(1200).finished, True)
+
+
+def _test_start_begins_a_new_run():
+    """start() forgets the released devices and the ramp, and the next
+    step starts from one device again."""
+    c = controller(window(0, fleet_ctl.OPEN_END, 4), 2, 2)
+    c.step(0)
+    c.report("d0", "succeeded")
+    c.step(600)
+    c.start(600)
+    testing.assertEqual(c.released, set())
+    testing.assertEqual((c.rung, c.rung_target), (1, 1))
+    c.report("d0", "in-progress")
+    c.report("d1", "in-progress")
+    c.report("d2", "in-progress")
+    testing.assertEqual(c.step(1200).started, ["d0"])

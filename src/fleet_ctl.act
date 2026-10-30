@@ -1,0 +1,202 @@
+#
+# The release decisions of one campaign run.
+#
+# The controller takes the campaign's layout, the reports of its devices
+# and the time, and decides which devices start. It has no clock and no
+# I/O: the caller passes the time in, starts the devices that a step
+# returns, and steps again at the wake time that the step returns or
+# after a report. The campaign actor runs it on the clock; tests run it
+# on times of their own.
+#
+
+import fleet_sched as fs
+from fleet_sched import imax
+
+# End of a window that never closes: the year 2100 as seconds since the
+# Unix epoch, far beyond any campaign.
+OPEN_END = 4102444800
+
+
+def is_final(status: ?str) -> bool:
+    """True when the status ends an upgrade attempt."""
+    if status == "succeeded" or status == "up-to-date":
+        return True
+    return status == "failed" or status == "rolled-back"
+
+
+class Step(object):
+    """What one step decided.
+
+    started holds the devices to start now. wake is the next time to
+    decide if no report comes first, or -1 when only a report can change
+    what starts. finished is true when every device in the layout is
+    done."""
+    started: list[str]
+    wake: int
+    finished: bool
+
+    def __init__(self, started: list[str], wake: int, finished: bool):
+        self.started = started
+        self.wake = wake
+        self.finished = finished
+
+
+class Controller(object):
+    """The release decisions of one campaign run.
+
+    start() begins a run from the estimated upgrade duration. configure()
+    takes the layout, the target and the max concurrency; it can come
+    again during a run with a new layout. report() takes the latest status
+    of a device, and step() decides at a time.
+
+    A step marks each released device that last reported a final status
+    as done at the time of the step, and adds the time since its release
+    to the observed duration. The ramp starts at one device and doubles,
+    up to the target, each time the devices done reach the rung target.
+    In each open window, the step starts what fs.launch_count allows for
+    the devices waiting there. The next decision is at the next opening of
+    a window with devices waiting, or at the moment a window can no longer
+    take its waiting devices at max concurrency, whichever comes first.
+    That moment raises an alarm once per run."""
+    # The windows of the layout: schedule, start, end, and the devices
+    # placed in it as (name, estimated start, estimated duration).
+    layout: list[(str, int, int, list[(str, int, int)])]
+    target: int
+    maxc: int
+    # Devices whose last report has a final status.
+    final: set[str]
+    released: set[str]
+    released_at: dict[str, int]
+    # The window each device was released in, as (schedule, start, end).
+    released_in: dict[str, (str, int, int)]
+    done_at: dict[str, int]
+    observed_s: int
+    rung: int
+    rung_target: int
+    alarmed: bool
+    alarms: list[str]
+
+    def __init__(self):
+        self.layout = []
+        self.target = 1
+        self.maxc = 1
+        self.final = set()
+        self.released = set()
+        self.released_at = {}
+        self.released_in = {}
+        self.done_at = {}
+        self.observed_s = 1
+        self.rung = 1
+        self.rung_target = 1
+        self.alarmed = False
+        self.alarms = []
+
+    def start(self, estimate_s: int) -> None:
+        """Begin a run: nothing is released, the observed duration is the
+        estimate, and the ramp is at one device. The reports stay."""
+        self.released = set()
+        self.released_at = {}
+        self.released_in = {}
+        self.done_at = {}
+        self.observed_s = estimate_s
+        self.rung = 1
+        self.rung_target = 1
+        self.alarmed = False
+        self.alarms = []
+
+    def configure(self, layout: list[(str, int, int, list[(str, int, int)])],
+                  target: int, maxc: int) -> None:
+        """Take the layout, the target and the max concurrency."""
+        self.layout = layout
+        self.target = target
+        self.maxc = maxc
+
+    def report(self, name: str, status: ?str) -> None:
+        """Take the latest status of a device."""
+        if is_final(status):
+            self.final.add(name)
+        else:
+            self.final.discard(name)
+
+    def lost(self, name: str) -> None:
+        """Forget the status of a device."""
+        self.final.discard(name)
+
+    def lost_all(self) -> None:
+        """Forget the status of every device."""
+        self.final = set()
+
+    def step(self, t: int) -> Step:
+        """Decide at time t: note the devices that are done, grow the
+        ramp, start what fits in each open window, and say when to decide
+        next."""
+        for name in self.released:
+            if name not in self.done_at and name in self.final:
+                self.done_at[name] = t
+                took = imax(1, t - self.released_at.get_def(name, 0))
+                self.observed_s = (self.observed_s * 3 + took) // 4
+
+        if len(self.done_at) >= self.rung_target and self.rung < self.target:
+            self.rung = fs.ramp_next(self.rung, 2, self.target)
+            self.rung_target = len(self.done_at) + self.rung
+
+        started: list[str] = []
+        placed_total = 0
+        next_edge = -1
+        crossings: list[(int, int)] = []
+        for win in self.layout:
+            wstart = win.1
+            wend = win.2
+            placed_total += len(win.3)
+            inflight = 0
+            waiting = []
+            for entry in win.3:
+                if entry.0 in self.released:
+                    if entry.0 not in self.done_at:
+                        inflight += 1
+                else:
+                    waiting.append(entry.0)
+            if len(waiting) > 0 and wend != OPEN_END and t < wend:
+                crossings.append((wend, len(waiting)))
+            if wstart > t and len(waiting) > 0:
+                if next_edge < 0 or wstart < next_edge:
+                    next_edge = wstart
+            if t < wstart or t >= wend:
+                continue
+            n_new = fs.launch_count(len(waiting), inflight, self.observed_s, wend - t,
+                                    self.target, self.maxc, self.rung, 1000000)
+            idx = 0
+            for name in waiting:
+                if idx < n_new:
+                    self.released.add(name)
+                    self.released_at[name] = t
+                    self.released_in[name] = (win.0, wstart, wend)
+                    started.append(name)
+                idx += 1
+
+        wake = next_edge
+        if not self.alarmed:
+            # The moment a window stops being makeable is plain arithmetic
+            # in time: decide then rather than at the next completion.
+            t_alarm = -1
+            sf_now = 0
+            for c in crossings:
+                g_need = fs.ceil_div(c.1, self.maxc)
+                t_need = (g_need - 1) * self.observed_s + (self.observed_s * 12) // 10
+                t_x = c.0 - t_need + 1
+                if t_x <= t:
+                    sf_now += fs.shortfall(c.1, self.observed_s, c.0 - t, self.maxc)
+                elif t_alarm < 0 or t_x < t_alarm:
+                    t_alarm = t_x
+            if sf_now > 0:
+                self.alarmed = True
+                self.alarms.append("{sf_now} device(s) cannot make their "
+                                   + "window even at max concurrency - deferral projected")
+            elif t_alarm >= 0:
+                if wake < 0 or t_alarm < wake:
+                    wake = t_alarm
+
+        finished = False
+        if placed_total > 0 and len(self.done_at) >= placed_total:
+            finished = True
+        return Step(started, wake, finished)

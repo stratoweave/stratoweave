@@ -5,6 +5,7 @@ import stratoweave.ttt as ttt
 
 import stratoweave.adapters.software_iosxe as sw_iosxe
 import stratoweave.adapters.software_mock as sw_mock
+import stratoweave.fleet_ctl as fctl
 import stratoweave.fleet_sched as fs
 import stratoweave.fleet_sched_sim as fsim
 
@@ -438,13 +439,13 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                                lower_tree_provider: ?ygdata.TreeProvider):
     """Aggregate device telemetry and control the release of the plan.
 
-    The actor plans for itself from the campaign and runs the core
-    controller on the layout and the telemetry, driven by events rather
-    than a tick: on-change telemetry arms a debounce timer and the timer
-    firing decides once for the whole batch; window openings and the
-    projected shortfall crossing get exact timers of their own. Releases
-    start small and double as upgrades complete. The actor writes the
-    decision as dynstate for the transform to actuate, and also sends the
+    The actor plans for itself from the campaign and runs a
+    fctl.Controller on the layout and the device reports, driven by events
+    rather than a tick: on-change telemetry arms a debounce timer and the
+    timer firing decides once for the whole batch; the controller says
+    when it next needs to decide, at a window opening or the projected
+    shortfall crossing, and the actor arms an exact timer for it. Releases
+    start small and double as upgrades complete. The actor sends the
     configuration of the released devices directly.
     """
     var members: list[str] = []
@@ -462,18 +463,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var generation = 0
     var debounce_armed = False
     var debounce_s = campaign_debounce_s(0)
-    var alarmed = False
-    var controller_alarms: list[str] = []
-    var released: set[str] = set()
-    var released_at: dict[str, int] = {}
-    # The window each device was released in, as (schedule, start, end).
-    var released_in: dict[str, (str, int, int)] = {}
-    var done_at: dict[str, int] = {}
-    var observed_s: int = 1
-    var rung: int = 1
-    var rung_target: int = 1
-    var target_c: int = 1
-    var max_c: int = 1
+    var ctl = fctl.Controller()
     # The campaign and the inventory from the last on_conf, and the
     # configuration they give for the released devices.
     var campaign: ?y_0.software__software__upgrade_campaign_entry = None
@@ -538,10 +528,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 win.end = u64(pw.2)
             for entry in pw.3:
                 pd = win.device.create(entry.0)
-                started = released_at.get(entry.0)
+                started = ctl.released_at.get(entry.0)
                 if started is not None:
                     pd.started = u64(started)
-                    finished = done_at.get(entry.0)
+                    finished = ctl.done_at.get(entry.0)
                     if finished is not None:
                         pd.finished = u64(finished)
                 else:
@@ -549,7 +539,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 pd.estimated_duration = u64(entry.2)
         for alarm in plan_alarms:
             st.plan.alarm.append(alarm)
-        for alarm in controller_alarms:
+        for alarm in ctl.alarms:
             st.plan.alarm.append(alarm)
         update_oper(oper)
 
@@ -557,13 +547,16 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 reason: ?str,
                 precheck: (verdict: ?str, detail: ?str, at: ?str),
                 postcheck: (verdict: ?str, detail: ?str, at: ?str)) -> None:
-        """Keep the state of one device, as its flotilla reports it."""
+        """Keep the state of one device, as its flotilla reports it, and
+        pass its status to the controller."""
         latest[name] = (status=status, running_release=running_release,
                         stage=stage, reason=reason, precheck=precheck, postcheck=postcheck)
+        ctl.report(name, status)
 
     def forget(name: str) -> None:
         if name in latest:
             del latest[name]
+        ctl.lost(name)
 
     def changed(relevant: bool) -> None:
         if relevant and subscriptions_synced and active and not debounce_armed:
@@ -582,6 +575,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         if error is not None:
             print("campaign status subscription failed at {path}: {error}", err=True)
             latest = {}
+            ctl.lost_all()
         elif keys is not None:
             relevant = keys.device_name in member_names
             if state is not None:
@@ -608,91 +602,20 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         pass
 
     def decide(gen: int) -> None:
-        """Note completions, release what fits, and arm the next event."""
+        """Run one step of the controller, start the devices it releases,
+        and arm the next decision at the time the step says."""
         if gen != generation or not active:
             return
         debounce_armed = False
         generation += 1
         next_gen = generation
         t = time.time().unix_s()
-
-        for name in released:
-            if name not in done_at:
-                observed = latest.get(name)
-                if observed is not None:
-                    status = observed.status
-                    if status == "succeeded" or status == "up-to-date" or \
-                       status == "failed" or status == "rolled-back":
-                        done_at[name] = t
-                        took = imax(1, t - released_at.get_def(name, 0))
-                        observed_s = (observed_s * 3 + took) // 4
-
-        if len(done_at) >= rung_target and rung < target_c:
-            rung = fs.ramp_next(rung, 2, target_c)
-            rung_target = len(done_at) + rung
-
-        fresh: set[str] = set()
-        placed_total = 0
-        next_edge = -1
-        crossings: list[(int, int)] = []
-        for win in plan_layout:
-            wstart = win.1
-            wend = win.2
-            placed_total += len(win.3)
-            inflight = 0
-            waiting = []
-            for entry in win.3:
-                if entry.0 in released:
-                    if entry.0 not in done_at:
-                        inflight += 1
-                else:
-                    waiting.append(entry.0)
-            if len(waiting) > 0 and wend != OPEN_END and t < wend:
-                crossings.append((wend, len(waiting)))
-            if wstart > t and len(waiting) > 0:
-                # A window opening is plain arithmetic in time: arm a
-                # timer for it instead of polling toward it.
-                if next_edge < 0 or wstart < next_edge:
-                    next_edge = wstart
-            if t < wstart or t >= wend:
-                continue
-            n_new = fs.launch_count(len(waiting), inflight, observed_s, wend - t,
-                                    target_c, max_c, rung, 1000000)
-            idx = 0
-            for name in waiting:
-                if idx < n_new:
-                    released.add(name)
-                    released_at[name] = t
-                    released_in[name] = (win.0, wstart, wend)
-                    fresh.add(name)
-                idx += 1
-        if len(fresh) > 0:
-            patch_output(fresh)
-        if next_edge >= 0:
-            delay = float(next_edge - t)
-            after now delay: decide(next_gen)
-        if not alarmed:
-            # So is the moment a window stops being makeable: arm the
-            # alarm for the projected crossing rather than waiting for
-            # the next completion to reveal it.
-            t_alarm = -1
-            sf_now = 0
-            for c in crossings:
-                g_need = fs.ceil_div(c.1, max_c)
-                t_need = (g_need - 1) * observed_s + (observed_s * 12) // 10
-                t_x = c.0 - t_need + 1
-                if t_x <= t:
-                    sf_now += fs.shortfall(c.1, observed_s, c.0 - t, max_c)
-                elif t_alarm < 0 or t_x < t_alarm:
-                    t_alarm = t_x
-            if sf_now > 0:
-                alarmed = True
-                controller_alarms.append("{sf_now} device(s) cannot make their "
-                                         + "window even at max concurrency - deferral projected")
-            elif t_alarm >= 0:
-                delay = float(t_alarm - t)
-                after now delay: decide(next_gen)
-        if placed_total > 0 and len(done_at) >= placed_total:
+        s = ctl.step(t)
+        if len(s.started) > 0:
+            patch_output(set(s.started))
+        if s.wake >= 0:
+            after now float(s.wake - t): decide(next_gen)
+        if s.finished:
             active = False
         publish()
 
@@ -710,27 +633,19 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         inventory = y_0.root.from_gdata(linked)
         run_now = conf.admin_state == "run"
         if run_now and not running:
-            released = set()
-            released_at = {}
-            released_in = {}
-            done_at = {}
-            observed_s = estimated_duration(conf, inventory)
-            rung = 1
-            rung_target = 1
-            alarmed = False
-            controller_alarms = []
+            ctl.start(estimated_duration(conf, inventory))
         running = run_now
-        output = campaign_config(conf, inventory, released).to_gdata()
+        output = campaign_config(conf, inventory, ctl.released).to_gdata()
         write_output(output)
 
         # Released devices keep their window and real times in the replan.
         layout, alarms = plan_campaign(conf, inventory, time.time().unix_s(),
-                                       released_in, released_at, done_at)
+                                       ctl.released_in, ctl.released_at, ctl.done_at)
         plan_layout = layout
         plan_alarms = alarms
 
         target_c = int(conf.target_concurrency)
-        max_c = imax(target_c, int(conf.max_concurrency))
+        ctl.configure(layout, target_c, imax(target_c, int(conf.max_concurrency)))
 
         paced = len(plan_layout) > 0
         # New intent invalidates every armed timer. The first decision after
@@ -759,6 +674,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 # A later subscription starts with a fresh rooted replay. Do
                 # not retain entries that may disappear while unsubscribed.
                 latest = {}
+                ctl.lost_all()
             subscriptions_synced = False
             subscriptions!.declare(want, synced=on_subscriptions_synced)
         else:
