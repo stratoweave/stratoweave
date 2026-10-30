@@ -1,0 +1,578 @@
+import testing
+
+import ttt
+import yang.gdata as gdata
+import test_ttt_list_producers as producers
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id("urn:test:container-filtering", name)
+
+
+def value(n: int, field: str="value") -> gdata.Node:
+    return gdata.Container({q(field): gdata.Leaf(n)})
+
+
+def state(x: ?gdata.Node=None, y: ?gdata.Node=None) -> gdata.Container:
+    return gdata.Container({q("x"): x if x is not None else gdata.Container(),
+                            q("y"): y if y is not None else gdata.Container()})
+
+
+actor Calls():
+    var counts: dict[(str, str), int] = {}
+    var previous: dict[str, int] = {}
+
+    def record(key: str, computes: int):
+        counts[(key, "compute")] = computes - previous.get_def(key, 0)
+        counts[(key, "commit")] = counts.get_def((key, "commit"), 0) + 1
+        previous[key] = computes
+
+    def reset():
+        counts = {}
+
+    def get():
+        return dict(counts.items())
+
+
+class CountedFunction(ttt.TransformFunction):
+    calls: Calls
+    key: str
+    computes: int
+
+    def __init__(self, log_handler, key, calls):
+        ttt.TransformFunction.__init__(self, log_handler)
+        self.calls = calls
+        self.key = key
+        self.computes = 0
+
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        self.computes += 1
+        return cfg, gdata.Leaf(self.computes)
+
+    proc def on_conf(self, conf, linked, memory):
+        await async self.calls.record(self.key, self.computes)
+
+    proc def shutdown(self, memory):
+        await async self.calls.record(self.key, self.computes)
+
+
+def visits(keys: list[str], computes: int=1, deleted: ?set[str]=None) -> dict[(str, str), int]:
+    counts: dict[(str, str), int] = {}
+    for key in keys:
+        counts[(key, "compute")] = 0 if deleted is not None and key in deleted else computes
+        counts[(key, "commit")] = 1
+    return counts
+
+
+class Input(object):
+    cfg: dict[str, gdata.Node]
+    differential: bool
+
+    def __init__(self, cfg, differential=False):
+        self.cfg = cfg
+        self.differential = differential
+
+
+class Phase(object):
+    inputs: list[Input]
+    expected: gdata.Node
+    counts: ?dict[(str, str), int]
+    ok: bool
+    empty: bool
+    reads: bool
+
+    def __init__(self, inputs, expected, counts=None, ok=True, empty=False, reads=False):
+        self.inputs = inputs
+        self.expected = expected
+        self.counts = counts
+        self.ok = ok
+        self.empty = empty
+        self.reads = reads
+
+
+actor Scenario(t: testing.AsyncT, phases: list[Phase], layout: str="flat", reuse: bool=False):
+    calls = Calls()
+    def counted(path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
+        return ttt.Transform(lambda log: CountedFunction(log, path.name, calls))(path, lower)
+
+    flat = ttt.Container({q("x"): counted, q("y"): counted})
+    template = flat
+    if layout == "nested":
+        template = ttt.Container({q("group"): flat})
+    elif layout == "list_child":
+        template = ttt.Container({q("items"): ttt.List(counted, [q("name")])})
+    elif layout == "list_parent":
+        template = ttt.List(flat, [q("name")])
+    root = template(ttt.PathRoot("receiver"), None)
+    var index = 0
+    var tx = root.newtrans()
+    var session = ttt.Session("receiver", tx, None, None)
+
+    def completed(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            phase = phases[index]
+            testing.assertEqual(root.get(), phase.expected)
+            # Reads must include children with no transaction object.
+            testing.assertEqual(tx.get(), phase.expected)
+            if phase.reads:
+                testing.assertEqual(tx.get_data(None, ttt.CONTENT_CONFIG), phase.expected)
+            counts = phase.counts
+            if phase.ok and counts is not None:
+                testing.assertEqual(calls.get(), counts)
+            index += 1
+            if index == len(phases):
+                t.success()
+            else:
+                run()
+        except Exception as error:
+            t.failure(error)
+
+    def locked(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            testing.assertEqual(result.empty, phases[index].empty)
+            await async session.commit(str(index), phases[index].ok)
+            session.wait_complete(completed)
+        except Exception as error:
+            t.failure(error)
+
+    def run():
+        try:
+            if not reuse:
+                tx = root.newtrans()
+            session = ttt.Session("receiver", tx, None, None)
+            calls.reset()
+            for part in phases[index].inputs:
+                if part.differential:
+                    result = tx.configure(str(index), part.cfg, None, differential=True)
+                else:
+                    for source, cfg in part.cfg.items():
+                        session.write_config(str(index), source, cfg)
+                    result = session.apply(str(index))
+                testing.assertEqual(len(result.errors), 0)
+            session.lock(str(index), locked)
+        except Exception as error:
+            t.failure(error)
+
+    run()
+
+
+actor unchanged_children_do_not_participate(t: testing.AsyncT):
+    x = value(10)
+    initial = state(x, value(20))
+    updated = state(x, value(21))
+    Scenario(t, [
+        Phase([Input({"producer": initial})], initial, visits(["x", "y"])),
+        Phase([Input({"producer": updated})], updated, visits(["y"]), reads=True),
+        Phase([Input({"producer": updated})], updated, {}, reads=True),
+    ])
+
+
+actor equal_value_different_pointer(t: testing.AsyncT):
+    y = value(20)
+    first = state(value(10), y)
+    second = state(value(10), y)
+    Scenario(t, [
+        Phase([Input({"producer": first})], first, visits(["x", "y"])),
+        Phase([Input({"producer": second})], second, visits(["x"])),
+    ])
+
+
+actor omitted_child_keeps_skipped_sibling_nonempty(t: testing.AsyncT):
+    x = value(10)
+    initial = state(x, value(20))
+    only_x = gdata.Container({q("x"): x})
+    Scenario(t, [
+        Phase([Input({"producer": initial})], initial, visits(["x", "y"])),
+        Phase([Input({"producer": only_x})], state(x), visits(["y"], deleted={"y"})),
+        # Omitted fixed children still participate to establish global emptiness.
+        Phase([Input({"producer": only_x})], state(x), visits(["y"], computes=0)),
+        Phase([Input({"producer": gdata.Container()})], state(), visits(["x", "y"], computes=0), empty=True),
+        Phase([Input({"producer": gdata.Container()})], state(), visits(["x", "y"], computes=0), empty=True),
+    ])
+
+
+actor omitted_earlier_contribution_is_cleared(t: testing.AsyncT):
+    x = value(10)
+    only_x = gdata.Container({q("x"): x})
+    both = state(x, value(20))
+    Scenario(t, [
+        Phase([Input({"producer": only_x})], state(x), visits(["x", "y"], deleted={"y"})),
+        Phase([Input({"producer": both}), Input({"producer": only_x})], state(x), visits(["y"])),
+        Phase([Input({"producer": only_x})], state(x), visits(["y"], computes=0)),
+    ])
+
+
+actor earlier_participant_receives_restored_input(t: testing.AsyncT):
+    y = value(20)
+    initial = state(value(10), y)
+    changed = state(value(11), y)
+    Scenario(t, [
+        Phase([Input({"producer": initial})], initial, visits(["x", "y"])),
+        Phase([Input({"producer": changed}), Input({"producer": initial})], initial, visits(["x"], computes=2)),
+        Phase([Input({"producer": initial})], initial, {}),
+    ])
+
+
+actor abort_keeps_baseline(t: testing.AsyncT):
+    x = value(10)
+    initial = state(x, value(20))
+    changed = state(x, value(21))
+    Scenario(t, [
+        Phase([Input({"producer": initial})], initial, visits(["x", "y"])),
+        Phase([Input({"producer": changed})], initial, ok=False),
+        Phase([Input({"producer": initial})], initial, {}),
+    ])
+
+
+actor differential_commit_invalidates_baseline(t: testing.AsyncT):
+    x = value(10)
+    y = value(21)
+    initial = state(x, value(20))
+    fragment = gdata.Container({q("y"): y})
+    Scenario(t, [
+        Phase([Input({"producer": initial})], initial, visits(["x", "y"])),
+        Phase([Input({"producer": fragment}, differential=True)], state(x, y), visits(["y"])),
+        Phase([Input({"producer": fragment})], state(y=y), visits(["x", "y"], deleted={"x"})),
+        Phase([Input({"producer": fragment})], state(y=y), visits(["x"], computes=0)),
+    ])
+
+
+actor differential_refresh_visits_all_children(t: testing.AsyncT):
+    initial = state(value(10), value(20))
+    Scenario(t, [
+        Phase([Input({"producer": initial})], initial, visits(["x", "y"])),
+        Phase([Input({"producer": gdata.Container()}, differential=True)], initial, visits(["x", "y"])),
+        Phase([Input({"producer": initial})], initial, visits(["x", "y"])),
+        Phase([Input({"producer": initial})], initial, {}),
+    ])
+
+
+actor fixed_empty_children_stay_empty(t: testing.AsyncT):
+    empty = state()
+    y = value(20)
+    nonempty = state(empty.children[q("x")], y)
+    Scenario(t, [
+        Phase([Input({"producer": empty})], empty, visits(["x", "y"], computes=0), empty=True),
+        Phase([Input({"producer": empty})], empty, visits(["x", "y"], computes=0), empty=True),
+        Phase([Input({"producer": nonempty})], nonempty, visits(["x", "y"], deleted={"x"})),
+        Phase([Input({"producer": nonempty})], nonempty, visits(["x"], computes=0)),
+    ])
+
+
+actor ignored_data_is_not_a_nonempty_witness(t: testing.AsyncT):
+    cfg = gdata.Container({q("group"): gdata.Container({q("ignored"): gdata.Leaf(7)})})
+    expected = gdata.Container({q("group"): state()})
+    Scenario(t, [
+        Phase([Input({"producer": cfg})], expected, visits(["x", "y"], computes=0), empty=True),
+        Phase([Input({"producer": cfg})], expected, visits(["x", "y"], computes=0), empty=True),
+    ], layout="nested")
+
+
+actor nested_nonempty_container_is_skipped(t: testing.AsyncT):
+    x = value(10)
+    inner = state(x, value(20))
+    initial = gdata.Container({q("group"): inner})
+    changed = gdata.Container({q("group"): state(x, value(21))})
+    Scenario(t, [
+        Phase([Input({"producer": initial})], initial, visits(["x", "y"])),
+        Phase([Input({"producer": initial})], initial, {}, reads=True),
+        Phase([Input({"producer": changed})], changed, visits(["y"]), reads=True),
+    ], layout="nested")
+
+
+actor enclosing_list_keeps_skipped_child_then_removes_empty_row(t: testing.AsyncT):
+    x = value(10)
+    initial_row = dict(state(x, value(20)).children.items())
+    initial_row[q("name")] = gdata.Leaf("row")
+    initial = gdata.List([q("name")], by_key={"row": gdata.Container(initial_row)})
+    changed = gdata.List([q("name")], by_key={"row": gdata.Container({q("name"): gdata.Leaf("row"), q("x"): x})})
+    retained_row = dict(state(x).children.items())
+    retained_row[q("name")] = gdata.Leaf("row")
+    retained = gdata.List([q("name")], by_key={"row": gdata.Container(retained_row)})
+    clear = gdata.List([q("name")], by_key={"row": gdata.Container({q("name"): gdata.Leaf("row")})})
+    Scenario(t, [
+        Phase([Input({"producer": initial})], initial, visits(["x", "y"])),
+        Phase([Input({"producer": changed})], retained, visits(["y"], deleted={"y"})),
+        Phase([Input({"producer": clear})], gdata.List([q("name")], []), visits(["x", "y"], computes=0), empty=True),
+    ], layout="list_parent")
+
+
+actor list_child_filters_its_own_elements(t: testing.AsyncT):
+    cfg = gdata.Container({q("items"): gdata.List([q("name")], by_key={
+        "x": gdata.Container({q("name"): gdata.Leaf("x"), q("value"): gdata.Leaf(10)}),
+        "y": gdata.Container({q("name"): gdata.Leaf("y"), q("value"): gdata.Leaf(20)}),
+    })})
+    empty = gdata.Container({q("items"): gdata.List([q("name")], [])})
+    Scenario(t, [
+        Phase([Input({"producer": cfg})], cfg, visits(["x", "y"])),
+        Phase([Input({"producer": cfg})], cfg, {}),
+        Phase([Input({"producer": empty})], empty, visits(["x", "y"], computes=0), empty=True),
+        Phase([Input({"producer": empty})], empty, {}, empty=True),
+    ], layout="list_child")
+
+
+actor transaction_can_be_reused(t: testing.AsyncT):
+    x = value(10)
+    initial = state(x, value(20))
+    changed = state(x, value(21))
+    Scenario(t, [
+        Phase([Input({"producer": initial})], initial, visits(["x", "y"])),
+        Phase([Input({"producer": changed})], changed, visits(["y"]), reads=True),
+        Phase([Input({"producer": changed})], changed, {}, reads=True),
+    ], reuse=True)
+
+
+actor multiple_sources_one_child(t: testing.AsyncT):
+    a = gdata.Container({q("x"): value(10, "a")})
+    b0 = gdata.Container({q("x"): value(20, "b")})
+    b1 = gdata.Container({q("x"): value(21, "b")})
+    merged0 = state(gdata.Container({q("a"): gdata.Leaf(10), q("b"): gdata.Leaf(20)}))
+    merged1 = state(gdata.Container({q("a"): gdata.Leaf(10), q("b"): gdata.Leaf(21)}))
+    a_empty = gdata.Container({q("x"): gdata.Container()})
+    Scenario(t, [
+        Phase([Input({"a": a, "b": b0})], merged0),
+        Phase([Input({"a": a, "b": b1})], merged1, visits(["x", "y"], deleted={"y"})),
+        Phase([Input({"a": a, "b": b1})], merged1, visits(["y"], computes=0)),
+        Phase([Input({"a": a_empty, "b": b1})], state(value(21, "b"))),
+        # An empty contribution cannot witness the child's global emptiness:
+        # the other source still keeps it nonempty.
+        Phase([Input({"a": a_empty})], state(value(21, "b")), visits(["x", "y"], deleted={"y"})),
+        Phase([Input({"b": gdata.Container()})], state(), empty=True),
+    ])
+
+
+actor known_absence_does_not_establish_global_emptiness(t: testing.AsyncT):
+    cfg = state(value(10), value(20))
+    Scenario(t, [
+        Phase([Input({"empty": gdata.Container(), "keeper": cfg})], cfg),
+        # This source was already absent. Clearing it must still report that
+        # the other source keeps both children and the container nonempty.
+        Phase([Input({"empty": gdata.Container()})], cfg, visits(["x", "y"])),
+    ])
+
+
+actor shared_producer(t: testing.AsyncT):
+    a, b = producers.ordinary_steps()
+    producers.Scenario(t, producers.shared_plan(), a, b, container=True)
+
+
+actor shared_producer_reverse(t: testing.AsyncT):
+    a, b = producers.ordinary_steps()
+    producers.Scenario(t, producers.shared_plan(), a, b, reverse=True, container=True)
+
+
+actor shared_and_exclusive_sources(t: testing.AsyncT):
+    a, b = producers.ordinary_steps()
+    producers.Scenario(t, producers.overlapping_plan(), a, b, container=True)
+
+
+actor shared_and_exclusive_sources_reverse(t: testing.AsyncT):
+    a, b = producers.ordinary_steps()
+    producers.Scenario(t, producers.overlapping_plan(), a, b, reverse=True, container=True)
+
+
+actor recomputed_membership(t: testing.AsyncT):
+    a, b = producers.ordinary_steps()
+    producers.Scenario(t, producers.membership_plan(), a, b, container=True)
+
+
+actor abort_losing_transaction(t: testing.AsyncT):
+    a, b = producers.ordinary_steps()
+    producers.Scenario(t, producers.membership_plan(), a, b, abort_loser=True, container=True)
+
+
+class VisitCountOutput(ttt.TransformFunction):
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        count = 1
+        if isinstance(memory, gdata.Leaf):
+            previous = memory.val
+            if isinstance(previous, int):
+                count = previous + 1
+        name = cfg.get_str(q("name"))
+        return (gdata.Container({q(name): gdata.Container({
+            q("value"): gdata.Leaf(cfg.get_int(q("value"))), q("visits"): gdata.Leaf(count),
+        })}), gdata.Leaf(count))
+
+
+actor unchanged_child_keeps_its_output(t: testing.AsyncT):
+    sink = ttt.Sink()
+    source = ttt.Layer("source", ttt.Container({
+        q("x"): ttt.Transform(VisitCountOutput), q("y"): ttt.Transform(VisitCountOutput),
+    }), sink)
+    first = source.newsession()
+    second = source.newsession()
+    x = gdata.Container({q("name"): gdata.Leaf("x"), q("value"): gdata.Leaf(10)})
+    initial = state(x, gdata.Container({q("name"): gdata.Leaf("y"), q("value"): gdata.Leaf(20)}))
+    changed = state(x, gdata.Container({q("name"): gdata.Leaf("y"), q("value"): gdata.Leaf(21)}))
+
+    def completed(result: value):
+        try:
+            if isinstance(result, Exception):
+                raise result
+            testing.assertEqual(source.get(), changed)
+            output = sink.get()
+            testing.assertEqual(output.children[q("x")].get_int(q("visits")), 1)
+            testing.assertEqual(output.children[q("y")].get_int(q("visits")), 2)
+            testing.assertEqual(output.children[q("y")].get_int(q("value")), 21)
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    def second_locked(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            await async second.commit("second", True)
+            second.wait_complete(completed)
+        except Exception as error:
+            t.failure(error)
+
+    def first_locked(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            await async first.commit("first", True)
+            output = sink.get()
+            testing.assertEqual(output.children[q("x")].get_int(q("visits")), 1)
+            testing.assertEqual(output.children[q("y")].get_int(q("visits")), 1)
+            second.write_config("second", "producer", changed)
+            testing.assertEqual(len(second.apply("second").errors), 0)
+            second.lock("second", second_locked)
+        except Exception as error:
+            t.failure(error)
+
+    first.write_config("first", "producer", initial)
+    testing.assertEqual(len(first.apply("first").errors), 0)
+    first.lock("first", first_locked)
+
+
+actor Nodes():
+    var nodes: dict[str, ttt.Node] = {}
+
+    def add(key: str, node: ttt.Node):
+        nodes[key] = node
+
+    def get(key: str) -> ttt.Node:
+        return nodes[key]
+
+
+actor skipped_child_is_not_locked(t: testing.AsyncT):
+    nodes = Nodes()
+    def captured(path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
+        node = ttt.Transform(ttt.PassThrough)(path, lower)
+        await async nodes.add(path.name, node)
+        return node
+
+    source = ttt.Layer("receiver", ttt.Container({q("x"): captured, q("y"): captured}), None)
+    seed = source.newsession()
+    repeat = source.newsession()
+    x = value(10)
+    initial = state(x, value(20))
+    changed = state(x, value(21))
+    var blocker: ?ttt.Transaction = None
+
+    def repeated(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            await async repeat.commit("repeat", True)
+            held_tx = blocker
+            if held_tx is not None:
+                await async held_tx.commit("blocker", False)
+            testing.assertEqual(source.get(), changed)
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    def held(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            repeat.write_config("repeat", "producer", changed)
+            testing.assertEqual(len(repeat.apply("repeat").errors), 0)
+            # Complete while x's lock is still held; only y should participate.
+            repeat.lock("repeat", repeated)
+        except Exception as error:
+            t.failure(error)
+
+    def seeded(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            await async seed.commit("seed", True)
+            child = nodes.get("x").newtrans()
+            blocker = child
+            child.lock("blocker", None, held)
+        except Exception as error:
+            t.failure(error)
+
+    seed.write_config("seed", "producer", initial)
+    testing.assertEqual(len(seed.apply("seed").errors), 0)
+    seed.lock("seed", seeded)
+
+
+actor filtering_requires_source_specific_evidence(t: testing.AsyncT):
+    try:
+        child = q("x")
+        cfg = {"producer": gdata.Container({child: value(10)})}
+        candidate = {"producer": {child}}
+        state_actor = ttt.ContainerState(ttt.PathRoot("receiver"), {child})
+
+        selected, retained = state_actor.acquire("unknown", candidate, {"producer"}, cfg)
+        testing.assertEqual(selected, {child})
+        # A globally nonempty child does not identify the contributing source.
+        state_actor.release("unknown", True, {child: ttt.CfgOk()})
+        selected, retained = state_actor.acquire("other-source", candidate, {"producer"}, cfg)
+        testing.assertEqual(selected, {child})
+        state_actor.release("other-source", True, {child: ttt.CfgOk(nonempty_sources={"other"})})
+        selected, retained = state_actor.acquire("proven", candidate, {"producer"}, cfg)
+        testing.assertEqual(selected, {child})
+        state_actor.release("proven", True, {child: ttt.CfgOk(nonempty_sources={"producer"})})
+        selected, retained = state_actor.acquire("repeat", candidate, {"producer"}, cfg)
+        testing.assertEqual(selected, set())
+        testing.assertEqual(retained, {child: {"producer"}})
+        state_actor.release("repeat", False, {})
+
+        # An aborted update must preserve the previous baseline and evidence.
+        selected, retained = state_actor.acquire("after-abort", candidate, {"producer"}, cfg)
+        testing.assertEqual(selected, set())
+        state_actor.release("after-abort", False, {})
+
+        # Differential commits invalidate both the baseline and its evidence.
+        selected, retained = state_actor.acquire("diff", candidate, set(), cfg, differential=True)
+        testing.assertEqual(selected, {child})
+        state_actor.release("diff", True, {child: ttt.CfgOk(nonempty_sources={"producer"})})
+        selected, retained = state_actor.acquire("after-diff", candidate, {"producer"}, cfg)
+        testing.assertEqual(selected, {child})
+        state_actor.release("after-diff", False, {})
+        t.success()
+    except Exception as error:
+        t.failure(error)
+
+
+actor source_evidence_propagates_through_children(t: testing.AsyncT):
+    template: proc(ttt.Path, ?ttt.Layer) -> ttt.Node = ttt.Container({q("items"): ttt.List(
+        ttt.Container({q("x"): ttt.Transform(ttt.PassThrough)}), [q("name")])})
+    root = template(ttt.PathRoot("receiver"), None)
+    tx = root.newtrans()
+    def config(x: gdata.Node) -> gdata.Node:
+        row = gdata.Container({q("name"): gdata.Leaf("row"), q("x"): x})
+        return gdata.Container({q("items"): gdata.List([q("name")], by_key={"row": row})})
+
+    def locked(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            # The empty source shares the same nonempty child, but must not
+            # inherit the contributing source's evidence along the way.
+            testing.assertEqual(result.nonempty_sources, {"contributing"})
+            await async tx.commit("test", True)
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    try:
+        result = tx.configure("test", {"contributing": config(value(10)),
+                                       "empty": config(gdata.Container())}, None)
+        testing.assertEqual(len(result.errors), 0)
+        testing.assertEqual(result.nonempty_sources, {"contributing"})
+        tx.lock("test", None, locked)
+    except Exception as error:
+        t.failure(error)
