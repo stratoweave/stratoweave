@@ -22,6 +22,70 @@ def nested(cfg: gdata.Node) -> gdata.List:
     return items({"outer": gdata.Container({q("name"): gdata.Leaf("outer"), q("items"): cfg})})
 
 
+class VisitCountOutput(ttt.TransformFunction):
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        visits = 1
+        if isinstance(memory, gdata.Leaf):
+            previous = memory.val
+            if isinstance(previous, int):
+                visits = previous + 1
+        name = cfg.get_str(q("name"))
+        return (gdata.Container({q(name): gdata.Container({
+            q("value"): gdata.Leaf(cfg.get_int(q("value"))),
+            q("visits"): gdata.Leaf(visits),
+        })}), gdata.Leaf(visits))
+
+
+actor unchanged_element_keeps_its_output(t: testing.AsyncT):
+    # Each real transform emits its visit count as ordinary configuration to
+    # the sink. No instrumentation hooks or elapsed-time assertions are needed.
+    sink = ttt.Sink()
+    source = ttt.Layer("source", ttt.List(ttt.Transform(VisitCountOutput), [q("name")]), sink)
+    first = source.newsession()
+    second = source.newsession()
+    unchanged = entry("x", 10)
+    initial = items({"x": unchanged, "y": entry("y", 20)})
+    # A new full list reuses x's exact input node and changes only y.
+    updated = items({"x": unchanged, "y": entry("y", 21)})
+
+    def second_locked(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            await async second.commit("second", True)
+            testing.assertEqual(source.get(), updated)
+            output = sink.get()
+            testing.assertEqual(output.children[q("x")].get_int(q("visits")), 1,
+                                "unchanged x must not participate in the second transaction")
+            testing.assertEqual(output.children[q("y")].get_int(q("visits")), 2,
+                                "changed y must participate in both transactions")
+            testing.assertEqual(output, gdata.Container({
+                q("x"): gdata.Container({q("value"): gdata.Leaf(10), q("visits"): gdata.Leaf(1)}),
+                q("y"): gdata.Container({q("value"): gdata.Leaf(21), q("visits"): gdata.Leaf(2)}),
+            }))
+            t.success()
+        except Exception as error:
+            t.failure(error)
+
+    def first_locked(result: ttt.CfgResult):
+        try:
+            testing.assertEqual(len(result.errors), 0)
+            await async first.commit("first", True)
+            testing.assertEqual(sink.get(), gdata.Container({
+                q("x"): gdata.Container({q("value"): gdata.Leaf(10), q("visits"): gdata.Leaf(1)}),
+                q("y"): gdata.Container({q("value"): gdata.Leaf(20), q("visits"): gdata.Leaf(1)}),
+            }))
+            second.write_config("second", "producer", updated)
+            # Session.apply sends buffered config as a non-differential input.
+            testing.assertEqual(len(second.apply("second").errors), 0)
+            second.lock("second", second_locked)
+        except Exception as error:
+            t.failure(error)
+
+    first.write_config("first", "producer", initial)
+    testing.assertEqual(len(first.apply("first").errors), 0)
+    first.lock("first", first_locked)
+
+
 actor Calls():
     var counts: dict[(str, str), int] = {}
     var previous: dict[str, int] = {}
