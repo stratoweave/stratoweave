@@ -117,6 +117,17 @@
 - Fixed campaigns that never ended after a window of a schedule opened again
   while its earlier window still held released devices. The waiting devices
   were placed in both windows and counted twice. [#722]
+- A campaign's plan is what its run does: the controller that releases the
+  devices makes the plan by running ahead at the expected upgrade durations.
+  Before, a campaign could plan without alarms and alarm as soon as it ran,
+  most of all in fleets that mix fast and slow devices. A window takes the
+  devices that the ramp starts before it closes, each device keeps the
+  window its plan gives it, and a device that misses its window moves to the
+  next one of its schedule. The controller goes above `target-concurrency`
+  only as far as those windows or the deadline need, up to
+  `max-concurrency`, which now counts the devices of the whole campaign. The
+  alarms name the devices. A window that opened on an earlier day and is
+  still open now counts. [#730]
 - The top always starts ten flotillas and places each device on `flotilla-N`
   by a hash of its name. Removed `/fleet/node` and `/fleet/device/shard`.
   Devices without a shard, which the top managed itself, are no longer
