@@ -6,11 +6,18 @@
 - Transform actors can write to the layer below at any time, each write in
   its own transaction. Enable it with `sw:direct-output` under
   `sw:transform`, and keep the transform function mute, or the output is
-  repeated. `fleetmgr.cfs.UpgradeCampaignTransform` is an example. [#698]
+  repeated. `fleetmgr.cfs.UpgradeCampaignTransform` is an example. A write
+  becomes the transform's output, which is persisted and passed to the
+  transform function as `prev_output`. [#698] [#731]
 - A transform's output replaces the configuration it wrote before, instead of
   being applied as a diff. This fixes source deletion, concurrent edits,
   restored list membership and subscriptions on newly committed list
   elements. [#680]
+- A full configuration replacement, like a transform's output, skips list
+  elements and container children that are the same instance as before.
+  They are not configured, locked or committed again and their transforms
+  don't run. Before, every element participated, even when only one changed.
+  [#731]
 - A session commit reports `done` and `complete` only after every transform
   below it has committed. Before, a link subscriber could commit without its
   linked input. [#685]
@@ -278,6 +285,7 @@ next. Give it a spin. We’d love to hear what you think.
 [#723]: https://github.com/stratoweave/stratoweave/pull/723
 [#724]: https://github.com/stratoweave/stratoweave/pull/724
 [#726]: https://github.com/stratoweave/stratoweave/pull/726
+[#731]: https://github.com/stratoweave/stratoweave/pull/731
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
