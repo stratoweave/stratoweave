@@ -4,20 +4,36 @@ import testing
 
 import fleet_ctl
 from fleet_ctl import Controller
+import fleet_sched_sim as sim
+
+HOUR = 3600
+DAY = 86400
 
 
-def window(start: int, end: int, n: int) -> list[(str, int, int, list[(str, int, int)])]:
-    """One window with n devices d0, d1, ... placed at its start, 600 s each."""
-    return [("w", start, end, [("d{i}", start, 600) for i in range(n)])]
+def devices(prefix: str, n: int, est: int, schedule: str) -> list[(str, int, str)]:
+    """n devices prefix0, prefix1, ... of est seconds on schedule."""
+    return [("{prefix}{i}", est, schedule) for i in range(n)]
 
 
-def controller(layout: list[(str, int, int, list[(str, int, int)])],
-               target: int, maxc: int) -> Controller:
-    """A controller at the start of a run, on a 600 s estimate."""
+def daily(schedule: str, start: int, length: int, days: int) -> list[(str, int, int)]:
+    """A window of length seconds at start every day for days days."""
+    return [(schedule, d * DAY + start, d * DAY + start + length) for d in range(days)]
+
+
+def controller(windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
+               maxc: int, must_place: bool=False, debounce: int=0,
+               estimate: int=600) -> Controller:
+    """A controller at the start of a run."""
     c = Controller()
-    c.start(600)
-    c.configure(layout, target, maxc)
+    c.configure(windows, devs, target, maxc, must_place, debounce, estimate)
+    c.start()
     return c
+
+
+def open_window(n: int, target: int, maxc: int, debounce: int=0) -> Controller:
+    """n devices d0, d1, ... of 600 s in a window that never closes."""
+    return controller([("w", 0, fleet_ctl.OPEN_END)], devices("d", n, 600, "w"), target, maxc,
+                      debounce=debounce)
 
 
 def _test_final_statuses():
@@ -36,116 +52,401 @@ def _test_final_statuses():
 
 
 def _test_first_step_starts_one_device():
-    """The ramp starts at one device, and in a window that never closes
-    only a report can change what starts."""
-    c = controller(window(0, fleet_ctl.OPEN_END, 10), 4, 8)
-    s = c.step(0)
+    """The ramp starts at one device, and the next decision is one
+    debounce after its upgrade is expected to end."""
+    c = open_window(10, 4, 8, 5)
+    s = c.decide(0)
     testing.assertEqual(s.started, ["d0"])
-    testing.assertEqual(s.wake, -1)
+    testing.assertEqual(s.wake, 605)
     testing.assertEqual(s.finished, False)
 
 
 def _test_ramp_doubles_as_devices_finish():
     """Each time the devices done reach the rung target, the rung doubles
-    up to the target. At the target the ramp stops binding, and the
-    target holds."""
-    c = controller(window(0, fleet_ctl.OPEN_END, 10), 4, 8)
-    testing.assertEqual(c.step(0).started, ["d0"])
-    c.report("d0", "succeeded")
-    testing.assertEqual(c.step(600).started, ["d1", "d2"])
+    up to the concurrency."""
+    c = open_window(10, 4, 8)
+    testing.assertEqual(c.decide(0).started, ["d0"])
+    c.report("d0", "succeeded", 600)
+    testing.assertEqual(c.decide(600).started, ["d1", "d2"])
     testing.assertEqual((c.rung, c.rung_target), (2, 3))
-    c.report("d1", "succeeded")
-    c.report("d2", "failed")
-    testing.assertEqual(c.step(1200).started, ["d3", "d4", "d5", "d6"])
+    c.report("d1", "succeeded", 1200)
+    c.report("d2", "failed", 1200)
+    testing.assertEqual(c.decide(1200).started, ["d3", "d4", "d5", "d6"])
     testing.assertEqual((c.rung, c.rung_target), (4, 7))
 
 
-def _test_done_at_the_step_after_the_report():
-    """A device is done at the step that sees its final report, and the
-    time from its release to that step goes into the observed duration."""
-    c = controller(window(0, fleet_ctl.OPEN_END, 2), 1, 1)
-    c.step(0)
-    c.report("d0", "succeeded")
-    c.step(700)
-    testing.assertEqual(c.done_at, {"d0": 700})
-    testing.assertEqual(c.observed_s, (600 * 3 + 700) // 4)
+def _test_done_at_its_report():
+    """A device is done at the time of its final report, not at the
+    decision that sees it, so the time it waited for the decision is not
+    upgrade time. A later final report does not move the end."""
+    c = open_window(2, 1, 1)
+    c.decide(0)
+    c.report("d0", "succeeded", 600)
+    c.report("d0", "succeeded", 650)
+    c.decide(700)
+    testing.assertEqual(c.done_at, {"d0": 600})
+    testing.assertEqual(c.observed_s, 600)
+
+
+def _test_final_report_from_before_the_release():
+    """A device that reported a final status before it was released is
+    done at the decision that sees it after the release."""
+    c = open_window(2, 1, 1)
+    c.report("d0", "up-to-date", 0)
+    c.decide(10)
+    c.decide(40)
+    testing.assertEqual(c.done_at, {"d0": 40})
+    testing.assertEqual(c.observed_s, (600 * 3 + 30) // 4)
 
 
 def _test_lost_or_later_status_is_not_done():
     """A device whose report was lost, or whose later report is not
     final, is not done, and keeps its slot."""
-    c = controller(window(0, fleet_ctl.OPEN_END, 3), 1, 1)
-    c.step(0)
-    c.report("d0", "succeeded")
+    c = open_window(3, 1, 1)
+    c.decide(0)
+    c.report("d0", "succeeded", 600)
     c.lost("d0")
-    s = c.step(600)
+    testing.assertEqual(c.decide(600).started, [])
     testing.assertEqual(c.done_at, {})
-    testing.assertEqual(s.started, [])
-    c.report("d0", "succeeded")
-    c.report("d0", "in-progress")
-    c.step(1200)
+    c.report("d0", "succeeded", 1100)
+    c.report("d0", "in-progress", 1150)
+    c.decide(1200)
     testing.assertEqual(c.done_at, {})
 
 
 def _test_waits_for_the_window_to_open():
     """Before its window opens nothing starts, and the next decision is at
     the opening."""
-    c = controller(window(1000, fleet_ctl.OPEN_END, 3), 1, 1)
-    s = c.step(0)
+    c = controller([("w", 1000, fleet_ctl.OPEN_END)], devices("d", 3, 600, "w"), 1, 1)
+    s = c.decide(0)
     testing.assertEqual(s.started, [])
     testing.assertEqual(s.wake, 1000)
-    testing.assertEqual(c.step(1000).started, ["d0"])
+    testing.assertEqual(c.decide(1000).started, ["d0"])
 
 
-def _test_wakes_when_the_window_stops_being_makeable():
-    """With 9 devices waiting at max 2, five rounds of 600 s, the last
-    with its 1.2x launch cutoff, need 3120 s: the window that closes at
-    10000 stops being makeable at 6881."""
-    c = controller(window(0, 10000, 10), 1, 2)
-    s = c.step(0)
-    testing.assertEqual(s.started, ["d0"])
-    testing.assertEqual(s.wake, 6881)
-    testing.assertEqual(c.alarms, [])
+def _test_a_device_waits_for_a_window_it_fits():
+    """Two 1000 s windows a day apart, one device at a time. d0 starts at
+    the first opening. At 600 the 400 s left are too short for d1's 600 s
+    and a fifth to spare, so it starts at the second opening, and waits in
+    the first window no more. The controller decides again when the first
+    window closes, and then at the second opening."""
+    wins = daily("w", 0, 1000, 2)
+    c = controller(wins, devices("d", 2, 600, "w"), 1, 1)
+    testing.assertEqual(c.decide(0).started, ["d0"])
+    c.report("d0", "succeeded", 600)
+    s = c.decide(600)
+    testing.assertEqual(s.started, [])
+    testing.assertEqual(s.wake, 1000)
+    testing.assertEqual(c.decide(1000).wake, DAY)
+    testing.assertEqual(c.decide(DAY).started, ["d1"])
+    testing.assertEqual(c.released_in, {"d0": wins[0], "d1": wins[1]})
+    c.report("d1", "succeeded", DAY + 600)
+    testing.assertEqual(c.decide(DAY + 600).finished, True)
 
 
-def _test_alarm_once_when_the_window_is_too_short():
+def plan_is_run(windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
+                maxc: int, must_place: bool, estimate: int) -> None:
+    """Run on the expected durations, the controller starts every device
+    in the window and at the time its first plan said."""
+    c = controller(windows, devs, target, maxc, must_place, 1, estimate)
+    p = c.plan(0)
+    sim.drive(c, 0, {}, 30 * DAY)
+    testing.assertEqual(sim.started(c), sim.planned(c, p))
+
+
+def _test_the_plan_is_the_run_uniform():
+    """100 devices of 10 min in a 1 h window every day, 10 at once."""
+    plan_is_run(daily("day", 0, HOUR, 9), devices("d", 100, 600, "day"), 10, 10, False, 600)
+
+
+def _test_the_plan_is_the_run_mixed():
+    """10 devices of 395 s and 100 of 4 s on one schedule, one at a time."""
+    devs = devices("real", 10, 395, "night") + devices("sim", 100, 4, "night")
+    plan_is_run(daily("night", 2 * HOUR, 1800, 9), devs, 1, 1, False, 40)
+
+
+def _test_the_plan_is_the_run_two_schedules():
+    """Two schedules of five 8 s devices each."""
+    devs = devices("n", 5, 8, "night") + devices("w", 5, 8, "weekend")
+    plan_is_run([("night", 0, HOUR), ("weekend", 2 * HOUR, 3 * HOUR)], devs, 8, 16, False, 8)
+
+
+def _test_the_plan_is_the_run_deadline():
+    """100 devices of 10 min with a deadline that raises the
+    concurrency."""
+    plan_is_run(daily("day", 0, HOUR, 2), devices("d", 100, 600, "day"), 10, 50, True, 600)
+
+
+def _test_uniform_fleet_fills_each_window_to_its_ramp():
+    """100 devices of 10 min, a 1 h window every day, 10 at once. The
+    first window ramps 1, 2, 4, 8, 10 and has no time for a sixth round:
+    it takes 25. The ramp belongs to the campaign, so the next window
+    runs five rounds of 10 and takes 50, and the third the last 25."""
+    c = controller(daily("day", 0, HOUR, 9), devices("d", 100, 600, "day"), 10, 10,
+                   debounce=1)
+    sizes = [len(w.3) for w in c.layout(c.plan(0))]
+    testing.assertEqual(sizes, [25, 50, 25])
+
+
+def _test_deadline_raises_the_concurrency():
+    """The same fleet with a deadline at the end of the second window. At
+    14 at once the two windows take 29 and 70, one short; at 15 they take
+    30 and 70."""
+    c = controller(daily("day", 0, HOUR, 2), devices("d", 100, 600, "day"), 10, 50,
+                   True, 1)
+    p = c.plan(0)
+    testing.assertEqual(p.c, 15)
+    testing.assertEqual([len(w.3) for w in c.layout(p)], [30, 70])
+    testing.assertEqual(p.alarms, [])
+
+
+def _test_device_without_a_window_keeps_the_concurrency():
+    """A device whose schedule gives no window cannot start at any
+    concurrency, so it does not raise the concurrency; it is the alarm."""
+    devs = devices("d", 99, 600, "day") + [("x", 600, "never")]
+    c = controller(daily("day", 0, HOUR, 3), devs, 10, 50, True, 1)
+    p = c.plan(0)
+    testing.assertEqual(p.c, 10)
+    testing.assertEqual(p.alarms, ["1 device(s) cannot start before the deadline: x"])
+
+
+def _test_a_device_that_misses_its_window_gets_a_later_one():
+    """Three devices of 600 s are promised a 3000 s window at one at a
+    time. d0 takes 2000 s, so the controller expects 950 s upgrades and
+    the 1000 s left are too short for d1. When the window closes d1 and
+    d2 are promised the next day's window, where they start, d2 when d1
+    reports after its 600 s."""
+    wins = daily("w", 0, 3000, 2)
+    c = controller(wins, devices("d", 3, 600, "w"), 1, 1)
+    p = c.plan(0)
+    testing.assertEqual([len(w.3) for w in c.layout(p)], [3])
+    sim.drive(c, 0, {"d0": 2000}, 2 * DAY)
+    testing.assertEqual(sim.started(c), {"d0": (wins[0], 0), "d1": (wins[1], DAY),
+                                         "d2": (wins[1], DAY + 600)})
+
+
+def _test_promises_raise_the_concurrency_when_upgrades_run_slow():
+    """50 devices of 600 s are promised a 1 h window at 10 at once, the ramp
+    already at 10. The upgrades take 900 s, so after the first round 10 at
+    once can no longer keep the promises, and the controller goes above
+    10 to keep them."""
+    c = Controller()
+    c.configure([("w", 0, HOUR)], devices("d", 50, 600, "w"), 10, 20, False, 0, 600)
+    c.start(10)
+    c.plan(0)
+    durations = {"d{i}": 900 for i in range(50)}
+    sim.drive(c, 0, durations, HOUR)
+    testing.assertEqual(len(c.released), 50)
+    testing.assertTrue(c.c > 10, "the concurrency must rise above the target")
+
+
+def _test_alarm_names_the_devices():
     """A window that one round fills cannot take 10 devices at max 1: the
-    step raises the alarm for the 9 that do not fit, and later steps do
-    not raise it again. The count is over the devices waiting before the
-    step, so the device the step starts is in it."""
-    c = controller(window(0, 1000, 10), 1, 1)
-    s = c.step(0)
-    testing.assertEqual(s.started, ["d0"])
-    testing.assertEqual(s.wake, -1)
-    testing.assertEqual(c.alarms, ["9 device(s) cannot make their window even at "
-                                   + "max concurrency - deferral projected"])
-    c.step(10)
-    testing.assertEqual(len(c.alarms), 1)
+    plan says which 9 do not fit."""
+    c = controller([("w", 0, 1000)], devices("d", 10, 600, "w"), 1, 1, True)
+    testing.assertEqual(c.plan(0).alarms,
+                        ["9 device(s) cannot start before the deadline even at "
+                         + "max-concurrency 1: d1, d2, d3, d4, d5 and 4 more"])
+
+
+def _test_a_plan_is_a_fixed_point():
+    """Windows [100, 500) and [1500, 1650), devices of 150, 150, 100 and
+    150 s, one at a time and up to three, every device before the
+    deadline. Run without promises, d2 takes the first window's last slot
+    and d3 fits nowhere. The plan promises d2 the second window, after
+    which two at once start every device. The plan runs again until its
+    promises stop changing, so it gives that at once, and again when
+    asked again."""
+    devs = [("d0", 150, "w"), ("d1", 150, "w"), ("d2", 100, "w"), ("d3", 150, "w")]
+    c = controller([("w", 100, 500), ("w", 1500, 1650)], devs, 1, 3, True)
+    p = c.plan(0)
+    testing.assertEqual((p.c, p.alarms), (2, []))
+    q = c.plan(0)
+    testing.assertEqual((q.c, q.starts), (p.c, p.starts))
+
+
+def _test_a_late_upgrade_keeps_the_end_it_was_given():
+    """d1 is expected to end at 201. At 202 its report could still count,
+    so it is not late. At 227 it is: it is expected to take one more
+    upgrade, to 327. A decision with nothing new keeps that end, so the
+    plans before and after it agree."""
+    c = controller([("w", 0, 500)], devices("d", 6, 100, "w"), 2, 4, debounce=1,
+                   estimate=100)
+    c.decide(0)
+    c.report("d0", "succeeded", 100)
+    c.decide(101)
+    c.report("d2", "succeeded", 201)
+    c.decide(202)
+    testing.assertEqual(c.due["d1"], 201)
+    p = c.decide(227).plan
+    testing.assertEqual(c.due["d1"], 327)
+    q = c.plan(260)
+    testing.assertEqual((q.c, q.starts), (p.c, p.starts))
+
+
+def _test_a_missed_promise_moves_to_an_open_window():
+    """Windows [0, 300) and [100, open) of one schedule, one device at a
+    time. The plan promises x the first window and b the second. a takes
+    250 s, x no longer fits the first window, and when it closes x is
+    promised the second, where it starts when b ends."""
+    wins = [("s", 0, 300), ("s", 100, fleet_ctl.OPEN_END)]
+    devs = [("a", 100, "s"), ("x", 100, "s"), ("b", 100, "s")]
+    c = controller(wins, devs, 1, 1, estimate=100)
+    p = c.plan(0)
+    testing.assertEqual(sim.planned(c, p), {"a": (wins[0], 0), "x": (wins[0], 100),
+                                            "b": (wins[1], 200)})
+    sim.drive(c, 0, {"a": 250}, 1000)
+    testing.assertEqual(sim.started(c), {"a": (wins[0], 0), "b": (wins[1], 250),
+                                         "x": (wins[1], 350)})
+
+
+def _test_a_device_that_fits_again_starts():
+    """x of 800 s does not fit at 100 with 900 s left. b ends after 10 s,
+    the observed pace falls, and x fits at 110."""
+    devs = [("a", 100, "w"), ("b", 100, "w"), ("x", 800, "w")]
+    c = controller([("w", 0, 1000)], devs, 2, 2, True, estimate=100)
+    c.decide(0)
+    c.report("a", "succeeded", 100)
+    testing.assertEqual(c.decide(100).started, ["b"])
+    c.report("b", "succeeded", 110)
+    testing.assertEqual(c.decide(110).started, ["x"])
+
+
+def _test_a_plan_keeps_the_window_a_promise_moves_to():
+    """a runs late, so x misses the first window and its promise moves to
+    the second, behind y. One at a time, y fills the second window and x
+    moves on to the third; two at once start both in the second, so the
+    plan runs at two as soon as a is late, and the run starts x in the
+    second window."""
+    wins = [("s", 0, 300), ("s", 1000, 1300), ("s", 2000, 2300)]
+    devs = [("a", 100, "s"), ("y", 200, "s"), ("x", 100, "s")]
+    c = controller(wins, devs, 1, 2, estimate=100)
+    c.decide(0)
+    p = c.decide(101).plan
+    testing.assertEqual(p.c, 2)
+    testing.assertEqual(sim.planned(c, p).get("x"), (wins[1], 1000))
+    c.report("a", "succeeded", 201)
+    sim.drive(c, 201, {}, 2000)
+    testing.assertEqual(sim.started(c).get("x"), (wins[1], 1000))
+
+
+def _test_a_pending_report_wakes_the_controller():
+    """d0 reported up-to-date before its release, so it is done at the next
+    decision, which the controller asks for a second later."""
+    c = open_window(2, 1, 1)
+    c.report("d0", "up-to-date", 0)
+    s = c.decide(10)
+    testing.assertEqual((s.started, s.wake), (["d0"], 11))
+    testing.assertEqual(sim.planned(c, s.plan).get("d1"), (("w", 0, fleet_ctl.OPEN_END), 11))
+
+
+def _test_reconfigure_keeps_the_order_of_a_moved_promise():
+    """x is promised the first window ahead of y, and misses it. The
+    campaign actor configures the controller again when the window has
+    closed, without that window; x still goes first in the next one."""
+    wins = [("s", 0, 25), ("s", 60, fleet_ctl.OPEN_END)]
+    devs = [("a", 10, "s"), ("x", 10, "s"), ("y", 10, "s")]
+    c = controller(wins, devs, 1, 1, estimate=10)
+    sim.drive(c, 0, {"a": 20}, 24)
+    c.configure(wins[1:], devs, 1, 1, False, 0, 10)
+    p = c.plan(25)
+    testing.assertEqual(sim.planned(c, p), {"x": (wins[1], 60), "y": (wins[1], 72)})
+
+
+def _test_a_promise_ends_when_the_device_changes_schedule():
+    """d1 is promised the window of schedule a. Bound to schedule b, it
+    starts in b's window."""
+    wins = [("a", 0, 3000), ("b", 4000, 5000)]
+    c = controller(wins, [("d0", 600, "a"), ("d1", 600, "a")], 1, 1)
+    c.decide(0)
+    testing.assertEqual(c.promised.get("d1"), wins[0])
+    c.configure(wins, [("d0", 600, "a"), ("d1", 600, "b")], 1, 1, False, 0, 600)
+    p = c.plan(10)
+    testing.assertEqual(sim.planned(c, p), {"d1": (wins[1], 4000)})
+
+
+def _test_a_removed_device_does_not_count_for_the_ramp():
+    """d0 and d1 are in flight at a ramp of two when d0 leaves the
+    campaign. Its report does not count towards the ramp, so the run
+    starts the rest where the plan said."""
+    c = open_window(6, 4, 4)
+    c.start(2)
+    c.decide(0)
+    c.configure([("w", 0, fleet_ctl.OPEN_END)], devices("d", 6, 600, "w")[1:], 4, 4,
+                False, 0, 600)
+    p = c.plan(10)
+    sim.drive(c, 10, {}, DAY, [(600, "d0"), (600, "d1")])
+    starts = sim.started(c)
+    testing.assertEqual({k: starts[k] for k in sim.planned(c, p).keys()}, sim.planned(c, p))
+
+
+def _test_a_removed_device_frees_its_slot():
+    """One device at a time: d0 is in flight. Removed from the campaign,
+    it holds no slot, and d1 starts."""
+    c = open_window(2, 1, 1)
+    testing.assertEqual(c.decide(0).started, ["d0"])
+    c.configure([("w", 0, fleet_ctl.OPEN_END)], [("d1", 600, "w")], 1, 1, False, 0, 600)
+    testing.assertEqual(c.decide(10).started, ["d1"])
+
+
+def _test_concurrency_counts_the_whole_campaign():
+    """Two schedules whose windows overlap share the concurrency: at two
+    at once, two devices start in all."""
+    wins = [("a", 0, fleet_ctl.OPEN_END), ("b", 0, fleet_ctl.OPEN_END)]
+    devs = devices("a", 3, 600, "a") + devices("b", 3, 600, "b")
+    c = controller(wins, devs, 2, 2)
+    c.start(2)
+    testing.assertEqual(c.decide(0).started, ["a0", "a1"])
+
+
+def _test_new_limits_start_the_concurrency_over():
+    """During a run the concurrency rises to keep promises. New limits
+    start it over at the new target."""
+    c = Controller()
+    c.configure([("w", 0, HOUR)], devices("d", 50, 600, "w"), 10, 20, False, 0, 600)
+    c.start(10)
+    c.plan(0)
+    sim.drive(c, 0, {"d{i}": 900 for i in range(50)}, 1000)
+    testing.assertTrue(c.c > 10, "the concurrency must rise above the target")
+    c.configure([("w", 0, HOUR)], devices("d", 50, 600, "w"), 5, 20, False, 0, 600)
+    testing.assertEqual(c.c, 5)
 
 
 def _test_finished_when_every_device_is_done():
-    """The run is finished at the step that sees the last device done."""
-    c = controller(window(0, fleet_ctl.OPEN_END, 2), 2, 2)
-    c.step(0)
-    c.report("d0", "succeeded")
-    s = c.step(600)
+    """The run is finished at the decision that sees the last device
+    done."""
+    c = open_window(2, 2, 2)
+    c.decide(0)
+    c.report("d0", "succeeded", 600)
+    s = c.decide(600)
     testing.assertEqual(s.started, ["d1"])
     testing.assertEqual(s.finished, False)
-    c.report("d1", "succeeded")
-    testing.assertEqual(c.step(1200).finished, True)
+    c.report("d1", "succeeded", 1200)
+    testing.assertEqual(c.decide(1200).finished, True)
 
 
 def _test_start_begins_a_new_run():
     """start() forgets the released devices and the ramp, and the next
-    step starts from one device again."""
-    c = controller(window(0, fleet_ctl.OPEN_END, 4), 2, 2)
-    c.step(0)
-    c.report("d0", "succeeded")
-    c.step(600)
-    c.start(600)
+    decision starts from one device again."""
+    c = open_window(4, 2, 2)
+    c.decide(0)
+    c.report("d0", "succeeded", 600)
+    c.decide(600)
+    c.start()
     testing.assertEqual(c.released, set())
     testing.assertEqual((c.rung, c.rung_target), (1, 1))
-    c.report("d0", "in-progress")
-    c.report("d1", "in-progress")
-    c.report("d2", "in-progress")
-    testing.assertEqual(c.step(1200).started, ["d0"])
+    c.report("d0", "in-progress", 700)
+    c.report("d1", "in-progress", 700)
+    c.report("d2", "in-progress", 700)
+    testing.assertEqual(c.decide(1200).started, ["d0"])
+
+
+def _test_observed_at_the_campaign_scale():
+    """A device estimated at 30 s that takes 60 s took twice its estimate:
+    on a campaign estimate of 120 s it counts as 240 s."""
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devices("d", 2, 30, "w"), 1, 1,
+                   estimate=120)
+    c.decide(0)
+    c.report("d0", "succeeded", 60)
+    c.decide(60)
+    testing.assertEqual(c.observed_s, (120 * 3 + 240) // 4)

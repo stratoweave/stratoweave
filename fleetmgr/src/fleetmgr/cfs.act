@@ -7,7 +7,6 @@ import stratoweave.adapters.software_iosxe as sw_iosxe
 import stratoweave.adapters.software_mock as sw_mock
 import stratoweave.fleet_ctl as fctl
 import stratoweave.fleet_sched as fs
-import stratoweave.fleet_sched_sim as fsim
 
 import fleetmgr.layers.base_0 as base
 import fleetmgr.supervisor as supervisor
@@ -145,14 +144,13 @@ def estimated_duration(i: y_0.software__software__upgrade_campaign_entry,
 # Unix epoch, far beyond any campaign.
 OPEN_END = 4102444800
 
-def campaign_debounce_s(devices: int) -> float:
-    # Keep demos quick while limiting full campaign publishes at scale.
-    debounce = float(devices) / 1000.0
-    if debounce < 0.1:
-        return 0.1
-    if debounce > 30.0:
-        return 30.0
-    return debounce
+def campaign_debounce_s(devices: int) -> int:
+    """The debounce between a report and the decision it leads to, in
+    whole seconds: a second per thousand devices, at least one and up to
+    30. Whole seconds let the controller's plan decide at the very second
+    the campaign actor does, with the reports of a second in one decision.
+    Large campaigns limit how often the whole campaign is published."""
+    return fs.imax(1, fs.imin(devices // 1000, 30))
 
 
 _DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
@@ -161,12 +159,17 @@ _DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 # covers a weekly rule with margin; longer recurrences come later.
 HORIZON_DAYS = 9
 
+# How long a running campaign waits at most before it decides again, so
+# that the windows beyond the horizon come in.
+HORIZON_REFRESH = 86400
+
 
 def occurrences(sched: y_0.maintenance__schedules__schedule_entry, now: int) -> list[(int, int)]:
     """The schedule's absolute window occurrences over the horizon, as
     seconds since the Unix epoch: each rule opens at its local time of
     day on its listed weekdays, every day when none are listed. A window
-    already open now is included; a closed one is not."""
+    already open now is included, also one that opened on an earlier day
+    within the horizon; a closed one is not."""
     out: list[(int, int)] = []
     off = int(sched.utc_offset) * 60
     local_now = now + off
@@ -178,7 +181,9 @@ def occurrences(sched: y_0.maintenance__schedules__schedule_entry, now: int) -> 
         for d in w.day:
             if d in _DAYS:
                 days.append(_DAYS[d])
-        for k in range(HORIZON_DAYS):
+        # A window that opened days ago can still be open; the horizon
+        # bounds how far back too.
+        for k in range(fs.imax(-(dur // 86400) - 1, -HORIZON_DAYS), HORIZON_DAYS):
             local_day = day0 + k * 86400
             if len(days) > 0:
                 # 1970-01-01 was a Thursday; monday is day zero here.
@@ -192,83 +197,41 @@ def occurrences(sched: y_0.maintenance__schedules__schedule_entry, now: int) -> 
     return sorted(out)
 
 
-def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
-                  inventory: y_0.root, now: int,
-                  released_in: dict[str, (str, int, int)] = {},
-                  released_at: dict[str, int] = {},
-                  done_at: dict[str, int] = {}) -> (list[(str, int, int, list[(str, int, int)])], list[str]):
-    """Plan the campaign into its windows at the concurrency the deadline
-    demands.
+def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_campaign_entry,
+                       inventory: y_0.root, now: int) -> None:
+    """Give the campaign's controller the windows, the devices and the
+    limits that the campaign and the inventory give at time now.
 
-    A campaign without windows gets one synthetic window that opens at
-    launch and never closes, and the controller paces it like any other.
-    The deadline cuts off the window supply - the synthetic window
-    included - and the concurrency it needs is computed backwards from
-    what remains, raised to target-concurrency and capped at
-    max-concurrency, with alarms rather than overruns.
-
-    Devices the controller has released stay in the window they were
-    released in (released_in: schedule, start, end), at their real
-    start, also when that window has closed or its schedule changed
-    since. Only the others are placed and simulated: devices in flight
-    hold their slots until they are expected to finish, done ones take
-    no part.
-
-    Returns the materialized layout: one (name, start, end, devices)
-    entry per window, each device with its start, real or estimated,
-    and its estimated duration, times as seconds since the Unix epoch,
-    plus the placement alarms. Devices that do not fit are absent from
-    the layout and present in the alarms.
-
-    The transform actuates from the layout; the companion actor publishes
-    the same layout as the plan, so both views come from one computation.
-    """
-    devices = []
-    est_of: dict[str, int] = {}
-    held: list[str] = []
-    for member in i.device:
-        dev = inventory.fleet.device.get(member.name)
-        est = device_estimate(dev)
-        est_of[member.name] = est
-        if member.name in released_in:
-            held.append(member.name)
-            continue
-        binding: ?str = None
-        if dev is not None:
-            binding = dev.schedule
-        devices.append(fs.DeviceIn(member.name, "cpe", binding, [], [], est, True))
-    estimate = estimated_duration(i, inventory)
-    if len(est_of) == 0:
-        return ([], [])
-    n = len(devices)
-    debounce = int(campaign_debounce_s(len(est_of)))
-    sel = [d.name for d in devices]
-    alarms: list[str] = []
-
+    A member device goes in the windows of the schedule it is bound to,
+    or else of the campaign's default schedule. A campaign with no
+    default and no bound members gets one synthetic window that opens at
+    launch and never closes. The deadline cuts off the windows - the
+    synthetic one included - and every device must start before it when
+    the planner sees every window before it."""
     deadline = 0
     dl = i.deadline
     if dl is not None:
         deadline = int(dl)
+    default: ?str = i.default_schedule
 
-    target = int(i.target_concurrency)
-    cap = imax(target, int(i.max_concurrency))
-
-    default_scheds: list[str] = []
-    ds = i.default_schedule
-    if ds is not None:
-        default_scheds = [ds]
-
+    members = sorted([member.name for member in i.device])
+    schedule_of: dict[str, ?str] = {}
     referenced: list[str] = []
-    for d in devices:
-        b = d.schedule
-        if b is not None:
-            if b not in referenced:
-                referenced.append(b)
-    for name in default_scheds:
-        if name not in referenced:
-            referenced.append(name)
+    for name in members:
+        binding: ?str = None
+        dev = inventory.fleet.device.get(name)
+        if dev is not None:
+            binding = dev.schedule
+        if binding is None:
+            binding = default
+        schedule_of[name] = binding
+        if binding is not None and binding not in referenced:
+            referenced.append(binding)
 
-    wins: list[(str, int, int)] = []
+    windows: list[(str, int, int)] = []
+    synthetic = len(referenced) == 0
+    if synthetic:
+        windows.append(("default", 0, deadline if deadline > 0 else OPEN_END))
     for sname in referenced:
         sched = inventory.schedules.schedule.get(sname)
         if sched is not None:
@@ -281,113 +244,20 @@ def plan_campaign(i: y_0.software__software__upgrade_campaign_entry,
                         continue
                     if wend > deadline:
                         wend = deadline
-                wins.append((sname, wstart, wend))
+                windows.append((sname, wstart, wend))
 
-    if len(wins) == 0:
-        # No windows: one synthetic window that opens at launch and never
-        # closes, or closes at the deadline like any other window.
-        wins.append(("default", 0, deadline if deadline > 0 else OPEN_END))
-        default_scheds = ["default"]
+    devices: list[(str, int, str)] = []
+    for name in members:
+        sname = "default"
+        if not synthetic:
+            b = schedule_of[name]
+            sname = b if b is not None else ""
+        devices.append((name, device_estimate(inventory.fleet.device.get(name)), sname))
 
-    needed_c = 0
-    if deadline > 0:
-        # The concurrency the deadline demands, with the ramp-up inverted
-        # rather than assumed away: the smallest concurrency whose waves
-        # finish the fleet within the windows. The planner keeps a margin,
-        # so it plans against what it will use.
-        spans = [(we.2 - imax(we.1, now)) * 95 // 100 for we in wins]
-        needed_c = fs.needed_concurrency(spans, n, estimate, debounce)
-    conc = needed_c if needed_c > target else target
-    if conc > cap:
-        conc = cap
-        alarms.append("deadline needs {needed_c} devices at once but "
-                      + "max-concurrency is {cap}; not all devices will be placed in time")
-
-    # A window already open gets only the time it has left, so the core
-    # does not fill it as if it were whole.
-    ordered = sorted([(imax(we.1, now), we.0, we.2) for we in wins])
-    fwins = []
-    for oe in ordered:
-        fwins.append(fs.Window(oe.1, oe.0, oe.2, conc))
-    camp = fs.Campaign(i.name, default_scheds, conc, conc, conc, 2, 0, "spread",
-                       sel_device=sel, admin_state="run")
-    r = fs.plan([], devices, camp, {}, [fs.ScriptedWindowGen(fwins)], 0, len(fwins))
-    for a in r.alarms:
-        alarms.append(a)
-
-    # Estimated starts come from the controller's own logic: simulate each
-    # window on estimate, with the target and max concurrency the live
-    # controller uses. Prediction and execution then disagree only where
-    # reality disagrees with the estimate.
-
-    # Released devices by the window they were released in. Windows the
-    # schedules no longer produce, closed since or changed, come first.
-    current: set[str] = set()
-    for we in wins:
-        current.add("{we.0}@{we.1}")
-    held_in: dict[str, list[(int, str)]] = {}
-    gone: list[(int, str, int)] = []
-    for name in held:
-        hw = released_in[name]
-        k = "{hw.0}@{hw.1}"
-        if k not in held_in:
-            held_in[k] = []
-            if k not in current:
-                gone.append((hw.1, hw.0, hw.2))
-        held_in[k].append((released_at.get_def(name, now), name))
-    all_wins = [(g.1, g.0, g.2) for g in sorted(gone)] + wins
-
-    layout: list[(str, int, int, list[(str, int, int)])] = []
-    overflow = 0
-    for we in all_wins:
-        devs: list[(str, int, int)] = []
-        running: list[(int, int)] = []
-        for h in sorted(held_in.get_def("{we.0}@{we.1}", [])):
-            est = est_of.get_def(h.1, estimate)
-            devs.append((h.1, h.0, est))
-            if h.1 not in done_at:
-                running.append((h.0 + est, est))
-        # The core places devices only in the windows the schedules give
-        # now. A window that closed or changed keeps only the devices
-        # released in it, also when its start matches an open window's.
-        placed: list[str] = []
-        if "{we.0}@{we.1}" in current:
-            for a in r.assigns:
-                if a.status != "unplannable":
-                    if a.schedule == we.0 and a.start == imax(we.1, now):
-                        placed.append(a.device)
-        if len(placed) > 0:
-            pcamp = fs.Campaign(i.name, [we.0], target, cap, 1, 2, 0,
-                                "spread", admin_state="run")
-            durations = [est_of.get_def(d, estimate) for d in placed]
-            # A window already open predicts from now, not from its past
-            # opening. The controller has ramped at least as far as it
-            # has devices in flight.
-            pred = fsim.simulate_window(len(placed), estimate, estimate,
-                                        fs.Window(we.0, imax(we.1, now), we.2, 1000000),
-                                        pcamp, imax(1, len(running)), debounce,
-                                        durations=durations,
-                                        running=running)
-            idx = 0
-            for d in placed:
-                if idx < len(pred.launch_offsets):
-                    devs.append((d, pred.launch_offsets[idx], est_of.get_def(d, estimate)))
-                else:
-                    # The core placed it, but the ramp cannot reach it
-                    # before the window closes: show it at the close.
-                    devs.append((d, we.2, est_of.get_def(d, estimate)))
-                    if we.2 != OPEN_END:
-                        overflow += 1
-                idx += 1
-        if len(devs) > 0:
-            layout.append((we.0, we.1, we.2, devs))
-
-    # Devices the core placed but the ramp cannot reach before their
-    # window closes are shown at the close; say so out loud too.
-    if overflow > 0:
-        alarms.append("{overflow} device(s) will not complete before their "
-                      + "window closes at the planned concurrency")
-    return (layout, alarms)
+    must_place = deadline > 0 and (synthetic or deadline - now <= (HORIZON_DAYS - 1) * 86400)
+    ctl.configure(windows, devices, int(i.target_concurrency), int(i.max_concurrency),
+                  must_place, campaign_debounce_s(len(members)),
+                  estimated_duration(i, inventory))
 
 
 class Schedules(base.Schedules):
@@ -430,23 +300,21 @@ class UpgradeCampaign(base.UpgradeCampaign):
         return base.o_root()
 
 
-def imax(a: int, b: int) -> int:
-    return a if a > b else b
-
 actor UpgradeCampaignTransform(path: ttt.Path,
                                write_output: action(ygdata.Node) -> None,
                                update_oper: proc(?y0_oper.software__software__upgrade_campaign_entry) -> None,
                                lower_tree_provider: ?ygdata.TreeProvider):
     """Aggregate device telemetry and control the release of the plan.
 
-    The actor plans for itself from the campaign and runs a
-    fctl.Controller on the layout and the device reports, driven by events
-    rather than a tick: on-change telemetry arms a debounce timer and the
-    timer firing decides once for the whole batch; the controller says
-    when it next needs to decide, at a window opening or the projected
-    shortfall crossing, and the actor arms an exact timer for it. Releases
-    start small and double as upgrades complete. The actor sends the
-    configuration of the released devices directly.
+    The actor runs a fctl.Controller on the campaign, the inventory and the
+    device reports, driven by events rather than a tick: on-change
+    telemetry arms a debounce timer and the timer firing decides once for
+    the whole batch; the controller says when it next needs to decide, at
+    a window opening or when an upgrade is expected to end, and the actor
+    arms an exact timer for it. Each decision plans and takes the plan's
+    first step, and the actor publishes that plan. Releases start small
+    and double as upgrades complete. The actor sends the configuration of
+    the released devices directly.
     """
     var members: list[str] = []
     var member_names: set[str] = set()
@@ -462,7 +330,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var active = False
     var generation = 0
     var debounce_armed = False
-    var debounce_s = campaign_debounce_s(0)
+    var debounce_s = 0.0
     var ctl = fctl.Controller()
     # The campaign and the inventory from the last on_conf, and the
     # configuration they give for the released devices.
@@ -539,8 +407,6 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 pd.estimated_duration = u64(entry.2)
         for alarm in plan_alarms:
             st.plan.alarm.append(alarm)
-        for alarm in ctl.alarms:
-            st.plan.alarm.append(alarm)
         update_oper(oper)
 
     def observe(name: str, status: ?str, running_release: ?str, stage: ?str,
@@ -548,10 +414,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 precheck: (verdict: ?str, detail: ?str, at: ?str),
                 postcheck: (verdict: ?str, detail: ?str, at: ?str)) -> None:
         """Keep the state of one device, as its flotilla reports it, and
-        pass its status to the controller."""
+        pass its status to the controller with the time it came."""
         latest[name] = (status=status, running_release=running_release,
                         stage=stage, reason=reason, precheck=precheck, postcheck=postcheck)
-        ctl.report(name, status)
+        ctl.report(name, status, time.time().unix_s())
 
     def forget(name: str) -> None:
         if name in latest:
@@ -602,20 +468,30 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         pass
 
     def decide(gen: int) -> None:
-        """Run one step of the controller, start the devices it releases,
-        and arm the next decision at the time the step says."""
+        """Plan and take the plan's first step, start the devices it
+        releases, and arm the next decision at the time the step says."""
         if gen != generation or not active:
             return
         debounce_armed = False
         generation += 1
         next_gen = generation
         t = time.time().unix_s()
-        s = ctl.step(t)
+        # The schedules give new windows as time passes.
+        current = campaign
+        if current is not None:
+            configure_campaign(ctl, current, inventory, t)
+        s = ctl.decide(t)
+        plan_layout = ctl.layout(s.plan)
+        plan_alarms = s.plan.alarms
         if len(s.started) > 0:
             patch_output(set(s.started))
-        if s.wake >= 0:
-            after now float(s.wake - t): decide(next_gen)
-        if s.finished:
+        wake = s.wake
+        if not s.finished and (wake < 0 or wake > t + HORIZON_REFRESH):
+            # Devices that wait for windows beyond the horizon.
+            wake = t + HORIZON_REFRESH
+        if not s.finished:
+            after now float(wake - t): decide(next_gen)
+        else:
             active = False
         publish()
 
@@ -627,35 +503,32 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             names.add(member.name)
         members = ms
         member_names = names
-        debounce_s = campaign_debounce_s(len(members))
+        debounce_s = float(campaign_debounce_s(len(members)))
 
         campaign = conf
         inventory = y_0.root.from_gdata(linked)
+        now = time.time().unix_s()
+        # The released devices, the ramp and the promises stay: a replan
+        # goes on from where the run is.
+        configure_campaign(ctl, conf, inventory, now)
         run_now = conf.admin_state == "run"
         if run_now and not running:
-            ctl.start(estimated_duration(conf, inventory))
+            ctl.start()
+        elif running and not run_now:
+            ctl.stop()
         running = run_now
         output = campaign_config(conf, inventory, ctl.released).to_gdata()
         write_output(output)
 
-        # Released devices keep their window and real times in the replan.
-        layout, alarms = plan_campaign(conf, inventory, time.time().unix_s(),
-                                       ctl.released_in, ctl.released_at, ctl.done_at)
-        plan_layout = layout
-        plan_alarms = alarms
+        p = ctl.plan(now)
+        plan_layout = ctl.layout(p)
+        plan_alarms = p.alarms
 
-        target_c = int(conf.target_concurrency)
-        ctl.configure(layout, target_c, imax(target_c, int(conf.max_concurrency)))
-
-        paced = len(plan_layout) > 0
         # New intent invalidates every armed timer. The first decision after
-        # subscription sync arms the exact timers the fresh layout needs.
+        # subscription sync arms the exact timers the fresh plan needs.
         generation += 1
         debounce_armed = False
-        if running and paced:
-            active = True
-        else:
-            active = False
+        active = running
 
         if lower_tree_provider is not None and subscriptions is None:
             subscriptions = ygdata.SubscriptionManager(

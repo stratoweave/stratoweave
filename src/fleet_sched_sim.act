@@ -1,16 +1,96 @@
 #
-# In-memory window simulator.
+# In-memory campaign simulator.
 #
-# Drives the pure controller in core.act through one window with a
-# configurable gap between estimated and actual upgrade duration. Decisions
-# are event-driven, like the controller design: the window opening decides
-# at once, a completion arms a debounce timer, updates landing while it is
-# armed join the same batch, and the timer firing recomputes. When the
-# window drains there is nothing left to decide, so the log ends.
+# Runs the campaign controller (fleet_ctl) the way the campaign actor
+# runs it, on upgrade durations that can differ from the estimates: it
+# decides at the start, one debounce after the first report that lands
+# after a decision, and at the wake the controller asks for. A device
+# reports once, when its upgrade ends; the reports that land before a
+# decision are its batch.
 #
 
+import fleet_ctl as ctl
 import fleet_sched as core
 from fleet_sched import imax
+
+
+class Decision(object):
+    """One decision of a run: its time, the devices it started, the plan's
+    concurrency, the devices in flight after it, the ramp, the devices
+    done and the plan's alarms."""
+    t: int
+    started: list[str]
+    c: int
+    flying: int
+    rung: int
+    done: int
+    alarms: list[str]
+
+    def __init__(self, t: int, started: list[str], c: int, flying: int, rung: int,
+                 done: int, alarms: list[str]):
+        self.t = t
+        self.started = started
+        self.c = c
+        self.flying = flying
+        self.rung = rung
+        self.done = done
+        self.alarms = alarms
+
+
+def drive(c: ctl.Controller, t0: int, dur_of: dict[str, int], until: int,
+          inflight: list[(int, str)]=[]) -> list[Decision]:
+    """Run the controller c from time t0 to time until the way the
+    campaign actor does. Each device it starts takes its duration in
+    dur_of, or its estimate without one, and reports once, when its
+    upgrade ends. inflight holds the devices in flight at t0, as (finish
+    time, name)."""
+    out: list[Decision] = []
+    flying = list(inflight)
+    t = t0
+    while t <= until:
+        still: list[(int, str)] = []
+        for f in flying:
+            if f.0 <= t:
+                c.report(f.1, "succeeded", f.0)
+            else:
+                still.append(f)
+        flying = still
+        s = c.decide(t)
+        for name in s.started:
+            flying.append((t + dur_of.get_def(name, c.est.get_def(name, 1)), name))
+        out.append(Decision(t, s.started, s.plan.c, len(c.flying), c.rung, len(c.done_at),
+                            s.plan.alarms))
+        if s.finished:
+            break
+        nxt = s.wake
+        if len(flying) > 0:
+            soonest = flying[0].0
+            for f in flying:
+                if f.0 < soonest:
+                    soonest = f.0
+            if nxt < 0 or soonest + c.debounce < nxt:
+                nxt = soonest + c.debounce
+        if nxt < 0:
+            break
+        t = nxt
+    return out
+
+
+def started(c: ctl.Controller) -> dict[str, ((str, int, int), int)]:
+    """Where and when each released device started, as (window, time)."""
+    out: dict[str, ((str, int, int), int)] = {}
+    for name in c.released:
+        out[name] = (c.released_in[name], c.released_at[name])
+    return out
+
+
+def planned(c: ctl.Controller, p: ctl.Plan) -> dict[str, ((str, int, int), int)]:
+    """The plan's starts, as (window, time)."""
+    out: dict[str, ((str, int, int), int)] = {}
+    for name, s in p.starts.items():
+        out[name] = (c.windows[s.0], s.1)
+    return out
+
 
 class SimResult(value):
     launched: int
@@ -18,151 +98,93 @@ class SimResult(value):
     deferred: int
     peak: int
     overran: int
-    final_rung: int
     first_launch: int
     launch_offsets: list[int]
     log: list[str]
 
     def __init__(self, launched: int, completed: int, deferred: int, peak: int,
-                 overran: int, final_rung: int, first_launch: int,
-                 launch_offsets: list[int], log: list[str]):
+                 overran: int, first_launch: int, launch_offsets: list[int], log: list[str]):
         self.launched = launched
         self.completed = completed
         self.deferred = deferred
         self.peak = peak
         self.overran = overran
-        self.final_rung = final_rung
         self.first_launch = first_launch
         # One entry per launched device, in launch order: the decision
-        # time it was launched at. This is what a plan's estimated starts
-        # are made of, so prediction and execution share one logic.
+        # time it was launched at.
         self.launch_offsets = launch_offsets
         self.log = log
 
+
 def simulate_window(n_devices: int, est_s: int, actual_s: int, w: core.Window,
-                    camp: core.Campaign, rung0: int, debounce_s: int,
-                    observed0: ?int = None, durations: ?list[int] = None,
+                    target: int, maxc: int, rung0: int, debounce_s: int,
+                    observed0: ?int = None,
                     running: ?list[(int, int)] = None) -> SimResult:
-    """With `durations`, each launch takes its own device's duration, in
-    launch order, and the observed EWMA follows the mixture - the same
-    thing the controller sees. Without it, every launch takes actual_s.
+    """Run the controller through the window w with n_devices devices of
+    est_s seconds that take actual_s, every one of which must start in
+    the window.
 
     With `running`, devices already in flight when the window starts, as
-    (finish time, duration): they hold their slots until they finish."""
-    remaining = n_devices
-    inflight: list[(int, int)] = []
+    (finish time, duration): they hold their slots until they finish.
+
+    The controller ramps from rung0, starts from observed0 as the
+    observed duration (est_s without it), and runs between target and
+    max concurrency maxc. The log has one row per decision, and a row
+    for each new alarm."""
+    win = (w.schedule, w.start, w.end)
+    devices: list[(str, int, str)] = []
     r0 = running
     if r0 is not None:
-        inflight = list(r0)
-    observed = est_s
-    o0 = observed0
-    if o0 is not None:
-        observed = o0
-    completed = 0
+        i = 0
+        for r in r0:
+            devices.append(("r{i}", r.1, w.schedule))
+            i += 1
+    dur_of: dict[str, int] = {}
+    for i in range(n_devices):
+        dur_of["d{i}"] = actual_s
+        devices.append(("d{i}", est_s, w.schedule))
+    c = ctl.Controller()
+    c.configure([win], devices, target, maxc, True, debounce_s, est_s)
+    c.start(rung0, observed0)
+    inflight: list[(int, str)] = []
+    if r0 is not None:
+        i = 0
+        for r in r0:
+            c.resume("r{i}", r.0 - r.1, win)
+            inflight.append((r.0, "r{i}"))
+            i += 1
+
+    decisions = drive(c, w.start, dur_of, w.end, inflight)
+
     launched = 0
     first_launch = -1
     peak = 0
-    rung = rung0
-    rung_target = rung0
+    completed = 0
+    overran = 0
     launch_offsets: list[int] = []
-    log = []
-    alarmed = False
-
-    log.append("      time | left  | inflt | req   | allw  | rung  | +new  | done")
-    t = w.start
-    while True:
-        # ---- one decision, at the window opening or a debounce timer firing.
-        # Completions that landed up to now are the batch; observed duration
-        # is an EWMA seeded from the estimate.
-        still = []
-        for f in inflight:
-            if f.0 <= t:
-                completed = completed + 1
-                observed = (observed * 3 + f.1) // 4
+    log = ["      time | left  | inflt | c     | rung  | +new  | done"]
+    alarms: list[str] = []
+    for d in decisions:
+        for name in d.started:
+            launch_offsets.append(d.t)
+            if d.t + dur_of[name] <= w.end:
+                completed += 1
             else:
-                still.append(f)
-        inflight = still
-
-        # ---- ramp: advance a rung once that many upgrades have landed cleanly
-        tgt = camp.target_concurrency
-        mx = camp.max_concurrency
-
-        if completed >= rung_target and rung < tgt:
-            rung = core.ramp_next(rung, camp.ramp_factor, tgt)
-            rung_target = completed + rung
-
-        t_rem = w.end - t
-        req = core.required_concurrency(remaining, observed, t_rem)
-        allw = core.allowed_concurrency(remaining, observed, t_rem,
-                                        tgt, mx)
-        n_new = core.launch_count(remaining, len(inflight), observed, t_rem,
-                                  tgt, mx,
-                                  rung, w.max_concurrency)
-        i = 0
-        while i < n_new:
-            dur = actual_s
-            d = durations
-            if d is not None and launched + i < len(d):
-                dur = d[launched + i]
-            inflight.append((t + dur, dur))
-            launch_offsets.append(t)
-            i = i + 1
-        remaining = remaining - n_new
-        launched = launched + n_new
-        if first_launch < 0 and n_new > 0:
-            first_launch = n_new
-        peak = core.imax(peak, len(inflight))
-
-        sf = core.shortfall(remaining, observed, t_rem, mx)
-        if sf > 0 and not alarmed and remaining > 0:
-            log.append(f"  {core.fmt_ts(t)} | ALARM: {sf} device(s) cannot make this window even at max concurrency -- deferral projected")
-            alarmed = True
-
-        log.append(f"  {core.fmt_ts(t)} | {remaining:5d} | {len(inflight):5d} | {req:5d} | {allw:5d} | {rung:5d} | {n_new:5d} | {completed:5d}")
-
-        if remaining == 0 and len(inflight) == 0:
-            # Drained: nothing left to decide, nothing more to log.
-            break
-        if len(inflight) == 0:
-            # Nothing running and nothing launched: no completion will ever
-            # arm another timer, so the rest defers.
-            break
-        # ---- the earliest completion arms the debounce timer; later ones
-        # land inside the same batch.
-        soonest = inflight[0].0
-        for f in inflight:
-            if f.0 < soonest:
-                soonest = f.0
-        nxt = soonest + debounce_s
-        if not alarmed and remaining > 0:
-            # The shortfall crossing is plain arithmetic in time, so arm an
-            # alarm timer for the projected moment instead of waiting for
-            # the next completion to reveal it.
-            g_need = core.ceil_div(remaining, mx)
-            t_need = (g_need - 1) * observed + (observed * 12) // 10
-            t_x = w.end - t_need + 1
-            if t_x <= t:
-                t_x = t + 1
-            if t_x <= w.end:
-                if t_x < nxt or nxt > w.end:
-                    sf_x = core.shortfall(remaining, observed, w.end - t_x,
-                                          mx)
-                    if sf_x > 0:
-                        log.append(f"  {core.fmt_ts(t_x)} | ALARM: {sf_x} device(s) cannot make this window even at max concurrency -- deferral projected")
-                        alarmed = True
-        if nxt > w.end:
-            break
-        t = nxt
-
-    # The window closes: whatever completes by the end still counts, the
-    # rest overran; unlaunched devices defer.
-    still = []
-    for f in inflight:
-        if f.0 <= w.end:
-            completed = completed + 1
-        else:
-            still.append(f)
-    inflight = still
-
-    return SimResult(launched, completed, remaining, peak, len(inflight), rung,
+                overran += 1
+        launched += len(d.started)
+        if first_launch < 0 and len(d.started) > 0:
+            first_launch = len(d.started)
+        peak = imax(peak, d.flying)
+        for a in d.alarms:
+            if a not in alarms:
+                log.append(f"  {core.fmt_ts(d.t)} | ALARM: {a}")
+        alarms = d.alarms
+        log.append(f"  {core.fmt_ts(d.t)} | {n_devices - launched:5d} | {d.flying:5d} | {d.c:5d} | {d.rung:5d} | {len(d.started):5d} | {d.done:5d}")
+    if r0 is not None:
+        for r in r0:
+            if r.0 <= w.end:
+                completed += 1
+            else:
+                overran += 1
+    return SimResult(launched, completed, n_devices - launched, peak, overran,
                      imax(first_launch, 0), launch_offsets, log)
