@@ -154,6 +154,11 @@
   windows but wait until it reports a success, or an operator takes it out
   of the group or the campaign. The plan's alarms name the devices that
   wait.
+- A device that reports a final status before the campaign releases it, for
+  example one that already runs the target release, no longer counts as an
+  upgrade that took no time. Before, a few such devices made the campaign
+  expect every upgrade to take seconds, and the plan put every device in the
+  first windows.
 - The top always starts ten flotillas and places each device on `flotilla-N`
   by a hash of its name. Removed `/fleet/node` and `/fleet/device/shard`.
   Devices without a shard, which the top managed itself, are no longer
