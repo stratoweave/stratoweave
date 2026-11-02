@@ -5,6 +5,7 @@
     | 'devices'
     | 'schedules'
     | 'config'
+    | 'apply'
     | 'refresh'
     | 'wrap'
     | 'copy'
@@ -44,6 +45,8 @@
     <path d="M3 10h18M8 3v4M16 3v4M7 14h3v3H7z" />
   {:else if name === 'config'}
     <path d="M14 3H5v18h14V8zM14 3v5h5M8 12h8M8 16h5" />
+  {:else if name === 'apply'}
+    <path d="M14 3H5v18h14V8zM14 3v5h5m-11 6 3 3 5-6" />
   {:else if name === 'refresh'}
     <path d="M20 4v5h-5M4 20v-5h5M20 9a8 8 0 0 0-14-3M4 15a8 8 0 0 0 14 3" />
   {:else if name === 'wrap'}

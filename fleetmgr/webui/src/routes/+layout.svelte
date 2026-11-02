@@ -27,7 +27,8 @@
     '/images/new': 'Add image',
     '/schedules': 'Schedules',
     '/schedules/new': 'New schedule',
-    '/config': 'Config'
+    '/config': 'Config',
+    '/apply': 'Apply config'
   };
   // Detail pages sit under their list: /campaigns/<name>, /devices/<name>,
   // /images/<name>, /schedules/<name>.
@@ -117,6 +118,10 @@
         <a class="nav-item" class:active={currentPathname === '/config'} href="/config">
           <span class="nav-icon"><NavIcon name="config" /></span>
           Config
+        </a>
+        <a class="nav-item" class:active={currentPathname === '/apply'} href="/apply">
+          <span class="nav-icon"><NavIcon name="apply" /></span>
+          Apply config
         </a>
       </div>
     </nav>

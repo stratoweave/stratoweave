@@ -153,6 +153,10 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `nonconfig` (the state its transforms publish, such as campaign
   progress) or `all`, as JSON, XML or AData. The choice is in the URL, so
   Refresh reads it again.
+- The Apply config page PATCHes `/restconf/data` with a JSON or XML body
+  as typed, so it merges. An XML body without a `<data>` root gets one:
+  the top answers 204 to a bare top-level element and drops it. So the
+  page takes what the Config page shows, in JSON or XML.
 
 ## Campaigns
 
