@@ -6,11 +6,19 @@
 - Transform actors can write to the layer below at any time, each write in
   its own transaction. Enable it with `sw:direct-output` under
   `sw:transform`, and keep the transform function mute, or the output is
-  repeated. `fleetmgr.cfs.UpgradeCampaignTransform` is an example. [#698]
+  repeated. `fleetmgr.cfs.UpgradeCampaignTransform` is an example. A write
+  takes the transform's lock, is replayed after a conflicting commit, and is
+  stored as the transform's output. [#698] [#731]
 - A transform's output replaces the configuration it wrote before, instead of
   being applied as a diff. This fixes source deletion, concurrent edits,
   restored list membership and subscriptions on newly committed list
   elements. [#680]
+- List elements and container children that are unchanged don't participate
+  in a full configuration replacement, like a transform's output. They get no
+  transaction, persistence write, lock or commit, and their transforms don't
+  run. Unchanged means the same node as in the last replacement committed
+  from that source, so an equal value in a new node participates, and so
+  does every element in the first replacement after a restart. [#731]
 - A session commit reports `done` and `complete` only after every transform
   below it has committed. Before, a link subscriber could commit without its
   linked input. [#685]
@@ -117,6 +125,10 @@
 - Fixed campaigns that never ended after a window of a schedule opened again
   while its earlier window still held released devices. The waiting devices
   were placed in both windows and counted twice. [#722]
+- The release decisions of a campaign are in the
+  `stratoweave.fleet_ctl.Controller` class instead of the campaign actor. The
+  controller has no clock and no I/O, so `test_fleet_ctl` runs it on times of
+  its own, without an actor. The move doesn't change the decisions. [#725]
 - A campaign's plan is what its run does: the controller that releases the
   devices makes the plan by running ahead at the expected upgrade durations.
   Before, a campaign could plan without alarms and alarm as soon as it ran,
@@ -288,7 +300,10 @@ next. Give it a spin. We’d love to hear what you think.
 [#722]: https://github.com/stratoweave/stratoweave/pull/722
 [#723]: https://github.com/stratoweave/stratoweave/pull/723
 [#724]: https://github.com/stratoweave/stratoweave/pull/724
+[#725]: https://github.com/stratoweave/stratoweave/pull/725
 [#726]: https://github.com/stratoweave/stratoweave/pull/726
+[#730]: https://github.com/stratoweave/stratoweave/pull/730
+[#731]: https://github.com/stratoweave/stratoweave/pull/731
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
