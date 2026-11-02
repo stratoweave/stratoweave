@@ -1,0 +1,281 @@
+import testing
+
+import ttt
+import yang.gdata as gdata
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id("urn:test:shared-deletion", name)
+
+
+def devices(names: list[str]) -> gdata.List:
+    return gdata.List([q("name")], by_key={name: gdata.Container({
+        q("name"): gdata.Leaf(name), q("value"): gdata.Leaf(1),
+    }) for name in names})
+
+
+def flotilla(names: list[str]) -> gdata.List:
+    return gdata.List([q("name")], by_key={"flotilla-2": gdata.Container({
+        q("name"): gdata.Leaf("flotilla-2"), q("device"): devices(names),
+    })})
+
+
+proc def receiver() -> ttt.Node:
+    return ttt.List(ttt.Container({
+        q("device"): ttt.List(ttt.Transform(ttt.PassThrough), [q("name")]),
+    }), [q("name")])(ttt.PathRoot("receiver"), None)
+
+
+actor DeleteShared(t: testing.AsyncT, continue_after_loss: bool):
+    # Each source owns one distinct device under the same outer list entry.
+    # Withdrawal must retain the entry until its last source is removed.
+    root = receiver()
+    var step = 0
+    var finished = False
+
+    def fail(error: Exception):
+        if not finished:
+            finished = True
+            t.failure(error)
+
+    def apply(cfg: dict[str, gdata.Node]):
+        tx = root.newtrans()
+        tid = str(step)
+        result = tx.configure(tid, cfg, None)
+        testing.assertEqual(len(result.errors), 0)
+
+        def locked(result: ttt.CfgResult):
+            try:
+                testing.assertEqual(len(result.errors), 0)
+                await async tx.commit(tid, True)
+                current = root.get()
+                if step == 0:
+                    testing.assertEqual(current, flotilla(["cpe-013", "cpe-014", "cpe-015"]))
+                    step = 1
+                    apply({"p": gdata.Absent()})
+                elif step == 1:
+                    if not continue_after_loss:
+                        testing.assertEqual(current, flotilla(["cpe-014", "cpe-015"]),
+                                            "first withdrawal removed the shared flotilla")
+                        testing.assertEqual(result.nonempty_sources, {"q", "r"})
+                    step = 2
+                    apply({"q": gdata.Absent()})
+                elif step == 2:
+                    testing.assertEqual(current, flotilla(["cpe-015"]))
+                    testing.assertEqual(result.nonempty_sources, {"r"})
+                    step = 3
+                    apply({"r": gdata.Absent()})
+                else:
+                    testing.assertEqual(current, gdata.List([q("name")], []))
+                    finished = True
+                    t.success()
+            except Exception as error:
+                fail(error)
+
+        tx.lock(tid, None, locked)
+
+    after 2: fail(ValueError("delete callback did not return"))
+
+    apply({"p": flotilla(["cpe-013"]), "q": flotilla(["cpe-014"]), "r": flotilla(["cpe-015"])})
+
+
+actor _test_shared_flotilla_survives_withdrawals(t: testing.AsyncT):
+    DeleteShared(t, False)
+
+
+actor _test_second_withdrawal_returns(t: testing.AsyncT):
+    DeleteShared(t, True)
+
+
+actor Concurrent(t: testing.AsyncT, reverse: bool=False, abort_first: bool=False,
+                 abort_second: bool=False, keeper: bool=False, create: bool=False):
+    root = receiver()
+    seed = root.newtrans()
+    first = root.newtrans()
+    second = root.newtrans()
+    first_src = "q" if reverse else "p"
+    second_src = "p" if reverse else "q"
+    first_name = "cpe-014" if reverse else "cpe-013"
+    second_name = "cpe-013" if reverse else "cpe-014"
+    initial = {"p": flotilla(["cpe-013"])}
+    if not create:
+        initial["q"] = flotilla(["cpe-014"])
+    if keeper:
+        initial["r"] = flotilla(["cpe-015"])
+    var first_done = False
+    var second_done = False
+
+    def check(result: ttt.CfgResult):
+        testing.assertEqual(len(result.errors), 0)
+        testing.assertEqual(len(result.requests), 0)
+        testing.assertEqual(len(result.updates), 0)
+
+    def finish():
+        if first_done and second_done:
+            names = []
+            if abort_first:
+                names.append(first_name)
+            keep_second = not abort_second if create else abort_second
+            if keep_second:
+                names.append(second_name)
+            if keeper:
+                names.append("cpe-015")
+            expected = flotilla(names) if names else gdata.List([q("name")], [])
+            testing.assertEqual(root.get(), expected)
+            t.success()
+
+    def second_locked(result: ttt.CfgResult):
+        try:
+            check(result)
+            testing.assertEqual(result.empty, not (abort_first or keeper or create))
+            await async second.commit("second", not abort_second)
+            second_done = True
+            finish()
+        except Exception as error:
+            t.failure(error)
+
+    def first_locked(result: ttt.CfgResult):
+        try:
+            check(result)
+            testing.assertEqual(result.empty, create)
+            # Both changes were configured before either lock. Start the
+            # second lock while the first still owns the shared outer entry.
+            second.lock("second", None, second_locked)
+            await async first.commit("first", not abort_first)
+            first_done = True
+            finish()
+        except Exception as error:
+            t.failure(error)
+
+    def seeded(result: ttt.CfgResult):
+        try:
+            check(result)
+            await async seed.commit("seed", True)
+            check(first.configure("first", {first_src: gdata.Absent()}, None))
+            other = flotilla([second_name]) if create else gdata.Absent()
+            check(second.configure("second", {second_src: other}, None))
+            names = ["cpe-013"] if create else ["cpe-013", "cpe-014"]
+            if keeper:
+                names.append("cpe-015")
+            testing.assertEqual(root.get(), flotilla(names))
+            first.lock("first", None, first_locked)
+        except Exception as error:
+            t.failure(error)
+
+    check(seed.configure("seed", initial, None))
+    seed.lock("seed", None, seeded)
+
+
+actor _test_concurrent_last_deletions(t: testing.AsyncT):
+    Concurrent(t)
+
+
+actor _test_concurrent_last_deletions_reverse(t: testing.AsyncT):
+    Concurrent(t, reverse=True)
+
+
+actor _test_concurrent_deletions_keep_third_source(t: testing.AsyncT):
+    Concurrent(t, keeper=True)
+
+
+actor _test_abort_first_deletion(t: testing.AsyncT):
+    Concurrent(t, abort_first=True)
+
+
+actor _test_abort_second_deletion(t: testing.AsyncT):
+    Concurrent(t, abort_second=True)
+
+
+actor _test_create_while_last_source_is_deleted(t: testing.AsyncT):
+    Concurrent(t, create=True)
+
+
+actor Grants():
+    var names: list[str] = []
+
+    def a(keys: dict[str, set[str]], nodes: dict[str, ttt.Node]):
+        names.append("A")
+
+    def b(keys: dict[str, set[str]], nodes: dict[str, ttt.Node]):
+        names.append("B")
+
+    def c(keys: dict[str, set[str]], nodes: dict[str, ttt.Node]):
+        names.append("C")
+
+    def get():
+        return list(names)
+
+
+actor _test_shared_entry_locks_and_pending_abort(t: testing.AsyncT):
+    # Source locks differ, but all three transactions affect the same entry.
+    # Queue directly at ListState so the round trips establish lock ordering.
+    state = ttt.ListState(ttt.PathRoot("receiver"), ttt.Transform(ttt.PassThrough), None)
+    grants = Grants()
+    cfg = devices(["shared"])
+    for tid in ["A", "B", "C"]:
+        state.acquire(tid, {tid: {"shared"}}, {tid},
+                      {"shared": {q("name"): gdata.Leaf("shared")}}, {tid: cfg})
+    state.acquire_deletes("A", grants.a)
+    state.acquire_deletes("A", grants.a)
+    state.acquire_deletes("B", grants.b)
+    nodes = state.all()
+    testing.assertEqual(grants.get(), ["A", "A"])
+    state.release("B", False, set())
+    state.acquire_deletes("C", grants.c)
+    nodes = state.all()
+    testing.assertEqual(grants.get(), ["A", "A"])
+    state.release("A", False, set())
+    nodes = state.all()
+    testing.assertEqual(grants.get(), ["A", "A", "C"])
+    state.release("C", False, set())
+    t.success()
+
+
+actor _test_disjoint_entry_locks_do_not_block(t: testing.AsyncT):
+    state = ttt.ListState(ttt.PathRoot("receiver"), ttt.Transform(ttt.PassThrough), None)
+    grants = Grants()
+    for tid in ["A", "B"]:
+        state.acquire(tid, {tid: {tid}}, {tid},
+                      {tid: {q("name"): gdata.Leaf(tid)}}, {tid: devices([tid])})
+    state.acquire_deletes("A", grants.a)
+    state.acquire_deletes("B", grants.b)
+    nodes = state.all()
+    testing.assertEqual(grants.get(), ["A", "B"])
+    state.release("A", False, set())
+    state.release("B", False, set())
+    t.success()
+
+
+actor _test_empty_source_does_not_leave_stale_membership(t: testing.AsyncT):
+    root = receiver()
+    var step = 0
+
+    def apply(cfg: dict[str, gdata.Node]):
+        tx = root.newtrans()
+        tid = str(step)
+
+        def locked(result: ttt.CfgResult):
+            try:
+                testing.assertEqual(len(result.errors), 0)
+                testing.assertEqual(result.nonempty_sources, {"p"} if step == 0 else set())
+                await async tx.commit(tid, True)
+                if step == 0:
+                    testing.assertEqual(root.get(), flotilla(["cpe-013"]))
+                    step = 1
+                    apply({"p": gdata.Absent()})
+                elif step == 1:
+                    testing.assertEqual(root.get(), gdata.List([q("name")], []))
+                    step = 2
+                    # q supplied an outer key, but no effective child config.
+                    # Its withdrawal must not follow a removed node.
+                    apply({"q": gdata.Absent()})
+                else:
+                    testing.assertEqual(root.get(), gdata.List([q("name")], []))
+                    t.success()
+            except Exception as error:
+                t.failure(error)
+
+        testing.assertEqual(len(tx.configure(tid, cfg, None).errors), 0)
+        tx.lock(tid, None, locked)
+
+    apply({"p": flotilla(["cpe-013"]), "q": flotilla([])})
