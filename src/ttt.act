@@ -2313,6 +2313,9 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
     # replacement and to check that a filtering baseline's element is active.
     # Restoration populates this index without reconstructing full configs.
     var active: dict[str, set[str]] = {}
+    # Positive source evidence from committed child results. Supplied key
+    # membership alone does not prove that a source contributes configuration.
+    var nonempty: dict[str, set[str]] = {}
     # Latest supplied membership per transaction/source, retaining other sources
     # across acquire calls. Differential calls record fragment membership, not
     # complete resulting membership. Linkage records keys under LINK_SRC too.
@@ -2325,6 +2328,9 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
     # Retains keys omitted by later replacements so their earlier contributions
     # can be cleared. Includes filtered keys, not just actual child participants.
     var touched: dict[str, dict[str, set[str]]] = {}
+    # Actual child participants, excluding entries filtered as unchanged.
+    # Deferred deletions and linkage add their entries before locking too.
+    var participants: dict[str, set[str]] = {}
     # Known full committed inputs per source, retained for same_node comparison.
     # Differential commits invalidate these baselines; restoration does not
     # populate them. This is not a complete view of effective configuration.
@@ -2337,6 +2343,11 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
     var pending: list[(str, action(dict[str, set[str]], dict[str, Node]) -> None)] = []
     # Transaction currently holding each source's deletion lock.
     var locked: dict[str, str] = {}
+    # Hold each participating entry through its child commits and release.
+    # Independent sources can share a container/list entry without sharing a
+    # leaf transform lock. Serializing that entry stabilizes its whole subtree
+    # while emptiness is decided, including concurrent final withdrawals.
+    var entry_locks: dict[str, str] = {}
     # Persistence store also bound to newly created element nodes.
     var db = None
     # Oper subscriptions to attach when new elements become committed.
@@ -2414,16 +2425,55 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
         if src not in active:
             active[src] = set()
         active[src].add(key)
+        if key not in nonempty:
+            nonempty[key] = set()
+        nonempty[key].add(src)
 
     def get_configs() -> dict[str, gdata.Node]:
         """Snapshot known full committed inputs, preserving node identity."""
         return dict(committed_configs.items())
+
+    def summarize(tid: str, results: dict[str, CfgResult]) -> CfgResult:
+        # Overlay this transaction's child results on committed entries. An
+        # untouched child still keeps the list alive, even when every child
+        # visited by this transaction is being removed. Entry locks in the
+        # enclosing list protect this view when it determines parent deletion.
+        remaining = set(elems.keys()) - provisional - set(results.keys())
+        # Completion callbacks also summarize after release, when no erasure
+        # intent remains for the transaction.
+        erasure = erasures.get_def(tid, set())
+        candidate = candidates.get_def(tid, {})
+        withdrawn = set()
+        retained = set()
+        for src, keys in active.items():
+            if src == LINK_SRC:
+                continue
+            if src in erasure:
+                supplied = candidate.get_def(src, set())
+                withdrawn |= keys - supplied
+                retained |= keys & supplied
+            else:
+                retained |= keys
+        # Before locking, omitted contributions have not reached their child
+        # transactions yet. A key whose every recorded owner is withdrawing
+        # can already be reported empty. Other owners keep it conservative.
+        remaining -= withdrawn - retained
+        empty = not remaining
+        sources = set()
+        for key in remaining:
+            sources |= {src for src in nonempty.get_def(key, set())
+                        if src not in erasure or key in candidate.get_def(src, set())}
+        for result in results.values():
+            empty = empty and result.empty
+            sources |= result.nonempty_sources
+        return CfgOk(empty=empty, nonempty_sources=sources)
 
     def acquire(tid, candidate: dict[str, set[str]], erasure: set[str], leaves_by_key: dict[str, dict[gdata.Id, gdata.Leaf]], cfg_by_src: dict[str, gdata.Node], differential=False):
         if tid not in candidates:
             candidates[tid] = {}
             config_updates[tid] = {}
             touched[tid] = {}
+            participants[tid] = set()
             erasures[tid] = set()
         for src, cfg in cfg_by_src.items():
             config_updates[tid][src] = None if differential else cfg
@@ -2455,6 +2505,7 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
                     elems[k] = node
                     provisional.add(k)
                 result[k] = elems[k]
+        participants[tid] |= set(result.keys())
         #print('====', tid, path, 'list acquire erasures:', erasures[tid], err=True)
         #print('====', tid, path, 'acquire provisional:', provisional, err=True)
         return result
@@ -2467,7 +2518,9 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
             candidates[tid] = {LINK_SRC: keys1}
             config_updates[tid] = {}
             touched[tid] = {}
+            participants[tid] = set()
             erasures[tid] = set()
+        participants[tid] |= keys1
         return {k: elems[k] for k in keys1}
 
     def acquire_deletes(tid, reply: action(dict[str, set[str]], dict[str, Node]) -> None):
@@ -2475,32 +2528,47 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
         if tid not in candidates:
             acquire(tid, {}, set(), {}, {})
         erasure = erasures[tid]
-        if any([src in locked and locked[src] != tid for src in erasure]):
+        candidate = candidates[tid]
+        keys_by_src = {}
+        nodes = {}
+        for src in erasure:
+            keys = active.get_def(src, set()) | touched[tid].get_def(src, set())
+            keys1 = keys - candidate.get_def(src, set())
+            keys_by_src[src] = keys1
+            for k in keys1:
+                nodes[k] = elems[k]
+        keys = participants[tid] | set(nodes.keys())
+        # Acquire both kinds of lock together. A waiter must hold neither a
+        # new source lock nor a new entry lock while another owner finishes.
+        if any([src in locked and locked[src] != tid for src in erasure]) or \
+           any([k in entry_locks and entry_locks[k] != tid for k in keys]):
             pending.append((tid, reply))
         else:
             for src in erasure:
                 locked[src] = tid
-            candidate = candidates[tid]
+            for k in keys:
+                entry_locks[k] = tid
+            participants[tid] = keys
             #print('====', tid, path, 'list acquire_deletes', candidate, 'erasure:', erasure, err=True)
-            keys_by_src = {}
-            nodes = {}
-            for src in erasure:
-                keys = active.get_def(src, set()) | touched[tid].get_def(src, set())
-                keys1 = keys - candidate.get_def(src, set())
-                keys_by_src[src] = keys1
-                for k in keys1:
-                    nodes[k] = elems[k]
             reply(keys_by_src, nodes)
 
-    def release(tid: str, ok: bool, deletes: set[str]):
+    def release(tid: str, ok: bool, results: dict[str, CfgResult]):
         candidate = candidates[tid]
         updates = config_updates[tid]
         erasure = erasures[tid]
+        entry_keys = participants[tid]
         del candidates[tid]
         del config_updates[tid]
         del touched[tid]
+        del participants[tid]
         del erasures[tid]
         if ok:
+            deletes = {k for k, result in results.items() if result.empty}
+            for k, result in results.items():
+                if result.empty:
+                    nonempty.pop(k)
+                else:
+                    nonempty[k] = set(result.nonempty_sources)
             for src, cfg in updates.items():
                 if cfg is not None:
                     committed_configs[src] = cfg
@@ -2520,6 +2588,12 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
                 for k in keys & provisional:
                     _attach(k)
                 provisional -= keys
+            # Empty contributions may have supplied a shared outer key too.
+            # Once that entry is globally empty, no source may retain a
+            # membership reference to the node being removed.
+            if deletes:
+                for source_keys in active.values():
+                    source_keys -= deletes
             provisional |= deletes
         #print('====', tid, path, 'release {ok} new active for {tid}:', active, err=True)
         if not candidates:
@@ -2532,8 +2606,11 @@ actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
         for src in erasure:
             if locked.get(src) == tid:
                 del locked[src]
+        for k in entry_keys:
+            if entry_locks.get(k) == tid:
+                del entry_locks[k]
         pending = [(tid1, reply) for tid1, reply in pending if tid1 != tid]
-        if erasure:
+        if erasure or entry_keys:
             pend = pending
             pending = []
             for tid, reply in pend:
@@ -2599,7 +2676,7 @@ class _ListTransaction(_Transaction):
         if refresh:
             # Refresh the selected subtree, including committed entries in a
             # transaction that has not configured any of them yet.
-            nodes.update(self.liststate.all().items())
+            nodes.update(self.liststate.acquire_existing(tid, set(self.liststate.all().keys())).items())
             cfg_by_key = {key: {} for key in nodes}
 
         #print('   #', tid, '(List)', _format_path(self.path), 'acquired nodes:', set(nodes.keys()), err=True)
@@ -2617,15 +2694,14 @@ class _ListTransaction(_Transaction):
                 msgs[key] = async self.elems[key].configure(tid, subcfg, out, dbuf, differential)
                 if key in leaves_by_key:
                     self.key_leaves[key] = leaves_by_key[key]
-            else:
-                # An unchanged committed child is still nonempty, although it
-                # needs no transaction, persistence write, lock, or commit.
-                self.results[key] = CfgOk()
+            # Filtered children have no transaction result. summarize() keeps
+            # their committed presence and source evidence without acquiring
+            # a child transaction, lock, or persistence write.
         results = {}
         for key, msg in msgs.items():
             results[key] = await msg
             #print('   #', tid, '(List)', _format_path(self.path), 'RESULT CONFIGURE ELEMENT', key, ':', results[key], err=True)
-        res = self._analyze(results)
+        res = self._analyze(tid, results)
 
         if dbuf is not None and not refresh:
             dbuf.replace(swdb.slot_key(_db_path(self.path), "list"), self.db_ops(self.key_leaves))
@@ -2648,9 +2724,9 @@ class _ListTransaction(_Transaction):
                 ops.append(swdb.put_op(path, swdb.ATTR_KEYS, gdata.Container(leaves_by_key[key]), key))
         return ops
 
-    def _analyze(self, results: dict[str, CfgResult]):
+    def _analyze(self, tid: str, results: dict[str, CfgResult]):
         self.results.update(results.items())
-        empty = all([r.empty for r in self.results.values()])
+        summary = self.liststate.summarize(tid, self.results)
         requests = []
         updates = []
         errors = []
@@ -2658,10 +2734,7 @@ class _ListTransaction(_Transaction):
             requests += r.requests
             updates += r.updates
             errors += r.errors
-        nonempty_sources = set()
-        for result in self.results.values():
-            nonempty_sources |= result.nonempty_sources
-        res = CfgResult(empty, requests, updates, errors, nonempty_sources)
+        res = CfgResult(summary.empty, requests, updates, errors, summary.nonempty_sources)
         #print('   # ...... (List)', _format_path(self.path), 'ANALYZE RESULT:', res, len(requests), len(updates), len(errors), err=True)
         return res
 
@@ -2712,7 +2785,7 @@ class _ListTransaction(_Transaction):
                 upds = upds_by_key.get_def(key, [])
                 #print('   #', tid, '(List)', _format_path(self.path), 'LINKAGE ELEMENT', key, len(reqs), len(upds), err=True)
                 results[key] = self.elems[key].linkage(tid, reqs, upds, out, dbuf)
-        return self._analyze(results)
+        return self._analyze(tid, results)
 
     # yield action
     def lock(self, actself, tid, out: ?Session, done, dbuf: ?swdb.Buffer=None):
@@ -2743,7 +2816,7 @@ class _ListTransaction(_Transaction):
             for k, msg in msgs.items():
                 results[k] = await msg
                 #print('   #', state.tid, '(List)', _format_path(self.path), 'RESULT CLEAR ELEMENT', k, ':', results[k], err=True)
-            self._analyze(results)
+            self._analyze(state.tid, results)
 
             self.state1 = None
             self.lock_elems(actself, state.tid, state.out, state.done, state.dbuf)
@@ -2760,7 +2833,7 @@ class _ListTransaction(_Transaction):
             tr.lock(tid, out, actself.lock_cont2, dbuf)                  # yield await
         else:
             #print('   #', tid, '(List)', _format_path(self.path), 'LOCK IMMEDIATELY DONE', err=True)
-            done(self._analyze({}))
+            done(self._analyze(tid, {}))
 
     def lock_cont2(self, actself, res):
         state = self.state2
@@ -2777,7 +2850,7 @@ class _ListTransaction(_Transaction):
             else:
                 self.state2 = None
                 #print('   #', state.tid, '(List)', _format_path(self.path), 'LOCK DONE', err=True)
-                res = self._analyze(state.results)
+                res = self._analyze(state.tid, state.results)
                 # Deferred source erasures can make entries empty only during
                 # locking. Persist their key deletions before the buffer flush,
                 # retaining keys staged by earlier configure calls as well.
@@ -2799,12 +2872,7 @@ class _ListTransaction(_Transaction):
             msgs.append(async tr.commit(tid, ok))
         for msg in msgs:
             await msg
-        deletes = set()
-        for key, res in self.results.items():
-            if res.empty:
-                #print('   #', tid, '(List)', _format_path(self.path), 'DELETE ELEMENT', key, err=True)
-                deletes.add(key)
-        await async self.liststate.release(tid, ok, deletes)
+        await async self.liststate.release(tid, ok, self.results)
         self.reset = True       # Defer resetting results, for the benefit of 'wait_complete'
 
     # yield action
@@ -2837,7 +2905,7 @@ class _ListTransaction(_Transaction):
             else:
                 self.state2 = None
                 #print('   #', state.tid, '(List)', _format_path(self.path), 'COMPLETION DONE', err=True)
-                state.done(self._analyze(state.results))
+                state.done(self._analyze(state.tid, state.results))
         else:
             pass
             #print('#### ...... (List)', _format_path(self.path), 'wait_complete_cont empty state!!!', err=True)
