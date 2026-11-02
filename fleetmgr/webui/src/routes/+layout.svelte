@@ -4,14 +4,28 @@
 
   import { invalidateAll } from '$app/navigation';
   import { page } from '$app/state';
-  import type { Snippet } from 'svelte';
+  import { onMount, type Snippet } from 'svelte';
 
+  import CommandPalette from '$lib/core/command-palette/CommandPalette.svelte';
   import { pageLabel } from '$lib/core/page-label.svelte';
   import { dropReadCache } from '$lib/core/restconf/client';
   import NavIcon from '$lib/core/ui/NavIcon.svelte';
   import logoUrl from '$lib/assets/stratoweave-logo.svg';
 
   let { children }: { children?: Snippet } = $props();
+
+  let paletteOpen = $state(false);
+
+  onMount(() => {
+    const handler = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        paletteOpen = !paletteOpen;
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  });
 
   /** Reload every page load from the server, cached fleet included. */
   function refresh(): void {
@@ -139,6 +153,9 @@
       </nav>
 
       <div class="header-actions">
+        <button class="btn btn-ghost btn-sm cmdk-trigger" type="button" onclick={() => (paletteOpen = true)} aria-label="Search">
+          Search <kbd>⌘K</kbd>
+        </button>
         <button class="btn btn-ghost btn-sm" type="button" onclick={refresh}>
           <NavIcon name="refresh" size={16} /> Refresh
         </button>
@@ -154,3 +171,24 @@
     </main>
   </div>
 </div>
+
+<CommandPalette bind:open={paletteOpen} />
+
+<style>
+  .cmdk-trigger {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .cmdk-trigger kbd {
+    display: inline-block;
+    padding: 1px 5px;
+    border: 1px solid var(--sw-border-subtle);
+    border-radius: 4px;
+    background: var(--sw-bg-card);
+    font-family: var(--sw-font-mono);
+    font-size: 11px;
+    color: var(--sw-text-muted);
+  }
+</style>

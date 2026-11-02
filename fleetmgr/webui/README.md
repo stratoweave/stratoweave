@@ -142,6 +142,13 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   before it is lost.
   Without an image folder `/image-file` answers 404, and the page says so
   and uploads nothing.
+- Search (Search in the header, or Ctrl/⌘+K) jumps to a page, campaign,
+  image, device or schedule by name, matched like the devices page
+  filter. It reads the four lists through the 30 s read cache the devices
+  page uses, so at 30k devices a first open takes about 0.4 s and a
+  reopen none. Each group shows at most 8 matches and then a Show all
+  row to its list page; for devices that page opens filtered by the same
+  text (`/devices?name=`).
 - Per-device status values: `pending`, `unknown`, `up-to-date`,
   `upgrade-needed`, `in-progress`, `succeeded`, `failed`, `rolled-back`.
   The `succeeded` counter includes `up-to-date`, `failed` includes
