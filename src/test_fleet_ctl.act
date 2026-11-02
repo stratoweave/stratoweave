@@ -1124,3 +1124,495 @@ def _test_the_plan_is_the_run_chains():
     separation = {"a": (True, 0), "b": (True, 0)}
     plan_is_run(daily("day", 0, HOUR, 2), devices("d", 20, 600, "day"), 4, 8, True, 600,
                 groups, priority, separation)
+
+
+#############################################################################
+# Whole campaigns on upgrade times that differ from the estimate
+#############################################################################
+
+class Campaign(object):
+    """A campaign for the tests below: its windows and devices, the target
+    and max concurrency, the debounce, the campaign's estimate and the
+    time that a run goes on to. The ramp starts at one device."""
+    windows: list[(str, int, int)]
+    devs: list[(str, int, str)]
+    target: int
+    maxc: int
+    debounce: int
+    estimate: int
+    until: int
+
+    def __init__(self, windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
+                 maxc: int, debounce: int, estimate: int, until: int):
+        self.windows = windows
+        self.devs = devs
+        self.target = target
+        self.maxc = maxc
+        self.debounce = debounce
+        self.estimate = estimate
+        self.until = until
+
+
+def nights(n: int=79) -> Campaign:
+    """n devices of 600 s in a 36 min window at midnight every day for 8
+    days, 8 at once and up to 32, and a debounce of 1 s. A round of
+    upgrades takes 601 s. A round fits in a night when it starts by
+    00:24:00, with the 720 s that a fifth to spare needs, so a night holds
+    three rounds. For 79 devices the first plan promises 7 to the first
+    night, in rounds of 1, 2 and 4, and 24 to each of the next three
+    nights."""
+    return Campaign(daily("night", 0, 2160, 8), devices("d", n, 600, "night"), 8, 32, 1, 600,
+                    8 * DAY)
+
+
+def edge(length: int) -> Campaign:
+    """41 devices of 600 s in a window of length seconds every day for 2
+    days, 8 at once and up to 16, and a debounce of 30 s. A round of
+    upgrades takes 630 s. In a 3903 s window the first plan promises 31
+    devices to the first window, in rounds of 1, 2, 4, 8, 8 and 8. The
+    last round starts at 00:52:30, 33 s before the last start that fits.
+    In a 3269 s window it promises 23, one round less. The last round
+    then starts at 00:42:00, 29 s before the last start that fits."""
+    return Campaign(daily("w", 0, length, 2), devices("d", 41, 600, "w"), 8, 16, 30, 600,
+                    2 * DAY)
+
+
+def clock(t: int) -> str:
+    """The time t as day and time of day, to the second."""
+    return f"d{t // DAY} {(t % DAY) // HOUR:02d}:{(t % HOUR) // 60:02d}:{t % 60:02d}"
+
+
+class Outcome(object):
+    """What one run of a campaign did.
+
+    cpath has the concurrency at the first decision and at each change,
+    as (time, concurrency). broken counts the devices that did not start
+    in the window that the first plan promised them, and overran the
+    devices in flight when their window closed. decisions counts the
+    decisions, and alarmed the decisions whose plan says that devices
+    will miss their window. peak is the most devices in flight after a
+    decision. table has a row for each decision that starts devices,
+    changes the concurrency or gives an alarm."""
+    cpath: list[(int, int)]
+    broken: int
+    overran: int
+    decisions: int
+    alarmed: int
+    peak: int
+    table: list[str]
+
+    def __init__(self, cpath: list[(int, int)], broken: int, overran: int, decisions: int,
+                 alarmed: int, peak: int, table: list[str]):
+        self.cpath = cpath
+        self.broken = broken
+        self.overran = overran
+        self.decisions = decisions
+        self.alarmed = alarmed
+        self.peak = peak
+        self.table = table
+
+    def top(self) -> int:
+        """The highest concurrency of the run."""
+        top = 0
+        for e in self.cpath:
+            top = fleet_ctl.imax(top, e.1)
+        return top
+
+    def changes(self) -> str:
+        """The changes of the concurrency after the first decision."""
+        return ", then ".join(["to {e.1} at {clock(e.0)}" for e in self.cpath[1:]])
+
+    def text(self, label: str) -> str:
+        """The table and the numbers, for a snapshot."""
+        lines = [label, ""] + self.table + [""]
+        lines.append("concurrency: " + ", ".join(["{clock(e.0)} {e.1}" for e in self.cpath]))
+        lines.append(f"broken promises {self.broken}, window overruns {self.overran}, "
+                     + f"decisions {self.decisions}, decisions with a will-miss alarm "
+                     + f"{self.alarmed}, peak in flight {self.peak}")
+        return "\n".join(lines)
+
+
+def run(cp: Campaign, maxc: int, durations: dict[str, int]) -> Outcome:
+    """Run the campaign cp at max-concurrency maxc the way the campaign
+    actor runs it. A device in durations takes that time, the others
+    their estimate."""
+    c = controller(cp.windows, cp.devs, cp.target, maxc, debounce=cp.debounce,
+                   estimate=cp.estimate)
+    first = sim.planned(c, c.plan(0))
+    ds = sim.drive(c, 0, durations, cp.until)
+    starts = sim.started(c)
+    est = {d.0: d.1 for d in cp.devs}
+    broken = 0
+    for name, p in first.items():
+        if name not in starts or starts[name].0 != p.0:
+            broken += 1
+    overran = 0
+    for name, s in starts.items():
+        if s.1 + durations.get_def(name, est[name]) > s.0.2:
+            overran += 1
+    cpath: list[(int, int)] = []
+    alarmed = 0
+    peak = 0
+    table: list[str] = []
+    for d in ds:
+        changed = len(cpath) == 0 or cpath[len(cpath) - 1].1 != d.c
+        if changed:
+            cpath.append((d.t, d.c))
+        if len([a for a in d.alarms if "will miss" in a]) > 0:
+            alarmed += 1
+        peak = fleet_ctl.imax(peak, d.flying)
+        if changed or len(d.started) > 0 or len(d.alarms) > 0:
+            row = f"  {clock(d.t)} | c {d.c:2d} | rung {d.rung:2d} | in flight {d.flying:2d} " \
+                  + f"| started {len(d.started):2d} | done {d.done:2d} | pace {d.pace:3d}"
+            for a in d.alarms:
+                row += " | " + a
+            table.append(row)
+    return Outcome(cpath, broken, overran, len(ds), alarmed, peak, table)
+
+
+def keeps_the_concurrency(cp: Campaign, cases: list[(str, dict[str, int])]) -> None:
+    """Run the campaign cp for each case, as (what the upgrade times are,
+    the times), with room up to max-concurrency. On these times the run
+    held at the target keeps every promise. So the concurrency may not
+    rise above the target, no more devices than the target may be in
+    flight, and no promise may break. The test fails with what goes
+    wrong, one to a line."""
+    problems: list[str] = []
+    for case in cases:
+        o = run(cp, cp.maxc, case.1)
+        room = "{case.0}, up to {cp.maxc}"
+        if o.top() > cp.target:
+            problems.append("{room}: the concurrency goes {o.changes()}")
+        if o.peak > cp.target:
+            problems.append("{room}: {o.peak} devices in flight at once")
+        if o.broken > 0:
+            problems.append("{room}: {o.broken} promise(s) break")
+    testing.assertTrue(len(problems) == 0, "\n" + "\n".join(problems))
+
+
+def gives_no_alarm(cp: Campaign, cases: list[(str, dict[str, int])]) -> None:
+    """Run the campaign cp for each case, as (what the upgrade times are,
+    the times), held at the target. On these times the run keeps every
+    promise, so no plan may say that devices will miss their window. The
+    test fails with what goes wrong, one to a line."""
+    problems: list[str] = []
+    for case in cases:
+        held = run(cp, cp.target, case.1)
+        at = "{case.0}, held at {cp.target}"
+        if held.broken > 0:
+            problems.append("{at}: {held.broken} promise(s) break")
+        if held.alarmed > 0:
+            problems.append("{at}: will-miss alarms in {held.alarmed} of {held.decisions} plans")
+    testing.assertTrue(len(problems) == 0, "\n" + "\n".join(problems))
+
+
+def keeps_every_promise(cp: Campaign, cases: list[(str, dict[str, int])]) -> None:
+    """Run the campaign cp for each case, as (what the upgrade times are,
+    the times), held at the target and with room up to max-concurrency.
+    On these times each device fits in the window that the first plan
+    promised it, so no promise may break. The test fails with what goes
+    wrong, one to a line."""
+    problems: list[str] = []
+    for case in cases:
+        held = run(cp, cp.target, case.1)
+        if held.broken > 0:
+            problems.append("{case.0}, held at {cp.target}: {held.broken} promise(s) break")
+        o = run(cp, cp.maxc, case.1)
+        if o.broken > 0:
+            problems.append("{case.0}, up to {cp.maxc}: {o.broken} promise(s) break")
+    testing.assertTrue(len(problems) == 0, "\n" + "\n".join(problems))
+
+
+def needs_a_rise(cp: Campaign, cases: list[(str, dict[str, int], int, int)]) -> None:
+    """Run the campaign cp for each case, as (what the upgrade times are,
+    the times, the most promises that may break, the most devices that
+    may be in flight when their window closes), held at the target and
+    with room up to max-concurrency. Held at the target, more promises
+    break than the case lets break, so the concurrency must rise. With
+    room it must rise, and break and overrun no more than the case lets.
+    The test fails with what goes wrong, one to a line."""
+    problems: list[str] = []
+    for case in cases:
+        held = run(cp, cp.target, case.1)
+        if held.broken <= case.2:
+            problems.append("{case.0}, held at {cp.target}: only {held.broken} promise(s) "
+                            + "break, so no rise is needed")
+        o = run(cp, cp.maxc, case.1)
+        room = "{case.0}, up to {cp.maxc}"
+        if o.top() <= cp.target:
+            problems.append("{room}: the concurrency does not rise")
+        if o.broken > case.2:
+            problems.append("{room}: {o.broken} promise(s) break, at most {case.2}")
+        if o.overran > case.3:
+            problems.append("{room}: {o.overran} device(s) in flight when their window closes, "
+                            + "at most {case.3}")
+    testing.assertTrue(len(problems) == 0, "\n" + "\n".join(problems))
+
+
+def late_by_seconds() -> list[(str, dict[str, int])]:
+    """Upgrade times where one device ends 3 to 60 s late: in the
+    round of 1, in the round of 2 (3 s and 60 s late), and in the first
+    round of the second night. When its report could have counted and
+    has not, the plan expects it to take one more whole upgrade. In the
+    run ahead the rounds after it start later, and devices miss the night
+    they were promised. The device reports soon after, and held at 8 the
+    run keeps every promise."""
+    return [
+        ("d0 ends 10 s late", {"d0": 610}),
+        ("d1 ends 3 s late", {"d1": 603}),
+        ("d1 ends 60 s late", {"d1": 660}),
+        ("d7 ends 10 s late", {"d7": 610}),
+    ]
+
+
+def _test_a_device_seconds_late_keeps_the_concurrency():
+    """On the times of late_by_seconds(), held at 8, the run keeps every
+    promise. So the concurrency must stay at 8."""
+    keeps_the_concurrency(nights(), late_by_seconds())
+
+
+def _test_a_device_seconds_late_gives_no_alarm():
+    """On the times of late_by_seconds(), held at 8, the run keeps every
+    promise. So no plan may say that devices will miss their night."""
+    gives_no_alarm(nights(), late_by_seconds())
+
+
+def early_by_seconds() -> list[(str, dict[str, int])]:
+    """Upgrade times where one device ends 10 s early: in the round of 1,
+    and in the last round of the first night. Its report moves the
+    observed pace to 597 s. The pace stays there: a quarter of the way
+    back to 600 s rounds down to no change. So each device that starts
+    after the report is expected to end 3 s before it does. When its
+    report could have counted and has not, the plan expects it to take
+    one more whole upgrade. Held at 8, the run keeps every promise."""
+    return [
+        ("d0 ends 10 s early", {"d0": 590}),
+        ("d6 ends 10 s early", {"d6": 590}),
+    ]
+
+
+def _test_a_device_seconds_early_keeps_the_concurrency():
+    """On the times of early_by_seconds(), held at 8, the run keeps every
+    promise. So the concurrency must stay at 8."""
+    keeps_the_concurrency(nights(), early_by_seconds())
+
+
+def _test_a_device_seconds_early_gives_no_alarm():
+    """On the times of early_by_seconds(), held at 8, the run keeps every
+    promise. So no plan may say that devices will miss their night."""
+    gives_no_alarm(nights(), early_by_seconds())
+
+
+def scattered() -> list[(str, dict[str, int])]:
+    """Upgrade times for d0 to d78 that scatter around the estimate: 570,
+    630, 600, 660 and 540 s in turn. d0 ends 30 s early, and the observed
+    pace falls to 592 s. So d1 and d2 are expected to end at 00:19:23. At
+    00:19:25 both are late, d2 although it takes its 600 s estimate, and
+    the plan expects each to take one more whole upgrade. Later, other
+    devices of 600 s or more are late in the same way. Held at 8, the run
+    keeps every promise."""
+    times = [570, 630, 600, 660, 540]
+    return [("570, 630, 600, 660 and 540 s in turn",
+             {"d{i}": times[i % len(times)] for i in range(79)})]
+
+
+def _test_scattered_upgrades_keep_the_concurrency():
+    """On the times of scattered(), held at 8, the run keeps every
+    promise. So the concurrency must stay at 8."""
+    keeps_the_concurrency(nights(), scattered())
+
+
+def _test_scattered_upgrades_give_no_alarm():
+    """On the times of scattered(), held at 8, the run keeps every
+    promise. So no plan may say that devices will miss their night."""
+    gives_no_alarm(nights(), scattered())
+
+
+def one_slow_upgrade() -> list[(str, dict[str, int])]:
+    """Upgrade times where d6, in the last round of the first night, takes
+    950 s. It ends before the night closes, and after the last start that
+    fits in it. Its report moves the observed pace a quarter of the way
+    to 950 s: to 687 s. The mean of the seven upgrades of the night is
+    650 s. At 687 s the third round of a night does not fit in the run
+    ahead. The next upgrades take 600 s, and held at 8 the run keeps
+    every promise."""
+    return [("d6 takes 950 s", {"d6": 950})]
+
+
+def _test_one_slow_upgrade_keeps_the_concurrency():
+    """On the times of one_slow_upgrade(), held at 8, the run keeps every
+    promise. So the concurrency must stay at 8."""
+    keeps_the_concurrency(nights(), one_slow_upgrade())
+
+
+def _test_one_slow_upgrade_gives_no_alarm():
+    """On the times of one_slow_upgrade(), held at 8, the run keeps every
+    promise. So no plan may say that devices will miss their night."""
+    gives_no_alarm(nights(), one_slow_upgrade())
+
+
+def round_of_8() -> list[(str, dict[str, int])]:
+    """Upgrade times for the round of 8 of edge(), d7 to d14, that average
+    the 600 s estimate, with the slower devices last. The round starts at
+    00:31:30. The observed pace moves a quarter of the way to each time,
+    so when the slower devices count it reads 610 s, or 608 s for the
+    spread times. The upgrades after the round take 600 s."""
+    return [
+        ("four take 576 s, then four 624 s",
+         {"d7": 576, "d8": 576, "d9": 576, "d10": 576,
+          "d11": 624, "d12": 624, "d13": 624, "d14": 624}),
+        ("they take 576, 582, 588, 594, 606, 612, 618 and 624 s",
+         {"d7": 576, "d8": 582, "d9": 588, "d10": 594,
+          "d11": 606, "d12": 612, "d13": 618, "d14": 624}),
+    ]
+
+
+def _test_a_round_that_averages_the_estimate_keeps_the_concurrency():
+    """On the times of round_of_8() in a 3903 s window, held at 8, the
+    run keeps every promise. So the concurrency must stay at 8."""
+    keeps_the_concurrency(edge(3903), round_of_8())
+
+
+def _test_a_round_that_averages_the_estimate_gives_no_alarm():
+    """On the times of round_of_8() in a 3903 s window, held at 8, the
+    run keeps every promise. So no plan may say that devices will miss
+    their window."""
+    gives_no_alarm(edge(3903), round_of_8())
+
+
+def _test_a_round_that_averages_the_estimate_keeps_every_promise():
+    """On the times of round_of_8(), a 3269 s window holds one round less.
+    When the slower devices count, an upgrade at the observed pace needs,
+    with a fifth to spare, more than the 725 s left at 00:42:24. So the
+    four devices of the last round that wait for the slower ones do not
+    start in it. With the spread times only d22, which waits for d14,
+    does not start in it. They miss the window they were promised, though their 600 s
+    fit."""
+    keeps_every_promise(edge(3269), round_of_8())
+
+
+def _test_upgrades_too_slow_for_8_at_once_raise_the_concurrency():
+    """When every upgrade takes 720 s, 2 rounds fit in a night, not 3.
+    The ramp starts 3 devices in the first night and 12 in the second at
+    any concurrency, so 20 promises break. Held at 8, 68 break. When d1
+    takes 1200 s, the round of 4 cannot start in the first night at any
+    concurrency, so 3 of its 4 promises break; d3 takes d2's slot. Held
+    at 8, 24 break."""
+    needs_a_rise(nights(), [
+        ("every upgrade takes 720 s", {"d{i}": 720 for i in range(79)}, 20, 0),
+        ("d1 takes 1200 s", {"d1": 1200}, 3, 0),
+    ])
+
+
+def _test_a_change_of_pace_raises_the_concurrency_in_time():
+    """The upgrades become 30 % slower. Then 2 rounds fit in a night, not
+    3, and the concurrency must rise before the rest of the night is
+    lost. The observed pace must follow the change, so that no device
+    starts that is then in flight when its window closes."""
+    later: dict[str, int] = {}
+    for i in range(79):
+        later["d{i}"] = 570 if i < 31 else 780
+    needs_a_rise(nights(), [
+        # Held at 8, 48 promises break.
+        ("780 s from the second night", {"d{i}": 780 for i in range(7, 79)}, 0, 0),
+        # Every upgrade before the change ends early, so a mean of the
+        # upgrades follows the change slowly. Held at 8, 24 promises
+        # break. The concurrency goes to 12 and then 14, and 4 promises
+        # break. With 16 from d2 00:09:32, when the first round of the
+        # third night is late, none break. With 16 from its first report,
+        # at d2 00:13:01, 4 still break.
+        ("570 s for two nights, then 780 s", later, 4, 0),
+    ])
+
+
+def _test_a_heavy_tail_raises_the_concurrency():
+    """Some devices take 1500 s, 2.5 times their estimate. Such a device
+    that starts in the last round of a night is in flight when the window
+    closes."""
+    every10: dict[str, int] = {}
+    for i in range(79):
+        if i % 10 == 9:
+            every10["d{i}"] = 1500
+    needs_a_rise(nights(), [
+        # d2 holds a slot of the round of 2 until it ends at 00:35:01,
+        # past 00:24:00, the last start that fits in the first night. So
+        # that night starts 4, not 7. d20 starts in the last round of the
+        # second night. Held at 8, 24 promises break and 2 devices
+        # overrun.
+        ("d2, d20 and d45 take 1500 s", {"d2": 1500, "d20": 1500, "d45": 1500}, 3, 1),
+        # d9, d19, ... d69. The concurrency goes to 32, max-concurrency.
+        # Held at 8, 18 promises break and 1 device overruns.
+        ("every tenth device takes 1500 s", every10, 2, 0),
+    ])
+
+
+def _test_a_device_that_never_reports_is_looked_at_no_more_than_three_times_an_upgrade():
+    """31 devices: 7 for the first night and 24 for the second. d1 never
+    reports. It holds its slot, and each time it is late the plan expects
+    it to end one upgrade later. So while nothing else happens, the
+    controller decides twice in each 602 s: 301 times up to the end of
+    the second night. The run may have at most three decisions in each
+    upgrade time of 600 s. d1 also delays each doubling of the ramp, so
+    the first night starts 4 devices and the second 13, and 17 promises
+    break."""
+    cp = nights(31)
+    cp.until = DAY + 2160
+    o = run(cp, 32, {"d1": 100 * DAY})
+    most = 3 * cp.until // 600
+    testing.assertTrue(o.decisions <= most, "{o.decisions} decisions, at most {most}")
+    testing.assertTrue(o.broken <= 17, "{o.broken} broken promises, at most 17")
+
+
+def _test_snapshot_a_device_seconds_late():
+    """d1 ends 10 s late. At 00:20:03 it is 1 s past its expected end and
+    the debounce, so the plan expects it to take one more upgrade, to
+    00:30:03. In the plan, the round of 4 then cannot start in the first
+    night, and the ramp starts the second night at 4, not 8. At 8 at once each later
+    night passes 7 promises on. 15 at once breaks only the 3 of the first
+    night, as 32 does, so the concurrency goes to 15. d1 reports 8 s
+    later, but the concurrency stays at 15, and the later nights start 15
+    at once. Held at 8, the same plan says that 24 devices will miss
+    their window, and none does."""
+    cp = nights()
+    return run(cp, 32, {"d1": 610}).text("d1 ends 10 s late, up to 32") + "\n\n" \
+           + run(cp, 8, {"d1": 610}).text("the same, held at 8")
+
+
+def _test_snapshot_scattered_upgrades():
+    """d0 takes 570 s, so the pace falls to 592 s, and d1 (630 s) and d2
+    (600 s) are late at 00:19:25. The concurrency goes to 16 and stays
+    there, and the third and fourth nights start 16 at once. Held at 8,
+    the run keeps every promise, but in each night plans say that devices
+    will miss their window."""
+    cp = nights()
+    times = scattered()[0].1
+    return run(cp, 32, times).text("570, 630, 600, 660 and 540 s in turn, up to 32") \
+           + "\n\n" + run(cp, 8, times).text("the same, held at 8")
+
+
+def _test_snapshot_one_slow_upgrade():
+    """d6 takes 950 s. Its report counts at 00:35:53, and the observed
+    pace goes to 687 s. In the run ahead a night then holds two rounds,
+    not three: 16 devices at 8 at once, and 24 at 16 at once. So the
+    concurrency goes to 16. After the first round of the second night the
+    pace is 608 s, but the concurrency stays at 16, and each later night
+    starts 16 at once. Held at 8, three plans say that 48 devices will
+    miss their window, and none does."""
+    cp = nights()
+    return run(cp, 32, {"d6": 950}).text("d6 takes 950 s, up to 32") + "\n\n" \
+           + run(cp, 8, {"d6": 950}).text("the same, held at 8")
+
+
+def _test_snapshot_a_round_that_averages_the_estimate():
+    """d7 to d10 take 576 s and d11 to d14 624 s, in a 3903 s window.
+    When the four fast ones count at 00:41:36, the pace reads 582 s. The
+    slow ones report at 00:41:54. At 00:42:00 the run ahead counts their
+    reports, the pace reads 610 s, and d27 to d30 start in the second
+    window. 12 at once starts them in the first, so the concurrency goes
+    to 12, and the second window starts 10 at once. Held at 8, the pace
+    is back at 600 s at 00:52:54, and d27 to d30 start then in the first
+    window, 9 s before the last start that fits."""
+    cp = edge(3903)
+    durations = round_of_8()[0].1
+    return run(cp, 16, durations).text("four take 576 s, then four 624 s, up to 16") + "\n\n" \
+           + run(cp, 8, durations).text("the same, held at 8")
