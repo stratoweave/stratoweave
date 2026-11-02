@@ -39,11 +39,22 @@
   let deleteTarget = $state<Device | null>(null);
   let deleting = $state(false);
 
-  let filterText = $state('');
+  let filterText = $state(untrack(() => data.nameFilter));
   let filterType = $state('');
   // Schedule selects hold '' (any or nothing chosen), 'none' or '=NAME'.
   let filterSchedule = $state(untrack(() => (data.scheduleFilter ? `=${data.scheduleFilter}` : '')));
   let page = $state(1);
+
+  // A new ?name= (the search's "show all" row while this page is open)
+  // replaces the name filter; a reload after a write keeps what was typed.
+  let urlName = $derived(data.nameFilter);
+  $effect(() => {
+    const name = urlName;
+    untrack(() => {
+      filterText = name;
+      page = 1;
+    });
+  });
 
   let types = $derived([...new Set(data.devices.map((d) => d.type))].sort());
   let scheduleNames = $derived(data.schedules.map((s) => s.name));
