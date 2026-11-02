@@ -22,7 +22,7 @@ after devices finish applying — a real install takes minutes.
 
     # UI development, from ../
     just webui
-    # -> http://localhost:3000, /restconf and /image-file proxied to FLEETMGR_API
+    # -> http://localhost:3000, /restconf, /image-file and /layer proxied to FLEETMGR_API
 
 Type check: `npm run check`. After UI changes: `just gen-webui`, then
 `just build` and commit the regenerated module.
@@ -148,6 +148,11 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `rolled-back`; `pending`/`unknown` count into nothing, so counters need
   not sum to `total`. Status is not latched — it tracks live device state
   and regresses when a campaign goes back to `plan`.
+- The Config page shows layer 0, the top's configuration, from
+  `GET /layer/0` (next to RESTCONF, not under it): `content=config`,
+  `nonconfig` (the state its transforms publish, such as campaign
+  progress) or `all`, as JSON, XML or AData. The choice is in the URL, so
+  Refresh reads it again.
 
 ## Campaigns
 

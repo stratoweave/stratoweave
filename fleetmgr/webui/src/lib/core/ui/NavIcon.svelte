@@ -4,12 +4,16 @@
     | 'images'
     | 'devices'
     | 'schedules'
-    | 'refresh';
+    | 'config'
+    | 'refresh'
+    | 'wrap'
+    | 'copy'
+    | 'check';
 </script>
 
 <script lang="ts">
   // Line icons on a 24 px grid, drawn in the current text colour. Ported from
-  // the sorespo web UI; `campaigns` is fleetmgr's own.
+  // the sorespo web UI; `campaigns` and `config` are fleetmgr's own.
   let { name, size = 18 }: { name: NavIconName; size?: number } = $props();
 </script>
 
@@ -38,7 +42,17 @@
   {:else if name === 'schedules'}
     <rect x="3" y="5" width="18" height="16" rx="1.5" />
     <path d="M3 10h18M8 3v4M16 3v4M7 14h3v3H7z" />
+  {:else if name === 'config'}
+    <path d="M14 3H5v18h14V8zM14 3v5h5M8 12h8M8 16h5" />
   {:else if name === 'refresh'}
     <path d="M20 4v5h-5M4 20v-5h5M20 9a8 8 0 0 0-14-3M4 15a8 8 0 0 0 14 3" />
+  {:else if name === 'wrap'}
+    <path d="M3 6h18M3 12h13a3 3 0 0 1 0 6h-3M3 18h6" />
+    <path d="m15 15-2 3 2 3" />
+  {:else if name === 'copy'}
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+  {:else if name === 'check'}
+    <path d="m5 12.5 4.5 4.5L19 7.5" />
   {/if}
 </svg>
