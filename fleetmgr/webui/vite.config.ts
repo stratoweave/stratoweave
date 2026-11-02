@@ -1,11 +1,11 @@
 import { sveltekit } from '@sveltejs/kit/vite';
 import { defineConfig } from 'vite';
 
-// Dev-mode API proxy: `vite dev` forwards /restconf and /image-file to a
-// running top (`just webui` sets STRATOWEAVE_API_ORIGIN from FLEETMGR_API).
+// Dev-mode API proxy: `vite dev` forwards /restconf, /image-file and /layer
+// to a running top (`just webui` sets STRATOWEAVE_API_ORIGIN from FLEETMGR_API).
 // The raw, still percent-encoded path is forwarded as-is, which RESTCONF
 // list keys depend on. The embedded build needs no proxy: the top serves
-// both.
+// them all.
 const API_PROXY_TARGET = process.env.STRATOWEAVE_API_ORIGIN ?? 'http://127.0.0.1:18200';
 
 export default defineConfig({
@@ -19,7 +19,8 @@ export default defineConfig({
   server: {
     proxy: {
       '^/restconf(/|$)': { target: API_PROXY_TARGET },
-      '^/image-file(/|$)': { target: API_PROXY_TARGET }
+      '^/image-file(/|$)': { target: API_PROXY_TARGET },
+      '^/layer(/|$)': { target: API_PROXY_TARGET }
     }
   }
 });

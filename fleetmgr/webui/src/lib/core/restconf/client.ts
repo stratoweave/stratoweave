@@ -160,6 +160,24 @@ export function restconfPatchJson<T>(path: string, body: unknown): Promise<T> {
   });
 }
 
+/** PATCH a body sent as is, JSON or XML as contentType says. */
+export function restconfPatchText(
+  path: string,
+  body: string,
+  contentType: string,
+  signal?: AbortSignal
+): Promise<null> {
+  return restconfRequest<null>(path, {
+    method: 'PATCH',
+    body,
+    signal,
+    headers: ASYNC_WRITE_HEADERS,
+    accept: contentType,
+    contentType,
+    readBody: false
+  });
+}
+
 export function restconfDelete(path: string): Promise<unknown> {
   return restconfRequest(path, {
     method: 'DELETE',

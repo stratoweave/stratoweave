@@ -264,6 +264,14 @@ Unlike the device config endpoints, serialization is selected with the
 - `application/yang-data+json`
 - `application/yang-data+acton-adata`
 
+The `content` query parameter selects what is returned, as in RESTCONF:
+
+- `config` (default): the configuration
+- `nonconfig`: the operational state the layer's transforms publish
+- `all`: both, merged into one tree
+
+A layer with no operational state returns an empty document for `nonconfig`.
+
 Examples:
 
 ```sh
@@ -275,6 +283,9 @@ curl -H "Accept: application/yang-data+json" \
 
 curl -H "Accept: application/yang-data+acton-adata" \
   "$STRATOWEAVE_API_ORIGIN/layer/3?loose=true"
+
+curl -H "Accept: application/yang-data+json" \
+  "$STRATOWEAVE_API_ORIGIN/layer/0?content=nonconfig"
 ```
 
 The meaning of each layer index depends on the system specification.

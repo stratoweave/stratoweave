@@ -44,6 +44,8 @@
 - RESTCONF replies use compact JSON and XML. `ncurl` output and the
   `/device/<name>/target`, `/running` and `/diff` inspection endpoints are
   still indented. [#684]
+- The `/layer/<idx>` inspection endpoint takes the same `content` query
+  parameter, so it can return a layer's operational state too.
 
 ### Devices & Adapters
 - New SNMP device adapters, built from MIBs. The system generator translates

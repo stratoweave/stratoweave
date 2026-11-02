@@ -80,6 +80,9 @@ demo-reschedule` reopens a running demo's windows shortly; give it the same
 window length and schedule list, `just demo-reschedule 14400 europe` for the
 big demo.
 
+`just run` starts the same top and flotillas with no config: no devices,
+images or campaigns.
+
 For bottom-node development, `just flotilla` still starts one standalone
 instance on the first flotilla's ports. Do not run it alongside `just demo`.
 
