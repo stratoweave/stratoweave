@@ -380,6 +380,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                            postcheck: (verdict: ?str, detail: ?str, at: ?str))] = {}
     var subscriptions: ?ygdata.SubscriptionManager = None
     var subscriptions_synced = False
+    # Set by shutdown, when the campaign is deleted.
+    var closed = False
     var plan_layout: list[(str, int, int, list[(str, int, int)])] = []
     var plan_alarms: list[str] = []
     var running = False
@@ -481,12 +483,25 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         ctl.lost(name)
 
     def changed(relevant: bool) -> None:
-        if relevant and subscriptions_synced and active and not debounce_armed:
+        """Act on a change in what the members report, once per debounce: a
+        campaign that decides decides again, and the decision publishes;
+        any other campaign publishes. Its devices can still change after it
+        stops or finishes."""
+        if relevant and subscriptions_synced and not debounce_armed and not closed:
             debounce_armed = True
             gen = generation
             # after now: the batch gets the whole window, however late the
             # telemetry that opens it arrives.
-            after now debounce_s: decide(gen)
+            if active:
+                after now debounce_s: decide(gen)
+            else:
+                after now debounce_s: publish_settled(gen)
+
+    def publish_settled(gen: int) -> None:
+        if gen != generation:
+            return
+        debounce_armed = False
+        publish()
 
     def on_rfs(
         keys: ?(rfs_name: str, device_name: str),
@@ -512,6 +527,9 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         changed(relevant)
 
     def on_subscriptions_synced() -> None:
+        # Closing the subscriptions fires a sync that is still pending.
+        if closed:
+            return
         subscriptions_synced = True
         gen = generation
         if active:
@@ -520,8 +538,14 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             publish()
 
     def shutdown() -> None:
-        # Releasing the subscriptions here is a separate change.
-        pass
+        # The campaign is deleted: end its timers, stop hearing from its
+        # members and clear its state.
+        closed = True
+        generation += 1
+        if subscriptions is not None:
+            subscriptions!.close()
+            subscriptions = None
+        update_oper(None)
 
     def decide(gen: int) -> None:
         """Plan and take the plan's first step, start the devices it
@@ -587,9 +611,11 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         active = running
 
         if lower_tree_provider is not None and subscriptions is None:
+            # The actor id keeps apart the subscriptions of a deleted campaign
+            # and of one created again under the same name.
             subscriptions = ygdata.SubscriptionManager(
                 lower_tree_provider!,
-                "campaign-status:{path}",
+                "campaign-status:{path}:{actorid()}",
             )
 
         if subscriptions is not None:

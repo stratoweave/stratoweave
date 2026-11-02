@@ -508,6 +508,134 @@ def _campaign_path(name: str) -> ttt.Path:
     return ttt.PathKey(name, campaigns, {gdata.Id(y0_oper.NS_software, "name"): gdata.Leaf(name)})
 
 
+def _cleared_last(published: list[bool]) -> bool:
+    """Whether a campaign published nothing after clearing its state: its
+    only None, False here, came last."""
+    nones = [p for p in published if not p]
+    return len(nones) == 1 and not published[len(published) - 1]
+
+
+actor _test_deleted_campaign_publishes_nothing_more(t: testing.AsyncT):
+    """A campaign in plan deleted while a member change waits out its
+    debounce clears its state and then publishes nothing: not for that
+    change, nor for a sync that comes after the delete."""
+    var published: list[bool] = []
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        published.append(oper is not None)
+
+    def check() -> None:
+        if _cleared_last(published):
+            t.success()
+        else:
+            t.failure(ValueError("published {published}"))
+
+    names = ["cpe-1", "cpe-2"]
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+    campaign.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+    campaign.on_subscriptions_synced()
+    # cpe-1's state goes, a member change like any other.
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), None, None)
+    campaign.shutdown()
+    # Closing the subscriptions fires a sync that is still pending.
+    campaign.on_subscriptions_synced()
+    after float(cfs.campaign_debounce_s(len(names))) + 0.5: check()
+
+
+actor _test_deleted_running_campaign_stops_deciding(t: testing.AsyncT):
+    """A deleted running campaign clears its state, and a member change
+    after the delete does not make it decide again."""
+    var published: list[bool] = []
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        published.append(oper is not None)
+
+    def check() -> None:
+        if _cleared_last(published):
+            t.success()
+        else:
+            t.failure(ValueError("published {published}"))
+
+    names = ["cpe-1", "cpe-2"]
+    campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+    campaign.on_conf(_paced_campaign(names), _with_nightly(_flat_inventory(names)).to_gdata())
+    campaign.on_subscriptions_synced()
+    campaign.shutdown()
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), None, None)
+    after float(cfs.campaign_debounce_s(len(names))) + 0.5: check()
+
+
+actor _SubscriptionLog():
+    """The owner ids declared to and removed from a _LoggingTreeProvider;
+    each declaration syncs at once."""
+    var declared: list[str] = []
+    var removed: list[str] = []
+
+    def declare(owner_id: str, synced: ?action(str) -> None) -> None:
+        declared.append(owner_id)
+        if synced is not None:
+            synced(owner_id)
+
+    def remove(owner_id: str) -> None:
+        removed.append(owner_id)
+
+    def owners() -> (list[str], list[str]):
+        return (list(declared), list(removed))
+
+
+class _LoggingTreeProvider(gdata.TreeProvider):
+    log: _SubscriptionLog
+
+    def __init__(self, log: _SubscriptionLog):
+        self.log = log
+
+    proc def rpc(self, cb: action(?gdata.Node, ?Exception) -> None, gdata_rpc: gdata.Node):
+        cb(None, ValueError("no RPC"))
+
+    proc def declare_subscriptions(self, owner_id: str, cb: proc(?gdata.Node, ?Exception) -> None, want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None):
+        self.log.declare(owner_id, synced)
+
+    proc def remove_subscriptions(self, owner_id: str):
+        self.log.remove(owner_id)
+
+
+actor _test_recreated_campaign_keeps_its_subscription(t: testing.AsyncT):
+    """A campaign deleted and one created again under the same name declare
+    subscriptions of their own, so the delete of the old one removes only
+    its own, also when it comes after the new one has subscribed."""
+    log = _SubscriptionLog()
+    names = ["cpe-1", "cpe-2"]
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    old = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, lambda o: None,
+                                       _LoggingTreeProvider(log))
+    old.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+    new = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, lambda o: None,
+                                       _LoggingTreeProvider(log))
+    new.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+
+    def check() -> None:
+        declared, removed = log.owners()
+        kept = [d for d in declared if d not in removed]
+        if len(removed) == 0:
+            after 0.05: check()
+        elif len(set(declared)) == 2 and len(removed) == 1 and len(kept) == 1:
+            t.success()
+        else:
+            t.failure(ValueError("declared {declared}, removed {removed}"))
+
+    def delete_old() -> None:
+        if len(log.owners().0) < 2:
+            after 0.05: delete_old()
+        else:
+            old.shutdown()
+            check()
+
+    delete_old()
+
+
 actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
     """Each device's stage, reason and check verdicts reach the campaign next
     to its status, as its flotilla reports them. A device not heard from has
@@ -579,6 +707,35 @@ actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
     # The replay is in. A campaign in plan publishes once it is synced.
     campaign.on_subscriptions_synced()
     after 2.0: fail("the campaign published no verdicts")
+
+
+actor _test_campaign_not_running_publishes_changes(t: testing.AsyncT):
+    """A campaign that does not decide, here one in plan, still publishes
+    what its members report after it has synced."""
+    var last = "nothing"
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if oper is not None:
+            r = oper!.state.device_status.get("cpe-1")
+            last = r.status if r is not None and r.status is not None else "missing"
+
+    def check() -> None:
+        if last == "in-progress":
+            t.success()
+        else:
+            t.failure(ValueError("cpe-1 published as {last}"))
+
+    names = ["cpe-1", "cpe-2"]
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+    campaign.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+    campaign.on_subscriptions_synced()
+    # cpe-1 starts its upgrade, as when a stopped campaign's released
+    # device carries on.
+    status = y1_oper.stratoweave_rfs__rfs__device__software__state(status="in-progress")
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), status, None)
+    after float(cfs.campaign_debounce_s(len(names))) + 0.5: check()
 
 
 def _render_layout(header: str, layout: list[(str, int, int, list[(str, int, int)])],
