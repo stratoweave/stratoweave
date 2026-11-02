@@ -211,8 +211,8 @@ publishes the status, stage, reason and check verdicts in the entry's own
 `state` and the platform as its `state/platform`. A change on one device
 publishes one entry. Removing the entry closes the subscription and clears
 the state. Each campaign transform subscribes to the `state` of every entry,
-one subscription, and aggregates its own members, each with the version its
-platform reports. Each `/fleet/device` actor subscribes to its RFS entry's
+one subscription, and aggregates its own members, each with the version and
+model its platform reports. Each `/fleet/device` actor subscribes to its RFS entry's
 platform and publishes it as its own
 `state/platform`: OS, version, model and serial number.
 
