@@ -17,8 +17,7 @@ an IOS XE device.
     flotilla operational datastore /device{cpe}/software/state
     and /device{cpe}/state/platform
         -> one on-change subscription per device
-        -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}/software/state
-           and /rfs{flotilla-1}/device{cpe}/state/platform
+        -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}/state
         -> fleetmgr CFS /software/upgrade-campaign/state
            and /fleet/device{cpe}/state/platform
 
@@ -208,13 +207,13 @@ configuration, so campaigns can link the whole list later.
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription on the flotilla
 to the device's `/device/software/state` and `/device/state/platform`, and
-publishes the status, running release, stage, reason and check verdicts as the
-entry's own `software/state` and the platform as its `state/platform`. A change
-on one device publishes one entry. Removing the entry closes the subscription
-and clears the state. Campaign transforms subscribe to these entries and
-aggregate their own members. Each `/fleet/device` actor subscribes to its RFS
-entry's platform and publishes it as its own `state/platform`: OS, version,
-model and serial number.
+publishes the status, running release, stage, reason and check verdicts in the
+entry's own `state` and the platform as its `state/platform`. A change on one
+device publishes one entry. Removing the entry closes the subscription and
+clears the state. Each campaign transform subscribes to the `state` of every
+entry, one subscription, and aggregates its own members. Each `/fleet/device`
+actor subscribes to its RFS entry's platform and publishes it as its own
+`state/platform`: OS, version, model and serial number.
 
 `flotilla` supplies one modeled layer, the standard RFS plus the
 `flotilla-rfs` augment below. StratoWeave adds the implicit device layer
