@@ -4,7 +4,7 @@ import testing
 
 import fleet_ctl
 from fleet_ctl import Controller
-import fleet_sched_sim as sim
+import fleet_ctl_sim as sim
 
 HOUR = 3600
 DAY = 86400
@@ -22,11 +22,14 @@ def daily(schedule: str, start: int, length: int, days: int) -> list[(str, int, 
 
 def controller(windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
                maxc: int, must_place: bool=False, debounce: int=0,
-               estimate: int=600) -> Controller:
+               estimate: int=600, groups: dict[str, list[str]]={},
+               priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
+               rung: int=1) -> Controller:
     """A controller at the start of a run."""
     c = Controller()
-    c.configure(windows, devs, target, maxc, must_place, debounce, estimate)
-    c.start()
+    c.configure(windows, devs, target, maxc, must_place, debounce, estimate, groups, priority,
+                separation)
+    c.start(rung)
     return c
 
 
@@ -90,13 +93,14 @@ def _test_done_at_its_report():
 
 def _test_final_report_from_before_the_release():
     """A device that reported a final status before it was released is
-    done at the decision that sees it after the release."""
+    done at the decision that sees it after the release. It ran no
+    upgrade, so the pace stays."""
     c = open_window(2, 1, 1)
     c.report("d0", "up-to-date", 0)
     c.decide(10)
     c.decide(40)
     testing.assertEqual(c.done_at, {"d0": 40})
-    testing.assertEqual(c.observed_s, (600 * 3 + 30) // 4)
+    testing.assertEqual(c.observed_s, 600)
 
 
 def _test_lost_or_later_status_is_not_done():
@@ -145,10 +149,13 @@ def _test_a_device_waits_for_a_window_it_fits():
 
 
 def plan_is_run(windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
-                maxc: int, must_place: bool, estimate: int) -> None:
+                maxc: int, must_place: bool, estimate: int,
+                groups: dict[str, list[str]]={}, priority: dict[str, int]={},
+                separation: dict[str, (bool, int)]={}) -> None:
     """Run on the expected durations, the controller starts every device
     in the window and at the time its first plan said."""
-    c = controller(windows, devs, target, maxc, must_place, 1, estimate)
+    c = controller(windows, devs, target, maxc, must_place, 1, estimate, groups, priority,
+                   separation)
     p = c.plan(0)
     sim.drive(c, 0, {}, 30 * DAY)
     testing.assertEqual(sim.started(c), sim.planned(c, p))
@@ -450,3 +457,670 @@ def _test_observed_at_the_campaign_scale():
     c.report("d0", "succeeded", 60)
     c.decide(60)
     testing.assertEqual(c.observed_s, (120 * 3 + 240) // 4)
+
+
+def pairs(n: int) -> (dict[str, list[str]], dict[str, int]):
+    """Redundancy groups of two of the devices d0, d1, ...: d0 and d1, d2
+    and d3, and so on, the second of each pair first. Returns the groups
+    and the priorities."""
+    groups: dict[str, list[str]] = {}
+    priority: dict[str, int] = {}
+    for k in range(n // 2):
+        groups["g{k}"] = ["d{2 * k}", "d{2 * k + 1}"]
+        priority["d{2 * k}"] = 2
+        priority["d{2 * k + 1}"] = 1
+    return (groups, priority)
+
+
+def _test_the_member_before_comes_by_priority_then_name():
+    """Each member of a redundancy group waits for the member before it,
+    by priority and then name, in each of its groups. A member that is
+    not in the campaign orders nothing."""
+    cases: list[(dict[str, list[str]], dict[str, int], dict[str, list[(str, str)]])] = [
+        ({"g": ["a", "b"]}, {"a": 2, "b": 1}, {"a": [("b", "g")]}),
+        ({"g": ["b", "a"]}, {"a": 1, "b": 1}, {"b": [("a", "g")]}),
+        ({"g": ["a", "c", "b"]}, {"a": 1, "c": 2, "b": 3}, {"c": [("a", "g")], "b": [("c", "g")]}),
+        ({"g": ["a", "x"]}, {"a": 1, "x": 0}, {}),
+        ({"g1": ["a", "c"], "g2": ["b", "c"]}, {"a": 1, "b": 1, "c": 2},
+         {"c": [("a", "g1"), ("b", "g2")]}),
+    ]
+    devs = [("a", 600, "w"), ("b", 600, "w"), ("c", 600, "w")]
+    for case in cases:
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups=case.0,
+                       priority=case.1)
+        testing.assertEqual(c.before, case.2, str(case.0))
+
+
+def _test_members_start_one_at_a_time_by_priority():
+    """r1 and r2 back each other up. r1 has the lower priority, so it
+    goes first, though r2 comes first in the campaign. d0 is in no group
+    and starts with r1. r2 starts when r1 is done, not when d0 is."""
+    devs = [("r2", 600, "w"), ("r1", 600, "w"), ("d0", 600, "w")]
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 4, 4, groups={"g": ["r1", "r2"]},
+                   priority={"r1": 10, "r2": 20}, rung=4)
+    testing.assertEqual(c.decide(0).started, ["r1", "d0"])
+    c.report("d0", "succeeded", 300)
+    testing.assertEqual(c.decide(300).started, [])
+    c.report("r1", "succeeded", 600)
+    testing.assertEqual(c.decide(600).started, ["r2"])
+
+
+def _test_a_device_in_two_groups_waits_for_both():
+    """x comes after a in one group and after b in another. a and b share
+    no group, so they start together; x starts when both are done, and
+    after the min-separation of each group has passed."""
+    devs = [("x", 600, "w"), ("a", 600, "w"), ("b", 600, "w")]
+    # (the separations, and the devices that start when b is done at 700
+    # and the next decision; b took 700 s, so x is expected to take 625 s)
+    cases: list[(dict[str, (bool, int)], (list[str], int))] = [
+        ({}, (["x"], 1325)),
+        ({"g1": (False, 600), "g2": (False, 0)}, ([], 1200)),
+        ({"g1": (False, 0), "g2": (False, 600)}, ([], 1300)),
+    ]
+    for case in cases:
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 4, 4,
+                       groups={"g1": ["a", "x"], "g2": ["b", "x"]},
+                       priority={"a": 1, "b": 1, "x": 2}, separation=case.0, rung=4)
+        testing.assertEqual(c.decide(0).started, ["a", "b"])
+        c.report("a", "succeeded", 600)
+        testing.assertEqual(c.decide(600).started, [])
+        c.report("b", "succeeded", 700)
+        s = c.decide(700)
+        testing.assertEqual((s.started, s.wake), case.1, str(case.0))
+
+
+def _test_a_member_added_before_a_member_in_flight_waits_for_it():
+    """b upgrades. An operator adds a to the campaign and to b's group,
+    with a lower priority than b's. a starts only when b is done."""
+    wins = [("w", 0, fleet_ctl.OPEN_END)]
+    c = controller(wins, [("b", 600, "w")], 2, 2, groups={"g": ["b"]}, priority={"b": 2},
+                   rung=2)
+    testing.assertEqual(c.decide(0).started, ["b"])
+    c.configure(wins, [("a", 600, "w"), ("b", 600, "w")], 2, 2, False, 0, 600,
+                {"g": ["a", "b"]}, {"a": 1, "b": 2})
+    testing.assertEqual(c.decide(100).started, [])
+    c.report("b", "succeeded", 600)
+    testing.assertEqual(c.decide(600).started, ["a"])
+
+
+def _test_a_failed_member_holds_the_other_members():
+    """r1 fails, so r2 and r3 wait for an operator. The plan that sees the
+    failure says so, and keeps r2 and r3 in their window, also when the
+    run stops. The devices it holds do not raise the concurrency, and d0,
+    in no group, still starts."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w"), ("r3", 600, "w"), ("d0", 600, "w")]
+    c = controller([("w", 0, DAY)], devs, 1, 10, True, groups={"g": ["r1", "r2", "r3"]},
+                   priority={"r1": 1, "r2": 2, "r3": 3})
+    testing.assertEqual(c.decide(0).started, ["r1"])
+    c.report("r1", "failed", 600)
+    s = c.decide(600)
+    testing.assertEqual(s.started, ["d0"])
+    testing.assertEqual(s.plan.c, 1)
+    testing.assertEqual(s.plan.alarms,
+                        ["2 device(s) wait behind a failed redundancy group member: "
+                         + "r2, r3"])
+    testing.assertEqual([e.0 for e in c.layout(s.plan)[0].3], ["r1", "d0", "r2", "r3"])
+    c.stop()
+    testing.assertEqual([e.0 for e in c.layout(c.plan(700))[0].3], ["r1", "d0", "r2", "r3"])
+
+
+def _test_a_failed_member_holds_the_members_after_the_held_ones():
+    """r1 fails. r2 waits behind r1 in one group, and r3 waits behind r2 in
+    another: the plan holds both."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w"), ("r3", 600, "w"), ("d0", 600, "w")]
+    c = controller([("w", 0, DAY)], devs, 1, 10, True,
+                   groups={"g1": ["r1", "r2"], "g2": ["r2", "r3"]},
+                   priority={"r1": 1, "r2": 2, "r3": 3})
+    c.decide(0)
+    c.report("r1", "failed", 600)
+    testing.assertEqual(c.decide(600).plan.alarms,
+                        ["2 device(s) wait behind a failed redundancy group member: "
+                         + "r2, r3"])
+
+
+def _test_a_failure_that_has_not_counted_yet_holds_the_members():
+    """a reports a failure after its upgrade was expected to end, and the
+    failure counts one debounce later. A plan before then holds b already,
+    in the first window, and gives d, in no group, the room left there."""
+    wins = [("w", 0, 1400), ("w", DAY, DAY + 1400)]
+    devs = [("a", 600, "w"), ("b", 600, "w"), ("d", 600, "w")]
+    c = controller(wins, devs, 1, 1, debounce=5, groups={"g": ["a", "b"]},
+                   priority={"a": 1, "b": 2})
+    c.resume("a", 0, wins[0])
+    c.report("a", "failed", 600)
+    p = c.decide(601).plan
+    testing.assertEqual(p.alarms,
+                        ["1 device(s) wait behind a failed redundancy group member: b"])
+    testing.assertEqual(p.starts, {"d": (0, 605)})
+    testing.assertEqual(p.held, {"b": (0, 601)})
+
+
+def _test_a_failed_member_holds_a_member_added_before_it():
+    """b fails. An operator adds a to the campaign and to b's group, with a
+    lower priority than b's. a waits too, in the window of its schedule."""
+    wins = [("w", 0, fleet_ctl.OPEN_END)]
+    c = controller(wins, [("b", 600, "w")], 1, 1, groups={"g": ["b"]}, priority={"b": 2})
+    testing.assertEqual(c.decide(0).started, ["b"])
+    c.report("b", "failed", 600)
+    c.decide(600)
+    c.configure(wins, [("a", 600, "w"), ("b", 600, "w")], 1, 1, False, 0, 600,
+                {"g": ["a", "b"]}, {"a": 1, "b": 2})
+    s = c.decide(700)
+    testing.assertEqual(s.started, [])
+    testing.assertEqual(s.plan.alarms,
+                        ["1 device(s) wait behind a failed redundancy group member: a"])
+    testing.assertEqual([e.0 for e in c.layout(s.plan)[0].3], ["b", "a"])
+
+
+def _test_a_held_member_keeps_the_later_window_promised_to_it():
+    """r1 starts, and d fills the rest of the first window, so r2, of
+    15 min, is promised the second. r1 fails: r2 keeps the second window,
+    though the first is still open."""
+    wins = [("w", 0, 1400), ("w", DAY, DAY + 1400)]
+    devs = [("r1", 600, "w"), ("d", 600, "w"), ("r2", 900, "w")]
+    c = controller(wins, devs, 1, 1, groups={"g": ["r1", "r2"]}, priority={"r1": 1, "r2": 2})
+    testing.assertEqual(c.decide(0).plan.starts["r2"], (1, DAY))
+    c.report("r1", "failed", 600)
+    p = c.decide(600).plan
+    testing.assertEqual(p.held, {"r2": (1, DAY)})
+    testing.assertEqual([(w.1, [e.0 for e in w.3]) for w in c.layout(p)],
+                        [(0, ["r1", "d"]), (DAY, ["r2"])])
+
+
+def _test_a_held_member_without_a_promise_leaves_its_window_to_others():
+    """r1 is down when the run starts, so r1 and r2 wait. The plan shows
+    them in the first window but does not promise it to them, and fills it
+    with d0 to d9. r1 comes back up before the window opens: the devices
+    promised the first window keep it, and r1 and r2 go where there is
+    room."""
+    wins = daily("day", HOUR, HOUR, 5)
+    devs = [("r1", 600, "day"), ("r2", 600, "day")] + devices("d", 12, 600, "day")
+    c = controller(wins, devs, 2, 2, groups={"g": ["r1", "r2"]}, priority={"r1": 1, "r2": 2},
+                   rung=2)
+    c.set_live("r1", False)
+    p = c.decide(0).plan
+    testing.assertEqual(p.held, {"r1": (0, HOUR), "r2": (0, HOUR)})
+    testing.assertEqual(sorted([n for n, s in p.starts.items() if s.0 == 0]),
+                        ["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7", "d8", "d9"])
+    c.set_live("r1", True)
+    p = c.decide(1800).plan
+    testing.assertEqual(p.alarms, [])
+    testing.assertEqual((p.starts["r1"].0, p.starts["r2"].0), (1, 1))
+
+
+def _test_a_member_looked_at_again_keeps_its_place_in_the_promises():
+    """d1, of 25 min, is promised the first window before h. f fails, so h
+    waits, and when f reports a success, h is looked at again. d1 still
+    starts first, and h after it, so both keep the window."""
+    wins = [("w", 0, 3500), ("w", DAY, DAY + 3500)]
+    devs = [("f", 600, "w"), ("d0", 600, "w"), ("d1", 1500, "w"), ("h", 600, "w")]
+    c = controller(wins, devs, 1, 1, groups={"g": ["f", "h"]}, priority={"f": 1, "h": 2})
+    c.decide(0)
+    c.report("f", "failed", 600)
+    c.decide(600)
+    c.report("f", "succeeded", 700)
+    c.decide(700)
+    c.report("d0", "succeeded", 1200)
+    s = c.decide(1200)
+    testing.assertEqual(s.started, ["d1"])
+    testing.assertEqual(s.plan.starts.get("h"), (0, 2700))
+    testing.assertEqual(s.plan.alarms, [])
+
+
+def _test_members_looked_at_again_start_in_the_order_of_their_promises():
+    """f1 and f2 fail, so h1 and h2 wait, and d1 and d2 take both slots.
+    f2 reports a success, then f1, so h2 is looked at again before h1.
+    h1 was promised the window before h2, so h1 starts in the first free
+    slot, and h2 in the next one: both keep the window."""
+    wins = [("w", 0, 7200)]
+    devs = [("f1", 600, "w"), ("f2", 600, "w"), ("h1", 600, "w"), ("h2", 600, "w"),
+            ("d1", 1200, "w"), ("d2", 1800, "w")]
+    c = controller(wins, devs, 2, 2, groups={"g1": ["f1", "h1"], "g2": ["f2", "h2"]},
+                   priority={"f1": 1, "h1": 2, "f2": 1, "h2": 2}, rung=2)
+    testing.assertEqual(c.decide(0).started, ["f1", "f2"])
+    c.report("f1", "failed", 600)
+    c.report("f2", "failed", 600)
+    testing.assertEqual(c.decide(600).started, ["d1", "d2"])
+    c.report("f2", "succeeded", 700)
+    c.decide(700)
+    c.report("f1", "succeeded", 800)
+    testing.assertEqual(c.decide(800).plan.alarms, [])
+    c.report("d1", "succeeded", 1800)
+    s = c.decide(1800)
+    testing.assertEqual(s.started, ["h1"])
+    testing.assertEqual(s.plan.starts, {"h1": (0, 1800), "h2": (0, 2400)})
+
+
+def _test_a_member_looked_at_again_starts_before_later_promises():
+    """h is promised the window before d. f fails, so h waits, and x takes
+    the slot. f reports a success, so h is looked at again. When x is
+    done, h starts before d."""
+    wins = [("w", 0, fleet_ctl.OPEN_END)]
+    devs = [("f", 600, "w"), ("h", 600, "w"), ("x", 600, "w"), ("d", 600, "w")]
+    c = controller(wins, devs, 1, 1, groups={"g": ["f", "h"]}, priority={"f": 1, "h": 2})
+    testing.assertEqual(c.decide(0).plan.starts,
+                        {"f": (0, 0), "h": (0, 600), "x": (0, 1200), "d": (0, 1800)})
+    c.report("f", "failed", 600)
+    testing.assertEqual(c.decide(600).started, ["x"])
+    c.report("f", "succeeded", 700)
+    c.decide(700)
+    c.report("x", "succeeded", 1200)
+    s = c.decide(1200)
+    testing.assertEqual(s.started, ["h"])
+    testing.assertEqual(s.plan.starts, {"h": (0, 1200), "d": (0, 1800)})
+
+
+def _test_the_promises_follow_the_order_of_the_starts():
+    """b waits for a, and y and z each wait 5 min after the member before
+    them. One at a time, the run starts x, a, y, b and z: y's
+    min-separation passes before a is done, so y starts before b. The
+    promises go in that order, so the run ahead with them is the same,
+    and z still fits."""
+    wins = [("w", 0, 3200)]
+    devs = [("b", 600, "w"), ("y", 600, "w"), ("z", 600, "w"), ("x", 600, "w"),
+            ("a", 600, "w")]
+    c = controller(wins, devs, 1, 1, groups={"g": ["a", "b"], "h": ["x", "y", "z"]},
+                   priority={"a": 1, "b": 2, "x": 1, "y": 2, "z": 3},
+                   separation={"h": (False, 300)})
+    p = c.plan(0)
+    testing.assertEqual(p.starts, {"x": (0, 0), "a": (0, 600), "y": (0, 1200),
+                                   "b": (0, 1800), "z": (0, 2400)})
+    testing.assertEqual(p.alarms, [])
+
+
+def _test_an_operator_frees_the_members_of_a_failed_one():
+    """r1 rolls back and r2 waits. When the operator takes r1 out of the
+    group, or out of the campaign, r2 starts."""
+    wins = [("w", 0, DAY)]
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    priority = {"r1": 1, "r2": 2}
+    # (what the operator does, devices, groups)
+    cases: list[(str, list[(str, int, str)], dict[str, list[str]])] = [
+        ("out of the group", devs, {"g": ["r2"]}),
+        ("out of the campaign", [("r2", 600, "w")], {"g": ["r2"]}),
+    ]
+    for case in cases:
+        c = controller(wins, devs, 1, 1, groups={"g": ["r1", "r2"]}, priority=priority)
+        testing.assertEqual(c.decide(0).started, ["r1"], case.0)
+        c.report("r1", "rolled-back", 600)
+        testing.assertEqual(c.decide(600).started, [], case.0)
+        c.configure(wins, case.1, 1, 1, False, 0, 600, case.2, priority)
+        testing.assertEqual(c.decide(700).started, ["r2"], case.0)
+
+
+def _test_a_later_success_frees_the_rest():
+    """r1 fails and r2 waits. An operator fixes r1, and when r1 reports a
+    success, whether or not it reported another status first, r2
+    starts."""
+    # (the reports of r1 after its failure, at 700 and 1300)
+    cases: list[list[(int, str)]] = [
+        [(700, "in-progress"), (1300, "succeeded")],
+        [(1300, "up-to-date")],
+        [(1300, "succeeded")],
+    ]
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    for case in cases:
+        c = controller([("w", 0, DAY)], devs, 1, 1, groups={"g": ["r1", "r2"]},
+                       priority={"r1": 1, "r2": 2})
+        testing.assertEqual(c.decide(0).started, ["r1"])
+        c.report("r1", "failed", 600)
+        testing.assertEqual(c.decide(600).started, [])
+        started: list[str] = []
+        for r in case:
+            c.report("r1", r.1, r.0)
+            started = c.decide(r.0).started
+        testing.assertEqual(started, ["r2"], str(case))
+
+
+def _test_a_retried_member_keeps_its_min_separation_from_its_success():
+    """r1 fails, and reports a success after a retry. r2 starts no sooner
+    than the min-separation of 30 min after that success."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["r1", "r2"]},
+                   priority={"r1": 1, "r2": 2}, separation={"g": (False, 1800)})
+    testing.assertEqual(c.decide(0).started, ["r1"])
+    c.report("r1", "failed", 600)
+    c.decide(600)
+    c.report("r1", "succeeded", 5000)
+    s = c.decide(5000)
+    testing.assertEqual((s.started, s.wake), ([], 6800))
+    testing.assertEqual(c.decide(6800).started, ["r2"])
+
+
+def _test_a_member_held_past_its_window_starts_when_freed():
+    """r comes after q in one group and after z in another. z ends late,
+    when the window r was promised has no room left for it, and the
+    window that never closes passes r over for its promise. Then q fails,
+    so r waits while its window closes, and its promise moves to the
+    window that never closes. When q reports a success after a retry, r
+    starts there."""
+    wins = [("s", 0, 230), ("s", 0, fleet_ctl.OPEN_END)]
+    devs = [("q", 100, "s"), ("z", 100, "s"), ("r", 100, "s")]
+    c = controller(wins, devs, 2, 2, estimate=100, groups={"g1": ["q", "r"], "g2": ["z", "r"]},
+                   priority={"q": 1, "z": 1, "r": 2}, rung=2)
+    testing.assertEqual(c.decide(0).started, ["q", "z"])
+    c.decide(100)
+    c.decide(101)
+    c.report("z", "succeeded", 120)
+    c.decide(120)
+    c.report("q", "failed", 130)
+    c.decide(130)
+    c.report("q", "in-progress", 200)
+    c.decide(200)
+    c.report("q", "succeeded", 300)
+    testing.assertEqual(c.decide(300).started, ["r"])
+
+
+def _test_a_success_within_the_debounce_frees_the_rest():
+    """r1 fails, and reports up-to-date before its failure counts. The
+    success counts, so r2 starts."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    c = controller([("w", 0, DAY)], devs, 1, 1, debounce=5, groups={"g": ["r1", "r2"]},
+                   priority={"r1": 1, "r2": 2})
+    testing.assertEqual(c.decide(0).started, ["r1"])
+    c.report("r1", "failed", 600)
+    c.report("r1", "up-to-date", 603)
+    testing.assertEqual(c.decide(605).started, ["r2"])
+
+
+def _test_members_wait_while_a_member_is_down():
+    """z backs up r1 and r2 but is not in the campaign. While z, or r1
+    itself, is down, neither r1 nor r2 starts, and the plan says so; d0,
+    in no group, starts. When the device comes back up, r1 starts."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w"), ("d0", 600, "w")]
+    for down in ["z", "r1"]:
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 4, 4,
+                       groups={"g": ["r1", "r2", "z"]}, priority={"r1": 1, "r2": 2, "z": 3},
+                       rung=4)
+        c.set_live(down, False)
+        s = c.decide(0)
+        testing.assertEqual(s.started, ["d0"], down)
+        testing.assertEqual(s.plan.alarms,
+                            ["2 device(s) wait while a redundancy group member is down: "
+                             + "r1, r2"], down)
+        testing.assertEqual(s.plan.starts, {"d0": (0, 0)}, down)
+        c.set_live(down, True)
+        s = c.decide(10)
+        testing.assertEqual(s.started, ["r1"], down)
+        testing.assertEqual(s.plan.alarms, [], down)
+
+
+def _test_a_member_that_reports_while_down_holds_the_others():
+    """a goes down while it upgrades, and reports a success while it is
+    still down. b waits until a is back up."""
+    devs = [("a", 600, "w"), ("b", 600, "w")]
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["a", "b"]},
+                   priority={"a": 1, "b": 2})
+    testing.assertEqual(c.decide(0).started, ["a"])
+    c.set_live("a", False)
+    c.report("a", "succeeded", 600)
+    s = c.decide(600)
+    testing.assertEqual(s.started, [])
+    testing.assertEqual(s.plan.alarms,
+                        ["1 device(s) wait while a redundancy group member is down: b"])
+    c.set_live("a", True)
+    testing.assertEqual(c.decide(700).started, ["b"])
+
+
+def _test_a_member_down_while_it_upgrades_keeps_the_plan():
+    """a goes down while it upgrades, as a device does when it reboots.
+    The plan expects it back up when its upgrade ends, so b keeps its
+    place right after a, in the first window."""
+    wins = [("w", 0, 1320), ("w", 5000, 8000)]
+    devs = [("a", 600, "w"), ("b", 600, "w"), ("d", 100, "w")]
+    c = controller(wins, devs, 1, 1, groups={"g": ["a", "b"]}, priority={"a": 1, "b": 2})
+    testing.assertEqual(c.decide(0).started, ["a"])
+    c.set_live("a", False)
+    s = c.decide(10)
+    testing.assertEqual(s.plan.alarms, [])
+    testing.assertEqual(s.plan.starts["b"], (0, 600))
+    c.set_live("a", True)
+    c.report("a", "succeeded", 600)
+    testing.assertEqual(c.decide(600).started, ["b"])
+
+
+def _test_a_pack_group_keeps_its_min_separation():
+    """r2 starts no sooner than the min-separation of 300 s after r1 is
+    done, and the controller decides again then."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["r1", "r2"]},
+                   priority={"r1": 1, "r2": 2}, separation={"g": (False, 300)})
+    testing.assertEqual(c.decide(0).started, ["r1"])
+    c.report("r1", "succeeded", 600)
+    s = c.decide(600)
+    testing.assertEqual((s.started, s.wake), ([], 900))
+    testing.assertEqual(c.decide(900).started, ["r2"])
+
+
+def _test_a_min_separation_past_the_deadline_alarms():
+    """A min-separation of 1 h puts r2 after the window that the deadline
+    ends: the plan says r2 cannot start before the deadline."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    c = controller([("w", 0, HOUR)], devs, 1, 4, True, groups={"g": ["r1", "r2"]},
+                   priority={"r1": 1, "r2": 2}, separation={"g": (False, HOUR)})
+    testing.assertEqual(c.plan(0).alarms,
+                        ["1 device(s) cannot start before the deadline: r2"])
+
+
+def _test_a_spread_pair_goes_in_the_first_and_the_last_window():
+    """r1 and r2, then 98 devices in no group, all of 10 min, in a 1 h
+    window every day, 10 at once. The run uses the first three windows.
+    Packed, r2 goes right after r1, in the first window. Spread, r2 goes
+    in the third window, and a device of the same estimate takes its
+    place in the first. The windows take the same number of devices
+    either way."""
+    devs = [("r1", 600, "day"), ("r2", 600, "day")] + devices("d", 98, 600, "day")
+    # (spread, the window of r1 and of r2)
+    cases: list[(bool, (int, int))] = [(False, (0, 0)), (True, (0, 2))]
+    for case in cases:
+        c = controller(daily("day", 0, HOUR, 9), devs, 10, 10, debounce=1,
+                       groups={"g": ["r1", "r2"]}, priority={"r1": 1, "r2": 2},
+                       separation={"g": (case.0, 0)})
+        p = c.plan(0)
+        testing.assertEqual((p.starts["r1"].0, p.starts["r2"].0), case.1, str(case.0))
+        testing.assertEqual([len(w.3) for w in c.layout(p)], [25, 50, 25])
+        testing.assertEqual(p.alarms, [])
+        sim.drive(c, 0, {}, 30 * DAY)
+        testing.assertEqual(sim.started(c), sim.planned(c, p))
+
+
+def _test_a_spread_pair_in_one_window_goes_one_after_the_other():
+    """In a window that never closes, 4 at once, r2 starts when r1 is
+    done, whether the group spreads or packs. Without the group it would
+    start with r1."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w")] + devices("d", 10, 600, "w")
+    for spread in [True, False]:
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 4, 4, groups={"g": ["r1", "r2"]},
+                       priority={"r1": 1, "r2": 2}, separation={"g": (spread, 0)}, rung=4)
+        testing.assertEqual(c.plan(0).starts["r2"], (0, 600), str(spread))
+
+
+def _test_a_spread_member_trades_only_with_a_device_of_its_estimate():
+    """r1 and r2 spread, then 98 devices of 10 min in no group, a 1 h
+    window every day, 10 at once. Members of 10 min trade, so r2 goes in
+    the third window. Members of 5 min have no device of their estimate to
+    trade with, so r2 stays in the first."""
+    # (the estimate of r1 and r2, and the window of r2)
+    cases: list[(int, int)] = [(600, 2), (300, 0)]
+    for case in cases:
+        devs = [("r1", case.0, "day"), ("r2", case.0, "day")] + devices("d", 98, 600, "day")
+        c = controller(daily("day", 0, HOUR, 9), devs, 10, 10, debounce=1,
+                       groups={"g": ["r1", "r2"]}, priority={"r1": 1, "r2": 2},
+                       separation={"g": (True, 0)})
+        testing.assertEqual(c.plan(0).starts["r2"].0, case.1, str(case.0))
+
+
+def _test_a_spread_member_keeps_an_earlier_promise():
+    """r1, r2 and 10 devices fit the first window, so r2 is promised it.
+    Then 90 more devices make the run use three windows; r2 keeps the
+    first."""
+    devs = [("r1", 600, "day"), ("r2", 600, "day")] + devices("d", 10, 600, "day")
+    groups = {"g": ["r1", "r2"]}
+    priority = {"r1": 1, "r2": 2}
+    separation = {"g": (True, 0)}
+    c = controller(daily("day", 0, HOUR, 9), devs, 10, 10, debounce=1, groups=groups,
+                   priority=priority, separation=separation)
+    testing.assertEqual(c.plan(0).starts["r2"].0, 0)
+    c.configure(daily("day", 0, HOUR, 9), devs + devices("e", 90, 600, "day"), 10, 10, False, 1,
+                600, groups, priority, separation)
+    testing.assertEqual(c.plan(0).starts["r2"].0, 0)
+
+
+def _test_a_spread_group_that_cannot_keep_its_order_packs_alone():
+    """r1, r2 and r3 spread, but r3 takes 5 min and no device in no group
+    has that estimate, so r3 cannot move. r2 would then go after r3, so
+    the group packs. s1 and s2 spread all the same."""
+    devs = [("r1", 600, "day"), ("r2", 600, "day"), ("r3", 300, "day"), ("s1", 600, "day"),
+            ("s2", 600, "day")] + devices("d", 95, 600, "day")
+    c = controller(daily("day", 0, HOUR, 9), devs, 10, 10, debounce=1,
+                   groups={"g": ["r1", "r2", "r3"], "h": ["s1", "s2"]},
+                   priority={"r1": 1, "r2": 2, "r3": 3, "s1": 1, "s2": 2},
+                   separation={"g": (True, 0), "h": (True, 0)})
+    p = c.plan(0)
+    testing.assertEqual([p.starts[n].0 for n in ["r1", "r2", "r3", "s1", "s2"]], [0, 0, 0, 0, 2])
+
+
+def _test_a_spread_member_trades_only_with_a_device_in_no_group():
+    """r1 and r2 spread. p2 comes after p1 in a pack group, and the run
+    puts it in the second window, where it is the only device of 10 min.
+    r2 does not trade with it, so it stays in the first window."""
+    devs = [("r1", 600, "day"), ("r2", 600, "day"), ("p1", 600, "day")] \
+           + devices("d", 60, 300, "day") + [("p2", 600, "day")]
+    c = controller(daily("day", 0, HOUR, 9), devs, 10, 10, debounce=1,
+                   groups={"g": ["r1", "r2"], "h": ["p1", "p2"]},
+                   priority={"r1": 1, "r2": 2, "p1": 1, "p2": 2},
+                   separation={"g": (True, 0)})
+    p = c.plan(0)
+    testing.assertEqual((p.starts["r2"].0, p.starts["p2"].0), (0, 1))
+    testing.assertEqual(p.alarms, [])
+
+
+def _test_a_spread_member_goes_after_the_window_of_the_member_before_it():
+    """A 20 h window every day, and devices of 2 h, one at a time: the run
+    uses three windows. A member moves only to a window that opens at
+    least the min-separation of each of its groups after the window of
+    the member before it in that group closes, and that closes at least
+    that long before the window of the member after it opens. The second
+    window opens 4 h after the first closes, less than the 6 h
+    min-separation of g in the first row: r2 stays and r3 goes in the
+    third window. With a min-separation of 4 h in the second row, r2 goes
+    in the second window. m cannot move, because of q before it or y
+    after it in h, so g packs."""
+    wins = daily("day", 0, 20 * HOUR, 9)
+    sep = 6 * HOUR
+    # (the devices before and after 20 devices in no group, the groups,
+    # priorities and separations, and the windows of the named devices)
+    cases: list[(list[str], list[str], dict[str, list[str]], dict[str, int],
+                 dict[str, (bool, int)], dict[str, int])] = [
+        (["r1", "r2", "r3"], [], {"g": ["r1", "r2", "r3"]}, {"r1": 1, "r2": 2, "r3": 3},
+         {"g": (True, sep)}, {"r2": 0, "r3": 2}),
+        (["r1", "r2", "r3"], [], {"g": ["r1", "r2", "r3"]}, {"r1": 1, "r2": 2, "r3": 3},
+         {"g": (True, 4 * HOUR)}, {"r2": 1, "r3": 2}),
+        (["a", "q", "m", "z"], [], {"g": ["a", "m", "z"], "h": ["q", "m"]},
+         {"a": 1, "q": 1, "m": 2, "z": 3}, {"g": (True, 0), "h": (False, sep)},
+         {"m": 0, "z": 0}),
+        (["a", "m", "z"], ["y"], {"g": ["a", "m", "z"], "h": ["m", "y"]},
+         {"a": 1, "m": 2, "z": 3, "y": 4}, {"g": (True, 0), "h": (False, sep)},
+         {"m": 0, "z": 0, "y": 2}),
+    ]
+    for case in cases:
+        devs = [(n, 2 * HOUR, "day") for n in case.0] + devices("d", 20, 2 * HOUR, "day") \
+               + [(n, 2 * HOUR, "day") for n in case.1]
+        c = controller(wins, devs, 1, 1, debounce=1, groups=case.2, priority=case.3,
+                       separation=case.4)
+        p = c.plan(0)
+        testing.assertEqual({n: p.starts[n].0 for n in case.5.keys()}, case.5, str(case.2))
+        testing.assertEqual(p.alarms, [], str(case.2))
+
+
+def _test_a_spread_partner_takes_the_place_of_the_member_in_the_promises():
+    """a and m spread, two at once, and D takes 15 min. Without spreading,
+    a and D start first, m when a is done, and P, in no group, in the
+    second window. m trades windows with P, and P takes m's place after D
+    in the order of the promises: P starts when a is done, D still fits,
+    and m goes in the second window."""
+    wins = [("w", 0, 1400), ("w", DAY, DAY + 1400)]
+    devs = [("a", 600, "w"), ("m", 600, "w"), ("D", 900, "w"), ("P", 600, "w")]
+    c = controller(wins, devs, 2, 2, groups={"g": ["a", "m"]}, priority={"a": 1, "m": 2},
+                   separation={"g": (True, 0)}, rung=2)
+    p = c.plan(0)
+    testing.assertEqual(p.starts, {"a": (0, 0), "D": (0, 0), "P": (0, 600), "m": (1, DAY)})
+    testing.assertEqual(p.alarms, [])
+
+
+def _test_a_spread_partner_keeps_the_place_of_the_member_in_a_new_configuration():
+    """m trades windows with P, and P takes m's place before Q in the order
+    of the promises. A new max-concurrency keeps that order: P starts when
+    a is done, and Q when D is done."""
+    wins = [("w", 0, 1800), ("w", DAY, DAY + 1800)]
+    devs = [("a", 600, "w"), ("m", 600, "w"), ("D", 900, "w"), ("Q", 600, "w"), ("P", 600, "w")]
+    groups = {"g": ["a", "m"]}
+    priority = {"a": 1, "m": 2}
+    separation = {"g": (True, 0)}
+    c = controller(wins, devs, 2, 2, groups=groups, priority=priority, separation=separation,
+                   rung=2)
+    testing.assertEqual(c.decide(0).plan.starts,
+                        {"a": (0, 0), "D": (0, 0), "P": (0, 600), "Q": (0, 900), "m": (1, DAY)})
+    c.configure(wins, devs, 2, 3, False, 0, 600, groups, priority, separation)
+    c.report("a", "succeeded", 600)
+    s = c.decide(600)
+    testing.assertEqual(s.started, ["P"])
+    testing.assertEqual(s.plan.starts, {"P": (0, 600), "Q": (0, 900), "m": (1, DAY)})
+
+
+def _test_a_spread_swap_that_breaks_a_promise_is_undone():
+    """r2 and s2 report that they are up to date before they start, so
+    each one is done as soon as it starts. Moved to the second window,
+    each would give its place in the first window to a device of 10 min,
+    and devices promised the first window would miss it. The plan keeps
+    r2 and s2 in the first window."""
+    devs = [("r1", 600, "day"), ("r2", 600, "day"), ("s1", 600, "day"), ("s2", 600, "day")] \
+           + devices("d", 9, 600, "day")
+    c = controller(daily("day", 0, HOUR, 3), devs, 1, 1,
+                   groups={"g": ["r1", "r2"], "h": ["s1", "s2"]},
+                   priority={"r1": 1, "r2": 2, "s1": 1, "s2": 2},
+                   separation={"g": (True, 0), "h": (True, 0)})
+    c.report("r2", "up-to-date", 0)
+    c.report("s2", "up-to-date", 0)
+    p = c.plan(0)
+    testing.assertEqual(p.alarms, [])
+    testing.assertEqual((p.starts["r2"].0, p.starts["s2"].0), (0, 0))
+
+
+def _test_a_spread_member_needs_a_device_in_no_group_to_swap_with():
+    """40 devices in spread pairs and nothing else: the plan is the packed
+    one."""
+    groups, priority = pairs(40)
+    separation = {g: (True, 0) for g in groups.keys()}
+    spread = controller(daily("day", 0, HOUR, 9), devices("d", 40, 600, "day"), 10, 10,
+                        debounce=1, groups=groups, priority=priority, separation=separation)
+    packed = controller(daily("day", 0, HOUR, 9), devices("d", 40, 600, "day"), 10, 10,
+                        debounce=1, groups=groups, priority=priority)
+    testing.assertEqual(spread.plan(0).starts, packed.plan(0).starts)
+
+
+def _test_the_plan_is_the_run_pairs():
+    """40 devices of 10 min in pairs, the second of each pair first, in a
+    1 h window every day, 10 at once."""
+    groups, priority = pairs(40)
+    plan_is_run(daily("day", 0, HOUR, 9), devices("d", 40, 600, "day"), 10, 10, False, 600,
+                groups, priority)
+
+
+def _test_the_plan_is_the_run_spread_pairs():
+    """The same 20 pairs, spread with a min-separation of 10 min, and 60
+    devices in no group."""
+    groups, priority = pairs(40)
+    separation = {g: (True, 600) for g in groups.keys()}
+    devs = devices("d", 40, 600, "day") + devices("e", 60, 600, "day")
+    plan_is_run(daily("day", 0, HOUR, 9), devs, 10, 10, False, 600, groups, priority, separation)
+
+
+def _test_the_plan_is_the_run_chains():
+    """20 devices of 10 min with a deadline: d0 to d3 in a chain of two
+    groups, spread, and d4 and d5 in a pair, d5 first."""
+    groups = {"a": ["d0", "d1", "d2"], "b": ["d2", "d3"], "c": ["d5", "d4"]}
+    priority = {"d0": 1, "d1": 2, "d2": 3, "d3": 4, "d5": 1, "d4": 2}
+    separation = {"a": (True, 0), "b": (True, 0)}
+    plan_is_run(daily("day", 0, HOUR, 2), devices("d", 20, 600, "day"), 4, 8, True, 600,
+                groups, priority, separation)

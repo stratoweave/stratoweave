@@ -142,6 +142,23 @@
   `max-concurrency`, which now counts the devices of the whole campaign. The
   alarms name the devices. A window that opened on an earlier day and is
   still open now counts. [#730]
+- Devices can be members of redundancy groups, set under
+  `/fleet/device/redundancy-group` with a `redundancy-priority`. A
+  campaign upgrades the members of a group one at a time, lower priority
+  first and equal priorities by name. `/redundancy-groups` sets how far
+  apart they go: `spread`, the default, moves later members to later
+  windows of the campaign where a device of the same estimate in no group
+  can trade windows with them, and `pack` starts each member as soon as
+  the one before it is done; both keep an optional `min-separation`. When
+  the upgrade of a member fails or rolls back, the other members keep their
+  windows but wait until it reports a success, or an operator takes it out
+  of the group or the campaign. The plan's alarms name the devices that
+  wait.
+- A device that reports a final status before the campaign releases it, for
+  example one that already runs the target release, no longer counts as an
+  upgrade that took no time. Before, a few such devices made the campaign
+  expect every upgrade to take seconds, and the plan put every device in the
+  first windows.
 - The top always starts ten flotillas and places each device on `flotilla-N`
   by a hash of its name. Removed `/fleet/node` and `/fleet/device/shard`.
   Devices without a shard, which the top managed itself, are no longer

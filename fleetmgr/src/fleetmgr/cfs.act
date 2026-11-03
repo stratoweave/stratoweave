@@ -6,7 +6,6 @@ import stratoweave.ttt as ttt
 import stratoweave.adapters.software_iosxe as sw_iosxe
 import stratoweave.adapters.software_mock as sw_mock
 import stratoweave.fleet_ctl as fctl
-import stratoweave.fleet_sched as fs
 
 import fleetmgr.layers.base_0 as base
 import fleetmgr.supervisor as supervisor
@@ -194,7 +193,7 @@ def estimated_duration(i: y_0.software__software__upgrade_campaign_entry,
         total += device_estimate(inventory.fleet.device.get(member.name))
         n += 1
     # Estimates are at least a second each, so the average is too.
-    return fs.ceil_div(total, n) if n > 0 else 1
+    return (total + n - 1) // n if n > 0 else 1
 
 # End of a window that never closes: the year 2100 as seconds since the
 # Unix epoch, far beyond any campaign.
@@ -206,7 +205,7 @@ def campaign_debounce_s(devices: int) -> int:
     30. Whole seconds let the controller's plan decide at the very second
     the campaign actor does, with the reports of a second in one decision.
     Large campaigns limit how often the whole campaign is published."""
-    return fs.imax(1, fs.imin(devices // 1000, 30))
+    return fctl.imax(1, fctl.imin(devices // 1000, 30))
 
 
 _DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
@@ -239,7 +238,7 @@ def occurrences(sched: y_0.maintenance__schedules__schedule_entry, now: int) -> 
                 days.append(_DAYS[d])
         # A window that opened days ago can still be open; the horizon
         # bounds how far back too.
-        for k in range(fs.imax(-(dur // 86400) - 1, -HORIZON_DAYS), HORIZON_DAYS):
+        for k in range(fctl.imax(-(dur // 86400) - 1, -HORIZON_DAYS), HORIZON_DAYS):
             local_day = day0 + k * 86400
             if len(days) > 0:
                 # 1970-01-01 was a Thursday; monday is day zero here.
@@ -263,7 +262,9 @@ def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_
     default and no bound members gets one synthetic window that opens at
     launch and never closes. The deadline cuts off the windows - the
     synthetic one included - and every device must start before it when
-    the planner sees every window before it."""
+    the planner sees every window before it. The members' redundancy
+    groups and priorities go with them, and each group's separation: a
+    group with no entry under /redundancy-groups spreads."""
     deadline = 0
     dl = i.deadline
     if dl is not None:
@@ -273,11 +274,18 @@ def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_
     members = sorted([member.name for member in i.device])
     schedule_of: dict[str, ?str] = {}
     referenced: list[str] = []
+    groups: dict[str, list[str]] = {}
+    priority: dict[str, int] = {}
     for name in members:
         binding: ?str = None
         dev = inventory.fleet.device.get(name)
         if dev is not None:
             binding = dev.schedule
+            priority[name] = int(dev.redundancy_priority)
+            for g in dev.redundancy_group:
+                if g not in groups:
+                    groups[g] = []
+                groups[g].append(name)
         if binding is None:
             binding = default
         schedule_of[name] = binding
@@ -310,10 +318,28 @@ def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_
             sname = b if b is not None else ""
         devices.append((name, device_estimate(inventory.fleet.device.get(name)), sname))
 
+    separation: dict[str, (bool, int)] = {}
+    for g in groups.keys():
+        policy = inventory.redundancy_groups.redundancy_group.get(g)
+        if policy is not None:
+            separation[g] = (policy.separation_policy == "spread", int(policy.min_separation))
+        else:
+            separation[g] = (True, 0)
+
     must_place = deadline > 0 and (synthetic or deadline - now <= (HORIZON_DAYS - 1) * 86400)
     ctl.configure(windows, devices, int(i.target_concurrency), int(i.max_concurrency),
                   must_place, campaign_debounce_s(len(members)),
-                  estimated_duration(i, inventory))
+                  estimated_duration(i, inventory), groups, priority, separation)
+
+
+class RedundancyGroups(base.RedundancyGroups):
+    def transform(self, i):
+        """Redundancy group entries produce no configuration of their own.
+
+        The container is a transform so campaigns can link it and re-plan
+        when an entry changes.
+        """
+        return base.o_root()
 
 
 class Schedules(base.Schedules):
