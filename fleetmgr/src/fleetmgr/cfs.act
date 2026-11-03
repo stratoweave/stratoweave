@@ -14,7 +14,7 @@ import fleetmgr.layers.y_0 as y_0
 import fleetmgr.layers.y_1_loose as y_1_loose
 import fleetmgr.layers.y_1_oper as y1_oper
 from fleetmgr.layers.y_1_oper import \
-    stratoweave_rfs__rfs__device__software__state as FlotillaDeviceStatus
+    stratoweave_rfs__rfs__device__state as FlotillaDeviceStatus
 # TODO: required by the compiler, see acton issue #2390
 import yang.identityref
 import fleetmgr.layers.y_0_oper as y0_oper
@@ -95,7 +95,9 @@ class Device(base.Device):
         dev.mock.enabled = i.mock.enabled
         dev.mock.software.upgrade_duration = i.mock.software.upgrade_duration
         dev.mock.software.failure = i.mock.software.failure
-        dev.mock.software.running_release = i.mock.software.running_release
+        dev.mock.platform.version = i.mock.platform.version
+        dev.mock.platform.model = i.mock.platform.model
+        dev.mock.platform.serial_number = i.mock.platform.serial_number
         for module in i.mock.module:
             out_module = dev.mock.module.create(
                 module.name,
@@ -111,6 +113,60 @@ class Device(base.Device):
         dev.upgrade_checks.precheck_wait = i.upgrade_checks.precheck_wait
         dev.upgrade_checks.postcheck_wait = i.upgrade_checks.postcheck_wait
         return o
+
+
+actor DeviceTransform(path: ttt.Path,
+                      update_oper: proc(?y0_oper.fleetmgr__fleet__device_entry) -> None,
+                      lower_tree_provider: ?ygdata.TreeProvider):
+    """Publish the platform of one device, as its RFS entry relays it from
+    the device's flotilla."""
+    var subscriptions: ?ygdata.SubscriptionManager = None
+    var platform: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+
+    def on_platform(keys: ?(rfs_name: str, device_name: str),
+                    state: ?y1_oper.stratoweave_rfs__rfs__device__state__platform,
+                    error: ?Exception) -> None:
+        # A call can still arrive after shutdown closed the subscription.
+        if subscriptions is None:
+            return
+        value: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+        if error is not None:
+            print("device platform subscription failed at {path}: {error}", err=True)
+        elif state is not None and (state.os is not None or state.version is not None or
+                                    state.model is not None or state.serial_number is not None):
+            value = (os=state.os, version=state.version, model=state.model,
+                     serial_number=state.serial_number)
+        if value == platform:
+            return
+        platform = value
+        if value is not None:
+            oper = base.Device.new_state(path)
+            o = oper.state.platform
+            o.os = value.os
+            o.version = value.version
+            o.model = value.model
+            o.serial_number = value.serial_number
+            update_oper(oper)
+        else:
+            update_oper(None)
+
+    def shutdown() -> None:
+        if subscriptions is not None:
+            subscriptions!.close()
+            subscriptions = None
+        if platform is not None:
+            platform = None
+            update_oper(None)
+
+    def on_conf(conf: y_0.fleetmgr__fleet__device_entry) -> None:
+        # The flotilla follows from the name, so it never changes.
+        tp = lower_tree_provider
+        if subscriptions is None and tp is not None:
+            subscriptions = ygdata.SubscriptionManager(tp, "device-platform:{path}")
+            platform_state = y1_oper.subs.rfs.device.state.platform
+            subscriptions!.declare({platform_state.dst(on_platform).deliver({
+                y1_oper.subs.rfs.entry(flotilla_of(conf.name)).device.entry(conf.name).state.platform.subscribe(),
+            })})
 
 
 def device_estimate(dev: ?y_0.fleetmgr__fleet__device_entry) -> int:
@@ -318,12 +374,16 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     """
     var members: list[str] = []
     var member_names: set[str] = set()
-    var latest: dict[str, (status: ?str, running_release: ?str, stage: ?str,
+    # What each device reports: its software state and the version and
+    # model its platform has.
+    var latest: dict[str, (status: ?str, version: ?str, model: ?str, stage: ?str,
                            reason: ?str,
                            precheck: (verdict: ?str, detail: ?str, at: ?str),
                            postcheck: (verdict: ?str, detail: ?str, at: ?str))] = {}
     var subscriptions: ?ygdata.SubscriptionManager = None
     var subscriptions_synced = False
+    # Set by shutdown, when the campaign is deleted.
+    var closed = False
     var plan_layout: list[(str, int, int, list[(str, int, int)])] = []
     var plan_alarms: list[str] = []
     var running = False
@@ -357,15 +417,18 @@ actor UpgradeCampaignTransform(path: ttt.Path,
 
         for d in members:
             status: ?str = None
-            running_release: ?str = None
+            version: ?str = None
+            model: ?str = None
             observed = latest.get(d)
             if observed is not None:
                 status = observed.status
-                running_release = observed.running_release
+                version = observed.version
+                model = observed.model
 
             ds = st.device_status.create(d)
             ds.status = status if status is not None else "pending"
-            ds.running_release = running_release
+            ds.version = version
+            ds.model = model
             if observed is not None:
                 ds.stage = observed.stage
                 ds.reason = observed.reason
@@ -409,28 +472,31 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             st.plan.alarm.append(alarm)
         update_oper(oper)
 
-    def observe(name: str, status: ?str, running_release: ?str, stage: ?str,
-                reason: ?str,
-                precheck: (verdict: ?str, detail: ?str, at: ?str),
-                postcheck: (verdict: ?str, detail: ?str, at: ?str)) -> None:
-        """Keep the state of one device, as its flotilla reports it, and
-        pass its status to the controller with the time it came."""
-        latest[name] = (status=status, running_release=running_release,
-                        stage=stage, reason=reason, precheck=precheck, postcheck=postcheck)
-        ctl.report(name, status, time.time().unix_s())
-
     def forget(name: str) -> None:
         if name in latest:
             del latest[name]
         ctl.lost(name)
 
     def changed(relevant: bool) -> None:
-        if relevant and subscriptions_synced and active and not debounce_armed:
+        """Act on a change in what the members report, once per debounce: a
+        campaign that decides decides again, and the decision publishes;
+        any other campaign publishes. Its devices can still change after it
+        stops or finishes."""
+        if relevant and subscriptions_synced and not debounce_armed and not closed:
             debounce_armed = True
             gen = generation
             # after now: the batch gets the whole window, however late the
             # telemetry that opens it arrives.
-            after now debounce_s: decide(gen)
+            if active:
+                after now debounce_s: decide(gen)
+            else:
+                after now debounce_s: publish_settled(gen)
+
+    def publish_settled(gen: int) -> None:
+        if gen != generation:
+            return
+        debounce_armed = False
+        publish()
 
     def on_rfs(
         keys: ?(rfs_name: str, device_name: str),
@@ -443,19 +509,29 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             latest = {}
             ctl.lost_all()
         elif keys is not None:
-            relevant = keys.device_name in member_names
+            name = keys.device_name
             if state is not None:
                 pre = state.precheck
                 post = state.postcheck
-                observe(keys.device_name, state.status, state.running_release,
-                        state.stage, state.reason,
-                        (verdict=pre.verdict, detail=pre.detail, at=pre.at),
-                        (verdict=post.verdict, detail=post.detail, at=post.at))
+                value = (status=state.status, version=state.platform.version,
+                         model=state.platform.model, stage=state.stage, reason=state.reason,
+                         precheck=(verdict=pre.verdict, detail=pre.detail, at=pre.at),
+                         postcheck=(verdict=post.verdict, detail=post.detail, at=post.at))
+                # Of the platform the campaign keeps only the version and the
+                # model, so a delivery can change nothing it keeps.
+                if value != latest.get(name):
+                    latest[name] = value
+                    ctl.report(name, state.status, time.time().unix_s())
+                    relevant = name in member_names
             else:
-                forget(keys.device_name)
+                forget(name)
+                relevant = name in member_names
         changed(relevant)
 
     def on_subscriptions_synced() -> None:
+        # Closing the subscriptions fires a sync that is still pending.
+        if closed:
+            return
         subscriptions_synced = True
         gen = generation
         if active:
@@ -464,8 +540,14 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             publish()
 
     def shutdown() -> None:
-        # Releasing the subscriptions here is a separate change.
-        pass
+        # The campaign is deleted: end its timers, stop hearing from its
+        # members and clear its state.
+        closed = True
+        generation += 1
+        if subscriptions is not None:
+            subscriptions!.close()
+            subscriptions = None
+        update_oper(None)
 
     def decide(gen: int) -> None:
         """Plan and take the plan's first step, start the devices it
@@ -531,15 +613,17 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         active = running
 
         if lower_tree_provider is not None and subscriptions is None:
+            # The actor id keeps apart the subscriptions of a deleted campaign
+            # and of one created again under the same name.
             subscriptions = ygdata.SubscriptionManager(
                 lower_tree_provider!,
-                "campaign-status:{path}",
+                "campaign-status:{path}:{actorid()}",
             )
 
         if subscriptions is not None:
             want: set[ygdata.Delivery] = set()
             if len(members) > 0:
-                statuses = y1_oper.subs.rfs.device.software.state
+                statuses = y1_oper.subs.rfs.device.state
                 want.add(statuses.dst(on_rfs).deliver({
                     statuses.subscribe(),
                 }))

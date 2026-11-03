@@ -36,6 +36,7 @@ export interface DeviceJson {
   address?: AddressJson[];
   credentials?: { username?: string; password?: string };
   mock?: { enabled?: boolean };
+  state?: { platform?: { version?: string; model?: string; 'serial-number'?: string } };
 }
 
 interface CampaignMemberJson {
@@ -53,7 +54,10 @@ interface CheckResultJson {
 interface DeviceStatusJson {
   device: string;
   status?: string;
-  'running-release'?: string;
+  /** What the device runs, from its platform. */
+  version?: string;
+  /** The chassis model, from its platform. */
+  model?: string;
   stage?: string;
   reason?: string;
   precheck?: CheckResultJson;
@@ -215,6 +219,10 @@ export interface Device {
   approvalRequired: boolean;
   /** First address entry as `host[:port]`; empty for a mock. */
   address: string;
+  /** What the device reports when it connects; empty until then. */
+  model: string;
+  version: string;
+  serialNumber: string;
 }
 
 export type Verdict = 'not-run' | 'pass' | 'fail';
@@ -245,7 +253,8 @@ export interface DeviceStatusRow {
   device: string;
   status: KnownStatus;
   raw: string;
-  runningRelease: string;
+  version: string;
+  model: string;
   /** The step the run is in or ended in; null before any run. */
   stage: Stage | null;
   /** Why the run failed or rolled back; '' otherwise. */
@@ -391,7 +400,10 @@ function parseDevice(entry: DeviceJson): Device {
     description: entry.description ?? '',
     schedule: entry.schedule ?? '',
     approvalRequired: entry['approval-required'] === true,
-    address: firstAddress(entry)
+    address: firstAddress(entry),
+    model: entry.state?.platform?.model ?? '',
+    version: entry.state?.platform?.version ?? '',
+    serialNumber: entry.state?.platform?.['serial-number'] ?? ''
   };
 }
 
@@ -437,7 +449,8 @@ function parseRow(row: DeviceStatusJson): DeviceStatusRow {
     device: row.device,
     status: normalizeStatus(raw),
     raw,
-    runningRelease: row['running-release'] ?? '',
+    version: row.version ?? '',
+    model: row.model ?? '',
     stage: parseStage(row.stage),
     reason: row.reason ?? '',
     precheck: parseCheck(row.precheck),

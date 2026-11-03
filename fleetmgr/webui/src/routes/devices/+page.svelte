@@ -41,6 +41,7 @@
 
   let filterText = $state(untrack(() => data.nameFilter));
   let filterType = $state('');
+  let filterModel = $state('');
   // Schedule selects hold '' (any or nothing chosen), 'none' or '=NAME'.
   let filterSchedule = $state(untrack(() => (data.scheduleFilter ? `=${data.scheduleFilter}` : '')));
   let page = $state(1);
@@ -57,6 +58,7 @@
   });
 
   let types = $derived([...new Set(data.devices.map((d) => d.type))].sort());
+  let models = $derived([...new Set(data.devices.map((d) => d.model).filter((m) => m))].sort());
   let scheduleNames = $derived(data.schedules.map((s) => s.name));
   let knownSchedules = $derived(new Set(scheduleNames));
   let colors = $derived(scheduleColors(scheduleNames));
@@ -79,7 +81,11 @@
   let filtered = $derived.by(() => {
     const matchName = nameMatcher(filterText.trim());
     return sorted.filter(
-      (d) => matchName(d.name) && (!filterType || d.type === filterType) && scheduleMatches(d, filterSchedule)
+      (d) =>
+        matchName(d.name) &&
+        (!filterType || d.type === filterType) &&
+        (!filterModel || d.model === filterModel) &&
+        scheduleMatches(d, filterSchedule)
     );
   });
   let paged = $derived(paginate(filtered, page, PAGE_SIZE));
@@ -518,6 +524,12 @@
           <option value={t}>{t}</option>
         {/each}
       </select>
+      <select class="select compact" aria-label="Model" bind:value={filterModel} onchange={() => (page = 1)}>
+        <option value="">all models</option>
+        {#each models as m (m)}
+          <option value={m}>{m}</option>
+        {/each}
+      </select>
       <select class="select compact" aria-label="Maintenance schedule" bind:value={filterSchedule} onchange={() => (page = 1)}>
         <option value="">all schedules</option>
         <option value="none">no schedule</option>
@@ -546,6 +558,9 @@
             </th>
             <th>Device</th>
             <th class="col-type">Type</th>
+            <th class="col-platform">Model</th>
+            <th class="col-platform">Version</th>
+            <th class="col-platform">Serial number</th>
             <th class="col-address">Address</th>
             <th>Schedule</th>
             <th class="col-action"><span class="sr-only">Actions</span></th>
@@ -569,6 +584,15 @@
                 <a class="device-name" href={`/devices/${encodeURIComponent(device.name)}`}>{device.name}</a>
               </td>
               <td class="col-type">{device.type}</td>
+              <td class="col-platform">
+                {#if device.model}
+                  <span class="pill mono">{device.model}</span>
+                {:else}
+                  <span class="dim">—</span>
+                {/if}
+              </td>
+              <td class="mono col-platform">{device.version || '—'}</td>
+              <td class="mono col-platform">{device.serialNumber || '—'}</td>
               <td class="mono col-address">{device.address || '—'}</td>
               <td>
                 {#if !device.schedule}
@@ -825,6 +849,7 @@
   @media (max-width: 720px) {
     /* The device page has these; the list keeps the name and the binding. */
     .col-type,
+    .col-platform,
     .col-address {
       display: none;
     }

@@ -134,6 +134,15 @@
         <h1 title={`YANG: /fleet/device=${device.name}`}>{device.name}</h1>
         <p class="meta">
           type <span class="mono">{device.type}</span>
+          {#if device.model}
+            · model <span class="mono">{device.model}</span>
+          {/if}
+          {#if device.version}
+            · version <span class="mono">{device.version}</span>
+          {/if}
+          {#if device.serialNumber}
+            · serial number <span class="mono">{device.serialNumber}</span>
+          {/if}
           {#if device.address}
             · OOB <span class="mono">{device.address}</span>
           {/if}
@@ -172,10 +181,6 @@
             <span class="fact">
               <span class="fact-label">Target release</span>
               <span class="mono">{campaign.targetRelease}</span>
-            </span>
-            <span class="fact">
-              <span class="fact-label">Running release</span>
-              <span class="mono">{row?.runningRelease || '—'}</span>
             </span>
             <span class="fact">
               <span class="fact-label">Planned start</span>

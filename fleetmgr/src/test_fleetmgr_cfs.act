@@ -247,7 +247,9 @@ mut def _lab_device() -> InputDevice:
     i.mock.enabled = True
     i.mock.software.upgrade_duration = u64(60)
     i.mock.software.failure = "commit-failed"
-    i.mock.software.running_release = "17.18.03a"
+    i.mock.platform.version = "17.18.03a"
+    i.mock.platform.model = "C8300-1N1S-4T2X"
+    i.mock.platform.serial_number = "FGL2231L0AB"
     module: InputMockModule = i.mock.module.create(
         "ietf-system",
         namespace="urn:ietf:params:xml:ns:yang:ietf-system",
@@ -301,8 +303,10 @@ actor _test_device_transform(t: testing.AsyncT):
         t.failure(ValueError("mock module fields were not preserved"))
     elif dev.mock.software.upgrade_duration != u64(60) or \
          dev.mock.software.failure != "commit-failed" or \
-         dev.mock.software.running_release != "17.18.03a":
-        t.failure(ValueError("mock upgrade duration, failure or running release was not preserved"))
+         dev.mock.platform.version != "17.18.03a" or \
+         dev.mock.platform.model != "C8300-1N1S-4T2X" or \
+         dev.mock.platform.serial_number != "FGL2231L0AB":
+        t.failure(ValueError("mock upgrade duration, failure or platform was not preserved"))
     elif not dev.debug.connection! or not dev.feature_flags.runtime_schema_fetch!:
         t.failure(ValueError("debug or feature flags were not preserved"))
     elif dev.upgrade_checks.precheck_wait != u64(30) or dev.upgrade_checks.postcheck_wait != u64(120):
@@ -504,6 +508,134 @@ def _campaign_path(name: str) -> ttt.Path:
     return ttt.PathKey(name, campaigns, {gdata.Id(y0_oper.NS_software, "name"): gdata.Leaf(name)})
 
 
+def _cleared_last(published: list[bool]) -> bool:
+    """Whether a campaign published nothing after clearing its state: its
+    only None, False here, came last."""
+    nones = [p for p in published if not p]
+    return len(nones) == 1 and not published[len(published) - 1]
+
+
+actor _test_deleted_campaign_publishes_nothing_more(t: testing.AsyncT):
+    """A campaign in plan deleted while a member change waits out its
+    debounce clears its state and then publishes nothing: not for that
+    change, nor for a sync that comes after the delete."""
+    var published: list[bool] = []
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        published.append(oper is not None)
+
+    def check() -> None:
+        if _cleared_last(published):
+            t.success()
+        else:
+            t.failure(ValueError("published {published}"))
+
+    names = ["cpe-1", "cpe-2"]
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+    campaign.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+    campaign.on_subscriptions_synced()
+    # cpe-1's state goes, a member change like any other.
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), None, None)
+    campaign.shutdown()
+    # Closing the subscriptions fires a sync that is still pending.
+    campaign.on_subscriptions_synced()
+    after float(cfs.campaign_debounce_s(len(names))) + 0.5: check()
+
+
+actor _test_deleted_running_campaign_stops_deciding(t: testing.AsyncT):
+    """A deleted running campaign clears its state, and a member change
+    after the delete does not make it decide again."""
+    var published: list[bool] = []
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        published.append(oper is not None)
+
+    def check() -> None:
+        if _cleared_last(published):
+            t.success()
+        else:
+            t.failure(ValueError("published {published}"))
+
+    names = ["cpe-1", "cpe-2"]
+    campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+    campaign.on_conf(_paced_campaign(names), _with_nightly(_flat_inventory(names)).to_gdata())
+    campaign.on_subscriptions_synced()
+    campaign.shutdown()
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), None, None)
+    after float(cfs.campaign_debounce_s(len(names))) + 0.5: check()
+
+
+actor _SubscriptionLog():
+    """The owner ids declared to and removed from a _LoggingTreeProvider;
+    each declaration syncs at once."""
+    var declared: list[str] = []
+    var removed: list[str] = []
+
+    def declare(owner_id: str, synced: ?action(str) -> None) -> None:
+        declared.append(owner_id)
+        if synced is not None:
+            synced(owner_id)
+
+    def remove(owner_id: str) -> None:
+        removed.append(owner_id)
+
+    def owners() -> (list[str], list[str]):
+        return (list(declared), list(removed))
+
+
+class _LoggingTreeProvider(gdata.TreeProvider):
+    log: _SubscriptionLog
+
+    def __init__(self, log: _SubscriptionLog):
+        self.log = log
+
+    proc def rpc(self, cb: action(?gdata.Node, ?Exception) -> None, gdata_rpc: gdata.Node):
+        cb(None, ValueError("no RPC"))
+
+    proc def declare_subscriptions(self, owner_id: str, cb: proc(?gdata.Node, ?Exception) -> None, want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None):
+        self.log.declare(owner_id, synced)
+
+    proc def remove_subscriptions(self, owner_id: str):
+        self.log.remove(owner_id)
+
+
+actor _test_recreated_campaign_keeps_its_subscription(t: testing.AsyncT):
+    """A campaign deleted and one created again under the same name declare
+    subscriptions of their own, so the delete of the old one removes only
+    its own, also when it comes after the new one has subscribed."""
+    log = _SubscriptionLog()
+    names = ["cpe-1", "cpe-2"]
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    old = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, lambda o: None,
+                                       _LoggingTreeProvider(log))
+    old.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+    new = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, lambda o: None,
+                                       _LoggingTreeProvider(log))
+    new.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+
+    def check() -> None:
+        declared, removed = log.owners()
+        kept = [d for d in declared if d not in removed]
+        if len(removed) == 0:
+            after 0.05: check()
+        elif len(set(declared)) == 2 and len(removed) == 1 and len(kept) == 1:
+            t.success()
+        else:
+            t.failure(ValueError("declared {declared}, removed {removed}"))
+
+    def delete_old() -> None:
+        if len(log.owners().0) < 2:
+            after 0.05: delete_old()
+        else:
+            old.shutdown()
+            check()
+
+    delete_old()
+
+
 actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
     """Each device's stage, reason and check verdicts reach the campaign next
     to its status, as its flotilla reports them. A device not heard from has
@@ -552,8 +684,8 @@ actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
     campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
     campaign.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
 
-    rolled_back = y1_oper.stratoweave_rfs__rfs__device__software__state(
-        status="rolled-back", running_release="17.18.02", stage="rollback",
+    rolled_back = y1_oper.stratoweave_rfs__rfs__device__state(
+        status="rolled-back", stage="rollback",
         reason="post-check failed: rfs-device-health: not back to the baseline")
     rolled_back.precheck.verdict = "pass"
     rolled_back.precheck.detail = "rfs-device-health: 1/1 sessions established"
@@ -563,8 +695,8 @@ actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
     rolled_back.postcheck.at = "2026-10-07T12:12:00Z"
     campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), rolled_back, None)
 
-    refused = y1_oper.stratoweave_rfs__rfs__device__software__state(
-        status="failed", running_release="17.18.02", stage="precheck",
+    refused = y1_oper.stratoweave_rfs__rfs__device__state(
+        status="failed", stage="precheck",
         reason="pre-check failed: did not answer: rfs-device-health")
     refused.precheck.verdict = "fail"
     refused.precheck.detail = "did not answer: rfs-device-health"
@@ -575,6 +707,121 @@ actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
     # The replay is in. A campaign in plan publishes once it is synced.
     campaign.on_subscriptions_synced()
     after 2.0: fail("the campaign published no verdicts")
+
+
+actor _test_campaign_not_running_publishes_changes(t: testing.AsyncT):
+    """A campaign that does not decide, here one in plan, still publishes
+    what its members report after it has synced."""
+    var last = "nothing"
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if oper is not None:
+            r = oper!.state.device_status.get("cpe-1")
+            last = r.status if r is not None and r.status is not None else "missing"
+
+    def check() -> None:
+        if last == "in-progress":
+            t.success()
+        else:
+            t.failure(ValueError("cpe-1 published as {last}"))
+
+    names = ["cpe-1", "cpe-2"]
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+    campaign.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+    campaign.on_subscriptions_synced()
+    # cpe-1 starts its upgrade, as when a stopped campaign's released
+    # device carries on.
+    status = y1_oper.stratoweave_rfs__rfs__device__state(status="in-progress")
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), status, None)
+    after float(cfs.campaign_debounce_s(len(names))) + 0.5: check()
+
+
+actor _test_campaign_platform_change_publishes_nothing(t: testing.AsyncT):
+    """A member's state that changes only in what the campaign does not
+    show, here the serial number, and a device outside the campaign
+    publish nothing."""
+    var publications = 0
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        publications += 1
+
+    def state(serial: str) -> y1_oper.stratoweave_rfs__rfs__device__state:
+        s = y1_oper.stratoweave_rfs__rfs__device__state(status="unknown")
+        s.platform.version = "17.18.2"
+        s.platform.model = "C8000V"
+        s.platform.serial_number = serial
+        return s
+
+    names = ["cpe-1", "cpe-2"]
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+    campaign.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), state("9ABCDEFGHIJ"), None)
+    campaign.on_subscriptions_synced()
+
+    def quiet(seen: int) -> None:
+        if publications == seen:
+            t.success()
+        else:
+            t.failure(ValueError("published again"))
+
+    def unchanged() -> None:
+        seen = publications
+        campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), state("9KSKL403GG7"), None)
+        campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-9"), device_name="cpe-9"), state("9ABCDEFGHIJ"), None)
+        after float(cfs.campaign_debounce_s(len(names))) + 0.5: quiet(seen)
+
+    # The publications of the conf and the sync are in.
+    after 0.2: unchanged()
+
+
+actor _test_campaign_device_status_platform(t: testing.AsyncT):
+    """Each device's version and model reach the campaign with its state,
+    also when one of them changes alone after a campaign in plan has
+    published. A device not heard from has neither."""
+    want = ["cpe-1 17.18.2 C8300-1N1S-4T2X", "cpe-2 17.18.3a ISR4331/K9", "cpe-3 None None"]
+    var last: list[str] = []
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if oper is not None:
+            got = []
+            for name in ["cpe-1", "cpe-2", "cpe-3"]:
+                r = oper!.state.device_status.get(name)
+                if r is not None:
+                    got.append("{name} {r.version} {r.model}")
+                else:
+                    got.append("{name} missing")
+            last = got
+
+    def check() -> None:
+        if last == want:
+            t.success()
+        else:
+            t.failure(ValueError("platforms not published: {last}"))
+
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+    campaign.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+
+    def report(name: str, version: str, model: str) -> None:
+        s = y1_oper.stratoweave_rfs__rfs__device__state(status="unknown")
+        s.platform.version = version
+        s.platform.model = model
+        campaign.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name), s, None)
+
+    report("cpe-1", "17.18.2", "C8000V")
+    report("cpe-2", "17.18.2", "ISR4331/K9")
+    # The replay is in. A campaign in plan publishes once it is synced.
+    campaign.on_subscriptions_synced()
+    # cpe-1 is a new box; cpe-2 is upgraded by hand.
+    report("cpe-1", "17.18.2", "C8300-1N1S-4T2X")
+    report("cpe-2", "17.18.3a", "ISR4331/K9")
+    after float(cfs.campaign_debounce_s(len(names))) + 0.5: check()
 
 
 def _render_layout(header: str, layout: list[(str, int, int, list[(str, int, int)])],
@@ -1095,7 +1342,7 @@ actor _test_campaign_replan_keeps_released_devices(t: testing.AsyncT):
     def finish(name: str) -> None:
         cc = controller
         if cc is not None:
-            state = y1_oper.stratoweave_rfs__rfs__device__software__state(status="succeeded", running_release="17.18.03a")
+            state = y1_oper.stratoweave_rfs__rfs__device__state(status="succeeded")
             cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name), state, None)
 
     def replan() -> None:
