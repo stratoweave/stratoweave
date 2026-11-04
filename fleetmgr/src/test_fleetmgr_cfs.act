@@ -121,8 +121,19 @@ def _test_device_ssh_propagation():
     testing.assertEqual(defaults.minimum_rsa_bits, u64(1024))
 
 
+IMAGE = "c8000v-universalk9.17.18.03a.SPA.bin"
+URL_BASE = "https://images.example/"
+
+
+def _with_images(linked: y_0.root) -> y_0.root:
+    """The image list the members name, with url-base."""
+    linked.images.url_base = URL_BASE
+    linked.images.image.create(IMAGE, os="IOS XE", version="17.18.03a")
+    return linked
+
+
 actor _test_campaign_transform(t: testing.AsyncT):
-    inventory = y_0.root()
+    inventory = _with_images(y_0.root())
     inventory.fleet.device.create(
         "cpe-1",
         type="iosxe",
@@ -130,12 +141,10 @@ actor _test_campaign_transform(t: testing.AsyncT):
     )
     campaign = InputCampaign(
         name="xe-upgrade",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         allow_staging=True,
         admin_state="run",
     )
-    campaign.device.create("cpe-1")
+    campaign.device.create("cpe-1", image=IMAGE)
 
     transform: cfs.UpgradeCampaign = cfs.UpgradeCampaign()
     released = {"cpe-1"}
@@ -146,7 +155,7 @@ actor _test_campaign_transform(t: testing.AsyncT):
 
     if dev.software.target_release != "17.18.03a" or \
        dev.software.upgrade_campaign != "xe-upgrade" or \
-       dev.software.image_url != "https://images.example/xe.bin" or \
+       dev.software.image_url != URL_BASE + IMAGE or \
        not dev.software.allow_staging!:
         t.failure(ValueError("campaign was not routed to the device's flotilla"))
     else:
@@ -155,7 +164,7 @@ actor _test_campaign_transform(t: testing.AsyncT):
 
 actor _test_campaign_link_routes_existing_inventory(t: testing.AsyncT):
     """A later campaign resolves and augments an existing inventory device."""
-    root = y_0.root()
+    root = _with_images(y_0.root())
     root.fleet.device.create(
         "cpe-1",
         type="iosxe",
@@ -202,11 +211,9 @@ actor _test_campaign_link_routes_existing_inventory(t: testing.AsyncT):
             return
         campaign = root.software.upgrade_campaign.create(
             "xe-upgrade",
-            target_release="17.18.03a",
-            image_url="https://images.example/xe.bin",
             admin_state="run",
         )
-        campaign.device.create("cpe-1")
+        campaign.device.create("cpe-1", image=IMAGE)
         tr.edit_config(root.to_gdata(), on_campaign)
 
     tr.edit_config(root.to_gdata(), on_inventory)
@@ -346,13 +353,11 @@ def _test_flotilla_placement():
 def _paced_campaign(names: list[str]) -> InputCampaign:
     campaign = InputCampaign(
         name="paced",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="run",
         default_schedule="nightly",
     )
     for name in names:
-        campaign.device.create(name)
+        campaign.device.create(name, image=IMAGE)
     return campaign
 
 
@@ -386,7 +391,7 @@ def _replanned(campaign: InputCampaign, linked: y_0.root, now: int) -> fctl.Cont
 
 
 def _flat_inventory(names: list[str], upgrade_duration: ?int = None) -> y_0.root:
-    linked = y_0.root()
+    linked = _with_images(y_0.root())
     for name in names:
         dev = linked.fleet.device.create(
             name,
@@ -414,11 +419,9 @@ actor _test_campaign_without_windows_gets_default_window(t: testing.AsyncT):
     linked = _flat_inventory(["cpe-1"])
     campaign = InputCampaign(
         name="now",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="run",
     )
-    campaign.device.create("cpe-1")
+    campaign.device.create("cpe-1", image=IMAGE)
     layout, alarms, conc = _plan(campaign, linked, 0)
     testing.assertEqual(_window_names(layout, "default"), ["cpe-1"], None)
     out = cfs.campaign_config(campaign, linked, set())
@@ -437,17 +440,60 @@ actor _test_campaign_without_windows_gets_default_window(t: testing.AsyncT):
     t.success()
 
 
+def _routed(campaign: InputCampaign, inventory: y_0.root) -> list[str]:
+    """The members campaign gives a target release once all are released."""
+    released: set[str] = set()
+    for member in campaign.device:
+        released.add(member.name)
+    o: y_1.root = y_1.root.from_gdata(cfs.campaign_config(campaign, inventory, released).to_gdata())
+    names: list[str] = []
+    for flotilla in o.rfs:
+        for dev in flotilla.device:
+            if dev.software.target_release is not None:
+                names.append(dev.name)
+    return sorted(names)
+
+
+def _test_campaign_member_images():
+    """A member whose image is not in the image list, or has no version,
+    gets no software intent, and the campaign says why."""
+    inventory = _flat_inventory(["cpe-1", "cpe-2", "cpe-3"])
+    inventory.images.image.create("no-version.bin", os="IOS XE")
+    campaign = InputCampaign(name="images", admin_state="run")
+    campaign.device.create("cpe-1", image=IMAGE)
+    campaign.device.create("cpe-2", image="gone.bin")
+    campaign.device.create("cpe-3", image="no-version.bin")
+    testing.assertEqual(_routed(campaign, inventory), ["cpe-1"])
+    testing.assertEqual(cfs.image_alarms(campaign, inventory), [
+        "image gone.bin is not in the image list (1 device)",
+        "image no-version.bin has no version (1 device)",
+    ])
+
+
+def _test_campaign_without_url_base():
+    """Without url-base the release is still set but there is no URL, and
+    the campaign says devices cannot fetch images."""
+    inventory = _flat_inventory(["cpe-1"])
+    inventory.images.url_base = None
+    campaign = InputCampaign(name="no-url", admin_state="run")
+    campaign.device.create("cpe-1", image=IMAGE)
+    o: y_1.root = y_1.root.from_gdata(cfs.campaign_config(campaign, inventory, {"cpe-1"}).to_gdata())
+    dev = o.rfs.get(cfs.flotilla_of("cpe-1"))!.device.get("cpe-1")!
+    testing.assertEqual(dev.software.target_release, "17.18.03a")
+    testing.assertEqual(dev.software.image_url, None)
+    testing.assertEqual(cfs.image_alarms(campaign, inventory),
+                        ["no url-base in the image list: devices cannot fetch images"])
+
+
 actor _test_campaign_deadline_without_windows_plans(t: testing.AsyncT):
     """A deadline alone closes the synthetic window; devices still plan."""
     campaign = InputCampaign(
         name="dl",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
         deadline=u64(3600),
     )
     for name in ["d1", "d2"]:
-        campaign.device.create(name)
+        campaign.device.create(name, image=IMAGE)
     layout, alarms, conc = _plan(campaign, _flat_inventory(["d1", "d2"]), 0)
     testing.assertEqual(_window_names(layout, "default"), ["d1", "d2"], None)
     testing.assertEqual(len(alarms), 0, "a meetable deadline must not alarm")
@@ -865,15 +911,13 @@ def _test_snapshot_plan_estimates():
     ramp from one, doubling on completions, not an even spread."""
     campaign = InputCampaign(
         name="ramped",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
         target_concurrency=u64(4),
         max_concurrency=u64(8),
     )
     names = []
     for i in range(10):
-        campaign.device.create("dev-{i}")
+        campaign.device.create("dev-{i}", image=IMAGE)
         names.append("dev-{i}")
     layout, alarms, conc = _plan(campaign, _flat_inventory(names), 0)
     return _render_layout("10 mock devices, no windows, target 4, max 8 at once: "
@@ -894,15 +938,13 @@ def _test_snapshot_plan_estimates_slow_devices():
     match."""
     campaign = InputCampaign(
         name="ramped",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
         target_concurrency=u64(8),
         max_concurrency=u64(16),
     )
     names = []
     for i in range(10):
-        campaign.device.create("dev-{i}")
+        campaign.device.create("dev-{i}", image=IMAGE)
         names.append("dev-{i}")
     layout, alarms, conc = _plan(campaign, _flat_inventory(names, upgrade_duration=8), 0)
     return _render_layout("10 mock devices at a configured 8s duration, "
@@ -917,8 +959,6 @@ def _test_snapshot_plan_estimates_mixed_fleet():
     own duration."""
     campaign = InputCampaign(
         name="mixed",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
         target_concurrency=u64(8),
         max_concurrency=u64(16),
@@ -928,8 +968,8 @@ def _test_snapshot_plan_estimates_mixed_fleet():
         "dev-real", type="iosxe",
         credentials=InputCredentials(username="admin"))
     for i in range(9):
-        campaign.device.create("dev-{i}")
-    campaign.device.create("dev-real")
+        campaign.device.create("dev-{i}", image=IMAGE)
+    campaign.device.create("dev-real", image=IMAGE)
     layout, alarms, conc = _plan(campaign, linked, 0)
     return _render_layout("nine 4s mocks and one real device at the adapter's "
                           + "395s nominal, target 8, max 16 at once",
@@ -945,15 +985,13 @@ actor _test_campaign_deadline_honors_ramp_up(t: testing.AsyncT):
         names.append("r{i}")
     campaign = InputCampaign(
         name="tight",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
         deadline=u64(40),
         target_concurrency=u64(1),
         max_concurrency=u64(3),
     )
     for name in names:
-        campaign.device.create(name)
+        campaign.device.create(name, image=IMAGE)
     layout, alarms, conc = _plan(campaign, _flat_inventory(names, upgrade_duration=8), 0)
     testing.assertEqual(alarms, ["1 device(s) cannot start before the deadline even at "
                                  + "max-concurrency 3: r9"])
@@ -975,12 +1013,10 @@ actor _test_campaign_estimate_from_the_adapter(t: testing.AsyncT):
     mocked.mock.software.upgrade_duration = u64(120)
     campaign = InputCampaign(
         name="mixed",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
     )
-    campaign.device.create("real-1")
-    campaign.device.create("mock-1")
+    campaign.device.create("real-1", image=IMAGE)
+    campaign.device.create("mock-1", image=IMAGE)
     layout, alarms, conc = _plan(campaign, linked, 0)
     ests: dict[str, int] = {}
     for win in layout:
@@ -1014,15 +1050,13 @@ def _test_campaign_open_window_takes_only_its_rest():
     linked.schedules.schedule.create("day").window.create(u64(0), duration=u64(14400))
     campaign = InputCampaign(
         name="late",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
         default_schedule="day",
         target_concurrency=u64(1),
         max_concurrency=u64(1),
     )
     for name in names:
-        campaign.device.create(name)
+        campaign.device.create(name, image=IMAGE)
     layout, alarms, conc = _plan(campaign, linked, 12600)
     by_start: dict[int, list[str]] = {}
     for win in layout:
@@ -1042,8 +1076,6 @@ def _daily_campaign(name: str, devices: int, deadline: ?int, target: int,
     linked.schedules.schedule.create("day").window.create(u64(0), duration=u64(3600))
     campaign = InputCampaign(
         name=name,
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
         default_schedule="day",
         target_concurrency=u64(target),
@@ -1052,7 +1084,7 @@ def _daily_campaign(name: str, devices: int, deadline: ?int, target: int,
     if deadline is not None:
         campaign.deadline = u64(deadline)
     for n in names:
-        campaign.device.create(n)
+        campaign.device.create(n, image=IMAGE)
     return (campaign, linked)
 
 
@@ -1120,15 +1152,13 @@ def _test_campaign_long_device_waits_for_a_window_it_fits():
             names.append(name)
     campaign = InputCampaign(
         name="long",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
         default_schedule="day",
         target_concurrency=u64(1),
         max_concurrency=u64(1),
     )
     for name in names:
-        campaign.device.create(name)
+        campaign.device.create(name, image=IMAGE)
     layout, alarms, conc = _plan(campaign, linked, 0)
     by_start: dict[int, list[str]] = {}
     for win in layout:
@@ -1184,13 +1214,11 @@ actor _test_campaign_devices_follow_their_own_schedule(t: testing.AsyncT):
     _bind(linked, "w2", "weekend")
     campaign = InputCampaign(
         name="split",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
         default_schedule="night",
     )
     for name in ["n1", "w1", "w2"]:
-        campaign.device.create(name)
+        campaign.device.create(name, image=IMAGE)
     layout, alarms, conc = _plan(campaign, linked, 0)
     testing.assertEqual(len(alarms), 0, None)
     testing.assertEqual(_window_names(layout, "night"), ["n1"],
@@ -1215,15 +1243,13 @@ def _test_snapshot_plan_two_schedules():
         _bind(linked, name, "weekend")
     campaign = InputCampaign(
         name="split",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="plan",
         default_schedule="night",
         target_concurrency=u64(8),
         max_concurrency=u64(16),
     )
     for name in ["n0", "n1", "n2", "n3", "n4", "w0", "w1", "w2", "w3", "w4"]:
-        campaign.device.create(name)
+        campaign.device.create(name, image=IMAGE)
     layout, alarms, conc = _plan(campaign, linked, 0)
     return _render_layout("two schedules, ten 8s devices, half bound to the "
                           + "weekend window at +2h",
@@ -1273,14 +1299,12 @@ def _test_mixed_fleet_runs_its_plan_without_alarm():
             names.append(name)
     campaign = InputCampaign(
         name="mixed",
-        target_release="17.18.03a",
-        image_url="https://images.example/xe.bin",
         admin_state="run",
         target_concurrency=u64(10),
         max_concurrency=u64(20),
     )
     for name in names:
-        campaign.device.create(name)
+        campaign.device.create(name, image=IMAGE)
     layout, alarms, conc = _plan(campaign, linked, 0)
     testing.assertEqual(alarms, [])
     testing.assertEqual(conc, 10)
@@ -1370,14 +1394,12 @@ actor _test_campaign_replan_keeps_released_devices(t: testing.AsyncT):
     def campaign(conc: int) -> InputCampaign:
         cp = InputCampaign(
             name="replan",
-            target_release="17.18.03a",
-            image_url="https://images.example/xe.bin",
             admin_state="run",
             target_concurrency=u64(conc),
             max_concurrency=u64(conc),
         )
         for name in names:
-            cp.device.create(name)
+            cp.device.create(name, image=IMAGE)
         return cp
 
     def finish(name: str) -> None:

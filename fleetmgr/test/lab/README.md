@@ -69,7 +69,9 @@ neighbor in the detail; `just heal-link ce1` brings it back.
 
 ## Upgrading
 
-Create and run a campaign with the URL `just image-url` prints, or headless:
+`just images` puts the staged images into the top's image list, with
+`url-base` on the image server; then create a campaign in the UI, or
+headless:
 
     just upgrade                                # campaign "lab" -> 17.18.03a on all CEs
     just CES=ce3 upgrade                        # one device
@@ -118,9 +120,9 @@ The software images are separate: one OCI artifact per release under
 blob, so the blob digest is the file's own sha256. `images.txt` lists the
 releases the lab serves, pinned by digest. `just pull` fetches them with
 ORAS into `image-server/images/`, verified against those digests. The lab
-bind-mounts that directory read-only into the image server, and
-`just image-url` and `just upgrade` take the staged file whose name carries
-`RELEASE`. Two releases, 17.16.01a and 17.18.03a, so a device on the lab's
+bind-mounts that directory read-only into the image server. `just images`
+adds every staged file to the image list, and `just upgrade` and
+`just load-ces` give the CEs the one whose name carries `RELEASE`. Two releases, 17.16.01a and 17.18.03a, so a device on the lab's
 17.18.02 base can go either way and an upgraded one can come back down.
 
 ORAS runs from its container, `ghcr.io/oras-project/oras`, with your Docker

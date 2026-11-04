@@ -69,7 +69,9 @@ modules that are shipped with StratoWeave:
 * `swyang.images` adds the image list, `/images`: software images by file
  name, with OS, version, family and hardware models. A family has at most
  one default image. The YANG says so with `must` statements, which are not
- checked yet, so clients keep to the rule. Add it to the top layer. The
+ checked yet, so clients keep to the rule. `url-base` says where devices
+ fetch the images from: an image's URL is `url-base` followed by its name.
+ Add it to the top layer. The
  files themselves go into the image folder (`--software.image-dir`) over
  `/image-file`.
 * `tmf.yang.ietf_yang_tmf_map` includes the TMF mapping schema, which is used
