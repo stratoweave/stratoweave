@@ -179,8 +179,8 @@
               <span class="mono">{campaign.adminState}</span>
             </span>
             <span class="fact">
-              <span class="fact-label">Target release</span>
-              <span class="mono">{campaign.targetRelease}</span>
+              <span class="fact-label">Image</span>
+              <span class="mono">{campaign.images[campaign.devices.indexOf(data.name)] || '—'}</span>
             </span>
             <span class="fact">
               <span class="fact-label">Planned start</span>

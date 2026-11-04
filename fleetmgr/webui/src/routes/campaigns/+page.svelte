@@ -6,6 +6,7 @@
   import CampaignProgress from '$lib/software/CampaignProgress.svelte';
   import { createPoller, nextSeq } from '$lib/core/polling/poller';
   import { withSignal } from '$lib/core/restconf/client';
+  import { releasesOf } from '$lib/software/campaign-images';
   import { fetchCounters } from '$lib/software/counters';
   import type { Campaign, CampaignCounters } from '$lib/software/model';
   import type { PageProps } from './$types';
@@ -125,7 +126,7 @@
         <thead>
           <tr>
             <th>Campaign</th>
-            <th>Target release</th>
+            <th>Release</th>
             <th>Mode</th>
             <th class="right">Devices</th>
             <th>Plan</th>
@@ -142,7 +143,7 @@
                   {campaign.name}
                 </a>
               </td>
-              <td class="mono tn" data-label="Target release">{campaign.targetRelease}</td>
+              <td class="mono tn" data-label="Release">{releasesOf(campaign.images, data.images).join(', ') || '—'}</td>
               <td data-label="Mode">
                 <AdminStatePill state={campaign.adminState} />
               </td>

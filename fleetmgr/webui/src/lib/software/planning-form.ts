@@ -1,6 +1,6 @@
 // A campaign's schedule and pace: the default schedule, the deadline and
-// how many devices upgrade at the same time, as the wizard and the campaign
-// page edit them.
+// how many devices upgrade at the same time, as the campaign page edits
+// them.
 //
 // The pace comes from a deadline or from a number of devices at once, not
 // both. The model takes both, with target-concurrency as a floor under the
@@ -43,10 +43,6 @@ export interface Planning {
 }
 
 const UINT32_MAX = 4294967295;
-
-export function emptyPlanningDraft(): PlanningDraft {
-  return { defaultSchedule: '', paceBy: 'concurrency', deadline: '', targetConcurrency: '', maxConcurrency: '' };
-}
 
 export function planningOf(c: Campaign): Planning {
   return {

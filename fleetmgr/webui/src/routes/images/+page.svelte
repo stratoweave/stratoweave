@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { onMount, tick } from 'svelte';
+  import { onMount, tick, untrack } from 'svelte';
   import { invalidate } from '$app/navigation';
 
   import { errorText } from '$lib/core/errors';
+  import { restconfPatchJson } from '$lib/core/restconf/client';
   import { takeNotice } from '$lib/core/notice';
   import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
   import FileDrop from '$lib/core/ui/FileDrop.svelte';
@@ -16,6 +17,7 @@
     type CatalogImage,
     type SortKey
   } from '$lib/software/images';
+  import { DATA_ROOT, urlBasePatch } from '$lib/software/model';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -43,6 +45,25 @@
   // What the add or edit page that sent us here did. Taken now, shown once
   // the status region is in place, so that a screen reader reads it.
   const notice = takeNotice();
+
+  // Where devices fetch the images from, as typed here until saved.
+  let urlBase = $state(untrack(() => data.urlBase));
+  let savingUrlBase = $state(false);
+
+  async function saveUrlBase(): Promise<void> {
+    try {
+      savingUrlBase = true;
+      statusMessage = null;
+      await restconfPatchJson(DATA_ROOT, urlBasePatch(urlBase.trim()));
+      statusMessage = { type: 'success', text: 'Saved the image URL base.' };
+      await invalidate('data:images');
+      urlBase = data.urlBase;
+    } catch (saveError) {
+      statusMessage = { type: 'error', text: errorText(saveError, 'Failed to save the image URL base.') };
+    } finally {
+      savingUrlBase = false;
+    }
+  }
 
   let rows = $derived(sortImages(data.images.filter((i) => matchesFilter(i, text)), sortKey, ascending));
   let paged = $derived(paginate(rows, pageNo, 50));
@@ -129,6 +150,26 @@
 {#if data.loadError}
   <div class="error-state status">{data.loadError}</div>
 {:else}
+  <section class="card url-base">
+    <label class="field url-field">
+      <span class="field__label">Image URL base</span>
+      <input
+        class="input mono"
+        placeholder="e.g. scp://user:password@host:/images/"
+        value={urlBase}
+        oninput={(e) => (urlBase = e.currentTarget.value)}
+      />
+    </label>
+    <button
+      class="btn btn-secondary"
+      type="button"
+      disabled={savingUrlBase || urlBase.trim() === data.urlBase}
+      onclick={saveUrlBase}
+    >
+      {savingUrlBase ? 'Saving…' : 'Save'}
+    </button>
+  </section>
+
   <section class="card" class:dropping={dragging}>
     {#if dragging}
       <div class="drop-hint-bar"><span class="drop-hint">Drop to add these files as images</span></div>
@@ -232,6 +273,18 @@
 />
 
 <style>
+  .url-base {
+    display: flex;
+    align-items: flex-end;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+
+  .url-field {
+    flex: 1;
+    max-width: 640px;
+  }
+
   .filters {
     display: flex;
     align-items: center;

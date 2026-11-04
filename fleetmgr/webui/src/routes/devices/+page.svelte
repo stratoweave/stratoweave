@@ -11,7 +11,7 @@
   import { bindPatch, unbindDevice } from '$lib/maintenance/binding';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
   import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device, type Schedule } from '$lib/software/model';
-  import { nameMatcher } from '$lib/software/selection';
+  import { nameMatcher, scheduleMatches } from '$lib/software/selection';
   import {
     IMPORT_BATCH,
     chunk,
@@ -69,12 +69,6 @@
       .filter((name) => name && !knownSchedules.has(name))
       .sort()
   );
-
-  function scheduleMatches(device: Device, filter: string): boolean {
-    if (filter === '') return true;
-    if (filter === 'none') return device.schedule === '';
-    return device.schedule === filter.slice(1);
-  }
 
   // The API returns devices in no particular order; ranges and pages need one.
   let sorted = $derived([...data.devices].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));

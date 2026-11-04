@@ -10,14 +10,28 @@
   interface Props {
     inventory: Device[];
     owners: Map<string, string>;
+    /** Schedule names, for the schedule filter. */
+    schedules: string[];
+    /** Held by the page, so that it outlives this component. */
+    selection?: Selection;
     error?: string;
     onchange?: (names: string[]) => void;
   }
 
-  let { inventory, owners, error = '', onchange }: Props = $props();
+  let {
+    inventory,
+    owners,
+    schedules,
+    selection = $bindable(emptySelection()),
+    error = '',
+    onchange
+  }: Props = $props();
 
-  let selection = $state<Selection>(emptySelection());
   let types = $derived([...new Set(inventory.map((d) => d.type))].sort());
+  // '' stands for devices that have not reported a model or version; it
+  // sorts first.
+  let models = $derived([...new Set(inventory.map((d) => d.model))].sort());
+  let versions = $derived([...new Set(inventory.map((d) => d.version))].sort());
   let context = $derived<SelectionContext>({ owners });
   let expansion = $derived(expandSelection(selection, inventory, context));
 
@@ -33,12 +47,50 @@
     return list.includes(value) ? list.filter((v) => v !== value) : [...list, value];
   }
 
-  let bars = $derived.by(() => {
-    const rows = Object.entries(expansion.byType).sort();
+  function barsOf(counts: Record<string, number>): { name: string; n: number; w: number }[] {
+    const rows = Object.entries(counts).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
     const max = Math.max(1, ...rows.map(([, n]) => n));
     return rows.map(([name, n]) => ({ name, n, w: (n / max) * 100 }));
-  });
+  }
+
+  let typeBars = $derived(barsOf(expansion.byType));
+  let modelBars = $derived(barsOf(expansion.byModel));
+
+  const NOT_REPORTED = 'not reported';
 </script>
+
+{#snippet tokens(values: string[], picked: string[], set: (next: string[]) => void)}
+  <span class="fvalue tokens">
+    {#each values as v (v)}
+      <button
+        class="tok"
+        class:on={picked.includes(v)}
+        class:none={v === ''}
+        aria-pressed={picked.includes(v)}
+        type="button"
+        onclick={() => set(toggle(picked, v))}
+      >
+        {v || NOT_REPORTED}
+      </button>
+    {/each}
+    {#if picked.length === 0}
+      <span class="hint">all</span>
+    {/if}
+  </span>
+{/snippet}
+
+{#snippet bars(title: string, rows: { name: string; n: number; w: number }[])}
+  <div>
+    <div class="kick" style:margin-bottom="10px">{title}</div>
+    {#each rows as b (b.name)}
+      <div class="bar-row">
+        <span class="mono bar-name" title={b.name || NOT_REPORTED}>{b.name || NOT_REPORTED}</span>
+        <span class="bar-track"><span class="bar-fill" style:width={`${b.w}%`}></span></span>
+        <span class="mono tn bar-n">{b.n.toLocaleString()}</span>
+      </div>
+    {/each}
+  </div>
+{/snippet}
 
 <div class="builder">
   <div class="filters-side">
@@ -50,25 +102,23 @@
       <div class="frow">
         <span class="flabel">Device type</span>
         <span class="fop">is any of</span>
-        <span class="fvalue tokens">
-          {#if types.length === 0}
-            <span class="hint">no devices</span>
-          {/if}
-          {#each types as t (t)}
-            <button
-              class="tok"
-              class:on={selection.types.includes(t)}
-              aria-pressed={selection.types.includes(t)}
-              type="button"
-              onclick={() => patch({ types: toggle(selection.types, t) })}
-            >
-              {t}
-            </button>
-          {/each}
-          {#if selection.types.length === 0}
-            <span class="hint">all</span>
-          {/if}
-        </span>
+        {#if types.length === 0}
+          <span class="hint">no devices</span>
+        {:else}
+          {@render tokens(types, selection.types, (next) => patch({ types: next }))}
+        {/if}
+      </div>
+      <div class="andr">AND</div>
+      <div class="frow">
+        <span class="flabel">Model</span>
+        <span class="fop">is any of</span>
+        {@render tokens(models, selection.models, (next) => patch({ models: next }))}
+      </div>
+      <div class="andr">AND</div>
+      <div class="frow">
+        <span class="flabel">Version</span>
+        <span class="fop">is any of</span>
+        {@render tokens(versions, selection.versions, (next) => patch({ versions: next }))}
       </div>
       <div class="andr">AND</div>
       <div class="frow">
@@ -81,6 +131,19 @@
           placeholder="substring, or glob with * and ?"
           value={selection.namePattern}
           oninput={(e) => patch({ namePattern: e.currentTarget.value })}
+        />
+      </div>
+      <div class="andr">AND</div>
+      <div class="frow">
+        <span class="flabel">Address</span>
+        <span class="fop">contains</span>
+        <input
+          class="fld mono"
+          type="text"
+          aria-label="Address contains"
+          placeholder="anything"
+          value={selection.addressContains}
+          oninput={(e) => patch({ addressContains: e.currentTarget.value })}
         />
       </div>
       <div class="andr">AND</div>
@@ -98,32 +161,19 @@
       </div>
       <div class="andr">AND</div>
       <div class="frow">
-        <span class="flabel">Requires approval</span>
+        <span class="flabel">Schedule</span>
         <span class="fop">is</span>
         <select
           class="select"
-          aria-label="Requires approval"
-          value={selection.requiresApproval}
-          onchange={(e) => patch({ requiresApproval: e.currentTarget.value as '' | 'yes' | 'no' })}
+          aria-label="Schedule"
+          value={selection.schedule}
+          onchange={(e) => patch({ schedule: e.currentTarget.value })}
         >
           <option value="">any</option>
-          <option value="no">No</option>
-          <option value="yes">Yes</option>
-        </select>
-      </div>
-      <div class="andr">AND</div>
-      <div class="frow">
-        <span class="flabel">Owned by a campaign</span>
-        <span class="fop">is</span>
-        <select
-          class="select"
-          aria-label="Owned by a campaign"
-          value={selection.ownedByCampaign}
-          onchange={(e) => patch({ ownedByCampaign: e.currentTarget.value as '' | 'yes' | 'no' })}
-        >
-          <option value="no">No</option>
-          <option value="yes">Yes</option>
-          <option value="">any</option>
+          <option value="none">no schedule</option>
+          {#each schedules as name (name)}
+            <option value={`=${name}`}>{name}</option>
+          {/each}
         </select>
       </div>
     </div>
@@ -149,20 +199,12 @@
       {/if}
     </div>
 
-    <div class="dists">
-      {#if bars.length > 0}
-        <div>
-          <div class="kick" style:margin-bottom="10px">Matched by type</div>
-          {#each bars as b (b.name)}
-            <div class="bar-row">
-              <span class="mono bar-name">{b.name}</span>
-              <span class="bar-track"><span class="bar-fill" style:width={`${b.w}%`}></span></span>
-              <span class="mono tn bar-n">{b.n.toLocaleString()}</span>
-            </div>
-          {/each}
-        </div>
-      {/if}
-    </div>
+    {#if typeBars.length > 0}
+      <div class="dists">
+        {@render bars('Matched by type', typeBars)}
+        {@render bars('Matched by model', modelBars)}
+      </div>
+    {/if}
   </div>
 
   <div class="rail">
@@ -187,7 +229,7 @@
           {#each expansion.sample as d (d.name)}
             <tr>
               <td class="mono sname">{d.name}</td>
-              <td class="mono stype">{d.type}</td>
+              <td class="mono stype">{d.model || NOT_REPORTED}</td>
             </tr>
           {/each}
         </tbody>
@@ -324,6 +366,12 @@
     color: var(--sw-accent-bright);
   }
 
+  /* "not reported" is not a value the device has. */
+  .tok.none {
+    font-family: inherit;
+    font-style: italic;
+  }
+
   .andr {
     font-size: var(--sw-text-2xs);
     font-weight: 500;
@@ -358,7 +406,8 @@
 
   .dists {
     display: grid;
-    grid-template-columns: 1fr;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 20px 26px;
   }
 
   .bar-row {
@@ -369,7 +418,7 @@
   }
 
   .bar-name {
-    width: 80px;
+    width: 110px;
     color: var(--sw-text-muted);
     font-size: var(--sw-text-xs);
     overflow: hidden;
