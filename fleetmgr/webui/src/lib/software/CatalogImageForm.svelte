@@ -20,10 +20,12 @@
   import {
     IMAGE_FILE_TYPES,
     OS_NAMES,
+    familyFromName,
     imageCountLabel,
     imageErrors,
     imageFromFileName,
     knownModels,
+    otherDefaults,
     previousImage,
     versionFromName,
     withDraftError,
@@ -36,6 +38,7 @@
     DATA_ROOT,
     IMAGES_ROOT,
     IMAGE_LIST_ROOT,
+    defaultsClearPatch,
     imageCreatePatch,
     imageToJson,
     parseImages
@@ -61,10 +64,14 @@
   let os = $state(untrack(() => image?.os ?? ''));
   let version = $state(untrack(() => image?.version ?? ''));
   let models = $state<string[]>(untrack(() => [...(image?.models ?? [])]));
+  let family = $state(untrack(() => image?.family ?? ''));
+  let isDefault = $state(untrack(() => image?.isDefault ?? false));
   let modelDraft = $state('');
-  // A new image takes its OS and version from the name until they are typed.
+  // A new image takes its OS, version and family from the name until they
+  // are typed.
   let osTyped = $state(!isNew);
   let versionTyped = $state(!isNew);
+  let familyTyped = $state(!isNew);
   // Names read again just before an add, for one added since this page loaded.
   let lateNames = $state<string[]>([]);
   let touched = $state(false);
@@ -78,17 +85,32 @@
 
   let modelOptions = $derived(knownModels(images).map(([value, count]) => ({ value, count })));
   let osOptions = $derived([...new Set([...OS_NAMES, ...images.map((i) => i.os)])]);
+  let familyOptions = $derived([...new Set(images.map((i) => i.family).filter((f) => f))]);
 
+  // What is typed, as it would be saved.
+  let current = $derived<CatalogImage>({
+    name: stored ?? name.trim(),
+    os: os.trim(),
+    version: version.trim(),
+    models,
+    family: family.trim(),
+    isDefault
+  });
   let taken = $derived(new Set([...images.map((i) => i.name), ...lateNames]));
-  let errors = $derived(withDraftError(imageErrors({ name, os, version, models }, isNew ? taken : null), modelDraft));
+  let errors = $derived(withDraftError(imageErrors(current, isNew ? taken : null), modelDraft));
   let shown = $derived(touched ? errors : ({} as ImageErrors));
   let modelsMeta = $derived(shown.models ?? (modelDraft.trim() ? 'Press Enter to add it.' : ''));
-  let previous = $derived(previousImage({ name: name.trim(), os, version, models }, images));
-  // An OS or version taken from the name comes back from the name.
+  let previous = $derived(previousImage(current, images));
+  // The default this image takes over; saving clears it.
+  let replaces = $derived(isDefault ? otherDefaults(current, images).map((i) => i.name) : []);
+  let defaultMeta = $derived(replaces.length > 0 ? `Replaces ${replaces.join(', ')} as the default.` : '');
+  // An OS, version or family taken from the name comes back from the name.
   let typedAnything = $derived(
     !!name.trim() ||
       (osTyped && !!os.trim()) ||
       (versionTyped && !!version.trim()) ||
+      (familyTyped && !!family.trim()) ||
+      isDefault ||
       models.length > 0 ||
       !!modelDraft.trim()
   );
@@ -97,12 +119,13 @@
     name = next;
     if (!osTyped) os = imageFromFileName(next.trim()).os;
     if (!versionTyped) version = versionFromName(next.trim());
+    if (!familyTyped) family = familyFromName(next.trim());
   }
 
   // Files take this page over, one row each. What is typed here goes to the
   // row of the same name; with no such row it would be lost, so ask first.
   function takeFiles(files: File[]): void {
-    const typed = { name: name.trim(), os: os.trim(), version: version.trim(), models: [...models], draft: modelDraft };
+    const typed = { ...current, models: [...models], draft: modelDraft };
     if (files.some((f) => f.name === typed.name)) onfiles?.(files, typed);
     else if (typedAnything) pendingFiles = files;
     else onfiles?.(files, null);
@@ -120,21 +143,27 @@
       await focusFirstError(form);
       return;
     }
-    const saved = { name: stored ?? name.trim(), os: os.trim(), version: version.trim(), models };
+    const saved = current;
     try {
       saving = true;
       statusMessage = '';
+      // The list as it is now: for the name check, and for the default this
+      // image takes over.
+      const list = parseImages(await restconfGetOrNull<unknown>(IMAGES_ROOT));
+      const clear = saved.isDefault ? otherDefaults(saved, list).map((i) => i.name) : [];
       if (stored === null) {
         // A PATCH merges into an image of the same name rather than fail.
-        const current = parseImages(await restconfGetOrNull<unknown>(IMAGES_ROOT)).map((i) => i.name);
-        if (current.includes(saved.name)) {
-          lateNames = current;
+        if (list.some((i) => i.name === saved.name)) {
+          lateNames = list.map((i) => i.name);
           saving = false;
           await focusFirstError(form);
           return;
         }
-        await restconfPatchJson(DATA_ROOT, imageCreatePatch([saved]));
+        // One write adds the image and clears the old default.
+        await restconfPatchJson(DATA_ROOT, imageCreatePatch([saved], clear));
       } else {
+        // The old default goes first, so that the family never has two.
+        if (clear.length > 0) await restconfPatchJson(DATA_ROOT, defaultsClearPatch(clear));
         // PUT replaces the whole entry, so a removed model disappears.
         await restconfPutJson(
           getListEntryPath(IMAGE_LIST_ROOT, stored),
@@ -269,6 +298,34 @@
       {modelsMeta || ' '}
     </small>
   </div>
+  <div class="grid">
+    <FieldText
+      label="Family"
+      required={isDefault}
+      value={family}
+      error={shown.family}
+      suggestions={familyOptions}
+      mono={true}
+      placeholder="e.g. c1100-universalk9"
+      onchange={(v) => {
+        familyTyped = true;
+        family = v;
+      }}
+      ontouch={() => (touched = true)}
+    />
+    <div class="field">
+      <span class="field__label">Default</span>
+      <label class="default-toggle">
+        <input
+          type="checkbox"
+          bind:checked={isDefault}
+          aria-describedby={defaultMeta ? `${uid}-default-meta` : undefined}
+        />
+        <span>Default of {family.trim() || 'its family'}</span>
+      </label>
+      <small id={`${uid}-default-meta`} class="field__meta">{defaultMeta || ' '}</small>
+    </div>
+  </div>
 </section>
 
 <ConfirmDialog
@@ -305,5 +362,16 @@
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 12px;
+  }
+
+  /* As tall as a text input, so that it lines up with Family. */
+  .default-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 38px;
+    font-size: var(--sw-text-sm);
+    cursor: pointer;
+    overflow-wrap: anywhere;
   }
 </style>

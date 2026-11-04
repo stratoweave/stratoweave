@@ -23,6 +23,7 @@
   const COLUMNS: { key: SortKey; label: string }[] = [
     { key: 'name', label: 'Name' },
     { key: 'os', label: 'OS' },
+    { key: 'family', label: 'Family' },
     { key: 'models', label: 'Models' },
     { key: 'version', label: 'Version' }
   ];
@@ -187,8 +188,10 @@
               <tr>
                 <td class="name-cell">
                   <a class="mono name" href={`/images/${encodeURIComponent(image.name)}`}>{image.name}</a>
+                  {#if image.isDefault}<span class="tag default">default</span>{/if}
                 </td>
                 <td class="os-cell nowrap">{image.os}</td>
+                <td class="family-cell mono" title={image.family}>{image.family}</td>
                 <td class="models-cell">
                   <span class="chips">
                     {#each image.models as m (m)}<span class="tag mono">{m}</span>{/each}
@@ -208,7 +211,7 @@
                 </td>
               </tr>
             {:else}
-              <tr class="empty-row"><td colspan="5" class="dim">No images match.</td></tr>
+              <tr class="empty-row"><td colspan="6" class="dim">No images match.</td></tr>
             {/each}
           </tbody>
         </table>
@@ -254,15 +257,19 @@
   }
 
   .col-name {
-    width: 38%;
+    width: 30%;
   }
 
   .col-os {
-    width: 11%;
+    width: 8%;
+  }
+
+  .col-family {
+    width: 20%;
   }
 
   .col-version {
-    width: 12%;
+    width: 10%;
   }
 
   .col-action {
@@ -324,6 +331,22 @@
     white-space: nowrap;
   }
 
+  /* Green as the success pills, so that it stands apart from the cyan
+     name links. */
+  .tag.default {
+    margin-left: 6px;
+    border-color: rgb(var(--sw-success-rgb) / 0.25);
+    background: var(--sw-success-dim);
+    color: var(--sw-success);
+  }
+
+  .family-cell {
+    font-size: var(--sw-text-xs);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
   .nowrap {
     white-space: nowrap;
   }
@@ -346,7 +369,8 @@
 
   @media (max-width: 720px) {
     /* Each image becomes a block: its name, then its version and OS, then
-       its models. The header stays, as a row of sort buttons. */
+       its family and its models. The header stays, as a row of sort
+       buttons. */
     .images {
       min-width: 0;
       table-layout: auto;
@@ -381,6 +405,7 @@
       grid-template-areas:
         'name name'
         'version os'
+        'family family'
         'models models';
       gap: 6px 12px;
       padding: 12px 0;
@@ -415,6 +440,11 @@
 
     .os-cell {
       grid-area: os;
+      color: var(--sw-text-secondary);
+    }
+
+    .family-cell {
+      grid-area: family;
       color: var(--sw-text-secondary);
     }
 

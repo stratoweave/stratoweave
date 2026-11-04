@@ -130,6 +130,8 @@ export interface ImageJson {
   os?: string;
   version?: string;
   model?: string[];
+  family?: string;
+  default?: boolean;
 }
 
 /** GET data merges every module; this UI reads three of them. */
@@ -566,7 +568,14 @@ export function parseDeviceEntry(json: unknown): Device | null {
 }
 
 function parseImage(entry: ImageJson): CatalogImage {
-  return { name: entry.name, os: entry.os ?? '', models: entry.model ?? [], version: entry.version ?? '' };
+  return {
+    name: entry.name,
+    os: entry.os ?? '',
+    models: entry.model ?? [],
+    version: entry.version ?? '',
+    family: entry.family ?? '',
+    isDefault: entry.default ?? false
+  };
 }
 
 /** Parse a GET of data/stratoweave-images:images. */
@@ -633,11 +642,27 @@ export function adminStatePatch(name: string, state: AdminState): SoftwarePatchJ
 
 /** Every leaf, since a PUT replaces the whole entry. */
 export function imageToJson(image: CatalogImage): ImageJson {
-  return { name: image.name, os: image.os, version: image.version, model: [...image.models] };
+  const json: ImageJson = {
+    name: image.name,
+    os: image.os,
+    version: image.version,
+    model: [...image.models],
+    default: image.isDefault
+  };
+  if (image.family) json.family = image.family;
+  return json;
 }
 
-export function imageCreatePatch(images: CatalogImage[]): ImagesPatchJson {
-  return { 'stratoweave-images:images': { image: images.map(imageToJson) } };
+/** Adds `images` and clears the default of the images named in `clear`, in
+ * one write, so that a family never has two defaults. */
+export function imageCreatePatch(images: CatalogImage[], clear: string[] = []): ImagesPatchJson {
+  const cleared: ImageJson[] = clear.map((name) => ({ name, default: false }));
+  return { 'stratoweave-images:images': { image: [...images.map(imageToJson), ...cleared] } };
+}
+
+/** Clears the default of the images named. */
+export function defaultsClearPatch(names: string[]): ImagesPatchJson {
+  return imageCreatePatch([], names);
 }
 
 // ── Validation ──
