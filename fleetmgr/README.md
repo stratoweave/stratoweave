@@ -198,8 +198,10 @@ routing each member to its flotilla before merging all software intent into the
 same device entry that the inventory transform writes.
 
 `/images` is the StratoWeave image list (`swyang.images`): software images
-by file name, each with its `os`, `version` and the hardware `model`s it is
-for. The web UI uploads the image files into the top's image folder,
+by file name, each with its `os`, `version`, `family` and the hardware
+`model`s it is for. One image of a family can be its `default`; the YANG
+`must` statements that say so are not checked yet, and the web UI keeps to
+the rule. The web UI uploads the image files into the top's image folder,
 `--software.image-dir`, and adds their entries; nothing else reads the list
 yet. Like `/schedules`, the container is a transform that produces no
 configuration, so campaigns can link the whole list later.
