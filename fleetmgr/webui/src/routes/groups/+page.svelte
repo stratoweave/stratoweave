@@ -80,7 +80,15 @@
               <td>
                 <a class="group-name mono" href={`/groups/${encodeURIComponent(row.name)}`}>{row.name}</a>
               </td>
-              <td class="tn right">{row.members.length.toLocaleString()}</td>
+              <td class="tn right">
+                {#if row.members.length === 0}
+                  <span class="dim">0</span>
+                {:else}
+                  <a class="count-link" href={`/devices?group=${encodeURIComponent(row.name)}`}>
+                    {row.members.length.toLocaleString()}
+                  </a>
+                {/if}
+              </td>
               <td class="order mono">
                 {#each row.members.slice(0, ORDER_SHOWN) as member, i (member.name)}
                   {#if i > 0}<span class="arrow">→</span>{/if}
@@ -135,9 +143,15 @@
     color: var(--sw-accent);
   }
 
-  .member {
+  .member,
+  .count-link {
     color: var(--sw-accent-bright);
     text-decoration: none;
+  }
+
+  .count-link:hover {
+    color: var(--sw-accent);
+    text-decoration: underline;
   }
 
   .order {

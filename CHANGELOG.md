@@ -468,6 +468,10 @@
   RESTCONF PATCH, after a confirmation. [#736]
 - The web UI has a search, in the header or with Ctrl/⌘+K, that jumps to a
   page, campaign, image, device or schedule by name. [#737]
+- The web UI has redundancy group pages: a list, one page per group with its
+  members in upgrade order and its separation, and a page to create a group.
+  The device page sets a device's groups and priority, and the devices page
+  shows and filters by group.
 - The device page is redesigned around the device's upgrade run. [#674]
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for

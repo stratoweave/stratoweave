@@ -83,6 +83,14 @@ export function scheduleMatches(device: Device, filter: string): boolean {
   return device.schedule === filter.slice(1);
 }
 
+/** Whether device's redundancy groups match filter: '' any, 'none' in no
+ * group, '=NAME' a member of NAME. */
+export function groupMatches(device: Device, filter: string): boolean {
+  if (filter === '') return true;
+  if (filter === 'none') return device.groups.length === 0;
+  return device.groups.includes(filter.slice(1));
+}
+
 /** Case-insensitive substring test; empty matches everything. */
 function contains(text: string, needle: string): boolean {
   const n = needle.trim().toLowerCase();

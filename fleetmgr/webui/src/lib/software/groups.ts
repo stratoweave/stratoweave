@@ -3,12 +3,14 @@
 // /redundancy-groups says how far apart its members upgrade. A group exists
 // while a device names it or it has an entry.
 
-import { rewriteListEntry } from '#lib/core/restconf/client.ts';
+import { restconfPatchJson, rewriteListEntry } from '#lib/core/restconf/client.ts';
 import { parseDuration } from '#lib/core/time.ts';
 import type { ValidationResult } from '#lib/core/validation/types.ts';
 import {
+  DATA_ROOT,
   FLEET_DEVICE_LIST_ROOT,
   type Device,
+  type DeviceJson,
   type FleetPatchJson,
   type GroupSeparation,
   type RedundancyGroupsPatchJson,
@@ -16,7 +18,8 @@ import {
 } from '#lib/software/model.ts';
 import { nameMatcher } from '#lib/software/selection.ts';
 
-/** The range of min-separation (uint32). */
+/** The ranges of redundancy-priority (uint16) and min-separation (uint32). */
+const MAX_PRIORITY = 65535;
 const MAX_SEPARATION = 4294967295;
 
 /** Names a field suggests at most: a datalist of 30k names freezes the page. */
@@ -87,9 +90,25 @@ export function suggestNames(names: string[], typed: string, skip: Set<string>):
   return out;
 }
 
+/** The part of a long list to show around item k: span items either side,
+ * and whether items before and after are left out. A short list is shown
+ * whole. */
+export function around<T>(items: T[], k: number, span = 2): { items: T[]; before: boolean; after: boolean } {
+  if (items.length <= 2 * span + 2) return { items, before: false, after: false };
+  const from = Math.max(0, k - span);
+  const to = Math.min(items.length, k + span + 1);
+  return { items: items.slice(from, to), before: from > 0, after: to < items.length };
+}
+
 /** "3 devices". */
 export function devicesText(n: number): string {
   return `${n.toLocaleString()} device${n === 1 ? '' : 's'}`;
+}
+
+/** A priority as typed; null unless it is a whole number in range. */
+export function parsePriority(text: string): number | null {
+  const t = text.trim();
+  return /^\d+$/.test(t) && Number(t) <= MAX_PRIORITY ? Number(t) : null;
 }
 
 /** A min-separation as typed, 30m or 1h; empty is none. Null when it does
@@ -125,6 +144,36 @@ export function removeFromGroup(name: string, group: string): Promise<void> {
     const left = groups.filter((g) => g !== group);
     if (left.length > 0) rest['redundancy-group'] = left;
     else delete rest['redundancy-group'];
+    return rest;
+  });
+}
+
+export interface Membership {
+  groups: string[];
+  priority: number;
+}
+
+/** Saves what changed from `before` to `after` on device `name`. Adding
+ * groups and a new priority is one PATCH; leaving a group rewrites the
+ * entry, keeping any group added there since it was read. */
+export async function saveMembership(name: string, before: Membership, after: Membership): Promise<void> {
+  const added = after.groups.filter((g) => !before.groups.includes(g));
+  const removed = new Set(before.groups.filter((g) => !after.groups.includes(g)));
+  const priorityChanged = after.priority !== before.priority;
+  if (removed.size === 0) {
+    const entry: DeviceJson = { name };
+    if (added.length > 0) entry['redundancy-group'] = added;
+    if (priorityChanged) entry['redundancy-priority'] = after.priority;
+    await restconfPatchJson(DATA_ROOT, { 'fleetmgr:fleet': { device: [entry] } });
+    return;
+  }
+  await rewriteListEntry(FLEET_DEVICE_LIST_ROOT, name, (entry) => {
+    const stored = (entry['redundancy-group'] as string[] | undefined) ?? [];
+    const groups = [...stored.filter((g) => !removed.has(g)), ...added.filter((g) => !stored.includes(g))];
+    const rest = { ...entry };
+    if (groups.length > 0) rest['redundancy-group'] = groups;
+    else delete rest['redundancy-group'];
+    if (priorityChanged) rest['redundancy-priority'] = after.priority;
     return rest;
   });
 }

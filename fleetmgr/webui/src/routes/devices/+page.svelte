@@ -11,7 +11,7 @@
   import { bindPatch, unbindDevice } from '#lib/maintenance/binding.ts';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
   import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, parseFleet, type Device, type Schedule } from '#lib/software/model.ts';
-  import { nameMatcher, scheduleMatches } from '#lib/software/selection.ts';
+  import { groupMatches, nameMatcher, scheduleMatches } from '#lib/software/selection.ts';
   import {
     IMPORT_BATCH,
     chunk,
@@ -52,6 +52,8 @@
   let filterModel = $state('');
   // Schedule selects hold '' (any or nothing chosen), 'none' or '=NAME'.
   let filterSchedule = $state(untrack(() => (data.scheduleFilter ? `=${data.scheduleFilter}` : '')));
+  // The same for the redundancy group.
+  let filterGroup = $state(untrack(() => (data.groupFilter ? `=${data.groupFilter}` : '')));
   let page = $state(1);
 
   // A new ?name= (the search's "show all" row while this page is open)
@@ -78,6 +80,14 @@
       .sort()
   );
 
+  // A fleet with no redundancy groups shows no group column or filter.
+  let groupNames = $derived(
+    [...new Set([...devices.flatMap((d) => d.groups), data.groupFilter].filter((g) => g))].sort((a, b) =>
+      a < b ? -1 : a > b ? 1 : 0
+    )
+  );
+  let hasGroups = $derived(groupNames.length > 0);
+
   // The API returns devices in no particular order; ranges and pages need one.
   let sorted = $derived([...devices].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));
   let filtered = $derived.by(() => {
@@ -87,7 +97,8 @@
         matchName(d.name) &&
         (!filterType || d.type === filterType) &&
         (!filterModel || d.model === filterModel) &&
-        scheduleMatches(d, filterSchedule)
+        scheduleMatches(d, filterSchedule) &&
+        groupMatches(d, filterGroup)
     );
   });
   let paged = $derived(paginate(filtered, page, PAGE_SIZE));
@@ -550,6 +561,15 @@
           <option value={`=${name}`}>{name} (missing)</option>
         {/each}
       </select>
+      {#if hasGroups}
+        <select class="select compact" aria-label="Redundancy group" bind:value={filterGroup} onchange={() => (page = 1)}>
+          <option value="">all groups</option>
+          <option value="none">no group</option>
+          {#each groupNames as name (name)}
+            <option value={`=${name}`}>{name}</option>
+          {/each}
+        </select>
+      {/if}
       <span class="filter-count">{filtered.length} of {devices.length}</span>
     </div>
     <div class="table-wrap">
@@ -573,6 +593,9 @@
             <th class="col-platform">Serial number</th>
             <th class="col-address">Address</th>
             <th>Schedule</th>
+            {#if hasGroups}
+              <th class="col-groups">Groups</th>
+            {/if}
             <th class="col-action"><span class="sr-only">Actions</span></th>
           </tr>
         </thead>
@@ -618,6 +641,16 @@
                   </span>
                 {/if}
               </td>
+              {#if hasGroups}
+                <td class="col-groups">
+                  {#each device.groups as group, i (group)}
+                    {#if i > 0}<span class="dim">, </span>{/if}
+                    <a class="group-name mono" href={`/groups/${encodeURIComponent(group)}`}>{group}</a>
+                  {:else}
+                    <span class="dim">—</span>
+                  {/each}
+                </td>
+              {/if}
               <td class="col-action">
                 <button
                   class="btn btn-ghost btn-sm row-remove on-row"
@@ -779,6 +812,16 @@
     color: var(--sw-accent);
   }
 
+  .group-name {
+    color: var(--sw-accent-bright);
+    text-decoration: none;
+    font-size: var(--sw-text-sm);
+  }
+
+  .group-name:hover {
+    color: var(--sw-accent);
+  }
+
   .swatch {
     display: inline-block;
     width: 9px;
@@ -860,7 +903,8 @@
     /* The device page has these; the list keeps the name and the binding. */
     .col-type,
     .col-platform,
-    .col-address {
+    .col-address,
+    .col-groups {
       display: none;
     }
 
