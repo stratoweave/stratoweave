@@ -1,6 +1,6 @@
-import { errorText } from '$lib/core/errors';
-import { restconfGetOrNull } from '$lib/core/restconf/client';
-import { SCHEDULES_ROOT, parseSchedules } from '$lib/software/model';
+import { errorText } from '#lib/core/errors.ts';
+import { restconfGetOrNull } from '#lib/core/restconf/client.ts';
+import { SCHEDULES_ROOT, parseSchedules } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 

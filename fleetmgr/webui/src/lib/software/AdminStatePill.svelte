@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { AdminState } from '$lib/software/model';
+  import type { AdminState } from '#lib/software/model.ts';
 
   let { state }: { state: AdminState } = $props();
 </script>

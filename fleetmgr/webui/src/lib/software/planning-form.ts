@@ -9,7 +9,7 @@
 // no deadline. The controller then goes above one device at once only as
 // far as the deadline needs, up to max-concurrency.
 
-import { restconfPatchJson, rewriteListEntry } from '$lib/core/restconf/client';
+import { restconfPatchJson, rewriteListEntry } from '#lib/core/restconf/client.ts';
 import {
   CAMPAIGN_LIST_ROOT,
   DATA_ROOT,
@@ -19,7 +19,7 @@ import {
   type CampaignJson,
   type CampaignPlan
 } from './model';
-import { formatDuration, toLocalInput } from '$lib/core/time';
+import { formatDuration, toLocalInput } from '#lib/core/time.ts';
 
 export type PaceBy = 'deadline' | 'concurrency';
 

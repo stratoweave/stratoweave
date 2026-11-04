@@ -1,4 +1,4 @@
-import type { Device } from '$lib/software/model';
+import type { Device } from '#lib/software/model.ts';
 
 // Campaign members are leafrefs into the fleet, so every selection ends
 // as an explicit, inventory-verified name list ("no range expansion" is

@@ -1,8 +1,8 @@
 // Picking the image each selected device installs: one pick per hardware
 // model, from the images that list the model.
 
-import { compareVersions, type CatalogImage } from '$lib/software/images';
-import type { Device } from '$lib/software/model';
+import { compareVersions, type CatalogImage } from '#lib/software/images.ts';
+import type { Device } from '#lib/software/model.ts';
 
 export interface ModelGroup {
   model: string;

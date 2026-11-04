@@ -10,11 +10,11 @@
     snapTime,
     type Block,
     type Occurrence
-  } from '$lib/maintenance/occurrences';
-  import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
-  import { ruleText, scheduleRulesText } from '$lib/maintenance/schedule-form';
-  import type { MaintenanceWindow, Schedule } from '$lib/software/model';
-  import { clockLabel, dayLabel, formatClock, formatTimeOfDay, formatUtcOffset } from '$lib/core/time';
+  } from '#lib/maintenance/occurrences.ts';
+  import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
+  import { ruleText, scheduleRulesText } from '#lib/maintenance/schedule-form.ts';
+  import type { MaintenanceWindow, Schedule } from '#lib/software/model.ts';
+  import { clockLabel, dayLabel, formatClock, formatTimeOfDay, formatUtcOffset } from '#lib/core/time.ts';
 
   interface Props {
     schedules: Schedule[];

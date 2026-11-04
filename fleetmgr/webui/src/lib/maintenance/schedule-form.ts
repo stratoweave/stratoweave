@@ -2,14 +2,14 @@
 // (a time of day, a duration, a UTC offset), validated into the model's
 // seconds and minutes, and turned into the YANG-JSON the API takes.
 
-import type { Campaign, Device, MaintenanceWindow, Schedule, ScheduleJson } from '$lib/software/model';
+import type { Campaign, Device, MaintenanceWindow, Schedule, ScheduleJson } from '#lib/software/model.ts';
 import {
   formatDuration,
   formatLocalTime,
   formatTimeOfDay,
   formatUtcOffset,
   parseDuration
-} from '$lib/core/time';
+} from '#lib/core/time.ts';
 import { WEEKDAYS } from './occurrences';
 
 export interface WindowDraft {

@@ -1,5 +1,5 @@
-import { errorText } from '$lib/core/errors';
-import { fetchLayer, parseContent, parseFormat } from '$lib/core/layer-config';
+import { errorText } from '#lib/core/errors.ts';
+import { fetchLayer, parseContent, parseFormat } from '#lib/core/layer-config.ts';
 
 import type { PageLoad } from './$types';
 

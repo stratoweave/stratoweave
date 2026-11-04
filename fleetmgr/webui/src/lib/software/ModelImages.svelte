@@ -1,6 +1,6 @@
 <script lang="ts">
-  import { imagesFor, type ModelGroup } from '$lib/software/campaign-images';
-  import type { CatalogImage } from '$lib/software/images';
+  import { imagesFor, type ModelGroup } from '#lib/software/campaign-images.ts';
+  import type { CatalogImage } from '#lib/software/images.ts';
 
   interface Props {
     groups: ModelGroup[];

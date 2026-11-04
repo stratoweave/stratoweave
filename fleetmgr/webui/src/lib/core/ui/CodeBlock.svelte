@@ -1,7 +1,7 @@
 <script lang="ts">
   // Read-only text with line numbers, a wrap toggle and a copy button.
   // Ported from the sorespo web UI without its diff colouring.
-  import NavIcon from '$lib/core/ui/NavIcon.svelte';
+  import NavIcon from '#lib/core/ui/NavIcon.svelte';
 
   let {
     content = '',

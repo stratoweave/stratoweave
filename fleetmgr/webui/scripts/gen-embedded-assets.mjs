@@ -9,7 +9,7 @@
 //
 // Run via `just gen-webui` (which builds the UI first). The output is
 // committed to git, so the build must stay byte-deterministic (see
-// kit.version in svelte.config.js). Ported from the sorespo web UI.
+// the version option in vite.config.ts). Ported from the sorespo web UI.
 
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { extname, join, relative, sep } from 'node:path';

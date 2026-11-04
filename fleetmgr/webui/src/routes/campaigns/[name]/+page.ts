@@ -1,8 +1,8 @@
-import { errorText } from '$lib/core/errors';
-import { nextSeq } from '$lib/core/polling/poller';
-import { restconfGetJson } from '$lib/core/restconf/client';
-import { fetchCampaignEntry } from '$lib/software/counters';
-import { SCHEDULES_ROOT, parseSchedules, type Schedule } from '$lib/software/model';
+import { errorText } from '#lib/core/errors.ts';
+import { nextSeq } from '#lib/core/polling/poller.ts';
+import { restconfGetJson } from '#lib/core/restconf/client.ts';
+import { fetchCampaignEntry } from '#lib/software/counters.ts';
+import { SCHEDULES_ROOT, parseSchedules, type Schedule } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 

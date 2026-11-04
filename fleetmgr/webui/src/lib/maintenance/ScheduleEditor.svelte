@@ -2,20 +2,20 @@
   import { untrack } from 'svelte';
   import { goto } from '$app/navigation';
 
-  import { errorText } from '$lib/core/errors';
-  import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
-  import FieldText from '$lib/core/ui/FieldText.svelte';
-  import Section from '$lib/core/ui/Section.svelte';
+  import { errorText } from '#lib/core/errors.ts';
+  import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import FieldText from '#lib/core/ui/FieldText.svelte';
+  import Section from '#lib/core/ui/Section.svelte';
   import {
     getListEntryPath,
     restconfDelete,
     restconfPatchJson,
     restconfPutJson,
     wrapListEntryBody
-  } from '$lib/core/restconf/client';
-  import WeekCalendar from '$lib/maintenance/WeekCalendar.svelte';
-  import { HORIZON_DAYS, WEEKDAYS, occurrences } from '$lib/maintenance/occurrences';
-  import { scheduleColors } from '$lib/maintenance/palette';
+  } from '#lib/core/restconf/client.ts';
+  import WeekCalendar from '#lib/maintenance/WeekCalendar.svelte';
+  import { HORIZON_DAYS, WEEKDAYS, occurrences } from '#lib/maintenance/occurrences.ts';
+  import { scheduleColors } from '#lib/maintenance/palette.ts';
   import {
     draftFromSchedule,
     draftToSchedule,
@@ -31,8 +31,8 @@
     type ScheduleDraft,
     type ScheduleUsage,
     type WindowDraft
-  } from '$lib/maintenance/schedule-form';
-  import { DATA_ROOT, SCHEDULE_LIST_ROOT, type MaintenanceWindow, type Schedule } from '$lib/software/model';
+  } from '#lib/maintenance/schedule-form.ts';
+  import { DATA_ROOT, SCHEDULE_LIST_ROOT, type MaintenanceWindow, type Schedule } from '#lib/software/model.ts';
   import {
     clockLabel,
     dayLabel,
@@ -40,7 +40,7 @@
     formatTimeOfDay,
     parseDuration,
     sameLocalDay
-  } from '$lib/core/time';
+  } from '#lib/core/time.ts';
 
   interface Props {
     /** null creates a new schedule. */
@@ -158,7 +158,7 @@
         );
       }
       // Not a preload made before the write (hovering Cancel makes one).
-      await goto('/schedules', { invalidateAll: true });
+      await goto('/schedules', { refreshAll: true });
     } catch (saveError) {
       statusMessage = errorText(saveError, 'Failed to save the schedule.');
     } finally {
@@ -173,7 +173,7 @@
       deleting = true;
       statusMessage = '';
       await restconfDelete(getListEntryPath(SCHEDULE_LIST_ROOT, schedule.name));
-      await goto('/schedules', { invalidateAll: true });
+      await goto('/schedules', { refreshAll: true });
     } catch (deleteError) {
       statusMessage = errorText(deleteError, 'Failed to delete the schedule.');
     } finally {

@@ -13,8 +13,8 @@
 // after the page's last write, and is for the campaign still on the page;
 // reads that can no longer count are aborted.
 
-import { nextSeq } from '$lib/core/polling/poller';
-import { withSignal } from '$lib/core/restconf/client';
+import { nextSeq } from '#lib/core/polling/poller.ts';
+import { withSignal } from '#lib/core/restconf/client.ts';
 import { FAST_ENTRY_LIMIT, fetchCampaignEntry, fetchCampaignState, fetchCounters } from './counters';
 import type { CampaignConfig, CampaignCounters, StateParts } from './model';
 import { RateTracker } from './rate';

@@ -1,7 +1,7 @@
-import { errorText } from '$lib/core/errors';
-import { deleteImageFile } from '$lib/core/image-file';
-import { getListEntryPath, restconfDelete } from '$lib/core/restconf/client';
-import { IMAGE_LIST_ROOT } from '$lib/software/model';
+import { errorText } from '#lib/core/errors.ts';
+import { deleteImageFile } from '#lib/core/image-file.ts';
+import { getListEntryPath, restconfDelete } from '#lib/core/restconf/client.ts';
+import { IMAGE_LIST_ROOT } from '#lib/software/model.ts';
 
 /** Delete the image `name`: its list entry, then its file. A file that is
  * not there, or a top without an image folder, gives a 404, which counts as

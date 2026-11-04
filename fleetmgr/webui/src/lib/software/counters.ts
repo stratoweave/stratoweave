@@ -1,4 +1,4 @@
-import { getListEntryPath, restconfGetOrNull } from '$lib/core/restconf/client';
+import { getListEntryPath, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import {
   CAMPAIGN_LIST_ROOT,
   countersOf,
@@ -7,7 +7,7 @@ import {
   type CampaignConfig,
   type CampaignCounters,
   type StateParts
-} from '$lib/software/model';
+} from '#lib/software/model.ts';
 
 // The state node carries the plan and one row per member (~150 B each),
 // so callers fetch it every tick only for campaigns up to this size and

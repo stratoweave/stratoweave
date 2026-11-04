@@ -1,5 +1,5 @@
-import type { ValidationResult } from '$lib/core/validation/types';
-import type { CatalogImage } from '$lib/software/images';
+import type { ValidationResult } from '#lib/core/validation/types.ts';
+import type { CatalogImage } from '#lib/software/images.ts';
 
 // RESTCONF paths. Writes always PATCH the datastore root: the backend
 // rejects a PATCH whose target resource does not exist yet (RFC 8040),

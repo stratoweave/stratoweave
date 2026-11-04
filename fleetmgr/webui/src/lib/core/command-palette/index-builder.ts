@@ -1,4 +1,4 @@
-import { restconfGetCachedOrNull } from '$lib/core/restconf/client';
+import { restconfGetCachedOrNull } from '#lib/core/restconf/client.ts';
 import {
   FLEET_ROOT,
   IMAGES_ROOT,
@@ -8,8 +8,8 @@ import {
   parseFleet,
   parseImages,
   parseSchedules
-} from '$lib/software/model';
-import { nameMatcher } from '$lib/software/selection';
+} from '#lib/software/model.ts';
+import { nameMatcher } from '#lib/software/selection.ts';
 
 import type { PaletteEntry } from './types';
 

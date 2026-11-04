@@ -1,5 +1,5 @@
-import type { ValidationResult } from '$lib/core/validation/types';
-import type { DeviceJson, FleetPatchJson } from '$lib/software/model';
+import type { ValidationResult } from '#lib/core/validation/types.ts';
+import type { DeviceJson, FleetPatchJson } from '#lib/software/model.ts';
 
 export interface NewDeviceInput {
   name: string;

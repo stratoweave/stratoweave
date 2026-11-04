@@ -1,11 +1,11 @@
 <script lang="ts">
-  import type { Device } from '$lib/software/model';
+  import type { Device } from '#lib/software/model.ts';
   import {
     emptySelection,
     expandSelection,
     type Selection,
     type SelectionContext
-  } from '$lib/software/selection';
+  } from '#lib/software/selection.ts';
 
   interface Props {
     inventory: Device[];

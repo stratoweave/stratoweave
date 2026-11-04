@@ -1,11 +1,11 @@
 <script lang="ts">
-  import FieldDateTime from '$lib/core/ui/FieldDateTime.svelte';
-  import FieldSelect from '$lib/core/ui/FieldSelect.svelte';
-  import FieldText from '$lib/core/ui/FieldText.svelte';
-  import { scheduleRulesText } from '$lib/maintenance/schedule-form';
+  import FieldDateTime from '#lib/core/ui/FieldDateTime.svelte';
+  import FieldSelect from '#lib/core/ui/FieldSelect.svelte';
+  import FieldText from '#lib/core/ui/FieldText.svelte';
+  import { scheduleRulesText } from '#lib/maintenance/schedule-form.ts';
   import { DEFAULT_MAX_CONCURRENCY, DEFAULT_TARGET_CONCURRENCY, type Schedule } from './model';
   import { perHourText, type PaceBy, type PlanningDraft } from './planning-form';
-  import { formatDuration, toLocalInput } from '$lib/core/time';
+  import { formatDuration, toLocalInput } from '#lib/core/time.ts';
 
   interface Props {
     schedules: Schedule[];

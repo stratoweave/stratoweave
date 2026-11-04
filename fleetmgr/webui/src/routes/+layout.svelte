@@ -1,16 +1,16 @@
 <script lang="ts">
-  import '$lib/fonts.css';
+  import '#lib/fonts.css';
   import '../app.css';
 
-  import { invalidateAll } from '$app/navigation';
+  import { refreshAll } from '$app/navigation';
   import { page } from '$app/state';
   import { onMount, type Snippet } from 'svelte';
 
-  import CommandPalette from '$lib/core/command-palette/CommandPalette.svelte';
-  import { pageLabel } from '$lib/core/page-label.svelte';
-  import { dropReadCache } from '$lib/core/restconf/client';
-  import NavIcon from '$lib/core/ui/NavIcon.svelte';
-  import logoUrl from '$lib/assets/stratoweave-logo.svg';
+  import CommandPalette from '#lib/core/command-palette/CommandPalette.svelte';
+  import { pageLabel } from '#lib/core/page-label.svelte.ts';
+  import { dropReadCache } from '#lib/core/restconf/client.ts';
+  import NavIcon from '#lib/core/ui/NavIcon.svelte';
+  import logoUrl from '#lib/assets/stratoweave-logo.svg';
 
   let { children }: { children?: Snippet } = $props();
 
@@ -30,7 +30,7 @@
   /** Reload every page load from the server, cached fleet included. */
   function refresh(): void {
     dropReadCache();
-    void invalidateAll();
+    void refreshAll();
   }
 
   const PAGE_LABELS: Record<string, string> = {

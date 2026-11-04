@@ -1,16 +1,16 @@
 <script lang="ts">
   import { goto } from '$app/navigation';
 
-  import { errorText } from '$lib/core/errors';
-  import { restconfPatchJson } from '$lib/core/restconf/client';
-  import FieldText from '$lib/core/ui/FieldText.svelte';
-  import Section from '$lib/core/ui/Section.svelte';
-  import Steps from '$lib/core/ui/Steps.svelte';
-  import { memberImages, modelGroups, withPreselected } from '$lib/software/campaign-images';
-  import { DATA_ROOT, campaignCreatePatch, validateNewCampaign, type Device } from '$lib/software/model';
-  import ModelImages from '$lib/software/ModelImages.svelte';
-  import SelectionBuilder from '$lib/software/SelectionBuilder.svelte';
-  import { campaignOwners, emptySelection, type Selection } from '$lib/software/selection';
+  import { errorText } from '#lib/core/errors.ts';
+  import { restconfPatchJson } from '#lib/core/restconf/client.ts';
+  import FieldText from '#lib/core/ui/FieldText.svelte';
+  import Section from '#lib/core/ui/Section.svelte';
+  import Steps from '#lib/core/ui/Steps.svelte';
+  import { memberImages, modelGroups, withPreselected } from '#lib/software/campaign-images.ts';
+  import { DATA_ROOT, campaignCreatePatch, validateNewCampaign, type Device } from '#lib/software/model.ts';
+  import ModelImages from '#lib/software/ModelImages.svelte';
+  import SelectionBuilder from '#lib/software/SelectionBuilder.svelte';
+  import { campaignOwners, emptySelection, type Selection } from '#lib/software/selection.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -62,7 +62,7 @@
       createError = '';
       const campaign = name.trim();
       await restconfPatchJson(DATA_ROOT, campaignCreatePatch({ name: campaign, devices: members, allowStaging }));
-      await goto(`/campaigns/${encodeURIComponent(campaign)}`, { invalidateAll: true });
+      await goto(`/campaigns/${encodeURIComponent(campaign)}`, { refreshAll: true });
     } catch (error) {
       createError = errorText(error, 'Failed to create the campaign.');
     } finally {

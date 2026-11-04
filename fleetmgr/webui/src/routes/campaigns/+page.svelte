@@ -2,13 +2,13 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
-  import AdminStatePill from '$lib/software/AdminStatePill.svelte';
-  import CampaignProgress from '$lib/software/CampaignProgress.svelte';
-  import { createPoller, nextSeq } from '$lib/core/polling/poller';
-  import { withSignal } from '$lib/core/restconf/client';
-  import { releasesOf } from '$lib/software/campaign-images';
-  import { fetchCounters } from '$lib/software/counters';
-  import type { Campaign, CampaignCounters } from '$lib/software/model';
+  import AdminStatePill from '#lib/software/AdminStatePill.svelte';
+  import CampaignProgress from '#lib/software/CampaignProgress.svelte';
+  import { createPoller, nextSeq } from '#lib/core/polling/poller.ts';
+  import { withSignal } from '#lib/core/restconf/client.ts';
+  import { releasesOf } from '#lib/software/campaign-images.ts';
+  import { fetchCounters } from '#lib/software/counters.ts';
+  import type { Campaign, CampaignCounters } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

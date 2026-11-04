@@ -1,8 +1,8 @@
-import { errorText } from '$lib/core/errors';
-import { nextSeq } from '$lib/core/polling/poller';
-import { restconfGetOrNull } from '$lib/core/restconf/client';
-import { fetchCounters, fetchPlanAlarms } from '$lib/software/counters';
-import { IMAGES_ROOT, SOFTWARE_CONFIG, parseCampaigns, parseImages, type Campaign } from '$lib/software/model';
+import { errorText } from '#lib/core/errors.ts';
+import { nextSeq } from '#lib/core/polling/poller.ts';
+import { restconfGetOrNull } from '#lib/core/restconf/client.ts';
+import { fetchCounters, fetchPlanAlarms } from '#lib/software/counters.ts';
+import { IMAGES_ROOT, SOFTWARE_CONFIG, parseCampaigns, parseImages, type Campaign } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 

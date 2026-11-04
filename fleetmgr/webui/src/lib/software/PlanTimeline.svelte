@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { CELL_BG } from '$lib/software/cells';
+  import { CELL_BG } from '#lib/software/cells.ts';
   import {
     deviceDuration,
     deviceStart,
@@ -7,7 +7,7 @@
     type KnownStatus,
     type PlanDevice,
     type PlanWindow
-  } from '$lib/software/model';
+  } from '#lib/software/model.ts';
   import {
     WINDOW_GAP,
     anchorStep,
@@ -28,7 +28,7 @@
     type Placed,
     type Rect,
     type WindowCells
-  } from '$lib/software/plan-timeline';
+  } from '#lib/software/plan-timeline.ts';
   import {
     clockLabel,
     dayLabel,
@@ -36,7 +36,7 @@
     formatClockSeconds,
     formatDuration,
     sameLocalDay
-  } from '$lib/core/time';
+  } from '#lib/core/time.ts';
 
   interface Props {
     plan: CampaignPlan;

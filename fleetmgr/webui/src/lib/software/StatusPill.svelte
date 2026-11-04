@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { STATUS_TONE, type KnownStatus } from '$lib/software/model';
+  import { STATUS_TONE, type KnownStatus } from '#lib/software/model.ts';
 
   interface Props {
     status: KnownStatus;

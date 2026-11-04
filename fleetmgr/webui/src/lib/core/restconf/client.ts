@@ -1,4 +1,4 @@
-import type { RestconfRequestOptions } from '$lib/core/restconf/types';
+import type { RestconfRequestOptions } from '#lib/core/restconf/types.ts';
 
 // Same origin: the fleetmgr top serves the UI next to its RESTCONF API, and
 // `vite dev` proxies this prefix to a running top.

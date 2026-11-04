@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { CampaignCounters } from '$lib/software/model';
+  import type { CampaignCounters } from '#lib/software/model.ts';
 
   interface Props {
     counters: CampaignCounters | null;
