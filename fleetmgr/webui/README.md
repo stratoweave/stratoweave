@@ -8,7 +8,7 @@ API on the same origin, so there is no proxy and no CORS: `just gen-webui`
 (from ../) builds it and writes the build into `src/fleetmgr/webui_assets.act`
 as embedded assets, which the top serves with an `index.html` fallback for
 client-routed pages. That module is committed; the build is byte-deterministic
-(see `svelte.config.js`) so it only changes with the UI. Fonts and the logo
+(see `vite.config.ts`) so it only changes with the UI. Fonts and the logo
 are inlined as data URIs because the server sends text bodies only. Writes
 send `async: true` so a PATCH returns when the transaction commits instead of
 after devices finish applying — a real install takes minutes.

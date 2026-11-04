@@ -1,8 +1,8 @@
 <script lang="ts">
-  import StageChain from '$lib/software/StageChain.svelte';
-  import StatusPill from '$lib/software/StatusPill.svelte';
-  import type { DeviceStatusRow } from '$lib/software/model';
-  import { stageDetail } from '$lib/software/stages';
+  import StageChain from '#lib/software/StageChain.svelte';
+  import StatusPill from '#lib/software/StatusPill.svelte';
+  import type { DeviceStatusRow } from '#lib/software/model.ts';
+  import { stageDetail } from '#lib/software/stages.ts';
 
   interface Props {
     rows: DeviceStatusRow[];

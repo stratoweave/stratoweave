@@ -1,5 +1,5 @@
 <script lang="ts">
-  import ScheduleEditor from '$lib/maintenance/ScheduleEditor.svelte';
+  import ScheduleEditor from '#lib/maintenance/ScheduleEditor.svelte';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

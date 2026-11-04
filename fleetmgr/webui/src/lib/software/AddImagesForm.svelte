@@ -2,15 +2,15 @@
   import { onDestroy, onMount, tick, untrack } from 'svelte';
   import { beforeNavigate, goto } from '$app/navigation';
 
-  import { errorText } from '$lib/core/errors';
-  import { imageFileError, imageFilesOn, uploadImageFile } from '$lib/core/image-file';
-  import { leaveNotice } from '$lib/core/notice';
-  import { pageLabel } from '$lib/core/page-label.svelte';
-  import { restconfGetOrNull, restconfPatchJson } from '$lib/core/restconf/client';
-  import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
-  import FileDrop from '$lib/core/ui/FileDrop.svelte';
-  import { focusFirstError } from '$lib/core/ui/focus';
-  import TokenSelect from '$lib/core/ui/TokenSelect.svelte';
+  import { errorText } from '#lib/core/errors.ts';
+  import { imageFileError, imageFilesOn, uploadImageFile } from '#lib/core/image-file.ts';
+  import { leaveNotice } from '#lib/core/notice.ts';
+  import { pageLabel } from '#lib/core/page-label.svelte.ts';
+  import { restconfGetOrNull, restconfPatchJson } from '#lib/core/restconf/client.ts';
+  import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import FileDrop from '#lib/core/ui/FileDrop.svelte';
+  import { focusFirstError } from '#lib/core/ui/focus.ts';
+  import TokenSelect from '#lib/core/ui/TokenSelect.svelte';
   import {
     IMAGE_FILE_TYPES,
     OS_NAMES,
@@ -26,8 +26,8 @@
     type CatalogImage,
     type ImageErrors,
     type TypedImage
-  } from '$lib/software/images';
-  import { DATA_ROOT, IMAGES_ROOT, imageCreatePatch, parseImages } from '$lib/software/model';
+  } from '#lib/software/images.ts';
+  import { DATA_ROOT, IMAGES_ROOT, imageCreatePatch, parseImages } from '#lib/software/model.ts';
 
   interface Props {
     /** Image files dropped or chosen. */
@@ -265,7 +265,7 @@
     if (rows.length === 0) {
       leaveNotice(added.length === 1 ? `Uploaded image ${added[0]}.` : `Uploaded ${added.length} images.`);
       // Not a preload made before the write (hovering Cancel makes one).
-      await goto('/images', { invalidateAll: true });
+      await goto('/images', { refreshAll: true });
     } else {
       statusMessage = total === 1 ? 'The image was not added.' : `${rows.length} of ${total} images were not added.`;
     }

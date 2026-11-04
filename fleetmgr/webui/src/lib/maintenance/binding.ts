@@ -1,7 +1,7 @@
 // A device binds to a schedule with the `schedule` leaf on its fleet entry.
 
-import { restconfPatchJson, rewriteListEntry } from '$lib/core/restconf/client';
-import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type FleetPatchJson } from '$lib/software/model';
+import { restconfPatchJson, rewriteListEntry } from '#lib/core/restconf/client.ts';
+import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type FleetPatchJson } from '#lib/software/model.ts';
 
 /** A merge, so one PATCH binds any number of devices. */
 export function bindPatch(names: string[], schedule: string): FleetPatchJson {

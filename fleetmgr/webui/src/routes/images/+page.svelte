@@ -2,22 +2,22 @@
   import { onMount, tick, untrack } from 'svelte';
   import { invalidate } from '$app/navigation';
 
-  import { errorText } from '$lib/core/errors';
-  import { restconfPatchJson } from '$lib/core/restconf/client';
-  import { takeNotice } from '$lib/core/notice';
-  import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
-  import FileDrop from '$lib/core/ui/FileDrop.svelte';
-  import Pager, { paginate } from '$lib/core/ui/Pager.svelte';
-  import { deleteImage } from '$lib/software/delete-image';
-  import { addImageFiles } from '$lib/software/image-files';
+  import { errorText } from '#lib/core/errors.ts';
+  import { restconfPatchJson } from '#lib/core/restconf/client.ts';
+  import { takeNotice } from '#lib/core/notice.ts';
+  import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import FileDrop from '#lib/core/ui/FileDrop.svelte';
+  import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
+  import { deleteImage } from '#lib/software/delete-image.ts';
+  import { addImageFiles } from '#lib/software/image-files.ts';
   import {
     IMAGE_FILE_TYPES,
     matchesFilter,
     sortImages,
     type CatalogImage,
     type SortKey
-  } from '$lib/software/images';
-  import { DATA_ROOT, urlBasePatch } from '$lib/software/model';
+  } from '#lib/software/images.ts';
+  import { DATA_ROOT, urlBasePatch } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

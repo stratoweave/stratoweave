@@ -2,16 +2,16 @@
   import { onDestroy, untrack } from 'svelte';
   import { invalidate } from '$app/navigation';
 
-  import { errorText } from '$lib/core/errors';
-  import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
-  import Pager, { paginate } from '$lib/core/ui/Pager.svelte';
-  import FieldText from '$lib/core/ui/FieldText.svelte';
-  import Section from '$lib/core/ui/Section.svelte';
-  import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
-  import { bindPatch, unbindDevice } from '$lib/maintenance/binding';
-  import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
-  import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device, type Schedule } from '$lib/software/model';
-  import { nameMatcher, scheduleMatches } from '$lib/software/selection';
+  import { errorText } from '#lib/core/errors.ts';
+  import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
+  import FieldText from '#lib/core/ui/FieldText.svelte';
+  import Section from '#lib/core/ui/Section.svelte';
+  import { getListEntryPath, restconfDelete, restconfPatchJson } from '#lib/core/restconf/client.ts';
+  import { bindPatch, unbindDevice } from '#lib/maintenance/binding.ts';
+  import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
+  import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device, type Schedule } from '#lib/software/model.ts';
+  import { nameMatcher, scheduleMatches } from '#lib/software/selection.ts';
   import {
     IMPORT_BATCH,
     chunk,
@@ -20,7 +20,7 @@
     parseImport,
     validateNewDevice,
     type NewDeviceInput
-  } from '$lib/software/inventory';
+  } from '#lib/software/inventory.ts';
   import type { PageProps } from './$types';
 
   const PAGE_SIZE = 100;

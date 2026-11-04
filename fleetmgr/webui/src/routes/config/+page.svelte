@@ -2,9 +2,9 @@
   import { goto } from '$app/navigation';
   import { navigating } from '$app/state';
 
-  import { CONTENT_OPTIONS, FORMAT_OPTIONS, type LayerContent, type LayerFormat } from '$lib/core/layer-config';
-  import CodeBlock from '$lib/core/ui/CodeBlock.svelte';
-  import SegmentedControl from '$lib/core/ui/SegmentedControl.svelte';
+  import { CONTENT_OPTIONS, FORMAT_OPTIONS, type LayerContent, type LayerFormat } from '#lib/core/layer-config.ts';
+  import CodeBlock from '#lib/core/ui/CodeBlock.svelte';
+  import SegmentedControl from '#lib/core/ui/SegmentedControl.svelte';
 
   import type { PageProps } from './$types';
 
@@ -15,7 +15,7 @@
 
   function show(content: LayerContent, format: LayerFormat): void {
     const query = new URLSearchParams({ content, format });
-    void goto(`/config?${query}`, { replaceState: true, noScroll: true, keepFocus: true });
+    void goto(`/config?${query}`, { replace: true, reset: false });
   }
 </script>
 

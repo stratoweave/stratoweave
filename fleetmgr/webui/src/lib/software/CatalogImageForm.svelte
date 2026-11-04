@@ -2,21 +2,21 @@
   import { untrack } from 'svelte';
   import { goto } from '$app/navigation';
 
-  import { errorText } from '$lib/core/errors';
-  import { leaveNotice } from '$lib/core/notice';
+  import { errorText } from '#lib/core/errors.ts';
+  import { leaveNotice } from '#lib/core/notice.ts';
   import {
     getListEntryPath,
     restconfGetOrNull,
     restconfPatchJson,
     restconfPutJson,
     wrapListEntryBody
-  } from '$lib/core/restconf/client';
-  import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
-  import FieldText from '$lib/core/ui/FieldText.svelte';
-  import FileDrop from '$lib/core/ui/FileDrop.svelte';
-  import { focusFirstError } from '$lib/core/ui/focus';
-  import TokenSelect from '$lib/core/ui/TokenSelect.svelte';
-  import { deleteImage } from '$lib/software/delete-image';
+  } from '#lib/core/restconf/client.ts';
+  import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import FieldText from '#lib/core/ui/FieldText.svelte';
+  import FileDrop from '#lib/core/ui/FileDrop.svelte';
+  import { focusFirstError } from '#lib/core/ui/focus.ts';
+  import TokenSelect from '#lib/core/ui/TokenSelect.svelte';
+  import { deleteImage } from '#lib/software/delete-image.ts';
   import {
     IMAGE_FILE_TYPES,
     OS_NAMES,
@@ -33,7 +33,7 @@
     type CatalogImage,
     type ImageErrors,
     type TypedImage
-  } from '$lib/software/images';
+  } from '#lib/software/images.ts';
   import {
     DATA_ROOT,
     IMAGES_ROOT,
@@ -42,7 +42,7 @@
     imageCreatePatch,
     imageToJson,
     parseImages
-  } from '$lib/software/model';
+  } from '#lib/software/model.ts';
 
   interface Props {
     /** null adds a new image. */
@@ -172,7 +172,7 @@
       }
       leaveNotice(stored === null ? `Added image ${saved.name}.` : `Saved image ${saved.name}.`);
       // Not a preload made before the write (hovering Cancel makes one).
-      await goto('/images', { invalidateAll: true });
+      await goto('/images', { refreshAll: true });
     } catch (saveError) {
       statusMessage = errorText(saveError, 'Failed to save the image.');
     } finally {
@@ -188,7 +188,7 @@
       statusMessage = '';
       await deleteImage(stored);
       leaveNotice(`Deleted image ${stored}.`);
-      await goto('/images', { invalidateAll: true });
+      await goto('/images', { refreshAll: true });
     } catch (deleteError) {
       statusMessage = errorText(deleteError, 'Failed to delete the image.');
     } finally {

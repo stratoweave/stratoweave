@@ -2,11 +2,11 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
-  import { createPoller } from '$lib/core/polling/poller';
-  import WeekCalendar from '$lib/maintenance/WeekCalendar.svelte';
-  import { SCHEDULE_COLOR_OTHER, scheduleColors } from '$lib/maintenance/palette';
-  import { scheduleRulesText, scheduleUsage } from '$lib/maintenance/schedule-form';
-  import { formatUtcOffset } from '$lib/core/time';
+  import { createPoller } from '#lib/core/polling/poller.ts';
+  import WeekCalendar from '#lib/maintenance/WeekCalendar.svelte';
+  import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
+  import { scheduleRulesText, scheduleUsage } from '#lib/maintenance/schedule-form.ts';
+  import { formatUtcOffset } from '#lib/core/time.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

@@ -2,16 +2,16 @@
   import { onMount } from 'svelte';
   import { goto, invalidate } from '$app/navigation';
 
-  import { errorText } from '$lib/core/errors';
-  import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
-  import Pager, { paginate } from '$lib/core/ui/Pager.svelte';
-  import CampaignProgress from '$lib/software/CampaignProgress.svelte';
-  import DeviceStatusTable from '$lib/software/DeviceStatusTable.svelte';
-  import PlanningFields from '$lib/software/PlanningFields.svelte';
-  import PlanTimeline from '$lib/software/PlanTimeline.svelte';
-  import { getListEntryPath, restconfDelete, restconfPatchJson } from '$lib/core/restconf/client';
-  import { createPoller } from '$lib/core/polling/poller';
-  import { CampaignLive, FAST_MS, type LiveView } from '$lib/software/campaign-live';
+  import { errorText } from '#lib/core/errors.ts';
+  import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
+  import CampaignProgress from '#lib/software/CampaignProgress.svelte';
+  import DeviceStatusTable from '#lib/software/DeviceStatusTable.svelte';
+  import PlanningFields from '#lib/software/PlanningFields.svelte';
+  import PlanTimeline from '#lib/software/PlanTimeline.svelte';
+  import { getListEntryPath, restconfDelete, restconfPatchJson } from '#lib/core/restconf/client.ts';
+  import { createPoller } from '#lib/core/polling/poller.ts';
+  import { CampaignLive, FAST_MS, type LiveView } from '#lib/software/campaign-live.ts';
   import {
     planningChanges,
     planningDraft,
@@ -21,11 +21,11 @@
     saveCampaignPlanning,
     validatePlanningDraft,
     type PlanningDraft
-  } from '$lib/software/planning-form';
-  import { formatEta } from '$lib/software/rate';
-  import { formatClock } from '$lib/core/time';
-  import { imageCounts } from '$lib/software/campaign-images';
-  import { nameMatcher } from '$lib/software/selection';
+  } from '#lib/software/planning-form.ts';
+  import { formatEta } from '#lib/software/rate.ts';
+  import { formatClock } from '#lib/core/time.ts';
+  import { imageCounts } from '#lib/software/campaign-images.ts';
+  import { nameMatcher } from '#lib/software/selection.ts';
   import {
     CAMPAIGN_LIST_ROOT,
     DATA_ROOT,
@@ -34,7 +34,7 @@
     joinState,
     unplacedText,
     type KnownStatus
-  } from '$lib/software/model';
+  } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
 
   const PAGE_SIZE = 100;
@@ -250,7 +250,7 @@
         await restconfDelete(getListEntryPath(CAMPAIGN_LIST_ROOT, data.name));
         live.dispose();
         // Not a preload made before the delete.
-        await goto('/campaigns', { invalidateAll: true });
+        await goto('/campaigns', { refreshAll: true });
         return;
       }
       await restconfPatchJson(DATA_ROOT, adminStatePatch(data.name, action));

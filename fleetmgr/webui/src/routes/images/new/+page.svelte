@@ -1,8 +1,8 @@
 <script lang="ts">
-  import AddImagesForm from '$lib/software/AddImagesForm.svelte';
-  import CatalogImageForm from '$lib/software/CatalogImageForm.svelte';
-  import { takeImageFiles } from '$lib/software/image-files';
-  import type { TypedImage } from '$lib/software/images';
+  import AddImagesForm from '#lib/software/AddImagesForm.svelte';
+  import CatalogImageForm from '#lib/software/CatalogImageForm.svelte';
+  import { takeImageFiles } from '#lib/software/image-files.ts';
+  import type { TypedImage } from '#lib/software/images.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

@@ -1,5 +1,5 @@
-import { errorText } from '$lib/core/errors';
-import { getListEntryPath, restconfGetOrNull } from '$lib/core/restconf/client';
+import { errorText } from '#lib/core/errors.ts';
+import { getListEntryPath, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import {
   FLEET_DEVICE_LIST_ROOT,
   SCHEDULES_ROOT,
@@ -7,7 +7,7 @@ import {
   parseCampaigns,
   parseDeviceEntry,
   parseSchedules
-} from '$lib/software/model';
+} from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 

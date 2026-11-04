@@ -4,7 +4,7 @@
 // weekdays, every day when none are listed, over a fixed horizon. The
 // calendar cuts them into the viewer's local days.
 
-import type { MaintenanceWindow, Schedule } from '$lib/software/model';
+import type { MaintenanceWindow, Schedule } from '#lib/software/model.ts';
 
 /** How far ahead the planner generates occurrences. */
 export const HORIZON_DAYS = 9;

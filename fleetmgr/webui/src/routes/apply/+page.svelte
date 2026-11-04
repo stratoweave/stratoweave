@@ -1,8 +1,8 @@
 <script lang="ts">
-  import { errorText } from '$lib/core/errors';
-  import { restconfPatchText } from '$lib/core/restconf/client';
-  import ConfirmDialog from '$lib/core/ui/ConfirmDialog.svelte';
-  import SegmentedControl from '$lib/core/ui/SegmentedControl.svelte';
+  import { errorText } from '#lib/core/errors.ts';
+  import { restconfPatchText } from '#lib/core/restconf/client.ts';
+  import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import SegmentedControl from '#lib/core/ui/SegmentedControl.svelte';
 
   type Format = 'xml' | 'json';
 

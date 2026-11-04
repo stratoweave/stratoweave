@@ -2,12 +2,12 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
-  import DevicePicture from '$lib/software/DevicePicture.svelte';
-  import StageChain from '$lib/software/StageChain.svelte';
-  import StatusPill from '$lib/software/StatusPill.svelte';
-  import { errorText } from '$lib/core/errors';
-  import { createPoller } from '$lib/core/polling/poller';
-  import { setDeviceSchedule } from '$lib/maintenance/binding';
+  import DevicePicture from '#lib/software/DevicePicture.svelte';
+  import StageChain from '#lib/software/StageChain.svelte';
+  import StatusPill from '#lib/software/StatusPill.svelte';
+  import { errorText } from '#lib/core/errors.ts';
+  import { createPoller } from '#lib/core/polling/poller.ts';
+  import { setDeviceSchedule } from '#lib/maintenance/binding.ts';
   import {
     STEP_LABEL,
     deviceStart,
@@ -15,9 +15,9 @@
     type CheckResult,
     type DeviceStatusRow,
     type Step
-  } from '$lib/software/model';
-  import { stageDetail, stageView } from '$lib/software/stages';
-  import { formatClock } from '$lib/core/time';
+  } from '#lib/software/model.ts';
+  import { stageDetail, stageView } from '#lib/software/stages.ts';
+  import { formatClock } from '#lib/core/time.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();

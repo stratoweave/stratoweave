@@ -1,5 +1,5 @@
-import { errorText } from '$lib/core/errors';
-import { restconfGetCachedOrNull, restconfGetOrNull } from '$lib/core/restconf/client';
+import { errorText } from '#lib/core/errors.ts';
+import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import {
   FLEET_ROOT,
   IMAGES_ROOT,
@@ -9,7 +9,7 @@ import {
   parseFleet,
   parseImages,
   parseSchedules
-} from '$lib/software/model';
+} from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 

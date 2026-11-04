@@ -1,6 +1,6 @@
-import { errorText } from '$lib/core/errors';
-import { getListEntryPath, restconfGetOrNull } from '$lib/core/restconf/client';
-import { IMAGES_ROOT, IMAGE_LIST_ROOT, parseImageEntry, parseImages } from '$lib/software/model';
+import { errorText } from '#lib/core/errors.ts';
+import { getListEntryPath, restconfGetOrNull } from '#lib/core/restconf/client.ts';
+import { IMAGES_ROOT, IMAGE_LIST_ROOT, parseImageEntry, parseImages } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 

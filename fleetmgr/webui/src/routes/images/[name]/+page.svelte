@@ -1,5 +1,5 @@
 <script lang="ts">
-  import CatalogImageForm from '$lib/software/CatalogImageForm.svelte';
+  import CatalogImageForm from '#lib/software/CatalogImageForm.svelte';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
