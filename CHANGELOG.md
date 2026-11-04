@@ -252,6 +252,9 @@
   together. It merges top-level nodes only, and raises `ValueError` when two
   roots hold the same top-level node or different revisions of a module.
   [acton-yang#548] [#716]
+- `take_leaf()` and `take_leaflist()` of the `yang.data.YangData` protocol
+  return no `t` type field. gdata keeps a union's value as its Acton type,
+  so the field is no longer needed. [acton-yang#553] [#741]
 
 #### acton-ssh
 - Fixed SSH events being delivered out of the order libssh raises them.
@@ -394,6 +397,7 @@ next. Give it a spin. We’d love to hear what you think.
 [#736]: https://github.com/stratoweave/stratoweave/pull/736
 [#737]: https://github.com/stratoweave/stratoweave/pull/737
 [#740]: https://github.com/stratoweave/stratoweave/pull/740
+[#741]: https://github.com/stratoweave/stratoweave/pull/741
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
@@ -410,3 +414,4 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-yang#547]: https://github.com/stratoweave/acton-yang/pull/547
 [acton-yang#548]: https://github.com/stratoweave/acton-yang/pull/548
 [acton-yang#550]: https://github.com/stratoweave/acton-yang/pull/550
+[acton-yang#553]: https://github.com/stratoweave/acton-yang/pull/553
