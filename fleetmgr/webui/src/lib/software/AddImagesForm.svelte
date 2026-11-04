@@ -14,10 +14,12 @@
   import {
     IMAGE_FILE_TYPES,
     OS_NAMES,
+    familyFromName,
     imageCountLabel,
     imageErrors,
     imageFromFileName,
     knownModels,
+    otherDefaults,
     previousImage,
     withDraftError,
     withModelsOf,
@@ -120,8 +122,16 @@
   // how to get past them instead.
   let errors = $derived.by(() => {
     const taken = new Set([...images.map((i) => i.name), ...lateNames]);
+    const defaults = new Map<string, number>();
+    for (const r of rows) {
+      const family = r.family.trim();
+      if (r.isDefault && family) defaults.set(family, (defaults.get(family) ?? 0) + 1);
+    }
     return rows.map((row) => {
-      const e = imageErrors(row, null);
+      let e = imageErrors(row, null);
+      if (row.isDefault && (defaults.get(row.family.trim()) ?? 0) > 1) {
+        e = { ...e, family: 'Another row is the default of this family.' };
+      }
       const name = taken.has(row.name)
         ? 'Already in the image list. Remove this row, or delete that image first.'
         : imageFileError(row.file);
@@ -137,6 +147,20 @@
     return size > 0 ? Math.floor((sent / size) * 100) : 0;
   }
 
+  /** Ticking a row takes the default from the other rows of its family. */
+  function setDefault(row: Row, on: boolean): void {
+    row.isDefault = on;
+    const family = row.family.trim();
+    if (!on || !family) return;
+    for (const r of rows) if (r.name !== row.name && r.family.trim() === family) r.isDefault = false;
+  }
+
+  /** The default in the image list that a row takes over. */
+  function replacesText(row: Row): string {
+    const others = row.isDefault ? otherDefaults(row, images) : [];
+    return others.length > 0 ? `Replaces ${others.map((i) => i.version || i.name).join(', ')} as the default.` : '';
+  }
+
   /** One row per file name; a name already in a row is skipped. The row
    * named as in `from` starts with what was typed there. */
   function addFiles(next: File[], from: TypedImage | null = null): void {
@@ -144,10 +168,20 @@
     for (const file of next) {
       if (names.has(file.name)) continue;
       names.add(file.name);
-      const row: Row = { file, name: file.name, models: [], draft: '', ...imageFromFileName(file.name) };
+      const row: Row = {
+        file,
+        name: file.name,
+        models: [],
+        draft: '',
+        family: familyFromName(file.name),
+        isDefault: false,
+        ...imageFromFileName(file.name)
+      };
       if (from?.name === file.name) {
         row.os = from.os || row.os;
         row.version = from.version || row.version;
+        row.family = from.family || row.family;
+        row.isDefault = from.isDefault;
         row.models = [...from.models];
         row.draft = from.draft;
       }
@@ -202,8 +236,20 @@
         };
         await uploadImageFile(row.name, row.file, onSent, controller.signal);
         row.upload = { state: 'adding' };
-        const image = { name: row.name, os: row.os.trim(), version: row.version.trim(), models: row.models };
-        await restconfPatchJson(DATA_ROOT, imageCreatePatch([image]));
+        const image = {
+          name: row.name,
+          os: row.os.trim(),
+          version: row.version.trim(),
+          models: row.models,
+          family: row.family.trim(),
+          isDefault: row.isDefault
+        };
+        // A default clears the family's current one in the same PATCH, as
+        // the list is now: the upload may have taken a while.
+        const clear = image.isDefault
+          ? otherDefaults(image, parseImages(await restconfGetOrNull<unknown>(IMAGES_ROOT))).map((i) => i.name)
+          : [];
+        await restconfPatchJson(DATA_ROOT, imageCreatePatch([image], clear));
         added.push(row.name);
         rows.splice(
           rows.findIndex((r) => r.name === row.name),
@@ -283,7 +329,9 @@
             <th class="col-name">Name</th>
             <th class="col-os">OS</th>
             <th class="col-version">Version</th>
+            <th class="col-family">Family</th>
             <th>Models</th>
+            <th class="col-default">Default</th>
             <th class="col-action"><span class="sr-only">Actions</span></th>
           </tr>
         </thead>
@@ -293,6 +341,7 @@
             {@const previous = previousImage(row, images)}
             {@const id = `${uid}-${index}`}
             {@const modelsMeta = shown.models ?? (row.draft.trim() ? 'Press Enter to add it.' : '')}
+            {@const replaces = replacesText(row)}
             <tr>
               <td class="name-cell">
                 <span class="mono name">{row.name}</span>
@@ -349,6 +398,21 @@
                   <small id={`${id}-version`} class="field__meta field__meta--error">{shown.version}</small>
                 {/if}
               </td>
+              <td class="family-cell" data-label="Family">
+                <input
+                  class="input compact mono"
+                  class:has-error={!!shown.family}
+                  aria-label={`Family of ${row.name}`}
+                  aria-invalid={shown.family ? 'true' : undefined}
+                  aria-describedby={shown.family ? `${id}-family` : undefined}
+                  bind:value={row.family}
+                />
+                {#if shown.family}
+                  <small id={`${id}-family`} class="field__meta field__meta--error">{shown.family}</small>
+                {:else if replaces}
+                  <small id={`${id}-default`} class="field__meta">{replaces}</small>
+                {/if}
+              </td>
               <td class="models-cell" data-label="Models">
                 <TokenSelect
                   options={modelOptions}
@@ -380,6 +444,16 @@
                     {modelsMeta}
                   </small>
                 {/if}
+              </td>
+              <td class="default-cell" data-label="Default">
+                <input
+                  type="checkbox"
+                  checked={row.isDefault}
+                  aria-label={`Default: ${row.name}`}
+                  aria-describedby={replaces ? `${id}-default` : undefined}
+                  disabled={saving}
+                  onchange={(event) => setDefault(row, event.currentTarget.checked)}
+                />
               </td>
               <td class="col-action action-cell">
                 <!-- An image that already exists has no field to fix: Remove is the way out. -->
@@ -431,7 +505,7 @@
   }
 
   .col-name {
-    width: 33%;
+    width: 17%;
   }
 
   .col-os {
@@ -439,7 +513,18 @@
   }
 
   .col-version {
-    width: 11%;
+    width: 12%;
+  }
+
+  .col-family {
+    width: 20%;
+  }
+
+  /* The checkbox sits under the middle of its header. */
+  .col-default,
+  .default-cell {
+    width: 76px;
+    text-align: center;
   }
 
   .col-action {
@@ -447,8 +532,8 @@
     text-align: right;
   }
 
-  /* The name and Remove sit on the middle line of the OS, version and
-     model fields beside them. */
+  /* The name and Remove sit on the middle line of the OS, version, family
+     and model fields beside them. */
   .name {
     display: block;
     padding-top: 8px;
@@ -458,6 +543,12 @@
 
   .row-remove {
     margin-top: 3px;
+  }
+
+  /* On the middle line of the fields beside it. */
+  .default-cell input {
+    margin: 10px 0 0;
+    cursor: pointer;
   }
 
   .field__meta {
@@ -486,7 +577,8 @@
 
   @media (max-width: 720px) {
     /* Each file becomes a block: its name with Remove, then OS and version
-       side by side, then the models, each under its own label. */
+       side by side, then family and default side by side, then the models,
+       each under its own label. */
     .files {
       min-width: 0;
       table-layout: auto;
@@ -507,6 +599,7 @@
       grid-template-areas:
         'name name'
         'os version'
+        'family default'
         'models models';
       gap: 10px 12px;
       padding: 14px 0;
@@ -545,6 +638,16 @@
 
     .version-cell {
       grid-area: version;
+    }
+
+    .family-cell {
+      grid-area: family;
+    }
+
+    .default-cell {
+      grid-area: default;
+      width: auto;
+      text-align: left;
     }
 
     .models-cell {

@@ -1,14 +1,17 @@
 // The software image list: images keyed by name, each with the OS it runs,
-// the hardware models it is for and its version.
+// the hardware models it is for, its version and its family. A family has
+// at most one default image.
 
 export interface CatalogImage {
   name: string;
   os: string;
   models: string[];
   version: string;
+  family: string;
+  isDefault: boolean;
 }
 
-export type SortKey = 'name' | 'os' | 'models' | 'version';
+export type SortKey = 'name' | 'os' | 'family' | 'models' | 'version';
 
 export const OS_NAMES = ['IOS XE', 'IOS XR', 'NX-OS', 'Junos', 'EOS'];
 
@@ -30,6 +33,8 @@ export function compareBy(key: SortKey, a: CatalogImage, b: CatalogImage): numbe
       return a.name.localeCompare(b.name, undefined, { numeric: true });
     case 'os':
       return a.os.localeCompare(b.os);
+    case 'family':
+      return a.family.localeCompare(b.family, undefined, { numeric: true });
     case 'models':
       return compareModels(a.models, b.models);
     case 'version':
@@ -37,14 +42,14 @@ export function compareBy(key: SortKey, a: CatalogImage, b: CatalogImage): numbe
   }
 }
 
-/** Sorted by key; within one OS the newest version comes first, then the
- * name keeps equal rows in a stable order. */
+/** Sorted by key; within one OS or family the newest version comes first,
+ * then the name keeps equal rows in a stable order. */
 export function sortImages(images: CatalogImage[], key: SortKey, ascending: boolean): CatalogImage[] {
   const sign = ascending ? 1 : -1;
   return [...images].sort(
     (a, b) =>
       sign * compareBy(key, a, b) ||
-      (key === 'os' ? -compareBy('version', a, b) : 0) ||
+      (key === 'os' || key === 'family' ? -compareBy('version', a, b) : 0) ||
       compareBy('name', a, b)
   );
 }
@@ -52,18 +57,35 @@ export function sortImages(images: CatalogImage[], key: SortKey, ascending: bool
 export function matchesFilter(image: CatalogImage, text: string): boolean {
   const t = text.trim().toLowerCase();
   if (!t) return true;
-  return [image.name, image.os, image.version, ...image.models].some((v) => v.toLowerCase().includes(t));
+  return [image.name, image.os, image.version, image.family, ...image.models].some((v) =>
+    v.toLowerCase().includes(t)
+  );
 }
 
-/** The version an IOS XE style name carries: the run of dot-separated
- * components that start with a digit. */
-export function versionFromName(name: string): string {
-  const parts = name.split('.');
+/** Where the version is in an IOS XE style name: the run of dot-separated
+ * parts that start with a digit, at least two of them, after at least one
+ * other part. */
+function versionRun(parts: string[]): { start: number; end: number } | null {
   const start = parts.findIndex((p) => /^\d/.test(p));
-  if (start <= 0) return '';
+  if (start <= 0) return null;
   let end = start;
   while (end < parts.length && /^\d/.test(parts[end])) end++;
-  return end - start >= 2 ? parts.slice(start, end).join('.') : '';
+  return end - start >= 2 ? { start, end } : null;
+}
+
+/** The version an IOS XE style name carries, e.g. 17.18.03a. */
+export function versionFromName(name: string): string {
+  const parts = name.split('.');
+  const run = versionRun(parts);
+  return run ? parts.slice(run.start, run.end).join('.') : '';
+}
+
+/** The family an IOS XE style name carries: what comes before the version,
+ * e.g. c8000v-universalk9. */
+export function familyFromName(name: string): string {
+  const parts = name.split('.');
+  const run = versionRun(parts);
+  return run ? parts.slice(0, run.start).join('.') : '';
 }
 
 const IOS_XE_IMAGE = /^([A-Za-z0-9][\w-]*)\.(\d+\.\d+\.\d+[a-z]?)\.SPA\.bin$/;
@@ -76,17 +98,24 @@ export function imageFromFileName(name: string): { os: string; version: string }
   return xe ? { os: 'IOS XE', version: xe[2] } : { os: '', version: '' };
 }
 
-/** The newest image of the same IOS XE family (e.g. c8000v-universalk9) with
- * an older version, to copy models from; null when there is none. */
+/** The newest image of the same family with an older version, to copy
+ * models from; null when there is none. */
 export function previousImage(image: CatalogImage, images: CatalogImage[]): CatalogImage | null {
-  const family = IOS_XE_IMAGE.exec(image.name)?.[1];
-  if (family === undefined) return null;
+  const family = image.family.trim();
+  if (!family) return null;
   let previous: CatalogImage | null = null;
   for (const i of images) {
-    if (IOS_XE_IMAGE.exec(i.name)?.[1] !== family || compareVersions(i.version, image.version) >= 0) continue;
+    if (i.family !== family || compareVersions(i.version, image.version) >= 0) continue;
     if (previous === null || compareVersions(i.version, previous.version) > 0) previous = i;
   }
   return previous;
+}
+
+/** The default images of `image`'s family other than `image` itself. */
+export function otherDefaults(image: CatalogImage, images: CatalogImage[]): CatalogImage[] {
+  const family = image.family.trim();
+  if (!family) return [];
+  return images.filter((i) => i.isDefault && i.family === family && i.name !== image.name);
 }
 
 /** `models` plus those of `from` it lacks. */
@@ -99,7 +128,7 @@ export interface TypedImage extends CatalogImage {
   draft: string;
 }
 
-export type ImageErrors = Partial<Record<'name' | 'os' | 'version' | 'models', string>>;
+export type ImageErrors = Partial<Record<'name' | 'os' | 'version' | 'family' | 'models', string>>;
 
 /** What keeps an image from being saved. `taken` holds the names already in
  * the list; null skips the name, which an edit does not change. */
@@ -112,6 +141,7 @@ export function imageErrors(image: CatalogImage, taken: Set<string> | null): Ima
   }
   if (!image.os.trim()) e.os = 'Required.';
   if (!image.version.trim()) e.version = 'Required.';
+  if (image.isDefault && !image.family.trim()) e.family = 'Required for a default image.';
   if (image.models.length === 0) e.models = 'At least one model.';
   return e;
 }

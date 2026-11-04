@@ -129,14 +129,21 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `os`, `version` and a model, though the YANG does not. A model is added
   by Enter or by picking a suggestion; other text left in the model field
   blocks the save, so a half-typed model is neither lost nor saved.
+- An image also has a `family` and a `default` flag. A family has at most
+  one default; the YANG says so, but the server does not check it yet, so
+  the UI keeps it. Ticking Default in the form takes the default over
+  from the family's current one: an add clears it in the same PATCH, an
+  edit PATCHes it clear first and then PUTs the entry.
 - Image files dropped on the image pages, or picked with Upload images,
   open a table with one row per file. An IOS XE name
-  (`<family>.<version>.SPA.bin`) fills OS and version, in the table and in
-  the one-image form until they are typed; the operator picks the models
+  (`<family>.<version>.SPA.bin`) fills OS, version and family, in the
+  table and in the one-image form until they are typed; the operator picks the models
   or copies them from the newest older image of the same family. Upload
   sends the files one at a time, each in one PUT to `/image-file/{name}`,
   which stores it in the top's image folder (`--software.image-dir`), and
-  then PATCHes that file's entry. A row that is done leaves the table; a
+  then PATCHes that file's entry. A row can be the default of its family
+  (the Default column): ticking it clears the other rows of that family, and its PATCH clears
+  the family's current default. A row that is done leaves the table; a
   failed one shows why, and Upload sends it again from the start. Leaving
   the page stops the upload, so while one runs the page asks first. Names
   the folder refuses and empty files are flagged before any upload. Files
