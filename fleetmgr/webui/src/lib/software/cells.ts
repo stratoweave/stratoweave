@@ -7,7 +7,9 @@ import type { KnownStatus } from './model';
 export const CELL_COLOR: Record<KnownStatus, string> = {
   pending: '#1d2c49',
   unknown: '#1d2c49',
-  'up-to-date': '#1d2c49',
+  // Done like succeeded, which it counts into, but dimmer: the device was
+  // on the target release already.
+  'up-to-date': '#166534',
   'upgrade-needed': '#3f3080',
   'in-progress': '#22d3ee',
   succeeded: '#16a34a',
