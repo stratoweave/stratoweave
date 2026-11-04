@@ -32,20 +32,26 @@
   with an HTTP error whose body is not UTF-8. [#724]
 
 ### Northbound APIs
-- NETCONF `<get-config>` returns only configuration, without the operational
-  state published by transforms. [#683]
-- RESTCONF supports the `content` query parameter (`config`, `nonconfig`,
-  `all`) on GET. [#686]
-- RESTCONF GET, NETCONF `<get>` and yang-push filters can reach an
-  operational subtree under a config node, like
+- Fixed NETCONF `<get-config>` returning the operational state published by
+  transforms. [#683]
+- RESTCONF supports the `content` query parameter on GET, which RFC 8040
+  requires. [#686]
+- Fixed RESTCONF GET, NETCONF `<get>` and yang-push filters that could not
+  reach an operational subtree under a config node, like
   `/software:software/upgrade-campaign=foo/state` in fleetmgr. [#677] [#681]
-- `/restconf-state/capabilities` lists only RESTCONF protocol capabilities,
-  not YANG modules. [#676]
+- Fixed `/restconf-state/capabilities` listing YANG modules next to the
+  RESTCONF protocol capabilities. [#676]
 - RESTCONF replies use compact JSON and XML. `ncurl` output and the
   `/device/<name>/target`, `/running` and `/diff` inspection endpoints are
   still indented. [#684]
 - The `/layer/<idx>` inspection endpoint takes the same `content` query
-  parameter, so it can return a layer's operational state too.
+  parameter, so it can return a layer's operational state too. [#736]
+- The NETCONF server serves the YANG library, `/yang-library` and
+  `/modules-state`. Besides the modules of the CFS schema, it lists
+  ietf-subscribed-notifications and ietf-yang-push as implemented, with
+  their features `subtree`, `xpath` and `on-change`. The `<hello>` has one
+  `yang-library:1.1` capability instead of a capability per module.
+  RESTCONF serves `/modules-state` too, which RFC 8040 requires. [#716]
 
 ### Devices & Adapters
 - New SNMP device adapters, built from MIBs. The system generator translates
@@ -89,9 +95,9 @@
 - Fixed "Invalid NETCONF chunk framing" errors around NETCONF session
   restarts, seen with large mock fleets. After such an error the device
   adapter restarts the session once, not once for every write. [#691] [#693]
-- The mock NETCONF server ends a session's yang-push subscriptions when the
-  session ends. Before, every client restart added another set of updates.
-  [#692]
+- Fixed the mock NETCONF server keeping a session's yang-push subscriptions
+  after the session ended. Every client restart added another set of
+  updates. [#692]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
@@ -108,6 +114,17 @@
   mock failures use it: with `bgp-down` the pre-check refuses the install, and
   with `bgp-lost` the post-check fails and the device rolls back. [#667]
   [#678]
+- The release a device runs is only in `state/platform/version`, and the
+  device software state has no `running-release`. The platform is read
+  again when an install ends: after a success, after a rollback, also a
+  failed one, and when the device runs another release than the target
+  after the commit. [#718]
+- A mock device sets the platform that the IOS XE mock reports under
+  `mock/platform`: `version`, the release it runs before an upgrade, and
+  `model` and `serial-number`. Without them it runs 17.18.02 on a C8000V.
+  `version` replaces `mock/software/running-release`. The mock reports a
+  release the way a device does, 17.18.02 as 17.18.2, before and after an
+  install. [#718]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -131,6 +148,12 @@
   `stratoweave.fleet_ctl.Controller` class instead of the campaign actor. The
   controller has no clock and no I/O, so `test_fleet_ctl` runs it on times of
   its own, without an actor. The move doesn't change the decisions. [#725]
+- Removed the `stratoweave.fleet_sched` module. Its helpers moved into
+  `stratoweave.fleet_ctl`, and the campaign simulator
+  `stratoweave.fleet_sched_sim` is now `stratoweave.fleet_ctl_sim`. The YANG
+  descriptions of `/device/software` no longer describe scheduler behavior
+  that never existed. Its input comes from an upgrade campaign or an
+  operator. [#740]
 - A campaign's plan is what its run does: the controller that releases the
   devices makes the plan by running ahead at the expected upgrade durations.
   Before, a campaign could plan without alarms and alarm as soon as it ran,
@@ -153,12 +176,20 @@
   the upgrade of a member fails or rolls back, the other members keep their
   windows but wait until it reports a success, or an operator takes it out
   of the group or the campaign. The plan's alarms name the devices that
-  wait.
+  wait. [#740]
 - A device that reports a final status before the campaign releases it, for
   example one that already runs the target release, no longer counts as an
   upgrade that took no time. Before, a few such devices made the campaign
   expect every upgrade to take seconds, and the plan put every device in the
-  first windows.
+  first windows. [#740]
+- Each `/fleet/device` has the platform that its flotilla reads from the
+  device under `state/platform`: `os`, `version`, `model` and
+  `serial-number`. It is absent until the device has connected. A
+  campaign's `device-status` has each member's `version` and `model`
+  instead of `running-release`. The web UI shows the platform on the
+  devices and device pages, and each member's model and version on the
+  campaign page. The devices page filters by model. The demo fleets mix ten
+  IOS XE models. [#718]
 - The top always starts ten flotillas and places each device on `flotilla-N`
   by a hash of its name. Removed `/fleet/node` and `/fleet/device/shard`.
   Devices without a shard, which the top managed itself, are no longer
@@ -166,6 +197,13 @@
 - The web UI has image pages. Drop image files on them to upload them. OS and
   version are filled in from IOS XE file names. Deleting an image also
   deletes its file. [#709]
+- The web UI has a Config page, which shows the top's configuration, the
+  state its transforms publish or both, as XML, JSON or AData. On the Apply
+  config page, JSON or XML configuration that is typed, pasted or dropped as
+  a file is merged into the running system with a RESTCONF PATCH, after a
+  confirmation. [#736]
+- The web UI has a search, in the header or with Ctrl/⌘+K, that jumps to a
+  page, campaign, image, device or schedule by name. [#737]
 - The device page is redesigned around the device's upgrade run. [#674]
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for
@@ -180,6 +218,8 @@
   now `dev-iosxe`. [#694]
 - `just demo-all` deploys the CEs, starts the top and loads both campaigns.
   [#690]
+- `just run` starts the top and its ten flotillas with no devices, images or
+  campaigns. [#736]
 
 ### Dependencies
 
@@ -199,11 +239,27 @@
   with the module in `name` instead of `module`. The new `submodules` and
   `implemented` fields are for schema discovery APIs. [acton-yang#545] [#714]
 - Optional APIs and generated constructors declare explicit defaults.
+- Fixed YANG patterns with a `.` or `$` in a character class. The nokia-conf
+  module of SR OS 25.10 failed to compile with "Invalid range bound", and
+  `[.]` and `[$]` matched any character and the end of the string instead of
+  a literal dot and dollar sign. [acton-yang#546] [acton-yang#547] [#729]
+- YANG sources are parsed concurrently, which makes compiling large module
+  sets faster. Removed `yang.parse_modules()` and `yang.compile_from_stmt()`,
+  which were only needed for the statement cache. [acton-yang#550] [#734]
+- `yang.schema.DRoot.merge()` merges compiled schema roots into one, with
+  the top-level nodes, RPCs, identities and modules of all of them, like the
+  CFS schema and ietf-yang-library that a northbound server serves
+  together. It merges top-level nodes only, and raises `ValueError` when two
+  roots hold the same top-level node or different revisions of a module.
+  [acton-yang#548] [#716]
+- `take_leaf()` and `take_leaflist()` of the `yang.data.YangData` protocol
+  return no `t` type field. gdata keeps a union's value as its Acton type,
+  so the field is no longer needed. [acton-yang#553] [#741]
 
 #### acton-ssh
-- SSH events are delivered in the order libssh raises them. Under load, pipe
-  streams were reordered and broke NETCONF chunk framing. [acton-ssh#15]
-  [#670]
+- Fixed SSH events being delivered out of the order libssh raises them.
+  Under load, pipe streams were reordered and broke NETCONF chunk framing.
+  [acton-ssh#15] [#670]
 - Fixed a `Client` hanging forever when its `on_hostkey` handler never
   responds. `connect_timeout` also covers the `on_hostkey` decision.
   [acton-ssh#6] [#707]
@@ -238,6 +294,8 @@
   break the downstream's checks. [#706]
 - Removed the actor pipe restart stress test, which was too slow for CI.
   [#696]
+- Fixed the build of the multi-arch `ghcr.io/stratoweave/ncurl:latest` image
+  on runners with Docker Engine 29. [#735]
 
 ### Compatibility Notes
 - Requires Acton newer than 0.31.0. Regenerate generated code with `make gen`
@@ -247,9 +305,17 @@
   sw-adapter-cisco-ios-cli, need the same change. [#702]
 - gdata `to_xmlstr()` and `to_yang_jsonstr()` return compact output by
   default. Pass `pretty=True` for indented output. [acton-yang#541] [#684]
-- `/restconf-state/capabilities` no longer lists YANG modules. The RESTCONF
-  server doesn't serve ietf-yang-library yet, so there is no replacement.
-  [#676]
+- `/restconf-state/capabilities` no longer lists YANG modules. Read them from
+  `/ietf-yang-library:modules-state` or `/ietf-yang-library:yang-library`
+  instead. [#676] [#716]
+- The NETCONF server's `<hello>` lists no module capabilities, only
+  `yang-library:1.1`. Clients that take the server's modules from the
+  `<hello>` must read them from `/yang-library` or `/modules-state`. [#716]
+- The device software state has no `running-release`. Read the release a
+  device runs from `state/platform/version`, and in Fleet Manager from the
+  `version` of a campaign's `device-status`. Mock devices take the release
+  they start on as `mock/platform/version` instead of
+  `mock/software/running-release`. [#718]
 - An app with its own `device_types.act` must add
   `import stratoweave.platform_probes as swplat` and
   `platform_probes: list[swdev.PlatformProbe] = swplat.PROBES` to it. The
@@ -312,7 +378,9 @@ next. Give it a spin. We’d love to hear what you think.
 [#712]: https://github.com/stratoweave/stratoweave/pull/712
 [#713]: https://github.com/stratoweave/stratoweave/pull/713
 [#714]: https://github.com/stratoweave/stratoweave/pull/714
+[#716]: https://github.com/stratoweave/stratoweave/pull/716
 [#717]: https://github.com/stratoweave/stratoweave/pull/717
+[#718]: https://github.com/stratoweave/stratoweave/pull/718
 [#719]: https://github.com/stratoweave/stratoweave/pull/719
 [#720]: https://github.com/stratoweave/stratoweave/pull/720
 [#721]: https://github.com/stratoweave/stratoweave/pull/721
@@ -321,8 +389,15 @@ next. Give it a spin. We’d love to hear what you think.
 [#724]: https://github.com/stratoweave/stratoweave/pull/724
 [#725]: https://github.com/stratoweave/stratoweave/pull/725
 [#726]: https://github.com/stratoweave/stratoweave/pull/726
+[#729]: https://github.com/stratoweave/stratoweave/pull/729
 [#730]: https://github.com/stratoweave/stratoweave/pull/730
 [#731]: https://github.com/stratoweave/stratoweave/pull/731
+[#734]: https://github.com/stratoweave/stratoweave/pull/734
+[#735]: https://github.com/stratoweave/stratoweave/pull/735
+[#736]: https://github.com/stratoweave/stratoweave/pull/736
+[#737]: https://github.com/stratoweave/stratoweave/pull/737
+[#740]: https://github.com/stratoweave/stratoweave/pull/740
+[#741]: https://github.com/stratoweave/stratoweave/pull/741
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
@@ -335,3 +410,8 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-yang#541]: https://github.com/stratoweave/acton-yang/pull/541
 [acton-yang#544]: https://github.com/stratoweave/acton-yang/pull/544
 [acton-yang#545]: https://github.com/stratoweave/acton-yang/pull/545
+[acton-yang#546]: https://github.com/stratoweave/acton-yang/pull/546
+[acton-yang#547]: https://github.com/stratoweave/acton-yang/pull/547
+[acton-yang#548]: https://github.com/stratoweave/acton-yang/pull/548
+[acton-yang#550]: https://github.com/stratoweave/acton-yang/pull/550
+[acton-yang#553]: https://github.com/stratoweave/acton-yang/pull/553
