@@ -24,6 +24,7 @@
   } from '$lib/software/planning-form';
   import { formatEta } from '$lib/software/rate';
   import { formatClock } from '$lib/core/time';
+  import { imageCounts } from '$lib/software/campaign-images';
   import { nameMatcher } from '$lib/software/selection';
   import {
     CAMPAIGN_LIST_ROOT,
@@ -31,7 +32,6 @@
     KNOWN_STATUSES,
     adminStatePatch,
     joinState,
-    maskUrlCredentials,
     unplacedText,
     type KnownStatus
   } from '$lib/software/model';
@@ -229,7 +229,7 @@
           ? ` The first window${first.schedule ? `, ${first.schedule},` : ''} opens at ${formatClock(first.start)}.`
           : '';
       return (
-        `Start upgrading ${placed} device(s) to ${c.targetRelease}? Devices are released a few at a time as their windows open and completions come in. Real installs reload devices and take several minutes.` +
+        `Start upgrading ${placed} device(s) to their images? Devices are released a few at a time as their windows open and completions come in. Real installs reload devices and take several minutes.` +
         opens +
         (unplaced > 0 ? ` ${unplaced} device(s) do not fit the windows and are left alone.` : '')
       );
@@ -280,13 +280,6 @@
     <div>
       <h1>{campaign.name}</h1>
       <p class="summary">{summary}</p>
-      <p class="facts">
-        <span><span class="fact-label">Release</span> <span class="mono">{campaign.targetRelease}</span></span>
-        <span class="image">
-          <span class="fact-label">Image</span>
-          <span class="mono image-url">{campaign.imageUrl ? maskUrlCredentials(campaign.imageUrl) : '—'}</span>
-        </span>
-      </p>
     </div>
     <div class="page-actions">
       <button
@@ -318,6 +311,18 @@
       {/if}
     </div>
   </div>
+
+  {#if campaign.images.length > 0}
+    <!-- The full width under the header, so a few images fit one line. -->
+    <div class="image-pills" aria-label="Images">
+      {#each imageCounts(campaign.images) as [image, n] (image)}
+        <span class="pill image-pill">
+          <span class="mono">{image || 'no image'}</span>
+          <span class="n tn">{n.toLocaleString()}</span>
+        </span>
+      {/each}
+    </div>
+  {/if}
 
   {#if counters !== null}
     <section class="card status-card" aria-label="Progress">
@@ -536,27 +541,23 @@
     font-size: var(--sw-text-md);
   }
 
-  .facts {
+  /* One line; more images than fit scroll sideways. */
+  .image-pills {
     display: flex;
-    flex-wrap: wrap;
-    gap: 4px 24px;
-    margin-top: 10px;
-    font-size: var(--sw-text-sm);
+    gap: 8px;
+    margin: -12px 0 20px;
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  .image-pill {
+    flex: none;
+    padding: 3px 10px;
+  }
+
+  .image-pill .n {
     color: var(--sw-text-primary);
-  }
-
-  .facts .fact-label {
-    margin-right: 6px;
-  }
-
-  .image {
-    min-width: 0;
-  }
-
-  /* A long URL breaks at its slashes rather than mid-word. */
-  .image-url {
-    overflow-wrap: anywhere;
-    color: var(--sw-text-secondary);
+    font-weight: 600;
   }
 
   .status-card {

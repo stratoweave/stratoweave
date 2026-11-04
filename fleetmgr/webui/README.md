@@ -35,8 +35,20 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   target does not exist yet, so nothing PATCHes list entries directly.
   RESTCONF PATCH merges: launching a campaign sends only
   `{name, admin-state: run}`.
-- Campaign members are a list of `{name}` entries whose names reference
-  `/fleetmgr:fleet/device`.
+- Campaign members are a list of `{name, image}` entries: the name
+  references `/fleetmgr:fleet/device`, the image names an entry of the
+  image list. A new campaign takes three steps. Devices: the selection
+  filters on type, model, version, name, address, description and
+  schedule, or starts from pasted names; devices another campaign has are
+  left out. Back keeps the filters. Images: one row per
+  model in the selection, offering the images that list the model; the
+  family default is preselected when exactly one default image lists the
+  model. Devices that have not reported a model are left out, and a model
+  no image lists blocks the create. Plan: Create sends one PATCH with
+  `admin-state: plan` and opens the campaign page, which shows the plan
+  and sets schedule and pace.
+- The image list's `url-base`, set on the images page, is where devices
+  fetch images from: url-base followed by the image name.
 - Each fleet device entry carries config-false `state/platform`: `os`,
   `version`, `model` and `serial-number` as the device reports them, absent
   until it has connected. The devices list shows them and filters by model.
@@ -48,8 +60,7 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   of devices at once, not both: `target-concurrency` is a floor under the
   deadline's pace, so pacing by the deadline sets it to 1, the slowest
   pace, and pacing by concurrency removes the deadline. A campaign that
-  has a deadline opens paced by it. The wizard sets them at create time
-  and the campaign page changes them later. A change PATCHes the leaves;
+  has a deadline opens paced by it. The campaign page sets them. A change PATCHes the leaves;
   clearing the default schedule or the deadline PUTs the entry back
   without the leaf and without `state`, since DELETE on a leaf returns
   500. The controller keeps the devices it has already released, so a

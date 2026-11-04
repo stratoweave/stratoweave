@@ -41,6 +41,7 @@ export interface DeviceJson {
 
 interface CampaignMemberJson {
   name: string;
+  image?: string;
 }
 
 /** A software upgrade check verdict, relayed from the device as strings. */
@@ -112,8 +113,6 @@ interface CampaignStateJson {
 
 export interface CampaignJson {
   name: string;
-  'target-release'?: string;
-  'image-url'?: string;
   'allow-staging'?: boolean;
   device?: CampaignMemberJson[];
   'admin-state'?: AdminState;
@@ -155,6 +154,7 @@ interface CampaignEntryJson {
 /** GET data/stratoweave-images:images */
 interface ImagesJson {
   'stratoweave-images:images'?: {
+    'url-base'?: string;
     image?: ImageJson[];
   };
 }
@@ -166,7 +166,7 @@ export interface FleetPatchJson {
 }
 
 interface ImagesPatchJson {
-  'stratoweave-images:images': { image: ImageJson[] };
+  'stratoweave-images:images': { 'url-base'?: string; image?: ImageJson[] };
 }
 
 interface SoftwarePatchJson {
@@ -218,7 +218,6 @@ export interface Device {
   description: string;
   /** Maintenance schedule binding, by name; empty when unbound. */
   schedule: string;
-  approvalRequired: boolean;
   /** First address entry as `host[:port]`; empty for a mock. */
   address: string;
   /** What the device reports when it connects; empty until then. */
@@ -350,9 +349,9 @@ export function planAlarmLines(plan: CampaignPlan): string[] {
 
 export interface Campaign {
   name: string;
-  targetRelease: string;
   devices: string[];
-  imageUrl: string;
+  /** The image of each member, in the order of devices. */
+  images: string[];
   adminState: AdminState;
   /** Name of the shared schedule for members whose device has no binding
    * of its own; empty when the campaign runs through its one synthetic
@@ -401,7 +400,6 @@ function parseDevice(entry: DeviceJson): Device {
     type: entry.type ?? '',
     description: entry.description ?? '',
     schedule: entry.schedule ?? '',
-    approvalRequired: entry['approval-required'] === true,
     address: firstAddress(entry),
     model: entry.state?.platform?.model ?? '',
     version: entry.state?.platform?.version ?? '',
@@ -510,9 +508,8 @@ export function joinState(parts: StateParts | null, members: string[]): Campaign
 function parseCampaignConfig(entry: CampaignJson): CampaignConfig {
   return {
     name: entry.name,
-    targetRelease: entry['target-release'] ?? '',
     devices: (entry.device ?? []).map((m) => m.name),
-    imageUrl: entry['image-url'] ?? '',
+    images: (entry.device ?? []).map((m) => m.image ?? ''),
     adminState: entry['admin-state'] === 'run' ? 'run' : 'plan',
     defaultSchedule: entry['default-schedule'] ?? '',
     deadline: typeof entry.deadline === 'number' ? entry.deadline : null,
@@ -583,6 +580,16 @@ export function parseImages(json: unknown): CatalogImage[] {
   return ((json as ImagesJson)?.['stratoweave-images:images']?.image ?? []).map(parseImage);
 }
 
+/** The url-base of a GET of data/stratoweave-images:images: where devices
+ * fetch images from; empty when unset. */
+export function parseUrlBase(json: unknown): string {
+  return (json as ImagesJson)?.['stratoweave-images:images']?.['url-base'] ?? '';
+}
+
+export function urlBasePatch(urlBase: string): ImagesPatchJson {
+  return { 'stratoweave-images:images': { 'url-base': urlBase } };
+}
+
 /** Parse a GET of data/stratoweave-images:images/image={name}. */
 export function parseImageEntry(json: unknown): CatalogImage | null {
   const entries = (json as { 'stratoweave-images:image'?: ImageJson[] })?.['stratoweave-images:image'];
@@ -600,38 +607,20 @@ export function parseCampaignEntry(json: unknown): { config: CampaignConfig; sta
 
 export interface NewCampaign {
   name: string;
-  targetRelease: string;
-  imageUrl: string;
-  devices: string[];
+  /** Each member with the image it installs. */
+  devices: { name: string; image: string }[];
   allowStaging?: boolean;
-  /** Name of an existing shared schedule. */
-  defaultSchedule?: string;
-  /** Seconds since the Unix epoch. */
-  deadline?: number | null;
-  /** Devices upgrading at the same time; null leaves the model default. */
-  targetConcurrency?: number | null;
-  maxConcurrency?: number | null;
 }
 
+/** A new campaign, in plan: schedule and pace are set on its page. */
 export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
-  const name = input.name.trim();
   const entry: Partial<CampaignJson> & { name: string } = {
-    name,
-    'target-release': input.targetRelease.trim(),
-    device: input.devices.map((device) => ({ name: device })),
+    name: input.name.trim(),
+    device: input.devices.map((d) => ({ name: d.name, image: d.image })),
     'admin-state': 'plan'
   };
-  const patch: SoftwarePatchJson = {
-    'software:software': { 'upgrade-campaign': [entry] }
-  };
-  const imageUrl = input.imageUrl.trim();
-  if (imageUrl) entry['image-url'] = imageUrl;
   if (input.allowStaging) entry['allow-staging'] = true;
-  if (input.defaultSchedule) entry['default-schedule'] = input.defaultSchedule;
-  if (input.deadline != null) entry.deadline = input.deadline;
-  if (input.targetConcurrency != null) entry['target-concurrency'] = input.targetConcurrency;
-  if (input.maxConcurrency != null) entry['max-concurrency'] = input.maxConcurrency;
-  return patch;
+  return { 'software:software': { 'upgrade-campaign': [entry] } };
 }
 
 /** PATCH merges: sending only {name, admin-state} flips one leaf and
@@ -675,16 +664,10 @@ export function validateNewCampaign(input: NewCampaign, existingNames: string[])
   } else if (existingNames.includes(name)) {
     errors['name'] = `Campaign ${name} already exists.`;
   }
-  if (!input.targetRelease.trim()) {
-    errors['target-release'] = 'A target release is required.';
-  }
   if (input.devices.length === 0) {
     errors['device'] = 'Select at least one device.';
+  } else if (input.devices.some((d) => !d.image)) {
+    errors['image'] = 'Pick an image for every model.';
   }
   return { ok: Object.keys(errors).length === 0, errors };
-}
-
-/** scp://user:pw@host:/path -> scp://***@host:/path, for display only. */
-export function maskUrlCredentials(url: string): string {
-  return url.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^@/]+@/i, '$1***@');
 }

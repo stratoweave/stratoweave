@@ -195,16 +195,21 @@ Algorithm preference order is preserved through both transforms.
 The generic `software` model remains separate from inventory. Each campaign
 device list entry links its name to the referenced `/fleet/device` entry,
 routing each member to its flotilla before merging all software intent into the
-same device entry that the inventory transform writes.
+same device entry that the inventory transform writes. Each member names its
+`image` from `/images`: the device's target release is the image's
+`version`, and its image URL is the list's `url-base` followed by the image
+name. A member whose image is not in the list, or has no version, gets no
+software intent, and the campaign's plan alarms say so.
 
 `/images` is the StratoWeave image list (`swyang.images`): software images
 by file name, each with its `os`, `version`, `family` and the hardware
 `model`s it is for. One image of a family can be its `default`; the YANG
 `must` statements that say so are not checked yet, and the web UI keeps to
-the rule. The web UI uploads the image files into the top's image folder,
-`--software.image-dir`, and adds their entries; nothing else reads the list
-yet. Like `/schedules`, the container is a transform that produces no
-configuration, so campaigns can link the whole list later.
+the rule. `url-base` says where devices fetch the images from. The web UI
+uploads the image files into the top's image folder,
+`--software.image-dir`, and adds their entries. Like `/schedules`, the
+container is a transform that produces no configuration, so campaigns link
+the whole list.
 
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription on the flotilla

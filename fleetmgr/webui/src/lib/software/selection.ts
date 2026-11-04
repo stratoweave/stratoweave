@@ -9,13 +9,16 @@ import type { Device } from '$lib/software/model';
 export interface Selection {
   /** is any of; empty = all */
   types: string[];
+  /** is any of; empty = all; '' stands for devices that have not
+   * reported one */
+  models: string[];
+  versions: string[];
   /** substring, or glob when it contains * or ? */
   namePattern: string;
+  addressContains: string;
   descriptionContains: string;
-  /** '' = don't care */
-  requiresApproval: '' | 'yes' | 'no';
-  /** '' = don't care; 'no' excludes devices another campaign owns */
-  ownedByCampaign: '' | 'yes' | 'no';
+  /** '' any, 'none' no schedule, '=NAME' bound to NAME */
+  schedule: string;
   /** explicit names, newline/comma-separated; when non-empty it is the
    * base set instead of the whole inventory */
   pasted: string;
@@ -33,6 +36,8 @@ export interface Expansion {
    * (the leafref would reject them) */
   unknown: string[];
   byType: Record<string, number>;
+  /** '' counts devices that have not reported a model */
+  byModel: Record<string, number>;
   excluded: ExclusionRow[];
   sample: Device[];
 }
@@ -45,10 +50,12 @@ export interface SelectionContext {
 export function emptySelection(): Selection {
   return {
     types: [],
+    models: [],
+    versions: [],
     namePattern: '',
+    addressContains: '',
     descriptionContains: '',
-    requiresApproval: '',
-    ownedByCampaign: 'no',
+    schedule: '',
     pasted: ''
   };
 }
@@ -66,6 +73,20 @@ export function nameMatcher(pattern: string): (name: string) => boolean {
   }
   const needle = pattern.toLowerCase();
   return (name) => name.toLowerCase().includes(needle);
+}
+
+/** Whether device's schedule binding matches filter: '' any, 'none' no
+ * schedule, '=NAME' bound to NAME. */
+export function scheduleMatches(device: Device, filter: string): boolean {
+  if (filter === '') return true;
+  if (filter === 'none') return device.schedule === '';
+  return device.schedule === filter.slice(1);
+}
+
+/** Case-insensitive substring test; empty matches everything. */
+function contains(text: string, needle: string): boolean {
+  const n = needle.trim().toLowerCase();
+  return !n || text.toLowerCase().includes(n);
 }
 
 export function expandSelection(
@@ -99,35 +120,27 @@ export function expandSelection(
   }
 
   const matchName = nameMatcher(sel.namePattern.trim());
-  const description = sel.descriptionContains.trim().toLowerCase();
   candidates = candidates.filter(
     (d) =>
       (sel.types.length === 0 || sel.types.includes(d.type)) &&
+      (sel.models.length === 0 || sel.models.includes(d.model)) &&
+      (sel.versions.length === 0 || sel.versions.includes(d.version)) &&
       matchName(d.name) &&
-      (!description || d.description.toLowerCase().includes(description))
+      contains(d.address, sel.addressContains) &&
+      contains(d.description, sel.descriptionContains) &&
+      scheduleMatches(d, sel.schedule)
   );
 
-  // The remaining criteria are exclusions worth accounting for, not
-  // silent filters.
+  // A device another campaign owns is an exclusion worth accounting for,
+  // not a silent filter: two campaigns would set it two targets.
   const selected: Device[] = [];
   let ownedOut = 0;
   const ownedBy = new Set<string>();
-  let approvalOut = 0;
   for (const d of candidates) {
     const owner = context.owners.get(d.name);
-    if (sel.ownedByCampaign === 'no' && owner !== undefined) {
+    if (owner !== undefined) {
       ownedOut += 1;
       ownedBy.add(owner);
-      continue;
-    }
-    if (sel.ownedByCampaign === 'yes' && owner === undefined) {
-      continue;
-    }
-    if (sel.requiresApproval === 'no' && d.approvalRequired) {
-      approvalOut += 1;
-      continue;
-    }
-    if (sel.requiresApproval === 'yes' && !d.approvalRequired) {
       continue;
     }
     selected.push(d);
@@ -135,8 +148,10 @@ export function expandSelection(
   selected.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   const byType: Record<string, number> = {};
+  const byModel: Record<string, number> = {};
   for (const d of selected) {
     byType[d.type] = (byType[d.type] ?? 0) + 1;
+    byModel[d.model] = (byModel[d.model] ?? 0) + 1;
   }
 
   const excluded: ExclusionRow[] = [];
@@ -145,13 +160,6 @@ export function expandSelection(
       n: ownedOut,
       what: 'owned by another campaign',
       path: [...ownedBy].slice(0, 2).map((o) => `software/upgrade-campaign = ${o}`).join(' · ')
-    });
-  }
-  if (approvalOut > 0) {
-    excluded.push({
-      n: approvalOut,
-      what: 'require per-change approval',
-      path: 'approval-required = true'
     });
   }
   if (unknown.length > 0) {
@@ -166,6 +174,7 @@ export function expandSelection(
     names: selected.map((d) => d.name),
     unknown,
     byType,
+    byModel,
     excluded,
     sample: selected.slice(0, 6)
   };

@@ -25,13 +25,34 @@ export const WINDOW_GAP = 6;
 const MAX_SIZE = 14;
 const MIN_SIZE = 3;
 
+/** Whether w is the window a campaign without schedules runs through:
+ * it opens at launch, which the controller sends as 0. */
+export function opensAtLaunch(w: PlanWindow): boolean {
+  return w.start <= 0;
+}
+
+/** Where a window's band starts on the axis: its start, or for one that
+ * opens at launch its first device's start less a small margin, so the
+ * axis does not reach back to 1970. */
+export function windowStart(w: PlanWindow): number {
+  if (!opensAtLaunch(w) || w.devices.length === 0) return w.start;
+  let first = Infinity;
+  let last = -Infinity;
+  for (const d of w.devices) {
+    first = Math.min(first, deviceStart(d));
+    last = Math.max(last, deviceStart(d) + deviceDuration(d));
+  }
+  return first - Math.max(60, Math.round((last - first) * 0.05));
+}
+
 /** Where a window's band ends on the axis: its end, or for an open window
  * the last finish plus a small margin. */
 export function windowEnd(w: PlanWindow): number {
   if (w.end !== null) return w.end;
-  let last = w.start;
+  const start = windowStart(w);
+  let last = start;
   for (const d of w.devices) last = Math.max(last, deviceStart(d) + deviceDuration(d));
-  return Math.max(w.start + 60, last + Math.max(60, Math.round((last - w.start) * 0.05)));
+  return Math.max(start + 60, last + Math.max(60, Math.round((last - start) * 0.05)));
 }
 
 function sameDevice(a: PlanDevice, b: PlanDevice): boolean {
@@ -80,6 +101,8 @@ export function holdWindows(): (windows: PlanWindow[]) => PlanWindow[] {
 
 export interface OrderedWindow {
   w: PlanWindow;
+  /** windowStart(w). */
+  start: number;
   /** windowEnd(w). */
   end: number;
   /** The devices in the order cells fill: by start, then name. */
@@ -100,6 +123,7 @@ export function orderWindows(windows: PlanWindow[]): OrderedWindow[] {
       keyed.sort((a, b) => a.start - b.start || byName(a.d.name, b.d.name));
       return {
         w,
+        start: windowStart(w),
         end: windowEnd(w),
         devices: keyed.map((k) => k.d),
         starts: Float64Array.from(keyed, (k) => k.start)
@@ -246,7 +270,7 @@ export interface Placed {
 export function assignLanes(windows: OrderedWindow[], axis: Axis, minGap: number): Placed[] {
   const laneEnds: number[] = [];
   return windows.map((o) => {
-    const x = axis.xOf(o.w.start);
+    const x = axis.xOf(o.start);
     const xEnd = axis.xOf(o.end);
     let lane = laneEnds.findIndex((e) => e + minGap <= x);
     if (lane === -1) {

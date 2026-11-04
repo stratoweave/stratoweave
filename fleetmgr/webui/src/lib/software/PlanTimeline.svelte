@@ -20,6 +20,7 @@
     holdWindows,
     layoutAt,
     nowAnchor,
+    opensAtLaunch,
     orderWindows,
     pickZoom,
     tickStep,
@@ -96,7 +97,7 @@
   const hold = holdWindows();
   let windows = $derived(hold(plan.windows));
   let ordered = $derived(orderWindows(windows));
-  let spans = $derived(ordered.map((o) => ({ start: o.w.start, end: o.end })));
+  let spans = $derived(ordered.map((o) => ({ start: o.start, end: o.end })));
   let step = $derived(anchorStep(spans));
   let anchor = $derived(nowAnchor(spans, now, step));
   let fit = $derived(
@@ -175,7 +176,11 @@
   function label(b: Block, share: number): string {
     const w = b.p.w;
     const name = w.schedule || 'window';
-    const range = `${clockLabel(w.start)} → ${w.end === null ? 'open' : clockLabel(w.end)}`;
+    const range = opensAtLaunch(w)
+      ? w.end === null
+        ? 'always open'
+        : `until ${clockLabel(w.end)}`
+      : `${clockLabel(w.start)} → ${w.end === null ? 'open' : clockLabel(w.end)}`;
     const n = w.devices.length;
     const count = `${n.toLocaleString()} device${n === 1 ? '' : 's'}`;
     const pct = now >= w.start ? `${Math.round(share * 100)}%` : null;
@@ -215,8 +220,9 @@
     if (hit === null) return '';
     if (hit.kind === 'window') {
       const w = hit.w;
+      const opens = opensAtLaunch(w) ? 'opens at launch' : `opens ${formatClock(w.start)}`;
       const closes = w.end === null ? 'never closes' : `closes ${formatClock(w.end)}`;
-      return `${w.schedule || 'window'}: opens ${formatClock(w.start)}, ${closes}, ${w.devices.length} device(s)`;
+      return `${w.schedule || 'window'}: ${opens}, ${closes}, ${w.devices.length} device(s)`;
     }
     const d = hit.d;
     const status = statuses.get(d.name) ?? 'pending';

@@ -354,27 +354,77 @@ class Schedules(base.Schedules):
 
 
 def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_entry,
-                   i: y_0.software__software__upgrade_campaign_entry) -> None:
-    """Write the software intent of campaign i for one device to its flotilla."""
+                   i: y_0.software__software__upgrade_campaign_entry,
+                   image: y_0.stratoweave_images__images__image_entry, url_base: ?str) -> None:
+    """Write the software intent of campaign i for one device to its
+    flotilla: the release of the device's image and the URL to fetch it
+    from, url_base followed by the image name."""
     software = o.rfs.create(flotilla_of(fleet_device.name)).device.create(fleet_device.name).software
-    software.target_release = i.target_release
+    software.target_release = image.version
     software.upgrade_campaign = i.name
-    software.image_url = i.image_url
+    if url_base is not None and url_base != "":
+        software.image_url = url_base + image.name
     software.allow_staging = i.allow_staging
+
+
+def member_image(inventory: y_0.root, name: ?str) -> ?y_0.stratoweave_images__images__image_entry:
+    """The image list entry a member names, when it is there and has a
+    version."""
+    if name is not None:
+        image = inventory.images.image.get(name)
+        if image is not None:
+            version = image.version
+            if version is not None and version != "":
+                return image
+    return None
 
 
 def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory: y_0.root,
                     released: set[str]) -> y_1_loose.root:
     """Return the software intent of campaign i for its members in released.
-    A campaign that does not run has no configuration."""
+    A campaign that does not run has no configuration, and a member whose
+    image is not in the image list, or has no version, gets none."""
     o = base.o_root()
     if i.admin_state == "run":
         for member in i.device:
             if member.name in released:
                 fleet_device = inventory.fleet.device.get(member.name)
                 if fleet_device is not None:
-                    route_software(o, fleet_device, i)
+                    image = member_image(inventory, member.image)
+                    if image is not None:
+                        route_software(o, fleet_device, i, image, inventory.images.url_base)
     return o
+
+
+def devices_text(n: int) -> str:
+    return "1 device" if n == 1 else "{n} devices"
+
+
+def image_alarms(i: y_0.software__software__upgrade_campaign_entry, inventory: y_0.root) -> list[str]:
+    """What keeps members of campaign i from their image: an image that is
+    not in the image list or has no version, and an image list without
+    url-base."""
+    missing: dict[str, int] = {}
+    no_version: dict[str, int] = {}
+    with_image = 0
+    for member in i.device:
+        name = member.image
+        if name is not None:
+            if member_image(inventory, name) is not None:
+                with_image += 1
+            elif inventory.images.image.get(name) is not None:
+                no_version[name] = no_version.get_def(name, 0) + 1
+            else:
+                missing[name] = missing.get_def(name, 0) + 1
+    alarms: list[str] = []
+    for name in sorted(list(missing.keys())):
+        alarms.append("image {name} is not in the image list ({devices_text(missing[name])})")
+    for name in sorted(list(no_version.keys())):
+        alarms.append("image {name} has no version ({devices_text(no_version[name])})")
+    url_base = inventory.images.url_base
+    if with_image > 0 and not (url_base is not None and url_base != ""):
+        alarms.append("no url-base in the image list: devices cannot fetch images")
+    return alarms
 
 
 class UpgradeCampaign(base.UpgradeCampaign):
@@ -412,6 +462,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var closed = False
     var plan_layout: list[(str, int, int, list[(str, int, int)])] = []
     var plan_alarms: list[str] = []
+    # What keeps members from their image, published after the plan alarms.
+    var member_alarms: list[str] = []
     var running = False
     var active = False
     var generation = 0
@@ -494,7 +546,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 else:
                     pd.estimated_start = u64(entry.1)
                 pd.estimated_duration = u64(entry.2)
-        for alarm in plan_alarms:
+        for alarm in plan_alarms + member_alarms:
             st.plan.alarm.append(alarm)
         update_oper(oper)
 
@@ -627,6 +679,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         running = run_now
         output = campaign_config(conf, inventory, ctl.released).to_gdata()
         write_output(output)
+        member_alarms = image_alarms(conf, inventory)
 
         p = ctl.plan(now)
         plan_layout = ctl.layout(p)
