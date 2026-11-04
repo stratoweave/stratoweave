@@ -32,15 +32,15 @@
   with an HTTP error whose body is not UTF-8. [#724]
 
 ### Northbound APIs
-- NETCONF `<get-config>` returns only configuration, without the operational
-  state published by transforms. [#683]
-- RESTCONF supports the `content` query parameter (`config`, `nonconfig`,
-  `all`) on GET. [#686]
-- RESTCONF GET, NETCONF `<get>` and yang-push filters can reach an
-  operational subtree under a config node, like
+- Fixed NETCONF `<get-config>` returning the operational state published by
+  transforms. [#683]
+- RESTCONF supports the `content` query parameter on GET, which RFC 8040
+  requires. [#686]
+- Fixed RESTCONF GET, NETCONF `<get>` and yang-push filters that could not
+  reach an operational subtree under a config node, like
   `/software:software/upgrade-campaign=foo/state` in fleetmgr. [#677] [#681]
-- `/restconf-state/capabilities` lists only RESTCONF protocol capabilities,
-  not YANG modules. [#676]
+- Fixed `/restconf-state/capabilities` listing YANG modules next to the
+  RESTCONF protocol capabilities. [#676]
 - RESTCONF replies use compact JSON and XML. `ncurl` output and the
   `/device/<name>/target`, `/running` and `/diff` inspection endpoints are
   still indented. [#684]
@@ -95,9 +95,9 @@
 - Fixed "Invalid NETCONF chunk framing" errors around NETCONF session
   restarts, seen with large mock fleets. After such an error the device
   adapter restarts the session once, not once for every write. [#691] [#693]
-- The mock NETCONF server ends a session's yang-push subscriptions when the
-  session ends. Before, every client restart added another set of updates.
-  [#692]
+- Fixed the mock NETCONF server keeping a session's yang-push subscriptions
+  after the session ended. Every client restart added another set of
+  updates. [#692]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
@@ -254,9 +254,9 @@
   [acton-yang#548] [#716]
 
 #### acton-ssh
-- SSH events are delivered in the order libssh raises them. Under load, pipe
-  streams were reordered and broke NETCONF chunk framing. [acton-ssh#15]
-  [#670]
+- Fixed SSH events being delivered out of the order libssh raises them.
+  Under load, pipe streams were reordered and broke NETCONF chunk framing.
+  [acton-ssh#15] [#670]
 - Fixed a `Client` hanging forever when its `on_hostkey` handler never
   responds. `connect_timeout` also covers the `on_hostkey` decision.
   [acton-ssh#6] [#707]
