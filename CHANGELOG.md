@@ -205,10 +205,19 @@
   the starts spread out as devices finish, and when the plan raises the
   concurrency, the extra devices start as devices finish instead of all
   at once. Failed upgrades no longer grow the ramp. [#746]
+- A campaign spreads its starts over the `stagger`, in percent of the
+  expected upgrade time: 25 by default. A device that starts holds the
+  next start back by that part of its upgrade time, divided by the
+  concurrency, so a larger campaign starts faster. Before, a window that
+  opened with room for many devices started them all in the same second.
+  [#748]
+- A campaign decision in which only devices start takes the last plan
+  again instead of planning anew, while nothing came in and no device is
+  due. [#748]
 - A campaign plan looks only at the devices due next at each step ahead,
   not at every device in flight. A plan that steps ahead often, as when
   devices start and end at many different times, takes seconds instead of
-  minutes at 100,000 devices.
+  minutes at 100,000 devices. [#748]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`: `os`, `version`, `model` and
   `serial-number`. It is absent until the device has connected. A
