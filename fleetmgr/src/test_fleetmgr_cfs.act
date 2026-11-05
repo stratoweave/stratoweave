@@ -908,7 +908,8 @@ def _render_layout(header: str, layout: list[(str, int, int, list[(str, int, int
 
 def _test_snapshot_plan_estimates():
     """Estimated starts are the controller's own predicted launches: the
-    ramp from one, doubling on completions, not an even spread."""
+    ramp from one device, three more for each device done, up to the
+    target of four, not an even spread."""
     campaign = InputCampaign(
         name="ramped",
         admin_state="plan",
@@ -978,24 +979,27 @@ def _test_snapshot_plan_estimates_mixed_fleet():
 
 actor _test_campaign_deadline_honors_ramp_up(t: testing.AsyncT):
     """A deadline the steady-state division calls makeable but the ramp
-    cannot make: ten 8 s devices in 40 s need four at once, and max is
-    three. The plan alarms."""
+    cannot make: ten 8 s devices before a deadline at 36 s. A device
+    starts only while 12 s, one and a half upgrades, are left, so there is
+    time for three rounds, at 0, 9 and 18 s. At four at once the ramp
+    starts 1, 4 and 4, so they need five at once, and max is four. The
+    plan alarms."""
     names = []
     for i in range(10):
         names.append("r{i}")
     campaign = InputCampaign(
         name="tight",
         admin_state="plan",
-        deadline=u64(40),
+        deadline=u64(36),
         target_concurrency=u64(1),
-        max_concurrency=u64(3),
+        max_concurrency=u64(4),
     )
     for name in names:
         campaign.device.create(name, image=IMAGE)
     layout, alarms, conc = _plan(campaign, _flat_inventory(names, upgrade_duration=8), 0)
     testing.assertEqual(alarms, ["1 device(s) cannot start before the deadline even at "
-                                 + "max-concurrency 3: r9"])
-    testing.assertEqual(conc, 3)
+                                 + "max-concurrency 4: r9"])
+    testing.assertEqual(conc, 4)
     t.success()
 
 
@@ -1094,33 +1098,60 @@ def _window_sizes(layout: list[(str, int, int, list[(str, int, int)])]) -> list[
 
 def _test_campaign_window_takes_what_the_ramp_starts():
     """100 devices of 10 min, a 1 h window every day, 10 at once. The
-    first window ramps 1, 2, 4, 8, 10 and has no time for a sixth round:
-    it takes 25. The ramp belongs to the campaign, so the next window runs
-    five rounds of 10 and takes 50, and the third the last 25."""
+    first window ramps 1, 4, 10, 10, 10 and has no time for a sixth
+    round: it takes 35. The ramp belongs to the campaign, so the next
+    window runs five rounds of 10 and takes 50, and the third the last
+    15."""
     campaign, linked = _daily_campaign("ramp", 100, None, 10, 10)
     layout, alarms, conc = _plan(campaign, linked, 0)
-    testing.assertEqual(_window_sizes(layout), [25, 50, 25])
+    testing.assertEqual(_window_sizes(layout), [35, 50, 15])
     testing.assertEqual([win.1 for win in layout], [0, 86400, 172800])
     testing.assertEqual(alarms, [])
     testing.assertEqual(conc, 10)
 
 
+def _test_campaign_close_margin_reaches_the_controller():
+    """The campaign's close-margin sets how late in a window a device
+    starts. The same 100 devices of 10 min, a 1 h window every day, 10 at
+    once. Each round starts one second, the debounce, after the round
+    before ends, so the rounds of a window start at 0, 601, 1202, 1803 and
+    2404 s. At the default of 150 percent a device starts while 900 s are
+    left, up to 2700 s: all five rounds fit, and the windows take 35, 50
+    and 15. At 200 percent it starts while 1200 s are left, up to 2400 s:
+    the fifth round does not fit, so the first window takes 1, 4, 10 and
+    10, 25, the second four rounds of 10, 40, and the third the last 35."""
+    # (the campaign's close-margin, or None for the default, and the
+    # number of devices in each window)
+    cases: list[(?int, list[int])] = [
+        (None, [35, 50, 15]),
+        (200, [25, 40, 35]),
+    ]
+    for case in cases:
+        campaign, linked = _daily_campaign("margin", 100, None, 10, 10)
+        margin = case.0
+        if margin is not None:
+            campaign.close_margin = u64(margin)
+        layout, alarms, conc = _plan(campaign, linked, 0)
+        testing.assertEqual(_window_sizes(layout), case.1, str(margin))
+        testing.assertEqual(alarms, [], str(margin))
+
+
 def _test_campaign_deadline_raises_the_planned_concurrency():
     """The same fleet with a deadline at the end of the second window. At
-    14 at once the two windows take 29 and 70, one short; at 15 they take
-    30 and 70, so the plan runs at 15."""
+    11 at once the two windows take 38 and 55, seven short; at 12 they
+    take 41 and 59, so the plan runs at 12."""
     campaign, linked = _daily_campaign("deadline", 100, 86400 + 3600, 10, 50)
     layout, alarms, conc = _plan(campaign, linked, 0)
-    testing.assertEqual(conc, 15)
-    testing.assertEqual(_window_sizes(layout), [30, 70])
+    testing.assertEqual(conc, 12)
+    testing.assertEqual(_window_sizes(layout), [41, 59])
     testing.assertEqual(alarms, [])
 
 
 def _test_campaign_replan_keeps_the_ramp():
     """The fleet with the deadline, run through the first window on the
     estimates and planned again between the windows. The run's ramp is
-    at 15, so the second window still takes its 70 at 15 at once. A plan
-    that ramped from one again would take 31 and leave 39 devices out."""
+    at 12, so the second window still takes its 59 at 12 at once. A plan
+    that ramped from one again would need 19 at once."""
     campaign, linked = _daily_campaign("deadline", 100, 86400 + 3600, 10, 50)
     campaign.admin_state = "run"
     ctl = fctl.Controller()
@@ -1129,9 +1160,9 @@ def _test_campaign_replan_keeps_the_ramp():
     sim.drive(ctl, 0, {}, 50000)
     cfs.configure_campaign(ctl, campaign, linked, 50000)
     p = ctl.plan(50000)
-    testing.assertEqual(_window_sizes(ctl.layout(p)), [30, 70])
+    testing.assertEqual(_window_sizes(ctl.layout(p)), [41, 59])
     testing.assertEqual(p.alarms, [])
-    testing.assertEqual(p.c, 15)
+    testing.assertEqual(p.c, 12)
 
 
 def _test_campaign_long_device_waits_for_a_window_it_fits():
@@ -1180,7 +1211,7 @@ def _test_campaign_device_without_a_window_keeps_the_concurrency():
     _bind(linked, "d99", "sunday")
     layout, alarms, conc = _plan(campaign, linked, 0)
     testing.assertEqual(conc, 10)
-    testing.assertEqual(_window_sizes(layout), [25, 50, 24])
+    testing.assertEqual(_window_sizes(layout), [35, 50, 14])
     testing.assertEqual(alarms, ["1 device(s) cannot start before the deadline: d99"])
 
 
@@ -1193,7 +1224,7 @@ def _test_campaign_deadline_beyond_the_horizon_keeps_the_concurrency():
     layout, alarms, conc = _plan(campaign, linked, 0)
     testing.assertEqual(conc, 10)
     testing.assertEqual(len(alarms), 1)
-    testing.assertTrue(alarms[0].startswith("75 device(s) are in no window yet: "), alarms[0])
+    testing.assertTrue(alarms[0].startswith("65 device(s) are in no window yet: "), alarms[0])
 
 
 def _bind(linked: y_0.root, name: str, schedule: str) -> None:
@@ -1231,8 +1262,8 @@ actor _test_campaign_devices_follow_their_own_schedule(t: testing.AsyncT):
 def _test_snapshot_plan_two_schedules():
     """The layout across two schedules: five nightly devices ramp from
     one in the first window. The ramp belongs to the campaign, so the five
-    weekend bound devices in the later window start at the four it
-    reached."""
+    weekend bound devices in the later window start together, at the
+    eight it reached."""
     linked = _flat_inventory(["n0", "n1", "n2", "n3", "n4",
                               "w0", "w1", "w2", "w3", "w4"], upgrade_duration=8)
     sch = linked.schedules.schedule.create("night")
@@ -1373,12 +1404,14 @@ def _test_closed_window_takes_no_new_devices():
 
 actor _test_campaign_replan_keeps_released_devices(t: testing.AsyncT):
     """Run a campaign one device at a time, let two finish, then raise
-    target-concurrency. The replan keeps the finished devices in their window
-    with started and finished, and predicts the waiting ones from the
-    device in flight instead of behind the finished ones: d3 takes the
-    second slot, and d4 starts when d2 is expected to finish. The plan
-    expects the pace the run observed, which is faster than the 600 s
-    estimate, since d0 and d1 report done right away."""
+    target-concurrency to two. The replan keeps the finished devices in
+    their window with started and finished, and predicts the waiting ones
+    from the device in flight instead of behind the finished ones. The
+    ramp is at one device, because the run went one at a time, and it
+    grows only when a device is done: d3 does not start at the replan,
+    and d3 and d4 start when d2 is expected to finish. The plan expects
+    the pace the run observed: d0 and d1 report done right away, so d2
+    is expected to finish before its 600 s estimate."""
     names = ["d0", "d1", "d2", "d3", "d4"]
     linked = _flat_inventory(names, upgrade_duration=600)
     ns = y0_oper.NS_software
@@ -1462,12 +1495,13 @@ actor _test_campaign_replan_keeps_released_devices(t: testing.AsyncT):
             t.failure(ValueError("finished devices lost started or finished"))
         elif "d2" not in started or "d2" in finished:
             t.failure(ValueError("d2 must be in flight"))
-        elif "d3" not in started:
-            t.failure(ValueError("d3 must take the second slot: {started}"))
-        elif estimated.get_def("d4", 0) <= started["d2"] or \
-             estimated.get_def("d4", 0) > started["d2"] + 601:
-            t.failure(ValueError("d4 must start when d2 is expected to finish: "
-                                 + "{estimated} {started}"))
+        elif "d3" in started:
+            t.failure(ValueError("d3 must wait for d2, as the ramp is at one: {started}"))
+        elif estimated.get_def("d3", 0) <= started["d2"] or \
+             estimated.get_def("d3", 0) >= started["d2"] + 600 or \
+             estimated.get_def("d4", 0) != estimated.get_def("d3", 0):
+            t.failure(ValueError("d3 and d4 must start when d2 is expected to finish, "
+                                 + "at the observed pace: {estimated} {started}"))
         else:
             t.success()
 
