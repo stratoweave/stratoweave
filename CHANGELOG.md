@@ -205,6 +205,10 @@
   the starts spread out as devices finish, and when the plan raises the
   concurrency, the extra devices start as devices finish instead of all
   at once. Failed upgrades no longer grow the ramp. [#746]
+- A campaign plan looks only at the devices due next at each step ahead,
+  not at every device in flight. A plan that steps ahead often, as when
+  devices start and end at many different times, takes seconds instead of
+  minutes at 100,000 devices.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`: `os`, `version`, `model` and
   `serial-number`. It is absent until the device has connected. A

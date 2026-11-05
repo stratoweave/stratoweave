@@ -74,6 +74,13 @@ def imax(a: int, b: int) -> int:
     return b
 
 
+def earliest(a: int, b: int) -> int:
+    """The earlier of the times a and b, where -1 is no time."""
+    if a < 0 or (b >= 0 and b < a):
+        return b
+    return a
+
+
 # TODO: upstream, as a heapq module in the standard library.
 def heap_push(h: list[(int, str)], x: (int, str)) -> None:
     """Add x to the binary heap h, smallest first."""
@@ -376,6 +383,12 @@ class Controller(object):
     due: dict[str, int]
     # The devices of the campaign in flight.
     flying: set[str]
+    # The devices in flight without a report, by when their upgrade is
+    # expected to end: a heap of (due, name). An entry is stale once its
+    # device reported, is done, or is due at another time. The devices
+    # that left the heap because their report would have counted by now.
+    dues: list[(int, str)]
+    overdue: set[str]
     done_at: dict[str, int]
     # The window promised to each waiting device during a run, and the
     # order of the promises.
@@ -444,6 +457,8 @@ class Controller(object):
         self.released_est = {}
         self.due = {}
         self.flying = set()
+        self.dues = []
+        self.overdue = set()
         self.done_at = {}
         self.promised = {}
         self.promise_seq = {}
@@ -688,6 +703,9 @@ class Controller(object):
         self.spreads = spreads
         self.promised = promised
         self.flying = flying
+        self.dues = sorted([(self.due[name], name) for name in flying
+                            if name not in self.reported])
+        self.overdue = set()
         self.devices_done = devices_done
 
     def report(self, name: str, status: ?str, at: int) -> None:
@@ -717,12 +735,16 @@ class Controller(object):
             del self.final_at[name]
             del self.final_status[name]
             self.reported.discard(name)
+            if name in self.flying:
+                heap_push(self.dues, (self.due[name], name))
 
     def lost_all(self) -> None:
         """Forget the status of every device."""
         self.final_at = {}
         self.final_status = {}
         self.reported = set()
+        self.dues = sorted([(self.due[name], name) for name in self.flying])
+        self.overdue = set()
 
     def set_live(self, name: str, live: bool) -> None:
         """Take whether a device is up. A member of a redundancy group
@@ -869,6 +891,8 @@ class Controller(object):
             self.waiting[j] -= 1
         if name in self.final_at:
             self.reported.add(name)
+        elif name in self.est:
+            heap_push(self.dues, (self.due[name], name))
 
     def move_promises(self, t: int) -> None:
         """Promise the devices still waiting for a window that has closed,
@@ -1074,22 +1098,61 @@ class Controller(object):
                         wake = win.2
         if len(self.timed) > 0 and (wake < 0 or self.timed[0].0 < wake):
             wake = self.timed[0].0
-        for name in self.flying:
-            if name in self.reported:
-                # Its report counts one debounce after it came.
-                w = imax(self.final_at[name] + self.debounce, t + 1)
-            else:
-                if self.late_at(name) < t:
-                    # Late: one more upgrade from now.
-                    self.due[name] = t + self.duration(name)
-                # When its report counts if it comes when expected, or
-                # else, once that has passed, when it is late.
-                w = self.due[name] + self.debounce
-                if w <= t:
-                    w = self.late_at(name) + 1
-            if wake < 0 or w < wake:
-                wake = w
+        wake = earliest(wake, self.flying_wake(t))
         return (started, wake, self.devices_done >= len(self.est))
+
+    def flying_wake(self, t: int) -> int:
+        """The next time to decide for the devices in flight at time t; -1
+        for none. A device that is late is expected to take one more
+        upgrade from t."""
+        w = -1
+        for name in self.reported:
+            if name in self.flying:
+                # Its report counts one debounce after it came.
+                w = earliest(w, imax(self.final_at[name] + self.debounce, t + 1))
+        # The devices whose report would have counted by now leave the heap.
+        while len(self.dues) > 0:
+            e = self.dues[0]
+            if not self.in_dues(e):
+                heap_pop(self.dues)
+            elif e.0 + self.debounce <= t:
+                heap_pop(self.dues)
+                self.overdue.add(e.1)
+            else:
+                break
+        for name in list(self.overdue):
+            if name not in self.flying or name in self.reported:
+                self.overdue.discard(name)
+            elif self.late_at(name) < t:
+                # Late: one more upgrade from now.
+                self.due[name] = t + self.duration(name)
+                heap_push(self.dues, (self.due[name], name))
+                self.overdue.discard(name)
+            else:
+                # Its report could have counted: decide when it is late.
+                w = earliest(w, self.late_at(name) + 1)
+        if len(self.dues) > 0:
+            # When its report counts if it comes when expected.
+            w = earliest(w, self.dues[0].0 + self.debounce)
+        return w
+
+    def in_dues(self, e: (int, str)) -> bool:
+        """True when e is the entry in dues of a device in flight without a
+        report."""
+        return e.1 in self.flying and e.1 not in self.reported and self.due[e.1] == e.0
+
+    def take_due(self, now: int) -> list[str]:
+        """Take from dues the devices in flight without a report whose
+        upgrade is expected to have ended by now."""
+        out: list[str] = []
+        for name in self.overdue:
+            if name in self.flying and name not in self.reported:
+                out.append(name)
+        while len(self.dues) > 0 and self.dues[0].0 <= now:
+            e = heap_pop(self.dues)
+            if self.in_dues(e):
+                out.append(e.1)
+        return out
 
     def copy(self) -> Controller:
         """A controller with this one's configuration and a copy of its
@@ -1140,6 +1203,8 @@ class Controller(object):
         c.released_est = {k: v for k, v in self.released_est.items()}
         c.due = {k: v for k, v in self.due.items()}
         c.flying = copy_set(self.flying)
+        c.dues = list(self.dues)
+        c.overdue = copy_set(self.overdue)
         c.done_at = {k: v for k, v in self.done_at.items()}
         c.promised = {k: v for k, v in self.promised.items()}
         c.promise_seq = {k: v for k, v in self.promise_seq.items()}
@@ -1174,12 +1239,10 @@ class Controller(object):
             if wake < 0 or finished:
                 break
             now = wake
-            for name in s.flying:
-                due = s.due[name]
-                if due <= now and name not in s.reported:
-                    # A member that is down while it upgrades comes back up.
-                    s.down.discard(name)
-                    s.report(name, "succeeded", due)
+            for name in s.take_due(now):
+                # A member that is down while it upgrades comes back up.
+                s.down.discard(name)
+                s.report(name, "succeeded", s.due[name])
         return (starts, s.moves)
 
     def breaks(self, run: (dict[str, (int, int)], int), t: int,
