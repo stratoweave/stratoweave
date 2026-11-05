@@ -65,17 +65,17 @@ def _test_first_step_starts_one_device():
 
 
 def _test_ramp_grows_four_times_a_round():
-    """The ramp starts at one device, and each device done lets three more
-    start, up to the concurrency. So when the devices of a round end
-    together, the next round is four times as large, up to the
-    concurrency: 1, 4, 16, then 20. A failed upgrade is done too."""
+    """The ramp starts at one device, and each device done without a
+    failure lets three more start, up to the concurrency. So when the
+    devices of a round succeed together, the next round is four times as
+    large, up to the concurrency: 1, 4, 16, then 20."""
     c = open_window(60, 20, 20)
     testing.assertEqual(c.decide(0).started, ["d0"])
     c.report("d0", "succeeded", 600)
     testing.assertEqual(c.decide(600).started, ["d1", "d2", "d3", "d4"])
     testing.assertEqual(c.rung, 4)
     for i in range(1, 5):
-        c.report("d{i}", "failed" if i == 4 else "succeeded", 1200)
+        c.report("d{i}", "succeeded", 1200)
     testing.assertEqual(c.decide(1200).started, ["d{i}" for i in range(5, 21)])
     testing.assertEqual(c.rung, 16)
     for i in range(5, 21):
@@ -84,13 +84,66 @@ def _test_ramp_grows_four_times_a_round():
     testing.assertEqual(c.rung, 20)
 
 
-def _test_each_device_done_lets_three_more_start():
-    """The ramp does not wait for a round to end. 10 at once. d0 is done,
-    and the ramp lets 4 be in flight: d1 to d4 start. d1 is done, though
+def _test_only_a_device_done_without_a_failure_grows_the_ramp():
+    """The ramp grows by three for each device that is done without a
+    failure, also one that reported up-to-date before its release. 10 at
+    once in a window that never closes, the ramp at one device. d1
+    reports up-to-date before its release. d0 fails: the ramp stays at
+    one, and d1 starts. d1 is done at the next decision, up to date: the
+    ramp lets 4 be in flight, and d2 to d5 start. d2 rolls back: the ramp
+    stays at 4, and d6 takes the slot of d2. d3 succeeds: the ramp lets 7
+    be in flight, and with d4, d5 and d6 in flight, d7 to d10 start."""
+    c = open_window(12, 10, 10)
+    c.report("d1", "up-to-date", 0)
+    testing.assertEqual(c.decide(0).started, ["d0"])
+    # (the time of the decision, the reports that come then, the devices
+    # that start, the ramp after)
+    cases: list[(int, list[(str, str)], list[str], int)] = [
+        (600, [("d0", "failed")], ["d1"], 1),
+        (601, [], ["d2", "d3", "d4", "d5"], 4),
+        (1201, [("d2", "rolled-back")], ["d6"], 4),
+        (1250, [("d3", "succeeded")], ["d7", "d8", "d9", "d10"], 7),
+    ]
+    for case in cases:
+        for r in case.1:
+            c.report(r.0, r.1, case.0)
+        testing.assertEqual(c.decide(case.0).started, case.2, str(case.0))
+        testing.assertEqual(c.rung, case.3, str(case.0))
+
+
+def _test_devices_up_to_date_before_their_release_grow_the_ramp():
+    """100 devices, u0 to u99, report up-to-date at 0, and 40 devices of
+    600 s, r0 to r39, come after them, 10 at once, in a window that never
+    closes, with a debounce of 30 s. The run starts at 10, so each
+    up-to-date device reported before its release, and is done at the
+    decision after its release. It grows the ramp as a device that
+    succeeds does: the decisions start 1, 4 and then 10 devices. So the
+    first 11 decisions start 95 of the up-to-date devices, and the 12th
+    the last 5 and r0 to r4. If the ramp did not grow on them, it would
+    stay at one device, and r0 would start at the 101st decision. r0 must
+    start at the 12th decision at the latest, and every device must be
+    done."""
+    devs = devices("u", 100, 600, "w") + devices("r", 40, 600, "w")
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 10, 10, debounce=30)
+    for i in range(100):
+        c.report("u{i}", "up-to-date", 0)
+    ds = sim.drive(c, 10, {}, DAY)
+    first = -1
+    for k in range(len(ds)):
+        if first < 0 and "r0" in ds[k].started:
+            first = k + 1
+    testing.assertTrue(first > 0 and first <= 12,
+                       "r0 starts at decision {first}, at the latest the 12th")
+    testing.assertEqual(len(c.done_at), 140)
+
+
+def _test_each_device_that_succeeds_lets_three_more_start():
+    """The ramp does not wait for a round to end. 10 at once. d0 succeeds,
+    and the ramp lets 4 be in flight: d1 to d4 start. d1 succeeds, though
     d2 to d4 are still in flight: the ramp lets 7 be in flight, and d5 to
-    d8 start. d2 is done: the ramp reaches the concurrency of 10, and d9
-    to d12 start. d3 is done: the ramp stays at 10, and d13 takes the slot
-    of d3."""
+    d8 start. d2 succeeds: the ramp reaches the concurrency of 10, and d9
+    to d12 start. d3 succeeds: the ramp stays at 10, and d13 takes the
+    slot of d3."""
     c = open_window(30, 10, 10)
     testing.assertEqual(c.decide(0).started, ["d0"])
     # (the device done, when, the devices that start, the ramp after)
@@ -109,9 +162,9 @@ def _test_each_device_done_lets_three_more_start():
 def _test_the_ramp_follows_a_rise_of_the_concurrency_as_devices_finish():
     """4 at once: the ramp is at the concurrency, with d1 to d4 in flight.
     New limits raise the concurrency to 10. No device is done, so the next
-    decision starts none. Then each device done lets three more start,
-    as on the way up: when d1 is done, d5 to d8 start, when d2 is done, d9
-    to d12, and when d3 is done, d13 only."""
+    decision starts none. Then each device that succeeds lets three more
+    start, as on the way up: when d1 succeeds, d5 to d8 start, when d2
+    succeeds, d9 to d12, and when d3 succeeds, d13 only."""
     c = open_window(30, 4, 4)
     c.decide(0)
     c.report("d0", "succeeded", 600)
@@ -402,6 +455,30 @@ def _test_a_device_that_fits_again_starts():
     testing.assertEqual(sim.started(c).get("x"), (("w", 0, 7000), 4770))
 
 
+def _test_a_device_without_a_promise_that_a_free_slot_passed_starts_when_it_fits():
+    """Two at a time, a window [0, 7000), and a campaign estimate of 100 s.
+    x, of 2000 s, comes first. The run starts at a pace of 300 s, so x
+    needs one and a half times 6000 s, 9000 s, and no plan promises it.
+    f0 to f48, of 100 s, run in pairs that take 90 s and 80 s in turn, so
+    each ends at a time other than expected, and its time counts. When
+    f46 and f47 count, at 2040, two of the last 50 times are still the
+    300 s that the run started from, and the slow time is 300 s: f48
+    takes one slot, and the window looks at x for the other, but x does
+    not fit. When f48 counts, at 2130, the slow time falls to 90 s, the
+    second longest of the last 50 times. The window looks at x again, x
+    needs 2700 s of the 4870 s left, and x starts."""
+    devs = [("x", 2000, "w")] + [("f{i}", 100, "w") for i in range(49)]
+    took: dict[str, int] = {}
+    for i in range(49):
+        took["f{i}"] = 90 if (i // 2) % 2 == 0 else 80
+    c = Controller()
+    c.configure([("w", 0, 7000)], devs, 2, 2, False, 0, 100)
+    c.start(2, 300)
+    testing.assertEqual(sim.planned(c, c.plan(0)).get("x"), None)
+    sim.drive(c, 0, took, 7000)
+    testing.assertEqual(sim.started(c).get("x"), (("w", 0, 7000), 2130))
+
+
 def _test_a_plan_keeps_the_window_a_promise_moves_to():
     """a runs late, so x misses the first window and its promise moves to
     the second, where y is promised. One at a time, x keeps the second
@@ -613,24 +690,37 @@ def _test_the_slow_time_is_the_98th_percentile():
         testing.assertEqual(fleet_ctl.slow_time(case.1, case.2), case.3, case.0)
 
 
-def _test_the_slow_time_keeps_at_least_50_upgrade_times():
+def _test_the_slow_time_is_taken_from_two_rounds_at_max_concurrency():
     """The observed pace is the mean of the last target + target // 4
-    upgrade times. The slow time is taken from the last two rounds at the
-    concurrency, and from at least the last 50."""
-    # (the target or the concurrency, how many times the pace is the mean
-    # of at that target, how many the slow time is taken from at that
-    # concurrency)
-    cases: list[(int, int, int)] = [
-        (1, 1, 50),
-        (8, 10, 50),
-        (25, 31, 50),
-        (26, 32, 52),
-        (40, 50, 80),
-        (50, 62, 100),
+    upgrade times. The controller keeps the last two rounds of upgrade
+    times at max-concurrency, and at least the last 50, and the slow time
+    is the 98th percentile of all of them by nearest rank. So of the 50
+    to 98 times kept up to max-concurrency 49 it is the second longest,
+    of the 100 to 148 kept from 50 to 74 the third longest, and of 150
+    the fourth longest."""
+    # (the target or the max-concurrency, how many times the pace is the
+    # mean of at that target, how many times the controller keeps at that
+    # max-concurrency, and the place of the slow time among them, the
+    # longest first)
+    cases: list[(int, int, int, int)] = [
+        (1, 1, 50, 2),
+        (8, 10, 50, 2),
+        (25, 31, 50, 2),
+        (26, 32, 52, 2),
+        (40, 50, 80, 2),
+        (49, 61, 98, 2),
+        (50, 62, 100, 3),
+        (64, 80, 128, 3),
+        (74, 92, 148, 3),
+        (75, 93, 150, 4),
     ]
     for case in cases:
-        testing.assertEqual((fleet_ctl.pace_samples(case.0), fleet_ctl.slow_samples(case.0)),
-                            (case.1, case.2), "{case.0}")
+        n = fleet_ctl.slow_samples(case.0)
+        # Times 1, 2, ... n s: the time at place k, the longest first, is
+        # n + 1 - k s.
+        place = n + 1 - fleet_ctl.slow_time([k + 1 for k in range(n)], 1)
+        testing.assertEqual((fleet_ctl.pace_samples(case.0), n, place),
+                            (case.1, case.2, case.3), "{case.0}")
 
 
 def _test_a_device_fits_with_one_and_a_half_times_its_slow_time_left():
@@ -681,17 +771,51 @@ def _test_a_device_fits_with_its_close_margin_left():
 
 
 def _test_a_new_close_margin_takes_effect():
-    """x, of 600 s, needs 900 s left before its window closes at the
-    default close margin of 150 percent. With 700 s left it does not
-    start. New limits that change only the close margin, to 100 percent,
-    let it start with the 600 s it then needs."""
+    """x, of 600 s, and y, of 100 s, two at a time, in a window that
+    closes at 10000. At 9300 the 700 s left are too short for x, which
+    needs 900 s at the default close margin of 150 percent, and y starts.
+    The window then looks at x again only when the slow time falls. New
+    limits that change only the close margin, to 100 percent, look at x
+    again, and x starts with the 600 s it then needs."""
     wins = [("w", 0, 10000)]
-    devs = [("x", 600, "w")]
-    c = controller(wins, devs, 1, 1)
-    testing.assertEqual(c.decide(9300).started, [])
-    c.configure(wins, devs, 1, 1, False, 0, 600, close_margin=100)
+    devs = [("x", 600, "w"), ("y", 100, "w")]
+    c = controller(wins, devs, 2, 2, rung=2)
+    testing.assertEqual(c.decide(9300).started, ["y"])
+    c.configure(wins, devs, 2, 2, False, 0, 600, close_margin=100)
     testing.assertEqual(c.close_margin, 100)
     testing.assertEqual(c.decide(9300).started, ["x"])
+
+
+def _test_new_limits_hold_the_ramp_to_the_new_target():
+    """10 at once, the ramp at 10, in a window that never closes: d0 to
+    d9 start. New limits of 4 at once hold the ramp to 4 too. When d0 to
+    d6 succeed, 3 devices are in flight, and d10 starts. Limits of 10 at
+    once again leave the ramp at 4, so nothing starts until a device
+    succeeds, and then each device that succeeds lets three more start,
+    as on the way up: when d7 succeeds, the ramp lets 7 be in flight, and
+    d11 to d14 start; when d8 succeeds, 10, and d15 to d18 start."""
+    wins = [("w", 0, fleet_ctl.OPEN_END)]
+    devs = devices("d", 30, 600, "w")
+    c = controller(wins, devs, 10, 10, rung=10)
+    testing.assertEqual(c.decide(0).started, ["d{i}" for i in range(10)])
+    c.configure(wins, devs, 4, 4, False, 0, 600)
+    testing.assertEqual(c.rung, 4)
+    for i in range(7):
+        c.report("d{i}", "succeeded", 600)
+    testing.assertEqual(c.decide(600).started, ["d10"])
+    c.configure(wins, devs, 10, 10, False, 0, 600)
+    s = c.decide(700)
+    testing.assertEqual((s.plan.c, s.started, c.rung), (10, [], 4))
+    # (the device that succeeds, when, the devices that start, the ramp
+    # after)
+    cases: list[(str, int, list[str], int)] = [
+        ("d7", 800, ["d11", "d12", "d13", "d14"], 7),
+        ("d8", 810, ["d15", "d16", "d17", "d18"], 10),
+    ]
+    for case in cases:
+        c.report(case.0, "succeeded", case.1)
+        testing.assertEqual(c.decide(case.1).started, case.2, case.0)
+        testing.assertEqual(c.rung, case.3, case.0)
 
 
 def _test_the_slow_time_follows_the_last_upgrades():
@@ -727,12 +851,13 @@ def newest(c: Controller, n: int) -> list[int]:
 
 def _test_fast_upgrades_that_end_together_do_not_push_slow_ones_out_of_view():
     """40 at once in a window that never closes, at a campaign estimate
-    of 600 s: the slow time is taken from the last 80 upgrade times, two
-    rounds. 40 devices start together. s0 and s1, of 100 s, take 300 s,
-    1800 s at the campaign's estimate, and their times count first. The
-    fast devices, of 600 s, take 590 s each, and their times count in
-    batches of 38, 2 and then the rest. While both slow times are among the
-    last 80, the slow time stays 1800 s: after 60 fast times, and after
+    of 600 s: the controller keeps the last 80 upgrade times, two rounds
+    at max-concurrency, and the slow time is their second longest. 40
+    devices start together. s0 and s1, of 100 s, take 300 s, 1800 s at
+    the campaign's estimate, and their times count first. The fast
+    devices, of 600 s, take 590 s each, and their times count in batches
+    of 38, 2 and then the rest. While both slow times are among the last
+    80, the slow time stays 1800 s: after 60 fast times, and after
     78. Taken from only the last 50 times, the ones of the pace at a
     target of 40, it would fall to 590 s. After 79 fast times, s0's time
     is no longer among the last 80, and the slow time falls to 590 s."""
@@ -757,27 +882,76 @@ def _test_fast_upgrades_that_end_together_do_not_push_slow_ones_out_of_view():
                             "{case.0} fast, the last 50 times")
 
 
+def _test_the_runs_ahead_of_a_plan_see_one_slow_time_at_every_concurrency():
+    """Target 20 and up to 64, in a window that never closes, at a
+    campaign estimate of 600 s. The controller keeps the last 128 upgrade
+    times, two rounds at max-concurrency, and a run starts as if they
+    took 600 s. A step at 64 starts s0 and s1, of 100 s, and f0 to f59,
+    of 600 s. s0 and s1 take 300 s, 1800 s at the campaign's estimate.
+    Copies of the controller step at 20, 40 and 64, as the runs ahead of
+    a plan do, and each takes the slow time from all 128 kept times:
+    their 98th percentile is the third longest, 600 s, and the pace, the
+    mean of the last 25 times, (23 * 600 + 2 * 1800) / 25 = 696 s, is
+    longer. So the slow time is 696 s at each concurrency. Then f0 to f59
+    take 590 s, and each copy steps again at its concurrency: the pace is
+    590 s, and the slow time the third longest of the 128 times, 600 s.
+    Taken over two rounds at the concurrency of the step, the slow time
+    would be 1800 s at 20 and at 40 after the first step, and 590 s at 20
+    and 1800 s at 40 after the second."""
+    devs = [("s0", 100, "w"), ("s1", 100, "w")] + devices("f", 60, 600, "w")
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 20, 64, rung=64)
+    testing.assertEqual(len(c.step(0, 64).0), 62)
+    testing.assertEqual(len(c.took_s), 128)
+    c.report("s0", "succeeded", 300)
+    c.report("s1", "succeeded", 300)
+    for conc in [20, 40, 64]:
+        x = c.copy()
+        x.step(300, conc)
+        testing.assertEqual((x.observed_s, x.slow_s), (696, 696), "the step at 300 at {conc}")
+        for i in range(60):
+            x.report("f{i}", "succeeded", 590)
+        x.step(590, conc)
+        testing.assertEqual((x.observed_s, x.slow_s), (590, 600), "the step at 590 at {conc}")
+
+
 def _test_the_upgrade_times_kept_follow_the_max_concurrency():
-    """One at a time and up to 32: the controller keeps the last 64
-    upgrade times, two rounds at max-concurrency. Three upgrades take 610,
-    620 and 630 s. New limits of up to 16 keep the newest 50 times: the
-    three and 47 of the 600 s that the run started from. Limits of up to
-    40 then keep 80: those 50, and 30 older ones at the pace, 630 s."""
+    """One at a time and up to 49: the controller keeps the last 98
+    upgrade times, two rounds at max-concurrency, and a run starts as if
+    they took 600 s. Three upgrades take 1800, 1500 and 630 s. The pace
+    is the last time, 630 s, and the slow time the 98th percentile of the
+    98 kept times, the second longest, 1500 s. New limits keep the newest
+    times, and take the slow time from them again. Up to 50 keeps 100: the
+    98 and two older ones at the pace. The 98th percentile of 100 times
+    is the third longest, so the slow time falls to 630 s. Up to 16 then
+    keeps the newest 50: the three and 47 of the 600 s, and the slow time
+    is 1500 s again. Up to 40 keeps 80: those 50, and 30 older ones at the
+    pace."""
     wins = [("w", 0, fleet_ctl.OPEN_END)]
     devs = devices("d", 4, 600, "w")
-    c = controller(wins, devs, 1, 32)
-    testing.assertEqual(c.took_s, [600 for _k in range(64)])
+    c = controller(wins, devs, 1, 49)
+    testing.assertEqual(c.took_s, [600 for _k in range(98)])
     c.decide(0)
     t = 0
-    for k in range(3):
-        t += 610 + 10 * k
+    k = 0
+    for took in [1800, 1500, 630]:
+        t += took
         c.report("d{k}", "succeeded", t)
         c.decide(t)
-    c.configure(wins, devs, 1, 16, False, 0, 600)
-    testing.assertEqual(c.took_s, [600 for _k in range(47)] + [610, 620, 630])
-    c.configure(wins, devs, 1, 40, False, 0, 600)
-    testing.assertEqual(c.took_s, [630 for _k in range(30)] + [600 for _k in range(47)]
-                        + [610, 620, 630])
+        k += 1
+    testing.assertEqual((len(c.took_s), newest(c, 3), c.observed_s, c.slow_s),
+                        (98, [630, 1500, 1800], 630, 1500), "up to 49")
+    three = [1800, 1500, 630]
+    # (the new max-concurrency, the times it keeps, the oldest first, and
+    # the slow time)
+    cases: list[(int, list[int], int)] = [
+        (50, [630, 630] + [600 for _k in range(95)] + three, 630),
+        (16, [600 for _k in range(47)] + three, 1500),
+        (40, [630 for _k in range(30)] + [600 for _k in range(47)] + three, 1500),
+    ]
+    for case in cases:
+        c.configure(wins, devs, 1, case.0, False, 0, 600)
+        testing.assertEqual((c.took_s, c.observed_s, c.slow_s), (case.1, 630, case.2),
+                            "up to {case.0}")
 
 
 def _test_a_close_margin_longer_than_every_window_stops_the_campaign_with_an_alarm():
@@ -795,8 +969,8 @@ def _test_a_close_margin_longer_than_every_window_stops_the_campaign_with_an_ala
     cases: list[(int, list[str], list[str])] = [
         (150, ["d0"],
          ["2 device(s) fit in no window: 150 percent of their slow time, 1400 s at the "
-          + "campaign's estimate, is longer than every window left in their schedule: "
-          + "d1, d2"]),
+          + "campaign's estimate, is longer than the time left in every window of their "
+          + "schedule: d1, d2"]),
         (140, ["d0", "d1", "d2"], []),
     ]
     for case in cases:
@@ -811,20 +985,54 @@ def _test_a_close_margin_longer_than_every_window_stops_the_campaign_with_an_ala
         testing.assertEqual(at_day, case.2, str(case.0))
 
 
+def _test_the_plan_says_that_devices_fit_in_no_window_when_the_slow_upgrade_counts():
+    """One device at a time, at a campaign estimate of 600 s. d0 takes
+    1400 s at the campaign's estimate, and its report counts at its end.
+    The plan of that decision takes the slow time of the reports that
+    count, 1400 s, and says that d1 and d2 fit in no window: they need
+    one and a half times their slow time, and the time left in each window
+    of their schedule is shorter. With a 1000 s window every day for
+    three days, and devices of 300 s, d0 takes 700 s: d1 and d2 need
+    1050 s, more than a window. With one window from 0 to a deadline at
+    3000, and devices of 600 s, d0 takes 1400 s: d1 and d2 need 2100 s,
+    less than the window, but more than the 1600 s left at 1400."""
+    alarm = ("2 device(s) fit in no window: 150 percent of their slow time, 1400 s at the "
+             + "campaign's estimate, is longer than the time left in every window of their "
+             + "schedule: d1, d2")
+    # (the windows, whether they end at a deadline, the estimate of the
+    # devices, how long d0 takes, the time of the first decision whose
+    # plan says that devices fit in no window)
+    cases: list[(list[(str, int, int)], bool, int, int, int)] = [
+        (daily("w", 0, 1000, 3), False, 300, 700, 700),
+        ([("w", 0, 3000)], True, 600, 1400, 1400),
+    ]
+    for case in cases:
+        c = controller(case.0, devices("d", 3, case.2, "w"), 1, 1, case.1)
+        first = (-1, "")
+        for d in sim.drive(c, 0, {"d0": case.3}, 3 * DAY):
+            for a in d.alarms:
+                if first.0 < 0 and "fit in no window" in a:
+                    first = (d.t, a)
+        testing.assertEqual(first, (case.4, alarm), str(case.0))
+
+
 def _test_one_long_upgrade_does_not_stop_the_campaign():
     """nights(), and d13, the first device of the second night, takes
     1700 s, more than two thirds of a night: one and a half times it is
     longer than the night. The slow time is the second longest of the
-    last 50 upgrade times, or the pace when that is longer. So this one
-    upgrade moves it only through the pace, the mean of the last ten
-    upgrades, to 710 s. The slow time stays below two thirds of a night,
-    and no plan says that a device fits in no window. d13 holds its slot:
-    at 00:20:02 the plan expects it to end at 00:22:01, and keeps that
-    slot for d36, the last device promised to the second night. d13 is
-    late then, and the next device is done at 00:30:03, when the night
-    has no room for d36 left. So with room up to 32, every device starts,
-    one promise breaks, and no device is in flight when its window
-    closes."""
+    last 64 upgrade times, two rounds at max-concurrency, or the pace when
+    that is longer. So this one upgrade moves it only through the pace,
+    the mean of the last ten upgrades, to 710 s. The slow time stays below
+    two thirds of a night, and no plan says that a device fits in no
+    window. d13 holds its slot.
+    It is late at 00:12:01, and the plan expects it to end one upgrade
+    later, at 00:22:01, and rises to 9: then d36, the last device
+    promised to the second night, can take d13's slot. d13 is late again
+    at 00:24:02, and the plan says that d36 will miss the night. When
+    d13's 1700 s count, at 00:28:21, the night has no room for d36 left:
+    699 s, and d36 needs one and a half times 710 s. So with room up to
+    32, every device starts, one promise breaks, and no device is in
+    flight when its window closes."""
     cp = nights()
     o = run(cp, cp.maxc, {"d13": 1700})
     room = "d13 takes 1700 s, up to {cp.maxc}"
@@ -1567,8 +1775,9 @@ class Outcome(object):
     not start. decisions counts the decisions, alarmed the decisions whose
     plan says that devices will miss their window, and unfit the decisions
     whose plan says that devices fit in no window. peak is the most
-    devices in flight after a decision, and slowest the longest slow time
-    after a decision."""
+    devices in flight after a decision, slowest the longest slow time
+    after a decision, and slow_at the slow time after each decision, by
+    the time of the decision."""
     cpath: list[(int, int)]
     broken: int
     overran: int
@@ -1578,9 +1787,11 @@ class Outcome(object):
     unfit: int
     peak: int
     slowest: int
+    slow_at: dict[int, int]
 
     def __init__(self, cpath: list[(int, int)], broken: int, overran: int, unstarted: int,
-                 decisions: int, alarmed: int, unfit: int, peak: int, slowest: int):
+                 decisions: int, alarmed: int, unfit: int, peak: int, slowest: int,
+                 slow_at: dict[int, int]):
         self.cpath = cpath
         self.broken = broken
         self.overran = overran
@@ -1590,6 +1801,7 @@ class Outcome(object):
         self.unfit = unfit
         self.peak = peak
         self.slowest = slowest
+        self.slow_at = slow_at
 
     def top(self) -> int:
         """The highest concurrency of the run."""
@@ -1626,6 +1838,7 @@ def run(cp: Campaign, maxc: int, durations: dict[str, int]) -> Outcome:
     unfit = 0
     peak = 0
     slowest = 0
+    slow_at: dict[int, int] = {}
     for d in ds:
         if len(cpath) == 0 or cpath[len(cpath) - 1].1 != d.c:
             cpath.append((d.t, d.c))
@@ -1635,8 +1848,9 @@ def run(cp: Campaign, maxc: int, durations: dict[str, int]) -> Outcome:
             unfit += 1
         peak = fleet_ctl.imax(peak, d.flying)
         slowest = fleet_ctl.imax(slowest, d.slow)
+        slow_at[d.t] = d.slow
     return Outcome(cpath, broken, overran, len(cp.devs) - len(starts), len(ds), alarmed, unfit,
-                   peak, slowest)
+                   peak, slowest, slow_at)
 
 
 def out_of_bounds(o: Outcome, room: str, most: int, broken: int, overran: int) -> list[str]:
@@ -1844,16 +2058,23 @@ def _test_a_change_of_pace_raises_the_concurrency_in_time():
     ])
 
 
+def every_tenth(n: int) -> dict[str, int]:
+    """Upgrade times where every tenth of n devices, d9, d19 and so on,
+    takes 1500 s, 2.5 times its estimate of 600 s."""
+    out: dict[str, int] = {}
+    for i in range(n):
+        if i % 10 == 9:
+            out["d{i}"] = 1500
+    return out
+
+
 def _test_a_heavy_tail_raises_the_concurrency():
     """Some devices take 1500 s, 2.5 times their estimate. While two such
-    upgrades are among the last 50 times, the slow time is 1500 s, and a
-    night starts devices only in its first 150 s. So the concurrency must
-    rise. The ramp follows the rise only as devices are done, and few are
-    done between the rise and the next night."""
-    every10: dict[str, int] = {}
-    for i in range(79):
-        if i % 10 == 9:
-            every10["d{i}"] = 1500
+    upgrades are among the kept times, the last 50 held at 8 and the last
+    64 up to 32, the slow time is 1500 s, and a night starts devices only
+    in its first 150 s. So the concurrency must rise. The ramp follows
+    the rise only as devices are done, and few are done between the rise
+    and the next night."""
     needs_a_rise(nights(), [
         # d2 holds a slot of the third round of the first night, which
         # starts 7 devices, and d12 misses the night. When d20's 1500 s
@@ -1869,30 +2090,58 @@ def _test_a_heavy_tail_raises_the_concurrency():
         # 1500 s. d19 done takes the ramp to 16, and the two devices done
         # after it that night to 22: the third night starts 22 devices,
         # and 2 miss it at any concurrency.
-        ("every tenth device takes 1500 s", every10, 2, 1),
+        ("every tenth device takes 1500 s", every_tenth(79), 2, 1),
     ])
+
+
+def _test_the_plan_does_not_rise_to_max_concurrency_to_forget_a_slow_upgrade():
+    """nights(), every tenth device takes 1500 s, at max-concurrency 50
+    and at 64. The controller keeps the last 100 and the last 128 upgrade
+    times. The 98th percentile of either is the third longest, and the
+    slow time is that, or the pace when the pace is longer. The campaign
+    has 79 devices, so both keep every time of the run, and the slow time
+    after each decision is the same at 50 and at 64. d9's and d19's
+    1500 s count at 00:45:03 of the first night and at 00:25:01 of the
+    second, and the slow time stays at the pace. It becomes 1500 s when
+    the third, d29's, counts, at 00:35:02. Each run ahead of a plan takes
+    the slow time from all the kept times, whatever its concurrency, so a
+    run at max-concurrency forgets no slow upgrade that a run at a lower
+    concurrency sees, and the plan gains nothing by a rise to
+    max-concurrency. So at 50 and at 64 the concurrency must take the
+    same path, and stay below 50. If a run took the slow time over two
+    rounds at its own concurrency, a run at 13 would see the second
+    longest of the last 50 times, and a run at 50 or more the third
+    longest of the last 100 times or more. When d19's time counts, the
+    runs at 50 and more would forget it and break fewer promises, and the
+    plan would rise to 50, up to 50 and up to 64 alike."""
+    cp = nights()
+    outcomes = [run(cp, maxc, every_tenth(79)) for maxc in [50, 64]]
+    testing.assertEqual(outcomes[1].slow_at, outcomes[0].slow_at, "the slow times up to 50 and 64")
+    testing.assertEqual(outcomes[0].slowest, 1500, "the longest slow time")
+    testing.assertEqual(outcomes[1].cpath, outcomes[0].cpath,
+                        "up to 64 the concurrency goes {outcomes[1].changes()}; up to 50 it "
+                        + "goes {outcomes[0].changes()}")
+    testing.assertTrue(outcomes[0].top() < 50,
+                       "up to 50 the concurrency goes {outcomes[0].changes()}, to 50")
 
 
 def _test_a_heavy_tail_runs_no_device_past_the_close():
     """60 devices of 600 s, 16 at once and up to 32, and a 4000 s window,
     to 01:06:40, every night. Every tenth device takes 1500 s, 2.5 times
-    its estimate. The slow time is the second longest of the last 50
-    upgrade times, or the pace when that is longer, so the tail raises it
-    only once it has shown twice. One slow upgrade alone moves it only
-    through the pace, and the night's last starts could then run past the
-    close. Here the tail shows twice before them: d9 and d19 start in the
-    round of 16 at 00:20:02, and when their 1500 s count, at 00:45:03, the
-    slow time is 1500 s. The night starts no more devices: each would need
-    2250 s. d29 and d39, which started before then, end by 01:05:04.
+    its estimate. The slow time is the second longest of the last 64
+    upgrade times, two rounds at max-concurrency, or the pace when that is
+    longer, so the tail raises it only once it has shown twice. One slow
+    upgrade alone moves it only through the pace, and the night's last
+    starts could then run past the close. Here the tail shows twice before
+    them: d9 and d19 start in the round of 16 at 00:20:02, and when their
+    1500 s count, at 00:45:03, the slow time is 1500 s. The night starts
+    no more devices: each would need 2250 s. d29 and d39, which started
+    before then, end by 01:05:04.
     Every device must start, none may be in flight when its window
     closes, and the concurrency may not go above 32."""
     cp = Campaign(daily("night", 0, 4000, 3), devices("d", 60, 600, "night"), 16, 32, 1, 600,
                   3 * DAY)
-    tail: dict[str, int] = {}
-    for i in range(60):
-        if i % 10 == 9:
-            tail["d{i}"] = 1500
-    o = run(cp, cp.maxc, tail)
+    o = run(cp, cp.maxc, every_tenth(60))
     problems = out_of_bounds(o, "every tenth device takes 1500 s", cp.maxc, len(cp.devs), 0)
     testing.assertTrue(len(problems) == 0, "\n" + "\n".join(problems))
 

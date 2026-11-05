@@ -119,10 +119,10 @@ def pace_samples(target: int) -> int:
     return imax(1, target + target // 4)
 
 
-def slow_samples(c: int) -> int:
+def slow_samples(maxc: int) -> int:
     """How many of the last upgrades the slow time is taken from at
-    concurrency c: two rounds, and at least 50."""
-    return imax(50, 2 * c)
+    max-concurrency maxc: two rounds, and at least 50."""
+    return imax(50, 2 * maxc)
 
 
 def slow_time(took: list[int], pace: int) -> int:
@@ -194,11 +194,12 @@ class Controller(object):
     debounce after it came. A step marks the released devices whose final
     report counts as done at the time of the report, or at the step when
     the report came before the release, and grows the ramp: one device at
-    first, and three more for each device done, up to the concurrency. So
-    the ramp takes four times as many devices each round, but it does not
-    wait for a round to end, and when the concurrency rises, the ramp
-    follows it as devices finish. Then it starts waiting devices, window by
-    window in the order the windows open, while fewer devices than the
+    first, and three more for each device that is done without a failure,
+    up to the concurrency. So the ramp takes four times as many devices
+    each round, but it does not wait for a round to end, and when the
+    concurrency rises, the ramp follows it as devices finish. A failed
+    upgrade does not grow the ramp. Then it starts waiting devices, window
+    by window in the order the windows open, while fewer devices than the
     ramp are in flight. A window starts only a device that is ready and
     that has its close margin left before the window closes: its slow
     time times the close margin, one and a half by default. A device that
@@ -244,12 +245,14 @@ class Controller(object):
     upgrade.
 
     The slow time is the 98th percentile of the times of the last
-    upgrades, two rounds at the concurrency and at least 50, or the pace
+    upgrades, two rounds at max-concurrency and at least 50, or the pace
     when the pace is longer. A device's slow time is its estimate at that
     slow time. So the margin a window keeps before its close grows when
-    slow upgrades show, one upgrade far longer than the others moves it
-    only through the pace, and the fast upgrades of a round that end
-    together do not push the slow ones of the round before out of view.
+    slow upgrades show, and one upgrade far longer than the others moves
+    it only through the pace. The fast upgrades of a round that end
+    together do not push the slow ones of the round before out of view,
+    and the slow time does not depend on the concurrency, so a plan gains
+    nothing by a higher one.
 
     A plan runs the step ahead, from the current state, every upgrade
     ending when it is expected to, until nothing more starts. During a
@@ -385,8 +388,7 @@ class Controller(object):
     # The last slow_samples(maxc) upgrades' times, at the scale of the
     # campaign's estimate, the place of the next one, and the sum of the
     # last pace_samples() of them. The observed pace is their mean, and
-    # the slow time is taken from the last slow_samples() at the
-    # concurrency.
+    # the slow time is taken from all of them.
     took_s: list[int]
     took_at: int
     took_sum: int
@@ -468,9 +470,9 @@ class Controller(object):
         the priority of each device, per group whether it spreads and its
         min-separation in seconds, and the close margin in percent of the
         slow time. A group without a separation packs with none. New
-        limits start the concurrency over at the target. A new target
-        keeps the last upgrade times: the pace becomes the mean of the
-        newest of them at the new target, and the slow time stays."""
+        limits start the concurrency over at the target, and the ramp at
+        most at the target. New limits keep the last upgrade times, and
+        the pace and the slow time are taken from them again."""
         m = imax(target, maxc)
         e = imax(1, estimate_s)
         margin = imax(100, close_margin)
@@ -485,13 +487,14 @@ class Controller(object):
         retarget = target != self.target
         if retarget or m != self.maxc:
             self.c = target
+            self.rung = imin(self.rung, target)
         if e != self.estimate_s:
             # Keep the observed pace at the scale of the new estimate.
             for k in range(len(self.took_s)):
                 self.took_s[k] = imax(1, self.took_s[k] * e // self.estimate_s)
             self.took_sum = self.pace_sum()
             self.observed_s = imax(1, self.took_sum // self.pace_count())
-            self.take_slow(self.c)
+            self.take_slow()
             self.estimate_s = e
         self.current = windows
         self.devices = devices
@@ -559,14 +562,11 @@ class Controller(object):
         self.took_at = 0
         self.took_sum = self.pace_sum()
         self.observed_s = imax(1, self.took_sum // self.pace_count())
-        self.take_slow(self.c)
+        self.take_slow()
 
-    def take_slow(self, c: int) -> None:
-        """Take the slow time from the last slow_samples(c) upgrade times,
-        or all of them when fewer are kept."""
-        n = len(self.took_s)
-        last = [self.took_s[(self.took_at - 1 - j + n) % n] for j in range(imin(slow_samples(c), n))]
-        self.slow_s = slow_time(last, self.observed_s)
+    def take_slow(self) -> None:
+        """Take the slow time from the kept upgrade times."""
+        self.slow_s = slow_time(self.took_s, self.observed_s)
 
     def pace_count(self) -> int:
         """How many of the kept upgrade times the pace is the mean of."""
@@ -989,14 +989,14 @@ class Controller(object):
             return n - 1
         return n
 
-    def step(self, t: int, c: int) -> (list[str], int, bool):
-        """Decide at time t at concurrency c: mark the devices that are
-        done, grow the ramp, start what fits, and say when to decide next.
-        Returns the started devices, the wake and whether every device is
-        done."""
+    def count(self, t: int) -> int:
+        """Take the reports that count by time t: mark the devices that
+        are done, take the pace and the slow time again, and look again at
+        the devices that waited for t. Returns how many devices are done
+        without a failure."""
         slow = self.slow_s
         sampled = False
-        done_before = self.devices_done
+        succeeded = 0
         # The reports that count by now, in the order they came.
         due_reports: list[(int, str)] = []
         for name in self.reported:
@@ -1030,21 +1030,30 @@ class Controller(object):
             if name in self.flying:
                 self.flying.discard(name)
                 self.devices_done += 1
+                if not is_failure(self.final_status.get(name)):
+                    succeeded += 1
             self.wake_members(name)
 
         while len(self.timed) > 0 and self.timed[0].0 <= t:
             self.look_again(heap_pop(self.timed).1)
 
         if sampled:
-            self.take_slow(c)
+            self.take_slow()
         if self.slow_s < slow:
             # Devices that did not fit may fit now.
             self.qcur = [0 for _w in self.windows]
             self.ecur = [0 for _w in self.windows]
             self.pcur = [0 for _w in self.windows]
+        return succeeded
 
+    def step(self, t: int, c: int) -> (list[str], int, bool):
+        """Decide at time t at concurrency c: take the reports that count,
+        grow the ramp, start what fits, and say when to decide next.
+        Returns the started devices, the wake and whether every device is
+        done."""
+        succeeded = self.count(t)
         if self.rung < c:
-            self.rung = imin(c, self.rung + 3 * (self.devices_done - done_before))
+            self.rung = imin(c, self.rung + 3 * succeeded)
 
         self.move_promises(t)
         started: list[str] = []
@@ -1474,32 +1483,42 @@ class Controller(object):
             else:
                 alarms.append("{len(unplaced)} device(s) are in no window yet: "
                               + names_text(unplaced))
-        short = self.windows_too_short(missed + unplaced, t)
+        # Why devices start in no window, at the slow time of the reports
+        # that count by now, as the run ahead had it.
+        s.count(t)
+        short = s.windows_too_short(missed + unplaced, t)
         if len(short) > 0:
             alarms.append("{len(short)} device(s) fit in no window: {self.close_margin} percent "
-                          + "of their slow time, {self.slow_s} s at the campaign's estimate, is "
-                          + "longer than every window left in their schedule: "
+                          + "of their slow time, {s.slow_s} s at the campaign's estimate, is "
+                          + "longer than the time left in every window of their schedule: "
                           + names_text(short))
         return Plan(c, starts, held, alarms)
 
     def windows_too_short(self, names: list[str], t: int) -> list[str]:
-        """The devices in names whose close margin is longer than every
-        window of their schedule that has not closed. They start in no
-        window until the slow time falls, which only upgrades of other
-        devices can bring about, or until the windows or the close margin
-        change."""
+        """The devices in names whose close margin is longer than the time
+        left from t in every window of their schedule that has not closed,
+        when such a window is left and none of them stays open. They start
+        in no window until the slow time falls, which only upgrades of
+        other devices can bring about, or until the windows or the close
+        margin change."""
+        # Per schedule, the most time left in one of its windows, or -1
+        # when none is left.
+        most: dict[str, int] = {}
         out: list[str] = []
         for name in names:
-            need = self.slow(name) * self.close_margin
-            left = False
-            fits = False
-            for j in self.windows_of.get_def(name, []):
-                w = self.windows[j]
-                if w.2 > t:
-                    left = True
-                    if w.2 == OPEN_END or (w.2 - w.1) * 100 >= need:
-                        fits = True
-            if left and not fits:
+            sched = self.schedule_of.get_def(name, "")
+            left = most.get_def(sched, -2)
+            if left == -2:
+                left = -1
+                for j in self.windows_of.get_def(name, []):
+                    w = self.windows[j]
+                    if w.2 == OPEN_END:
+                        left = OPEN_END
+                    elif w.2 > t:
+                        left = imax(left, w.2 - imax(w.1, t))
+                most[sched] = left
+            if left >= 0 and left != OPEN_END \
+               and left * 100 < self.slow(name) * self.close_margin:
                 out.append(name)
         return out
 
