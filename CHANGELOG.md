@@ -182,6 +182,29 @@
   upgrade that took no time. Before, a few such devices made the campaign
   expect every upgrade to take seconds, and the plan put every device in the
   first windows. [#740]
+- A campaign no longer raises its concurrency for good when a device
+  reports a few seconds late or upgrade times scatter around the estimate.
+  The expected pace is the mean of the last upgrades, a round and a
+  quarter at `target-concurrency`, and a device is late only a fifth of
+  its upgrade after it was expected to end. Before, one late device could
+  raise the concurrency for the rest of the campaign and give alarms.
+  [#746]
+- A window starts a device only while its close margin is left before the
+  window closes, by default one and a half times the device's slow time.
+  The slow time is the 98th percentile of the last upgrade times, two
+  rounds at `max-concurrency` and at least 50, so the margin grows when
+  slow upgrades show, and one slow upgrade alone moves it only through the
+  mean of the last upgrades. Set the margin with `close-margin` on the
+  campaign. Before, a fifth of the expected duration was the only margin,
+  and upgrades in a heavy tail ran past the close. A device whose margin
+  is longer than the time left in every window of its schedule does not
+  start, and the plan says so. [#746]
+- The ramp lets three more devices start for each device that is done
+  without a failure, up to the concurrency, instead of doubling once a
+  whole round has finished. A round now takes four times as many devices,
+  the starts spread out as devices finish, and when the plan raises the
+  concurrency, the extra devices start as devices finish instead of all
+  at once. Failed upgrades no longer grow the ramp. [#746]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`: `os`, `version`, `model` and
   `serial-number`. It is absent until the device has connected. A
@@ -398,6 +421,7 @@ next. Give it a spin. We’d love to hear what you think.
 [#737]: https://github.com/stratoweave/stratoweave/pull/737
 [#740]: https://github.com/stratoweave/stratoweave/pull/740
 [#741]: https://github.com/stratoweave/stratoweave/pull/741
+[#746]: https://github.com/stratoweave/stratoweave/pull/746
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
