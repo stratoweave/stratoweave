@@ -61,8 +61,10 @@ Then:
 
 A campaign shows each CE's upgrade stage, why a failed run stopped, and its
 pre-check and post-check verdicts in `just state`.
-The detail carries what the check saw, "1/1 sessions established, 3 routes
-advertised"; the device is only read while a check runs.
+The detail carries what each check saw, "bgp: 1/1 sessions established, 3
+routes advertised; interfaces: 4 interfaces up/up; ospf: no OSPF
+neighbors"; the flotilla reads the
+device every 30 s, and every 2 s while a check runs.
 `just break-link ce1` takes ce1's WAN down and the session drops within
 15 s, so a campaign started now is refused by the pre-check, with the
 neighbor in the detail; `just heal-link ce1` brings it back.

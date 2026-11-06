@@ -91,8 +91,8 @@ device itself. A check added during a run counts from the next run.
 `remove_precheck` and `remove_postcheck` take a check out, also during a run.
 An answer that arrives after its round has ended is ignored.
 
-The BGP device-health check in `fleetmgr/src/flotilla/rfs.act` is a working
-example.
+The device-health checks in `fleetmgr/src/flotilla/rfs.act`, `bgp`,
+`interfaces` and `ospf`, are working examples.
 
 ## State
 
