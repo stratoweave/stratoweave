@@ -3,6 +3,7 @@ import net
 import std.xml as xml
 
 import netconf
+import netconf.events as ncevents
 import ssh
 import ssh.pipe as sshpipe
 
@@ -15,6 +16,7 @@ import ietf_yang_library as yl
 import monitoring
 import northbound
 import yp
+import yp.events as ypevents
 import yp_ttt
 
 
@@ -37,6 +39,11 @@ SERVER_MODULES: list[(name: str, namespace: str, revision: ?str, implemented: bo
     (name="ietf-yang-schema-mount", namespace="urn:ietf:params:xml:ns:yang:ietf-yang-schema-mount", revision="2019-01-14", implemented=False, features=[]),
 ]
 
+# Classic event notifications (RFC 5277): create-subscription plus interleave —
+# this server keeps accepting RPCs on a subscribed session.
+CAP_NOTIFICATION_1_0 = "urn:ietf:params:netconf:capability:notification:1.0"
+CAP_INTERLEAVE_1_0 = "urn:ietf:params:netconf:capability:interleave:1.0"
+
 
 def module_inventory(top_oper_schema: yschema.DRoot) -> monitoring.ModuleInventory:
     """The modules of a NETCONF server for top_oper_schema: those of
@@ -45,9 +52,11 @@ def module_inventory(top_oper_schema: yschema.DRoot) -> monitoring.ModuleInvento
 
 
 def build_capabilities(inventory: monitoring.ModuleInventory) -> list[str]:
-    """The <hello> capabilities: NETCONF base 1.0/1.1, writable-running, and
-    yang-library:1.1, see monitoring.module_capabilities."""
-    return [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1, CAP_WRITABLE_RUNNING] + monitoring.module_capabilities(inventory.schema, inventory.yl_view)
+    """The <hello> capabilities: NETCONF base 1.0/1.1, writable-running,
+    notification and interleave, and yang-library:1.1, see
+    monitoring.module_capabilities."""
+    return [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1, CAP_WRITABLE_RUNNING,
+            CAP_NOTIFICATION_1_0, CAP_INTERLEAVE_1_0] + monitoring.module_capabilities(inventory.schema, inventory.yl_view)
 
 
 actor StaticAuthChecker(expected_user: str, expected_password: str, log_handler: ?logging.Handler=None):
@@ -79,7 +88,7 @@ actor StaticAuthChecker(expected_user: str, expected_password: str, log_handler:
             respond(False)
 
 
-actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRoot, top_oper_schema: yschema.DRoot, cfs: ttt.Layer, inventory: monitoring.ModuleInventory, on_close: ?action(NetconfSession) -> None=None, session_seq: int=0):
+actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRoot, top_oper_schema: yschema.DRoot, cfs: ttt.Layer, inventory: monitoring.ModuleInventory, on_close: ?action(NetconfSession) -> None=None, session_seq: int=0, event_hub: ?ypevents.EventStreamHub=None):
     """A single NETCONF session driving the configuration tree.
 
     Wraps a netconf.Server bound to `pipe` (one transport channel) and handles
@@ -109,6 +118,7 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
     """
     _log = logging.Logger(log_handler)
     var service: ?yp_ttt.TttSubscriptionService = None
+    var notif_service: ?ncevents.NetconfEventService = None
 
     def _extract_filter(op: xml.Node) -> (?xml.Node, ?str):
         for child in op.children:
@@ -165,10 +175,27 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
 
         if yp.is_subscription_rpc(op.tag):
             sv = service
-            if sv is not None:
+            nsv0 = notif_service
+            if nsv0 is not None and nsv0.active() and op.tag == "establish-subscription":
+                # RFC 8640 section 3: one session must not mix RFC 5277 and
+                # RFC 8639 subscriptions.
+                s.send_error(message_id, "operation-not-supported",
+                    "this session has an RFC 5277 subscription; RFC 8639 subscriptions cannot share it")
+            elif sv is not None:
                 sv.handle_rpc(message_id, op)
             else:
                 s.send_error(message_id, "operation-failed", "subscription service not ready")
+        elif yp.is_create_subscription(op.tag):
+            nsv = notif_service
+            sv0 = service
+            if sv0 is not None and sv0.has_subscriptions():
+                # RFC 8640 section 3, the other direction.
+                s.send_error(message_id, "operation-not-supported",
+                    "this session has RFC 8639 subscriptions; create-subscription cannot share it")
+            elif nsv is not None:
+                nsv.handle_rpc(message_id, op)
+            else:
+                s.send_error(message_id, "operation-failed", "notification service not ready")
         elif op.tag == "get" or op.tag == "get-config":
             if op.tag == "get-config" and _datastore(op, "source") != "running":
                 s.send_error(message_id, "operation-not-supported", "Only the running datastore is supported")
@@ -228,6 +255,9 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
             sv = service
             if sv is not None:
                 sv.shutdown()
+            nsv = notif_service
+            if nsv is not None:
+                nsv.shutdown()
             cb = on_close
             if cb is not None:
                 cb(self)
@@ -236,6 +266,9 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
     # owner_prefix must be unique per session: TTT keys subscriptions by owner id,
     # so sessions sharing this cfs must not collide on "yp-<sub_id>".
     service = yp_ttt.TttSubscriptionService(server, cfs, top_oper_schema, owner_prefix="yp-" + str(session_seq), log_handler=log_handler)
+    _hub = event_hub
+    if _hub is not None:
+        notif_service = ncevents.NetconfEventService(server, _hub, log_handler=log_handler)
 
 
 actor NetconfServer(
@@ -269,6 +302,9 @@ actor NetconfServer(
     _log = logging.Logger(log_handler)
     _inventory = module_inventory(top_oper_schema)
     _auth = auth_check if auth_check is not None else StaticAuthChecker(username, password, log_handler).check
+    # One hub for the whole server: app code publishes events here and every
+    # session with an active create-subscription receives the matching ones.
+    _event_hub = ypevents.EventStreamHub(log_handler)
     var _sessions: list[NetconfSession] = []
     var _session_seq: int = 0
     var listener: ?sshpipe.SshPipeListener = None
@@ -297,7 +333,7 @@ actor NetconfServer(
     def _on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
         _session_seq += 1
         _log.info("NETCONF session accepted", {"session": _session_seq})
-        _sessions.append(NetconfSession(p, log_handler, top_schema, top_oper_schema, cfs, _inventory, on_close=_session_closed, session_seq=_session_seq))
+        _sessions.append(NetconfSession(p, log_handler, top_schema, top_oper_schema, cfs, _inventory, on_close=_session_closed, session_seq=_session_seq, event_hub=_event_hub))
 
     listener = sshpipe.SshPipeListener(
         listen_cap,
@@ -316,6 +352,11 @@ actor NetconfServer(
         if l is not None:
             return int(l.bound_port())
         raise ValueError("NETCONF server is not listening")
+
+    def event_hub() -> ypevents.EventStreamHub:
+        """The server's event stream hub: publish YANG notifications here and
+        every subscribed NETCONF session receives the matching ones."""
+        return _event_hub
 
     def active_sessions() -> int:
         return len(_sessions)
