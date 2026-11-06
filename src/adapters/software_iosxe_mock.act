@@ -65,15 +65,35 @@ FAILURE_COMMIT = "commit-failed"
 FAILURE_REVERTS = "reverts"
 FAILURE_BGP_DOWN = "bgp-down"
 FAILURE_BGP_LOST = "bgp-lost"
+FAILURE_INTERFACE_LOST = "interface-lost"
+FAILURE_OSPF_LOST = "ospf-lost"
 FAILURES = [FAILURE_NONE, FAILURE_DOWNLOAD, FAILURE_ADD,
             FAILURE_ACTIVATE_REFUSED, FAILURE_COMMIT, FAILURE_REVERTS,
-            FAILURE_BGP_DOWN, FAILURE_BGP_LOST]
+            FAILURE_BGP_DOWN, FAILURE_BGP_LOST, FAILURE_INTERFACE_LOST,
+            FAILURE_OSPF_LOST]
 
 NS_BGP_OPER = "http://cisco.com/ns/yang/Cisco-IOS-XE-bgp-oper"
 # The mock's one BGP neighbor and the prefixes it exchanges while up.
 BGP_NEIGHBOR = "10.0.0.1"
 BGP_ADVERTISED = 3
 BGP_RECEIVED = 4
+
+NS_INTERFACES_OPER = "http://cisco.com/ns/yang/Cisco-IOS-XE-interfaces-oper"
+# The mock's interfaces as (name, admin up); GigabitEthernet0/0/2 is shut.
+INTERFACES = [("GigabitEthernet0/0/0", True), ("GigabitEthernet0/0/1", True),
+              ("GigabitEthernet0/0/2", False), ("Loopback0", True), ("NVI0", True),
+              ("Virtual-Access1", True), ("Virtual-Access2", True)]
+# The interfaces whose line protocol goes down with interface-lost.
+INTERFACES_LOST = ["GigabitEthernet0/0/1", "Virtual-Access2"]
+
+NS_OSPF_OPER = "http://cisco.com/ns/yang/Cisco-IOS-XE-ospf-oper"
+# The mock's OSPF router ID, as the model's uint32, and its neighbors on
+# GigabitEthernet0/0/0 in area 0 as (router ID, address).
+OSPF_ROUTER_ID = "167837441"
+OSPF_INTERFACE = "GigabitEthernet0/0/0"
+OSPF_NEIGHBORS = [("10.255.0.2", "10.1.0.2"), ("10.255.0.3", "10.1.0.3")]
+# The neighbor that is stuck in init with ospf-lost.
+OSPF_LOST = "10.255.0.3"
 
 # Device vocabulary for a failed operation (Cisco-IOS-XE-install-oper-types).
 OP_FAIL = "install-op-fail"
@@ -235,6 +255,82 @@ def bgp_up(failure: str, running: str, committed: str) -> bool:
     return True
 
 
+def interfaces_up(failure: str, running: str, committed: str) -> bool:
+    """Whether all the mock's interfaces that are not shut are up: with
+    interface-lost not while an uncommitted release runs."""
+    if failure == FAILURE_INTERFACE_LOST:
+        return running == committed
+    return True
+
+
+def interfaces_datastore(up: bool) -> ygdata.Node:
+    """Return Cisco-IOS-XE-interfaces-oper with the mock's interfaces; when
+    not up, the INTERFACES_LOST ones have their line protocol down."""
+    def q(n: str) -> ygdata.Id:
+        return ygdata.Id(NS_INTERFACES_OPER, n)
+    ns = NS_INTERFACES_OPER
+    mod = "Cisco-IOS-XE-interfaces-oper"
+    entries: list[ygdata.Node] = []
+    for name, admin_up in INTERFACES:
+        line_up = admin_up and (up or name not in INTERFACES_LOST)
+        entries.append(ygdata.Container({
+            q("name"): ygdata.Leaf(name, ns=ns, module=mod),
+            q("admin-status"): ygdata.Leaf("if-state-up" if admin_up else "if-state-down", ns=ns, module=mod),
+            q("oper-status"): ygdata.Leaf("if-oper-state-ready" if line_up else "if-oper-state-no-pass",
+                                          ns=ns, module=mod),
+        }, ns=ns, module=mod))
+    return ygdata.Container({
+        q("interfaces"): ygdata.Container({
+            q("interface"): ygdata.List([q("name")], entries, ns=ns, module=mod),
+        }, ns=ns, module=mod)
+    })
+
+
+def ospf_full(failure: str, running: str, committed: str) -> bool:
+    """Whether all the mock's OSPF adjacencies are full: with ospf-lost not
+    while an uncommitted release runs."""
+    if failure == FAILURE_OSPF_LOST:
+        return running == committed
+    return True
+
+
+def ospf_datastore(full: bool) -> ygdata.Node:
+    """Return Cisco-IOS-XE-ospf-oper with the mock's neighbors, all full,
+    or with OSPF_LOST stuck in init."""
+    def q(n: str) -> ygdata.Id:
+        return ygdata.Id(NS_OSPF_OPER, n)
+    ns = NS_OSPF_OPER
+    mod = "Cisco-IOS-XE-ospf-oper"
+    neighbors: list[ygdata.Node] = []
+    for router_id, address in OSPF_NEIGHBORS:
+        up = full or router_id != OSPF_LOST
+        neighbors.append(ygdata.Container({
+            q("neighbor-id"): ygdata.Leaf(router_id, ns=ns, module=mod),
+            q("address"): ygdata.Leaf(address, ns=ns, module=mod),
+            q("state"): ygdata.Leaf("ospf-nbr-full" if up else "ospf-nbr-init", ns=ns, module=mod),
+        }, ns=ns, module=mod))
+    interface = ygdata.Container({
+        q("name"): ygdata.Leaf(OSPF_INTERFACE, ns=ns, module=mod),
+        q("ospf-neighbor"): ygdata.List([q("neighbor-id")], neighbors, ns=ns, module=mod),
+    }, ns=ns, module=mod)
+    area = ygdata.Container({
+        q("area-id"): ygdata.Leaf("0", ns=ns, module=mod),
+        q("ospf-interface"): ygdata.List([q("name")], [interface], ns=ns, module=mod),
+    }, ns=ns, module=mod)
+    instance = ygdata.Container({
+        q("af"): ygdata.Leaf("address-family-ipv4", ns=ns, module=mod),
+        q("router-id"): ygdata.Leaf(OSPF_ROUTER_ID, ns=ns, module=mod),
+        q("ospf-area"): ygdata.List([q("area-id")], [area], ns=ns, module=mod),
+    }, ns=ns, module=mod)
+    return ygdata.Container({
+        q("ospf-oper-data"): ygdata.Container({
+            q("ospf-state"): ygdata.Container({
+                q("ospf-instance"): ygdata.List([q("af"), q("router-id")], [instance], ns=ns, module=mod),
+            }, presence=True, ns=ns, module=mod),
+        }, ns=ns, module=mod)
+    })
+
+
 def bgp_datastore(up: bool) -> ygdata.Node:
     """Return Cisco-IOS-XE-bgp-oper with the one neighbor, established and
     exchanging prefixes, or idle with none."""
@@ -273,9 +369,13 @@ def operational_datastore(version: str, history: list[ygdata.Node],
                           vstates: list[ygdata.Node]=[],
                           bgp: bool=True,
                           active: list[ygdata.Node]=[],
-                          inventory: list[ygdata.Node]=[]) -> ygdata.Node:
+                          inventory: list[ygdata.Node]=[],
+                          interfaces: bool=True,
+                          ospf: bool=True) -> ygdata.Node:
     """Return the complete operational datastore served by the mock; bgp says
-    whether its BGP session is up. The mock moves a finished record straight
+    whether its BGP session is up, interfaces whether all its interfaces
+    that are not shut are up, ospf whether all its OSPF adjacencies are
+    full. The mock moves a finished record straight
     to history; active is for tests of records still in install-oper.
     inventory is the device-inventory entries, none by default."""
     def q(n: str) -> ygdata.Id:
@@ -292,8 +392,10 @@ def operational_datastore(version: str, history: list[ygdata.Node],
             q("install-location-information"): ygdata.KeylessList([loc]),
         }, ns=ns, module=mod)
     })
-    return ygdata.merge(ygdata.merge(install_oper, hardware_datastore(version, inventory)),
-                        bgp_datastore(bgp))
+    out = ygdata.merge(install_oper, hardware_datastore(version, inventory))
+    out = ygdata.merge(out, bgp_datastore(bgp))
+    out = ygdata.merge(out, interfaces_datastore(interfaces))
+    return ygdata.merge(out, ospf_datastore(ospf))
 
 
 def _uuid_of(request: xml.Node) -> ?str:
@@ -355,6 +457,11 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
       bgp-down          the BGP session is idle from the start
       bgp-lost          the BGP session is idle while the activated release
                         runs, until a commit or an abort
+      interface-lost    GigabitEthernet0/0/1 and Virtual-Access2 have their
+                        line protocol down while the activated release runs,
+                        until a commit or an abort
+      ospf-lost         the OSPF neighbor 10.255.0.3 is stuck in init while
+                        the activated release runs, until a commit or an abort
     """
     _log = logging.Logger(log_handler)
 
@@ -393,7 +500,9 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
                 "install-version-state-provisioned-uncommitted", device_version(a!)))
         mock_server.set_oper_ds(operational_datastore(
             cur, history, vstates, bgp_up(failure, cur, committed),
-            inventory=[inventory_entry(swxeplat.HW_TYPE_CHASSIS, 0, model, serial)]))
+            inventory=[inventory_entry(swxeplat.HW_TYPE_CHASSIS, 0, model, serial)],
+            interfaces=interfaces_up(failure, cur, committed),
+            ospf=ospf_full(failure, cur, committed)))
 
     def _remember(record: ygdata.Node) -> None:
         # Copy on write: the published datastore still holds the old list.
