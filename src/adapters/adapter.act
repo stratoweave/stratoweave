@@ -8,6 +8,8 @@ import yang.adata as yadata
 import yang.gdata as ygdata
 import subscriptions
 
+import yp
+
 from device_schema import DeviceSchema, SchemaKey
 
 from device_meta_config import \
@@ -283,6 +285,155 @@ class SubscriptionStatus(object):
         return self.method
 
 
+# notif_status() mechanism values: how a notification channel reaches the device.
+NOTIF_5277 = "create-subscription"          # RFC 5277 classic
+NOTIF_ESTABLISH = "establish-subscription"  # RFC 8639 or the IOS XE draft dialect
+NOTIF_MOCK = "mock"                         # in-process mock adapter
+
+
+class NotifSpec(value):
+    """Declarative event notification subscription.
+
+    name is the qualified notification name to deliver; None means all
+    notifications (scoped to `stream` if given, else the device's default
+    channels). stream pins the spec to a named device stream (e.g. "snmpevents")
+    instead of the adapter's routing policy — the explicit opt-in for streams no
+    policy can infer; None routes by policy.
+    """
+    name: ?ygdata.Id
+    stream: ?str
+
+    def __init__(self, name: ?ygdata.Id=None, stream: ?str=None):
+        self.name = name
+        self.stream = stream
+
+    def __str__(self) -> str:
+        name = self.name
+        name_str = str(name) if name is not None else "*"
+        stream = self.stream
+        if stream is not None:
+            return "NotifSpec({name_str} @ {stream})"
+        return "NotifSpec({name_str})"
+
+    def __repr__(self) -> str:
+        return str(self)
+
+
+extension NotifSpec(Hashable):
+    def __eq__(self, other: NotifSpec) -> bool:
+        self_name = self.name
+        other_name = other.name
+        if self_name is None:
+            if other_name is not None:
+                return False
+        elif other_name is None or self_name != other_name:
+            return False
+        self_stream = self.stream
+        other_stream = other.stream
+        if self_stream is None:
+            return other_stream is None
+        return other_stream is not None and self_stream == other_stream
+
+    def hash(self, hasher):
+        name = self.name
+        if name is not None:
+            "some".hash(hasher)
+            name.q.hash(hasher)
+            name.name.hash(hasher)
+        else:
+            "none".hash(hasher)
+        stream = self.stream
+        if stream is not None:
+            "some".hash(hasher)
+            stream.hash(hasher)
+        else:
+            "none".hash(hasher)
+
+
+class NotifEvent(object):
+    """One received event notification.
+
+    payload is the event decoded against the device schema, rooted at the
+    notification; None when the notification is not in the schema or failed to
+    decode — raw always carries the payload element as received, so taps and
+    debugging see everything. raw also carries the namespace prefixes that the
+    device declared on the envelope, so it reads correctly on its own.
+    event_time is the envelope's eventTime, verbatim RFC 3339 text.
+    """
+    name: ygdata.Id
+    event_time: str
+    payload: ?ygdata.Node
+    raw: xml.Node
+
+    def __init__(self, name: ygdata.Id, event_time: str, payload: ?ygdata.Node,
+                 raw: xml.Node):
+        self.name = name
+        self.event_time = event_time
+        self.payload = payload
+        self.raw = raw
+
+    def __str__(self) -> str:
+        return "NotifEvent({self.name} @ {self.event_time})"
+
+
+class NotifChannelStatus(object):
+    """Operational state of one open notification channel: the mechanism (see
+    NOTIF_* above), the device stream it consumes (None when the mechanism has
+    no stream concept), whether it rides the main session or a dedicated one,
+    and its state ("active" | "connecting" | "unsupported")."""
+    mechanism: str
+    stream: ?str
+    session: str
+    state: str
+
+    def __init__(self, mechanism: str, stream: ?str, session: str, state: str):
+        self.mechanism = mechanism
+        self.stream = stream
+        self.session = session
+        self.state = state
+
+    def description(self) -> str:
+        stream = self.stream
+        at_stream = " stream={stream}" if stream is not None else ""
+        return "{self.mechanism}{at_stream} ({self.session} session, {self.state})"
+
+
+class NotifOwner(object):
+    """One logical event subscriber: its callback, desired spec set, and
+    whether it still waits to hear that its subscriptions are in place."""
+    @property
+    cb: action(?NotifEvent, ?Exception) -> None
+    want: set[NotifSpec]
+    @property
+    synced: ?action(str) -> None
+    owed: bool
+
+    def __init__(self, cb: action(?NotifEvent, ?Exception) -> None, want: set[NotifSpec], synced: ?action(str) -> None=None):
+        self.cb = cb
+        self.want = set(want)
+        self.synced = synced
+        self.owed = synced is not None
+
+
+def notif_want_matches(want: set[NotifSpec], name: ygdata.Id, src_stream: ?str=None) -> bool:
+    """True if an event with this qualified name, arriving on src_stream
+    (None when the channel has no stream concept), should be delivered to an
+    owner with this want set. Named specs match by name regardless of arrival
+    channel — the stream only steers routing. A wildcard spec pinned to a
+    stream takes only that stream's events; a bare wildcard takes everything."""
+    for spec in want:
+        spec_name = spec.name
+        spec_stream = spec.stream
+        if spec_name is not None:
+            if spec_name.q == name.q and spec_name.name == name.name:
+                return True
+        elif spec_stream is None:
+            return True
+        elif src_stream is not None and spec_stream == src_stream:
+            return True
+    return False
+
+
 def subscription_delay(spec: ygdata.SubscriptionSpec) -> float:
     pn = spec.period
     if pn is not None:
@@ -373,6 +524,30 @@ class DeviceAdapter(object):
     declare_subscriptions: proc(str, proc(?ygdata.Node, ?Exception) -> None, set[ygdata.SubscriptionSpec], ?action(str) -> None) -> None
     remove_subscriptions: proc(str) -> None
 
+    ## Declare an owner's full desired set of event notification subscriptions.
+    ##
+    ## Like declare_subscriptions but for discrete events: each call replaces
+    ## the owner's previous set; matching events arrive as cb(event, None), and
+    ## cb(None, err) signals channel trouble (events may be missing until it
+    ## recovers on its own). Delivery is at-most-once with no replay.
+    ##
+    ## synced, if given, is called once per declaration, when the device
+    ## subscriptions for every spec in want are in place: events from then on
+    ## reach cb. Send an RPC whose result arrives as an event only after it.
+    ##
+    ## The default tells the owner that this adapter does not deliver event
+    ## notifications. Adapters that deliver them override all three methods.
+    proc def declare_notif_subscriptions(self, owner_id: str, cb: action(?NotifEvent, ?Exception) -> None, want: set[NotifSpec], synced: ?action(str) -> None=None):
+        if len(want) > 0:
+            cb(None, PermanentError("this device adapter does not deliver event notifications"))
+
+    proc def remove_notif_subscriptions(self, owner_id: str):
+        pass
+
+    ## The open notification channels and how each reaches the device.
+    proc def notif_status(self) -> list[NotifChannelStatus]:
+        return []
+
 
 class NoAdapter(DeviceAdapter):
     def __init__(self, bundled_schema: object, log_handler, env: ?Env):
@@ -423,6 +598,9 @@ class NoAdapter(DeviceAdapter):
 
     def remove_subscriptions(self, owner_id: str):
         pass
+
+    def declare_notif_subscriptions(self, owner_id: str, cb: action(?NotifEvent, ?Exception) -> None, want: set[NotifSpec], synced: ?action(str) -> None=None):
+        cb(None, NotConnectedError())
 
 class MockAdapter(DeviceAdapter):
     """Mock device adapter
@@ -479,6 +657,22 @@ class MockAdapter(DeviceAdapter):
 
     def remove_subscriptions(self, owner_id: str):
         pass
+
+    def declare_notif_subscriptions(self, owner_id: str, cb: action(?NotifEvent, ?Exception) -> None, want: set[NotifSpec], synced: ?action(str) -> None=None):
+        self._driver.declare_notif_subscriptions(owner_id, cb, want, synced)
+
+    def remove_notif_subscriptions(self, owner_id: str):
+        self._driver.remove_notif_subscriptions(owner_id)
+
+    def notif_status(self) -> list[NotifChannelStatus]:
+        return [NotifChannelStatus(NOTIF_MOCK, None, "main", "active")]
+
+    def inject_notif(self, name: ygdata.Id, payload: ?ygdata.Node=None, stream: ?str=None) -> None:
+        """Test hook: deliver an event to every owner whose specs match name
+        (and stream, for stream-pinned taps), as if the device had emitted it.
+        payload becomes the event's decoded body; raw is a synthesized bare
+        element."""
+        self._driver.inject_notif(name, payload, stream)
 
 actor MockDriver(on_connect: action(dict[str, ModCap], ?SchemaKey) -> None, bundled_schema: DeviceSchema, log_handler: logging.Handler, env: ?Env):
     _log = logging.Logger(log_handler)
@@ -556,8 +750,55 @@ actor MockDriver(on_connect: action(dict[str, ModCap], ?SchemaKey) -> None, bund
         # The mock driver keeps no device data.
         cb(ygdata.Container({}), None)
 
+    var notif_owners: dict[str, NotifOwner] = {}
+
+    def declare_notif_subscriptions(owner_id: str, cb: action(?NotifEvent, ?Exception) -> None, want: set[NotifSpec], synced: ?action(str) -> None=None) -> None:
+        notif_owners[owner_id] = NotifOwner(cb, want)
+        if synced is not None:
+            synced(owner_id)
+
+    def remove_notif_subscriptions(owner_id: str) -> None:
+        if owner_id in notif_owners:
+            del notif_owners[owner_id]
+
+    def inject_notif(name: ygdata.Id, payload: ?ygdata.Node=None, stream: ?str=None) -> None:
+        raw = xml.Node(name.name, nsdefs=[(None, name.q)])
+        ev = NotifEvent(name, yp.event_time_now(), payload, raw)
+        for owner in notif_owners.values():
+            if notif_want_matches(owner.want, name, stream):
+                owner.cb(ev, None)
 
 
+
+
+def _test_notif_spec_identity():
+    verify = ygdata.Id("urn:test:events", "verify-event")
+    other = ygdata.Id("urn:test:events", "other-event")
+    testing.assertEqual(NotifSpec(verify), NotifSpec(ygdata.Id("urn:test:events", "verify-event")))
+    testing.assertNotEqual(NotifSpec(verify), NotifSpec(other))
+    testing.assertNotEqual(NotifSpec(verify), NotifSpec(verify, stream="snmpevents"))
+    testing.assertNotEqual(NotifSpec(), NotifSpec(verify))
+    # Value semantics: equal specs collapse in a set.
+    testing.assertEqual(len({NotifSpec(verify), NotifSpec(ygdata.Id("urn:test:events", "verify-event")), NotifSpec()}), 2)
+
+def _test_notif_want_matches():
+    verify = ygdata.Id("urn:test:events", "verify-event")
+    other = ygdata.Id("urn:test:events", "other-event")
+    foreign = ygdata.Id("urn:other:ns", "verify-event")
+    testing.assertEqual(notif_want_matches({NotifSpec(verify)}, verify), True)
+    testing.assertEqual(notif_want_matches({NotifSpec(verify)}, other), False)
+    # Same local name in a different module must not match.
+    testing.assertEqual(notif_want_matches({NotifSpec(verify)}, foreign), False)
+    # Named specs match regardless of which channel the event arrived on.
+    testing.assertEqual(notif_want_matches({NotifSpec(verify)}, verify, "snmpevents"), True)
+    # A bare wildcard matches everything; a stream-pinned wildcard only takes
+    # events that arrived on that stream's channel.
+    testing.assertEqual(notif_want_matches({NotifSpec()}, other), True)
+    testing.assertEqual(notif_want_matches({NotifSpec()}, other, "snmpevents"), True)
+    testing.assertEqual(notif_want_matches({NotifSpec(stream="snmpevents")}, other), False)
+    testing.assertEqual(notif_want_matches({NotifSpec(stream="snmpevents")}, other, "snmpevents"), True)
+    testing.assertEqual(notif_want_matches({NotifSpec(stream="snmpevents")}, other, "NETCONF"), False)
+    testing.assertEqual(notif_want_matches(set(), verify), False)
 
 def _test_parse_cap_base():
     mod = parse_cap("urn:ietf:params:netconf:base:1.1")
