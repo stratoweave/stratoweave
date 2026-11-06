@@ -17,8 +17,11 @@ export interface ImportShared {
   password: string;
 }
 
-/** Devices per PATCH when importing in bulk. */
-export const IMPORT_BATCH = 100;
+/** Devices per PATCH when importing in bulk. At 100k devices a PATCH costs
+ * 0.6 s however small, so batches are big. Each flotilla gets about a
+ * tenth of a batch in one edit; its SSH write buffer (8 MiB) takes 1k
+ * devices but not 10k. */
+export const IMPORT_BATCH = 5000;
 
 function validPort(text: string): boolean {
   const n = Number(text);
