@@ -1,0 +1,147 @@
+"""In-process event notification tests over an actor pipe.
+
+A netconf.Client and netconf.Server are wired together with actor_pipe_pair()
+to exercise the RFC 5277 create-subscription round-trip: the client subscribes,
+the server accepts and emits event notifications, and the client receives them
+through its on_notif callback. Also covers the dispatch guard: a <notification>
+in a foreign namespace must not reach on_notif.
+
+Pure NETCONF library bits — no sockets, no TTT, no device adapter.
+"""
+
+import logging
+import testing
+import std.xml as xml
+
+import netconf
+import yp
+
+NS_TEST_EVENTS = "urn:test:events"
+
+
+def _verify_event(uuid: str) -> xml.Node:
+    return xml.Node("verify-event", nsdefs=[(None, NS_TEST_EVENTS)], children=[
+        xml.Node("uuid", text=uuid)
+    ])
+
+
+actor _test_create_subscription_roundtrip(t: testing.EnvT):
+    """Client create-subscription; server accepts and emits; client receives."""
+    pipes = netconf.actor_pipe_pair()
+
+    var done = False
+    var stream_seen: ?str = None
+
+    def _fail(e: Exception) -> None:
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        if yp.is_create_subscription(op.tag):
+            params = yp.parse_create_subscription(op)
+            stream_seen = params.stream
+            s.send_ok(message_id)
+            s.send_notification(yp.build_notification(yp.event_time_now(),
+                _verify_event("cafe-0001")))
+        else:
+            s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if not done:
+            done = True
+            payload = yp.notification_payload(notif)
+            event_time = yp.notification_event_time(notif)
+            if payload is not None and payload.tag == "verify-event" and event_time is not None:
+                testing.assertEqual(stream_seen, "NETCONF")
+                c.close(None)
+                t.success()
+            else:
+                t.failure(ValueError("Unexpected notification: " + notif.encode()))
+
+    def _on_subscribed(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            _fail(ValueError("connect failed: " + str(e)))
+        else:
+            c.create_subscription(_on_subscribed)
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=_on_connect,
+                            on_notif=_on_notif,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    after 10.0: _fail(ValueError("Timed out waiting for notification"))
+
+
+actor _test_foreign_namespace_notification_ignored(t: testing.EnvT):
+    """A <notification> in a foreign namespace is dropped by the dispatch guard;
+    a proper RFC 5277 one after it still arrives."""
+    pipes = netconf.actor_pipe_pair()
+
+    var done = False
+
+    def _fail(e: Exception) -> None:
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        if yp.is_create_subscription(op.tag):
+            s.send_ok(message_id)
+            # A same-tag message from some other protocol must not surface...
+            s.send_notification(xml.Node("notification",
+                nsdefs=[(None, "urn:example:not-netconf")],
+                children=[_verify_event("bogus")]))
+            # ...while the real thing still must.
+            s.send_notification(yp.build_notification(yp.event_time_now(),
+                _verify_event("cafe-0002")))
+        else:
+            s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if not done:
+            done = True
+            payload = yp.notification_payload(notif)
+            uuid: ?str = None
+            if payload is not None:
+                for child in payload.children:
+                    if child.tag == "uuid":
+                        uuid = child.text
+            if uuid is not None and uuid == "cafe-0002":
+                c.close(None)
+                t.success()
+            else:
+                t.failure(ValueError("Foreign-namespace notification leaked through: " + notif.encode()))
+
+    def _on_subscribed(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            _fail(ValueError("connect failed: " + str(e)))
+        else:
+            c.create_subscription(_on_subscribed)
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=_on_connect,
+                            on_notif=_on_notif,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    after 10.0: _fail(ValueError("Timed out waiting for notification"))

@@ -1,15 +1,23 @@
-"""YANG-push — protocol primitives (RFC 8639 / 8640 / 8641).
+"""YANG notification subscriptions — protocol primitives (RFC 5277 / 8639 / 8640 / 8641).
 
 This module (yp) is pure and transport-agnostic: it builds and parses the XML for
-dynamic subscriptions and their push notifications. It has no dependency on
-NETCONF (or any transport), so it is reused by the NETCONF client/server, a future
-RESTCONF binding, and tests alike.
+subscriptions and their notifications. It has no dependency on NETCONF (or any
+transport), so it is reused by the NETCONF client/server, a future RESTCONF
+binding, and tests alike.
 
-Scope: periodic and on-change subscriptions. A periodic push carries the full
-datastore snapshot (push-update); an on-change push carries an RFC 8072 yang-patch
-of what changed (push-change-update). This module only frames the XML around a
-yang-patch — the patch itself is built by the caller (acton-yang's ypatch from a
-gdata.diff) and embedded here, so yp keeps no dependency on the schema or gdata.
+Scope: two subscription families sharing one notification envelope.
+
+Datastore subscriptions (YANG-push): periodic and on-change. A periodic push
+carries the full datastore snapshot (push-update); an on-change push carries an
+RFC 8072 yang-patch of what changed (push-change-update). This module only frames
+the XML around a yang-patch — the patch itself is built by the caller (acton-yang's
+ypatch from a gdata.diff) and embedded here, so yp keeps no dependency on the
+schema or gdata.
+
+Event-stream subscriptions: discrete YANG notifications from a named event stream,
+via RFC 5277 create-subscription or an RFC 8639 establish-subscription carrying a
+<stream> instead of a <datastore>. Replay (startTime / replay-start-time) is not
+built yet; subscriptions are live-only.
 
 Layering:
   - yp.engine adds the transport-agnostic YangPushPublisher actor that drives
@@ -39,17 +47,27 @@ NS_DATASTORES: str = "urn:ietf:params:xml:ns:yang:ietf-datastores"
 DATASTORE_OPERATIONAL: str = "operational"
 DATASTORE_RUNNING: str = "running"
 
+# The default event stream. Every publisher provides it (RFC 5277 3.2.3,
+# RFC 8640 4), and RFC 6470 base notifications such as netconf-config-change
+# are delivered on it.
+STREAM_NETCONF: str = "NETCONF"
+
 
 class EstablishParams(object):
     """Parsed parameters of an incoming <establish-subscription> (server side).
 
-    A subscription is either periodic (periodic_period set) or on-change (on_change
-    True, with optional dampening_period and sync_on_start). subtree_filter
-    carries the top-level data nodes from datastore-subtree-filter, if present.
-    xpath_filter carries the datastore XPath expression, if present. datastore is
-    captured but not enforced here.
+    A datastore subscription is either periodic (periodic_period set) or on-change
+    (on_change True, with optional dampening_period and sync_on_start).
+    subtree_filter carries the top-level data nodes from datastore-subtree-filter,
+    if present. xpath_filter carries the datastore XPath expression, if present.
+    datastore is captured but not enforced here.
+
+    An event-stream subscription (RFC 8639) carries stream instead of datastore;
+    subtree_filter and xpath_filter then hold the stream-subtree-filter and
+    stream-xpath-filter contents.
     """
     datastore: ?str
+    stream: ?str             # event-stream subscription when set
     periodic_period: ?int    # centiseconds; None if no <period> was given
     on_change: bool          # True if an <on-change> element was present
     dampening_period: ?int   # centiseconds; on-change only, None if absent
@@ -61,14 +79,42 @@ class EstablishParams(object):
                  on_change: bool=False, dampening_period: ?int=None,
                  sync_on_start: bool=True,
                  subtree_filter: ?list[xml.Node]=None,
-                 xpath_filter: ?str=None):
+                 xpath_filter: ?str=None,
+                 stream: ?str=None):
         self.datastore = datastore
+        self.stream = stream
         self.periodic_period = periodic_period
         self.on_change = on_change
         self.dampening_period = dampening_period
         self.sync_on_start = sync_on_start
         self.subtree_filter = subtree_filter
         self.xpath_filter = xpath_filter
+
+
+class CreateSubParams(object):
+    """Parsed parameters of an incoming <create-subscription> (RFC 5277, server side).
+
+    subtree_filter carries the children of a type="subtree" <filter>, matched
+    against notification payloads; xpath_filter carries the select of a
+    type="xpath" one, captured so servers that cannot honour it reject it
+    rather than serve a subscription that delivers nothing. startTime/stopTime
+    (replay) are captured for the same reason.
+    """
+    stream: str
+    subtree_filter: ?list[xml.Node]
+    xpath_filter: ?str
+    start_time: ?str
+    stop_time: ?str
+
+    def __init__(self, stream: str=STREAM_NETCONF,
+                 subtree_filter: ?list[xml.Node]=None,
+                 start_time: ?str=None, stop_time: ?str=None,
+                 xpath_filter: ?str=None):
+        self.stream = stream
+        self.subtree_filter = subtree_filter
+        self.xpath_filter = xpath_filter
+        self.start_time = start_time
+        self.stop_time = stop_time
 
 
 class PushUpdate(object):
@@ -113,23 +159,38 @@ def build_establish_subscription(
         dampening_period: ?int=None,
         sync_on_start: bool=True,
         event_notifs: bool=False,
-        xpath_nsdefs: list[(?str, str)]=[]) -> xml.Node:
+        xpath_nsdefs: list[(?str, str)]=[],
+        stream: ?str=None,
+        stream_nsdefs: list[(?str, str)]=[]) -> xml.Node:
     """Build an <establish-subscription> operation node (RFC 8639 + 8641).
 
-    Pass period (centiseconds) for a periodic subscription, or on_change=True for an
-    on-change one (optionally with dampening_period centiseconds). sync_on_start
-    defaults to the RFC 8641/YANG default of true; pass false to request
-    push-change-update notifications only. on-change takes precedence if both are
-    given. A filter is optional; pass either subtree_filter (the filter's top-level
-    data nodes, each carrying its own module namespace) or xpath_filter. Set
-    event_notifs=True for IOS XE's non-standard ietf-yang-push over
+    Datastore subscription (default): pass period (centiseconds) for a periodic
+    subscription, or on_change=True for an on-change one (optionally with
+    dampening_period centiseconds). sync_on_start defaults to the RFC 8641/YANG
+    default of true; pass false to request push-change-update notifications only.
+    on-change takes precedence if both are given. A filter is optional; pass
+    either subtree_filter (the filter's top-level data nodes, each carrying its
+    own module namespace) or xpath_filter.
+
+    Event-stream subscription: pass stream (e.g. yp.STREAM_NETCONF) to subscribe
+    to discrete event notifications instead of a datastore. In the standard shape
+    the stream is a plain name and filters become stream-subtree-filter /
+    stream-xpath-filter; period/on-change do not apply and are ignored.
+
+    Set event_notifs=True for IOS XE's non-standard ietf-yang-push over
     ietf-event-notifications RPC shape; the default is standard YANG Push over
-    ietf-subscribed-notifications.
+    ietf-subscribed-notifications. In that dialect the stream leaf is an
+    identityref — pass its exact text (plus stream_nsdefs for its namespace),
+    e.g. a Cisco identity for yang-notif-native — and the on-change timing
+    elements still apply (yang-notif-native wants on_change with dampening 0).
     """
     children: list[xml.Node] = []
 
     if event_notifs:
-        children.append(xml.Node("stream", text="yp:yang-push"))
+        if stream is not None:
+            children.append(xml.Node("stream", nsdefs=stream_nsdefs, text=stream))
+        else:
+            children.append(xml.Node("stream", text="yp:yang-push"))
 
         if subtree_filter is not None:
             children.append(xml.Node("subtree-filter", nsdefs=[(None, NS_YP)],
@@ -137,6 +198,16 @@ def build_establish_subscription(
         elif xpath_filter is not None:
             children.append(xml.Node("xpath-filter", nsdefs=[(None, NS_YP)] + xpath_nsdefs,
                 text=xpath_filter))
+    elif stream is not None:
+        # RFC 8639 event-stream subscription: plain stream name, stream-* filters,
+        # no timing elements (those are yang-push datastore augmentations).
+        children.append(xml.Node("stream", text=stream))
+        if subtree_filter is not None:
+            children.append(xml.Node("stream-subtree-filter", children=subtree_filter))
+        elif xpath_filter is not None:
+            children.append(xml.Node("stream-xpath-filter", nsdefs=xpath_nsdefs,
+                text=xpath_filter))
+        return xml.Node("establish-subscription", nsdefs=[(None, NS_SN)], children=children)
     else:
         # <datastore> is an identityref in the ietf-datastores module, carried in the
         # ietf-yang-push namespace.
@@ -188,6 +259,33 @@ def build_delete_subscription(sub_id: int, event_notifs: bool=False) -> xml.Node
     ])
 
 
+def build_create_subscription(stream: ?str=None,
+                              subtree_filter: ?list[xml.Node]=None,
+                              start_time: ?str=None,
+                              stop_time: ?str=None) -> xml.Node:
+    """Build a <create-subscription> operation node (RFC 5277).
+
+    All parameters are optional: stream defaults to the NETCONF stream on the
+    server, subtree_filter is matched against notification payloads (a list of
+    elements, typically one empty element per wanted notification, each in its
+    module's namespace), and start_time requests replay on streams that support
+    it (stop_time requires start_time). The subscription is anonymous and bound
+    to the session: no id is returned and RFC 5277 defines no way to modify or
+    cancel it short of closing the session.
+    """
+    children: list[xml.Node] = []
+    if stream is not None:
+        children.append(xml.Node("stream", text=stream))
+    if subtree_filter is not None:
+        children.append(xml.Node("filter", attributes=[("type", "subtree")],
+            children=subtree_filter))
+    if start_time is not None:
+        children.append(xml.Node("startTime", text=start_time))
+    if stop_time is not None:
+        children.append(xml.Node("stopTime", text=stop_time))
+    return xml.Node("create-subscription", nsdefs=[(None, NS_NOTIF)], children=children)
+
+
 def build_subscription_id_reply(sub_id: int) -> xml.Node:
     """The <id> element returned top-level in the establish-subscription reply."""
     return xml.Node("id", nsdefs=[(None, NS_SN)], text=str(sub_id))
@@ -226,6 +324,32 @@ def build_push_change_update(sub_id: int, yang_patch: xml.Node) -> xml.Node:
 # ----------------------------------------------------------------------------
 # Parsers
 # ----------------------------------------------------------------------------
+
+def element_namespace(el: xml.Node) -> ?str:
+    """The namespace an element's own prefix resolves to, if declared on it.
+
+    Only the element's own nsdefs are consulted — enough for message roots and
+    for payload/filter elements that carry their module namespace themselves.
+    """
+    for ns_prefix, ns in el.nsdefs:
+        if ns_prefix == el.prefix:
+            return ns
+    return None
+
+
+def filter_names(subtree_filter: ?list[xml.Node]) -> ?list[(?str, str)]:
+    """Reduce a subtree filter to the (namespace, name) pairs of its top elements.
+
+    This is the name-filter reading of a subtree filter: each top-level filter
+    element selects notifications of that name. None (no filter) means all.
+    """
+    if subtree_filter is not None:
+        names: list[(?str, str)] = []
+        for el in subtree_filter:
+            names.append((element_namespace(el), el.tag))
+        return names
+    return None
+
 
 def _child_by_tag(node: ?xml.Node, tag: str) -> ?xml.Node:
     if node is not None:
@@ -333,13 +457,45 @@ def parse_establish_subscription(op: xml.Node) -> EstablishParams:
                 sync_on_start = False
     sf = _child_by_tag(op, "datastore-subtree-filter")
     subtree_filter = sf.children if sf is not None else None
-    xf = _child_by_tag(op, "datastore-xpath-filter")
+    xpath_tag = "datastore-xpath-filter"
+    stream = _text_of(_child_by_tag(op, "stream"))
+    if stream is not None:
+        ssf = _child_by_tag(op, "stream-subtree-filter")
+        subtree_filter = ssf.children if ssf is not None else None
+        xpath_tag = "stream-xpath-filter"
+    xf = _child_by_tag(op, xpath_tag)
     xpath_filter: ?str = None
     if xf is not None:
         # Preserve presence of an empty element so the binding rejects the empty
         # expression instead of accidentally widening it to an unfiltered request.
         xpath_filter = xf.text if xf.text is not None else ""
-    return EstablishParams(datastore, period, on_change, dampening_period, sync_on_start, subtree_filter, xpath_filter)
+    return EstablishParams(datastore, period, on_change, dampening_period, sync_on_start, subtree_filter, xpath_filter, stream)
+
+
+def _attr(node: xml.Node, name: str) -> ?str:
+    for attr_name, attr_val in node.attributes:
+        if attr_name == name or attr_name.split(":", -1)[-1] == name:
+            return attr_val
+    return None
+
+
+def parse_create_subscription(op: xml.Node) -> CreateSubParams:
+    """Parse an incoming <create-subscription> operation node (RFC 5277, server side)."""
+    stream = _text_of(_child_by_tag(op, "stream"))
+    subtree_filter: ?list[xml.Node] = None
+    xpath_filter: ?str = None
+    f = _child_by_tag(op, "filter")
+    if f is not None:
+        ftype = _attr(f, "type")
+        if ftype is not None and ftype == "xpath":
+            xpath_filter = _attr(f, "select")
+        else:
+            subtree_filter = f.children
+    return CreateSubParams(stream if stream is not None else STREAM_NETCONF,
+                           subtree_filter,
+                           _text_of(_child_by_tag(op, "startTime")),
+                           _text_of(_child_by_tag(op, "stopTime")),
+                           xpath_filter)
 
 
 def parse_delete_subscription(op: xml.Node) -> ?int:
@@ -355,3 +511,13 @@ def is_subscription_rpc(tag: str) -> bool:
     flag synchronously).
     """
     return tag == "establish-subscription" or tag == "delete-subscription" or tag == "modify-subscription" or tag == "kill-subscription" or tag == "resync-subscription"
+
+
+def is_create_subscription(tag: str) -> bool:
+    """True if an RPC operation tag is RFC 5277 <create-subscription>.
+
+    Kept separate from is_subscription_rpc: create-subscription belongs to the
+    classic notification capability and routes to an event-stream service, not
+    to the YANG-push publisher.
+    """
+    return tag == "create-subscription"
