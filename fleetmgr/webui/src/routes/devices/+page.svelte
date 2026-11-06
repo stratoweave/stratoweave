@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onDestroy, untrack } from 'svelte';
-  import { invalidate } from '$app/navigation';
 
   import { errorText } from '#lib/core/errors.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
@@ -10,7 +9,7 @@
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '#lib/core/restconf/client.ts';
   import { bindPatch, unbindDevice } from '#lib/maintenance/binding.ts';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
-  import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device, type Schedule } from '#lib/software/model.ts';
+  import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, parseFleet, type Device, type Schedule } from '#lib/software/model.ts';
   import { nameMatcher, scheduleMatches } from '#lib/software/selection.ts';
   import {
     IMPORT_BATCH,
@@ -26,6 +25,9 @@
   const PAGE_SIZE = 100;
 
   let { data }: PageProps = $props();
+  // Writes patch this copy instead of re-reading the fleet (34 MB and 4 s
+  // at 100k devices); the next load replaces it.
+  let devices = $derived(data.devices);
 
   let draft = $state<NewDeviceInput | null>(null);
   let importOpen = $state(false);
@@ -57,21 +59,21 @@
     });
   });
 
-  let types = $derived([...new Set(data.devices.map((d) => d.type))].sort());
-  let models = $derived([...new Set(data.devices.map((d) => d.model).filter((m) => m))].sort());
+  let types = $derived([...new Set(devices.map((d) => d.type))].sort());
+  let models = $derived([...new Set(devices.map((d) => d.model).filter((m) => m))].sort());
   let scheduleNames = $derived(data.schedules.map((s) => s.name));
   let knownSchedules = $derived(new Set(scheduleNames));
   let colors = $derived(scheduleColors(scheduleNames));
   // Bindings to a schedule that does not exist: the planner places those
   // devices in no window.
   let missingSchedules = $derived(
-    [...new Set([...data.devices.map((d) => d.schedule), data.scheduleFilter])]
+    [...new Set([...devices.map((d) => d.schedule), data.scheduleFilter])]
       .filter((name) => name && !knownSchedules.has(name))
       .sort()
   );
 
   // The API returns devices in no particular order; ranges and pages need one.
-  let sorted = $derived([...data.devices].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));
+  let sorted = $derived([...devices].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0)));
   let filtered = $derived.by(() => {
     const matchName = nameMatcher(filterText.trim());
     return sorted.filter(
@@ -181,9 +183,11 @@
     bindError = '';
     let done = 0;
     let current = '';
+    const written = new Set<string>();
     try {
       if (plan.schedule) {
         await restconfPatchJson(DATA_ROOT, bindPatch(names, plan.schedule));
+        for (const name of names) written.add(name);
         done = names.length;
       } else {
         stopRequested = false;
@@ -192,6 +196,7 @@
           if (stopRequested) break;
           current = name;
           await unbindDevice(name);
+          written.add(name);
           done += 1;
           progress = { done, total: names.length };
         }
@@ -216,13 +221,15 @@
     } finally {
       applying = false;
       progress = null;
-      await invalidate('data:software');
+      if (written.size > 0) {
+        devices = devices.map((d) => (written.has(d.name) ? { ...d, schedule: plan.schedule } : d));
+      }
     }
   }
 
   let validation = $derived(
     draft
-      ? validateNewDevice(draft, data.devices.map((d) => d.name))
+      ? validateNewDevice(draft, devices.map((d) => d.name))
       : { ok: true, errors: {} as Record<string, string> }
   );
   let errors = $derived(touched ? validation.errors : ({} as Record<string, string>));
@@ -258,11 +265,11 @@
       saving = true;
       statusMessage = null;
       const name = draft.name.trim();
-      const entries = deviceEntries([draft]);
-      await restconfPatchJson(DATA_ROOT, devicesPatch(entries));
+      const body = devicesPatch(deviceEntries([draft]));
+      await restconfPatchJson(DATA_ROOT, body);
+      devices = [...devices, ...parseFleet(body).devices];
       statusMessage = { type: 'success', text: `Added device ${name}.` };
       closeEditor();
-      await invalidate('data:software');
     } catch (saveError) {
       statusMessage = {
         type: 'error',
@@ -277,7 +284,7 @@
     try {
       saving = true;
       statusMessage = null;
-      const existing = new Set(data.devices.map((d) => d.name));
+      const existing = new Set(devices.map((d) => d.name));
       const shared = { type: importType.trim() || 'iosxe', username: importUsername, password: importPassword };
       const result = parseImport(importText, shared, existing);
       if (result.errors.length > 0) {
@@ -299,7 +306,9 @@
       }
       const entries = deviceEntries(result.inputs);
       for (const batch of chunk(entries, IMPORT_BATCH)) {
-        await restconfPatchJson(DATA_ROOT, devicesPatch(batch));
+        const body = devicesPatch(batch);
+        await restconfPatchJson(DATA_ROOT, body);
+        devices = [...devices, ...parseFleet(body).devices];
       }
       const skipped =
         result.skippedExisting.length > 0 ? `, ${result.skippedExisting.length} already existed` : '';
@@ -307,7 +316,6 @@
       importText = '';
       importPassword = '';
       closeEditor();
-      await invalidate('data:software');
     } catch (importError) {
       statusMessage = {
         type: 'error',
@@ -325,8 +333,8 @@
       deleting = true;
       statusMessage = null;
       await restconfDelete(getListEntryPath(FLEET_DEVICE_LIST_ROOT, target.name));
+      devices = devices.filter((d) => d.name !== target.name);
       statusMessage = { type: 'success', text: `Removed device ${target.name}.` };
-      await invalidate('data:software');
     } catch (deleteError) {
       statusMessage = {
         type: 'error',
@@ -500,7 +508,7 @@
 {/if}
 
 <section class="card">
-  {#if data.devices.length === 0}
+  {#if devices.length === 0}
     <div class="empty-state">No devices yet. Add or import some, or seed the fleet from a lab deploy.</div>
   {:else}
     <div class="filter-row">
@@ -534,7 +542,7 @@
           <option value={`=${name}`}>{name} (missing)</option>
         {/each}
       </select>
-      <span class="filter-count">{filtered.length} of {data.devices.length}</span>
+      <span class="filter-count">{filtered.length} of {devices.length}</span>
     </div>
     <div class="table-wrap">
       <table class="dense">
@@ -627,7 +635,7 @@
         {/if}
         {#if chosenShown < filtered.length}
           <button class="link-button tn" type="button" disabled={applying} onclick={selectAllMatching}>
-            Select all {filtered.length.toLocaleString()}{filtered.length < data.devices.length ? ' matching' : ''}
+            Select all {filtered.length.toLocaleString()}{filtered.length < devices.length ? ' matching' : ''}
           </button>
         {/if}
         <button class="link-button" type="button" disabled={applying} onclick={clearSelection}>Clear</button>
