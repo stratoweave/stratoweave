@@ -8,10 +8,12 @@ in a foreign namespace must not reach on_notif) and the real publisher stack —
 EventStreamHub + NetconfEventService — for name filtering, stream separation,
 and the RFC 5277 session rules.
 
-Pure NETCONF library bits — no sockets, no TTT, no device adapter.
+Pure NETCONF library bits, without TTT or a device adapter. The interop
+tests at the end need a notconf server.
 """
 
 import logging
+import net
 import testing
 import std.xml as xml
 
@@ -365,3 +367,155 @@ actor _test_session_rules(t: testing.EnvT):
                             log_handler=t.log_handler,
                             pipe=pipes.client)
     after 10.0: _fail(ValueError("Timed out"))
+
+
+# ----------------------------------------------------------------------------
+# Interop tests against a real NETCONF server (Netopeer2 via notconf).
+# Run with: docker run -td -p 42830:830 ghcr.io/notconf/notconf
+# then: acton test --tag notconf-server
+# Netopeer2 is the one implementation shipping final RFC 8639/8640 over
+# NETCONF, so these exercise both our classic-5277 and final-8639 event paths
+# against an independent peer, plus RFC 6470 netconf-config-change end to end.
+# ----------------------------------------------------------------------------
+
+NS_NCN = "urn:ietf:params:xml:ns:yang:ietf-netconf-notifications"
+
+
+def _notconf_client(t: testing.EnvT,
+                    on_connect: action(netconf.Client, ?Exception) -> None,
+                    on_notif: ?action(netconf.Client, xml.Node) -> None) -> netconf.Client:
+    return netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                          address=netconf.test_address,
+                          port=netconf.test_port,
+                          username=netconf.test_username,
+                          password=netconf.test_password,
+                          key=None,
+                          on_connect=on_connect,
+                          on_notif=on_notif,
+                          skip_host_key_check=True,
+                          log_handler=t.log_handler)
+
+
+def _nacm_group_edit(operation: str) -> xml.Node:
+    return xml.Node("nacm", nsdefs=[(None, "urn:ietf:params:xml:ns:yang:ietf-netconf-acm")], children=[
+        xml.Node("groups", children=[
+            xml.Node("group", attributes=[("xc:operation", operation)], children=[
+                xml.Node("name", text="sw-notif-test")
+            ])
+        ])
+    ])
+
+
+actor _test_notconf_5277_config_change(t: testing.EnvT):
+    """RFC 5277 against Netopeer2: create-subscription with a name filter for
+    netconf-config-change on one session; an edit-config from a second session
+    must arrive as the RFC 6470 notification."""
+    t.require("notconf-server")
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if not done:
+            payload = yp.notification_payload(notif)
+            if payload is not None and payload.tag == "netconf-config-change":
+                done = True
+                c.close(None)
+                t.success()
+            # Anything else (e.g. replayComplete) is ignored; the filter should
+            # prevent unrelated events anyway.
+
+    def _on_edit_create(c2: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("edit-config (create) failed: {err}"))
+
+    def _on_edit_remove(c2: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("edit-config (remove) failed: {err}"))
+        else:
+            # remove-then-merge guarantees a real datastore change even when a
+            # previous run left the group behind.
+            c2.edit_config([_nacm_group_edit("merge")], _on_edit_create)
+
+    def _on_editor_connect(c2: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            fail(ValueError("editor connect failed: {e}"))
+        else:
+            c2.edit_config([_nacm_group_edit("remove")], _on_edit_remove)
+
+    def _on_subscribed(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("create-subscription failed: {err}"))
+        else:
+            _notconf_client(t, _on_editor_connect, None)
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            fail(ValueError("subscriber connect failed: {e}"))
+        else:
+            c.create_subscription(_on_subscribed,
+                subtree_filter=[xml.Node("netconf-config-change", nsdefs=[(None, NS_NCN)])])
+
+    _notconf_client(t, _on_connect, _on_notif)
+    after 15.0: fail(ValueError("Timed out waiting for netconf-config-change over 5277"))
+
+
+actor _test_notconf_8639_event_stream(t: testing.EnvT):
+    """Final RFC 8639/8640 against Netopeer2: establish-subscription on the
+    NETCONF stream with a stream-subtree-filter; the config-change event from a
+    second session's edit must arrive on the establishing session."""
+    t.require("notconf-server")
+    var done = False
+    var sub_id_seen: ?int = None
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if not done:
+            payload = yp.notification_payload(notif)
+            if payload is not None and payload.tag == "netconf-config-change":
+                done = True
+                testing.assertEqual(sub_id_seen is not None, True)
+                c.close(None)
+                t.success()
+
+    def _on_edit_create(c2: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("edit-config (create) failed: {err}"))
+
+    def _on_edit_remove(c2: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("edit-config (remove) failed: {err}"))
+        else:
+            c2.edit_config([_nacm_group_edit("merge")], _on_edit_create)
+
+    def _on_editor_connect(c2: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            fail(ValueError("editor connect failed: {e}"))
+        else:
+            c2.edit_config([_nacm_group_edit("remove")], _on_edit_remove)
+
+    def _on_established(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("establish-subscription (stream) failed: {err}"))
+        elif sub_id is None:
+            fail(ValueError("establish-subscription returned no id"))
+        else:
+            sub_id_seen = sub_id
+            _notconf_client(t, _on_editor_connect, None)
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            fail(ValueError("subscriber connect failed: {e}"))
+        else:
+            c.establish_subscription(_on_established, stream=yp.STREAM_NETCONF,
+                subtree_filter=[xml.Node("netconf-config-change", nsdefs=[(None, NS_NCN)])])
+
+    _notconf_client(t, _on_connect, _on_notif)
+    after 15.0: fail(ValueError("Timed out waiting for netconf-config-change over 8639"))
