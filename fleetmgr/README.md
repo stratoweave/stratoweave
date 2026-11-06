@@ -161,7 +161,13 @@ page shows a week of every schedule's windows on a calendar and edits the
 schedules themselves: the local time zone, and rules of an opening time, a
 duration and weekdays, typed or dragged on the calendar. The devices page
 shows each device's health and filters on it, and binds devices to a
-schedule, one at a time or a whole filtered selection. A device's page
+schedule, one at a time or a whole filtered selection. Export CSV
+downloads the devices' config as `devices.csv` and Import CSV takes one
+back, pasted, dropped or chosen as a file: one row per device and one
+column per leaf, named by its path in the device entry
+(`credentials/username`); repeated elements take an index
+(`redundancy-group[2]`, `address[2]/name`). Existing devices are updated,
+and an empty cell leaves the leaf as it is. A device's page
 shows the details of its health check, which the top reads from the
 device's flotilla when the page opens (`GET /device-health/<name>`): one
 row per check (BGP, interfaces, OSPF) with the BGP neighbors, the

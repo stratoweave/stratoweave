@@ -7,10 +7,11 @@
   import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
   import FieldText from '#lib/core/ui/FieldText.svelte';
   import Section from '#lib/core/ui/Section.svelte';
-  import { getListEntryPath, restconfDelete, restconfPatchJson } from '#lib/core/restconf/client.ts';
+  import { getListEntryPath, restconfDelete, restconfPatchJson, restconfPatchText } from '#lib/core/restconf/client.ts';
   import { bindPatch, unbindDevice } from '#lib/maintenance/binding.ts';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
   import HealthPill from '#lib/software/HealthPill.svelte';
+  import { DEVICES_CSV_EXAMPLE, devicesCsvToXml, fetchDevicesCsv } from '#lib/software/device-csv.ts';
   import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device, type Schedule } from '#lib/software/model.ts';
   import { nameMatcher, scheduleMatches } from '#lib/software/selection.ts';
   import {
@@ -30,6 +31,9 @@
 
   let draft = $state<NewDeviceInput | null>(null);
   let importOpen = $state(false);
+  let csvOpen = $state(false);
+  let csvText = $state('');
+  let exporting = $state(false);
   let importText = $state('');
   let importType = $state('iosxe');
   let importUsername = $state('');
@@ -234,12 +238,21 @@
   function openNew(): void {
     draft = { name: '', type: 'iosxe', address: '', port: '', username: '', password: '' };
     importOpen = false;
+    csvOpen = false;
     touched = false;
     statusMessage = null;
   }
 
   function openImport(): void {
     importOpen = true;
+    csvOpen = false;
+    draft = null;
+    statusMessage = null;
+  }
+
+  function openCsvImport(): void {
+    csvOpen = true;
+    importOpen = false;
     draft = null;
     statusMessage = null;
   }
@@ -247,7 +260,62 @@
   function closeEditor(): void {
     draft = null;
     importOpen = false;
+    csvOpen = false;
     touched = false;
+  }
+
+  async function readCsvFile(file: File | undefined): Promise<void> {
+    if (file) csvText = await file.text();
+  }
+
+  function handleCsvDrop(event: DragEvent): void {
+    const file = event.dataTransfer?.files[0];
+    if (!file) return;
+    event.preventDefault();
+    readCsvFile(file);
+  }
+
+  async function handleCsvImport(): Promise<void> {
+    statusMessage = null;
+    const result = devicesCsvToXml(csvText, new Set(data.devices.map((d) => d.name)));
+    if (result.errors.length > 0) {
+      statusMessage = {
+        type: 'error',
+        text: `Import not started: ${result.errors.slice(0, 5).join('; ')}${result.errors.length > 5 ? ` (+${result.errors.length - 5} more)` : ''}`
+      };
+      return;
+    }
+    try {
+      saving = true;
+      await restconfPatchText('data', result.xml, 'application/yang-data+xml');
+      statusMessage = { type: 'success', text: `Imported ${result.entries} devices.` };
+      csvText = '';
+      closeEditor();
+      await invalidate('data:software');
+    } catch (importError) {
+      statusMessage = { type: 'error', text: errorText(importError, 'Import failed.') };
+    } finally {
+      saving = false;
+    }
+  }
+
+  /** Download the devices' config as devices.csv. */
+  async function exportCsv(): Promise<void> {
+    try {
+      exporting = true;
+      statusMessage = null;
+      const text = await fetchDevicesCsv();
+      const url = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = 'devices.csv';
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (exportError) {
+      statusMessage = { type: 'error', text: errorText(exportError, 'Export failed.') };
+    } finally {
+      exporting = false;
+    }
   }
 
   function patch(partial: Partial<NewDeviceInput>): void {
@@ -351,6 +419,12 @@
     </p>
   </div>
   <div class="page-actions">
+    <button class="btn btn-secondary" type="button" onclick={exportCsv} disabled={exporting}>
+      {exporting ? 'Exporting…' : 'Export CSV'}
+    </button>
+    <button class="btn btn-secondary" type="button" onclick={openCsvImport} disabled={saving || applying}>
+      Import CSV
+    </button>
     <button class="btn btn-secondary" type="button" onclick={openImport} disabled={saving || applying}>
       Import
     </button>
@@ -496,6 +570,41 @@
           Cancel
         </button>
         <button class="btn btn-primary" type="button" onclick={handleImport} disabled={saving}>
+          {saving ? 'Importing…' : 'Import'}
+        </button>
+      </div>
+    </Section>
+  </section>
+{/if}
+
+{#if csvOpen}
+  <section class="card editor-card">
+    <Section
+      title="Import devices from CSV"
+      description="One row per device under a header of leaf paths, as Export CSV writes it. A repeated element takes an index, e.g. address[2]/address. Existing devices are updated; an empty cell leaves a leaf as it is."
+      yangPath="fleetmgr:fleet/device"
+    >
+      <textarea
+        class="input mono"
+        rows="10"
+        placeholder={`${DEVICES_CSV_EXAMPLE}\ncpe-1,iosxe,192.0.2.11,admin,secret`}
+        bind:value={csvText}
+        ondragover={(e) => e.preventDefault()}
+        ondrop={handleCsvDrop}
+      ></textarea>
+      <div class="editor-actions">
+        <label class="btn btn-ghost csv-file">
+          Choose file
+          <input
+            type="file"
+            accept=".csv,.tsv,text/csv,text/tab-separated-values"
+            onchange={(e) => readCsvFile(e.currentTarget.files?.[0])}
+          />
+        </label>
+        <button class="btn btn-secondary" type="button" onclick={closeEditor} disabled={saving}>
+          Cancel
+        </button>
+        <button class="btn btn-primary" type="button" onclick={handleCsvImport} disabled={saving || !csvText.trim()}>
           {saving ? 'Importing…' : 'Import'}
         </button>
       </div>
@@ -751,6 +860,15 @@
 
   .health-link {
     text-decoration: none;
+  }
+
+  .csv-file {
+    margin-right: auto;
+    cursor: pointer;
+  }
+
+  .csv-file input {
+    display: none;
   }
 
   .mono {
