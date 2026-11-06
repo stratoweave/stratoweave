@@ -14,8 +14,10 @@ import yang.xml as yxml
 import yang.ypatch as ypatch
 
 import netconf
+import netconf.events as ncevents
 import netconf.yp as nyp
 import yp
+import yp.events as ypevents
 from yp.engine import YangPushBackend
 import device as swdev
 import device_schema as swds
@@ -25,6 +27,7 @@ import schema_filter
 from device_schema import DeviceSchema
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig
+import adapters.adapter as swadapt
 from adapters.adapter import \
     DeviceAdapter, ModCap, DISCONNECTED, CONNECTING, CONNECTED, TRANSACTION, \
     NotConnectedError, BusyError, LockedError, TxidMismatchError, ConfigError, \
@@ -43,6 +46,13 @@ NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
 # which some devices count towards locking the account. A change of the
 # settings connects at once.
 RETRY_AFTER_SSH_REFUSAL = 60.0
+
+# The IOS XE native-event stream for the draft establish-subscription dialect.
+# The stream leaf there is an identityref; which module defines the
+# yang-notif-native identity (and so how the value must be prefixed) is pending
+# verification against live XE — until then we send the bare name, resolving in
+# the RPC's default (ietf-event-notifications) namespace.
+XE_STREAM_YANG_NOTIF_NATIVE = "yang-notif-native"
 
 def extract_txid(conf: ?xml.Node) -> ?str:
     """Attempt to extract a txid from configuration
@@ -368,7 +378,7 @@ class _MockPushBackend(YangPushBackend):
         return self._chg(filter)
 
 
-actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[str], bundled_schema: DeviceSchema):
+actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[str], bundled_schema: DeviceSchema, event_hub: ?ypevents.EventStreamHub=None):
     # `capabilities` carries true NETCONF protocol capabilities only.
     # The config root of bundled_schema parses <get-config> filters. The oper
     # root, which holds the config nodes too, parses <get> filters and lists
@@ -396,6 +406,22 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
     # The latest source change is shared by all on-change subscribers.
     var _yp_previous: ?ygdata.Node = None
     var yp_service: ?nyp.NetconfSubscriptionService = None
+    # Event notifications: RFC 5277 create-subscription is served by an event
+    # service over the hub; establish-subscription with a <stream> (the XE draft
+    # dialect for native events, or RFC 8639 event streams) is served here with
+    # ids well above the yang-push service's so delete-subscription routes
+    # unambiguously. The hub may be shared with a second mock session — the
+    # dedicated notification session a driver opens — so injected events reach
+    # whichever session subscribed.
+    def _mk_hub() -> ypevents.EventStreamHub:
+        given = event_hub
+        if given is not None:
+            return given
+        return ypevents.EventStreamHub(log_handler)
+    var hub: ypevents.EventStreamHub = _mk_hub()
+    var notif_service: ?ncevents.NetconfEventService = None
+    var event_sub_rids: dict[int, int] = {}   # establish sub id -> hub receiver id
+    var event_sub_next_id: int = 1000000
 
     # Serve ietf-yang-library only when the device's inventory implements it.
     # Otherwise the modules are advertised as additiona "?module=..." capabilities.
@@ -524,7 +550,30 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
         if op.tag in rpc_overrides:
             _custom_rpc(s, message_id, op)
             return
+        if yp.is_create_subscription(op.tag):
+            nsv = notif_service
+            if nsv is not None:
+                nsv.handle_rpc(message_id, op)
+            else:
+                s.send_error(message_id, "operation-failed", "notification service not ready")
+            return
         if yp.is_subscription_rpc(op.tag):
+            if op.tag == "establish-subscription":
+                est = yp.parse_establish_subscription(op)
+                est_stream = est.stream
+                # The XE dialect spells datastore yang-push with an explicit
+                # <stream>yp:yang-push</stream>; only other streams are event
+                # streams — yang-push must keep flowing to the push service.
+                if est_stream is not None and est_stream.split(":", -1)[-1] != "yang-push":
+                    _event_establish(s, message_id, est_stream, est.subtree_filter, est.xpath_filter)
+                    return
+            elif op.tag == "delete-subscription":
+                del_id = yp.parse_delete_subscription(op)
+                if del_id is not None and del_id in event_sub_rids:
+                    hub.detach(event_sub_rids[del_id])
+                    del event_sub_rids[del_id]
+                    s.send_ok(message_id)
+                    return
             if yp_service is not None:
                 yp_service.handle_rpc(message_id, op)
             else:
@@ -582,19 +631,69 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
         else:
             s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
 
+    def _event_establish(s: netconf.Server, message_id: str, stream_ref: str,
+                         subtree_filter: ?list[xml.Node], xpath_filter: ?str):
+        # An event-stream establish-subscription. The stream may arrive as an
+        # identityref ("notif-bis:yang-notif-native") or plain name; a mock
+        # accepts any stream by its local name. An XE-shaped XPath filter names
+        # a whole notification ("/pfx:verify-event"): match on the local name,
+        # leniently, since the prefix's namespace is not resolved here.
+        stream_name = stream_ref.split(":", -1)[-1]
+        hub.define_stream(stream_name)
+        names: ?list[(?str, str)] = yp.filter_names(subtree_filter)
+        if names is None and xpath_filter is not None:
+            names = [(None, xpath_filter.split("/", -1)[-1].split(":", -1)[-1])]
+        rid = hub.attach((lambda n: s.send_notification(n)), stream_name, names)
+        if rid is not None:
+            sid = event_sub_next_id
+            event_sub_next_id += 1
+            event_sub_rids[sid] = rid
+            s.send_reply(message_id, [yp.build_subscription_id_reply(sid)])
+        else:
+            s.send_error(message_id, "invalid-value", "no such event stream: " + stream_name)
+
+    def _end_event_subscriptions():
+        nsv = notif_service
+        if nsv is not None:
+            nsv.shutdown()
+        for rid in event_sub_rids.values():
+            hub.detach(rid)
+        event_sub_rids = {}
+
     def on_connect(s: netconf.Server, err: ?Exception):
-        # Dynamic subscriptions end with their session (RFC 8639). A client
-        # restart starts a new session on the same pipe (err is None). The end
-        # of the transport sets err.
+        # Dynamic subscriptions end with their session (RFC 8639), and so does
+        # an RFC 5277 subscription. A client restart starts a new session on
+        # the same pipe (err is None). The end of the transport sets err.
         if yp_service is not None:
             yp_service.shutdown()
+        _end_event_subscriptions()
 
     var server: netconf.Server = netconf.Server(pipe=pipe, on_connect=on_connect, on_rpc=on_rpc, log_handler=log_handler, capabilities=all_capabilities)
     yp_service = nyp.NetconfSubscriptionService(server, _MockPushBackend(_yp_prepare_filter, _yp_snapshot, _yp_change), log_handler)
+    notif_service = ncevents.NetconfEventService(server, hub, log_handler)
+
+    def emit_event(payload: xml.Node, stream: str="NETCONF", event_time: ?str=None):
+        """Test hook: emit an event notification to this mock device's
+        subscribers, whichever session and mechanism they subscribed with."""
+        hub.define_stream(stream)
+        hub.publish(payload, stream, event_time)
+
+    def define_stream(name: str):
+        """Test hook: declare an event stream before anything subscribes to it
+        (create-subscription on an unknown stream is rejected, as on a real
+        device)."""
+        hub.define_stream(name)
 
     def send_notification(notification: xml.Node):
         """Send raw notification XML, including malformed updates in client tests."""
         server.send_notification(notification)
+
+    def shutdown_session():
+        """End this session's event subscriptions. Call this when the driver
+        drops the session: closing the client end of an actor pipe does not
+        tell the server end, so the shared hub would keep framing events for
+        a dead pipe."""
+        _end_event_subscriptions()
 
     def set_oper_ds(new_oper_ds: ygdata.Node, schema: ?yschema.DRoot=None):
         """Set the operational datastore (and optionally its schema) for <get>."""
@@ -663,6 +762,23 @@ actor NetconfMockServer(pipe, log_handler: logging.Handler, capabilities: list[s
         """
         rpc_cb = cb
         rpc_overrides = set(overrides)
+
+
+class _Notif5277Channel(object):
+    """One dedicated RFC 5277 notification session: its stream, the session's
+    client, and where it is in its lifecycle ("connecting" | "active"). In
+    mock mode the channel also holds its per-session mock server, so closing
+    the channel can detach that session's receivers from the shared hub."""
+    stream: str
+    client: ?netconf.Client
+    state: str
+    mock: ?NetconfMockServer
+
+    def __init__(self, stream: str):
+        self.stream = stream
+        self.client = None
+        self.state = "connecting"
+        self.mock = None
 
 
 actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc: DeviceMetaConfig, schema_registry: swdev.SchemaRegistry, log_handler: logging.Handler, env: ?Env):
@@ -759,6 +875,22 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
     var yp_spec_subid: dict[ygdata.SubscriptionSpec, int] = {}
     var yp_pending: set[ygdata.SubscriptionSpec] = set()
 
+    # Event notification subscriptions. Owners declare name-keyed NotifSpecs;
+    # the driver reconciles those into channels: dedicated RFC 5277 sessions
+    # (one per stream, since 5277 allows one subscription per session) and
+    # establish-based subscriptions riding the main session (RFC 8639 event
+    # streams, or the XE draft's yang-notif-native for native event modules).
+    # Demux is by qualified notification name — the wire carries no ids for
+    # event streams — so wire filters are only bandwidth optimizations.
+    # _notif_ready gates reconciliation until finish_connect has determined the
+    # dialect; establish state is per-connection like the yp_* maps above.
+    var notif_owners: dict[str, swadapt.NotifOwner] = {}
+    var notif_5277: dict[str, _Notif5277Channel] = {}
+    var notif_estab_ids: dict[str, int] = {}
+    var notif_estab_pending: set[str] = set()
+    var _notif_ready = False
+    var mock_event_hub: ?ypevents.EventStreamHub = None
+
     def _supports_schema_discovery(capabilities: list[str]) -> bool:
         for cap in capabilities:
             if "urn:ietf:params:netconf:capability:yang-library" in cap:
@@ -835,6 +967,13 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 for spec in list(streams.keys()):
                     if streams[spec].active:
                         _yp_ensure(spec)
+            # Establish-based event subscriptions died with the old session;
+            # reconcile re-establishes them (5277 channels are separate
+            # sessions and survive a main-session reconnect).
+            notif_estab_ids = {}
+            notif_estab_pending = set()
+            _notif_ready = True
+            _notif_reconcile()
             dev.on_connect(modset, schema_key)
 
         def list_schemas(c1: netconf.Client, schema_list: list[(identifier: str, namespace: str, version: str, format: str)], error: ?netconf.NetconfError):
@@ -936,6 +1075,19 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 _log.debug("Device._on_connect: connection failed", {"error": str(err)})
             modset = {}
             schema_key = None
+            # Establish-based event subscriptions die with the main session;
+            # owners get the documented channel-trouble cue, and the maps are
+            # cleared so the reconnect's reconcile re-establishes cleanly.
+            if len(notif_estab_ids) > 0 or len(notif_estab_pending) > 0:
+                lost: set[str] = set()
+                for key in notif_estab_ids.keys():
+                    lost.add("estab:" + key)
+                for key in notif_estab_pending:
+                    lost.add("estab:" + key)
+                notif_estab_ids = {}
+                notif_estab_pending = set()
+                _notif_channel_error(lost, NotConnectedError("main session lost"))
+            _notif_ready = False
             if isinstance(err, ssh.AuthenticationError) or isinstance(err, ssh.HostKeyError) or isinstance(err, ssh.KeyExchangeError):
                 after now RETRY_AFTER_SSH_REFUSAL: _retry(c)
             else:
@@ -988,7 +1140,9 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 if cspec in streams and streams[cspec].active:
                     _apply_push_change(cspec, csid, pcu)
             return
-        _log.debug("Notification from device (no matching push-update subscription)")
+        # Anything else on the main session is an event notification (from an
+        # establish-based event subscription).
+        _notif_deliver(n, None)
 
     def set_dmc(new_dmc: DeviceMetaConfig):
         old_g = dmc.to_gdata()
@@ -1011,7 +1165,12 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 and old_g.get_opt_cnt(ygdata.Id(ns, "ssh")) == new_g.get_opt_cnt(ygdata.Id(ns, "ssh"))
                 and old_g.get_opt_cnt(ygdata.Id(ns, "feature-flags")) == new_g.get_opt_cnt(ygdata.Id(ns, "feature-flags"))):
             _log.debug("Device.set_dmc: reconnect required, reconnecting")
-            _connect(new_dmc)
+            # Through close() so the dedicated notification sessions are torn
+            # down too: they hold the old endpoint/credentials (and in mock
+            # mode the old hub) and would otherwise keep delivering from the
+            # old device forever. finish_connect's reconcile reopens them
+            # against the new endpoint.
+            close(lambda: _connect(new_dmc))
         else:
             _log.debug("Device.set_dmc: no reconnect required, keeping client")
         dmc = new_dmc
@@ -1030,6 +1189,10 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             return None
 
     def _connect(new_dmc):
+        # Gate notification reconciliation until this connection's
+        # finish_connect has determined the dialect; a declare landing
+        # mid-handshake must not fire RPCs into a half-open session.
+        _notif_ready = False
         use_mock_server = system_mock or new_dmc.mock.enabled or len(new_dmc.mock.module) > 0
 
         username = new_dmc.credentials.username
@@ -1040,9 +1203,13 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             pipes = netconf.actor_pipe_pair()
             # The mock owns its module-facing output: it derives its module
             # inventory from the bundled schema and serves ietf-yang-library iff
-            # the inventory implements it.
+            # the inventory implements it. The event hub is shared with any
+            # dedicated notification session opened against this mock, so an
+            # emit_event on the main mock reaches subscribers on either session.
             caps = _mock_capabilities_from_dmc(new_dmc)
-            ms = NetconfMockServer(pipes.server, _con_log_handler, caps, bundled_schema)
+            hub = ypevents.EventStreamHub(_con_log_handler)
+            mock_event_hub = hub
+            ms = NetconfMockServer(pipes.server, _con_log_handler, caps, bundled_schema, event_hub=hub)
             mock_server = ms
             _abandon_fetch()
             client = netconf.Client(None,
@@ -1095,6 +1262,14 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         """
         _log.debug("Device.close")
         _abandon_fetch()
+        _notif_ready = False
+        notif_estab_ids = {}
+        notif_estab_pending = set()
+        drop_streams: list[str] = []
+        for stream in notif_5277.keys():
+            drop_streams.append(stream)
+        for stream in drop_streams:
+            _notif_5277_close(stream)
         c = client
         if c is not None:
             client = None
@@ -2122,6 +2297,373 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         else:
             streams[spec] = st
 
+    # ------------------------------------------------------------------
+    # Event notification subscriptions
+    # ------------------------------------------------------------------
+
+    def _is_xe_native_event(name: ygdata.Id) -> bool:
+        # v1 vendor heuristic: IOS XE carries native event modules'
+        # notifications on yang-notif-native (via the draft establish dialect),
+        # while everything else — RFC 6470, trap/syslog conversion — lives on
+        # the RFC 5277 streams.
+        for m in modset.values():
+            if m.namespace == name.q:
+                return m.name.startswith("Cisco-IOS-XE-") and m.name.endswith("-events")
+        return False
+
+    def _notif_collapse() -> (wildcard: bool, netconf_tap: bool):
+        # Overlapping routes would deliver one event once per wire
+        # subscription, because demux is by name. A wildcard spec on a
+        # standard-8639 device makes one unfiltered establish carry every
+        # name, and a spec pinned to the NETCONF stream makes its unfiltered
+        # 5277 session carry them instead.
+        standard_8639 = _yang_push is not None and _yang_push == True and not _yp_event_notifs
+        wildcard = False
+        netconf_tap = False
+        for owner in notif_owners.values():
+            for spec in owner.want:
+                spec_stream = spec.stream
+                if spec_stream is not None:
+                    if spec_stream == yp.STREAM_NETCONF:
+                        netconf_tap = True
+                elif spec.name is None and standard_8639:
+                    wildcard = True
+        return (wildcard=wildcard, netconf_tap=netconf_tap)
+
+    def _notif_route(spec: swadapt.NotifSpec, collapse: (wildcard: bool, netconf_tap: bool)) -> (route: str, name: ?ygdata.Id):
+        # The channel that carries spec's events: "5277:<stream>" for a
+        # dedicated RFC 5277 session, or "estab:<key>" for an
+        # establish-subscription on the main session. A stream pin always
+        # means 5277. Standard-8639 devices use establish on the NETCONF
+        # stream; the XE draft dialect uses it for native event modules;
+        # everything else falls back to 5277 on the NETCONF stream.
+        standard_8639 = _yang_push is not None and _yang_push == True and not _yp_event_notifs
+        xe_dialect = _yang_push is not None and _yang_push == True and _yp_event_notifs
+        spec_stream = spec.stream
+        spec_name = spec.name
+        if spec_stream is not None:
+            return (route="5277:" + spec_stream, name=None)
+        if standard_8639:
+            if collapse.netconf_tap:
+                return (route="5277:" + yp.STREAM_NETCONF, name=None)
+            if spec_name is not None and not collapse.wildcard:
+                return (route="estab:{spec_name.q}#{spec_name.name}", name=spec_name)
+            return (route="estab:*", name=None)
+        if xe_dialect and spec_name is not None and _is_xe_native_event(spec_name):
+            return (route="estab:{spec_name.q}#{spec_name.name}", name=spec_name)
+        return (route="5277:" + yp.STREAM_NETCONF, name=None)
+
+    def _notif_desired() -> (rfc5277_streams: set[str], estab: dict[str, ?ygdata.Id]):
+        # The channels for the union of all owners' specs.
+        collapse = _notif_collapse()
+        rfc5277_streams: set[str] = set()
+        estab: dict[str, ?ygdata.Id] = {}
+        for owner in notif_owners.values():
+            for spec in owner.want:
+                r = _notif_route(spec, collapse)
+                if r.route.startswith("5277:"):
+                    rfc5277_streams.add(r.route[5:])
+                else:
+                    estab[r.route[6:]] = r.name
+        return (rfc5277_streams=rfc5277_streams, estab=estab)
+
+    def _notif_route_active(route: str) -> bool:
+        if route.startswith("5277:"):
+            stream = route[5:]
+            if stream in notif_5277:
+                return notif_5277[stream].state == "active"
+            return False
+        return route[6:] in notif_estab_ids
+
+    def _notif_check_synced():
+        # Tell each owner that still waits once every channel for its specs
+        # is active on the device.
+        collapse = _notif_collapse()
+        for owner_id, owner in notif_owners.items():
+            synced = owner.synced
+            if owner.owed and synced is not None:
+                in_place = True
+                for spec in owner.want:
+                    if not _notif_route_active(_notif_route(spec, collapse).route):
+                        in_place = False
+                if in_place:
+                    owner.owed = False
+                    synced(owner_id)
+
+    def _notif_channel_error(routes: set[str], err: Exception):
+        # Tell the owners with a spec on one of these channels that events
+        # may be missing until the channel recovers. Owners on other channels
+        # are not affected.
+        collapse = _notif_collapse()
+        for owner in notif_owners.values():
+            affected = False
+            for spec in owner.want:
+                if _notif_route(spec, collapse).route in routes:
+                    affected = True
+            if affected:
+                owner.cb(None, err)
+
+    def _notif_reconcile():
+        if not _notif_ready:
+            return
+        desired = _notif_desired()
+        for stream in desired.rfc5277_streams:
+            if stream not in notif_5277:
+                ch = _Notif5277Channel(stream)
+                notif_5277[stream] = ch
+                _notif_5277_connect(stream)
+        drop_streams: list[str] = []
+        for stream in notif_5277.keys():
+            if stream not in desired.rfc5277_streams:
+                drop_streams.append(stream)
+        for stream in drop_streams:
+            _notif_5277_close(stream)
+        for key, est_name in desired.estab.items():
+            if key not in notif_estab_ids and key not in notif_estab_pending:
+                _notif_estab_ensure(key, est_name)
+        drop_keys: list[str] = []
+        for key in notif_estab_ids.keys():
+            if key not in desired.estab:
+                drop_keys.append(key)
+        for key in drop_keys:
+            _notif_estab_delete(key)
+
+    def _notif_5277_connect(stream: str):
+        # Open the dedicated notification session for one 5277 stream. 5277
+        # forces this shape: one subscription per session, no modify/delete,
+        # and without :interleave no other RPCs — so the channel gets its own
+        # session, subscribed wire-unfiltered with client-side name demux.
+        if stream not in notif_5277:
+            return
+        ch = notif_5277[stream]
+        ch.state = "connecting"
+        hub = mock_event_hub
+        if mock_server is not None and hub is not None:
+            pipes = netconf.actor_pipe_pair()
+            caps = _mock_capabilities_from_dmc(dmc)
+            ch.mock = NetconfMockServer(pipes.server, _con_log_handler, caps, bundled_schema, event_hub=hub)
+            ch.client = netconf.Client(None, "dummy-address", 0,
+                dmc.credentials.username, dmc.credentials.password,
+                on_connect=(lambda c, e: _notif_5277_on_connect(stream, c, e)),
+                on_notif=(lambda c, n: _notif_5277_on_notif(stream, c, n)),
+                skip_host_key_check=True,
+                log_handler=_con_log_handler,
+                pipe=pipes.client)
+            return
+        addresses = list(dmc.address)
+        password = dmc.credentials.password
+        if len(addresses) > 0 and env is not None and password is not None:
+            transport = _ssh_transport(dmc)
+            if transport is not None:
+                addr = addresses[0]
+                addr_port = addr.port
+                connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(env.cap)))
+                ch.client = netconf.Client(connect_cap, addr.address,
+                    int(addr_port if addr_port is not None else bigint(830)),
+                    dmc.credentials.username, password,
+                    on_connect=(lambda c, e: _notif_5277_on_connect(stream, c, e)),
+                    on_notif=(lambda c, n: _notif_5277_on_notif(stream, c, n)),
+                    skip_host_key_check=True,
+                    log_handler=_con_log_handler,
+                    ssh_transport=transport)
+
+    def _notif_5277_stale(stream: str, c: netconf.Client) -> bool:
+        if stream in notif_5277:
+            cur = notif_5277[stream].client
+            if cur is not None:
+                return c is not cur
+        return True
+
+    def _notif_5277_on_connect(stream: str, c: netconf.Client, err: ?Exception):
+        if _notif_5277_stale(stream, c):
+            return
+        ch = notif_5277[stream]
+        if err is not None:
+            ch.state = "connecting"
+            _notif_channel_error({"5277:" + stream}, NotConnectedError("notification session lost (stream {stream})"))
+            if isinstance(err, ssh.AuthenticationError) or isinstance(err, ssh.HostKeyError) or isinstance(err, ssh.KeyExchangeError):
+                after now RETRY_AFTER_SSH_REFUSAL: _notif_5277_retry(stream, c)
+            else:
+                after now 5: _notif_5277_retry(stream, c)
+            return
+        def on_sub(cc: netconf.Client, serr: ?netconf.NetconfError):
+            if _notif_5277_stale(stream, cc):
+                return
+            ch2 = notif_5277[stream]
+            if serr is not None:
+                _log.error("Device: create-subscription failed", {"stream": stream, "error": str(serr)})
+                _notif_channel_error({"5277:" + stream}, serr)
+                after now 5: _notif_5277_retry(stream, cc)
+            else:
+                ch2.state = "active"
+                _notif_check_synced()
+        c.create_subscription(on_sub, stream=stream)
+
+    def _notif_5277_retry(stream: str, c: netconf.Client):
+        if _notif_5277_stale(stream, c):
+            return
+        c.restart()
+
+    def _notif_5277_on_notif(stream: str, c: netconf.Client, n: xml.Node):
+        if _notif_5277_stale(stream, c):
+            return
+        _notif_deliver(n, stream)
+
+    def _notif_5277_close(stream: str):
+        if stream in notif_5277:
+            ch = notif_5277[stream]
+            del notif_5277[stream]
+            ch_client = ch.client
+            ch.client = None
+            if ch_client is not None:
+                ch_client.close(None)
+            ch_mock = ch.mock
+            ch.mock = None
+            if ch_mock is not None:
+                # Closing the client pipe does not notify the mock's server
+                # end; detach its receivers so the shared hub stops delivering
+                # into a dead session.
+                ch_mock.shutdown_session()
+
+    def _notif_estab_ensure(key: str, name: ?ygdata.Id):
+        c = client
+        if c is not None:
+            notif_estab_pending.add(key)
+            def on_est(cc: netconf.Client, sid: ?int, err: ?netconf.NetconfError):
+                # Staleness first: a late reply from a replaced session must
+                # not clear the new session's pending marker (that enables a
+                # double establish and duplicate deliveries).
+                if _is_stale(cc):
+                    return
+                notif_estab_pending.discard(key)
+                if err is not None:
+                    _log.error("Device: event establish-subscription failed", {"key": key, "error": str(err)})
+                    _notif_channel_error({"estab:" + key}, err)
+                    # Recovery is the contract: reconcile is idempotent and
+                    # re-ensures any still-desired key absent from both maps.
+                    after now 5: _notif_reconcile()
+                elif sid is not None:
+                    notif_estab_ids[key] = sid
+                    # The spec may have been removed while the establish was in
+                    # flight; reconcile drops a subscription nobody wants.
+                    _notif_reconcile()
+                    _notif_check_synced()
+            if _yp_event_notifs:
+                if name is not None:
+                    # IOS XE matches the XPath against the module prefix it
+                    # advertises; take it from the device schema.
+                    nd = _notif_dnotification(name.q, name.name)
+                    pfx = nd.prefix if nd is not None else "ev"
+                    c.establish_subscription(on_est,
+                        stream=XE_STREAM_YANG_NOTIF_NATIVE,
+                        xpath_filter="/{pfx}:{name.name}",
+                        on_change=True,
+                        dampening_period=0,
+                        event_notifs=True,
+                        xpath_nsdefs=[(pfx, name.q)])
+                else:
+                    # Routing never sends a wildcard here: XE's yang-notif-native
+                    # XPath filter must name a whole notification.
+                    notif_estab_pending.discard(key)
+            else:
+                filt: ?list[xml.Node] = None
+                if name is not None:
+                    filt = [xml.Node(name.name, nsdefs=[(None, name.q)])]
+                c.establish_subscription(on_est, stream=yp.STREAM_NETCONF, subtree_filter=filt)
+
+    def _notif_estab_delete(key: str):
+        if key in notif_estab_ids:
+            sid = notif_estab_ids[key]
+            del notif_estab_ids[key]
+            c = client
+            if c is not None:
+                c.delete_subscription((lambda cc, err: None), sid, event_notifs=_yp_event_notifs)
+
+    def _notif_dnotification(ns: str, tag: str) -> ?yschema.DNotification:
+        s = _oper_schema()
+        if s is not None:
+            for child in s.children:
+                if isinstance(child, yschema.DNotification):
+                    if child.name == tag and child.namespace == ns:
+                        return child
+        return None
+
+    def _notif_decode(nd: yschema.DNotification, payload: xml.Node) -> ?ygdata.Node:
+        # The children of the payload element are the notification's data, as
+        # the children of an rpc-reply are the rpc output's.
+        s = _oper_schema()
+        if s is not None:
+            try:
+                return yxml.from_xml(s, payload, loose=True, root_path=["{nd.module}:{nd.name}"])
+            except Exception as e:
+                _log.debug("Notification decode failed", {"name": "{nd.module}:{nd.name}", "error": str(e)})
+                return None
+        return None
+
+    def _notif_deliver(n: xml.Node, src_stream: ?str):
+        payload = yp.notification_payload(n)
+        if payload is not None:
+            et = yp.notification_event_time(n)
+            # A device may declare the payload's namespace prefixes on the
+            # envelope. Copy those onto the payload so that it reads correctly
+            # on its own. The envelope's default namespace is the RFC 5277
+            # one, so only prefixed declarations apply.
+            own: set[str] = set()
+            for pfx, pfx_ns in payload.nsdefs:
+                if pfx is not None:
+                    own.add(pfx)
+            inherited: list[(?str, str)] = []
+            for env_pfx, env_ns in n.nsdefs:
+                if env_pfx is not None and env_pfx not in own:
+                    inherited.append((env_pfx, env_ns))
+            raw = payload
+            if len(inherited) > 0:
+                raw = xml.Node(payload.tag, inherited + payload.nsdefs, payload.prefix,
+                               payload.attributes, payload.children, payload.text, payload.tail)
+            pns = yp.element_namespace(raw)
+            name = ygdata.Id(pns if pns is not None else "", payload.tag)
+            # Subscription machinery notifications belong to the adapter, not
+            # to owners: 8639/draft subscription-state changes and the 5277
+            # replay/stop markers are consumed here.
+            if name.q == yp.NS_SN or name.q == yp.NS_EN or name.name == "replayComplete" or name.name == "notificationComplete":
+                _log.debug("Consumed subscription control notification", {"name": str(name)})
+                return
+            decoded: ?ygdata.Node = None
+            nd = _notif_dnotification(name.q, name.name)
+            if nd is not None:
+                decoded = _notif_decode(nd, raw)
+            ev = swadapt.NotifEvent(name, et if et is not None else "", decoded, raw)
+            delivered = False
+            for owner in notif_owners.values():
+                if swadapt.notif_want_matches(owner.want, name, src_stream):
+                    delivered = True
+                    owner.cb(ev, None)
+            if not delivered:
+                _log.debug("Notification from device matched no subscriber", {"name": str(name)})
+        else:
+            _log.debug("Notification with no payload", {"notification": n.encode()})
+
+    def declare_notif_subscriptions(owner_id: str, cb: action(?swadapt.NotifEvent, ?Exception) -> None, want: set[swadapt.NotifSpec], synced: ?action(str) -> None=None):
+        notif_owners[owner_id] = swadapt.NotifOwner(cb, want, synced)
+        _notif_reconcile()
+        _notif_check_synced()
+
+    def remove_notif_subscriptions(owner_id: str):
+        if owner_id in notif_owners:
+            del notif_owners[owner_id]
+            _notif_reconcile()
+
+    def notif_status() -> list[swadapt.NotifChannelStatus]:
+        out: list[swadapt.NotifChannelStatus] = []
+        for ch in notif_5277.values():
+            out.append(swadapt.NotifChannelStatus(swadapt.NOTIF_5277, ch.stream, "dedicated", ch.state))
+        estab_stream = XE_STREAM_YANG_NOTIF_NATIVE if _yp_event_notifs else yp.STREAM_NETCONF
+        for key in notif_estab_ids.keys():
+            out.append(swadapt.NotifChannelStatus(swadapt.NOTIF_ESTABLISH, estab_stream, "main", "active"))
+        for key in notif_estab_pending:
+            out.append(swadapt.NotifChannelStatus(swadapt.NOTIF_ESTABLISH, estab_stream, "main", "connecting"))
+        return out
+
     def declare_subscriptions(owner_id: str, cb: proc(?ygdata.Node, ?Exception) -> None, want: set[ygdata.SubscriptionSpec], synced: ?action(str) -> None=None):
         root: ?ygdata.FNode = None
         point: list[ygdata.Id] = []
@@ -2230,6 +2772,15 @@ class NetconfAdapter(DeviceAdapter):
 
     def remove_subscriptions(self, owner_id: str):
         self._driver.remove_subscriptions(owner_id)
+
+    def declare_notif_subscriptions(self, owner_id: str, cb: action(?swadapt.NotifEvent, ?Exception) -> None, want: set[swadapt.NotifSpec], synced: ?action(str) -> None=None):
+        self._driver.declare_notif_subscriptions(owner_id, cb, want, synced)
+
+    def remove_notif_subscriptions(self, owner_id: str):
+        self._driver.remove_notif_subscriptions(owner_id)
+
+    def notif_status(self) -> list[swadapt.NotifChannelStatus]:
+        return self._driver.notif_status()
 
     # TODO: try removing proc. at the time of writing this, it led to crash in CPS
     proc def get_mock_server(self) -> ?NetconfMockServer:
