@@ -10,9 +10,8 @@
   import { setDeviceSchedule } from '#lib/maintenance/binding.ts';
   import {
     STEP_LABEL,
-    deviceStart,
-    type Campaign,
     type CheckResult,
+    type DeviceCampaign,
     type DeviceStatusRow,
     type Step
   } from '#lib/software/model.ts';
@@ -67,24 +66,16 @@
     return () => poller.stop();
   });
 
-  function statusRow(campaign: Campaign) {
-    return campaign.deviceStatus.find((r) => r.device === data.name) ?? null;
-  }
-
-  function campaignHref(campaign: Campaign): string {
+  function campaignHref(campaign: DeviceCampaign): string {
     return `/campaigns/${encodeURIComponent(campaign.name)}`;
   }
 
   /** This device's start in the plan, real once released, else the
    * planner's estimate; "not placed" when the plan has the campaign but
    * no window for it. */
-  function plannedStart(campaign: Campaign): string {
-    if (campaign.plan === null) return '—';
-    for (const w of campaign.plan.windows) {
-      const d = w.devices.find((x) => x.name === data.name);
-      if (d) return formatClock(deviceStart(d));
-    }
-    return campaign.plan.unplaced.includes(data.name) ? 'not placed' : '—';
+  function plannedStart(campaign: DeviceCampaign): string {
+    if (campaign.start === null) return '—';
+    return campaign.start === 'unplaced' ? 'not placed' : formatClock(campaign.start);
   }
 
   /** The checks of the last run that have a verdict. */
@@ -155,10 +146,8 @@
         </p>
       </div>
       {#if single}
-        {@const row = statusRow(data.campaigns[0])}
-        {#if row}
-          <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
-        {/if}
+        {@const row = data.campaigns[0].row}
+        <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
       {/if}
     </div>
 
@@ -166,7 +155,8 @@
       <p class="none">Not a member of any campaign.</p>
     {/if}
     {#each data.campaigns as campaign (campaign.name)}
-      {@const row = statusRow(campaign)}
+      {@const row = campaign.row}
+      {@const text = note(row)}
       <div class="run">
         <div class="run-head">
           <div class="facts">
@@ -180,45 +170,42 @@
             </span>
             <span class="fact">
               <span class="fact-label">Image</span>
-              <span class="mono">{campaign.images[campaign.devices.indexOf(data.name)] || '—'}</span>
+              <span class="mono">{campaign.image || '—'}</span>
             </span>
             <span class="fact">
               <span class="fact-label">Planned start</span>
               <span class="mono">{plannedStart(campaign)}</span>
             </span>
           </div>
-          {#if !single && row}
+          {#if !single}
             <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
           {/if}
         </div>
-        {#if row}
-          {@const text = note(row)}
-          <div class="track"><StageChain {row} large /></div>
-          {#if text}
-            <p class="note">{text}</p>
-          {/if}
-          {#each checks(row) as check (check.step)}
-            {@const verdict = check.result.verdict}
-            <div class="check" class:pass={verdict === 'pass'} class:fail={verdict === 'fail'}>
-              <span class="check-name">{STEP_LABEL[check.step]}</span>
-              <span class="pill verdict" class:success={verdict === 'pass'} class:danger={verdict === 'fail'}>
-                {verdict}
-              </span>
-              <span class="check-detail mono">
-                {#each detailParts(check.result.detail) as part, i (i)}
-                  <span class="part">
-                    {#if part.source}<span class="source">{part.source}</span>{/if}
-                    {part.text}
-                  </span>
-                {/each}
-              </span>
-              {#if check.step === 'precheck' && verdict === 'pass'}
-                <span class="baseline mono" title="The post-check compares against this.">baseline</span>
-              {/if}
-              <span class="at mono">{check.result.at !== null ? formatClock(check.result.at) : ''}</span>
-            </div>
-          {/each}
+        <div class="track"><StageChain {row} large /></div>
+        {#if text}
+          <p class="note">{text}</p>
         {/if}
+        {#each checks(row) as check (check.step)}
+          {@const verdict = check.result.verdict}
+          <div class="check" class:pass={verdict === 'pass'} class:fail={verdict === 'fail'}>
+            <span class="check-name">{STEP_LABEL[check.step]}</span>
+            <span class="pill verdict" class:success={verdict === 'pass'} class:danger={verdict === 'fail'}>
+              {verdict}
+            </span>
+            <span class="check-detail mono">
+              {#each detailParts(check.result.detail) as part, i (i)}
+                <span class="part">
+                  {#if part.source}<span class="source">{part.source}</span>{/if}
+                  {part.text}
+                </span>
+              {/each}
+            </span>
+            {#if check.step === 'precheck' && verdict === 'pass'}
+              <span class="baseline mono" title="The post-check compares against this.">baseline</span>
+            {/if}
+            <span class="at mono">{check.result.at !== null ? formatClock(check.result.at) : ''}</span>
+          </div>
+        {/each}
       </div>
     {/each}
   </section>

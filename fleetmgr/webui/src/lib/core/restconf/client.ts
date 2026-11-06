@@ -114,7 +114,8 @@ export async function restconfGetOrNull<T>(path: string, fetchFn: Fetch = fetch)
 
 // The devices, schedules and new-campaign pages all read the whole fleet,
 // which at 30k devices is 14 MB and 2 s, so one read serves every page
-// opened within READ_CACHE_MS. A write through this client drops the cache
+// opened within READ_CACHE_MS. The device page reads campaign config and
+// plans through it too. A write through this client drops the cache
 // and the Refresh button bypasses it; what others change shows up when the
 // entry expires.
 const READ_CACHE_MS = 30_000;
@@ -123,8 +124,13 @@ const readCache = new Map<string, { at: number; value: Promise<unknown> }>();
 /** `restconfGetOrNull` served from a short-lived cache shared by every page. */
 export function restconfGetCachedOrNull<T>(path: string, fetchFn: Fetch = fetch): Promise<T | null> {
   const key = normalizePath(path);
+  const now = Date.now();
+  // Drop expired reads, so big ones do not pile up.
+  for (const [k, entry] of readCache) {
+    if (now - entry.at >= READ_CACHE_MS) readCache.delete(k);
+  }
   const hit = readCache.get(key);
-  if (hit && Date.now() - hit.at < READ_CACHE_MS) {
+  if (hit) {
     return hit.value as Promise<T | null>;
   }
   const value = restconfGetOrNull<T>(path, fetchFn);
