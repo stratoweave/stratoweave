@@ -1,0 +1,99 @@
+"""GET /device-health/<name>: the health details of one fleet device, read
+from its flotilla when asked. The top relays only healthy or unhealthy; the
+checks' details stay on the flotilla until a page asks for them."""
+
+import http_router
+import json
+
+import yang.gdata as ygdata
+
+import stratoweave.device as swdev
+
+import fleetmgr.cfs as cfs
+import fleetmgr.devices.flotilla_oper as flotilla_oper
+# TODO: required by the compiler, see acton issue #2390
+import yang.identityref
+
+
+def _respond_json(respond: proc(int, dict[str, str], str) -> None, status: int, body: dict[str, ?value]) -> None:
+    respond(status, {"Content-Type": "application/json"}, json.encode(body))
+
+
+def _verdict(health: ?str, detail: ?str) -> dict[str, ?value]:
+    return {"health": health, "detail": detail}
+
+
+def details(name: str, flotilla: str, data: ?ygdata.Node) -> dict[str, ?value]:
+    """The health state the flotilla has for name, as plain JSON."""
+    out: dict[str, ?value] = {"device": name, "flotilla": flotilla}
+    if data is None:
+        return out
+    entry = flotilla_oper.root.from_gdata(data).rfs.get(name)
+    # No health yet: the flotilla has not read the device.
+    if entry is not None and entry.device_health.state.health is not None:
+        s = entry.device_health.state
+        out["health"] = s.health
+        out["since"] = s.since
+        checks: list[?value] = []
+        for c in s.check:
+            checks.append({"name": c.name, "health": c.health,
+                           "precheck": _verdict(c.precheck.health, c.precheck.detail),
+                           "postcheck": _verdict(c.postcheck.health, c.postcheck.detail),
+                           "baseline-at": c.baseline_at})
+        out["checks"] = checks
+        neighbors: list[?value] = []
+        for n in s.bgp.neighbor:
+            neighbors.append({"address": n.address, "session-state": n.session_state,
+                              "advertised": n.advertised, "received": n.received})
+        bgp: dict[str, ?value] = {"neighbors": neighbors}
+        b = s.bgp.baseline
+        if b.established is not None:
+            bgp["baseline"] = {"established": b.established, "advertised": b.advertised}
+        out["bgp"] = bgp
+        interfaces: list[?value] = []
+        for i in s.interfaces.interface:
+            interfaces.append({"name": i.name, "admin-status": i.admin_status,
+                               "oper-status": i.oper_status, "up-at-baseline": i.up_at_baseline})
+        out["interfaces"] = interfaces
+        ospf: list[?value] = []
+        for n in s.ospf.neighbor:
+            ospf.append({"neighbor-id": n.neighbor_id, "interface": n.interface, "address": n.address,
+                         "state": n.state, "state-at-baseline": n.state_at_baseline})
+        out["ospf"] = ospf
+    return out
+
+
+actor HealthApi(devices: swdev.DeviceRegistry):
+    def get(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None) -> None:
+        name = ctx.param("name")
+        flotilla = cfs.flotilla_of(name)
+        state = flotilla_oper.subs.rfs.entry(name).device_health.state.filt()
+        filt = ygdata.FNode(children=[state] if state is not None else [])
+
+        def on_get(data: ?ygdata.Node, error: ?Exception) -> None:
+            if error is not None:
+                _respond_json(respond, 502, {"error": "could not read {flotilla}: {error}"})
+                return
+            try:
+                _respond_json(respond, 200, details(name, flotilla, data))
+            except Exception as e:
+                _respond_json(respond, 500, {"error": str(e)})
+
+        dev = devices.get(flotilla)
+        if dev is not None:
+            dev.get(on_get, filt)
+        else:
+            _respond_json(respond, 404, {"error": "no {flotilla} for {name}"})
+
+
+def install(router: http_router.Router, devices: swdev.DeviceRegistry) -> None:
+    """Add the /device-health route to router.
+
+    The handler only sends the request on to the api actor, so the HTTP
+    server does not wait for the flotilla."""
+    api = HealthApi(devices)
+
+    def get(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        api.get(ctx, respond)
+
+    router.get("/device-health/{{name}}", get)
