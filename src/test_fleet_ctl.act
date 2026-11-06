@@ -24,11 +24,12 @@ def controller(windows: list[(str, int, int)], devs: list[(str, int, str)], targ
                maxc: int, must_place: bool=False, debounce: int=0,
                estimate: int=600, groups: dict[str, list[str]]={},
                priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
-               rung: int=1, close_margin: int=fleet_ctl.CLOSE_MARGIN) -> Controller:
+               rung: int=1, close_margin: int=fleet_ctl.CLOSE_MARGIN,
+               stagger: int=0) -> Controller:
     """A controller at the start of a run."""
     c = Controller()
     c.configure(windows, devs, target, maxc, must_place, debounce, estimate, groups, priority,
-                separation, close_margin)
+                separation, close_margin, stagger)
     c.start(rung)
     return c
 
@@ -258,16 +259,61 @@ def plan_is_run(windows: list[(str, int, int)], devs: list[(str, int, str)], tar
                 maxc: int, must_place: bool, estimate: int,
                 groups: dict[str, list[str]]={}, priority: dict[str, int]={},
                 separation: dict[str, (bool, int)]={},
-                close_margin: int=fleet_ctl.CLOSE_MARGIN) -> list[int]:
+                close_margin: int=fleet_ctl.CLOSE_MARGIN, stagger: int=0) -> list[int]:
     """Run on the expected durations, the controller starts every device
     in the window and at the time its first plan said. Return how many
     devices the first plan puts in each window that has devices."""
     c = controller(windows, devs, target, maxc, must_place, 1, estimate, groups, priority,
-                   separation, close_margin=close_margin)
+                   separation, close_margin=close_margin, stagger=stagger)
     p = c.plan(0)
     sim.drive(c, 0, {}, 30 * DAY)
     testing.assertEqual(sim.started(c), sim.planned(c, p))
     return [len(w.3) for w in c.layout(p)]
+
+
+def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
+                       late: int=0) -> int:
+    """Run c the way the campaign actor does, each decision late seconds
+    after its time, next to a copy of it that plans at every decision.
+    Each decision of c starts the same devices, wakes at the same time and
+    has the same plan as the copy's. Return how many decisions of c took
+    the last plan again."""
+    d = c.copy()
+    flying: list[(int, str)] = []
+    again = 0
+    t = 0
+    while t <= until:
+        still: list[(int, str)] = []
+        for f in flying:
+            if f.0 <= t:
+                c.report(f.1, "succeeded", f.0)
+                d.report(f.1, "succeeded", f.0)
+            else:
+                still.append(f)
+        flying = still
+        if c.last_plan is not None and c.quiet_from <= t and t < c.quiet_until:
+            again += 1
+        d.quiet_until = 0
+        s = c.decide(t)
+        n = d.decide(t)
+        testing.assertEqual(s.started, n.started, "started at {t}")
+        testing.assertEqual(s.wake, n.wake, "wake at {t}")
+        testing.assertEqual(s.finished, n.finished, "finished at {t}")
+        testing.assertEqual(s.plan.c, n.plan.c, "concurrency at {t}")
+        testing.assertEqual(s.plan.starts, n.plan.starts, "plan at {t}")
+        testing.assertEqual(s.plan.alarms, n.plan.alarms, "alarms at {t}")
+        for name in s.started:
+            flying.append((t + dur_of.get_def(name, c.est.get_def(name, 1)), name))
+        if s.finished:
+            break
+        nxt = s.wake
+        for f in flying:
+            if nxt < 0 or f.0 + c.debounce < nxt:
+                nxt = f.0 + c.debounce
+        if nxt < 0:
+            break
+        t = nxt + late
+    return again
 
 
 def _test_the_plan_is_the_run_uniform():
@@ -282,6 +328,45 @@ def _test_the_plan_is_the_run_at_a_close_margin_of_200_percent():
     sizes = plan_is_run(daily("day", 0, HOUR, 9), devices("d", 100, 600, "day"), 10, 10, False,
                         600, close_margin=200)
     testing.assertEqual(sizes, [25, 40, 35])
+
+
+def _test_the_plan_is_the_run_at_a_stagger():
+    """100 devices of 600 s in a 1 h window every day, 10 at once,
+    staggered over a whole upgrade: one start a minute. A window fills
+    over ten minutes, so the windows take 30, 45 and 25 devices, not 35,
+    50 and 15."""
+    sizes = plan_is_run(daily("day", 0, HOUR, 9), devices("d", 100, 600, "day"), 10, 10, False,
+                        600, stagger=100)
+    testing.assertEqual(sizes, [30, 45, 25])
+
+
+def _test_a_decision_that_takes_the_last_plan_again_decides_as_a_new_plan():
+    """60 devices of 600 s in a 1 h window every day, 5 at once and at most
+    10. Their upgrades take 85 to 115 percent of the estimate, or every
+    fifth one twice the estimate. Staggered, the decisions in which only
+    devices start take the last plan again, and decide as a new plan
+    would. A decision that comes a second or two late plans anew."""
+    scatter: dict[str, int] = {}
+    tail: dict[str, int] = {}
+    for i in range(60):
+        scatter["d{i}"] = 600 * (85 + (i * 7) % 31) // 100
+        tail["d{i}"] = 1200 if i % 5 == 4 else 600
+    # (stagger, upgrade times, how late each decision comes)
+    cases = [
+        (100, scatter, 0),
+        (25, scatter, 0),
+        (100, tail, 0),
+        (25, tail, 0),
+        (25, scatter, 1),
+        (100, tail, 2),
+    ]
+    for case in cases:
+        c = controller(daily("day", 0, HOUR, 9), devices("d", 60, 600, "day"), 5, 10, False, 1,
+                       stagger=case.0)
+        again = same_as_a_new_plan(c, case.1, 9 * DAY, case.2)
+        if case.2 == 0:
+            testing.assertTrue(again > 0,
+                               "stagger {case.0}: {again} decisions took the plan again")
 
 
 def _test_the_plan_is_the_run_mixed():
@@ -768,6 +853,136 @@ def _test_a_device_fits_with_its_close_margin_left():
             expect = ["x"] if late == 0 else []
             testing.assertEqual(c.decide(t).started, expect,
                                 "close margin {case.0}, {10000 - t} s left")
+
+
+def _test_the_stagger_spreads_the_starts_when_a_window_opens():
+    """Four devices of 600 s, three at a time with the ramp at three,
+    staggered over a quarter of an upgrade: three starts in 150 s, one
+    every 50 s, in a window that opens at 1000. The time before the window
+    opened gives no extra starts. Once no slot is left, the next decision
+    is when an upgrade is expected to end. The decisions at 1050 and 1100
+    take the plan of 1000 again: each comes on the stagger's turn, and
+    before d0 is due at 1600 only starts happen. A decision a second after
+    a turn would plan anew."""
+    c = controller([("w", 1000, fleet_ctl.OPEN_END)], devices("d", 4, 600, "w"), 3, 3, rung=3,
+                   stagger=25)
+    cases = [
+        (0, [], 1000, 1000),
+        (1000, ["d0"], 1050, 1051),
+        (1050, ["d1"], 1100, 1101),
+        (1100, ["d2"], 1600, 1600),
+    ]
+    for case in cases:
+        s = c.decide(case.0)
+        testing.assertEqual(s.started, case.1, "started at {case.0}")
+        testing.assertEqual(s.wake, case.2, "wake at {case.0}")
+        testing.assertEqual(c.quiet_until, case.3, "quiet until, at {case.0}")
+    c.report("d0", "succeeded", 1600)
+    testing.assertEqual(c.quiet_until, 0)
+    testing.assertEqual(c.decide(1600).started, ["d3"])
+
+
+def _test_a_stagger_starts_several_devices_in_a_second():
+    """Ten devices of 600 s, ten at a time with the ramp at ten, staggered
+    over 1 percent of an upgrade: ten starts in 6 s, one every 0.6 s. Each
+    second starts the devices whose turn falls in it."""
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devices("d", 10, 600, "w"), 10, 10,
+                   rung=10, stagger=1)
+    cases = [
+        (0, 2, 1),
+        (1, 2, 2),
+        (2, 1, 3),
+        (3, 2, 4),
+        (4, 2, 5),
+        (5, 1, 600),
+    ]
+    for case in cases:
+        s = c.decide(case.0)
+        testing.assertEqual(len(s.started), case.1, "started at {case.0}")
+        testing.assertEqual(s.wake, case.2, "wake at {case.0}")
+
+
+def _test_the_stagger_follows_the_concurrency():
+    """Six devices of 600 s with the ramp at six, staggered over half an
+    upgrade. At a concurrency of three, the starts are 100 s apart: d0
+    starts at 0, and the next device may start at 100. A target of six
+    halves the time between starts at once: d1 may start at 50."""
+    wins = [("w", 0, fleet_ctl.OPEN_END)]
+    devs = devices("d", 6, 600, "w")
+    c = controller(wins, devs, 3, 3, rung=6, stagger=50)
+    s = c.decide(0)
+    testing.assertEqual((s.started, s.wake), (["d0"], 100))
+    c.configure(wins, devs, 6, 6, False, 0, 600, stagger=50)
+    cases = [
+        (25, [], 50),
+        (50, ["d1"], 100),
+        (100, ["d2"], 150),
+    ]
+    for case in cases:
+        s = c.decide(case.0)
+        testing.assertEqual(s.started, case.1, "started at {case.0}")
+        testing.assertEqual(s.wake, case.2, "wake at {case.0}")
+
+def _test_a_decision_after_the_stagger_wake_plans_anew_and_catches_up():
+    """Three devices of 600 s in a window from 1000 to 2000, three at a
+    time and at most six, staggered over a quarter of an upgrade: one
+    start every 50 s. A device must start by 1100 to have its close
+    margin. The decision at 1000 starts d0 and asks to decide again at
+    1050. That decision comes a second late, at 1051: it plans anew, and d1
+    starts as of its turn at 1050. So d2 can still start at 1100, and the
+    plan keeps three at once and d2 its window."""
+    c = controller([("w", 1000, 2000)], devices("d", 3, 600, "w"), 3, 6, rung=3, stagger=25)
+    s = c.decide(1000)
+    testing.assertEqual((s.started, s.wake, c.quiet_until), (["d0"], 1050, 1051))
+    s = c.decide(1051)
+    testing.assertEqual((s.started, s.wake, s.plan.c), (["d1"], 1100, 3))
+    s = c.decide(1100)
+    testing.assertEqual((s.started, s.plan.alarms), (["d2"], []))
+
+
+def _test_the_stagger_does_not_hold_devices_that_reported_before_their_release():
+    """Five devices that report up to date before their release, then
+    three of 600 s, three at a time with the ramp at three, staggered over
+    a whole upgrade: 200 s from one start to the next. They report at 0
+    and the run starts at 10. The five run no upgrade, so the stagger does
+    not hold them: they start as fast as the ramp allows, and r0 starts
+    with the last two. Then r1 and r2 follow 200 s apart."""
+    wins = [("w", 0, fleet_ctl.OPEN_END)]
+    c = controller(wins, devices("u", 5, 600, "w") + devices("r", 3, 600, "w"), 3, 3, rung=3,
+                   stagger=100)
+    for i in range(5):
+        c.report("u{i}", "up-to-date", 0)
+    cases = [
+        (10, ["u0", "u1", "u2"], 11),
+        (11, ["u3", "u4", "r0"], 12),
+        (12, [], 211),
+        (211, ["r1"], 411),
+        (411, ["r2"], 611),
+    ]
+    for case in cases:
+        s = c.decide(case.0)
+        testing.assertEqual(s.started, case.1, "started at {case.0}")
+        testing.assertEqual(s.wake, case.2, "wake at {case.0}")
+
+
+def _test_a_report_of_a_device_no_longer_in_the_campaign_ends_the_quiet():
+    """x and four devices of 600 s, two at a time, staggered over a whole
+    upgrade: 300 s from one start to the next. x starts and then leaves
+    the campaign. Its report at 450 counts at 451 and takes the pace to
+    525 s, so the gap after d0 shrinks to 262 s. The plan at 450 ends its
+    quiet at 451, and the decision at 500 plans anew: d1 may start at 562,
+    not 600."""
+    wins = [("w", 0, fleet_ctl.OPEN_END)]
+    devs = devices("x", 1, 600, "w") + devices("d", 4, 600, "w")
+    c = controller(wins, devs, 2, 2, debounce=1, rung=2, stagger=100)
+    testing.assertEqual(c.decide(0).started, ["x0"])
+    c.configure(wins, devs[1:], 2, 2, False, 1, 600, stagger=100)
+    testing.assertEqual(c.decide(300).started, ["d0"])
+    c.report("x0", "succeeded", 450)
+    s = c.decide(450)
+    testing.assertEqual((s.started, s.wake, c.quiet_until), ([], 600, 451))
+    s = c.decide(500)
+    testing.assertEqual((s.started, s.wake, s.plan.starts.get("d1")), ([], 562, (0, 562)))
 
 
 def _test_a_new_close_margin_takes_effect():

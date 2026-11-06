@@ -23,6 +23,9 @@ ALARM_NAMES = 5
 # How many times plan() runs ahead until its promises stop changing.
 PLAN_ROUNDS = 3
 
+# Microseconds in a second: the stagger times the starts in them.
+MICRO = 1000000
+
 
 def is_final(status: ?str) -> bool:
     """True when the status ends an upgrade attempt."""
@@ -72,6 +75,13 @@ def imax(a: int, b: int) -> int:
     if a > b:
         return a
     return b
+
+
+def earliest(a: int, b: int) -> int:
+    """The earlier of the times a and b, where -1 is no time."""
+    if a < 0 or (b >= 0 and b < a):
+        return b
+    return a
 
 
 # TODO: upstream, as a heapq module in the standard library.
@@ -200,7 +210,15 @@ class Controller(object):
     concurrency rises, the ramp follows it as devices finish. A failed
     upgrade does not grow the ramp. Then it starts waiting devices, window
     by window in the order the windows open, while fewer devices than the
-    ramp are in flight. A window starts only a device that is ready and
+    ramp are in flight. With a stagger, a device that starts holds the
+    next start back by the stagger's percent of its expected upgrade time,
+    divided by the concurrency. So as many devices as the concurrency
+    start over that part of an upgrade, also when a window opens with room
+    for many, and the starts go faster in a larger campaign. At 100 percent
+    the starts can go as fast as devices end on average; below it they can
+    also catch up when more devices end at once. The stagger does not hold
+    a device that reported before its release: it runs no upgrade. A
+    window starts only a device that is ready and
     that has its close margin left before the window closes: its slow
     time times the close margin, one and a half by default. A device that
     has not reported when a fifth of its upgrade has passed since the
@@ -208,8 +226,9 @@ class Controller(object):
     late: it is expected to take one more upgrade from then. Before that,
     a plan expects it to end at the next decision. The next decision is
     when the next report counts, when an upgrade is expected to end and
-    its report to count, when a device is late, or at the next opening or
-    close of a window with devices waiting.
+    its report to count, when a device is late, at the next opening or
+    close of a window with devices waiting, or when the stagger lets a
+    waiting device start.
 
     Devices in a redundancy group back each other up, so the members of a
     group upgrade one at a time, lower priority first and equal priorities
@@ -326,6 +345,9 @@ class Controller(object):
     # How much of its slow time a device must have left before a window
     # closes to start there, in percent.
     close_margin: int
+    # The time over which as many devices as the concurrency start, in
+    # percent of the expected upgrade time; 0 starts them at once.
+    stagger: int
 
     # Derived from the configuration and the state by rebuild().
     # Per window: the devices that can start in it, in order and by
@@ -376,6 +398,12 @@ class Controller(object):
     due: dict[str, int]
     # The devices of the campaign in flight.
     flying: set[str]
+    # The devices in flight without a report, by when their upgrade is
+    # expected to end: a heap of (due, name). An entry is stale once its
+    # device reported, is done, or is due at another time. The devices
+    # that left the heap because their report would have counted by now.
+    dues: list[(int, str)]
+    overdue: set[str]
     done_at: dict[str, int]
     # The window promised to each waiting device during a run, and the
     # order of the promises.
@@ -397,6 +425,20 @@ class Controller(object):
     # How many devices the ramp lets be in flight.
     rung: int
     c: int
+    # When the last device started, in microseconds, -1 before the first,
+    # and its estimate. The stagger lets the next device start a gap after
+    # it. held is true when the last step had slots free and a device that
+    # the stagger held.
+    last_start: int
+    last_est: int
+    held: bool
+    # The last plan when a decision can take it again: made during a run,
+    # with its promises settled and no alarm. From the step at quiet_from
+    # until quiet_until the run ahead only starts devices; anything that
+    # comes in ends that time.
+    last_plan: ?Plan
+    quiet_from: int
+    quiet_until: int
 
     def __init__(self):
         self.windows = []
@@ -417,6 +459,7 @@ class Controller(object):
         self.must_place = False
         self.debounce = 0
         self.close_margin = CLOSE_MARGIN
+        self.stagger = 0
         self.estimate_s = 1
         self.queue = []
         self.by_est = []
@@ -444,6 +487,8 @@ class Controller(object):
         self.released_est = {}
         self.due = {}
         self.flying = set()
+        self.dues = []
+        self.overdue = set()
         self.done_at = {}
         self.promised = {}
         self.promise_seq = {}
@@ -456,34 +501,43 @@ class Controller(object):
         self.slow_s = 1
         self.rung = 1
         self.c = 1
+        self.last_start = -1
+        self.last_est = 0
+        self.held = False
+        self.last_plan = None
+        self.quiet_from = 0
+        self.quiet_until = 0
 
     def configure(self, windows: list[(str, int, int)], devices: list[(str, int, str)],
                   target: int, maxc: int, must_place: bool, debounce: int,
                   estimate_s: int, groups: dict[str, list[str]]={},
                   priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
-                  close_margin: int=CLOSE_MARGIN) -> None:
+                  close_margin: int=CLOSE_MARGIN, stagger: int=0) -> None:
         """Take the windows the schedules give, the devices as (name,
         estimated duration, schedule) in the order they start, the target
         and the max concurrency, whether every device must start in a
         window, the debounce in seconds, the campaign's estimated
         duration, the redundancy groups of the devices as their members,
         the priority of each device, per group whether it spreads and its
-        min-separation in seconds, and the close margin in percent of the
-        slow time. A group without a separation packs with none. New
-        limits start the concurrency over at the target, and the ramp at
-        most at the target. New limits keep the last upgrade times, and
-        the pace and the slow time are taken from them again."""
+        min-separation in seconds, the close margin in percent of the slow
+        time, and the stagger in percent of the expected upgrade time. A
+        group without a separation packs with none. New limits start the
+        concurrency over at the target, and the ramp at most at the target.
+        New limits keep the last upgrade times, and the pace and the slow
+        time are taken from them again."""
         m = imax(target, maxc)
         e = imax(1, estimate_s)
         margin = imax(100, close_margin)
+        st = imax(0, stagger)
         same_groups = False
         if groups == self.groups and priority == self.priority and separation == self.separation:
             same_groups = True
         if windows == self.current and devices == self.devices and target == self.target \
            and m == self.maxc and must_place == self.must_place \
            and debounce == self.debounce and e == self.estimate_s and same_groups \
-           and margin == self.close_margin:
+           and margin == self.close_margin and st == self.stagger:
             return
+        self.quiet_until = 0
         retarget = target != self.target
         if retarget or m != self.maxc:
             self.c = target
@@ -496,6 +550,7 @@ class Controller(object):
             self.observed_s = imax(1, self.took_sum // self.pace_count())
             self.take_slow()
             self.estimate_s = e
+        self.stagger = st
         self.current = windows
         self.devices = devices
         self.order = [d.0 for d in devices]
@@ -521,8 +576,8 @@ class Controller(object):
     def start(self, rung: int=1, observed_s: ?int=None) -> None:
         """Begin a run: nothing is released or promised, the observed
         pace is observed_s or else the campaign's estimate, the ramp is at
-        rung devices and the concurrency at the target. The reports and
-        the configuration stay."""
+        rung devices, the concurrency at the target, and a device may start
+        now. The reports and the configuration stay."""
         self.running = True
         self.released = set()
         self.released_at = {}
@@ -537,6 +592,9 @@ class Controller(object):
         self.set_pace(imax(1, observed_s) if observed_s is not None else self.estimate_s)
         self.rung = rung
         self.c = self.target
+        self.last_start = -1
+        self.held = False
+        self.quiet_until = 0
         self.rebuild()
 
     def set_pace(self, pace: int) -> None:
@@ -586,6 +644,7 @@ class Controller(object):
         self.running = False
         self.promised = {}
         self.promise_seq = {}
+        self.quiet_until = 0
         self.rebuild()
 
     def resume(self, name: str, at: int, win: (str, int, int)) -> None:
@@ -595,6 +654,7 @@ class Controller(object):
         i = self.index.get(win)
         if i is not None:
             self.release(name, at, i)
+            self.quiet_until = 0
 
     def rebuild(self) -> None:
         """Derive the windows, queues and counts from the configuration
@@ -688,6 +748,9 @@ class Controller(object):
         self.spreads = spreads
         self.promised = promised
         self.flying = flying
+        self.dues = sorted([(self.due[name], name) for name in flying
+                            if name not in self.reported])
+        self.overdue = set()
         self.devices_done = devices_done
 
     def report(self, name: str, status: ?str, at: int) -> None:
@@ -701,13 +764,16 @@ class Controller(object):
                 self.final_status[name] = status
                 if name in self.released and name not in self.done_at:
                     self.reported.add(name)
-            elif not is_failure(status):
+                self.quiet_until = 0
+            elif not is_failure(status) and self.final_status[name] != status:
                 self.final_status[name] = status
+                self.quiet_until = 0
             if name in self.failed and not is_failure(status):
                 self.failed.discard(name)
                 # The min-separation of its groups counts from the success.
                 self.done_at[name] = imax(self.done_at[name], at)
                 self.wake_members(name)
+                self.quiet_until = 0
         elif name in self.final_at:
             self.lost(name)
 
@@ -717,12 +783,18 @@ class Controller(object):
             del self.final_at[name]
             del self.final_status[name]
             self.reported.discard(name)
+            if name in self.flying:
+                heap_push(self.dues, (self.due[name], name))
+            self.quiet_until = 0
 
     def lost_all(self) -> None:
         """Forget the status of every device."""
         self.final_at = {}
         self.final_status = {}
         self.reported = set()
+        self.dues = sorted([(self.due[name], name) for name in self.flying])
+        self.overdue = set()
+        self.quiet_until = 0
 
     def set_live(self, name: str, live: bool) -> None:
         """Take whether a device is up. A member of a redundancy group
@@ -731,8 +803,10 @@ class Controller(object):
             if name in self.down:
                 self.down.discard(name)
                 self.wake_members(name)
-        else:
+                self.quiet_until = 0
+        elif name not in self.down:
             self.down.add(name)
+            self.quiet_until = 0
 
     def separation_of(self, g: str) -> int:
         """The min-separation of group g: the time from when one member is
@@ -869,6 +943,8 @@ class Controller(object):
             self.waiting[j] -= 1
         if name in self.final_at:
             self.reported.add(name)
+        elif name in self.est:
+            heap_push(self.dues, (self.due[name], name))
 
     def move_promises(self, t: int) -> None:
         """Promise the devices still waiting for a window that has closed,
@@ -913,11 +989,12 @@ class Controller(object):
             self.pqueue[j] = merged
             self.pcur[j] = imin(self.pcur[j], first)
 
-    def fill(self, i: int, t: int, slots: int, started: list[str]) -> int:
+    def fill(self, i: int, t: int, slots: int, started: list[str], c: int) -> int:
         """Start devices in the open window i at time t, at most slots of
-        them: first the devices promised to it, in the order of the
-        promises, then the ones promised no window, the ones looked at
-        again first. Return the slots left. A device that does not fit is
+        them, at concurrency c: first the devices promised to it, in the
+        order of the promises, then the ones promised no window, the ones
+        looked at again first. Return the slots left, 0 when the stagger
+        holds the next device. A device that does not fit is
         not looked at again in this window until the slow time falls; one
         that waits for its groups is looked at again when they let it
         start."""
@@ -943,33 +1020,34 @@ class Controller(object):
         while a < len(mine) or (n > 0 and k < len(q)):
             if a < len(mine) and (n == 0 or k >= len(q)
                                   or mine[a].0 < self.promise_seq.get_def(q[k], 0)):
-                n = self.try_start(mine[a].1, i, t, end, n, started)
+                n = self.try_start(mine[a].1, i, t, end, n, started, c)
                 a += 1
             else:
                 name = q[k]
                 k += 1
                 if self.promise(name, t) == i:
-                    n = self.try_start(name, i, t, end, n, started)
+                    n = self.try_start(name, i, t, end, n, started, c)
         self.pcur[i] = k
         for name in again:
             if self.promise(name, t) < 0:
-                n = self.try_start(name, i, t, end, n, started)
+                n = self.try_start(name, i, t, end, n, started, c)
         q = self.queue[i]
         k = self.qcur[i]
         while n > 0 and k < len(q):
             name = q[k]
             k += 1
             if self.promise(name, t) < 0:
-                n = self.try_start(name, i, t, end, n, started)
+                n = self.try_start(name, i, t, end, n, started, c)
         self.qcur[i] = k
         return n
 
     def try_start(self, name: str, i: int, t: int, end: int, n: int,
-                  started: list[str]) -> int:
+                  started: list[str], c: int) -> int:
         """Start the device name in window i at t if it waits, its groups
-        let it start and it fits. Park it while it must wait for its
-        groups, and keep it until its separation has passed. Return the
-        slots left."""
+        let it start, it fits and the stagger at concurrency c lets it
+        start. Park it while it must wait for its groups, and keep it until
+        its separation has passed. Return the slots left, 0 when the
+        stagger holds it."""
         if name in self.released:
             return n
         if n == 0:
@@ -984,6 +1062,16 @@ class Controller(object):
             heap_push(self.timed, (at, name))
             return n
         if self.fits(name, t, end):
+            # A device that reported before its release runs no upgrade: the
+            # stagger does not hold it, and it holds no start back.
+            if self.stagger > 0 and name not in self.final_at:
+                first = self.first_start(t, c)
+                if first >= (t + 1) * MICRO:
+                    # Look at it again when the stagger lets it start.
+                    self.retry[i].append(name)
+                    return 0
+                self.last_start = first
+                self.last_est = self.est.get_def(name, self.estimate_s)
             self.release(name, t, i)
             started.append(name)
             return n - 1
@@ -1046,6 +1134,26 @@ class Controller(object):
             self.pcur = [0 for _w in self.windows]
         return succeeded
 
+    def start_gap(self, est: int, c: int) -> int:
+        """The time from the start of a device with estimate est to the
+        next start at concurrency c, in microseconds: the stagger's part of
+        the device's expected upgrade time, divided by c."""
+        expected = imax(1, est * self.observed_s // self.estimate_s)
+        return self.stagger * expected * (MICRO // 100) // imax(1, c)
+
+    def first_start(self, t: int, c: int) -> int:
+        """The time from which the stagger at concurrency c lets a device
+        start at the second t, in microseconds: a gap after the last start,
+        and not before t. When the last step held a device, a step that
+        comes later than its turn starts it as of its turn, so the devices
+        whose turn has passed all start at t."""
+        if self.last_start < 0:
+            return t * MICRO
+        nxt = self.last_start + self.start_gap(self.last_est, c)
+        if self.held:
+            return nxt
+        return imax(t * MICRO, nxt)
+
     def step(self, t: int, c: int) -> (list[str], int, bool):
         """Decide at time t at concurrency c: take the reports that count,
         grow the ramp, start what fits, and say when to decide next.
@@ -1058,6 +1166,10 @@ class Controller(object):
         self.move_promises(t)
         started: list[str] = []
         slots = imin(self.rung, c) - len(self.flying)
+        n = slots
+        # True when the stagger holds back devices that wait in an open
+        # window while slots are left.
+        held_back = False
         wake = -1
         for i in range(len(self.windows)):
             if self.waiting[i] == 0:
@@ -1067,29 +1179,92 @@ class Controller(object):
                 if wake < 0 or win.1 < wake:
                     wake = win.1
             elif t < win.2:
-                if slots > 0:
-                    slots = self.fill(i, t, slots, started)
+                if n > 0:
+                    n = self.fill(i, t, n, started, c)
+                if self.stagger > 0 and n <= 0 and len(started) < slots \
+                   and self.waiting[i] > 0:
+                    held_back = True
                 if win.2 != OPEN_END and self.waiting[i] > 0:
                     if wake < 0 or win.2 < wake:
                         wake = win.2
         if len(self.timed) > 0 and (wake < 0 or self.timed[0].0 < wake):
             wake = self.timed[0].0
-        for name in self.flying:
-            if name in self.reported:
-                # Its report counts one debounce after it came.
-                w = imax(self.final_at[name] + self.debounce, t + 1)
-            else:
-                if self.late_at(name) < t:
-                    # Late: one more upgrade from now.
-                    self.due[name] = t + self.duration(name)
-                # When its report counts if it comes when expected, or
-                # else, once that has passed, when it is late.
-                w = self.due[name] + self.debounce
-                if w <= t:
-                    w = self.late_at(name) + 1
-            if wake < 0 or w < wake:
-                wake = w
+        # Until quiet the run ahead only starts devices: no report counts,
+        # no device is due, and no window opens or closes.
+        quiet = wake
+        fl = self.flying_times(t)
+        wake = earliest(wake, fl.0)
+        quiet = earliest(quiet, fl.1)
+        self.held = held_back
+        if held_back:
+            # The second in which the next device may start. A decision
+            # after it starts that device later than the run ahead did.
+            w = self.first_start(t, c) // MICRO
+            wake = earliest(wake, w)
+            quiet = earliest(quiet, w + 1)
+        self.quiet_from = t
+        self.quiet_until = quiet if quiet >= 0 else OPEN_END
         return (started, wake, self.devices_done >= len(self.est))
+
+    def flying_times(self, t: int) -> (int, int):
+        """For the devices in flight at time t: the next time to decide for
+        them, and the time until which the run ahead takes no report from
+        them; -1 for none. A device that is late is expected to take one
+        more upgrade from t."""
+        w = -1
+        q = -1
+        for name in self.reported:
+            # Its report counts one debounce after it came. The report of a
+            # device no longer in the campaign counts too: it takes the pace.
+            r = imax(self.final_at[name] + self.debounce, t + 1)
+            q = earliest(q, r)
+            if name in self.flying:
+                w = earliest(w, r)
+        # The devices whose report would have counted by now leave the heap.
+        while len(self.dues) > 0:
+            e = self.dues[0]
+            if not self.in_dues(e):
+                heap_pop(self.dues)
+            elif e.0 + self.debounce <= t:
+                heap_pop(self.dues)
+                self.overdue.add(e.1)
+            else:
+                break
+        for name in list(self.overdue):
+            if name not in self.flying or name in self.reported:
+                self.overdue.discard(name)
+            elif self.late_at(name) < t:
+                # Late: one more upgrade from now.
+                self.due[name] = t + self.duration(name)
+                heap_push(self.dues, (self.due[name], name))
+                self.overdue.discard(name)
+            else:
+                # Its report could have counted: decide when it is late.
+                w = earliest(w, self.late_at(name) + 1)
+                q = earliest(q, self.due[name])
+        if len(self.dues) > 0:
+            # When its report counts if it comes when expected.
+            w = earliest(w, self.dues[0].0 + self.debounce)
+            q = earliest(q, self.dues[0].0)
+        return (w, q)
+
+    def in_dues(self, e: (int, str)) -> bool:
+        """True when e is the entry in dues of a device in flight without a
+        report."""
+        return e.1 in self.flying and e.1 not in self.reported and self.due[e.1] == e.0
+
+    def take_due(self, now: int) -> list[str]:
+        """Take from dues the devices in flight without a report whose
+        upgrade is expected to have ended by now."""
+        out: list[str] = []
+        for name in self.overdue:
+            if name in self.flying and name not in self.reported:
+                out.append(name)
+        while len(self.dues) > 0 and self.dues[0].0 <= now:
+            e = heap_pop(self.dues)
+            if self.in_dues(e):
+                out.append(e.1)
+        return out
 
     def copy(self) -> Controller:
         """A controller with this one's configuration and a copy of its
@@ -1114,6 +1289,7 @@ class Controller(object):
         c.debounce = self.debounce
         c.estimate_s = self.estimate_s
         c.close_margin = self.close_margin
+        c.stagger = self.stagger
         c.queue = self.queue
         c.by_est = self.by_est
         c.windows_of = self.windows_of
@@ -1140,6 +1316,8 @@ class Controller(object):
         c.released_est = {k: v for k, v in self.released_est.items()}
         c.due = {k: v for k, v in self.due.items()}
         c.flying = copy_set(self.flying)
+        c.dues = list(self.dues)
+        c.overdue = copy_set(self.overdue)
         c.done_at = {k: v for k, v in self.done_at.items()}
         c.promised = {k: v for k, v in self.promised.items()}
         c.promise_seq = {k: v for k, v in self.promise_seq.items()}
@@ -1152,6 +1330,9 @@ class Controller(object):
         c.slow_s = self.slow_s
         c.rung = self.rung
         c.c = self.c
+        c.last_start = self.last_start
+        c.last_est = self.last_est
+        c.held = self.held
         return c
 
     def project(self, t: int, c: int, skip: set[str]) -> (dict[str, (int, int)], int):
@@ -1174,12 +1355,10 @@ class Controller(object):
             if wake < 0 or finished:
                 break
             now = wake
-            for name in s.flying:
-                due = s.due[name]
-                if due <= now and name not in s.reported:
-                    # A member that is down while it upgrades comes back up.
-                    s.down.discard(name)
-                    s.report(name, "succeeded", due)
+            for name in s.take_due(now):
+                # A member that is down while it upgrades comes back up.
+                s.down.discard(name)
+                s.report(name, "succeeded", s.due[name])
         return (starts, s.moves)
 
     def breaks(self, run: (dict[str, (int, int)], int), t: int,
@@ -1447,9 +1626,11 @@ class Controller(object):
         s = self.copy()
         held = s.held_windows(stuck.0 + stuck.1, t)
         c, run, b = s.choose(t, skip)
+        settled = False
         for _round in range(PLAN_ROUNDS):
             fresh = s.promise_starts(run.0, t)
             if len(fresh) == 0:
+                settled = True
                 break
             if s.spreads:
                 s.spread_out(fresh, t, c, run, b, skip)
@@ -1492,7 +1673,9 @@ class Controller(object):
                           + "of their slow time, {s.slow_s} s at the campaign's estimate, is "
                           + "longer than the time left in every window of their schedule: "
                           + names_text(short))
-        return Plan(c, starts, held, alarms)
+        p = Plan(c, starts, held, alarms)
+        self.last_plan = p if self.running and settled and len(alarms) == 0 else None
+        return p
 
     def windows_too_short(self, names: list[str], t: int) -> list[str]:
         """The devices in names whose close margin is longer than the time
@@ -1523,8 +1706,19 @@ class Controller(object):
         return out
 
     def decide(self, t: int) -> Step:
-        """Plan at time t and take the plan's first step."""
-        p = self.plan(t)
+        """Plan at time t and take the plan's first step. The last plan
+        holds when it has no alarm, nothing came in since the last step,
+        and from that step until t the run ahead only starts devices: no
+        report counts, no device is due, and no window opens or closes.
+        Then the decision takes that plan again, without the devices that
+        started since, and only starts the devices it starts now."""
+        last = self.last_plan
+        if last is not None and self.quiet_from <= t and t < self.quiet_until:
+            p = Plan(last.c, {name: s for name, s in last.starts.items()
+                              if name not in self.released}, last.held, last.alarms)
+            self.last_plan = p
+        else:
+            p = self.plan(t)
         started, wake, finished = self.step(t, p.c)
         return Step(started, wake, finished, p)
 
