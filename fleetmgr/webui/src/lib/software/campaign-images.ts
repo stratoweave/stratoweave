@@ -16,8 +16,13 @@ export function modelGroups(devices: Device[]): { groups: ModelGroup[]; leftOut:
   const byModel = new Map<string, string[]>();
   const leftOut: string[] = [];
   for (const d of devices) {
-    if (!d.model) leftOut.push(d.name);
-    else byModel.set(d.model, [...(byModel.get(d.model) ?? []), d.name]);
+    if (!d.model) {
+      leftOut.push(d.name);
+      continue;
+    }
+    const names = byModel.get(d.model);
+    if (names) names.push(d.name);
+    else byModel.set(d.model, [d.name]);
   }
   const groups = [...byModel.entries()]
     .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
