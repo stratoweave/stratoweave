@@ -79,7 +79,7 @@ duration in seconds or a range, the window length in seconds, and which
 schedules open soon rather than at their local midnight. `just demo-big`
 is `just demo-fleet 1000 10 20 10 120-150 14400 europe`: a thousand
 devices with `demo.xml`'s knobs, 120 to 150 s installs and a tenth failing
-one of the seven ways, picked by a fixed shuffle so the grids show no
+one of the mock's nine ways, picked by a fixed shuffle so the grids show no
 pattern, in four-hour windows with ten devices at once, where only europe
 opens right away and americas and asia wait for their midnight, as a real
 fleet's windows would. The files land in `out/`; a thousand devices come up
