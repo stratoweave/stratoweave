@@ -83,19 +83,21 @@ demo:
 # its window is planned into the next day's. SOON names the schedules whose
 # windows are pulled forward to open shortly after the start, all of them
 # by default; the others open at their real local midnight, where a
-# fleet's windows are. Models follow a rough field mix of ten IOS XE
-# routers, branch ISR 1100 and ISR 4300 the most, each with its own
-# serial number.
-demo-fleet n="100" target="8" max="16" fail="0" duration="8" window="3600" soon="all": (gen-demo-fleet n target max fail duration window soon)
+# fleet's windows are. STATE is the campaign's admin-state at startup:
+# plan, or run to start upgrading right away. Models follow a rough field
+# mix of ten IOS XE routers, branch ISR 1100 and ISR 4300 the most, each
+# with its own serial number.
+demo-fleet n="100" target="8" max="16" fail="0" duration="8" window="3600" soon="all" state="plan": (gen-demo-fleet n target max fail duration window soon state)
 	mkdir -p out/images
 	out/bin/fleetmgr --http.port 18200 --netconf.port 12900 --software.image-dir out/images out/demo-fleet.xml out/demo-fleet-campaign.xml demo-images.xml
 
 # Generate the demo fleet's two files into out/ without starting the top;
 # `just demo-fleet` runs this first, and the lab loads them into a running
 # top. The knobs are demo-fleet's.
-gen-demo-fleet n="100" target="8" max="16" fail="0" duration="8" window="3600" soon="all":
+gen-demo-fleet n="100" target="8" max="16" fail="0" duration="8" window="3600" soon="all" state="plan":
 	#!/usr/bin/env bash
 	set -euo pipefail
+	[[ "{{state}}" =~ ^(plan|run)$ ]] || { echo "state must be plan or run, not '{{state}}'" >&2; exit 1; }
 	fail={{fail}}
 	[[ $fail =~ ^[0-9]+$ && $fail -le 100 ]] || { echo "fail must be a percentage 0-100, not '$fail'" >&2; exit 1; }
 	[[ "{{duration}}" =~ ^([0-9]+)(-([0-9]+))?$ ]] || { echo "duration must be seconds or a range like 8 or 120-150, not '{{duration}}'" >&2; exit 1; }
@@ -196,7 +198,7 @@ gen-demo-fleet n="100" target="8" max="16" fail="0" duration="8" window="3600" s
 	  for i in $(seq 1 {{n}}); do
 	    printf '            <device><name>cpe-%04d</name><image>%s.17.18.03a.SPA.bin</image></device>\n' "$i" "${family[${models[$i]}]}"
 	  done
-	  echo '            <admin-state>plan</admin-state>'
+	  echo '            <admin-state>{{state}}</admin-state>'
 	  echo '            <default-schedule>europe</default-schedule>'
 	  echo '            <target-concurrency>{{target}}</target-concurrency>'
 	  echo '            <max-concurrency>{{max}}</max-concurrency>'
@@ -204,7 +206,7 @@ gen-demo-fleet n="100" target="8" max="16" fail="0" duration="8" window="3600" s
 	  echo '    </software>'
 	  echo '</data>'
 	} > "$c"
-	echo "Generated $f and $c: {{n}} devices, target {{target}} and max {{max}} at once, $count failing, installs {{duration}} s, windows {{window}} s, opening soon: $soon"
+	echo "Generated $f and $c: {{n}} devices, target {{target}} and max {{max}} at once, $count failing, installs {{duration}} s, windows {{window}} s, opening soon: $soon, campaign in {{state}}"
 
 # Recompute the running demo's regional windows so they open about 30, 90
 # and 150 seconds from now, WINDOW seconds long; pass the length and the
@@ -244,6 +246,62 @@ demo-big n="1000":
 	set -euo pipefail
 	target=$(( ({{n}} + 99) / 100 ))
 	exec just demo-fleet {{n}} "$target" "$((target * 2))" 10 120-150 14400 europe
+
+# `just demo-big N` with its campaign already running, at N/250 devices at
+# once (20 for 5000, max twice that) rather than N/100, so europe's 60%
+# takes two of its windows: about 2000 devices in today's, the rest in the
+# next day's. Plus out/demo-import.csv: ADD more mock devices, branch-0001
+# and on, not in the campaign, to paste into Devices > Import CSV while it
+# runs.
+# Start the CSV import demo: N devices upgrading, ADD more ready to import.
+demo-import n="5000" add="500": (gen-demo-import add)
+	#!/usr/bin/env bash
+	set -euo pipefail
+	target=$(( ({{n}} + 249) / 250 ))
+	exec just demo-fleet {{n}} "$target" "$((target * 2))" 10 120-150 14400 europe run
+
+# ADD mock devices named branch-0001 and on, so the name filter
+# `branch-*` finds them, in the demo fleet's model mix, each bound to its
+# region's schedule, europe included, with installs of 120 to 150 s and a
+# tenth failing one of the mock's nine ways. The columns are leaf paths, as
+# Devices > Export CSV writes them.
+# Write out/demo-import.csv for the CSV import demo, without starting a top.
+gen-demo-import add="500":
+	#!/usr/bin/env bash
+	set -euo pipefail
+	[[ "{{add}}" =~ ^[1-9][0-9]*$ ]] || { echo "add must be a number, not '{{add}}'" >&2; exit 1; }
+	mkdir -p out
+	f=out/demo-import.csv
+	kinds=(download-failed add-failed activate-refused commit-failed reverts bgp-down bgp-lost interface-lost ospf-lost)
+	mix="22 C1111-8P 18 ISR4331/K9 14 C8200L-1N-4T 11 C8300-1N1S-6T 10 ISR4321/K9 10 C8000V 6 C8300-1N1S-4T2X 5 ISR4451-X/K9 3 ASR1001-X 1 C8500-12X4QC"
+	{
+	  echo "name,type,description,schedule,credentials/username,credentials/password,mock/enabled,mock/software/upgrade-duration,mock/software/failure,mock/platform/model,mock/platform/serial-number"
+	  # The same shuffles as gen-demo-fleet with other seeds: the model mix
+	  # and the serial numbers, and every tenth device in the shuffle failing.
+	  awk -v n={{add}} 'BEGIN { x = 20261106; for (i = 1; i <= n; i++) { x = (x * 48271) % 2147483647; printf "%d %d\n", x, i } }' | LC_ALL=C sort -n |
+	  awk -v n={{add}} -v mix="$mix" -v kinds="${kinds[*]}" '
+	    function b36(v, k,   s) { s = ""; while (k-- > 0) { s = substr(c, v % 36 + 1, 1) s; v = int(v / 36) } return s }
+	    BEGIN { c = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"; k = split(mix, a, " "); split("FGL FDO FOC JAE", fac, " "); nk = split(kinds, kind, " ") }
+	    {
+	      x = $1
+	      cum = 0
+	      for (j = 1; j < k; j += 2) { cum += a[j]; if ((NR - 1) * 100 < cum * n) break }
+	      if (a[j + 1] == "C8000V") s = "9" b36(x, 6) b36(int(x / 7), 4)
+	      else s = fac[x % 4 + 1] sprintf("%02d%02d", 18 + int(x / 4) % 8, 1 + int(x / 32) % 52) b36(int(x / 1664), 4)
+	      failure = (NR % 10 == 0) ? kind[(NR / 10 - 1) % nk + 1] : ""
+	      model[$2] = a[j + 1]; serial[$2] = s; fails[$2] = failure
+	    }
+	    END {
+	      for (i = 1; i <= n; i++) {
+	        # The same regional split as the fleet: 60% europe, 30% americas, 10% asia.
+	        r = i % 10
+	        sched = (r >= 7) ? "americas" : (r == 0 ? "asia" : "europe")
+	        desc = "added by CSV import" (fails[i] != "" ? " (fails: " fails[i] ")" : "")
+	        printf "branch-%04d,iosxe,%s,%s,admin,admin,true,%d,%s,%s,%s\n", i, desc, sched, 120 + (i * 7) % 31, fails[i], model[i], serial[i]
+	      }
+	    }'
+	} > "$f"
+	echo "Generated $f: {{add}} devices, branch-0001 to branch-$(printf %04d {{add}})"
 
 # Submit the three-device IOS XE demo campaign. The transaction applies but
 # its response can hang (open engine bug), so cap the wait and watch state.

@@ -88,6 +88,20 @@ demo-reschedule` reopens a running demo's windows shortly; give it the same
 window length and schedule list, `just demo-reschedule 14400 europe` for the
 big demo.
 
+`just demo-import` shows the devices page's CSV import on a busy fleet:
+it is `just demo-big 5000` with the campaign started (the last argument
+of `demo-fleet` and `gen-demo-fleet` is the campaign's admin-state, plan
+or run) and slower, 20 devices at once, so europe's 3000 take two of its
+windows, about 2000 in today's and the rest in the next day's. It also
+writes `out/demo-import.csv` with 500 more mock devices,
+`branch-0001` to `branch-0500`, in the same mix of models and regions,
+each bound to its region's schedule, europe included, and a tenth of them
+failing. Paste the file into Devices > Import CSV while the campaign runs;
+the 500 join the fleet, not the campaign, and show their health within
+half a minute; the name filter `branch-*` finds them. `just demo-import N
+ADD` changes the two counts, and `just gen-demo-import ADD` writes only
+the file.
+
 `just run` starts the same top and flotillas with no config: no devices,
 images or campaigns.
 
