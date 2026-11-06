@@ -19,31 +19,41 @@ def device_subscription(name: str) -> ygdata.SubscriptionSpec:
     return device.subscribe(select=[device.software.state, device.state.platform])
 
 
+def health_subscription(name: str) -> ygdata.SubscriptionSpec:
+    """Return the on-change subscription to the health the flotilla's
+    device-health service judges for one device."""
+    state = flotilla_oper.subs.rfs.entry(name).device_health.state
+    return state.subscribe(select=[state.health])
+
+
 actor DeviceTransform(
     path,
     update_oper: proc(?y1_oper.stratoweave_rfs__rfs__device_entry) -> None,
     dev: swdev.DeviceMgr,
 ):
-    """Publish the software state and platform that the flotilla reports for
-    one device.
+    """Publish the software state, platform and health that the flotilla
+    reports for one device.
 
     The actor subscribes to the flotilla for this device only. It publishes
-    the status, stage, reason, check verdicts and platform in the state of
-    its own entry, so a change on one device publishes one entry. One
-    subscription takes both."""
+    the status, stage, reason, check verdicts, platform and health in the
+    state of its own entry, so a change on one device publishes one entry.
+    One subscription takes the software state and the platform; the health
+    lives in the flotilla's /rfs/device-health and takes a second one."""
     var subscriptions: ?ygdata.SubscriptionManager = None
     var latest: ?(status: ?str, stage: ?str, reason: ?str,
                   precheck: (verdict: ?str, detail: ?str, at: ?str),
                   postcheck: (verdict: ?str, detail: ?str, at: ?str)) = None
     var platform: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+    var health: ?str = None
 
     def publish() -> None:
         value = latest
         p = platform
-        if value is None and p is None:
+        if value is None and p is None and health is None:
             update_oper(None)
             return
         oper = base.Device.new_state(path)
+        oper.state.health = health
         if value is not None:
             s = oper.state
             s.status = value.status
@@ -92,9 +102,24 @@ actor DeviceTransform(
             platform = p
             publish()
 
+    def on_health(keys: ?(rfs_name: str),
+                  state: ?flotilla_oper.stratoweave_rfs__rfs__device_health__state,
+                  error: ?Exception) -> None:
+        if subscriptions is None:
+            return
+        value: ?str = None
+        if error is not None:
+            print("device health subscription failed at {path}: {error}", err=True)
+        elif state is not None:
+            value = state.health
+        if value != health:
+            health = value
+            publish()
+
     def shutdown() -> None:
         latest = None
         platform = None
+        health = None
         if subscriptions is not None:
             subscriptions!.close()
             subscriptions = None
@@ -106,6 +131,9 @@ actor DeviceTransform(
             subscriptions!.declare({
                 flotilla_oper.subs.device.dst(on_device).deliver({
                     device_subscription(conf.name),
+                }),
+                flotilla_oper.subs.rfs.device_health.state.dst(on_health).deliver({
+                    health_subscription(conf.name),
                 }),
             })
 
