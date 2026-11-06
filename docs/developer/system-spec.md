@@ -76,6 +76,10 @@ modules that are shipped with StratoWeave:
  Add it to the top layer. The
  files themselves go into the image folder (`--software.image-dir`) over
  `/image-file`, where `/image-folder` and `/image-move` keep them in folders.
+* `swyang.users` adds the user list, `/users`: the users that log in to the
+ NETCONF and HTTP servers; see [Users and logins](../operations/users.md).
+ StratoWeave adds it to the top layer of every application itself, so the
+ layer definitions need not list it.
 * `tmf.yang.ietf_yang_tmf_map` includes the TMF mapping schema, which is used
  to annotate YANG with TMF Service/Resource mapping instructions.
 * `tmf.yang.swtmf` and `tmf.yang.swtmf640` include the TMF640 store transform

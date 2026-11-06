@@ -29,7 +29,7 @@ StratoWeave writes one log file for each part of the system, in the directory
 |---|---|
 | `core.log` | Startup and exit, TTT layers and transforms |
 | `netconf.log` | Northbound NETCONF server: logins, sessions, subscriptions |
-| `http.log` | HTTP server: RESTCONF, TMF API and web UI, one line per request at `info` |
+| `http.log` | HTTP server: logins, RESTCONF, TMF API and web UI, one line per request and one per login at `info` |
 | `devices/<name>.log` | One file per device: connection, configuration, software upgrades |
 
 The default level is `warning`, so a healthy system writes little. Startup
@@ -131,9 +131,6 @@ Options:
   --netconf.port INT
       NETCONF SSH listen port
       env: STRATOWEAVE_NETCONF__PORT; default: 830
-  --netconf.user TEXT
-      NETCONF SSH username (v1 static credential)
-      env: STRATOWEAVE_NETCONF__USER; default: admin
   ...
 ```
 
@@ -149,12 +146,13 @@ http:
     port = 8080
 netconf:
     port = 1830
-    user = "netops"
 ```
 
 The `FILE` arguments are startup configuration documents, applied in the order
 given. Operators often keep a base system configuration in one file and add
-environment-specific overlays as later arguments.
+environment-specific overlays as later arguments. The NETCONF and HTTP servers
+open when TTT has committed the startup configuration, so the users in it can
+log in from the first connection; see [Users and logins](users.md).
 
 The most important settings are:
 
@@ -166,9 +164,6 @@ The most important settings are:
   `830`.
 - `--netconf.ssh.host-key` points to a persistent SSH host key. If you omit
   it, an ephemeral in-memory key is generated at startup.
-- `--netconf.user` and `--netconf.password` configure the built-in static
-  NETCONF credentials. They default to `admin` / `admin` and should be
-  overridden outside local testing.
 - `--exit-on-done` applies the supplied startup configuration and then exits
   instead of continuing to serve traffic. This is useful for CI validation or
   one-shot initialization jobs.

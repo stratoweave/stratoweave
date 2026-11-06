@@ -29,6 +29,7 @@ wait: $(addprefix platform-wait-,$(ROUTERS_XR))
 .PHONY: copy
 copy: build
 	docker cp $(MINISYS_BIN) $(TESTENV)-sweave:/$(SYSNAME)
+	docker cp ../common/users.xml $(TESTENV)-sweave:/users.xml
 	docker cp netinfra.xml $(TESTENV)-sweave:/netinfra.xml
 
 ifndef CI
@@ -37,11 +38,11 @@ endif
 
 .PHONY: run
 run: copy
-	docker exec $(INTERACTIVE) $(TESTENV)-sweave /$(SYSNAME) --rts-bt-dbg
+	docker exec $(INTERACTIVE) $(TESTENV)-sweave /$(SYSNAME) users.xml --rts-bt-dbg
 
 .PHONY: run-detached run-bg
 run-detached run-bg: copy
-	docker exec -d $(TESTENV)-sweave sh -lc '/$(SYSNAME) --rts-bt-dbg > /tmp/$(SYSNAME).log 2>&1'
+	docker exec -d $(TESTENV)-sweave sh -lc '/$(SYSNAME) users.xml --rts-bt-dbg > /tmp/$(SYSNAME).log 2>&1'
 
 .PHONY: logs
 logs:
@@ -53,7 +54,7 @@ stop-mini:
 
 .PHONY: run-and-configure
 run-and-configure: copy
-	docker exec $(INTERACTIVE) -e EXIT_ON_DONE=$(CI) $(TESTENV)-sweave /$(SYSNAME) netinfra.xml --rts-bt-dbg
+	docker exec $(INTERACTIVE) -e EXIT_ON_DONE=$(CI) $(TESTENV)-sweave /$(SYSNAME) users.xml netinfra.xml --rts-bt-dbg
 
 .PHONY: configure
 configure:
@@ -67,30 +68,32 @@ shell:
 send-config: send-config-wait
 
 RESTCONF_PORT=$(shell docker inspect -f '{{(index (index .NetworkSettings.Ports "80/tcp") 0).HostPort}}' $(TESTENV)-sweave)
+# The admin user of users.xml
+AUTH?=admin:admin
 
 .PHONY: send-config-async
 send-config-async:
-	curl -X PATCH -H "Content-Type: application/yang-data+xml" -H "Async: true" -d @$(FILE) http://localhost:$(RESTCONF_PORT)/restconf/data
+	curl -u $(AUTH) -X PATCH -H "Content-Type: application/yang-data+xml" -H "Async: true" -d @$(FILE) http://localhost:$(RESTCONF_PORT)/restconf/data
 
 .PHONY: send-config-wait
 send-config-wait:
-	curl -X PATCH -H "Content-Type: application/yang-data+xml" -d @$(FILE) http://localhost:$(RESTCONF_PORT)/restconf/data
+	curl -u $(AUTH) -X PATCH -H "Content-Type: application/yang-data+xml" -d @$(FILE) http://localhost:$(RESTCONF_PORT)/restconf/data
 
 .PHONY: get-data get-router get-telemetry
 get-data:
-	curl -H "Accept: application/yang-data+json" http://localhost:$(RESTCONF_PORT)/restconf/data
+	curl -u $(AUTH) -H "Accept: application/yang-data+json" http://localhost:$(RESTCONF_PORT)/restconf/data
 
 get-router get-telemetry:
-	curl -H "Accept: application/yang-data+json" http://localhost:$(RESTCONF_PORT)/restconf/data/netinfra:netinfra/router=rtr1
+	curl -u $(AUTH) -H "Accept: application/yang-data+json" http://localhost:$(RESTCONF_PORT)/restconf/data/netinfra:netinfra/router=rtr1
 
 .PHONY: get-config0 get-config1 get-config2
 get-config0 get-config1 get-config2:
-	curl -H "Accept: application/yang-data+xml" http://localhost:$(RESTCONF_PORT)/layer/$(subst get-config,,$@)
+	curl -u $(AUTH) -H "Accept: application/yang-data+xml" http://localhost:$(RESTCONF_PORT)/layer/$(subst get-config,,$@)
 
 .PHONY: get-config-adata0 get-config-adata1 get-config-adata2
 get-config-adata0 get-config-adata1 get-config-adata2:
-	@curl -H "Accept: application/yang-data+acton-adata" http://localhost:$(RESTCONF_PORT)/layer/$(subst get-config-adata,,$@)
+	@curl -u $(AUTH) -H "Accept: application/yang-data+acton-adata" http://localhost:$(RESTCONF_PORT)/layer/$(subst get-config-adata,,$@)
 
 .PHONY: delete-rtr1
 delete-rtr1:
-	curl -X DELETE http://localhost:$(RESTCONF_PORT)/restconf/data/netinfra:netinfra/router=rtr1
+	curl -u $(AUTH) -X DELETE http://localhost:$(RESTCONF_PORT)/restconf/data/netinfra:netinfra/router=rtr1

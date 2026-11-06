@@ -1,0 +1,354 @@
+"""Tests of logins: the users schema, LocalAuth, and the NETCONF and HTTP
+logins."""
+
+import std.http
+import net
+import std.xml as xml
+import testing
+
+import yang
+import yang.schema as yschema
+import yang.xml as yxml
+
+import netconf
+
+import auth as swauth
+import device as swdev
+import http_server as swhttp
+import netconf_server as swnetconf
+import swyang
+import test_devicemgr_netconf as devtest
+import ttt
+import user_list
+
+# The hashes of "abc" and "xyz", made with xcrypt and fixed salts. The
+# yescrypt hashes have the lowest cost, so the tests run fast.
+Y_ABC = "$y$j75$saltsaltsaltsaltsalt$M55SrA4IbNTV9bHlfH5lEIqBpXYAic0z/gGQIUoAey4"
+Y_XYZ = "$y$j75$saltsaltsaltsaltsalt$Gaom45B/VE/EJevAD0nZ5V2/P1zsdH4ZQEXp2cCz7b2"
+B10_ABC = "$2b$10$abcdefghijklmnopqrstuuIKf86pdcwpO2sVQ5UzC4OF.Xfw8WGTS"
+B12_ABC = "$2y$12$abcdefghijklmnopqrstuux3bSFsSh/HRPR0wMkn1U24m43ky.vw6"
+
+# The public key of the key pair in test_devicemgr_netconf
+KEY = devtest.TEST_PUBLIC_KEY.decode()
+OTHER_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBXQ7y5yqK5vHhUVw1hY2Jx0G0Cgr1bWEfTHqJ9W5xYw"
+
+# HTTP Basic for alice:abc, alice:abd and admin:admin
+ALICE_BASIC = "Basic YWxpY2U6YWJj"
+ALICE_WRONG = "Basic YWxpY2U6YWJk"
+ADMIN_BASIC = "Basic YWRtaW46YWRtaW4="
+
+
+def users_doc(users: str) -> str:
+    """Return a data document with users, the XML of user entries."""
+    return '<data><users xmlns="' + swauth.NS + '">' + users + '</users></data>'
+
+
+def users_layer() -> ttt.Layer:
+    return ttt.Layer("top", ttt.Container({swauth.USERS: ttt.Transform(user_list.UserList)}), None)
+
+
+def _test_users_schema():
+    """The users schema takes the hash kinds and key lines that logins
+    accept, and refuses the others."""
+    schema = yang.compile([swyang.stratoweave, swyang.users])
+    cases: list[(name: str, user: str, accepted: bool)] = [
+        (name="yescrypt", user="<name>a</name><password>" + Y_ABC + "</password>", accepted=True),
+        (name="bcrypt 2b cost 10", user="<name>a</name><password>" + B10_ABC + "</password>", accepted=True),
+        (name="bcrypt 2y cost 12", user="<name>a</name><password>" + B12_ABC + "</password>", accepted=True),
+        (name="bcrypt cost 5", user="<name>a</name><password>" + B10_ABC.replace("$10$", "$05$") + "</password>", accepted=False),
+        (name="bcrypt cost 13", user="<name>a</name><password>" + B10_ABC.replace("$10$", "$13$") + "</password>", accepted=False),
+        (name="bcrypt 2a", user="<name>a</name><password>" + B10_ABC.replace("$2b$", "$2a$") + "</password>", accepted=False),
+        (name="sha512crypt", user="<name>a</name><password>$6$saltsalt$qFmFH.bQmmtXzyBY0s9v7Oicd2z4XSIecDzlB5KiA2/jctKu9YterLp8wwnSq.qc.eoxqOmSuNp2xS0ktL3nh/</password>", accepted=False),
+        (name="md5crypt", user="<name>a</name><password>$1$saltsalt$qjXMvbEw8oaL.CzflDugX/</password>", accepted=False),
+        (name="cleartext with $0$", user="<name>a</name><password>$0$secret</password>", accepted=False),
+        (name="cleartext", user="<name>a</name><password>secret</password>", accepted=False),
+        (name="yescrypt with a short hash", user="<name>a</name><password>" + Y_ABC[:-1] + "</password>", accepted=False),
+        (name="key with a comment", user="<name>a</name><authorized-key>" + KEY + " alice@laptop</authorized-key>", accepted=True),
+        (name="ssh-rsa key", user="<name>a</name><authorized-key>ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ==</authorized-key>", accepted=True),
+        (name="ecdsa key", user="<name>a</name><authorized-key>ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTY=</authorized-key>", accepted=True),
+        (name="certificate", user="<name>a</name><authorized-key>ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5</authorized-key>", accepted=False),
+        (name="key with an option", user='<name>a</name><authorized-key>from="10.0.0.1" ' + KEY + '</authorized-key>', accepted=False),
+        (name="key with two spaces", user="<name>a</name><authorized-key>" + KEY.replace(" ", "  ") + "</authorized-key>", accepted=False),
+        (name="name with a dot and an at sign", user="<name>a.b@c</name>", accepted=True),
+        (name="name with a leading dash", user="<name>-x</name>", accepted=False),
+        (name="name with a colon", user="<name>a:b</name>", accepted=False),
+    ]
+    for c in cases:
+        accepted = True
+        try:
+            yxml.from_xml(schema, xml.decode(users_doc("<user>" + c.user + "</user>")), loose=True)
+        except ValueError:
+            accepted = False
+        testing.assertEqual(accepted, c.accepted, c.name)
+
+
+proc def _test_local_auth(t: testing.AsyncT):
+    """LocalAuth accepts the passwords and keys of the users in /users, and
+    no login while /users is empty. A changed password applies to the next
+    login."""
+    # A debug build computes a hash slowly: bcrypt at cost 10 takes about
+    # 0.8 s.
+    t.timeout(15.0)
+    schema = yang.compile([swyang.stratoweave, swyang.users])
+    layer = users_layer()
+    _LocalAuthActor(t=t, schema=schema, layer=layer, checker=swauth.LocalAuth(layer, t.log_handler), key=KEY.encode(), other_key=OTHER_KEY.encode())
+
+
+actor _LocalAuthActor(t: testing.AsyncT, schema, layer: ttt.Layer, checker: swauth.LocalAuth, key: bytes, other_key: bytes):
+    var failed = False
+
+    def expect(step: str, cases: list[(user: str, password: ?str, pubkey: ?bytes, accepted: bool)]):
+        for c in cases:
+            accepted = checker.accepts(c.user, c.password, c.pubkey)
+            if accepted != c.accepted and not failed:
+                failed = True
+                t.failure(ValueError("{step}: {c.user} with password {c.password} and key {c.pubkey}: accepted {accepted}, expected {c.accepted}"))
+
+    def edit(doc: str, then: action() -> None):
+        def done(r: value):
+            if isinstance(r, Exception):
+                t.failure(r)
+                return
+            then()
+        layer.edit_config(yxml.from_xml(schema, xml.decode(doc), loose=True), done)
+
+    def no_users():
+        expect("no users", [
+            (user="admin", password="admin", pubkey=None, accepted=False),
+            (user="alice", password="abc", pubkey=None, accepted=False),
+            (user="alice", password=None, pubkey=key, accepted=False),
+            (user="admin", password=None, pubkey=None, accepted=False),
+        ])
+        edit(users_doc(
+            "<user><name>alice</name><password>" + Y_ABC + "</password>"
+            + "<authorized-key>" + KEY + " alice@laptop</authorized-key></user>"
+            + "<user><name>bob</name><authorized-key>" + KEY + "</authorized-key></user>"
+            + "<user><name>dave</name><password>" + B10_ABC + "</password></user>"), users)
+
+    def users():
+        expect("users", [
+            (user="alice", password="abc", pubkey=None, accepted=True),
+            (user="alice", password="abc", pubkey=None, accepted=True),
+            (user="alice", password="abd", pubkey=None, accepted=False),
+            (user="alice", password="abc\x00x", pubkey=None, accepted=False),
+            (user="alice", password="", pubkey=None, accepted=False),
+            (user="alice", password=None, pubkey=key, accepted=True),
+            (user="alice", password=None, pubkey=other_key, accepted=False),
+            (user="bob", password="abc", pubkey=None, accepted=False),
+            (user="bob", password=None, pubkey=key, accepted=True),
+            (user="dave", password="abc", pubkey=None, accepted=True),
+            (user="dave", password=None, pubkey=key, accepted=False),
+            (user="carol", password="abc", pubkey=None, accepted=False),
+            (user="carol", password=None, pubkey=key, accepted=False),
+            (user="admin", password="admin", pubkey=None, accepted=False),
+        ])
+        edit(users_doc("<user><name>alice</name><password>" + Y_XYZ + "</password></user>"), changed_password)
+
+    def changed_password():
+        expect("changed password", [
+            (user="alice", password="abc", pubkey=None, accepted=False),
+            (user="alice", password="xyz", pubkey=None, accepted=True),
+        ])
+        edit('<data><users xmlns="' + swauth.NS + '" xmlns:nc="urn:ietf:params:xml:ns:netconf:base:1.0" nc:operation="remove"/></data>', removed)
+
+    def removed():
+        expect("users removed", [
+            (user="alice", password="xyz", pubkey=None, accepted=False),
+            (user="admin", password="admin", pubkey=None, accepted=False),
+        ])
+        if not failed:
+            t.success()
+
+    def __startup__():
+        no_users()
+
+
+def _test_basic_credentials():
+    cases: list[(authorization: ?str, expected: ?(user: str, password: str))] = [
+        (authorization="Basic YWRtaW46YWRtaW4=", expected=(user="admin", password="admin")),
+        (authorization="basic YWxpY2U6cDpx", expected=(user="alice", password="p:q")),
+        (authorization="Basic Ym9iOg==", expected=(user="bob", password="")),
+        (authorization="Basic YWRtaW4=", expected=None),
+        (authorization="Basic !!!", expected=None),
+        (authorization="Basic //79", expected=None),
+        (authorization="Bearer YWRtaW46YWRtaW4=", expected=None),
+        (authorization=None, expected=None),
+    ]
+    testing.assertEqual(swauth.basic_authorization("admin", "admin"), "Basic YWRtaW46YWRtaW4=")
+    for c in cases:
+        got = swauth.basic_credentials(c.authorization)
+        expected = c.expected
+        if expected is not None and got is not None:
+            testing.assertEqual(got.user, expected.user, str(c.authorization))
+            testing.assertEqual(got.password, expected.password, str(c.authorization))
+        else:
+            testing.assertEqual(got is None, expected is None, str(c.authorization))
+
+
+def _test_cross_origin():
+    cases: list[(method: str, headers: dict[str, str], refused: bool)] = [
+        (method="GET", headers={"sec-fetch-site": "cross-site"}, refused=False),
+        (method="HEAD", headers={"sec-fetch-site": "cross-site"}, refused=False),
+        (method="POST", headers={}, refused=False),
+        (method="POST", headers={"sec-fetch-site": "same-origin", "origin": "http://evil", "host": "h"}, refused=False),
+        (method="POST", headers={"sec-fetch-site": "none"}, refused=False),
+        (method="POST", headers={"sec-fetch-site": "same-site"}, refused=True),
+        (method="POST", headers={"sec-fetch-site": "cross-site"}, refused=True),
+        (method="DELETE", headers={"sec-fetch-site": "cross-site"}, refused=True),
+        (method="PUT", headers={"origin": "http://h:8080", "host": "h:8080"}, refused=False),
+        (method="POST", headers={"origin": "http://h:8080", "host": "h:9090"}, refused=True),
+        (method="POST", headers={"origin": "null", "host": "h"}, refused=True),
+        (method="PATCH", headers={"origin": "https://evil.example", "host": "h"}, refused=True),
+    ]
+    for c in cases:
+        request = std.http.Request(c.method, "/x", b"1.1", c.headers, b"")
+        testing.assertEqual(swauth.cross_origin(request), c.refused, "{c.method} {c.headers}")
+
+
+pure def _raising_schema(i: int) -> yschema.DRoot:
+    """Raise, so that the handler of GET /layer/<idx> raises."""
+    raise ValueError("no schema for layer {i}")
+
+
+proc def _test_http_login(t: testing.EnvT):
+    """The HTTP server answers a request only with credentials that its
+    checker accepts, and refuses writes that a browser sends from a page of
+    another origin. A handler that raises answers 500."""
+    schema = yang.compile([swyang.stratoweave, swyang.users])
+    layer = users_layer()
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    _HttpLoginActor(t=t, schema=schema, layer=layer, listen_cap=listen_cap)
+
+
+actor _HttpLoginActor(t: testing.EnvT, schema, layer: ttt.Layer, listen_cap: net.TCPListenCap):
+    checker = swauth.LocalAuth(layer, t.log_handler)
+    server = swhttp.HttpServer(listen_cap, t.log_handler, schema, schema, layer,
+                               swdev.DeviceRegistry(log_handler=t.log_handler), checker.check,
+                               _raising_schema, lambda i: schema, address="127.0.0.1", port=0)
+    # body is the expected body, or None to not check it. For an unknown
+    # device the device routes answer "Not found", and the router answers ""
+    # for a request that no route takes.
+    cases: list[(name: str, method: str, path: str, headers: dict[str, str], status: int, body: ?str)] = [
+        (name="no credentials", method="GET", path="/device", headers={}, status=401, body=None),
+        (name="wrong password", method="GET", path="/device", headers={"authorization": ALICE_WRONG}, status=401, body=None),
+        (name="admin, not a user", method="GET", path="/device", headers={"authorization": ADMIN_BASIC}, status=401, body=None),
+        (name="logged in", method="GET", path="/device", headers={"authorization": ALICE_BASIC}, status=200, body=None),
+        (name="handler raises", method="GET", path="/layer/0", headers={"authorization": ALICE_BASIC}, status=500, body=None),
+        (name="cross-site POST", method="POST", path="/device/x/resync", headers={"authorization": ALICE_BASIC, "sec-fetch-site": "cross-site"}, status=403, body=None),
+        (name="POST from another origin", method="POST", path="/device/x/resync", headers={"authorization": ALICE_BASIC, "origin": "http://evil.example", "host": "h"}, status=403, body=None),
+        (name="resync with POST from the same origin", method="POST", path="/device/x/resync", headers={"authorization": ALICE_BASIC, "origin": "http://h", "host": "h"}, status=404, body="Not found"),
+        (name="resync with GET", method="GET", path="/device/x/resync", headers={"authorization": ALICE_BASIC}, status=404, body=""),
+        (name="unknown path, no credentials", method="GET", path="/nothing", headers={}, status=401, body=None),
+        (name="unknown path", method="GET", path="/nothing", headers={"authorization": ALICE_BASIC}, status=404, body=""),
+    ]
+    var answers = 0
+    var failed = False
+
+    def fail(e: Exception):
+        if not failed:
+            failed = True
+            t.failure(e)
+
+    def send(c: (name: str, method: str, path: str, headers: dict[str, str], status: int, body: ?str)):
+        def answered(status: int, headers: dict[str, str], body: bytes):
+            expected_body = c.body
+            if status != c.status:
+                fail(ValueError("{c.name}: status {status}, expected {c.status}"))
+            elif expected_body is not None and body != expected_body.encode():
+                fail(ValueError("{c.name}: body {body}, expected '{expected_body}'"))
+            elif headers.get("X-Frame-Options") != "DENY":
+                fail(ValueError("{c.name}: no X-Frame-Options DENY in {headers}"))
+            elif status == 401 and headers.get("WWW-Authenticate") != swauth.CHALLENGE:
+                fail(ValueError("{c.name}: no Basic challenge in {headers}"))
+            answers += 1
+            if answers == len(cases) and not failed:
+                t.success()
+        server.serve(std.http.Request(c.method, c.path, b"1.1", c.headers, b""), answered)
+
+    def users_added(r: value):
+        if isinstance(r, Exception):
+            fail(r)
+            return
+        for c in cases:
+            send(c)
+
+    def timed_out():
+        fail(ValueError("timed out after {answers} of {len(cases)} answers"))
+
+    def __startup__():
+        doc = users_doc("<user><name>alice</name><password>" + Y_ABC + "</password></user>")
+        layer.edit_config(yxml.from_xml(schema, xml.decode(doc), loose=True), users_added)
+        after 10.0: timed_out()
+
+
+proc def _test_ssh_login(t: testing.EnvT):
+    """The NETCONF server logs in a user with the password or the SSH key of
+    the user, and refuses other logins. This also checks that a stored key
+    line matches the key that SSH gives."""
+    t.timeout(30.0)
+    schema = yang.compile([swyang.stratoweave, swyang.users])
+    layer = users_layer()
+    listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap)))
+    connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+    _SshLoginActor(t=t, schema=schema, layer=layer, listen_cap=listen_cap, connect_cap=connect_cap)
+
+
+actor _SshLoginActor(t: testing.EnvT, schema, layer: ttt.Layer, listen_cap: net.TCPListenCap, connect_cap: net.TCPConnectCap):
+    checker = swauth.LocalAuth(layer, t.log_handler)
+    cases: list[(name: str, user: str, password: ?str, key: ?str, connects: bool)] = [
+        (name="password", user="alice", password="abc", key=None, connects=True),
+        (name="wrong password", user="alice", password="abd", key=None, connects=False),
+        (name="key", user="alice", password=None, key=devtest.TEST_PRIVATE_KEY, connects=True),
+        (name="admin, not a user", user="admin", password="admin", key=None, connects=False),
+    ]
+    var server: ?swnetconf.NetconfServer = None
+    var answers = 0
+    var done = False
+
+    def finish(e: ?Exception):
+        if done:
+            return
+        done = True
+        s = server
+        if s is not None:
+            s.close()
+        if e is not None:
+            t.failure(e)
+        else:
+            t.success()
+
+    def connect(port: int, c: (name: str, user: str, password: ?str, key: ?str, connects: bool)):
+        def connected(client: netconf.Client, e: ?Exception):
+            if e is None:
+                client.close(None)
+            if (e is None) != c.connects:
+                finish(ValueError("{c.name}: connected {e is None}, expected {c.connects}: {e}"))
+                return
+            answers += 1
+            if answers == len(cases):
+                finish(None)
+        netconf.Client(connect_cap, "127.0.0.1", port, c.user, c.password, c.key, connected, None, True, t.log_handler)
+
+    def listening(err: ?Exception):
+        if err is not None:
+            finish(err)
+            return
+        s = server
+        if s is not None:
+            port = await async s.bound_port()
+            for c in cases:
+                connect(port, c)
+
+    def users_added(r: value):
+        if isinstance(r, Exception):
+            finish(r)
+            return
+        server = swnetconf.NetconfServer(listen_cap, log_handler=t.log_handler, top_schema=schema, top_oper_schema=schema, cfs=layer, yang_sources=[], auth_check=checker.check, address="127.0.0.1", port=0, on_listen=listening)
+
+    def timed_out():
+        finish(ValueError("timed out after {answers} of {len(cases)} logins"))
+
+    def __startup__():
+        doc = users_doc("<user><name>alice</name><password>" + Y_ABC + "</password><authorized-key>" + KEY + " alice@laptop</authorized-key></user>")
+        layer.edit_config(yxml.from_xml(schema, xml.decode(doc), loose=True), users_added)
+        after 20.0: timed_out()

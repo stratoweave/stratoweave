@@ -13,8 +13,8 @@ the schema before connecting, and disables schema downloads. The local
 schema is used both to parse updates and to resolve `--filter-subtree`.
 It works with periodic monitoring and with `--on-change`.
 
-For example, from the repository root, monitor a minisys server using
-its CFS models:
+For example, from the repository root, monitor a minisys server that runs
+with the user of `minisys/test/common/users.xml`, using its CFS models:
 
 ```sh
 out/bin/ncurl --port 8830 --password admin monitor --yang-dir minisys/gen/yang/cfs

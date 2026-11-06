@@ -57,35 +57,6 @@ def build_capabilities(inventory: monitoring.ModuleInventory) -> list[str]:
             CAP_NOTIFICATION_1_0, CAP_INTERLEAVE_1_0] + monitoring.module_capabilities(inventory.schema, inventory.yl_view)
 
 
-actor StaticAuthChecker(expected_user: str, expected_password: str, log_handler: ?logging.Handler=None):
-    """An SSH authentication check for a single static username + password.
-
-    `check` has the asynchronous (continuation-passing) shape that
-    SshPipeListener expects: it inspects the offered credentials and calls
-    respond(True) to accept or respond(False) to reject. The async shape is the
-    point -- a real implementation can reach out to an authentication service
-    (RADIUS/LDAP/TACACS+) and call respond from that IO callback; this static
-    one answers immediately. Public-key attempts (password None) are rejected.
-
-    An accepted login is logged at info and a rejected password as a
-    warning. A rejected public key is not logged: clients try their keys
-    before a password.
-    """
-    # TODO: upstream to acton-ssh: SshPipeListener sees every login and the
-    # client address, so it can log logins like sshd does, for any checker.
-    _log = logging.Logger(log_handler)
-
-    def check(user: str, password: ?str, pubkey: ?bytes, respond: action(bool) -> None):
-        if password is None:
-            respond(False)
-        elif user == expected_user and password == expected_password:
-            _log.info("NETCONF user authenticated", {"user": user})
-            respond(True)
-        else:
-            _log.warning("NETCONF authentication failed", {"user": user})
-            respond(False)
-
-
 actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRoot, top_oper_schema: yschema.DRoot, cfs: ttt.Layer, inventory: monitoring.ModuleInventory, on_close: ?action(NetconfSession) -> None=None, session_seq: int=0, event_hub: ?ypevents.EventStreamHub=None):
     """A single NETCONF session driving the configuration tree.
 
@@ -293,11 +264,9 @@ actor NetconfServer(
     top_oper_schema: yschema.DRoot,
     cfs: ttt.Layer,
     yang_sources: list[yschema.YangSource],
+    auth_check: action(str, ?str, ?bytes, action(bool) -> None) -> None,
     address: str = "::",
     port: int = 830,
-    username: str = "admin",
-    password: str = "admin",
-    auth_check: ?action(str, ?str, ?bytes, action(bool) -> None) -> None = None,
     host_key: ?str = None,
     on_listen: ?action(?Exception) -> None = None,
     ssh_transport: ?ssh.TransportConfig = None,
@@ -312,14 +281,12 @@ actor NetconfServer(
     None the SSH library generates an ephemeral in-memory host key per run.
     Reading a key from disk is the caller's job.
 
-    Authentication defaults to a static username/password check
-    (StaticAuthChecker). Pass `auth_check` to plug in any checker with the same
-    asynchronous shape -- e.g. one validating credentials against an external
-    service over the network before responding.
+    auth_check checks each login. It gets the user and the password, or the
+    SSH key as "type base64" once SSH has checked its signature, and answers
+    through its callback. auth.LocalAuth.check is one.
     """
     _log = logging.Logger(log_handler)
     _inventory = module_inventory(top_oper_schema, yang_sources)
-    _auth = auth_check if auth_check is not None else StaticAuthChecker(username, password, log_handler).check
     # One hub for the whole server: app code publishes events here and every
     # session with an active create-subscription receives the matching ones.
     _event_hub = ypevents.EventStreamHub(log_handler)
@@ -382,7 +349,7 @@ actor NetconfServer(
             port=port,
             on_listen=_on_listen,
             on_accept=_on_accept,
-            auth_check=_auth,
+            auth_check=auth_check,
             subsystem="netconf",
             host_keys=_host_keys,
             transport=ssh_transport,

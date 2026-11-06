@@ -48,6 +48,7 @@ import std.http
 import std.json
 import std.uri
 
+import auth as swauth
 import device as swdev
 import logs as swlogs
 
@@ -169,13 +170,14 @@ def _counts(counts: dict[int, int]) -> dict[str, ?value]:
 
 actor DeviceLogApi(device_logs: swlogs.DeviceLogs, devices: swdev.DeviceRegistry,
                    connect_cap: ?net.TCPConnectCap=None,
-                   remote_device_http: ?com(str) -> ?(str, int)=None,
+                   remote_device_http: ?com(str) -> ?(str, int, str, str)=None,
                    log_handler: ?logging.Handler=None):
     """Answers the requests that install() forwards.
 
     remote_device_http gives, for a device that is not in devices, the
-    address and HTTP port of the StratoWeave system that manages it, or
-    None. Requests about such a device go on to that system.
+    address and HTTP port of the StratoWeave system that manages it and the
+    user and password that log in to it, or None. Requests about such a
+    device go on to that system.
     """
     _log = logging.Logger(log_handler)
     fs = file.FS(device_logs.cap)
@@ -321,7 +323,7 @@ actor DeviceLogApi(device_logs: swlogs.DeviceLogs, devices: swdev.DeviceRegistry
         if remote is not None and cap is not None:
             target = remote(name)
             if target is not None:
-                _Forward(cap, target.0, target.1, ctx.raw_path, respond, _log)
+                _Forward(cap, target.0, target.1, swauth.basic_authorization(target.2, target.3), ctx.raw_path, respond, _log)
                 return
         _reply(respond, 404, {"error": f"No device named {name}"})
 
@@ -375,10 +377,11 @@ actor DeviceLogApi(device_logs: swlogs.DeviceLogs, devices: swdev.DeviceRegistry
         _reply(respond, 503, {"error": "The log file rotated while it was read; ask again"})
 
 
-actor _Forward(cap: net.TCPConnectCap, host: str, port: int, path: str,
+actor _Forward(cap: net.TCPConnectCap, host: str, port: int, authorization: str, path: str,
                respond: action(int, dict[str, str], bytes) -> None, log: logging.Logger):
-    """Send one GET of path on to the HTTP server at host and port, and its
-    answer back with respond."""
+    """Send one GET of path on to the HTTP server at host and port, with
+    the Authorization header authorization, and its answer back with
+    respond. If that server refuses the login, the answer is 502."""
     var answered = False
     var sent = False
 
@@ -388,11 +391,16 @@ actor _Forward(cap: net.TCPConnectCap, host: str, port: int, path: str,
             respond(status, headers, body)
 
     def _on_response(c: std.http.Client, r: std.http.Response):
-        headers: dict[str, str] = {}
-        for k, v in r.headers.items():
-            if k.lower() == "content-type":
-                headers["Content-Type"] = v
-        _answer(r.status, headers, r.body)
+        if r.status == 401:
+            # The 401 refuses the login of this system, not of the client
+            log.warning("Device log request refused", {"host": host, "port": port})
+            _reply(_answer, 502, {"error": f"{host} port {port}, which manages the device, refused the login"})
+        else:
+            headers: dict[str, str] = {}
+            for k, v in r.headers.items():
+                if k.lower() == "content-type":
+                    headers["Content-Type"] = v
+            _answer(r.status, headers, r.body)
         c.close()
 
     def _on_connect(c: std.http.Client):
@@ -400,7 +408,7 @@ actor _Forward(cap: net.TCPConnectCap, host: str, port: int, path: str,
         # connection; the request goes once.
         if not sent:
             sent = True
-            c.get(path, _on_response)
+            c.get(path, _on_response, {"Authorization": authorization})
 
     def _on_error(c: std.http.Client, error: str):
         if not answered:
