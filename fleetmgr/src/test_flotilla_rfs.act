@@ -34,6 +34,77 @@ def _test_read_neighbors():
     testing.assertEqual(0, len(health.read_neighbors(None)))
 
 
+def _test_rules():
+    """The pre-check rule wants one established session when there are
+    sessions; the post-check rule wants the baseline back."""
+    up = [(address="10.0.1.1", session_state="fsm-established", advertised=3, received=1),
+          (address="10.0.2.1", session_state="fsm-idle", advertised=0, received=0)]
+    pre = health.precheck_rule(up)
+    testing.assertEqual(True, pre.ok)
+    testing.assertEqual("1/2 sessions established (down: 10.0.2.1 fsm-idle), 3 routes advertised", pre.detail)
+    testing.assertEqual(True, health.precheck_rule([]).ok)
+    testing.assertEqual(False, health.precheck_rule([up[1]]).ok)
+
+    testing.assertEqual("no baseline", health.postcheck_rule(up, None).detail)
+    at_baseline = health.postcheck_rule(up, (established=1, advertised=3))
+    testing.assertEqual(True, at_baseline.ok)
+    testing.assertEqual("at the baseline: 1/1 sessions, 3/3 routes", at_baseline.detail)
+    below = health.postcheck_rule([up[1]], (established=1, advertised=3))
+    testing.assertEqual(False, below.ok)
+    testing.assertEqual("not back to the baseline: 0/1 sessions, 0/3 routes, down: 10.0.2.1 fsm-idle", below.detail)
+
+
+def _test_interface_rules():
+    """Up, line protocol up, is admin up and operationally ready. The
+    post-check rule misses an interface that was up, NVI and Virtual-Access
+    aside, and fewer Virtual-Access interfaces up."""
+    read = [(name="GigabitEthernet0/0/0", admin_status="if-state-up", oper_status="if-oper-state-ready"),
+            (name="GigabitEthernet0/0/1", admin_status="if-state-up", oper_status="if-oper-state-no-pass"),
+            (name="GigabitEthernet0/0/2", admin_status="if-state-down", oper_status="if-oper-state-no-pass"),
+            (name="NVI0", admin_status="if-state-up", oper_status="if-oper-state-ready"),
+            (name="Virtual-Access1", admin_status="if-state-up", oper_status="if-oper-state-ready")]
+    up = health.up_up(read)
+    testing.assertEqual(["GigabitEthernet0/0/0", "NVI0", "Virtual-Access1"], up)
+    pre = health.interfaces_precheck_rule(up)
+    testing.assertEqual(True, pre.ok)
+    testing.assertEqual("3 interfaces up/up, 1 of them Virtual-Access", pre.detail)
+
+    testing.assertEqual("no baseline", health.interfaces_postcheck_rule(up, None).detail)
+    same = health.interfaces_postcheck_rule(up, up)
+    testing.assertEqual(True, same.ok)
+    testing.assertEqual("at the baseline: 1/1 up/up, Virtual-Access 1/1", same.detail)
+    # NVI0 and a Virtual-Access interface going away alone are no missing
+    # interface; fewer Virtual-Access is its own failure.
+    baseline = ["GigabitEthernet0/0/0", "GigabitEthernet0/0/1", "NVI0", "NVI1",
+                "Virtual-Access1", "Virtual-Access2"]
+    got = health.interfaces_postcheck_rule(up, baseline)
+    testing.assertEqual(False, got.ok)
+    testing.assertEqual("not back to the baseline: missing GigabitEthernet0/0/1 and Virtual-Access up 1/2",
+                        got.detail)
+    testing.assertEqual(True, health.interfaces_postcheck_rule(up + ["Virtual-Access9"], ["NVI1", "Virtual-Access1"]).ok)
+
+
+def _test_ospf_rules():
+    """The OSPF post-check rule wants the baseline's neighbors back, each in
+    the same state: a missing, a new or a changed neighbor fails it."""
+    base = [(neighbor_id="10.255.0.2", interface="GigabitEthernet0/0/0", address="10.1.0.2", state="ospf-nbr-full"),
+            (neighbor_id="10.255.0.3", interface="GigabitEthernet0/0/0", address="10.1.0.3", state="ospf-nbr-full")]
+    pre = health.ospf_precheck_rule(base)
+    testing.assertEqual(True, pre.ok)
+    testing.assertEqual("2 OSPF neighbors, 2 full", pre.detail)
+    testing.assertEqual("no OSPF neighbors", health.ospf_precheck_rule([]).detail)
+    testing.assertEqual("no baseline", health.ospf_postcheck_rule(base, None).detail)
+    same = health.ospf_postcheck_rule(base, base)
+    testing.assertEqual(True, same.ok)
+    testing.assertEqual("at the baseline: 2 OSPF neighbors", same.detail)
+    now = [(neighbor_id="10.255.0.3", interface="GigabitEthernet0/0/0", address="10.1.0.3", state="ospf-nbr-init"),
+           (neighbor_id="10.255.0.9", interface="GigabitEthernet0/0/1", address="10.1.1.9", state="ospf-nbr-full")]
+    got = health.ospf_postcheck_rule(now, base)
+    testing.assertEqual(False, got.ok)
+    testing.assertEqual("not back to the baseline: missing 10.255.0.2, 10.255.0.3 init, was full, new 10.255.0.9",
+                        got.detail)
+
+
 actor _test_direct_device_config(t: testing.AsyncT):
     """The flotilla northbound is RFS: /device is its top-level intent."""
     root = rfs.root()
@@ -181,8 +252,96 @@ actor _test_iosxe_bgp_down_refuses_the_install(t: testing.AsyncT):
                 pre="fail", post="not-run")
 
 
+actor _test_iosxe_interface_lost_rolls_back(t: testing.AsyncT):
+    """With an interface down on the new release, the interfaces post-check
+    fails and the abort takes the device back."""
+    MockUpgrade(t, "interface-lost", status="rolled-back", release="17.18.2", stage="rollback",
+                pre="pass", post="fail")
+
+
+actor _test_iosxe_ospf_lost_rolls_back(t: testing.AsyncT):
+    """With an OSPF neighbor stuck in init on the new release, the ospf
+    post-check fails and the abort takes the device back."""
+    MockUpgrade(t, "ospf-lost", status="rolled-back", release="17.18.2", stage="rollback",
+                pre="pass", post="fail")
+
+
 actor _test_iosxe_bgp_lost_rolls_back(t: testing.AsyncT):
     """With the session idle on the new release, the post-check fails and the
     abort takes the device back."""
     MockUpgrade(t, "bgp-lost", status="rolled-back", release="17.18.2", stage="rollback",
                 pre="pass", post="fail")
+
+
+actor IdleHealth(t: testing.AsyncT, failure: str, health_state: str, bgp: str, session_state: str):
+    """A flotilla mock IOS XE device in no upgrade: its health shows anyway,
+    judged on reads taken every second: one check for BGP, one for the
+    interfaces and one for OSPF."""
+    root = rfs.root()
+    dev = root.device.create(
+        "xe-1",
+        type="iosxe",
+        credentials=Credentials(username="admin", password="admin"),
+    )
+    dev.mock.enabled = True
+    dev.mock.software.failure = failure
+    root.rfs.create("xe-1").device_health.health_period = u64(1)
+
+    tr = stratoweave.test_main(sysspec.SYSSPEC, t.log_handler)
+    var polls = 0
+    var last = ""
+
+    def poll() -> None:
+        polls += 1
+        oper = rfs_oper.root.from_gdata(tr.cfs.newsession().get_data())
+        entry = oper.rfs.get("xe-1")
+        if entry is not None:
+            s = entry.device_health.state
+            checks: list[str] = []
+            for c in s.check:
+                checks.append("{c.name} {c.health}: {c.precheck.detail} / {c.postcheck.detail}")
+            states: list[str] = []
+            for n in s.bgp.neighbor:
+                st = n.session_state
+                states.append(st if st is not None else "")
+            full = 0
+            for n in s.ospf.neighbor:
+                if n.state == "ospf-nbr-full" and n.state_at_baseline == "ospf-nbr-full":
+                    full += 1
+            up_up = 0
+            for i in s.interfaces.interface:
+                if i.oper_status == "if-oper-state-ready" and i.up_at_baseline == True:
+                    up_up += 1
+            last = "{s.health} | {checks} | {states} | {up_up} up at the baseline | {full} OSPF full"
+            bgp_check = s.check.get("bgp")
+            interfaces_check = s.check.get("interfaces")
+            ospf_check = s.check.get("ospf")
+            if s.health == health_state and bgp_check is not None and bgp_check.health == bgp \
+                    and interfaces_check is not None and interfaces_check.health == "healthy" \
+                    and ospf_check is not None and ospf_check.health == "healthy" and full == 2 \
+                    and states == [session_state] and up_up == 6 and s.since is not None:
+                t.success()
+                return
+        if polls > 300:
+            t.failure(ValueError("health never became {health_state}: {last}"))
+            return
+        after 0.01: poll()
+
+    def on_device(result):
+        if isinstance(result, Exception):
+            t.failure(result)
+        else:
+            poll()
+
+    tr.edit_config(root.to_gdata(), on_device)
+
+
+actor _test_health_without_an_upgrade(t: testing.AsyncT):
+    """An established session and the interfaces up are healthy, and the
+    first reads are the post-checks' baselines."""
+    IdleHealth(t, "none", "healthy", "healthy", "fsm-established")
+
+
+actor _test_health_with_bgp_down(t: testing.AsyncT):
+    """An idle session is unhealthy before any upgrade tries the device."""
+    IdleHealth(t, "bgp-down", "unhealthy", "unhealthy", "fsm-idle")

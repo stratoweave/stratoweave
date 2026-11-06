@@ -1,6 +1,14 @@
-"""Device-health RFS service: BGP session state and prefix counts read off
-the device, used as the device's software upgrade pre-check and post-check.
+"""Device-health RFS service: checks read off the device all the time, each
+judged by its software upgrade pre-check and post-check rules and published
+as the device's health. An upgrade consults the same rules.
+
+bgp: BGP session state and prefix counts. interfaces: the interfaces that
+are up with their line protocol up, what `show interfaces | inc up, line
+protocol is up` lists. ospf: the OSPF neighbors and their adjacency state,
+what `show ip ospf neighbor detail` lists.
 """
+
+import time
 
 import yang.gdata as ygdata
 
@@ -9,12 +17,23 @@ import stratoweave.ttt as ttt
 
 import flotilla.layers.base_0 as base
 import flotilla.layers.y_0 as y_0
+import flotilla.layers.y_0_oper as y0_oper
 import flotilla.devices.iosxe as iosxe
 import flotilla.devices.iosxe_oper as iosxe_oper
 # TODO: required by the compiler, see acton issue #2390
 import yang.identityref
 
-REGISTRANT = "rfs-device-health"
+BGP = "bgp"
+INTERFACES = "interfaces"
+OSPF = "ospf"
+# The checks in the order they are shown. Each is registered with the
+# software manager under its name.
+CHECKS = [BGP, INTERFACES, OSPF]
+
+# The interfaces the missing rule leaves out, and the ones the less rule
+# counts.
+UNWATCHED_PREFIXES = ["NVI", "Virtual-Access"]
+COUNTED_PREFIX = "Virtual-Access"
 
 
 def read_neighbors(root: ?iosxe_oper.root) -> list[(address: str, session_state: str, advertised: int, received: int)]:
@@ -41,149 +60,523 @@ def down(ns: list[(address: str, session_state: str, advertised: int, received: 
     return ", ".join(parts)
 
 
+def counts(ns: list[(address: str, session_state: str, advertised: int, received: int)]) -> (established: int, advertised: int):
+    """Established sessions and advertised routes of one read."""
+    est = 0
+    adv = 0
+    for n in ns:
+        if n.session_state == "fsm-established":
+            est += 1
+        adv += n.advertised
+    return (established=est, advertised=adv)
+
+
+def precheck_rule(ns: list[(address: str, session_state: str, advertised: int, received: int)]) -> (ok: bool, detail: str):
+    """Would an upgrade start: not while sessions are configured and none is
+    established."""
+    total = len(ns)
+    c = counts(ns)
+    d = down(ns)
+    if total > 0 and c.established == 0:
+        return (ok=False, detail="no established BGP session: {d}")
+    if total == 0:
+        return (ok=True, detail="no BGP neighbors")
+    if c.established < total:
+        return (ok=True, detail="{c.established}/{total} sessions established (down: {d}), {c.advertised} routes advertised")
+    return (ok=True, detail="{c.established}/{total} sessions established, {c.advertised} routes advertised")
+
+
+def postcheck_rule(ns: list[(address: str, session_state: str, advertised: int, received: int)],
+                   baseline: ?(established: int, advertised: int)) -> (ok: bool, detail: str):
+    """Is the device back at the baseline: as many sessions established and
+    as many routes advertised."""
+    if baseline is not None:
+        c = counts(ns)
+        got = "{c.established}/{baseline.established} sessions, {c.advertised}/{baseline.advertised} routes"
+        if c.established < baseline.established or c.advertised < baseline.advertised:
+            d = down(ns)
+            return (ok=False, detail="not back to the baseline: {got}" + (", down: {d}" if d != "" else ""))
+        return (ok=True, detail="at the baseline: {got}")
+    return (ok=False, detail="no baseline")
+
+
+def read_interfaces(root: ?iosxe_oper.root) -> list[(name: str, admin_status: str, oper_status: str)]:
+    """Each interface's admin and operational status out of a device oper
+    tree."""
+    out: list[(name: str, admin_status: str, oper_status: str)] = []
+    if root is not None:
+        for i in root.interfaces.interface:
+            admin = i.admin_status
+            oper = i.oper_status
+            out.append((name=i.name,
+                        admin_status=admin if admin is not None else "",
+                        oper_status=oper if oper is not None else ""))
+    return out
+
+
+def up_up(interfaces: list[(name: str, admin_status: str, oper_status: str)]) -> list[str]:
+    """The interfaces that are up with their line protocol up."""
+    return [i.name for i in interfaces
+            if i.admin_status == "if-state-up" and i.oper_status == "if-oper-state-ready"]
+
+
+def watched(name: str) -> bool:
+    """Whether the missing rule looks at this interface."""
+    for prefix in UNWATCHED_PREFIXES:
+        if name.startswith(prefix):
+            return False
+    return True
+
+
+def interfaces_precheck_rule(up: list[str]) -> (ok: bool, detail: str):
+    """Passes on every read: an upgrade's pre-check only takes the baseline."""
+    counted = len([n for n in up if n.startswith(COUNTED_PREFIX)])
+    if counted > 0:
+        return (ok=True, detail="{len(up)} interfaces up/up, {counted} of them {COUNTED_PREFIX}")
+    return (ok=True, detail="{len(up)} interfaces up/up")
+
+
+def interfaces_postcheck_rule(up: list[str], baseline: ?list[str]) -> (ok: bool, detail: str):
+    """Is the device back at the baseline: every interface that was up, line
+    protocol up, still is, NVI and Virtual-Access aside, and no fewer
+    Virtual-Access interfaces are."""
+    if baseline is not None:
+        now_up = set(up)
+        before = [n for n in baseline if watched(n)]
+        missing = [n for n in before if n not in now_up]
+        counted_before = len([n for n in baseline if n.startswith(COUNTED_PREFIX)])
+        counted_now = len([n for n in up if n.startswith(COUNTED_PREFIX)])
+        parts: list[str] = []
+        if len(missing) > 0:
+            parts.append("missing " + ", ".join(missing))
+        if counted_now < counted_before:
+            parts.append("{COUNTED_PREFIX} up {counted_now}/{counted_before}")
+        if len(parts) > 0:
+            return (ok=False, detail="not back to the baseline: " + " and ".join(parts))
+        got = "{len(before)}/{len(before)} up/up"
+        if counted_before > 0:
+            got += ", {COUNTED_PREFIX} {counted_now}/{counted_before}"
+        return (ok=True, detail="at the baseline: " + got)
+    return (ok=False, detail="no baseline")
+
+
+def read_ospf(root: ?iosxe_oper.root) -> list[(neighbor_id: str, interface: str, address: str, state: str)]:
+    """The OSPF neighbors on each interface out of a device oper tree."""
+    out: list[(neighbor_id: str, interface: str, address: str, state: str)] = []
+    if root is not None:
+        st = root.ospf_oper_data.ospf_state
+        if st is not None:
+            for instance in st.ospf_instance:
+                for area in instance.ospf_area:
+                    for intf in area.ospf_interface:
+                        for n in intf.ospf_neighbor:
+                            address = n.address
+                            state = n.state
+                            out.append((neighbor_id=n.neighbor_id, interface=intf.name,
+                                        address=address if address is not None else "",
+                                        state=state if state is not None else ""))
+    return out
+
+
+def ospf_state_label(state: str) -> str:
+    """ospf-nbr-full -> full"""
+    return state[9:] if state.startswith("ospf-nbr-") else state
+
+
+def ospf_precheck_rule(ns: list[(neighbor_id: str, interface: str, address: str, state: str)]) -> (ok: bool, detail: str):
+    """Passes on every read: an upgrade's pre-check only takes the baseline."""
+    if len(ns) == 0:
+        return (ok=True, detail="no OSPF neighbors")
+    full = len([n for n in ns if n.state == "ospf-nbr-full"])
+    return (ok=True, detail="{len(ns)} OSPF neighbors, {full} full")
+
+
+def ospf_postcheck_rule(ns: list[(neighbor_id: str, interface: str, address: str, state: str)],
+                        baseline: ?list[(neighbor_id: str, interface: str, address: str, state: str)]) -> (ok: bool, detail: str):
+    """Are the neighbors the baseline's, each in the same state: none
+    missing, none new, none changed."""
+    if baseline is not None:
+        now: dict[str, str] = {}
+        for n in ns:
+            now["{n.neighbor_id} {n.interface}"] = n.state
+        before: dict[str, str] = {}
+        for n in baseline:
+            before["{n.neighbor_id} {n.interface}"] = n.state
+        parts: list[str] = []
+        for n in baseline:
+            k = "{n.neighbor_id} {n.interface}"
+            if k not in now:
+                parts.append("missing {n.neighbor_id}")
+            elif now[k] != n.state:
+                parts.append("{n.neighbor_id} {ospf_state_label(now[k])}, was {ospf_state_label(n.state)}")
+        for n in ns:
+            if "{n.neighbor_id} {n.interface}" not in before:
+                parts.append("new {n.neighbor_id}")
+        if len(parts) > 0:
+            return (ok=False, detail="not back to the baseline: " + ", ".join(parts))
+        return (ok=True, detail="at the baseline: {len(baseline)} OSPF neighbors")
+    return (ok=False, detail="no baseline")
+
+
+def now_text() -> str:
+    """The current UTC time as a yang:date-and-time."""
+    d = time.utcnow()
+    return f"{d.year:04d}-{d.month:02d}-{d.day:02d}T{d.hour:02d}:{d.minute:02d}:{d.second:02d}Z"
+
+
 class DeviceHealth(base.DeviceHealth):
-    def transform(self, i, di, dynstate):
+    def transform(self, i, di):
         # No device configuration.
         return iosxe.root()
 
 
 actor DeviceHealthTransform(
     path: ttt.Path,
-    update_dynstate: proc(?y_0.stratoweave_rfs__rfs__device_health__dynstate) -> None,
+    update_oper: proc(?y0_oper.stratoweave_rfs__rfs__device_health) -> None,
     dev: swdev.DeviceMgr,
 ):
-    """Gates the device's software upgrade on its BGP state.
-
-    update_dynstate is never called: the model's empty dynstate container
-    exists only so the generator gives this transform an actor."""
+    """Reads the device for each check all the time and judges every read by
+    the check's pre-check and post-check rules, published as the health
+    state. Each check also gates the device's software upgrade on the same
+    rules."""
     var subscriptions: ?ygdata.SubscriptionManager = None
-    var destination: ?ygdata.Dst = None
+    var bgp_dst: ?ygdata.Dst = None
+    var interfaces_dst: ?ygdata.Dst = None
+    var ospf_dst: ?ygdata.Dst = None
+    var enabled = False
     var registered = False
-    var period = 2.0
-    # How long each check waits for a sample it can pass on.
+    # The period each check is read at, 0 while it is not.
+    var periods: dict[str, float] = {}
+    var poll_period = 2.0
+    var health_period = 30.0
+    # How long each upgrade check waits for a read it can pass on.
     var precheck_wait = 45.0
     var postcheck_wait = 600.0
 
-    # Taken by the pre-check; the post-check compares against it.
-    var baseline: ?(established: int, advertised: int) = None
+    # What the post-checks compare against, taken by an upgrade's pre-check
+    # or by the first read the pre-check rule passes.
+    var bgp_baseline: ?(established: int, advertised: int) = None
+    var interfaces_baseline: ?list[str] = None
+    var ospf_baseline: ?list[(neighbor_id: str, interface: str, address: str, state: str)] = None
+    var baseline_at: dict[str, str] = {}
 
-    # The check in progress: its kind, the manager's done action, and what
-    # the last sample showed. The id retires the budget timer of an answered
-    # check. The device is subscribed to only while a check runs; a periodic
-    # subscription delivers on every successful read, so each delivery is a
-    # fresh sample to decide on.
-    var kind = ""
-    var check = 0
-    var done: ?action(bool, str) -> None = None
-    var last_seen = ""
+    # The last reads, and each check's verdicts on its last read.
+    var neighbors: list[(address: str, session_state: str, advertised: int, received: int)] = []
+    var interfaces: list[(name: str, admin_status: str, oper_status: str)] = []
+    var ospf_neighbors: list[(neighbor_id: str, interface: str, address: str, state: str)] = []
+    var verdicts: dict[str, (pre: (ok: bool, detail: str), post: (ok: bool, detail: str))] = {}
 
-    def on_state(root: ?iosxe_oper.root, error: ?Exception) -> None:
-        if kind == "":
+    # The upgrade check each check has in progress: its kind ("" for none),
+    # the manager's done action, and what the last read showed. The round
+    # retires the budget timer of an answered check. While an upgrade check
+    # runs its device is read every poll_period, so each delivery is a fresh
+    # read to decide on.
+    var kinds: dict[str, str] = {}
+    var dones: dict[str, action(bool, str) -> None] = {}
+    var rounds: dict[str, int] = {}
+    var last_seen: dict[str, str] = {}
+
+    # What the health state last published, to publish only changes.
+    var shown = ""
+    var shown_health = ""
+    var since = ""
+
+    def kind_of(name: str) -> str:
+        return kinds[name] if name in kinds else ""
+
+    def on_bgp(root: ?iosxe_oper.root, error: ?Exception) -> None:
+        # A call can still arrive after shutdown closed the subscription.
+        if subscriptions is None:
             return
         if error is not None:
             # Expected around a reload; the next read gets its turn.
-            last_seen = "could not read the device: {error}"
+            neighbors = []
+            failed(BGP, "could not read the device: {error}")
             return
-        decide(read_neighbors(root))
+        ns = read_neighbors(root)
+        neighbors = ns
+        pre = precheck_rule(ns)
+        if pre.ok and (bgp_baseline is None or kind_of(BGP) == "precheck"):
+            c = counts(ns)
+            bgp_baseline = (established=c.established, advertised=c.advertised)
+            baseline_at[BGP] = now_text()
+        judged(BGP, pre, postcheck_rule(ns, bgp_baseline))
 
-    def decide(ns: list[(address: str, session_state: str, advertised: int, received: int)]) -> None:
-        """Decide the waiting check from the sample just delivered; if it does
-        not decide, the next delivery gets its turn."""
-        total = len(ns)
-        est = 0
-        adv = 0
-        for n in ns:
-            if n.session_state == "fsm-established":
-                est += 1
-            adv += n.advertised
-        d = down(ns)
+    def on_interfaces(root: ?iosxe_oper.root, error: ?Exception) -> None:
+        if subscriptions is None:
+            return
+        if error is not None:
+            interfaces = []
+            failed(INTERFACES, "could not read the device: {error}")
+            return
+        ifs = read_interfaces(root)
+        interfaces = ifs
+        up = up_up(ifs)
+        pre = interfaces_precheck_rule(up)
+        if pre.ok and (interfaces_baseline is None or kind_of(INTERFACES) == "precheck"):
+            interfaces_baseline = up
+            baseline_at[INTERFACES] = now_text()
+        judged(INTERFACES, pre, interfaces_postcheck_rule(up, interfaces_baseline))
+
+    def on_ospf(root: ?iosxe_oper.root, error: ?Exception) -> None:
+        if subscriptions is None:
+            return
+        if error is not None:
+            ospf_neighbors = []
+            failed(OSPF, "could not read the device: {error}")
+            return
+        ns = read_ospf(root)
+        ospf_neighbors = ns
+        pre = ospf_precheck_rule(ns)
+        if pre.ok and (ospf_baseline is None or kind_of(OSPF) == "precheck"):
+            ospf_baseline = ns
+            baseline_at[OSPF] = now_text()
+        judged(OSPF, pre, ospf_postcheck_rule(ns, ospf_baseline))
+
+    def failed(name: str, reading: str) -> None:
+        if kind_of(name) != "":
+            last_seen[name] = reading
+        verdicts[name] = (pre=(ok=False, detail=reading), post=(ok=False, detail=reading))
+        show()
+
+    def judged(name: str, pre: (ok: bool, detail: str), post: (ok: bool, detail: str)) -> None:
+        """Keep a check's verdicts on its last read, and decide its waiting
+        upgrade check; if the read does not decide it, the next gets its
+        turn."""
+        verdicts[name] = (pre=pre, post=post)
+        kind = kind_of(name)
         if kind == "precheck":
-            if total > 0 and est == 0:
-                # Nothing to compare against afterwards.
-                last_seen = "no established BGP session: {d}"
-                return
-            baseline = (established=est, advertised=adv)
-            if total == 0:
-                answer(True, "no BGP neighbors")
-            elif est < total:
-                answer(True, "{est}/{total} sessions established (down: {d}), {adv} routes advertised")
+            if pre.ok:
+                answer(name, True, pre.detail)
             else:
-                answer(True, "{est}/{total} sessions established, {adv} routes advertised")
-            return
-        b = baseline
-        if b is None:
-            answer(False, "no pre-upgrade baseline")
-            return
-        got = "{est}/{b!.established} sessions, {adv}/{b!.advertised} routes"
-        if est < b!.established or adv < b!.advertised:
-            last_seen = "not back to the baseline: {got}" + (", down: {d}" if est < total else "")
-            return
-        answer(True, "recovered: {got}")
+                last_seen[name] = pre.detail
+        elif kind == "postcheck":
+            if post.ok:
+                answer(name, True, post.detail)
+            else:
+                last_seen[name] = post.detail
+        show()
 
-    def answer(ok: bool, detail: str) -> None:
-        d = done
-        k = kind
-        kind = ""
-        done = None
-        subscriptions!.declare(set())
+    def show() -> None:
+        """Publish the verdicts and the reads, if anything changed."""
+        health = "healthy"
+        key = ""
+        for name in CHECKS:
+            if name in verdicts:
+                v = verdicts[name]
+                if not (v.pre.ok and v.post.ok):
+                    health = "unhealthy"
+                at = baseline_at[name] if name in baseline_at else ""
+                key += "|{name} {v.pre.detail} {v.post.detail} {at}"
+        b = bgp_baseline
+        if b is not None:
+            key += "|{b.established} {b.advertised}"
+        for n in neighbors:
+            key += "|{n.address} {n.session_state} {n.advertised} {n.received}"
+        before: set[str] = set()
+        ib = interfaces_baseline
+        if ib is not None:
+            before = set(ib)
+            key += "|" + " ".join(ib)
+        for i in interfaces:
+            key += "|{i.name} {i.admin_status} {i.oper_status}"
+        ob = ospf_baseline
+        ospf_before: dict[str, str] = {}
+        if ob is not None:
+            for n in ob:
+                ospf_before["{n.neighbor_id} {n.interface}"] = n.state
+                key += "|b {n.neighbor_id} {n.interface} {n.state}"
+        for n in ospf_neighbors:
+            key += "|{n.neighbor_id} {n.interface} {n.address} {n.state}"
+        key = health + key
+        if key == shown:
+            return
+        shown = key
+        if health != shown_health:
+            shown_health = health
+            since = now_text()
+        oper = base.DeviceHealth.new_state(path)
+        s = oper.state
+        s.health = health
+        s.since = since
+        for name in CHECKS:
+            if name in verdicts:
+                v = verdicts[name]
+                c = s.check.create(name, health="healthy" if v.pre.ok and v.post.ok else "unhealthy")
+                c.precheck.health = "healthy" if v.pre.ok else "unhealthy"
+                c.precheck.detail = v.pre.detail
+                c.postcheck.health = "healthy" if v.post.ok else "unhealthy"
+                c.postcheck.detail = v.post.detail
+                if name in baseline_at:
+                    c.baseline_at = baseline_at[name]
+        if b is not None:
+            s.bgp.baseline.established = u64(b.established)
+            s.bgp.baseline.advertised = u64(b.advertised)
+        for n in neighbors:
+            s.bgp.neighbor.create(n.address, session_state=n.session_state,
+                                  advertised=u64(n.advertised), received=u64(n.received))
+        read: set[str] = set()
+        for i in interfaces:
+            read.add(i.name)
+            s.interfaces.interface.create(i.name, admin_status=i.admin_status, oper_status=i.oper_status,
+                                          up_at_baseline=i.name in before)
+        for name in before:
+            if name not in read:
+                s.interfaces.interface.create(name, up_at_baseline=True)
+        seen: set[str] = set()
+        for n in ospf_neighbors:
+            k = "{n.neighbor_id} {n.interface}"
+            seen.add(k)
+            entry = s.ospf.neighbor.create((neighbor_id=n.neighbor_id, interface=n.interface),
+                                           address=n.address, state=n.state)
+            if k in ospf_before:
+                entry.state_at_baseline = ospf_before[k]
+        if ob is not None:
+            for n in ob:
+                if "{n.neighbor_id} {n.interface}" not in seen:
+                    s.ospf.neighbor.create((neighbor_id=n.neighbor_id, interface=n.interface),
+                                           address=n.address, state_at_baseline=n.state)
+        update_oper(oper)
+
+    def declare() -> None:
+        """Subscribe to each check's readout at its period."""
+        want: set[ygdata.Delivery] = set()
+        bd = bgp_dst
+        p = periods[BGP] if BGP in periods else 0.0
+        if bd is not None and p > 0.0:
+            # The whole neighbors container; the parser keeps only what the
+            # pruned model has.
+            bgp = iosxe_oper.subs.bgp_state_data.neighbors
+            want.add(bd.deliver({bgp.subscribe(period=p)}))
+        idst = interfaces_dst
+        p = periods[INTERFACES] if INTERFACES in periods else 0.0
+        if idst is not None and p > 0.0:
+            # Only the two statuses: the device has many more leaves per
+            # interface.
+            ifs = iosxe_oper.subs.interfaces
+            want.add(idst.deliver({ifs.subscribe(select=[ifs.interface.admin_status, ifs.interface.oper_status],
+                                                 period=p)}))
+        odst = ospf_dst
+        p = periods[OSPF] if OSPF in periods else 0.0
+        if odst is not None and p > 0.0:
+            # Only each neighbor's address and state, not the LSAs and the
+            # rest of the OSPF state.
+            st = iosxe_oper.subs.ospf_oper_data.ospf_state
+            nb = st.ospf_instance.ospf_area.ospf_interface.ospf_neighbor
+            want.add(odst.deliver({st.subscribe(select=[nb.address, nb.state], period=p)}))
+        sm = subscriptions
+        if sm is not None:
+            sm.declare(want)
+
+    def read_every() -> None:
+        """Read each check every poll_period while its upgrade check runs,
+        else every health_period; not at all while disabled."""
+        changed = False
+        for name in CHECKS:
+            p = 0.0
+            if enabled:
+                p = poll_period if kind_of(name) != "" else health_period
+            if name not in periods or periods[name] != p:
+                periods[name] = p
+                changed = True
+        if changed:
+            declare()
+
+    def answer(name: str, ok: bool, detail: str) -> None:
+        kind = kind_of(name)
+        kinds[name] = ""
+        read_every()
         if ok:
-            print("device-health {path}: {k} pass: {detail}")
+            print("device-health {path}: {name} {kind} pass: {detail}")
         else:
-            print("device-health {path}: {k} refused: {detail}")
-        if d is not None:
+            print("device-health {path}: {name} {kind} refused: {detail}")
+        if name in dones:
+            d = dones[name]
+            del dones[name]
             d(ok, detail)
 
-    def start(k: str, cb: action(bool, str) -> None, budget: float) -> None:
-        kind = k
-        done = cb
-        last_seen = "no reading from the device"
-        check += 1
-        after budget: expire(check, budget)
-        # The whole neighbors container; the parser keeps only what the
-        # pruned model has.
-        bgp = iosxe_oper.subs.bgp_state_data.neighbors
-        subscriptions!.declare({destination!.deliver({bgp.subscribe(period=period)})})
+    def start(name: str, kind: str, cb: action(bool, str) -> None, budget: float) -> None:
+        kinds[name] = kind
+        dones[name] = cb
+        last_seen[name] = "no reading from the device"
+        r = (rounds[name] if name in rounds else 0) + 1
+        rounds[name] = r
+        after budget: expire(name, r, budget)
+        read_every()
 
-    def expire(c: int, budget: float) -> None:
-        if c != check or kind == "":
+    def expire(name: str, r: int, budget: float) -> None:
+        if name not in rounds or rounds[name] != r or kind_of(name) == "":
             return
-        answer(False, "{last_seen} after {int(budget)}s")
+        seen = last_seen[name] if name in last_seen else ""
+        answer(name, False, "{seen} after {int(budget)}s")
 
-    def precheck(cb: action(bool, str) -> None) -> None:
-        start("precheck", cb, precheck_wait)
+    def precheck_bgp(cb: action(bool, str) -> None) -> None:
+        start(BGP, "precheck", cb, precheck_wait)
 
-    def postcheck(cb: action(bool, str) -> None) -> None:
-        start("postcheck", cb, postcheck_wait)
+    def postcheck_bgp(cb: action(bool, str) -> None) -> None:
+        start(BGP, "postcheck", cb, postcheck_wait)
+
+    def precheck_interfaces(cb: action(bool, str) -> None) -> None:
+        start(INTERFACES, "precheck", cb, precheck_wait)
+
+    def postcheck_interfaces(cb: action(bool, str) -> None) -> None:
+        start(INTERFACES, "postcheck", cb, postcheck_wait)
+
+    def precheck_ospf(cb: action(bool, str) -> None) -> None:
+        start(OSPF, "precheck", cb, precheck_wait)
+
+    def postcheck_ospf(cb: action(bool, str) -> None) -> None:
+        start(OSPF, "postcheck", cb, postcheck_wait)
 
     def register() -> None:
         if not registered:
             registered = True
             swmgr = dev.get_swmgr()
-            swmgr.add_precheck(REGISTRANT, precheck)
-            swmgr.add_postcheck(REGISTRANT, postcheck)
+            swmgr.add_precheck(BGP, precheck_bgp)
+            swmgr.add_postcheck(BGP, postcheck_bgp)
+            swmgr.add_precheck(INTERFACES, precheck_interfaces)
+            swmgr.add_postcheck(INTERFACES, postcheck_interfaces)
+            swmgr.add_precheck(OSPF, precheck_ospf)
+            swmgr.add_postcheck(OSPF, postcheck_ospf)
 
     def unregister() -> None:
         if registered:
             registered = False
             swmgr = dev.get_swmgr()
-            swmgr.remove_precheck(REGISTRANT)
-            swmgr.remove_postcheck(REGISTRANT)
+            for name in CHECKS:
+                swmgr.remove_precheck(name)
+                swmgr.remove_postcheck(name)
+
+    def forget() -> None:
+        """Drop the published state."""
+        if shown != "":
+            shown = ""
+            shown_health = ""
+            update_oper(None)
 
     def on_conf(conf: y_0.stratoweave_rfs__rfs__device_health) -> None:
         if subscriptions is None:
             subscriptions = ygdata.SubscriptionManager(dev.tree_provider(), str(path))
-            destination = iosxe_oper.dst(on_state)
-        period = float(conf.poll_period)
+            bgp_dst = iosxe_oper.dst(on_bgp)
+            interfaces_dst = iosxe_oper.dst(on_interfaces)
+            ospf_dst = iosxe_oper.dst(on_ospf)
+            periods = {}
+        poll_period = float(conf.poll_period)
+        health_period = float(conf.health_period)
         precheck_wait = float(conf.precheck_wait)
         postcheck_wait = float(conf.postcheck_wait)
+        enabled = conf.enabled
         if conf.enabled:
             register()
         else:
             unregister()
-            subscriptions!.declare(set())
+            forget()
+        read_every()
 
     def shutdown() -> None:
         unregister()
         s = subscriptions
+        subscriptions = None
         if s is not None:
             s.close()
+        forget()
