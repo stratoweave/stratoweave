@@ -2,6 +2,7 @@
   import { goto } from '$app/navigation';
 
   import { errorText } from '#lib/core/errors.ts';
+  import { onLoaded } from '#lib/core/loading.svelte.ts';
   import { restconfPatchJson } from '#lib/core/restconf/client.ts';
   import FieldText from '#lib/core/ui/FieldText.svelte';
   import Section from '#lib/core/ui/Section.svelte';
@@ -14,6 +15,12 @@
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
+  // null until the reads are in.
+  let inventory = $state.raw<Awaited<typeof data.inventory> | null>(null);
+  onLoaded(() => data.inventory, (value) => (inventory = value));
+  let devices = $derived(inventory?.devices ?? []);
+  let campaigns = $derived(inventory?.campaigns ?? []);
+  let images = $derived(inventory?.images ?? []);
 
   // The third step is the campaign's own page, which shows its plan.
   const STEPS = ['Devices', 'Images', 'Plan'];
@@ -32,15 +39,15 @@
   let creating = $state(false);
   let createError = $state('');
 
-  let owners = $derived(campaignOwners(data.campaigns));
-  let scheduleNames = $derived(data.schedules.map((s) => s.name));
-  let byName = $derived(new Map(data.devices.map((d) => [d.name, d])));
+  let owners = $derived(campaignOwners(campaigns));
+  let scheduleNames = $derived((inventory?.schedules ?? []).map((s) => s.name));
+  let byName = $derived(new Map(devices.map((d) => [d.name, d])));
   let grouped = $derived(
     modelGroups(selected.map((n) => byName.get(n)).filter((d): d is Device => d !== undefined))
   );
-  let members = $derived(memberImages(grouped.groups, picks, data.images));
+  let members = $derived(memberImages(grouped.groups, picks, images));
   let errors = $derived(
-    validateNewCampaign({ name, devices: members }, data.campaigns.map((c) => c.name)).errors
+    validateNewCampaign({ name, devices: members }, campaigns.map((c) => c.name)).errors
   );
 
   function devicesText(n: number): string {
@@ -50,7 +57,7 @@
   function toImages(): void {
     devicesTouched = true;
     if (selected.length === 0) return;
-    picks = withPreselected(grouped.groups, picks, data.images);
+    picks = withPreselected(grouped.groups, picks, images);
     step = 2;
   }
 
@@ -79,18 +86,20 @@
 
 <Steps steps={STEPS} current={step} />
 
-{#if createError || data.loadError}
-  <div class="error-state status">{createError || data.loadError}</div>
+{#if createError || inventory?.loadError}
+  <div class="error-state status">{createError || inventory?.loadError}</div>
 {/if}
 
 {#if step === 1}
   <section class="card">
     <Section title="Devices">
-      {#if data.devices.length === 0}
+      {#if inventory === null}
+        <div class="empty-state" aria-busy="true">Loading devices…</div>
+      {:else if devices.length === 0}
         <div class="empty-state">No devices in the inventory.</div>
       {:else}
         <SelectionBuilder
-          inventory={data.devices}
+          inventory={devices}
           {owners}
           schedules={scheduleNames}
           bind:selection
@@ -100,7 +109,7 @@
       {/if}
       <div class="editor-actions">
         <a class="btn btn-secondary" href="/campaigns">Cancel</a>
-        <button class="btn btn-primary" type="button" onclick={toImages}>
+        <button class="btn btn-primary" type="button" onclick={toImages} disabled={inventory === null}>
           Next: images ({devicesText(selected.length)})
         </button>
       </div>
@@ -115,7 +124,7 @@
         <ModelImages
           groups={grouped.groups}
           leftOut={grouped.leftOut}
-          images={data.images}
+          {images}
           {picks}
           showErrors={touched}
           onpick={(model, image) => (picks = { ...picks, [model]: image })}

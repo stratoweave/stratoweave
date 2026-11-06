@@ -2,6 +2,7 @@
   import { onDestroy, untrack } from 'svelte';
 
   import { errorText } from '#lib/core/errors.ts';
+  import { onLoaded } from '#lib/core/loading.svelte.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
   import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
   import FieldText from '#lib/core/ui/FieldText.svelte';
@@ -25,9 +26,14 @@
   const PAGE_SIZE = 100;
 
   let { data }: PageProps = $props();
+  // null until the first fleet read is in.
+  let fleet = $state.raw<Awaited<typeof data.fleet> | null>(null);
+  onLoaded(() => data.fleet, (value) => (fleet = value));
+  let loading = $derived(fleet === null);
   // Writes patch this copy instead of re-reading the fleet (34 MB and 4 s
   // at 100k devices); the next load replaces it.
-  let devices = $derived(data.devices);
+  let devices = $derived(fleet?.devices ?? []);
+  let schedules = $derived(fleet?.schedules ?? []);
 
   let draft = $state<NewDeviceInput | null>(null);
   let importOpen = $state(false);
@@ -61,7 +67,7 @@
 
   let types = $derived([...new Set(devices.map((d) => d.type))].sort());
   let models = $derived([...new Set(devices.map((d) => d.model).filter((m) => m))].sort());
-  let scheduleNames = $derived(data.schedules.map((s) => s.name));
+  let scheduleNames = $derived(schedules.map((s) => s.name));
   let knownSchedules = $derived(new Set(scheduleNames));
   let colors = $derived(scheduleColors(scheduleNames));
   // Bindings to a schedule that does not exist: the planner places those
@@ -355,17 +361,17 @@
     </p>
   </div>
   <div class="page-actions">
-    <button class="btn btn-secondary" type="button" onclick={openImport} disabled={saving || applying}>
+    <button class="btn btn-secondary" type="button" onclick={openImport} disabled={loading || saving || applying}>
       Import
     </button>
-    <button class="btn btn-primary" type="button" onclick={openNew} disabled={saving || applying}>
+    <button class="btn btn-primary" type="button" onclick={openNew} disabled={loading || saving || applying}>
       Add device
     </button>
   </div>
 </div>
 
-{#if data.loadError}
-  <div class="error-state status">{data.loadError}</div>
+{#if fleet?.loadError}
+  <div class="error-state status">{fleet.loadError}</div>
 {/if}
 
 {#if statusMessage}
@@ -508,7 +514,9 @@
 {/if}
 
 <section class="card">
-  {#if devices.length === 0}
+  {#if loading}
+    <div class="empty-state" aria-busy="true">Loading devices…</div>
+  {:else if devices.length === 0}
     <div class="empty-state">No devices yet. Add or import some, or seed the fleet from a lab deploy.</div>
   {:else}
     <div class="filter-row">

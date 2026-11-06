@@ -35,30 +35,35 @@ async function inCampaign(config: CampaignConfig, device: string, fetch: typeof 
   };
 }
 
-export const load: PageLoad = async ({ fetch, depends, params }) => {
-  depends('data:device');
-
+async function loadDevice(name: string, fetch: typeof globalThis.fetch) {
   try {
     const [entry, schedules] = await Promise.all([
-      restconfGetOrNull<unknown>(getListEntryPath(FLEET_DEVICE_LIST_ROOT, params.name), fetch),
+      restconfGetOrNull<unknown>(getListEntryPath(FLEET_DEVICE_LIST_ROOT, name), fetch),
       restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch)
     ]);
-    const device = parseDeviceEntry(entry);
-    let campaigns: DeviceCampaign[] = [];
-    if (device !== null) {
-      const configs = parseCampaignConfigs(await restconfGetCachedOrNull<unknown>(SOFTWARE_CONFIG, fetch));
-      const member = configs.filter((c) => c.devices.includes(params.name));
-      campaigns = await Promise.all(member.map((c) => inCampaign(c, params.name, fetch)));
-    }
-    return { name: params.name, device, campaigns, schedules: parseSchedules(schedules), loadError: '' };
+    return { device: parseDeviceEntry(entry), schedules: parseSchedules(schedules), loadError: '' };
   } catch (loadError) {
-    const message = errorText(loadError, 'Failed to load the device.');
-    return {
-      name: params.name,
-      device: null,
-      campaigns: [] as DeviceCampaign[],
-      schedules: [],
-      loadError: message
-    };
+    return { device: null, schedules: [], loadError: errorText(loadError, 'Failed to load the device.') };
   }
+}
+
+async function loadCampaigns(name: string, fetch: typeof globalThis.fetch) {
+  try {
+    const configs = parseCampaignConfigs(await restconfGetCachedOrNull<unknown>(SOFTWARE_CONFIG, fetch));
+    const member = configs.filter((c) => c.devices.includes(name));
+    return { campaigns: await Promise.all(member.map((c) => inCampaign(c, name, fetch))), loadError: '' };
+  } catch (loadError) {
+    return { campaigns: [] as DeviceCampaign[], loadError: errorText(loadError, 'Failed to load the campaigns.') };
+  }
+}
+
+// Not awaited: the page shows at once, the device in a few ms and its
+// campaigns after it.
+export const load: PageLoad = ({ fetch, depends, params }) => {
+  depends('data:device');
+  const device = loadDevice(params.name, fetch);
+  const campaigns = device.then((d) =>
+    d.device === null ? { campaigns: [] as DeviceCampaign[], loadError: '' } : loadCampaigns(params.name, fetch)
+  );
+  return { name: params.name, device, campaigns };
 };

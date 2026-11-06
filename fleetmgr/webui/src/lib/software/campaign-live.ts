@@ -82,7 +82,7 @@ export class CampaignLive {
     private readonly clock: () => number = Date.now
   ) {}
 
-  /** The loader's data: on open, after navigation, a refresh or a write.
+  /** The loader's data: on open, after navigation or a refresh.
    * `config` undefined means the load failed: what is shown stays and the
    * ticks keep trying. Another campaign starts from nothing. */
   load(name: string, seq: number, config: CampaignConfig | null | undefined, state: StateParts | null): void {
@@ -120,10 +120,21 @@ export class CampaignLive {
   }
 
   /** A write went through: drop and cancel the reads that started before
-   * it. The page reloads right after. */
+   * it. The page calls reload right after. */
   wrote(): void {
     this.barrier = nextSeq();
     this.abortReads();
+  }
+
+  /** Read the whole entry now and show it. Never rejects: on a failure
+   * the ticks try again. */
+  async reload(): Promise<void> {
+    if (this.disposed || this.name === '') return;
+    try {
+      await this.readEntry(this.name, false, this.aborter.signal);
+    } catch {
+      // keep what is shown
+    }
   }
 
   dispose(): void {

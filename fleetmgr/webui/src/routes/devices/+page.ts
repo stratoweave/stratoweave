@@ -1,25 +1,33 @@
 import { errorText } from '#lib/core/errors.ts';
 import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
-import { FLEET_ROOT, SCHEDULES_ROOT, parseFleet, parseSchedules } from '#lib/software/model.ts';
+import { FLEET_ROOT, SCHEDULES_ROOT, parseFleet, parseSchedules, type Device, type Schedule } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 
-// ?schedule=NAME opens the list filtered to the devices bound to NAME,
-// ?name=TEXT with the name filter set to TEXT.
-export const load: PageLoad = async ({ fetch, depends, url }) => {
-  depends('data:software');
-  const scheduleFilter = url.searchParams.get('schedule') ?? '';
-  const nameFilter = url.searchParams.get('name') ?? '';
-
+async function loadFleet(
+  fetch: typeof globalThis.fetch
+): Promise<{ devices: Device[]; schedules: Schedule[]; loadError: string }> {
   try {
-    const [response, schedules] = await Promise.all([
-      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch),
-      restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch)
+    // The small read first: the top answers GETs one at a time, and the
+    // fleet takes 4 s at 100k devices.
+    const [schedules, fleet] = await Promise.all([
+      restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch),
+      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch)
     ]);
-    const { devices } = parseFleet(response);
-    return { devices, schedules: parseSchedules(schedules), scheduleFilter, nameFilter, loadError: '' };
+    return { devices: parseFleet(fleet).devices, schedules: parseSchedules(schedules), loadError: '' };
   } catch (loadError) {
-    const message = errorText(loadError, 'Failed to load devices.');
-    return { devices: [], schedules: [], scheduleFilter, nameFilter, loadError: message };
+    return { devices: [], schedules: [], loadError: errorText(loadError, 'Failed to load devices.') };
   }
+}
+
+// ?schedule=NAME opens the list filtered to the devices bound to NAME,
+// ?name=TEXT with the name filter set to TEXT. The fleet is not awaited:
+// the page shows at once and fills in when it arrives.
+export const load: PageLoad = ({ fetch, depends, url }) => {
+  depends('data:software');
+  return {
+    scheduleFilter: url.searchParams.get('schedule') ?? '',
+    nameFilter: url.searchParams.get('name') ?? '',
+    fleet: loadFleet(fetch)
+  };
 };

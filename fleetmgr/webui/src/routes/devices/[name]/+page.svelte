@@ -6,6 +6,7 @@
   import StageChain from '#lib/software/StageChain.svelte';
   import StatusPill from '#lib/software/StatusPill.svelte';
   import { errorText } from '#lib/core/errors.ts';
+  import { onLoaded } from '#lib/core/loading.svelte.ts';
   import { createPoller } from '#lib/core/polling/poller.ts';
   import { setDeviceSchedule } from '#lib/maintenance/binding.ts';
   import {
@@ -20,34 +21,46 @@
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
+  // null until their reads are in; a poll keeps what is shown until then.
+  let deviceLoad = $state.raw<Awaited<typeof data.device> | null>(null);
+  let campaignsLoad = $state.raw<Awaited<typeof data.campaigns> | null>(null);
+  onLoaded(() => data.device, (value) => (deviceLoad = value));
+  onLoaded(() => data.campaigns, (value) => (campaignsLoad = value));
+  /** undefined while loading, null when there is no such device. */
+  let device = $derived(deviceLoad?.device);
+  let schedules = $derived(deviceLoad?.schedules ?? []);
+  let campaigns = $derived(campaignsLoad?.campaigns ?? []);
+  let loadError = $derived(deviceLoad?.loadError || campaignsLoad?.loadError || '');
 
   // null follows the device as polled; a pick holds until it is saved.
   let picked = $state<string | null>(null);
   let savingSchedule = $state(false);
   let scheduleMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
-  let bound = $derived(data.device?.schedule ?? '');
+  let bound = $derived(device?.schedule ?? '');
   let choice = $derived(picked ?? bound);
   let scheduleOptions = $derived.by(() => {
-    const options = data.schedules.map((s) => ({ name: s.name, label: s.name }));
-    if (bound && !data.schedules.some((s) => s.name === bound)) {
+    const options = schedules.map((s) => ({ name: s.name, label: s.name }));
+    if (bound && !schedules.some((s) => s.name === bound)) {
       options.push({ name: bound, label: `${bound} (missing)` });
     }
     return options;
   });
   // Unbound, the device follows each campaign's default schedule.
   let defaultLabel = $derived.by(() => {
-    const names = new Set(data.campaigns.map((c) => c.defaultSchedule || 'none'));
+    const names = new Set(campaigns.map((c) => c.defaultSchedule || 'none'));
     return `${names.size > 0 ? [...names].join(', ') : 'none'} (default)`;
   });
 
   async function saveSchedule(): Promise<void> {
-    if (!data.device || choice === bound) return;
+    if (!device || choice === bound) return;
     const schedule = choice;
     try {
       savingSchedule = true;
       scheduleMessage = null;
-      await setDeviceSchedule(data.device.name, schedule);
+      await setDeviceSchedule(device.name, schedule);
+      // Drops the reads from before the write; the new ones come in after.
       await invalidate('data:device');
+      if (deviceLoad?.device) deviceLoad = { ...deviceLoad, device: { ...deviceLoad.device, schedule } };
       picked = null;
       scheduleMessage = { type: 'success', text: schedule ? `Bound to ${schedule}.` : 'Unbound.' };
     } catch (saveError) {
@@ -61,7 +74,12 @@
   }
 
   onMount(() => {
-    const poller = createPoller(() => invalidate('data:device'), 5000);
+    // Waits for the reads: loads return before them, and a slow top must
+    // not be asked again before it answered.
+    const poller = createPoller(async () => {
+      await invalidate('data:device');
+      await Promise.all([data.device, data.campaigns]);
+    }, 5000);
     poller.start();
     return () => poller.stop();
   });
@@ -107,17 +125,26 @@
   }
 </script>
 
-{#if data.loadError}
-  <div class="error-state status">{data.loadError}</div>
+{#if loadError}
+  <div class="error-state status">{loadError}</div>
 {/if}
 
-{#if data.device === null}
+{#if device === undefined}
+  <section class="card hero" aria-busy="true">
+    <div class="head">
+      <DevicePicture />
+      <div class="ident">
+        <h1>{data.name}</h1>
+        <p class="meta">Loading…</p>
+      </div>
+    </div>
+  </section>
+{:else if device === null}
   <section class="card">
     <div class="empty-state">No device named {data.name}.</div>
   </section>
 {:else}
-  {@const device = data.device}
-  {@const single = data.campaigns.length === 1}
+  {@const single = campaigns.length === 1}
   <section class="card hero">
     <div class="head">
       <DevicePicture />
@@ -146,15 +173,17 @@
         </p>
       </div>
       {#if single}
-        {@const row = data.campaigns[0].row}
+        {@const row = campaigns[0].row}
         <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
       {/if}
     </div>
 
-    {#if data.campaigns.length === 0}
+    {#if campaignsLoad === null}
+      <p class="none" aria-busy="true">Loading campaigns…</p>
+    {:else if campaigns.length === 0}
       <p class="none">Not a member of any campaign.</p>
     {/if}
-    {#each data.campaigns as campaign (campaign.name)}
+    {#each campaigns as campaign (campaign.name)}
       {@const row = campaign.row}
       {@const text = note(row)}
       <div class="run">

@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import { onLoaded } from '#lib/core/loading.svelte.ts';
   import { createPoller } from '#lib/core/polling/poller.ts';
   import WeekCalendar from '#lib/maintenance/WeekCalendar.svelte';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
@@ -10,12 +11,23 @@
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
+  // null until their reads are in.
+  let list = $state.raw<Awaited<typeof data.schedules> | null>(null);
+  let usage = $state.raw<Awaited<typeof data.usage> | null>(null);
+  onLoaded(() => data.schedules, (value) => (list = value));
+  onLoaded(() => data.usage, (value) => (usage = value));
+  let schedules = $derived(list?.schedules ?? []);
+  let loadError = $derived(list?.loadError || usage?.loadError || '');
 
   let now = $state(Date.now() / 1000);
 
   onMount(() => {
     // Schedules change rarely; the clock only has to move the marker.
-    const slow = createPoller(() => invalidate('data:schedules'), 30000);
+    // Waits for the reads: loads return before them.
+    const slow = createPoller(async () => {
+      await invalidate('data:schedules');
+      await Promise.all([data.schedules, data.usage]);
+    }, 30000);
     const clock = setInterval(() => (now = Date.now() / 1000), 30000);
     slow.start();
     return () => {
@@ -24,12 +36,12 @@
     };
   });
 
-  let colors = $derived(scheduleColors(data.schedules.map((s) => s.name)));
+  let colors = $derived(scheduleColors(schedules.map((s) => s.name)));
   let rows = $derived(
-    data.schedules.map((s) => ({
+    schedules.map((s) => ({
       schedule: s,
       color: colors.get(s.name) ?? SCHEDULE_COLOR_OTHER,
-      usage: scheduleUsage(s.name, data.devices, data.campaigns)
+      usage: usage ? scheduleUsage(s.name, usage.devices, usage.campaigns) : null
     }))
   );
 
@@ -48,8 +60,8 @@
   </div>
 </div>
 
-{#if data.loadError}
-  <div class="error-state status">{data.loadError}</div>
+{#if loadError}
+  <div class="error-state status">{loadError}</div>
 {/if}
 
 <section class="card">
@@ -57,14 +69,16 @@
     <h2 class="panel-title">Next seven days</h2>
     <span class="hint">every schedule's windows in your local time · click one to edit its schedule</span>
   </div>
-  {#if data.schedules.length === 0}
+  {#if list === null}
+    <div class="empty-state" aria-busy="true">Loading schedules…</div>
+  {:else if schedules.length === 0}
     <div class="empty-state">No schedules yet. Campaigns without one run through a single always-open window.</div>
   {:else}
-    <WeekCalendar schedules={data.schedules} {now} {colors} hrefFor={href} />
+    <WeekCalendar {schedules} {now} {colors} hrefFor={href} />
   {/if}
 </section>
 
-{#if data.schedules.length > 0}
+{#if schedules.length > 0}
   <section class="card">
     <div class="table-wrap">
       <table>
@@ -89,7 +103,9 @@
               <td class="mono">UTC{formatUtcOffset(row.schedule.utcOffset)}</td>
               <td class="mono rules">{scheduleRulesText(row.schedule)}</td>
               <td class="tn right">
-                {#if row.usage.boundDevices === 0}
+                {#if row.usage === null}
+                  <span class="dim" aria-busy="true">…</span>
+                {:else if row.usage.boundDevices === 0}
                   <span class="dim">0</span>
                 {:else}
                   <a class="count-link" href={`/devices?schedule=${encodeURIComponent(row.schedule.name)}`}>
@@ -98,7 +114,9 @@
                 {/if}
               </td>
               <td>
-                {#if row.usage.defaultOf.length === 0}
+                {#if row.usage === null}
+                  <span class="dim" aria-busy="true">…</span>
+                {:else if row.usage.defaultOf.length === 0}
                   <span class="dim">—</span>
                 {:else}
                   {#each row.usage.defaultOf as campaign, i (campaign)}
