@@ -10,6 +10,7 @@
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '#lib/core/restconf/client.ts';
   import { bindPatch, unbindDevice } from '#lib/maintenance/binding.ts';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
+  import HealthPill from '#lib/software/HealthPill.svelte';
   import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, type Device, type Schedule } from '#lib/software/model.ts';
   import { nameMatcher, scheduleMatches } from '#lib/software/selection.ts';
   import {
@@ -42,6 +43,8 @@
   let filterText = $state(untrack(() => data.nameFilter));
   let filterType = $state('');
   let filterModel = $state('');
+  // '' any, else healthy, unhealthy or unknown.
+  let filterHealth = $state('');
   // Schedule selects hold '' (any or nothing chosen), 'none' or '=NAME'.
   let filterSchedule = $state(untrack(() => (data.scheduleFilter ? `=${data.scheduleFilter}` : '')));
   let page = $state(1);
@@ -79,6 +82,7 @@
         matchName(d.name) &&
         (!filterType || d.type === filterType) &&
         (!filterModel || d.model === filterModel) &&
+        (!filterHealth || (d.health || 'unknown') === filterHealth) &&
         scheduleMatches(d, filterSchedule)
     );
   });
@@ -524,6 +528,12 @@
           <option value={m}>{m}</option>
         {/each}
       </select>
+      <select class="select compact" aria-label="Health" bind:value={filterHealth} onchange={() => (page = 1)}>
+        <option value="">any health</option>
+        <option value="healthy">healthy</option>
+        <option value="unhealthy">unhealthy</option>
+        <option value="unknown">unknown</option>
+      </select>
       <select class="select compact" aria-label="Maintenance schedule" bind:value={filterSchedule} onchange={() => (page = 1)}>
         <option value="">all schedules</option>
         <option value="none">no schedule</option>
@@ -551,6 +561,7 @@
               />
             </th>
             <th>Device</th>
+            <th>Health</th>
             <th class="col-type">Type</th>
             <th class="col-platform">Model</th>
             <th class="col-platform">Version</th>
@@ -576,6 +587,15 @@
               </td>
               <td>
                 <a class="device-name" href={`/devices/${encodeURIComponent(device.name)}`}>{device.name}</a>
+              </td>
+              <td>
+                <a
+                  class="health-link"
+                  href={`/devices/${encodeURIComponent(device.name)}#health`}
+                  title="Pre-check and post-check details"
+                >
+                  <HealthPill health={device.health} />
+                </a>
               </td>
               <td class="col-type">{device.type}</td>
               <td class="col-platform">
@@ -727,6 +747,10 @@
 
   .device-name:hover {
     color: var(--sw-accent);
+  }
+
+  .health-link {
+    text-decoration: none;
   }
 
   .mono {

@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import DeviceHealthPanel from '#lib/software/DeviceHealthPanel.svelte';
   import DevicePicture from '#lib/software/DevicePicture.svelte';
   import StageChain from '#lib/software/StageChain.svelte';
   import StatusPill from '#lib/software/StatusPill.svelte';
@@ -14,6 +15,7 @@
     type Campaign,
     type CheckResult,
     type DeviceStatusRow,
+    type Stage,
     type Step
   } from '#lib/software/model.ts';
   import { stageDetail, stageView } from '#lib/software/stages.ts';
@@ -69,6 +71,15 @@
 
   function statusRow(campaign: Campaign) {
     return campaign.deviceStatus.find((r) => r.device === data.name) ?? null;
+  }
+
+  /** The stage of the campaign run upgrading this device, if one is. */
+  function upgradeStage(): Stage | null {
+    for (const campaign of data.campaigns) {
+      const row = statusRow(campaign);
+      if (row?.status === 'in-progress') return row.stage;
+    }
+    return null;
   }
 
   function campaignHref(campaign: Campaign): string {
@@ -222,6 +233,12 @@
       </div>
     {/each}
   </section>
+
+  <DeviceHealthPanel
+    name={device.name}
+    health={device.health}
+    stage={upgradeStage()}
+  />
 
   <section class="card">
     <h2 class="panel-title">Maintenance schedule</h2>

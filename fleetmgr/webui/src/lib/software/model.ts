@@ -1,4 +1,5 @@
 import type { ValidationResult } from '#lib/core/validation/types.ts';
+import { parseHealth, type Health } from '#lib/software/health.ts';
 import type { CatalogImage } from '#lib/software/images.ts';
 
 // RESTCONF paths. Writes always PATCH the datastore root: the backend
@@ -36,7 +37,7 @@ export interface DeviceJson {
   address?: AddressJson[];
   credentials?: { username?: string; password?: string };
   mock?: { enabled?: boolean };
-  state?: { platform?: { version?: string; model?: string; 'serial-number'?: string } };
+  state?: { health?: string; platform?: { version?: string; model?: string; 'serial-number'?: string } };
 }
 
 interface CampaignMemberJson {
@@ -224,6 +225,8 @@ export interface Device {
   model: string;
   version: string;
   serialNumber: string;
+  /** The health checks on the device's last read; '' until it is read. */
+  health: Health;
 }
 
 export type Verdict = 'not-run' | 'pass' | 'fail';
@@ -403,7 +406,8 @@ function parseDevice(entry: DeviceJson): Device {
     address: firstAddress(entry),
     model: entry.state?.platform?.model ?? '',
     version: entry.state?.platform?.version ?? '',
-    serialNumber: entry.state?.platform?.['serial-number'] ?? ''
+    serialNumber: entry.state?.platform?.['serial-number'] ?? '',
+    health: parseHealth(entry.state?.health)
   };
 }
 

@@ -160,7 +160,14 @@ them. The schedules
 page shows a week of every schedule's windows on a calendar and edits the
 schedules themselves: the local time zone, and rules of an opening time, a
 duration and weekdays, typed or dragged on the calendar. The devices page
-binds devices to a schedule, one at a time or a whole filtered selection. A
+shows each device's health and filters on it, and binds devices to a
+schedule, one at a time or a whole filtered selection. A device's page
+shows the details of its health check, which the top reads from the
+device's flotilla when the page opens (`GET /device-health/<name>`): one
+row per check (BGP, interfaces, OSPF) with the BGP neighbors, the
+interfaces and the OSPF neighbors; once a campaign's upgrade of the device
+reaches the pre-check, each check's pre-check apart, and from the
+post-check on its post-check too. A
 campaign page draws the plan as a timeline: each window is a band as wide
 as its duration, with one cell per device at its start on the wall
 clock, the real one once the controller has released the device; a marker
@@ -175,8 +182,8 @@ then `just build` picks it up. For UI work,
 
     just webui
 
-starts the Vite dev server on :3000 and proxies `/restconf` to
-`FLEETMGR_API`. See `webui/README.md`.
+starts the Vite dev server on :3000 and proxies `/restconf` and the other
+API paths to `FLEETMGR_API`. See `webui/README.md`.
 
 ## Lab with real devices
 
