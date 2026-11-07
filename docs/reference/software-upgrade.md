@@ -145,7 +145,7 @@ NETCONF RPCs:
 | Step | RPC |
 | --- | --- |
 | prepare | `xcopy` from `image-url` to bootflash |
-| install | `install` (add only), then `activate` with a 30 minute auto-abort timer |
+| install | `install` (add only), `save-config`, then `activate` with a 30 minute auto-abort timer |
 | commit | `install-commit` |
 | rollback | `abort` |
 
@@ -154,6 +154,9 @@ NETCONF RPCs:
   operation ends.
 - `activate` names the image by the version the device gave it during the
   add, for example `17.18.03a.0.5540`.
+- `cisco-ia:save-config` runs right before `activate`. The reboot loads the
+  startup config, so config that was not saved would be lost. If the save
+  fails, the run fails and nothing is activated.
 - The device reboots after `activate` and after `abort`. Read errors during
   the reboot are expected. The adapter reads the running release until it is
   the one it waits for.
