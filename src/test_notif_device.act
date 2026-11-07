@@ -244,6 +244,110 @@ actor _test_notif_stream_tap(t: testing.EnvT):
     after 10.0: fail("timed out: seen={seen}")
 
 
+# A minimal stand-in for RFC 6470's module: enough for the modset gate and for
+# decoding the one notification the DeviceMgr subscribes to itself.
+NETCONF_NOTIFICATIONS_YANG = r"""module ietf-netconf-notifications {
+  namespace "urn:ietf:params:xml:ns:yang:ietf-netconf-notifications";
+  prefix ncn;
+  notification netconf-config-change {
+    leaf datastore {
+      type string;
+    }
+  }
+}"""
+
+CONFIG_CHANGE_NS = "urn:ietf:params:xml:ns:yang:ietf-netconf-notifications"
+
+
+def _config_change_xml() -> xml.Node:
+    return xml.Node("netconf-config-change", nsdefs=[(None, CONFIG_CHANGE_NS)], children=[
+        xml.Node("datastore", text="running")
+    ])
+
+
+actor _test_config_change_resync(t: testing.EnvT):
+    """A device advertising ietf-netconf-notifications gets an automatic
+    DeviceMgr subscription to netconf-config-change wired to resync():
+    emitting the event makes the driver re-fetch the device config. A second
+    owner declared through the DeviceMgr passthrough sees the same event."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-notif-ccr", noop_on_reconf,
+        extra_models=[NETCONF_NOTIFICATIONS_YANG])
+    var done = False
+    var emitted = False
+    var owner_saw_event = False
+    var get_config_baseline = -1
+    var recording = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def _get_config_count(ms: swna.NetconfMockServer) -> int:
+        n = 0
+        for entry in ms.get_rpc_history():
+            if entry.startswith("<get-config"):
+                n += 1
+        return n
+
+    def on_event(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if ev is not None:
+            owner_saw_event = True
+
+    def check():
+        if done:
+            return
+        ms = _mock_server_of(dev)
+        if ms is not None and emitted:
+            if _get_config_count(ms) > get_config_baseline and owner_saw_event:
+                done = True
+                t.success()
+            else:
+                after 0.01: check()
+
+    var quiet_polls = 0
+
+    def start():
+        if done:
+            return
+        ms = _mock_server_of(dev)
+        if ms is not None and not recording:
+            ms.clear_rpc_history()
+            recording = True
+        active = False
+        for st in dev.notif_status():
+            if st.state == "active":
+                active = True
+        if ms is not None and active:
+            # Drain the connect-time resync out of the race window: only take
+            # the baseline once the get-config count has been stable across a
+            # few polls, so a late connect-time fetch cannot masquerade as the
+            # event-triggered resync this test exists to prove.
+            n = _get_config_count(ms)
+            if n == get_config_baseline and quiet_polls >= 3:
+                emitted = True
+                ms.emit_event(_config_change_xml())
+                check()
+            else:
+                if n == get_config_baseline:
+                    quiet_polls += 1
+                else:
+                    get_config_baseline = n
+                    quiet_polls = 0
+                after 0.01: start()
+        else:
+            after 0.01: start()
+
+    # The DeviceMgr subscribes itself (module-gated); this owner shares the
+    # event through the public passthrough.
+    dev.declare_notif_subscriptions("t-ccr", on_event,
+        {NotifSpec(ygdata.Id(CONFIG_CHANGE_NS, "netconf-config-change"))})
+    start()
+    after 10.0: fail("timed out waiting for config-change resync")
+
+
 actor _test_notif_teardown(t: testing.EnvT):
     """Removing the last owner tears the channel down: notif_status empties and
     later events are not delivered."""

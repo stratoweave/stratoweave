@@ -138,6 +138,13 @@ adapter subscribed, for example
 `--count` stops after that many notifications, and `--yang-dir` decodes them
 with local YANG files instead of downloaded schemas, as for `ncurl monitor`.
 
+## Automatic drift detection
+
+When a device advertises `ietf-netconf-notifications` (RFC 6470), the
+`DeviceMgr` subscribes itself to `netconf-config-change` and triggers a resync
+on it — out-of-band configuration drift is detected the moment the device
+reports it, rather than on the next reconnect.
+
 ## Emitting notifications northbound
 
 StratoWeave's own NETCONF server serves RFC 5277 `create-subscription` and
@@ -163,5 +170,8 @@ receives it; with no subscribers the event simply evaporates.
 - The northbound server does not serve RFC 8639 event-stream
   establish-subscription yet; the classic RPC covers the event side. It also
   does not serve the RFC 5277 `/netconf/streams` discovery container.
+- The automatic config-change resync does not yet discriminate `changed-by`,
+  so StratoWeave's own commits trigger a redundant (harmless) resync on
+  devices that emit RFC 6470 notifications.
 - The exact identityref spelling of XE's `yang-notif-native` stream is pending
   verification against live IOS XE.
