@@ -1,0 +1,407 @@
+"""Routing of device requests between the adapters of one device.
+
+A device has a primary adapter and can have extra adapters, each named by its
+device type. Each adapter advertises the modules it serves. A module belongs to
+the first adapter that advertises it, the primary first. A request goes to the
+adapters that serve the namespaces of its top-level nodes; a namespace that no
+adapter serves goes to the primary.
+"""
+
+import testing
+import std.xml as xml
+
+import yang
+import yang.gdata as ygdata
+import yang.schema as yschema
+
+from adapters.adapter import ModCap, NotifSpec
+from device_schema import DeviceSchema
+
+
+class Routes(object):
+    """Which adapter serves each namespace of a device.
+
+    adapters holds the device types of the adapters in order, the primary
+    first. owner maps a namespace to the adapter that serves it.
+    """
+    adapters: list[str]
+    owner: dict[str, str]
+
+    def __init__(self, adapters: list[str], modules: dict[str, dict[str, ModCap]]):
+        self.adapters = adapters
+        self.owner = {}
+        for a in adapters:
+            for m in modules.get_def(a, {}).values():
+                if m.namespace not in self.owner:
+                    self.owner[m.namespace] = a
+
+    def primary(self) -> str:
+        return self.adapters[0]
+
+    def adapter_of(self, ns: ?str) -> str:
+        """Give the adapter that serves namespace ns."""
+        if ns is not None:
+            return self.owner.get_def(ns, self.adapters[0])
+        return self.adapters[0]
+
+    def split_filter(self, filt: ?ygdata.FNode) -> dict[str, ?ygdata.FNode]:
+        """Split filt into one filter for each adapter that serves one of its
+        top-level nodes. A filter of None selects everything, so every adapter
+        gets None."""
+        parts: dict[str, ?ygdata.FNode] = {}
+        if filt is not None:
+            for a, f in self._split_tops(filt).items():
+                parts[a] = f
+        else:
+            for a in self.adapters:
+                parts[a] = None
+        return parts
+
+    def _split_tops(self, filt: ygdata.FNode) -> dict[str, ygdata.FNode]:
+        parts: dict[str, ygdata.FNode] = {}
+        name = filt.name
+        if len(self.adapters) == 1 or name is not None:
+            parts[self.adapter_of(name.q if name is not None else None)] = filt
+            return parts
+        groups: dict[str, list[ygdata.FNode]] = {}
+        for child in filt.children:
+            child_name = child.name
+            a = self.adapter_of(child_name.q if child_name is not None else None)
+            if a in groups:
+                groups[a].append(child)
+            else:
+                groups[a] = [child]
+        if len(groups) <= 1:
+            for a in groups.keys():
+                parts[a] = filt
+            if len(parts) == 0:
+                parts[self.adapters[0]] = filt
+            return parts
+        for a, children in groups.items():
+            parts[a] = ygdata.FNode(None, filt.value_match, children)
+        return parts
+
+    def split_specs(self, want: set[ygdata.SubscriptionSpec]) -> dict[str, set[ygdata.SubscriptionSpec]]:
+        """Split subscription specs like split_filter splits a filter. A spec
+        keeps its period and on-change setting. A rooted spec goes whole to
+        the adapter of the top node of its root, because its filter leads to
+        the root. An empty set goes to the primary."""
+        parts: dict[str, set[ygdata.SubscriptionSpec]] = {}
+        if len(self.adapters) == 1:
+            parts[self.adapters[0]] = want
+            return parts
+        for spec in want:
+            root = spec.root
+            if root is not None:
+                names = ygdata.root_names(root)
+                _add_spec(parts, self.adapter_of(names[0].q), spec)
+                continue
+            split = self.split_filter(spec.filt)
+            if len(split) == 1:
+                for a in split.keys():
+                    _add_spec(parts, a, spec)
+                continue
+            for a, f in split.items():
+                if f is not None:
+                    _add_spec(parts, a, ygdata.SubscriptionSpec(f, spec.period, spec.on_change))
+                else:
+                    _add_spec(parts, a, spec)
+        if len(parts) == 0:
+            parts[self.adapters[0]] = set()
+        return parts
+
+    def split_notif_specs(self, want: set[NotifSpec]) -> dict[str, set[NotifSpec]]:
+        """Split event notification specs: a named spec goes to the adapter of
+        the namespace of its name, a spec without a name to every adapter. An
+        empty set goes to the primary."""
+        parts: dict[str, set[NotifSpec]] = {}
+        if len(self.adapters) == 1:
+            parts[self.adapters[0]] = want
+            return parts
+        for spec in want:
+            name = spec.name
+            if name is not None:
+                _add_notif_spec(parts, self.adapter_of(name.q), spec)
+            else:
+                for a in self.adapters:
+                    _add_notif_spec(parts, a, spec)
+        if len(parts) == 0:
+            parts[self.adapters[0]] = set()
+        return parts
+
+    def rpc_adapter(self, gdata_rpc: ygdata.Node) -> str:
+        """Give the adapter of the namespace of the RPC node. A request that is
+        not one RPC node goes to the primary, which reports the error."""
+        if len(gdata_rpc.children) == 1:
+            for rpc_id in gdata_rpc.children.keys():
+                return self.adapter_of(rpc_id.q)
+        return self.adapters[0]
+
+    def rpc_xml_adapter(self, xml_rpc: xml.Node) -> str:
+        """Give the adapter of the namespace of the RPC element. An element
+        without a namespace goes to the primary."""
+        prefix = xml_rpc.prefix
+        for p, uri in xml_rpc.nsdefs:
+            if prefix is None:
+                if p is None:
+                    return self.adapter_of(uri)
+            elif p is not None and p == prefix:
+                return self.adapter_of(uri)
+        return self.adapters[0]
+
+
+def _add_spec(parts: dict[str, set[ygdata.SubscriptionSpec]], a: str, spec: ygdata.SubscriptionSpec) -> None:
+    if a in parts:
+        parts[a].add(spec)
+    else:
+        parts[a] = {spec}
+
+
+def _add_notif_spec(parts: dict[str, set[NotifSpec]], a: str, spec: NotifSpec) -> None:
+    if a in parts:
+        parts[a].add(spec)
+    else:
+        parts[a] = {spec}
+
+
+def union_modules(adapters: list[str], modules: dict[str, dict[str, ModCap]]) -> dict[str, ModCap]:
+    """Give the modules of all adapters. For a module that several adapters
+    advertise, the first adapter's entry is kept."""
+    res: dict[str, ModCap] = {}
+    for a in adapters:
+        for name, m in modules.get_def(a, {}).items():
+            if name not in res:
+                res[name] = m
+    return res
+
+
+def _merge_roots(roots: list[yschema.DRoot]) -> yschema.DRoot:
+    """Merge schema roots at their top-level nodes. The first root keeps a
+    top-level node or module that several roots have."""
+    nodes: set[str] = set()
+    namespaces: set[str] = set()
+    kept: list[yschema.DRoot] = []
+    for root in roots:
+        children = []
+        for c in root.children:
+            if not isinstance(c, yschema.DRpc) and "{c.namespace}:{c.name}" not in nodes:
+                children.append(c)
+        rpcs = [r for r in root.rpcs if "{r.namespace}:{r.name}" not in nodes]
+        metadata = {}
+        for ns, meta in root.module_metadata.items():
+            if ns not in namespaces:
+                metadata[ns] = meta
+        kept.append(yschema.DRoot(children, root.identities, rpcs, metadata))
+        for c in root.children:
+            nodes.add("{c.namespace}:{c.name}")
+        for ns in root.module_metadata.keys():
+            namespaces.add(ns)
+    return yschema.DRoot.merge(kept)
+
+
+def merge_schemas(schemas: list[DeviceSchema]) -> DeviceSchema:
+    """Merge the bundled schemas of the adapters of a device, the primary's
+    first. The first schema keeps a top-level node that several schemas have,
+    and gives the name and the transforms."""
+    if len(schemas) == 1:
+        return schemas[0]
+    return DeviceSchema(schemas[0].name,
+                        _merge_roots([s.src_dnode for s in schemas]),
+                        _merge_roots([s.oper_src_dnode for s in schemas]),
+                        schemas[0].transforms)
+
+
+#############################################################################
+# Tests
+#############################################################################
+
+NS_A = "urn:test:a"
+NS_B = "urn:test:b"
+NS_SHARED = "urn:test:shared"
+NS_OTHER = "urn:test:other"
+
+
+def _routes() -> Routes:
+    """The primary "a" and the extra adapter "b". Both have the shared module."""
+    return Routes(["a", "b"], {
+        "a": {"mod-a": ModCap("mod-a", NS_A), "shared": ModCap("shared", NS_SHARED)},
+        "b": {"mod-b": ModCap("mod-b", NS_B), "shared": ModCap("shared", NS_SHARED)},
+    })
+
+
+def _top(ns: str, name: str="top", children: list[ygdata.FNode]=[]) -> ygdata.FNode:
+    return ygdata.FNode(ygdata.Id(ns, name), children=children)
+
+
+def _filter_tops(filt: ?ygdata.FNode) -> str:
+    """The top-level nodes of a filter as "ns:name" in order, "*" for None."""
+    if filt is not None:
+        name = filt.name
+        if name is not None:
+            return "{name.q}:{name.name}"
+        tops = []
+        for c in filt.children:
+            cn = c.name
+            if cn is not None:
+                tops.append("{cn.q}:{cn.name}")
+        return ",".join(sorted(tops))
+    return "*"
+
+
+def _describe_filters(parts: dict[str, ?ygdata.FNode]) -> str:
+    return "; ".join(["{a}={_filter_tops(parts[a])}" for a in sorted(parts.keys())])
+
+
+def _describe_specs(parts: dict[str, set[ygdata.SubscriptionSpec]]) -> str:
+    res = []
+    for a in sorted(parts.keys()):
+        specs = sorted([_filter_tops(s.filt) + ("@" + str(s.period) if s.period is not None else "") for s in parts[a]])
+        res.append("{a}=[{', '.join(specs)}]")
+    return "; ".join(res)
+
+
+def _describe_notif_specs(parts: dict[str, set[NotifSpec]]) -> str:
+    res = []
+    for a in sorted(parts.keys()):
+        names = []
+        for s in parts[a]:
+            n = s.name
+            stream = s.stream
+            names.append(("{n.q}:{n.name}" if n is not None else "*") + ("@" + stream if stream is not None else ""))
+        res.append("{a}=[{', '.join(sorted(names))}]")
+    return "; ".join(res)
+
+
+def _test_split_filter():
+    cases = [
+        ("no filter goes to every adapter", None,
+         "a=*; b=*"),
+        ("a module of the primary", ygdata.FNode(children=[_top(NS_A)]),
+         "a={NS_A}:top"),
+        ("a module of the extra adapter", ygdata.FNode(children=[_top(NS_B)]),
+         "b={NS_B}:top"),
+        ("modules of both adapters", ygdata.FNode(children=[_top(NS_A), _top(NS_B)]),
+         "a={NS_A}:top; b={NS_B}:top"),
+        ("two nodes of one adapter stay together", ygdata.FNode(children=[_top(NS_B, "x"), _top(NS_B, "y"), _top(NS_A)]),
+         "a={NS_A}:top; b={NS_B}:x,{NS_B}:y"),
+        ("a module of both adapters goes to the first", ygdata.FNode(children=[_top(NS_SHARED)]),
+         "a={NS_SHARED}:top"),
+        ("a namespace no adapter has goes to the primary", ygdata.FNode(children=[_top(NS_OTHER), _top(NS_B)]),
+         "a={NS_OTHER}:top; b={NS_B}:top"),
+        ("a filter rooted at a named node", _top(NS_B),
+         "b={NS_B}:top"),
+        ("a node of another module follows its top-level node",
+         ygdata.FNode(children=[_top(NS_A, children=[_top(NS_B, "aug")])]),
+         "a={NS_A}:top"),
+    ]
+    routes = _routes()
+    for name, filt, want in cases:
+        testing.assertEqual(_describe_filters(routes.split_filter(filt)), want, name)
+
+
+def _test_split_filter_one_adapter():
+    """With one adapter every filter goes to it unchanged."""
+    routes = Routes(["a"], {"a": {"mod-a": ModCap("mod-a", NS_A)}})
+    filt = ygdata.FNode(children=[_top(NS_A), _top(NS_B)])
+    testing.assertEqual(_describe_filters(routes.split_filter(filt)), "a={NS_A}:top,{NS_B}:top")
+
+
+def _test_split_specs():
+    rooted_b = ygdata.SubscriptionSpec(ygdata.FNode(children=[_top(NS_B, children=[_top(NS_B, "entry")])]),
+                                       period=1.0, root=_top(NS_B, children=[_top(NS_B, "entry")]))
+    cases = [
+        ("no specs go to the primary", set(),
+         "a=[]"),
+        ("a spec across both adapters splits and keeps its period",
+         {ygdata.SubscriptionSpec(ygdata.FNode(children=[_top(NS_A), _top(NS_B)]), period=2.0)},
+         "a=[{NS_A}:top@2000000000]; b=[{NS_B}:top@2000000000]"),
+        ("specs of one adapter each",
+         {ygdata.SubscriptionSpec(ygdata.FNode(children=[_top(NS_A)]), period=1.0),
+          ygdata.SubscriptionSpec(ygdata.FNode(children=[_top(NS_B)]), on_change=True)},
+         "a=[{NS_A}:top@1000000000]; b=[{NS_B}:top]"),
+        ("a spec without a filter goes to every adapter",
+         {ygdata.SubscriptionSpec(None, period=1.0)},
+         "a=[*@1000000000]; b=[*@1000000000]"),
+        ("a rooted spec goes whole to the adapter of its root", {rooted_b},
+         "b=[{NS_B}:top@1000000000]"),
+    ]
+    routes = _routes()
+    for name, want, expect in cases:
+        testing.assertEqual(_describe_specs(routes.split_specs(want)), expect, name)
+    # A spec that does not split is passed on as it is.
+    testing.assertEqual(routes.split_specs({rooted_b})["b"], {rooted_b})
+
+
+def _test_split_notif_specs():
+    ev_a = ygdata.Id(NS_A, "event")
+    ev_b = ygdata.Id(NS_B, "event")
+    ev_other = ygdata.Id(NS_OTHER, "event")
+    cases = [
+        ("no specs go to the primary", set(),
+         "a=[]"),
+        ("a named event goes to the adapter of its module", {NotifSpec(ev_b)},
+         "b=[{NS_B}:event]"),
+        ("named events of both adapters", {NotifSpec(ev_a), NotifSpec(ev_b)},
+         "a=[{NS_A}:event]; b=[{NS_B}:event]"),
+        ("an event of no adapter goes to the primary", {NotifSpec(ev_other)},
+         "a=[{NS_OTHER}:event]"),
+        ("a spec without a name goes to every adapter", {NotifSpec()},
+         "a=[*]; b=[*]"),
+        ("the stream stays with its spec", {NotifSpec(ev_b, stream="NETCONF")},
+         "b=[{NS_B}:event@NETCONF]"),
+    ]
+    routes = _routes()
+    for name, want, expect in cases:
+        testing.assertEqual(_describe_notif_specs(routes.split_notif_specs(want)), expect, name)
+
+
+def _test_rpc_adapter():
+    cases = [
+        ("an RPC of the primary", ygdata.Container({ygdata.Id(NS_A, "do"): ygdata.Container({})}), "a"),
+        ("an RPC of the extra adapter", ygdata.Container({ygdata.Id(NS_B, "do"): ygdata.Container({})}), "b"),
+        ("an RPC of both goes to the first", ygdata.Container({ygdata.Id(NS_SHARED, "do"): ygdata.Container({})}), "a"),
+        ("an RPC of no adapter goes to the primary", ygdata.Container({ygdata.Id(NS_OTHER, "do"): ygdata.Container({})}), "a"),
+        ("not one RPC node goes to the primary", ygdata.Container({}), "a"),
+    ]
+    routes = _routes()
+    for name, rpc, want in cases:
+        testing.assertEqual(routes.rpc_adapter(rpc), want, name)
+
+
+def _test_rpc_xml_adapter():
+    cases = [
+        ("a default namespace", xml.Node("do", nsdefs=[(None, NS_B)]), "b"),
+        ("a prefixed namespace", xml.Node("do", nsdefs=[("x", NS_A), ("b", NS_B)], prefix="b"), "b"),
+        ("no namespace goes to the primary", xml.Node("get-software-information"), "a"),
+        ("a namespace of no adapter goes to the primary", xml.Node("do", nsdefs=[(None, NS_OTHER)]), "a"),
+    ]
+    routes = _routes()
+    for name, rpc, want in cases:
+        testing.assertEqual(routes.rpc_xml_adapter(rpc), want, name)
+
+
+def _test_union_modules():
+    """The first adapter's entry of a shared module is kept."""
+    mods = union_modules(["a", "b"], {
+        "a": {"mod-a": ModCap("mod-a", NS_A), "shared": ModCap("shared", NS_SHARED, "2026-01-01")},
+        "b": {"mod-b": ModCap("mod-b", NS_B), "shared": ModCap("shared", NS_SHARED, "2026-02-02")},
+    })
+    testing.assertEqual(sorted(mods.keys()), ["mod-a", "mod-b", "shared"])
+    testing.assertEqual(mods["shared"].revision, "2026-01-01")
+
+
+def _yang_module(name: str, ns: str, body: str) -> str:
+    return "module {name} {{ yang-version 1.1; namespace \"{ns}\"; prefix {name}; {body} }}"
+
+
+def _test_merge_schemas():
+    shared = _yang_module("shared", NS_SHARED, r"container shared-top { leaf x { type string; } }")
+    a = DeviceSchema("a", yang.compile([_yang_module("mod-a", NS_A, r"container a-top { leaf x { type string; } } rpc a-rpc;"), shared]))
+    b = DeviceSchema("b", yang.compile([_yang_module("mod-b", NS_B, r"container b-top { leaf x { type string; } } rpc b-rpc;"), shared]))
+    merged = merge_schemas([a, b])
+    testing.assertEqual(merged.name, "a")
+    tops = sorted(["{c.namespace}:{c.name}" for c in merged.src_dnode.children])
+    testing.assertEqual(tops, sorted(["{NS_A}:a-top", "{NS_A}:a-rpc", "{NS_B}:b-top", "{NS_B}:b-rpc", "{NS_SHARED}:shared-top"]))
+    testing.assertEqual(sorted(merged.src_dnode.module_metadata.keys()), sorted([NS_A, NS_B, NS_SHARED]))
+    # One schema is used as it is.
+    testing.assertEqual(merge_schemas([a]).name, "a")
