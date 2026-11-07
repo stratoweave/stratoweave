@@ -1,6 +1,6 @@
-GENERATED_ACT := src/device_meta_config.act src/device_oper.act src/ietf_restconf_monitoring.act src/ietf_yang_library.act src/adapters/software_iosxe_rpc.act src/adapters/software_iosxe_oper.act src/adapters/platform_iosxr_oper.act src/adapters/platform_srlinux_oper.act src/adapters/platform_sros_oper.act src/adapters/platform_arcos_oper.act
+GENERATED_ACT := src/device_meta_config.act src/device_oper.act src/ietf_restconf_monitoring.act src/ietf_yang_library.act src/adapters/software_iosxe_rpc.act src/adapters/software_iosxe_oper.act src/adapters/platform_iosxr_oper.act src/adapters/platform_srlinux_oper.act src/adapters/platform_sros_oper.act src/adapters/platform_arcos_oper.act src/adapters/iosxe_cli_data.act
 # The YANG that gen_adata compiles. It builds from its own copies in gen_adata/src.
-GEN_YANG := src/swyang.act src/adapters/software_iosxe_yang.act src/adapters/platform_iosxr_yang.act src/adapters/platform_srlinux_yang.act src/adapters/platform_sros_yang.act src/adapters/platform_arcos_yang.act
+GEN_YANG := src/swyang.act src/adapters/software_iosxe_yang.act src/adapters/platform_iosxr_yang.act src/adapters/platform_srlinux_yang.act src/adapters/platform_sros_yang.act src/adapters/platform_arcos_yang.act src/adapters/iosxe_cli_yang.act
 
 .PHONY: build
 build: $(GENERATED_ACT)

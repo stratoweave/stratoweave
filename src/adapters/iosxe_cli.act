@@ -1,0 +1,636 @@
+"""IOS XE exec commands over SSH, with the results as YANG data.
+
+The adapter implements the stratoweave-iosxe-cli module only. It reads and
+runs commands; it does not configure the device.
+
+Each command opens its own SSH connection, because IOS XE closes the
+connection when an exec channel ends. The exit status is always 0, so the
+adapter finds errors in the output text.
+"""
+
+import logging
+import net
+import ssh
+import std.xml as xml
+import yang.gdata as gdata
+
+import device as swdev
+import adapters.iosxe_cli_data as xecli_data
+import adapters.iosxe_cli_yang as xecli_yang
+from device_meta_config import stratoweave_rfs__device_entry as DeviceMetaConfig
+from device_schema import DeviceSchema
+from adapters.adapter import DeviceAdapter, ModCap, ConfigError, NotConnectedError, \
+    PermanentError, TransientError, SubscriptionStatus, SUBSCRIPTION_UNKNOWN, ssh_transport_config
+
+## The file systems that a read gets when its filter does not name any.
+DEFAULT_FILE_SYSTEMS = ["bootflash:"]
+
+## Seconds that the command of a read can run. A dir of bootflash: takes less
+## than a second on a C8000V.
+COMMAND_TIMEOUT = 60.0
+
+## Seconds that the command of an RPC can run. The checksum RPC runs verify:
+## MD5 of an 838 MB image takes 23 s on a C8000V.
+RPC_TIMEOUT = 600.0
+
+## Seconds between login attempts after a failure: the first delay, and the
+## limit for the delay that doubles after each failure.
+RETRY_FIRST = 1.0
+RETRY_MAX = 60.0
+
+_RFS_NS = "http://stratoweave.org/yang/stratoweave-rfs"
+_FILE_SYSTEM_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789-"
+_FILE_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+_DIGITS = "0123456789"
+_HEX = "0123456789abcdef"
+_MONTHS = {"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04", "May": "05", "Jun": "06",
+           "Jul": "07", "Aug": "08", "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12"}
+
+
+class CommandError(PermanentError):
+    """The device rejected a command, or the output was not as expected."""
+
+
+def modules() -> dict[str, ModCap]:
+    """Return the modules that the adapter implements."""
+    return {xecli_yang.MODULE: ModCap(xecli_yang.MODULE, xecli_yang.NS)}
+
+
+def check_file_system(name: str) -> None:
+    """Raise ValueError if name is not a file system name such as bootflash:."""
+    if len(name) < 2 or not name.endswith(":") or any([c not in _FILE_SYSTEM_CHARS for c in name[:-1]]):
+        raise ValueError("invalid file system name: " + name)
+
+
+def check_file(name: str) -> None:
+    """Raise ValueError if name is not a plain file name.
+
+    The name goes into an IOS XE command, so only letters, digits, dots,
+    underscores and hyphens are permitted.
+    """
+    if name in ["", ".", ".."] or any([c not in _FILE_CHARS for c in name]):
+        raise ValueError("invalid file name: " + name + ". Use only letters, digits, dots, underscores and hyphens")
+
+
+def dir_command(file_system: str) -> str:
+    """Return the command that lists the top directory of file_system."""
+    check_file_system(file_system)
+    return "dir " + file_system
+
+
+def verify_command(file_system: str, file: str, algorithm: str) -> str:
+    """Return the command that computes the checksum of a file."""
+    check_file_system(file_system)
+    check_file(file)
+    if algorithm not in ["md5", "sha512"]:
+        raise ValueError("unsupported checksum algorithm: " + algorithm)
+    return "verify /" + algorithm + " " + file_system + file
+
+
+def _digits(s: str) -> bool:
+    return len(s) > 0 and all([c in _DIGITS for c in s])
+
+
+def _device_error(lines: list[str]) -> ?str:
+    """Return the first line where the device reports an error."""
+    for line in lines:
+        if line.startswith("%") or line.startswith("Line has invalid autocommand"):
+            return line
+    return None
+
+
+class DirEntry(object):
+    """A regular file in a dir listing."""
+    name: str
+    size: u64
+    modified: str
+
+    def __init__(self, name: str, size: u64, modified: str):
+        self.name = name
+        self.size = size
+        self.modified = modified
+
+    def __str__(self) -> str:
+        return self.name + " " + str(self.size) + " " + self.modified
+
+
+def date_and_time(month: str, day: str, year: str, clock: str, offset: str) -> str:
+    """Write a dir date, e.g. Nov 7 2026 20:28:06 +00:00, in the
+    yang:date-and-time format, e.g. 2026-11-07T20:28:06+00:00.
+
+    Raise ValueError if a part is not as expected.
+    """
+    ok = True
+    if month not in _MONTHS or not _digits(day) or len(day) > 2 or not _digits(year) or len(year) != 4:
+        ok = False
+    elif len(clock) != 8 or clock[2] != ":" or clock[5] != ":" or not _digits(clock[0:2] + clock[3:5] + clock[6:8]):
+        ok = False
+    elif len(offset) != 6 or offset[0] not in "+-" or offset[3] != ":" or not _digits(offset[1:3] + offset[4:6]):
+        ok = False
+    if not ok:
+        raise ValueError("unexpected date: " + " ".join([month, day, year, clock, offset]))
+    return year + "-" + _MONTHS[month] + "-" + day.zfill(2) + "T" + clock + offset
+
+
+def _dir_line(line: str) -> ?DirEntry:
+    """Read one entry line of a dir listing. Return None for an entry that is
+    not a regular file.
+
+    An entry line has the inode, the permissions, the size, the date and the
+    name, e.g. 55 -rw- 1048576 Nov 7 2026 20:28:04 +00:00 sw.bin.
+    """
+    fields = line.split()
+    if len(fields) < 9 or not _digits(fields[0]) or len(fields[1]) != 4 or not _digits(fields[2]):
+        raise CommandError("unexpected dir line: " + line)
+    try:
+        modified = date_and_time(fields[3], fields[4], fields[5], fields[6], fields[7])
+    except ValueError:
+        raise CommandError("unexpected dir line: " + line)
+    if not fields[1].startswith("-"):
+        return None
+    return DirEntry(" ".join(fields[8:]), u64(int(fields[2])), modified)
+
+
+def _total_line(line: str) -> bool:
+    """True for the last line of a listing, e.g. 11546681344 bytes total (9966010368 bytes free)."""
+    fields = line.split()
+    return len(fields) == 6 and _digits(fields[0]) and fields[1:3] == ["bytes", "total"] and fields[5] == "free)"
+
+
+def parse_dir(output: str, file_system: str) -> list[DirEntry]:
+    """Read the regular files from the output of dir_command(file_system).
+
+    Raise CommandError when the device reports an error, when a listing line
+    is not as expected, or when the listing has no total line at the end.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    header = "Directory of " + file_system + "/"
+    files: list[DirEntry] = []
+    listing = False
+    for line in lines:
+        if not listing:
+            if line == header:
+                listing = True
+        elif _total_line(line):
+            return files
+        elif line != "" and line != "No files in directory":
+            entry = _dir_line(line)
+            if entry is not None:
+                files.append(entry)
+    if listing:
+        raise CommandError("dir output of " + file_system + " ended before the total line")
+    raise CommandError("dir output has no listing of " + file_system)
+
+
+def parse_verify(output: str, file_system: str, file: str, algorithm: str) -> str:
+    """Read the digest from the output of verify_command(file_system, file, algorithm).
+
+    Progress dots are not a result. Raise CommandError unless the output has
+    exactly one result line for this file and algorithm, with a digest of the
+    correct length.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    marker = "verify /" + algorithm + " (" + file_system + file + ") = "
+    length = 32 if algorithm == "md5" else 128
+    digest: ?str = None
+    for line in lines:
+        if line.startswith(marker):
+            if digest is not None:
+                raise CommandError("verify output has more than one result")
+            value = line[len(marker):].lower()
+            if len(value) != length or any([c not in _HEX for c in value]):
+                raise CommandError("verify output has an invalid digest: " + line)
+            digest = value
+    if digest is not None:
+        return digest
+    raise CommandError("verify output has no result for " + file_system + file)
+
+
+def parse_version(output: str) -> xecli_data.stratoweave_iosxe_cli__version:
+    """Read the release and the hardware from the output of show version.
+
+    Raise CommandError when the device reports an error or the output has no
+    IOS XE release. The model, the serial number and the system image are
+    optional.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    release = "Cisco IOS XE Software, Version "
+    serial = "Processor board ID "
+    image = "System image file is \""
+    v = xecli_data.stratoweave_iosxe_cli__version()
+    for line in lines:
+        if line.startswith(release):
+            v.version = line[len(release):].split(",")[0].strip()
+        elif line.startswith("cisco ") and " processor " in line:
+            v.model = line.split()[1]
+        elif line.startswith(serial):
+            v.serial_number = line[len(serial):]
+        elif line.startswith(image) and line.endswith("\""):
+            v.system_image = line[len(image):-1]
+    if v.version is None:
+        raise CommandError("show version output has no IOS XE release")
+    return v
+
+
+def file_systems_selected(top: gdata.FNode) -> list[str]:
+    """Return the file systems that a filter of file-systems selects.
+
+    A file-system entry with a name gives that name. A filter without
+    children, or a file-system entry without a name, gives
+    DEFAULT_FILE_SYSTEMS.
+    """
+    file_system = gdata.Id(xecli_yang.NS, "file-system")
+    key = gdata.Id(xecli_yang.NS, "name")
+    names: list[str] = []
+    if len(top.children) == 0:
+        names.extend(DEFAULT_FILE_SYSTEMS)
+    for fs in top.children:
+        named = False
+        if fs.name == file_system:
+            for c in fs.children:
+                value = c.value_match
+                if c.name == key and isinstance(value, str):
+                    names.append(value)
+                    named = True
+        if not named:
+            names.extend(DEFAULT_FILE_SYSTEMS)
+    selected: list[str] = []
+    for name in names:
+        if name not in selected:
+            selected.append(name)
+    return selected
+
+
+class Read(object):
+    """An exec command whose output becomes operational data.
+
+    A subclass sets command and implements parse.
+    """
+    command: str
+
+    ## Add the data in the output of command to r. Raise CommandError when
+    ## the output is not as expected.
+    parse: proc(r: xecli_data.root, output: str) -> None
+
+
+class DirRead(Read):
+    """Read the files of a file system with dir."""
+    file_system: str
+
+    def __init__(self, file_system: str):
+        self.command = dir_command(file_system)
+        self.file_system = file_system
+
+    def parse(self, r: xecli_data.root, output: str) -> None:
+        fs = r.file_systems.file_system.create(self.file_system)
+        for e in parse_dir(output, self.file_system):
+            fs.file.create(e.name, size=e.size, modified=e.modified)
+
+
+class VersionRead(Read):
+    """Read the release and the hardware with show version."""
+    def __init__(self):
+        self.command = "show version"
+
+    def parse(self, r: xecli_data.root, output: str) -> None:
+        r.version = parse_version(output)
+
+
+def _node_reads(top: gdata.FNode) -> list[Read]:
+    """Return the reads for one top-level node of a filter. A node of
+    another module gives no reads."""
+    if top.name == gdata.Id(xecli_yang.NS, "file-systems"):
+        return [DirRead(name) for name in file_systems_selected(top)]
+    if top.name == gdata.Id(xecli_yang.NS, "version"):
+        return [VersionRead()]
+    return []
+
+
+def reads(filt: ?gdata.FNode) -> list[Read]:
+    """Return the reads that a get with filt needs.
+
+    Each top-level node that filt selects gives its own reads. A get without
+    filt reads all top-level nodes of the module. Raise ValueError when filt
+    names a file system that is not valid.
+    """
+    tops: list[gdata.FNode] = []
+    if filt is not None:
+        tops = filt.children if filt.name is None else [filt]
+    else:
+        tops = [gdata.FNode(gdata.Id(n.namespace, n.name)) for n in xecli_data.SRC_DNODE.children]
+    result: list[Read] = []
+    for top in tops:
+        for read in _node_reads(top):
+            if all([r.command != read.command for r in result]):
+                result.append(read)
+    return result
+
+
+class Call(object):
+    """An exec command that runs an RPC of the module.
+
+    A subclass sets command and implements reply.
+    """
+    command: str
+
+    ## Return the RPC output in the output of command. Raise CommandError
+    ## when the output is not as expected.
+    reply: proc(output: str) -> gdata.Node
+
+
+class ChecksumCall(Call):
+    """Run the checksum RPC with verify."""
+    file_system: str
+    file: str
+    algorithm: str
+
+    def __init__(self, inp: xecli_data.stratoweave_iosxe_cli__checksum__input):
+        self.command = verify_command(inp.file_system, inp.file, inp.algorithm)
+        self.file_system = inp.file_system
+        self.file = inp.file
+        self.algorithm = inp.algorithm
+
+    def reply(self, output: str) -> gdata.Node:
+        digest = parse_verify(output, self.file_system, self.file, self.algorithm)
+        return xecli_data.stratoweave_iosxe_cli__checksum__output(digest=digest).to_gdata()
+
+
+def rpc_call(request: gdata.Node) -> Call:
+    """Return the call for an RPC request. Raise ValueError for an RPC that
+    the adapter does not run, or for input that is not valid."""
+    items = list(request.children.items())
+    if len(items) != 1:
+        raise ValueError("an RPC request must have exactly one child")
+    rpc_id, body = items[0]
+    if rpc_id == gdata.Id(xecli_yang.NS, "checksum"):
+        return ChecksumCall(xecli_data.stratoweave_iosxe_cli__checksum__input.from_gdata(body))
+    raise ValueError("RPC " + str(rpc_id) + " is not supported by the IOS XE CLI adapter")
+
+
+def _tcp(env: ?Env) -> ?net.TCPConnectCap:
+    if env is not None:
+        return net.TCPConnectCap(net.TCPCap(net.NetCap(env.cap)))
+    return None
+
+
+actor _Session(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, command: ?str, timeout: float,
+               done: action(?str, ?Exception) -> None):
+    """Log in to the device over SSH and run command, or only log in when
+    command is None. Call done once with the output, then close the connection.
+    """
+    var client: ?ssh.Client = None
+    var finished = False
+
+    def _finish(output: ?str, err: ?Exception):
+        if finished:
+            return
+        finished = True
+        c = client
+        client = None
+        if c is not None:
+            c.close()
+        done(output, err)
+
+    def _on_hostkey(c: ssh.Client, state: str, info: ssh.HostKeyInfo):
+        # The NETCONF adapter does not check host keys either.
+        c.accept_hostkey()
+
+    def _on_exit(ch: ssh.Channel, code: int, signal: ?str, stdout: bytes, stderr: bytes, error: ?str):
+        if error is not None:
+            _finish(None, TransientError("SSH command failed: " + error))
+            return
+        if signal is not None or code != 0:
+            _finish(None, CommandError("SSH command ended with exit status " + str(code)))
+            return
+        try:
+            text = stdout.decode()
+        except Exception:
+            _finish(None, CommandError("SSH command output is not UTF-8"))
+        else:
+            _finish(text, None)
+
+    def _on_connect(c: ssh.Client, err: ?Exception):
+        if err is not None:
+            _finish(None, NotConnectedError("SSH login failed: " + swdev.error_text(err)))
+            return
+        cmd = command
+        if cmd is not None:
+            ssh.RunCommand(c, cmd, _on_exit, timeout=timeout)
+        else:
+            _finish("", None)
+
+    def _on_close(c: ssh.Client, reason: str):
+        # IOS XE closes the connection when the command ends. RunCommand
+        # reports the result of the command.
+        pass
+
+    def _start():
+        addresses = list(dmc.address)
+        if len(addresses) == 0:
+            _finish(None, NotConnectedError("the device has no address"))
+            return
+        address = addresses[0]
+        port = address.port
+        keys: list[ssh.PrivateKey] = []
+        for key in dmc.credentials.key:
+            material = key.private_key
+            if material is not None:
+                keys.append(ssh.PrivateKey(material.encode()))
+        try:
+            client = ssh.Client(cap, address.address, dmc.credentials.username,
+                                _on_connect, _on_close, _on_hostkey,
+                                password=dmc.credentials.password,
+                                private_keys=keys if len(keys) > 0 else None,
+                                port=u16(port) if port is not None else u16(22),
+                                transport=ssh_transport_config(dmc.ssh))
+        except Exception as e:
+            _finish(None, e)
+
+    _start()
+
+
+actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?Env,
+                     command_timeout: float, rpc_timeout: float):
+    """Run the commands of one device and turn their output into YANG data.
+
+    A change of the address, the credentials or the SSH settings starts a
+    login. When the login succeeds, the driver tells DeviceMgr that the
+    device is connected. When it fails, the driver tries again later.
+    """
+    _log = logging.Logger(log_handler)
+    tcp = _tcp(env)
+    var dmc: ?DeviceMetaConfig = None
+    var settings: ?gdata.Node = None
+    var configured = False
+    var generation = 0
+    var closed = False
+
+    def _session(command: ?str, timeout: float, done: action(?str, ?Exception) -> None):
+        d = dmc
+        if d is not None and tcp is not None and not closed:
+            _Session(tcp, d, command, timeout, done)
+        else:
+            done(None, NotConnectedError("the IOS XE CLI adapter has no SSH connection settings"))
+
+    def _login(gen: int, delay: float):
+        if closed or gen != generation:
+            return
+        def logged_in(output: ?str, err: ?Exception):
+            if closed or gen != generation:
+                return
+            if err is not None:
+                _log.warning("IOS XE CLI: SSH login failed", {"error": err, "retry_in": delay})
+                next_delay = delay * 2.0
+                if next_delay > RETRY_MAX:
+                    next_delay = RETRY_MAX
+                after now delay: _login(gen, next_delay)
+                return
+            _log.info("IOS XE CLI: SSH login succeeded")
+            async dev.on_connect(modules(), None)
+        _session(None, command_timeout, logged_in)
+
+    def set_dmc(new_dmc: DeviceMetaConfig):
+        if closed:
+            return
+        dmc = new_dmc
+        selected = gdata.FNode(children=[gdata.FNode(gdata.Id(_RFS_NS, name))
+                                       for name in ["address", "credentials", "ssh"]])
+        new_settings = gdata.filter(new_dmc.to_gdata(), selected)
+        if configured and settings == new_settings:
+            return
+        configured = True
+        settings = new_settings
+        generation += 1
+        if len(new_dmc.address) > 0:
+            _login(generation, RETRY_FIRST)
+
+    def _read(rs: list[Read], i: int, r: xecli_data.root, filt: ?gdata.FNode,
+              cb: action(?gdata.Node, ?Exception) -> None):
+        """Run the reads from rs[i] on, one after the other, and add their data to r."""
+        if i == len(rs):
+            try:
+                tree = gdata.filter(r.to_gdata(), filt)
+            except Exception as e:
+                cb(None, e)
+            else:
+                cb(tree, None)
+            return
+        read = rs[i]
+        def received(output: ?str, err: ?Exception):
+            if err is not None:
+                cb(None, err)
+                return
+            try:
+                read.parse(r, output if output is not None else "")
+            except Exception as e:
+                cb(None, e)
+            else:
+                _read(rs, i + 1, r, filt, cb)
+        _session(read.command, command_timeout, received)
+
+    def get(cb: action(?gdata.Node, ?Exception) -> None, filt: ?gdata.FNode=None):
+        try:
+            rs = reads(filt)
+        except Exception as e:
+            cb(None, e)
+        else:
+            if len(rs) > 0:
+                _read(rs, 0, xecli_data.root(), filt, cb)
+            else:
+                cb(gdata.Container({}), None)
+
+    def _call(cb: action(?gdata.Node, ?Exception) -> None, c: Call):
+        def received(output: ?str, err: ?Exception):
+            if err is not None:
+                cb(None, err)
+                return
+            try:
+                reply = c.reply(output if output is not None else "")
+            except Exception as e:
+                cb(None, e)
+            else:
+                cb(reply, None)
+        _session(c.command, rpc_timeout, received)
+
+    def rpc(cb: action(?gdata.Node, ?Exception) -> None, request: gdata.Node):
+        try:
+            c = rpc_call(request)
+        except Exception as e:
+            cb(None, e)
+        else:
+            _call(cb, c)
+
+    def close(on_close: ?action() -> None=None):
+        closed = True
+        generation += 1
+        if on_close is not None:
+            on_close()
+
+
+class IosXeCliAdapter(DeviceAdapter):
+    """Device adapter for the IOS XE CLI over SSH.
+
+    The device address and port are those of the SSH server, port 22 by
+    default. command_timeout and rpc_timeout are in seconds.
+    """
+    def __init__(self, dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc: DeviceMetaConfig,
+                 schema_registry: swdev.SchemaRegistry, log_handler, env: ?Env,
+                 command_timeout: float=COMMAND_TIMEOUT, rpc_timeout: float=RPC_TIMEOUT):
+        self._log_handler = log_handler
+        self._env = env
+        self._modules = modules()
+        self._driver = IosXeCliDriver(dev, log_handler, env, command_timeout, rpc_timeout)
+
+    def set_dmc(self, new_dmc: DeviceMetaConfig):
+        self._driver.set_dmc(new_dmc)
+
+    def configure(self, done, new_diff, new_conf, running_conf):
+        done(ConfigError("the IOS XE CLI adapter does not configure devices", new_diff, new_conf), None)
+
+    def get_capabilities(self) -> list[str]:
+        return []
+
+    def get_modules(self) -> dict[str, ModCap]:
+        return self._modules
+
+    def subscription_method(self) -> str:
+        return SUBSCRIPTION_UNKNOWN
+
+    def subscription_status(self) -> SubscriptionStatus:
+        return SubscriptionStatus(SUBSCRIPTION_UNKNOWN)
+
+    def fetch_config(self, done: action(?gdata.Node, ?Exception) -> None):
+        done(gdata.Container({}), None)
+
+    def get_config(self) -> ?gdata.Node:
+        return gdata.Container({})
+
+    def get(self, cb: action(?gdata.Node, ?Exception) -> None, filt: ?gdata.FNode=None):
+        self._driver.get(cb, filt)
+
+    def rpc(self, cb: action(?gdata.Node, ?Exception) -> None, gdata_rpc: gdata.Node):
+        self._driver.rpc(cb, gdata_rpc)
+
+    def rpc_xml(self, cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node):
+        cb(None, ConfigError("the IOS XE CLI adapter does not support XML RPCs"))
+
+    def declare_subscriptions(self, owner_id: str, cb: proc(?gdata.Node, ?Exception) -> None,
+                              want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None):
+        cb(None, PermanentError("the IOS XE CLI adapter does not support subscriptions"))
+        if synced is not None:
+            synced(owner_id)
+
+    def remove_subscriptions(self, owner_id: str):
+        pass
+
+    def close(self, on_close: ?action() -> None=None):
+        self._driver.close(on_close)
