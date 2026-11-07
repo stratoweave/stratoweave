@@ -103,7 +103,9 @@ channels:
 - Devices with RFC 8639 subscribed-notifications get establish-subscription on
   the **main session** (per-name stream-subtree-filter on the NETCONF stream).
 - IOS XE's draft dialect gets per-name establishes on the `yang-notif-native`
-  stream for Cisco-native event modules; other names fall back to RFC 5277.
+  stream for Cisco's native event modules, `Cisco-IOS-XE-*-events` and
+  `Cisco-IOS-XE-*-events-oper`; IOS XE sends these only there. Other names
+  fall back to RFC 5277.
 - Everything else uses classic RFC 5277 `create-subscription` on a **dedicated
   session per stream** — forced by 5277 itself: one anonymous subscription per
   session, no modify or cancel, and no other RPCs without `:interleave`.
@@ -143,7 +145,8 @@ with local YANG files instead of downloaded schemas, as for `ncurl monitor`.
 When a device advertises `ietf-netconf-notifications` (RFC 6470), the
 `DeviceMgr` subscribes itself to `netconf-config-change` and triggers a resync
 on it — out-of-band configuration drift is detected the moment the device
-reports it, rather than on the next reconnect.
+reports it, rather than on the next reconnect. IOS XE reports changes made
+from the CLI as well as over NETCONF.
 
 ## Emitting notifications northbound
 
@@ -173,5 +176,6 @@ receives it; with no subscribers the event simply evaporates.
 - The automatic config-change resync does not yet discriminate `changed-by`,
   so StratoWeave's own commits trigger a redundant (harmless) resync on
   devices that emit RFC 6470 notifications.
-- The exact identityref spelling of XE's `yang-notif-native` stream is pending
-  verification against live IOS XE.
+- IOS XE matches a `yang-notif-native` filter against the module's own prefix,
+  which the adapter takes from the device schema. A notification whose module
+  is not in the schema is rejected (`error-no-such-option`) and retried.
