@@ -1,0 +1,521 @@
+"""In-process event notification tests over an actor pipe.
+
+A netconf.Client and netconf.Server are wired together with actor_pipe_pair()
+to exercise the RFC 5277 create-subscription round-trip: the client subscribes,
+the server accepts and emits event notifications, and the client receives them
+through its on_notif callback. Also covers the dispatch guard (a <notification>
+in a foreign namespace must not reach on_notif) and the real publisher stack —
+EventStreamHub + NetconfEventService — for name filtering, stream separation,
+and the RFC 5277 session rules.
+
+Pure NETCONF library bits, without TTT or a device adapter. The interop
+tests at the end need a notconf server.
+"""
+
+import logging
+import net
+import testing
+import std.xml as xml
+
+import netconf
+import netconf.events as ncevents
+import yp
+import yp.events as ypevents
+
+NS_TEST_EVENTS = "urn:test:events"
+
+
+def _verify_event(uuid: str) -> xml.Node:
+    return xml.Node("verify-event", nsdefs=[(None, NS_TEST_EVENTS)], children=[
+        xml.Node("uuid", text=uuid)
+    ])
+
+
+actor _test_create_subscription_roundtrip(t: testing.EnvT):
+    """Client create-subscription; server accepts and emits; client receives."""
+    pipes = netconf.actor_pipe_pair()
+
+    var done = False
+    var stream_seen: ?str = None
+
+    def _fail(e: Exception) -> None:
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        if yp.is_create_subscription(op.tag):
+            params = yp.parse_create_subscription(op)
+            stream_seen = params.stream
+            s.send_ok(message_id)
+            s.send_notification(yp.build_notification(yp.event_time_now(),
+                _verify_event("cafe-0001")))
+        else:
+            s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if not done:
+            done = True
+            payload = yp.notification_payload(notif)
+            event_time = yp.notification_event_time(notif)
+            if payload is not None and payload.tag == "verify-event" and event_time is not None:
+                testing.assertEqual(stream_seen, "NETCONF")
+                c.close(None)
+                t.success()
+            else:
+                t.failure(ValueError("Unexpected notification: " + notif.encode()))
+
+    def _on_subscribed(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            _fail(ValueError("connect failed: " + str(e)))
+        else:
+            c.create_subscription(_on_subscribed)
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=_on_connect,
+                            on_notif=_on_notif,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    after 10.0: _fail(ValueError("Timed out waiting for notification"))
+
+
+actor _test_foreign_namespace_notification_ignored(t: testing.EnvT):
+    """A <notification> in a foreign namespace is dropped by the dispatch guard;
+    a proper RFC 5277 one after it still arrives."""
+    pipes = netconf.actor_pipe_pair()
+
+    var done = False
+
+    def _fail(e: Exception) -> None:
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        if yp.is_create_subscription(op.tag):
+            s.send_ok(message_id)
+            # A same-tag message from some other protocol must not surface...
+            s.send_notification(xml.Node("notification",
+                nsdefs=[(None, "urn:example:not-netconf")],
+                children=[_verify_event("bogus")]))
+            # ...while the real thing still must.
+            s.send_notification(yp.build_notification(yp.event_time_now(),
+                _verify_event("cafe-0002")))
+        else:
+            s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if not done:
+            done = True
+            payload = yp.notification_payload(notif)
+            uuid: ?str = None
+            if payload is not None:
+                for child in payload.children:
+                    if child.tag == "uuid":
+                        uuid = child.text
+            if uuid is not None and uuid == "cafe-0002":
+                c.close(None)
+                t.success()
+            else:
+                t.failure(ValueError("Foreign-namespace notification leaked through: " + notif.encode()))
+
+    def _on_subscribed(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            _fail(ValueError("connect failed: " + str(e)))
+        else:
+            c.create_subscription(_on_subscribed)
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=_on_connect,
+                            on_notif=_on_notif,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    after 10.0: _fail(ValueError("Timed out waiting for notification"))
+
+
+def _other_event(seq: str) -> xml.Node:
+    return xml.Node("other-event", nsdefs=[(None, NS_TEST_EVENTS)], children=[
+        xml.Node("seq", text=seq)
+    ])
+
+
+actor _test_hub_name_filter(t: testing.EnvT):
+    """A name-filtered subscription only receives matching notifications."""
+    pipes = netconf.actor_pipe_pair()
+    hub = ypevents.EventStreamHub(t.log_handler)
+
+    var service: ?ncevents.NetconfEventService = None
+    var done = False
+
+    def _fail(e: Exception) -> None:
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        sv = service
+        if yp.is_create_subscription(op.tag) and sv is not None:
+            sv.handle_rpc(message_id, op)
+        else:
+            s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if not done:
+            done = True
+            payload = yp.notification_payload(notif)
+            if payload is not None and payload.tag == "verify-event":
+                c.close(None)
+                t.success()
+            else:
+                t.failure(ValueError("Filter leaked a notification: " + notif.encode()))
+
+    def _on_subscribed(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+        else:
+            # The non-matching event must be filtered out server-side; only the
+            # verify-event may reach on_notif.
+            hub.publish(_other_event("1"))
+            hub.publish(_verify_event("cafe-0003"))
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            _fail(ValueError("connect failed: " + str(e)))
+        else:
+            c.create_subscription(_on_subscribed,
+                subtree_filter=[xml.Node("verify-event", nsdefs=[(None, NS_TEST_EVENTS)])])
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    service = ncevents.NetconfEventService(server, hub, log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=_on_connect,
+                            on_notif=_on_notif,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    after 10.0: _fail(ValueError("Timed out waiting for notification"))
+
+
+actor _test_hub_allow_all_and_streams(t: testing.EnvT):
+    """An unfiltered subscription on a named stream receives everything published
+    to that stream and nothing from other streams."""
+    pipes = netconf.actor_pipe_pair()
+    hub = ypevents.EventStreamHub(t.log_handler)
+    hub.define_stream("ops")
+
+    var service: ?ncevents.NetconfEventService = None
+    var done = False
+    var seen: list[str] = []
+
+    def _fail(e: Exception) -> None:
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        sv = service
+        if yp.is_create_subscription(op.tag) and sv is not None:
+            sv.handle_rpc(message_id, op)
+        else:
+            s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if not done:
+            payload = yp.notification_payload(notif)
+            if payload is not None:
+                seen.append(payload.tag)
+            if len(seen) == 2:
+                done = True
+                # The NETCONF-stream event must not arrive; both ops-stream
+                # events must, in publish order.
+                testing.assertEqual(seen, ["other-event", "verify-event"])
+                c.close(None)
+                t.success()
+
+    def _on_subscribed(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+        else:
+            hub.publish(_verify_event("not-for-us"))          # NETCONF stream
+            hub.publish(_other_event("1"), stream="ops")
+            hub.publish(_verify_event("cafe-0004"), stream="ops")
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            _fail(ValueError("connect failed: " + str(e)))
+        else:
+            c.create_subscription(_on_subscribed, stream="ops")
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    service = ncevents.NetconfEventService(server, hub, log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=_on_connect,
+                            on_notif=_on_notif,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    after 10.0: _fail(ValueError("Timed out: seen={seen}"))
+
+
+def _err_tag(err: ?netconf.NetconfError) -> ?str:
+    if err is not None:
+        rpce = err.rpc_error
+        if rpce is not None and len(rpce) > 0:
+            return rpce[0].error_tag
+    return None
+
+
+actor _test_session_rules(t: testing.EnvT):
+    """RFC 5277 session rules at the service, each with its mandated error-tag:
+    unknown stream and replay are rejected up front (while no subscription is
+    active yet, so the branches genuinely run), then a subscription succeeds,
+    then a second one fails with operation-failed."""
+    pipes = netconf.actor_pipe_pair()
+    hub = ypevents.EventStreamHub(t.log_handler)
+
+    var service: ?ncevents.NetconfEventService = None
+    var done = False
+
+    def _fail(e: Exception) -> None:
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _expect_tag(err: ?netconf.NetconfError, want: str, what: str) -> bool:
+        tag = _err_tag(err)
+        if tag is not None and tag == want:
+            return True
+        _fail(ValueError("{what}: expected error-tag {want}, got {tag}"))
+        return False
+
+    def _on_server_rpc(s: netconf.Server, message_id: str, op: xml.Node) -> None:
+        sv = service
+        if yp.is_create_subscription(op.tag) and sv is not None:
+            sv.handle_rpc(message_id, op)
+        else:
+            s.send_error(message_id, "operation-not-supported", "unsupported: " + op.tag)
+
+    def _on_second(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if not done:
+            if _expect_tag(err, "operation-failed", "second create-subscription"):
+                done = True
+                c.close(None)
+                t.success()
+
+    def _on_first(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            _fail(err)
+        else:
+            c.create_subscription(_on_second)
+
+    def _on_stoptime_rejected(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if _expect_tag(err, "missing-element", "stopTime without startTime"):
+            c.create_subscription(_on_first)
+
+    def _on_replay_rejected(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if _expect_tag(err, "operation-failed", "replay"):
+            c.create_subscription(_on_stoptime_rejected, stop_time="2026-01-01T00:00:00Z")
+
+    def _on_unknown_stream(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if _expect_tag(err, "invalid-value", "unknown stream"):
+            c.create_subscription(_on_replay_rejected, start_time="2026-01-01T00:00:00Z")
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            _fail(ValueError("connect failed: " + str(e)))
+        else:
+            c.create_subscription(_on_unknown_stream, stream="no-such-stream")
+
+    server = netconf.Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+    service = ncevents.NetconfEventService(server, hub, log_handler=t.log_handler)
+    client = netconf.Client(None,
+                            address="actor-pipe",
+                            username="actor-pipe",
+                            key=None,
+                            password=None,
+                            port=0,
+                            on_connect=_on_connect,
+                            on_notif=None,
+                            log_handler=t.log_handler,
+                            pipe=pipes.client)
+    after 10.0: _fail(ValueError("Timed out"))
+
+
+# ----------------------------------------------------------------------------
+# Interop tests against a real NETCONF server (Netopeer2 via notconf).
+# Run with: docker run -td -p 42830:830 ghcr.io/notconf/notconf
+# then: acton test --tag notconf-server
+# Netopeer2 is the one implementation shipping final RFC 8639/8640 over
+# NETCONF, so these exercise both our classic-5277 and final-8639 event paths
+# against an independent peer, plus RFC 6470 netconf-config-change end to end.
+# ----------------------------------------------------------------------------
+
+NS_NCN = "urn:ietf:params:xml:ns:yang:ietf-netconf-notifications"
+
+
+def _notconf_client(t: testing.EnvT,
+                    on_connect: action(netconf.Client, ?Exception) -> None,
+                    on_notif: ?action(netconf.Client, xml.Node) -> None) -> netconf.Client:
+    return netconf.Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                          address=netconf.test_address,
+                          port=netconf.test_port,
+                          username=netconf.test_username,
+                          password=netconf.test_password,
+                          key=None,
+                          on_connect=on_connect,
+                          on_notif=on_notif,
+                          skip_host_key_check=True,
+                          log_handler=t.log_handler)
+
+
+def _nacm_group_edit(operation: str) -> xml.Node:
+    return xml.Node("nacm", nsdefs=[(None, "urn:ietf:params:xml:ns:yang:ietf-netconf-acm")], children=[
+        xml.Node("groups", children=[
+            xml.Node("group", attributes=[("xc:operation", operation)], children=[
+                xml.Node("name", text="sw-notif-test")
+            ])
+        ])
+    ])
+
+
+actor _test_notconf_5277_config_change(t: testing.EnvT):
+    """RFC 5277 against Netopeer2: create-subscription with a name filter for
+    netconf-config-change on one session; an edit-config from a second session
+    must arrive as the RFC 6470 notification."""
+    t.require("notconf-server")
+    var done = False
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if not done:
+            payload = yp.notification_payload(notif)
+            if payload is not None and payload.tag == "netconf-config-change":
+                done = True
+                c.close(None)
+                t.success()
+            # Anything else (e.g. replayComplete) is ignored; the filter should
+            # prevent unrelated events anyway.
+
+    def _on_edit_create(c2: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("edit-config (create) failed: {err}"))
+
+    def _on_edit_remove(c2: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("edit-config (remove) failed: {err}"))
+        else:
+            # remove-then-merge guarantees a real datastore change even when a
+            # previous run left the group behind.
+            c2.edit_config([_nacm_group_edit("merge")], _on_edit_create)
+
+    def _on_editor_connect(c2: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            fail(ValueError("editor connect failed: {e}"))
+        else:
+            c2.edit_config([_nacm_group_edit("remove")], _on_edit_remove)
+
+    def _on_subscribed(c: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("create-subscription failed: {err}"))
+        else:
+            _notconf_client(t, _on_editor_connect, None)
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            fail(ValueError("subscriber connect failed: {e}"))
+        else:
+            c.create_subscription(_on_subscribed,
+                subtree_filter=[xml.Node("netconf-config-change", nsdefs=[(None, NS_NCN)])])
+
+    _notconf_client(t, _on_connect, _on_notif)
+    after 15.0: fail(ValueError("Timed out waiting for netconf-config-change over 5277"))
+
+
+actor _test_notconf_8639_event_stream(t: testing.EnvT):
+    """Final RFC 8639/8640 against Netopeer2: establish-subscription on the
+    NETCONF stream with a stream-subtree-filter; the config-change event from a
+    second session's edit must arrive on the establishing session."""
+    t.require("notconf-server")
+    var done = False
+    var sub_id_seen: ?int = None
+
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _on_notif(c: netconf.Client, notif: xml.Node) -> None:
+        if not done:
+            payload = yp.notification_payload(notif)
+            if payload is not None and payload.tag == "netconf-config-change":
+                done = True
+                testing.assertEqual(sub_id_seen is not None, True)
+                c.close(None)
+                t.success()
+
+    def _on_edit_create(c2: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("edit-config (create) failed: {err}"))
+
+    def _on_edit_remove(c2: netconf.Client, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("edit-config (remove) failed: {err}"))
+        else:
+            c2.edit_config([_nacm_group_edit("merge")], _on_edit_create)
+
+    def _on_editor_connect(c2: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            fail(ValueError("editor connect failed: {e}"))
+        else:
+            c2.edit_config([_nacm_group_edit("remove")], _on_edit_remove)
+
+    def _on_established(c: netconf.Client, sub_id: ?int, err: ?netconf.NetconfError) -> None:
+        if err is not None:
+            fail(ValueError("establish-subscription (stream) failed: {err}"))
+        elif sub_id is None:
+            fail(ValueError("establish-subscription returned no id"))
+        else:
+            sub_id_seen = sub_id
+            _notconf_client(t, _on_editor_connect, None)
+
+    def _on_connect(c: netconf.Client, e: ?Exception) -> None:
+        if e is not None:
+            fail(ValueError("subscriber connect failed: {e}"))
+        else:
+            c.establish_subscription(_on_established, stream=yp.STREAM_NETCONF,
+                subtree_filter=[xml.Node("netconf-config-change", nsdefs=[(None, NS_NCN)])])
+
+    _notconf_client(t, _on_connect, _on_notif)
+    after 15.0: fail(ValueError("Timed out waiting for netconf-config-change over 8639"))

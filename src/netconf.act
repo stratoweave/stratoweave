@@ -513,22 +513,28 @@ actor Client(
                                dampening_period: ?int=None,
                                sync_on_start: bool=True,
                                event_notifs: bool=False,
-                               xpath_nsdefs: list[(?str, str)]=[]) -> None:
-        """Establish a YANG-push subscription (RFC 8639 + 8641 / 8640).
+                               xpath_nsdefs: list[(?str, str)]=[],
+                               stream: ?str=None,
+                               stream_nsdefs: list[(?str, str)]=[]) -> None:
+        """Establish a YANG-push or event-stream subscription (RFC 8639 + 8641 / 8640).
 
-        Pass period (centiseconds) for a periodic subscription, or on_change=True for
-        an on-change one (optionally with dampening_period centiseconds). For
-        on-change, sync_on_start defaults to the RFC 8641/YANG default of true;
-        pass false to request deltas only. The callback receives the allocated
-        subscription-id on success; push notifications then arrive via the Client's
-        on_notif callback — push-update for periodic and sync-on-start, and
-        push-change-update carrying a yang-patch for on-change deltas. Set
-        event_notifs=True for IOS XE's non-standard ietf-yang-push over
-        ietf-event-notifications RPC shape; the default is standard YANG Push over
-        ietf-subscribed-notifications.
+        Datastore subscription (default): pass period (centiseconds) for a
+        periodic subscription, or on_change=True for an on-change one (optionally
+        with dampening_period centiseconds). For on-change, sync_on_start
+        defaults to the RFC 8641/YANG default of true; pass false to request
+        deltas only. The callback receives the allocated subscription-id on
+        success; push notifications then arrive via the Client's on_notif
+        callback — push-update for periodic and sync-on-start, and
+        push-change-update carrying a yang-patch for on-change deltas.
+
+        Event-stream subscription: pass stream (e.g. yp.STREAM_NETCONF) to
+        receive discrete event notifications instead; they too arrive via
+        on_notif. Set event_notifs=True for IOS XE's non-standard
+        ietf-yang-push over ietf-event-notifications RPC shape; the default is
+        standard YANG Push over ietf-subscribed-notifications.
         """
-        _log.info("NETCONF establish-subscription", {"datastore": datastore, "period": period, "on_change": on_change, "event_notifs": event_notifs})
-        op = yp.build_establish_subscription(datastore, subtree_filter, xpath_filter, period, on_change, dampening_period, sync_on_start, event_notifs, xpath_nsdefs)
+        _log.info("NETCONF establish-subscription", {"datastore": datastore, "stream": stream, "period": period, "on_change": on_change, "event_notifs": event_notifs})
+        op = yp.build_establish_subscription(datastore, subtree_filter, xpath_filter, period, on_change, dampening_period, sync_on_start, event_notifs, xpath_nsdefs, stream, stream_nsdefs)
         def _on_reply(c: Client, reply: ?xml.Node, err: ?NetconfError) -> None:
             if err is not None:
                 cb(c, None, err)
@@ -564,6 +570,26 @@ actor Client(
             else:
                 cb(c, None)
         rpc(yp.build_delete_subscription(id, event_notifs), _on_reply)
+
+    def create_subscription(cb: action(Client, ?NetconfError) -> None,
+                            stream: ?str=None,
+                            subtree_filter: ?list[xml.Node]=None,
+                            start_time: ?str=None,
+                            stop_time: ?str=None) -> None:
+        """Create an RFC 5277 notification subscription on this session.
+
+        stream defaults to the server's NETCONF stream; subtree_filter is matched
+        against notification payloads (typically one empty element per wanted
+        notification, each in its module's namespace). Notifications then arrive
+        via the Client's on_notif callback. The subscription is anonymous and
+        bound to this session: RFC 5277 defines no modify or cancel short of
+        closing the session, and unless the server advertises :interleave it may
+        reject any further RPC here with resource-denied — plan for a dedicated
+        session in that case.
+        """
+        _log.info("NETCONF create-subscription", {"stream": stream})
+        rpc(yp.build_create_subscription(stream, subtree_filter, start_time, stop_time),
+            lambda c, _, err: cb(c, err))
 
     def get_schema(cb: action(Client, ?xml.Node, ?NetconfError) -> None, identifier: str, version: ?str=None, format: str="yang") -> None:
         _log.info("NETCONF get-schema", {"identifier": identifier, "version": version, "format": format})
@@ -891,8 +917,15 @@ actor Client(
                 _log.info("Server switched to implicit namespace mode")
                 nc_prefix = None
 
-            if root.tag == "notification": # TODO: check namespace as well?
-                _on_msg_notification(root)
+            if root.tag == "notification":
+                # Accept the RFC 5277 notification namespace, and be lenient when
+                # the peer declares none at all; anything else is some other
+                # protocol's message and must not reach on_notif.
+                notif_ns = yp.element_namespace(root)
+                if notif_ns is None or notif_ns == yp.NS_NOTIF:
+                    _on_msg_notification(root)
+                else:
+                    _log.warning("Ignoring <notification> in unexpected namespace", {"namespace": notif_ns})
             elif root.tag == "rpc-reply": # TODO: check namespace as well?
                 _on_msg_rpc_reply(root)
             elif root.tag == "hello": # TODO: check namespace as well?

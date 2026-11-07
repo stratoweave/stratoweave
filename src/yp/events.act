@@ -1,0 +1,104 @@
+"""Event streams — the publisher side of YANG event notifications.
+
+The EventStreamHub is where application code emits notifications and where
+transport bindings attach receivers. Emitting is one call:
+
+    hub.publish(payload)                      # on the NETCONF stream, timestamped now
+    hub.publish(payload, stream="my-stream")  # on a named stream
+
+payload is the notification's XML element (for gdata content, node.to_xml()).
+The hub frames it in the RFC 5277 <notification> envelope and fans it out to
+every attached receiver whose stream and name filter match. Events are
+fire-and-forget: no receivers, no delivery — there is no replay log.
+
+A transport binding (netconf.events.NetconfEventService for NETCONF sessions; a
+future RESTCONF event stream would be the analogous consumer) calls attach with
+its delivery sink when a client subscribes and detach when the subscription or
+session ends. Filtering is by notification name: a receiver's names are
+(namespace, name) pairs matched against the payload's top element, the
+name-filter reading of an RFC 5277 subtree filter. Deeper subtree matching is
+not implemented.
+
+The hub is transport-agnostic and shared: one hub per publisher, any number of
+sessions attached. Streams are just names; NETCONF always exists, others are
+declared with define_stream. It knows nothing of the schema — name filtering
+needs only the XML element names.
+"""
+
+import logging
+import std.xml as xml
+
+import yp
+
+
+class _Receiver(object):
+    stream: str
+    names: ?list[(?str, str)]   # (namespace, name) pairs; None = all
+    @property
+    deliver: action(xml.Node) -> None
+
+    def __init__(self, stream: str, names: ?list[(?str, str)],
+                 deliver: action(xml.Node) -> None):
+        self.stream = stream
+        self.names = names
+        self.deliver = deliver
+
+
+def _name_match(names: ?list[(?str, str)], payload: xml.Node) -> bool:
+    if names is not None:
+        payload_ns = yp.element_namespace(payload)
+        for ns, name in names:
+            if name == payload.tag:
+                # Lenient when either side leaves the namespace undeclared.
+                if ns is None or payload_ns is None or ns == payload_ns:
+                    return True
+        return False
+    return True
+
+
+actor EventStreamHub(log_handler: ?logging.Handler=None):
+    """A publisher's event streams and their attached receivers."""
+
+    _log = logging.Logger(log_handler)
+    var streams: list[str] = [yp.STREAM_NETCONF]
+    var receivers: dict[int, _Receiver] = {}
+    var next_rid: int = 1
+
+    def define_stream(name: str) -> None:
+        """Declare an additional event stream (the NETCONF stream always exists)."""
+        if name not in streams:
+            streams.append(name)
+
+    def stream_names() -> list[str]:
+        return streams
+
+    def attach(deliver: action(xml.Node) -> None,
+               stream: str=yp.STREAM_NETCONF,
+               names: ?list[(?str, str)]=None) -> ?int:
+        """Attach a receiver to a stream; returns its id, or None for an unknown
+        stream. names limits delivery to those notification names; None means all.
+        deliver receives fully framed <notification> messages."""
+        if stream not in streams:
+            return None
+        rid = next_rid
+        next_rid += 1
+        receivers[rid] = _Receiver(stream, names, deliver)
+        _log.debug("event receiver attached", {"rid": rid, "stream": stream})
+        return rid
+
+    def detach(rid: int) -> None:
+        if rid in receivers:
+            del receivers[rid]
+            _log.debug("event receiver detached", {"rid": rid})
+
+    def publish(payload: xml.Node,
+                stream: str=yp.STREAM_NETCONF,
+                event_time: ?str=None) -> None:
+        """Emit one notification: frame payload in the RFC 5277 envelope and
+        deliver it to every matching receiver on stream. event_time defaults to
+        now; pass one to preserve an original event's timestamp when relaying."""
+        et = event_time if event_time is not None else yp.event_time_now()
+        notif = yp.build_notification(et, payload)
+        for r in receivers.values():
+            if r.stream == stream and _name_match(r.names, payload):
+                r.deliver(notif)

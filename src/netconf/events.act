@@ -1,0 +1,89 @@
+"""NETCONF binding for event streams (RFC 5277).
+
+The thin, transport-specific layer over yp.events.EventStreamHub: it decodes the
+RFC 5277 create-subscription RPC, enforces the protocol's session rules (one
+subscription per session, no replay), and attaches the session's
+send_notification as a hub receiver.
+
+One NetconfEventService instance belongs to one NETCONF session; route
+create-subscription to handle_rpc from the server's on_rpc, using
+yp.is_create_subscription to decide. Call shutdown when the session closes so
+the hub stops delivering to a dead transport.
+
+RFC 8639 event-stream establish-subscription (a <stream> instead of a
+<datastore>) is not served yet: it shares the establish/delete RPCs and the
+subscription-id space with the YANG-push service, so serving both cleanly means
+factoring the content-agnostic subscription service that yp.engine's docstring
+anticipates. Until then the classic RPC covers the event side.
+"""
+
+import logging
+import std.xml as xml
+
+from netconf import Server
+import yp
+from yp.events import EventStreamHub
+
+
+actor NetconfEventService(server: Server,
+                          hub: EventStreamHub,
+                          log_handler: ?logging.Handler=None):
+    """Binds RFC 5277 create-subscription on a single NETCONF session to an
+    EventStreamHub."""
+
+    _log = logging.Logger(log_handler)
+    var rid: ?int = None   # RFC 5277: at most one subscription per session
+
+    def handle_rpc(message_id: str, op: xml.Node) -> None:
+        """Handle a notification RPC. Route here when is_create_subscription."""
+        if op.tag == "create-subscription":
+            if rid is not None:
+                # RFC 5277 6.5: a second create-subscription on a session with an
+                # active subscription is a protocol-level operation-failed.
+                server.send_error(message_id, "operation-failed",
+                    "a notification subscription is already active on this session",
+                    error_type="protocol")
+                return
+            params = yp.parse_create_subscription(op)
+            if params.stop_time is not None and params.start_time is None:
+                # RFC 5277 2.1.1: stopTime requires startTime.
+                server.send_error(message_id, "missing-element",
+                    "stopTime requires startTime", error_type="protocol")
+                return
+            if params.start_time is not None:
+                # RFC 5277 2.1.1: replay requested on a publisher without
+                # replay support is a protocol-level operation-failed.
+                server.send_error(message_id, "operation-failed",
+                    "replay (startTime) is not supported", error_type="protocol")
+                return
+            if params.xpath_filter is not None:
+                server.send_error(message_id, "operation-not-supported",
+                    "xpath filters are not supported")
+                return
+            if params.stream not in hub.stream_names():
+                server.send_error(message_id, "invalid-value",
+                    "no such event stream: " + params.stream)
+                return
+            # Reply before attaching: the sync attach call happens-after the ok
+            # is queued to the session, so no notification can precede the
+            # rpc-reply on the wire.
+            _log.info("create-subscription", {"stream": params.stream})
+            server.send_ok(message_id)
+            rid = hub.attach((lambda n: server.send_notification(n)),
+                             params.stream, yp.filter_names(params.subtree_filter))
+        else:
+            server.send_error(message_id, "operation-not-supported",
+                "unsupported notification RPC: " + op.tag)
+
+    def active() -> bool:
+        """True while this session holds an RFC 5277 subscription. RFC 8640
+        section 3: such a session must not also take establish-subscription."""
+        return rid is not None
+
+    def shutdown() -> None:
+        """Detach from the hub. Call when the NETCONF session closes; also ends
+        the subscription itself — the only way RFC 5277 allows."""
+        r = rid
+        if r is not None:
+            hub.detach(r)
+            rid = None

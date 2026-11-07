@@ -1,0 +1,534 @@
+"""Event notification tests at the device adapter level.
+
+A NetconfDriver against its in-process mock device: owners declare NotifSpecs
+through the adapter, the mock emits events, and NotifEvents come back decoded
+against the device schema. Covers the 5277 dedicated-session channel (device
+without any establish mechanism), the RFC 8639 establish-on-main channel
+(device advertising subscribed-notifications), and explicit stream taps.
+"""
+
+import logging
+import net
+import testing
+import std.xml as xml
+import yang
+import yang.gdata as ygdata
+
+import adapters.adapter as swadapt
+import adapters.netconf as swna
+import device as swdev
+import device_schema
+import swyang
+import yp
+
+from adapters.adapter import NotifSpec
+from test_devicemgr_netconf import new_netconf_mock_device_mgr, make_netconf_mock_dmc
+
+TEST_EVENTS_NS = "urn:test:events"
+
+TEST_EVENTS_YANG = r"""module test-events {
+  yang-version "1.1";
+  namespace "urn:test:events";
+  prefix tev;
+  notification verify-event {
+    leaf uuid {
+      type string;
+    }
+    leaf result {
+      type string;
+    }
+  }
+  notification other-event {
+    leaf seq {
+      type string;
+    }
+  }
+}"""
+
+# The import closure needed for a mock device to advertise dynamic YANG-push
+# (RFC 8639/8641), flipping the driver to establish-based event subscriptions.
+YP_MODELS: list[str] = [
+    swyang.ietf_datastores,
+    swyang.ietf_yang_types,
+    swyang.ietf_inet_types,
+    swyang.ietf_yang_push,
+    swyang.ietf_subscribed_notifications,
+    swyang.ietf_restconf,
+    swyang.ietf_yang_patch,
+    swyang.ietf_interfaces,
+    swyang.ietf_netconf_acm,
+    swyang.ietf_network_instance,
+    swyang.ietf_ip,
+    swyang.ietf_yang_schema_mount,
+]
+
+VERIFY_EVENT = ygdata.Id(TEST_EVENTS_NS, "verify-event")
+OTHER_EVENT = ygdata.Id(TEST_EVENTS_NS, "other-event")
+
+
+def _verify_event_xml(uuid: str) -> xml.Node:
+    return xml.Node("verify-event", nsdefs=[(None, TEST_EVENTS_NS)], children=[
+        xml.Node("uuid", text=uuid),
+        xml.Node("result", text="passed")
+    ])
+
+
+def _other_event_xml(seq: str) -> xml.Node:
+    return xml.Node("other-event", nsdefs=[(None, TEST_EVENTS_NS)], children=[
+        xml.Node("seq", text=seq)
+    ])
+
+
+def _payload_leaf(ev: swadapt.NotifEvent, leaf: str) -> ?str:
+    p = ev.payload
+    if p is not None and isinstance(p, ygdata.Container):
+        l = p.get_opt_leaf(ygdata.Id(TEST_EVENTS_NS, leaf))
+        if l is not None:
+            val = l.val
+            if isinstance(val, str):
+                return val
+    return None
+
+
+def _mock_server_of(dev: swdev.DeviceMgr) -> ?swna.NetconfMockServer:
+    adapter = dev.get_adapter()
+    if isinstance(adapter, swna.NetconfAdapter):
+        return adapter.get_mock_server()
+    return None
+
+
+actor _test_notif_5277_channel(t: testing.EnvT):
+    """A device with no establish mechanism: the driver opens a dedicated RFC
+    5277 session, demuxes by name client-side, and decodes against the schema."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-notif-5277", noop_on_reconf,
+        extra_models=[TEST_EVENTS_YANG])
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_event(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            # Channel-trouble signals while the dedicated session comes up are
+            # legitimate; delivery is what the test asserts.
+            return
+        if ev is not None:
+            done = True
+            if not (ev.name.q == VERIFY_EVENT.q and ev.name.name == VERIFY_EVENT.name):
+                t.failure(ValueError("name filter leaked: {ev.name}"))
+            elif _payload_leaf(ev, "uuid") is not None and _payload_leaf(ev, "uuid") == "cafe-1" and len(ev.event_time) > 0 and ev.raw.tag == "verify-event":
+                statuses = dev.get_adapter().notif_status()
+                if len(statuses) == 1 and statuses[0].mechanism == swadapt.NOTIF_5277 and statuses[0].session == "dedicated":
+                    t.success()
+                else:
+                    t.failure(ValueError("unexpected notif_status: " + ", ".join([s.description() for s in statuses])))
+            else:
+                t.failure(ValueError("undecoded or wrong event: {ev} uuid={_payload_leaf(ev, 'uuid')}"))
+
+    def on_synced(owner_id: str):
+        # The subscription is in place, so emitted events must arrive. The
+        # non-matching event must be demuxed away; only verify-event may reach
+        # the owner.
+        ms = _mock_server_of(dev)
+        if ms is not None:
+            ms.emit_event(_other_event_xml("1"))
+            ms.emit_event(_verify_event_xml("cafe-1"))
+        else:
+            fail("no mock server")
+
+    dev.get_adapter().declare_notif_subscriptions("t-5277", on_event, {NotifSpec(VERIFY_EVENT)}, on_synced)
+    after 10.0: fail("timed out waiting for verify-event")
+
+
+actor _test_notif_establish_channel(t: testing.EnvT):
+    """A device advertising RFC 8639 subscribed-notifications: event
+    subscriptions ride the main session as establish-subscription with a
+    stream-subtree-filter; no dedicated session is opened."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-notif-estab", noop_on_reconf,
+        extra_models=[TEST_EVENTS_YANG] + YP_MODELS)
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_event(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            return
+        if ev is not None:
+            done = True
+            if _payload_leaf(ev, "uuid") is not None and _payload_leaf(ev, "uuid") == "cafe-2":
+                statuses = dev.get_adapter().notif_status()
+                if len(statuses) == 1 and statuses[0].mechanism == swadapt.NOTIF_ESTABLISH and statuses[0].session == "main":
+                    t.success()
+                else:
+                    t.failure(ValueError("unexpected notif_status: " + ", ".join([s.description() for s in statuses])))
+            else:
+                t.failure(ValueError("undecoded or wrong event: {ev}"))
+
+    def on_synced(owner_id: str):
+        ms = _mock_server_of(dev)
+        if ms is not None:
+            ms.emit_event(_verify_event_xml("cafe-2"))
+        else:
+            fail("no mock server")
+
+    dev.get_adapter().declare_notif_subscriptions("t-estab", on_event, {NotifSpec(VERIFY_EVENT)}, on_synced)
+    after 10.0: fail("timed out waiting for establish-based event")
+
+
+actor _test_notif_stream_tap(t: testing.EnvT):
+    """A wildcard spec pinned to a named stream taps everything on that stream
+    and nothing from other streams."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-notif-tap", noop_on_reconf,
+        extra_models=[TEST_EVENTS_YANG])
+    var done = False
+    var seen: list[str] = []
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_event(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            return
+        if ev is not None:
+            seen.append(ev.name.name)
+            if len(seen) == 2:
+                done = True
+                # Only the snmpevents-stream events, in emit order; the
+                # NETCONF-stream event must not arrive.
+                if seen == ["other-event", "verify-event"]:
+                    t.success()
+                else:
+                    t.failure(ValueError("unexpected events: {seen}"))
+
+    def start():
+        if done:
+            return
+        ms = _mock_server_of(dev)
+        active = False
+        for st in dev.get_adapter().notif_status():
+            if st.stream is not None and st.stream == "snmpevents" and st.state == "active":
+                active = True
+        if ms is not None and active:
+            ms.emit_event(_verify_event_xml("not-for-us"))              # NETCONF stream
+            ms.emit_event(_other_event_xml("1"), stream="snmpevents")
+            ms.emit_event(_verify_event_xml("cafe-3"), stream="snmpevents")
+        else:
+            ms2 = _mock_server_of(dev)
+            if ms2 is not None:
+                # The tap's stream must exist before the channel's
+                # create-subscription names it.
+                ms2.define_stream("snmpevents")
+            after 0.01: start()
+
+    dev.get_adapter().declare_notif_subscriptions("t-tap", on_event, {NotifSpec(stream="snmpevents")})
+    start()
+    after 10.0: fail("timed out: seen={seen}")
+
+
+actor _test_notif_teardown(t: testing.EnvT):
+    """Removing the last owner tears the channel down: notif_status empties and
+    later events are not delivered."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-notif-teardown", noop_on_reconf,
+        extra_models=[TEST_EVENTS_YANG])
+    var done = False
+    var got_first = False
+    var stray_after_removal = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_event(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if ev is not None:
+            if got_first:
+                stray_after_removal = True
+            else:
+                got_first = True
+
+    def finish():
+        if done:
+            return
+        if stray_after_removal:
+            fail("event delivered after owner removal")
+        elif len(dev.notif_status()) != 0:
+            fail("channels not torn down: " + ", ".join([s.description() for s in dev.notif_status()]))
+        else:
+            done = True
+            t.success()
+
+    def after_removal():
+        if done:
+            return
+        ms = _mock_server_of(dev)
+        if ms is not None:
+            # Nobody wants this; if the channel leaked it would still arrive.
+            ms.emit_event(_verify_event_xml("cafe-late"))
+            after 0.2: finish()
+
+    def start():
+        if done:
+            return
+        ms = _mock_server_of(dev)
+        active = False
+        for st in dev.get_adapter().notif_status():
+            if st.state == "active":
+                active = True
+        if ms is not None and active:
+            ms.emit_event(_verify_event_xml("cafe-first"))
+            wait_first()
+        else:
+            after 0.01: start()
+
+    def wait_first():
+        if done:
+            return
+        if got_first:
+            dev.remove_notif_subscriptions("t-teardown")
+            after 0.05: after_removal()
+        else:
+            after 0.01: wait_first()
+
+    dev.declare_notif_subscriptions("t-teardown", on_event, {NotifSpec(VERIFY_EVENT)})
+    start()
+    after 10.0: fail("timed out")
+
+
+actor _test_notif_channel_error(t: testing.EnvT):
+    """A subscription the device rejects (unknown stream) surfaces the
+    documented cb(None, err) channel-trouble cue."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-notif-err", noop_on_reconf,
+        extra_models=[TEST_EVENTS_YANG])
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_event(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            done = True
+            t.success()
+        elif ev is not None:
+            fail("unexpected event on a stream the mock does not define")
+
+    # The mock defines no such stream, so create-subscription is rejected and
+    # the owner must hear about it.
+    dev.declare_notif_subscriptions("t-err", on_event, {NotifSpec(stream="no-such-stream")})
+    after 10.0: fail("timed out waiting for channel error")
+
+
+actor _test_mock_adapter_inject(t: testing.EnvT):
+    """The generic MockDriver realizes the same owner API: name demux and
+    stream-pinned taps behave like the real driver's, and an in-process
+    subscription is in place at once."""
+    schema = yang.compile([TEST_EVENTS_YANG])
+    ds = device_schema.DeviceSchema("mock", schema, schema)
+
+    var named_seen: list[str] = []
+    var tap_seen: list[str] = []
+    var synced_seen: list[str] = []
+
+    def on_named(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if ev is not None:
+            named_seen.append(ev.name.name)
+
+    def on_tap(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if ev is not None:
+            tap_seen.append(ev.name.name)
+
+    def on_synced(owner_id: str):
+        synced_seen.append(owner_id)
+
+    def noop_connect(modset: dict[str, swadapt.ModCap], schema_key: ?device_schema.SchemaKey):
+        pass
+
+    driver = swadapt.MockDriver(noop_connect, ds, t.log_handler, None)
+    driver.declare_notif_subscriptions("named", on_named, {NotifSpec(VERIFY_EVENT)}, on_synced)
+    driver.declare_notif_subscriptions("tap", on_tap, {NotifSpec(stream="snmpevents")})
+
+    driver.inject_notif(VERIFY_EVENT)                          # named only
+    driver.inject_notif(OTHER_EVENT, stream="snmpevents")      # tap only
+    driver.inject_notif(VERIFY_EVENT, stream="snmpevents")     # both
+
+    def check():
+        if named_seen == ["verify-event", "verify-event"] and tap_seen == ["other-event", "verify-event"] and synced_seen == ["named"]:
+            t.success()
+        else:
+            t.failure(ValueError("named={named_seen} tap={tap_seen} synced={synced_seen}"))
+
+    after 0.2: check()
+
+
+actor _test_notif_declared_before_adapter(t: testing.EnvT):
+    """An owner declares before the device has its adapter. The DeviceMgr keeps
+    the declaration and gives it to the adapter that set_dmc creates, so the
+    owner still gets the device's events."""
+    def noop_on_reconf(name: str):
+        pass
+    dev_types = {
+        "netconf": swdev.DeviceType(
+            name="netconf",
+            adapter_type=swna.NetconfAdapter,
+            src_dnode=yang.compile([TEST_EVENTS_YANG])
+        )
+    }
+    dev = swdev.DeviceMgr(dev_types, t.env, "dev-notif-early", t.log_handler, noop_on_reconf, swdev.SchemaRegistry())
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_event(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if done:
+            return
+        if ev is not None:
+            uuid = _payload_leaf(ev, "uuid")
+            if uuid is not None and uuid == "cafe-early":
+                done = True
+                t.success()
+
+    def on_synced(owner_id: str):
+        ms = _mock_server_of(dev)
+        if ms is not None:
+            ms.emit_event(_verify_event_xml("cafe-early"))
+        else:
+            fail("no mock server")
+
+    # The declaration reaches a NoAdapter; set_dmc then creates the real one,
+    # which gets the declaration and tells the owner once it is in place.
+    dev.declare_notif_subscriptions("t-early", on_event, {NotifSpec(VERIFY_EVENT)}, on_synced)
+    dev.set_dmc(make_netconf_mock_dmc("dev-notif-early"))
+    after 10.0: fail("timed out: the declaration did not reach the new adapter")
+
+
+actor _test_notif_error_reaches_only_its_channel(t: testing.EnvT):
+    """Channel trouble reaches only the owners whose specs use that channel:
+    a subscription the device rejects does not disturb an owner on another
+    channel."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-notif-scope", noop_on_reconf,
+        extra_models=[TEST_EVENTS_YANG])
+    var done = False
+    var good_event = False
+    var good_errors = 0
+    var bad_error = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def verdict():
+        if not done:
+            done = True
+            if good_errors == 0:
+                t.success()
+            else:
+                t.failure(ValueError("an owner on a healthy channel got {good_errors} channel error(s)"))
+
+    def check():
+        # Wait a moment after both outcomes so that a stray error to the
+        # healthy owner arrives before the verdict.
+        if good_event and bad_error:
+            after 0.2: verdict()
+
+    def on_bad(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if err is not None and not bad_error:
+            bad_error = True
+            check()
+
+    def on_good(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if err is not None:
+            good_errors += 1
+        elif ev is not None and not good_event:
+            good_event = True
+            check()
+
+    def on_good_synced(owner_id: str):
+        ms = _mock_server_of(dev)
+        if ms is not None:
+            ms.emit_event(_verify_event_xml("cafe-scope"))
+        else:
+            fail("no mock server")
+
+    # The mock defines no such stream, so that subscription is rejected.
+    dev.declare_notif_subscriptions("bad", on_bad, {NotifSpec(stream="no-such-stream")})
+    dev.declare_notif_subscriptions("good", on_good, {NotifSpec(VERIFY_EVENT)}, on_good_synced)
+    after 10.0: fail("timed out: good_event={good_event} bad_error={bad_error}")
+
+
+actor _test_notif_hoisted_prefix(t: testing.EnvT):
+    """A device may declare the payload's namespace prefix on the envelope.
+    The event is still named and decoded, and its raw element reads correctly
+    on its own."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-notif-hoisted", noop_on_reconf,
+        extra_models=[TEST_EVENTS_YANG])
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_event(ev: ?swadapt.NotifEvent, err: ?Exception):
+        if done:
+            return
+        if ev is not None:
+            done = True
+            uuid = _payload_leaf(ev, "uuid")
+            raw_ns = yp.element_namespace(ev.raw)
+            if ev.name.q != TEST_EVENTS_NS:
+                t.failure(ValueError("event named in the wrong namespace: {ev.name}"))
+            elif uuid is None or uuid != "cafe-h":
+                t.failure(ValueError("event payload not decoded: uuid={uuid}"))
+            elif raw_ns is None or raw_ns != TEST_EVENTS_NS:
+                t.failure(ValueError("raw element lost its namespace: {ev.raw.encode()}"))
+            else:
+                t.success()
+
+    def on_synced(owner_id: str):
+        ms = _mock_server_of(dev)
+        if ms is not None:
+            ms.send_notification(xml.decode(
+                '<notification xmlns="urn:ietf:params:xml:ns:netconf:notification:1.0" '
+                'xmlns:tev="urn:test:events">'
+                '<eventTime>2026-11-06T00:00:00Z</eventTime>'
+                '<tev:verify-event><tev:uuid>cafe-h</tev:uuid><tev:result>passed</tev:result></tev:verify-event>'
+                '</notification>'))
+        else:
+            fail("no mock server")
+
+    dev.declare_notif_subscriptions("t-hoisted", on_event, {NotifSpec(VERIFY_EVENT)}, on_synced)
+    after 10.0: fail("timed out waiting for the event")
