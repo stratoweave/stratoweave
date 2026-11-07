@@ -3,7 +3,7 @@
   import '../app.css';
 
   import { refreshAll } from '$app/navigation';
-  import { page } from '$app/state';
+  import { navigating, page } from '$app/state';
   import { onMount, type Snippet } from 'svelte';
 
   import CommandPalette from '#lib/core/command-palette/CommandPalette.svelte';
@@ -54,6 +54,9 @@
   };
 
   let currentPathname = $derived(page.url.pathname);
+  // While a page loads, the sidebar already marks it and the old page dims.
+  let activePathname = $derived(navigating.to?.url.pathname ?? currentPathname);
+  let leaving = $derived(activePathname !== currentPathname);
   let parent = $derived.by(() => {
     if (PAGE_LABELS[currentPathname] !== undefined) return null;
     for (const [prefix, label] of Object.entries(PARENTS)) {
@@ -90,7 +93,7 @@
         <div class="nav-section-label">Software</div>
         <a
           class="nav-item"
-          class:active={currentPathname.startsWith('/campaigns')}
+          class:active={activePathname.startsWith('/campaigns')}
           href="/campaigns"
         >
           <span class="nav-icon"><NavIcon name="campaigns" /></span>
@@ -98,7 +101,7 @@
         </a>
         <a
           class="nav-item"
-          class:active={currentPathname.startsWith('/images')}
+          class:active={activePathname.startsWith('/images')}
           href="/images"
         >
           <span class="nav-icon"><NavIcon name="images" /></span>
@@ -109,7 +112,7 @@
         <div class="nav-section-label">Inventory</div>
         <a
           class="nav-item"
-          class:active={currentPathname.startsWith('/devices')}
+          class:active={activePathname.startsWith('/devices')}
           href="/devices"
         >
           <span class="nav-icon"><NavIcon name="devices" /></span>
@@ -120,7 +123,7 @@
         <div class="nav-section-label">Maintenance</div>
         <a
           class="nav-item"
-          class:active={currentPathname.startsWith('/schedules')}
+          class:active={activePathname.startsWith('/schedules')}
           href="/schedules"
         >
           <span class="nav-icon"><NavIcon name="schedules" /></span>
@@ -129,11 +132,11 @@
       </div>
       <div class="nav-section">
         <div class="nav-section-label">Configuration</div>
-        <a class="nav-item" class:active={currentPathname === '/config'} href="/config">
+        <a class="nav-item" class:active={activePathname === '/config'} href="/config">
           <span class="nav-icon"><NavIcon name="config" /></span>
           Config
         </a>
-        <a class="nav-item" class:active={currentPathname === '/apply'} href="/apply">
+        <a class="nav-item" class:active={activePathname === '/apply'} href="/apply">
           <span class="nav-icon"><NavIcon name="apply" /></span>
           Apply config
         </a>
@@ -162,7 +165,11 @@
       </div>
     </header>
 
-    <main class="app-content">
+    {#if navigating.to}
+      <div class="nav-progress" role="progressbar" aria-label="Loading the page"></div>
+    {/if}
+
+    <main class="app-content" class:leaving>
       {#key currentPathname}
         <div class="page-enter">
           {@render children?.()}
@@ -175,6 +182,56 @@
 <CommandPalette bind:open={paletteOpen} />
 
 <style>
+  /* Shows only when a page takes more than a moment to load. */
+  .nav-progress {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    z-index: 1000;
+    height: 2px;
+    overflow: hidden;
+    pointer-events: none;
+    opacity: 0;
+    animation: nav-show 0s linear 120ms forwards;
+  }
+
+  .nav-progress::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    width: 40%;
+    background: var(--sw-accent);
+    animation: nav-slide 1.1s ease-in-out infinite;
+  }
+
+  @keyframes nav-show {
+    to {
+      opacity: 1;
+    }
+  }
+
+  @keyframes nav-slide {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(250%);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .nav-progress::after {
+      width: 100%;
+      animation: none;
+    }
+  }
+
+  .leaving .page-enter {
+    opacity: 0.5;
+    transition: opacity 150ms 150ms;
+  }
+
   .cmdk-trigger {
     display: inline-flex;
     align-items: center;

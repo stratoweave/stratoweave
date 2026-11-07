@@ -1,8 +1,9 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { goto, invalidate } from '$app/navigation';
+  import { goto } from '$app/navigation';
 
   import { errorText } from '#lib/core/errors.ts';
+  import { onLoaded } from '#lib/core/loading.svelte.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
   import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
   import CampaignProgress from '#lib/software/CampaignProgress.svelte';
@@ -33,7 +34,8 @@
     adminStatePatch,
     joinState,
     unplacedText,
-    type KnownStatus
+    type KnownStatus,
+    type Schedule
   } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
 
@@ -68,11 +70,25 @@
   let view = $state.raw<LiveView | null>(null);
   const live = new CampaignLive((v) => (view = v));
 
-  // Every load goes through it: open, navigation, Refresh and the reload
-  // after a write. Another campaign starts over, its form and filters too.
+  // Every load goes through it when its entry is in: open, navigation and
+  // Refresh. The error is the one of the load last applied.
+  let applied = $state.raw({ seq: 0, loadError: '' });
+  onLoaded(
+    () => {
+      const { name, seq, entry } = data;
+      return entry.then((e) => ({ name, seq, ...e }));
+    },
+    (e) => {
+      applied = { seq: e.seq, loadError: e.loadError };
+      live.load(e.name, e.seq, e.config, e.state);
+    }
+  );
+  let schedules = $state.raw<Schedule[]>([]);
+  onLoaded(() => data.schedules, (value) => (schedules = value));
+
+  // Another campaign starts over, its form and filters too.
   let shownName: string | null = null;
   $effect.pre(() => {
-    live.load(data.name, data.seq, data.config, data.state);
     if (data.name !== shownName) {
       shownName = data.name;
       actionError = '';
@@ -108,7 +124,7 @@
   let rate = $derived(shown?.rate ?? null);
   let eta = $derived(shown?.eta ?? null);
   // A failed load stops showing once a later read got through.
-  let loadError = $derived((shown?.seq ?? 0) > data.seq ? '' : data.loadError);
+  let loadError = $derived((shown?.seq ?? 0) > applied.seq ? '' : applied.loadError);
   let paceOpen = $derived(paceOpenChoice ?? campaign?.adminState === 'plan');
   let statuses = $derived(
     new Map<string, KnownStatus>((campaign?.deviceStatus ?? []).map((r) => [r.device, r.status]))
@@ -141,7 +157,7 @@
       planningMessage = null;
       await saveCampaignPlanning(data.name, savedPlanning, planningFromDraft(planningForm));
       live.wrote();
-      await invalidate('data:campaign');
+      await live.reload();
       planningEdit = null;
       planningMessage = { type: 'success', text: 'Saved.' };
     } catch (saveError) {
@@ -256,7 +272,7 @@
       await restconfPatchJson(DATA_ROOT, adminStatePatch(data.name, action));
       // Reads still in flight may predate the change; the reload shows it.
       live.wrote();
-      await invalidate('data:campaign');
+      await live.reload();
     } catch (error) {
       actionError = errorText(error, 'The action failed.');
     } finally {
@@ -269,7 +285,17 @@
   <div class="error-state status">{actionError || loadError}</div>
 {/if}
 
-{#if campaign === null}
+{#if shown === null}
+  <div class="page-header">
+    <div>
+      <h1>{data.name}</h1>
+      <p class="summary">Loading…</p>
+    </div>
+  </div>
+  <section class="card" aria-busy="true">
+    <div class="placeholder-plan">Loading the campaign…</div>
+  </section>
+{:else if campaign === null}
   {#if config === null}
     <section class="card">
       <div class="empty-state">No campaign named {data.name}.</div>
@@ -482,7 +508,7 @@
       {#if paceOpen}
         <div class="pace-body">
           <PlanningFields
-            schedules={data.schedules}
+            {schedules}
             draft={planningForm}
             errors={planningErrors}
             disabled={planningSaving}

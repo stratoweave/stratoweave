@@ -367,6 +367,18 @@ export interface Campaign {
   deviceStatus: DeviceStatusRow[];
 }
 
+/** One campaign as a member device's page shows it. */
+export interface DeviceCampaign {
+  name: string;
+  adminState: AdminState;
+  defaultSchedule: string;
+  /** The image the device installs; '' for none. */
+  image: string;
+  row: DeviceStatusRow;
+  /** See planStartOf. */
+  start: number | 'unplaced' | null;
+}
+
 /** The published half of a campaign: counters, plan and one row per
  * member. */
 type CampaignState = Pick<Campaign, 'counters' | 'plan' | 'deviceStatus'>;
@@ -540,6 +552,33 @@ export function parseFleet(json: unknown): { devices: Device[] } {
 export function parseCampaigns(json: unknown): Campaign[] {
   const tree = (json as DataTreeJson)?.['software:software'];
   return (tree?.['upgrade-campaign'] ?? []).map(parseCampaign);
+}
+
+/** Parse a GET of data/software:software?content=config: the campaigns
+ * without their state. */
+export function parseCampaignConfigs(json: unknown): CampaignConfig[] {
+  const tree = (json as DataTreeJson)?.['software:software'];
+  return (tree?.['upgrade-campaign'] ?? []).map(parseCampaignConfig);
+}
+
+/** Parse a GET of one campaign's state/device-status={device}; a device
+ * the campaign does not report (404) is unknown. */
+export function parseDeviceStatusEntry(json: unknown, device: string): DeviceStatusRow {
+  const rows = (json as { 'software:device-status'?: DeviceStatusJson[] })?.['software:device-status'];
+  return parseRow(rows?.[0] ?? { device });
+}
+
+/** A device's start in a GET of one campaign's state/plan: real once
+ * released, else the estimate. 'unplaced' when the plan has no window for
+ * the device, null when there is no plan (404). */
+export function planStartOf(json: unknown, device: string): number | 'unplaced' | null {
+  const plan = (json as { 'software:plan'?: PlanJson })?.['software:plan'];
+  if (!plan) return null;
+  for (const w of plan.window ?? []) {
+    const d = (w.device ?? []).find((x) => x.name === device);
+    if (d) return d.started == null ? num(d['estimated-start']) : num(d.started);
+  }
+  return 'unplaced';
 }
 
 /** Parse a GET of data/maintenance:schedules. */

@@ -1,12 +1,15 @@
 // The campaign page's live data: the loader's snapshot, kept fresh by one
 // tick every FAST_MS that decides what to read. A campaign of up to
 // FAST_ENTRY_LIMIT members gets its state node every tick; a larger one
-// its four counter leaves every tick, and its state every SLOW_MS, or
-// FAILED_GAP_MS after the last one when `failed` moved. The config comes
-// every SLOW_MS with content=config, which is also how an outside change
-// or a deletion shows. Without published state the tick reads the whole
-// entry instead: it is small then, and it tells a campaign that has not
-// reported yet from one that was deleted.
+// its four counter leaves every tick, and its state every slow gap, or
+// half a gap after the last one when `failed` moved. The config comes
+// every slow gap with content=config, which is also how an outside change
+// or a deletion shows. The slow gap is SLOW_MS, or SLOW_COST times the
+// last state read when that is longer: at 100k members the state is 22 MB
+// and takes the server over a second, during which it answers no other
+// read. Without published state a small campaign's tick reads the whole
+// entry, which tells a campaign that has not reported yet from one that
+// was deleted; a large one reads its counter leaves until they appear.
 //
 // Every read takes a sequence number when it starts. What it brings back
 // is used only if it is newer than what is shown of its kind, started
@@ -21,7 +24,7 @@ import { RateTracker } from './rate';
 
 export const FAST_MS = 1500;
 export const SLOW_MS = 12_000;
-export const FAILED_GAP_MS = SLOW_MS / 2;
+export const SLOW_COST = 20;
 
 export interface LiveView {
   name: string;
@@ -65,6 +68,7 @@ export class CampaignLive {
   /** When the last state and config reads started, ms. */
   private stateAt = 0;
   private configAt = 0;
+  private slowGap = SLOW_MS;
   private lastFailed: number | null = null;
   private failedMoved = false;
   private tracker = new RateTracker();
@@ -78,7 +82,7 @@ export class CampaignLive {
     private readonly clock: () => number = Date.now
   ) {}
 
-  /** The loader's data: on open, after navigation, a refresh or a write.
+  /** The loader's data: on open, after navigation or a refresh.
    * `config` undefined means the load failed: what is shown stays and the
    * ticks keep trying. Another campaign starts from nothing. */
   load(name: string, seq: number, config: CampaignConfig | null | undefined, state: StateParts | null): void {
@@ -99,14 +103,16 @@ export class CampaignLive {
     if (this.disposed || name === '' || config === null) return;
     const signal = this.aborter.signal;
     try {
-      if (config === undefined || this.state.value === null) {
+      const large = config !== undefined && config.devices.length > FAST_ENTRY_LIMIT;
+      if (config === undefined || (this.state.value === null && !large)) {
         await this.readEntry(name, false, signal);
         return;
       }
       const t = this.clock();
       const reads: Promise<void>[] = [];
-      reads.push(this.stateDue(config, t) ? this.readState() : this.readCounters(name, signal));
-      if (t - this.configAt >= SLOW_MS) reads.push(this.readEntry(name, true, signal));
+      if (this.state.value === null) reads.push(this.awaitState(name, signal));
+      else reads.push(this.stateDue(config, t) ? this.readState() : this.readCounters(name, signal));
+      if (t - this.configAt >= this.slowGap) reads.push(this.readEntry(name, true, signal));
       await Promise.allSettled(reads);
     } catch {
       // keep what is shown; the next tick tries again
@@ -114,10 +120,21 @@ export class CampaignLive {
   }
 
   /** A write went through: drop and cancel the reads that started before
-   * it. The page reloads right after. */
+   * it. The page calls reload right after. */
   wrote(): void {
     this.barrier = nextSeq();
     this.abortReads();
+  }
+
+  /** Read the whole entry now and show it. Never rejects: on a failure
+   * the ticks try again. */
+  async reload(): Promise<void> {
+    if (this.disposed || this.name === '') return;
+    try {
+      await this.readEntry(this.name, false, this.aborter.signal);
+    } catch {
+      // keep what is shown
+    }
   }
 
   dispose(): void {
@@ -148,6 +165,7 @@ export class CampaignLive {
     this.barrier = 0;
     this.stateAt = 0;
     this.configAt = 0;
+    this.slowGap = SLOW_MS;
     this.lastFailed = null;
     this.failedMoved = false;
     this.tracker.reset();
@@ -168,7 +186,7 @@ export class CampaignLive {
   private stateDue(config: CampaignConfig, t: number): boolean {
     if (config.devices.length <= FAST_ENTRY_LIMIT) return true;
     const since = t - this.stateAt;
-    return since >= SLOW_MS || (this.failedMoved && since >= FAILED_GAP_MS);
+    return since >= this.slowGap || (this.failedMoved && since >= this.slowGap / 2);
   }
 
   /** The state node. Whoever asks while it is in flight gets the same read. */
@@ -177,11 +195,13 @@ export class CampaignLive {
     const name = this.name;
     const signal = this.aborter.signal;
     const seq = nextSeq();
-    this.stateAt = this.clock();
+    const started = this.clock();
+    this.stateAt = started;
     this.failedMoved = false;
     const read = (async () => {
       const parts = await fetchCampaignState(name, withSignal(signal, this.fetchFn));
       if (!this.current(name, seq)) return;
+      this.slowGap = Math.max(SLOW_MS, SLOW_COST * (this.clock() - started));
       if (parts === null) {
         // Gone: not published any more, or the campaign was deleted.
         await this.readEntry(name, false, signal);
@@ -206,6 +226,13 @@ export class CampaignLive {
       return;
     }
     if (this.applyCounters(seq, counters)) this.emit();
+  }
+
+  /** A large campaign without published state: its counters show when it
+   * has some, then the state is read. */
+  private async awaitState(name: string, signal: AbortSignal): Promise<void> {
+    const counters = await fetchCounters(name, withSignal(signal, this.fetchFn));
+    if (counters !== null && name === this.name) await this.readState();
   }
 
   /** The entry, config only or with its state. A 404 means the campaign

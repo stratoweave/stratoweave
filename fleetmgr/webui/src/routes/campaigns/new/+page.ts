@@ -13,13 +13,15 @@ import {
 
 import type { PageLoad } from './$types';
 
-export const load: PageLoad = async ({ fetch }) => {
+async function loadInventory(fetch: typeof globalThis.fetch) {
   try {
-    const [software, fleet, schedules, images] = await Promise.all([
-      restconfGetOrNull<unknown>(SOFTWARE_CONFIG, fetch),
-      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch),
+    // Small reads first: the top answers GETs one at a time, and the fleet
+    // takes 4 s at 100k devices.
+    const [images, schedules, software, fleet] = await Promise.all([
+      restconfGetOrNull<unknown>(IMAGES_ROOT, fetch),
       restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch),
-      restconfGetOrNull<unknown>(IMAGES_ROOT, fetch)
+      restconfGetOrNull<unknown>(SOFTWARE_CONFIG, fetch),
+      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch)
     ]);
     return {
       devices: parseFleet(fleet).devices,
@@ -32,4 +34,7 @@ export const load: PageLoad = async ({ fetch }) => {
     const message = errorText(loadError, 'Failed to load inventory.');
     return { devices: [], campaigns: [], schedules: [], images: [], loadError: message };
   }
-};
+}
+
+// Not awaited: the page shows at once and fills in when the reads are in.
+export const load: PageLoad = ({ fetch }) => ({ inventory: loadInventory(fetch) });

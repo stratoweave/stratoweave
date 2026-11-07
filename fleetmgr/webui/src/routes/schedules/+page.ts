@@ -11,25 +11,32 @@ import {
 
 import type { PageLoad } from './$types';
 
-// The fleet and the campaigns are loaded for the usage columns: which
-// devices are bound to a schedule and which campaigns default to it.
-export const load: PageLoad = async ({ fetch, depends }) => {
-  depends('data:schedules');
-
+async function loadSchedules(fetch: typeof globalThis.fetch) {
   try {
-    const [schedules, fleet, software] = await Promise.all([
-      restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch),
-      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch),
-      restconfGetOrNull<unknown>(SOFTWARE_CONFIG, fetch)
-    ]);
-    return {
-      schedules: parseSchedules(schedules),
-      devices: parseFleet(fleet).devices,
-      campaigns: parseCampaigns(software),
-      loadError: ''
-    };
+    return { schedules: parseSchedules(await restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch)), loadError: '' };
   } catch (loadError) {
-    const message = errorText(loadError, 'Failed to load schedules.');
-    return { schedules: [], devices: [], campaigns: [], loadError: message };
+    return { schedules: [], loadError: errorText(loadError, 'Failed to load schedules.') };
   }
+}
+
+// The fleet and the campaigns are for the usage columns: which devices are
+// bound to a schedule and which campaigns default to it.
+async function loadUsage(fetch: typeof globalThis.fetch) {
+  try {
+    const [software, fleet] = await Promise.all([
+      restconfGetOrNull<unknown>(SOFTWARE_CONFIG, fetch),
+      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch)
+    ]);
+    return { devices: parseFleet(fleet).devices, campaigns: parseCampaigns(software), loadError: '' };
+  } catch (loadError) {
+    return { devices: [], campaigns: [], loadError: errorText(loadError, 'Failed to load the schedule usage.') };
+  }
+}
+
+// Not awaited, and the schedules apart and first: the calendar shows
+// before the fleet is in, which takes 4 s at 100k devices.
+export const load: PageLoad = ({ fetch, depends }) => {
+  depends('data:schedules');
+  const schedules = loadSchedules(fetch);
+  return { schedules, usage: loadUsage(fetch) };
 };

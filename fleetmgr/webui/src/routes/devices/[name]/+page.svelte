@@ -6,13 +6,13 @@
   import StageChain from '#lib/software/StageChain.svelte';
   import StatusPill from '#lib/software/StatusPill.svelte';
   import { errorText } from '#lib/core/errors.ts';
+  import { onLoaded } from '#lib/core/loading.svelte.ts';
   import { createPoller } from '#lib/core/polling/poller.ts';
   import { setDeviceSchedule } from '#lib/maintenance/binding.ts';
   import {
     STEP_LABEL,
-    deviceStart,
-    type Campaign,
     type CheckResult,
+    type DeviceCampaign,
     type DeviceStatusRow,
     type Step
   } from '#lib/software/model.ts';
@@ -21,34 +21,46 @@
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
+  // null until their reads are in; a poll keeps what is shown until then.
+  let deviceLoad = $state.raw<Awaited<typeof data.device> | null>(null);
+  let campaignsLoad = $state.raw<Awaited<typeof data.campaigns> | null>(null);
+  onLoaded(() => data.device, (value) => (deviceLoad = value));
+  onLoaded(() => data.campaigns, (value) => (campaignsLoad = value));
+  /** undefined while loading, null when there is no such device. */
+  let device = $derived(deviceLoad?.device);
+  let schedules = $derived(deviceLoad?.schedules ?? []);
+  let campaigns = $derived(campaignsLoad?.campaigns ?? []);
+  let loadError = $derived(deviceLoad?.loadError || campaignsLoad?.loadError || '');
 
   // null follows the device as polled; a pick holds until it is saved.
   let picked = $state<string | null>(null);
   let savingSchedule = $state(false);
   let scheduleMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
-  let bound = $derived(data.device?.schedule ?? '');
+  let bound = $derived(device?.schedule ?? '');
   let choice = $derived(picked ?? bound);
   let scheduleOptions = $derived.by(() => {
-    const options = data.schedules.map((s) => ({ name: s.name, label: s.name }));
-    if (bound && !data.schedules.some((s) => s.name === bound)) {
+    const options = schedules.map((s) => ({ name: s.name, label: s.name }));
+    if (bound && !schedules.some((s) => s.name === bound)) {
       options.push({ name: bound, label: `${bound} (missing)` });
     }
     return options;
   });
   // Unbound, the device follows each campaign's default schedule.
   let defaultLabel = $derived.by(() => {
-    const names = new Set(data.campaigns.map((c) => c.defaultSchedule || 'none'));
+    const names = new Set(campaigns.map((c) => c.defaultSchedule || 'none'));
     return `${names.size > 0 ? [...names].join(', ') : 'none'} (default)`;
   });
 
   async function saveSchedule(): Promise<void> {
-    if (!data.device || choice === bound) return;
+    if (!device || choice === bound) return;
     const schedule = choice;
     try {
       savingSchedule = true;
       scheduleMessage = null;
-      await setDeviceSchedule(data.device.name, schedule);
+      await setDeviceSchedule(device.name, schedule);
+      // Drops the reads from before the write; the new ones come in after.
       await invalidate('data:device');
+      if (deviceLoad?.device) deviceLoad = { ...deviceLoad, device: { ...deviceLoad.device, schedule } };
       picked = null;
       scheduleMessage = { type: 'success', text: schedule ? `Bound to ${schedule}.` : 'Unbound.' };
     } catch (saveError) {
@@ -62,29 +74,26 @@
   }
 
   onMount(() => {
-    const poller = createPoller(() => invalidate('data:device'), 5000);
+    // Waits for the reads: loads return before them, and a slow top must
+    // not be asked again before it answered.
+    const poller = createPoller(async () => {
+      await invalidate('data:device');
+      await Promise.all([data.device, data.campaigns]);
+    }, 5000);
     poller.start();
     return () => poller.stop();
   });
 
-  function statusRow(campaign: Campaign) {
-    return campaign.deviceStatus.find((r) => r.device === data.name) ?? null;
-  }
-
-  function campaignHref(campaign: Campaign): string {
+  function campaignHref(campaign: DeviceCampaign): string {
     return `/campaigns/${encodeURIComponent(campaign.name)}`;
   }
 
   /** This device's start in the plan, real once released, else the
    * planner's estimate; "not placed" when the plan has the campaign but
    * no window for it. */
-  function plannedStart(campaign: Campaign): string {
-    if (campaign.plan === null) return '—';
-    for (const w of campaign.plan.windows) {
-      const d = w.devices.find((x) => x.name === data.name);
-      if (d) return formatClock(deviceStart(d));
-    }
-    return campaign.plan.unplaced.includes(data.name) ? 'not placed' : '—';
+  function plannedStart(campaign: DeviceCampaign): string {
+    if (campaign.start === null) return '—';
+    return campaign.start === 'unplaced' ? 'not placed' : formatClock(campaign.start);
   }
 
   /** The checks of the last run that have a verdict. */
@@ -116,17 +125,26 @@
   }
 </script>
 
-{#if data.loadError}
-  <div class="error-state status">{data.loadError}</div>
+{#if loadError}
+  <div class="error-state status">{loadError}</div>
 {/if}
 
-{#if data.device === null}
+{#if device === undefined}
+  <section class="card hero" aria-busy="true">
+    <div class="head">
+      <DevicePicture />
+      <div class="ident">
+        <h1>{data.name}</h1>
+        <p class="meta">Loading…</p>
+      </div>
+    </div>
+  </section>
+{:else if device === null}
   <section class="card">
     <div class="empty-state">No device named {data.name}.</div>
   </section>
 {:else}
-  {@const device = data.device}
-  {@const single = data.campaigns.length === 1}
+  {@const single = campaigns.length === 1}
   <section class="card hero">
     <div class="head">
       <DevicePicture />
@@ -155,18 +173,19 @@
         </p>
       </div>
       {#if single}
-        {@const row = statusRow(data.campaigns[0])}
-        {#if row}
-          <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
-        {/if}
+        {@const row = campaigns[0].row}
+        <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
       {/if}
     </div>
 
-    {#if data.campaigns.length === 0}
+    {#if campaignsLoad === null}
+      <p class="none" aria-busy="true">Loading campaigns…</p>
+    {:else if campaigns.length === 0}
       <p class="none">Not a member of any campaign.</p>
     {/if}
-    {#each data.campaigns as campaign (campaign.name)}
-      {@const row = statusRow(campaign)}
+    {#each campaigns as campaign (campaign.name)}
+      {@const row = campaign.row}
+      {@const text = note(row)}
       <div class="run">
         <div class="run-head">
           <div class="facts">
@@ -180,45 +199,42 @@
             </span>
             <span class="fact">
               <span class="fact-label">Image</span>
-              <span class="mono">{campaign.images[campaign.devices.indexOf(data.name)] || '—'}</span>
+              <span class="mono">{campaign.image || '—'}</span>
             </span>
             <span class="fact">
               <span class="fact-label">Planned start</span>
               <span class="mono">{plannedStart(campaign)}</span>
             </span>
           </div>
-          {#if !single && row}
+          {#if !single}
             <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
           {/if}
         </div>
-        {#if row}
-          {@const text = note(row)}
-          <div class="track"><StageChain {row} large /></div>
-          {#if text}
-            <p class="note">{text}</p>
-          {/if}
-          {#each checks(row) as check (check.step)}
-            {@const verdict = check.result.verdict}
-            <div class="check" class:pass={verdict === 'pass'} class:fail={verdict === 'fail'}>
-              <span class="check-name">{STEP_LABEL[check.step]}</span>
-              <span class="pill verdict" class:success={verdict === 'pass'} class:danger={verdict === 'fail'}>
-                {verdict}
-              </span>
-              <span class="check-detail mono">
-                {#each detailParts(check.result.detail) as part, i (i)}
-                  <span class="part">
-                    {#if part.source}<span class="source">{part.source}</span>{/if}
-                    {part.text}
-                  </span>
-                {/each}
-              </span>
-              {#if check.step === 'precheck' && verdict === 'pass'}
-                <span class="baseline mono" title="The post-check compares against this.">baseline</span>
-              {/if}
-              <span class="at mono">{check.result.at !== null ? formatClock(check.result.at) : ''}</span>
-            </div>
-          {/each}
+        <div class="track"><StageChain {row} large /></div>
+        {#if text}
+          <p class="note">{text}</p>
         {/if}
+        {#each checks(row) as check (check.step)}
+          {@const verdict = check.result.verdict}
+          <div class="check" class:pass={verdict === 'pass'} class:fail={verdict === 'fail'}>
+            <span class="check-name">{STEP_LABEL[check.step]}</span>
+            <span class="pill verdict" class:success={verdict === 'pass'} class:danger={verdict === 'fail'}>
+              {verdict}
+            </span>
+            <span class="check-detail mono">
+              {#each detailParts(check.result.detail) as part, i (i)}
+                <span class="part">
+                  {#if part.source}<span class="source">{part.source}</span>{/if}
+                  {part.text}
+                </span>
+              {/each}
+            </span>
+            {#if check.step === 'precheck' && verdict === 'pass'}
+              <span class="baseline mono" title="The post-check compares against this.">baseline</span>
+            {/if}
+            <span class="at mono">{check.result.at !== null ? formatClock(check.result.at) : ''}</span>
+          </div>
+        {/each}
       </div>
     {/each}
   </section>
