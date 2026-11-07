@@ -1,0 +1,626 @@
+"""A device with an extra adapter: which adapter gets each request, and what
+the owner of a declaration gets back.
+
+The devices are mocked. The device types "a" and "b" have disjoint YANG, so
+their MockAdapters serve disjoint modules. "a" is the primary, "b" the extra
+adapter. urn:test:c is a module that no adapter has.
+"""
+
+import logging
+import testing
+import std.xml as xml
+import yang
+import yang.gdata as ygdata
+
+import device as swdev
+import device_oper as swdevoper
+import adapters.netconf as swna
+import test_devicemgr_netconf as fixture
+from adapters.adapter import DeviceAdapter, NoAdapter, MockAdapter, NotifSpec, NotifEvent
+from device_schema import DeviceSchema
+
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials, \
+    stratoweave_rfs__device__address_entry as Address, \
+    stratoweave_rfs__device__extra_adapter_entry as ExtraAdapter, \
+    stratoweave_rfs__device__extra_adapter__credentials as ExtraCredentials
+
+NS_A = "urn:test:a"
+NS_B = "urn:test:b"
+NS_C = "urn:test:c"
+
+MODEL_A = r"""module mod-a {
+  yang-version 1.1;
+  namespace "urn:test:a";
+  prefix a;
+  container a-top { config false; leaf x { type string; } }
+  rpc a-rpc;
+  notification a-event { leaf x { type string; } }
+}"""
+
+MODEL_B = r"""module mod-b {
+  yang-version 1.1;
+  namespace "urn:test:b";
+  prefix b;
+  container b-top { config false; leaf x { type string; } }
+  rpc b-rpc;
+  notification b-event { leaf x { type string; } }
+}"""
+
+
+def _no_adapter(dev: swdev.DeviceMgr, schema: DeviceSchema, dmc: DeviceMetaConfig,
+                registry: swdev.SchemaRegistry, log_handler: logging.Handler,
+                env: ?Env) -> DeviceAdapter:
+    """No real adapter: the device is mocked, so DeviceMgr uses MockAdapter."""
+    return NoAdapter(schema, log_handler, env)
+
+
+def _types() -> dict[str, swdev.DeviceType]:
+    return {"a": swdev.DeviceType("a", _no_adapter, yang.compile([MODEL_A])),
+            "b": swdev.DeviceType("b", _no_adapter, yang.compile([MODEL_B]))}
+
+
+def _dmc(name: str, extra: list[str]) -> DeviceMetaConfig:
+    return DeviceMetaConfig(name, Credentials("admin", "admin"), type="a",
+                            extra_adapter=[ExtraAdapter(t) for t in extra])
+
+
+def _device(t: testing.EnvT, name: str, extra: list[str]) -> swdev.DeviceMgr:
+    dev = swdev.DeviceMgr(_types(), None, name, t.log_handler, lambda n: None, swdev.SchemaRegistry())
+    dev.set_dmc(_dmc(name, extra))
+    return dev
+
+
+def _data(ns: str, top: str, x: str) -> ygdata.Node:
+    module = "mod-a" if ns == NS_A else "mod-b"
+    return ygdata.Container({ygdata.Id(ns, top): ygdata.Container({ygdata.Id(ns, "x"): ygdata.Leaf(x)},
+                                                                   ns=ns, module=module)})
+
+
+def _filter(tops: list[(str, str)]) -> ygdata.FNode:
+    return ygdata.FNode(children=[ygdata.FNode(ygdata.Id(ns, top)) for ns, top in tops])
+
+
+def _tops(tree: ?ygdata.Node) -> str:
+    """The names of the top-level nodes of a tree, sorted."""
+    if tree is not None:
+        return ",".join(sorted([k.name for k in tree.children.keys()]))
+    return "none"
+
+
+def _mock(a: ?DeviceAdapter) -> MockAdapter:
+    if a is not None:
+        if isinstance(a, MockAdapter):
+            return a
+    raise ValueError("the adapter is not a MockAdapter")
+
+
+proc def _has_modules(dev: swdev.DeviceMgr, names: list[str]) -> bool:
+    mods = dev.get_modules().0
+    for n in names:
+        if n not in mods:
+            return False
+    return True
+
+
+actor _test_get(t: testing.EnvT):
+    """Each case reads the device once. It checks the top-level nodes of the
+    reply and the filter each adapter got."""
+    dev = _device(t, "get", ["b"])
+    cases = [
+        ("across both adapters", _filter([(NS_A, "a-top"), (NS_B, "b-top")]), "a-top,b-top", ["get a-top"], ["get b-top"]),
+        ("the primary only", _filter([(NS_A, "a-top")]), "a-top", ["get a-top"], []),
+        ("the extra adapter only", _filter([(NS_B, "b-top")]), "b-top", [], ["get b-top"]),
+        ("no filter", None, "a-top,b-top", ["get *"], ["get *"]),
+        ("a module no adapter has goes to the primary", _filter([(NS_C, "c-top")]), "", ["get c-top"], []),
+    ]
+    var mocks: list[MockAdapter] = []
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def run(i: int):
+        if i == len(cases):
+            done = True
+            t.success()
+            return
+        label, filt, want_reply, want_a, want_b = cases[i]
+        mocks[0].clear_requests()
+        mocks[1].clear_requests()
+
+        def on_reply(tree: ?ygdata.Node, err: ?Exception):
+            if err is not None:
+                fail("{label}: {err}")
+                return
+            got_reply = _tops(tree)
+            got_a = mocks[0].requests()
+            got_b = mocks[1].requests()
+            if got_reply != want_reply or got_a != want_a or got_b != want_b:
+                fail("{label}: reply {got_reply}, a {got_a}, b {got_b}; want {want_reply}, {want_a}, {want_b}")
+                return
+            run(i + 1)
+
+        dev.get(on_reply, filt)
+
+    def start(n: int):
+        if done:
+            return
+        if not _has_modules(dev, ["mod-a", "mod-b"]):
+            if n > 200:
+                fail("the adapters did not connect")
+                return
+            after 0.01: start(n + 1)
+            return
+        a = _mock(dev.get_adapter())
+        b = _mock(dev.get_extra_adapter("b"))
+        a.set_data(_data(NS_A, "a-top", "from-a"))
+        b.set_data(_data(NS_B, "b-top", "from-b"))
+        mocks = [a, b]
+        run(0)
+
+    start(0)
+
+
+actor _test_rpc(t: testing.EnvT):
+    """Each case sends one RPC and checks which adapter got it."""
+    dev = _device(t, "rpc", ["b"])
+    cases = [
+        ("an RPC of the primary", ygdata.Id(NS_A, "a-rpc"), ["rpc a-rpc"], []),
+        ("an RPC of the extra adapter", ygdata.Id(NS_B, "b-rpc"), [], ["rpc b-rpc"]),
+        ("an RPC no adapter has goes to the primary", ygdata.Id(NS_C, "c-rpc"), ["rpc c-rpc"], []),
+    ]
+    xml_cases = [
+        ("an XML RPC of the extra adapter", xml.Node("b-rpc", nsdefs=[(None, NS_B)]), [], ["rpc_xml b-rpc"]),
+        ("an XML RPC without a namespace goes to the primary", xml.Node("get-software-information"), ["rpc_xml get-software-information"], []),
+    ]
+    var mocks: list[MockAdapter] = []
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def check(label: str, want_a: list[str], want_b: list[str]) -> bool:
+        got_a = mocks[0].requests()
+        got_b = mocks[1].requests()
+        if got_a != want_a or got_b != want_b:
+            fail("{label}: a {got_a}, b {got_b}; want {want_a}, {want_b}")
+            return False
+        return True
+
+    def run_xml(i: int):
+        if i == len(xml_cases):
+            done = True
+            t.success()
+            return
+        label, rpc, want_a, want_b = xml_cases[i]
+        mocks[0].clear_requests()
+        mocks[1].clear_requests()
+
+        def on_reply(reply: ?xml.Node, err: ?Exception):
+            if err is not None:
+                fail("{label}: {err}")
+            elif check(label, want_a, want_b):
+                run_xml(i + 1)
+
+        dev.rpc_xml(on_reply, rpc)
+
+    def run(i: int):
+        if i == len(cases):
+            run_xml(0)
+            return
+        label, rpc_id, want_a, want_b = cases[i]
+        mocks[0].clear_requests()
+        mocks[1].clear_requests()
+
+        def on_reply(reply: ?ygdata.Node, err: ?Exception):
+            if err is not None:
+                fail("{label}: {err}")
+            elif check(label, want_a, want_b):
+                run(i + 1)
+
+        dev.rpc(on_reply, ygdata.Container({rpc_id: ygdata.Container({})}))
+
+    def start(n: int):
+        if done:
+            return
+        if not _has_modules(dev, ["mod-a", "mod-b"]):
+            if n > 200:
+                fail("the adapters did not connect")
+                return
+            after 0.01: start(n + 1)
+            return
+        mocks = [_mock(dev.get_adapter()), _mock(dev.get_extra_adapter("b"))]
+        run(0)
+
+    start(0)
+
+
+actor _test_subscription_across_adapters(t: testing.EnvT):
+    """A subscription to the modules of both adapters gives the owner one
+    tree with the data of both, and one synced. A subscription to the extra
+    adapter's module only goes to that adapter."""
+    dev = _device(t, "subscribe", ["b"])
+    var latest: dict[str, ?ygdata.Node] = {}
+    var synced: dict[str, int] = {}
+    var mocks: list[MockAdapter] = []
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_tree(owner: str, tree: ?ygdata.Node, err: ?Exception):
+        if tree is not None:
+            latest[owner] = tree
+
+    def on_synced(owner: str):
+        synced[owner] = synced.get_def(owner, 0) + 1
+
+    def check(n: int):
+        if done:
+            return
+        got_both = _tops(latest.get_def("both", None))
+        got_one = _tops(latest.get_def("one", None))
+        if got_both != "a-top,b-top" or got_one != "b-top":
+            if n > 200:
+                fail("trees: both {got_both}, one {got_one}")
+                return
+            after 0.01: check(n + 1)
+            return
+        got_a = mocks[0].requests()
+        got_b = mocks[1].requests()
+        want_a = ["subscribe both a-top"]
+        want_b = ["subscribe both b-top", "subscribe one b-top"]
+        if sorted(got_a) != want_a or sorted(got_b) != want_b:
+            fail("requests: a {got_a}, b {got_b}")
+            return
+        if synced.get_def("both", 0) != 1 or synced.get_def("one", 0) != 1:
+            fail("synced: {synced}")
+            return
+        done = True
+        t.success()
+
+    def start(n: int):
+        if done:
+            return
+        if not _has_modules(dev, ["mod-a", "mod-b"]):
+            if n > 200:
+                fail("the adapters did not connect")
+                return
+            after 0.01: start(n + 1)
+            return
+        a = _mock(dev.get_adapter())
+        b = _mock(dev.get_extra_adapter("b"))
+        a.set_data(_data(NS_A, "a-top", "from-a"))
+        b.set_data(_data(NS_B, "b-top", "from-b"))
+        a.clear_requests()
+        b.clear_requests()
+        mocks = [a, b]
+        dev.declare_subscriptions("both", lambda tree, err: self.on_tree("both", tree, err),
+                                  {ygdata.SubscriptionSpec(_filter([(NS_A, "a-top"), (NS_B, "b-top")]), period=1.0)},
+                                  self.on_synced)
+        dev.declare_subscriptions("one", lambda tree, err: self.on_tree("one", tree, err),
+                                  {ygdata.SubscriptionSpec(_filter([(NS_B, "b-top")]), period=1.0)},
+                                  self.on_synced)
+        check(0)
+
+    start(0)
+
+
+actor _test_notifications_across_adapters(t: testing.EnvT):
+    """Named events go to the adapter of their module, an owner without names
+    to both. Events from both adapters reach the owner, and synced comes
+    once."""
+    dev = _device(t, "notif", ["b"])
+    var got: dict[str, list[str]] = {}
+    var synced: dict[str, int] = {}
+    var mocks: list[MockAdapter] = []
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_event(owner: str, ev: ?NotifEvent, err: ?Exception):
+        if ev is not None:
+            got[owner] = got.get_def(owner, []) + [ev.name.name]
+
+    def on_synced(owner: str):
+        synced[owner] = synced.get_def(owner, 0) + 1
+
+    def check(n: int):
+        if done:
+            return
+        named = sorted(got.get_def("named", []))
+        every = sorted(got.get_def("every", []))
+        if named != ["a-event", "b-event"] or every != ["a-event", "b-event"]:
+            if n > 200:
+                fail("events: named {named}, every {every}")
+                return
+            after 0.01: check(n + 1)
+            return
+        if synced.get_def("named", 0) != 1 or synced.get_def("every", 0) != 1:
+            fail("synced: {synced}")
+            return
+        done = True
+        t.success()
+
+    def declared(n: int):
+        if done:
+            return
+        if synced.get_def("named", 0) < 1 or synced.get_def("every", 0) < 1:
+            if n > 200:
+                fail("not synced: {synced}")
+                return
+            after 0.01: declared(n + 1)
+            return
+        got_a = sorted(mocks[0].requests())
+        got_b = sorted(mocks[1].requests())
+        if got_a != ["notif every *", "notif named a-event"] or got_b != ["notif every *", "notif named b-event"]:
+            fail("requests: a {got_a}, b {got_b}")
+            return
+        mocks[0].inject_notif(ygdata.Id(NS_A, "a-event"))
+        mocks[1].inject_notif(ygdata.Id(NS_B, "b-event"))
+        check(0)
+
+    def start(n: int):
+        if done:
+            return
+        if not _has_modules(dev, ["mod-a", "mod-b"]):
+            if n > 200:
+                fail("the adapters did not connect")
+                return
+            after 0.01: start(n + 1)
+            return
+        a = _mock(dev.get_adapter())
+        b = _mock(dev.get_extra_adapter("b"))
+        a.clear_requests()
+        b.clear_requests()
+        mocks = [a, b]
+        dev.declare_notif_subscriptions("named", lambda ev, err: self.on_event("named", ev, err),
+                                        {NotifSpec(ygdata.Id(NS_A, "a-event")), NotifSpec(ygdata.Id(NS_B, "b-event"))},
+                                        self.on_synced)
+        dev.declare_notif_subscriptions("every", lambda ev, err: self.on_event("every", ev, err),
+                                        {NotifSpec()}, self.on_synced)
+        declared(0)
+
+    start(0)
+
+
+actor _test_declarations_follow_the_extra_adapter(t: testing.EnvT):
+    """A subscription and an event subscription for the extra adapter's
+    module, declared before the device has the extra adapter, go to the
+    primary. They move to the extra adapter when it connects, and back to the
+    primary when it is removed."""
+    dev = _device(t, "follow", [])
+    var synced: dict[str, int] = {}
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_tree(tree: ?ygdata.Node, err: ?Exception):
+        pass
+
+    def on_event(ev: ?NotifEvent, err: ?Exception):
+        pass
+
+    def on_synced(owner: str):
+        synced[owner] = synced.get_def(owner, 0) + 1
+
+    def wait_requests(n: int, label: str, mock: proc() -> ?MockAdapter, want: list[str], then: proc() -> None):
+        if done:
+            return
+        m = mock()
+        got = sorted(m.requests()) if m is not None else []
+        if got != want:
+            if n > 200:
+                fail("{label}: requests {got}, want {want}")
+                return
+            after 0.01: wait_requests(n + 1, label, mock, want, then)
+            return
+        then()
+
+    def primary() -> ?MockAdapter:
+        return _mock(dev.get_adapter())
+
+    def extra() -> ?MockAdapter:
+        a = dev.get_extra_adapter("b")
+        if a is not None:
+            return _mock(a)
+        return None
+
+    def finish(n: int):
+        # synced once for each adapter the declarations went to.
+        if done:
+            return
+        if synced.get_def("sub", 0) != 3 or synced.get_def("notif", 0) != 3:
+            if n > 200:
+                fail("synced: {synced}")
+                return
+            after 0.01: finish(n + 1)
+            return
+        done = True
+        t.success()
+
+    def removed():
+        wait_requests(0, "back on the primary", primary,
+                      ["notif notif b-event", "subscribe sub b-top"], lambda: finish(0))
+
+    def moved():
+        wait_requests(0, "off the primary", primary, ["unnotif notif", "unsubscribe sub"], remove_extra)
+
+    def remove_extra():
+        primary()!.clear_requests()
+        dev.set_dmc(_dmc("follow", []))
+        removed()
+
+    def add_extra():
+        primary()!.clear_requests()
+        dev.set_dmc(_dmc("follow", ["b"]))
+        wait_requests(0, "on the extra adapter", extra,
+                      ["notif notif b-event", "subscribe sub b-top"], moved)
+
+    def start(n: int):
+        if done:
+            return
+        if not _has_modules(dev, ["mod-a"]):
+            if n > 200:
+                fail("the primary did not connect")
+                return
+            after 0.01: start(n + 1)
+            return
+        primary()!.clear_requests()
+        dev.declare_subscriptions("sub", lambda tree, err: self.on_tree(tree, err),
+                                  {ygdata.SubscriptionSpec(_filter([(NS_B, "b-top")]), period=1.0)},
+                                  self.on_synced)
+        dev.declare_notif_subscriptions("notif", self.on_event, {NotifSpec(ygdata.Id(NS_B, "b-event"))},
+                                        self.on_synced)
+        wait_requests(0, "on the primary", primary, ["notif notif b-event", "subscribe sub b-top"], add_extra)
+
+    start(0)
+
+
+actor _test_adapter_oper(t: testing.EnvT):
+    """state/adapter lists the adapters of the device and whether each is
+    connected. A removed extra adapter leaves the list."""
+    dev = _device(t, "oper", ["b"])
+    var adapters: list[str] = []
+    var removed = False
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_oper(n: ?ygdata.Node):
+        if done or n is None:
+            return
+        entries = []
+        for e in swdevoper.stratoweave_rfs__device_entry.from_gdata(n!).state.adapter:
+            c = e.connected
+            connected = "no"
+            if c is not None and c:
+                connected = "yes"
+            entries.append("{e.type}={connected}")
+        adapters = sorted(entries)
+        if not removed and adapters == ["a=yes", "b=yes"]:
+            removed = True
+            dev.set_dmc(_dmc("oper", []))
+        elif removed and adapters == ["a=yes"]:
+            done = True
+            t.success()
+
+    def timeout():
+        fail("state/adapter: {adapters}")
+
+    dev.set_update_oper(on_oper)
+    after 2: timeout()
+
+
+actor _test_extra_adapter_dmc(t: testing.EnvT):
+    """The device meta configuration an extra adapter gets: its own device
+    type, the chosen address without the primary's port, and its own
+    credentials when it has them."""
+    dmc = DeviceMetaConfig("d", Credentials("netconf", "secret1"), type="a",
+                           address=[Address("mgmt", "10.0.0.1", u64(830)), Address("oob", "192.168.0.5")])
+    cases = [
+        ("the defaults", ExtraAdapter("b"), "b 10.0.0.1:- netconf"),
+        ("a port", ExtraAdapter("b", port=u64(22)), "b 10.0.0.1:22 netconf"),
+        ("an address and credentials", ExtraAdapter("b", address="oob", credentials=ExtraCredentials("cli", "secret2")), "b 192.168.0.5:- cli"),
+    ]
+    for label, extra, want in cases:
+        view = swdev.extra_adapter_dmc(dmc, extra)
+        addrs = list(view.address)
+        got = "{view.type} none {view.credentials.username}"
+        if len(addrs) == 1:
+            p = addrs[0].port
+            port = "-"
+            if p is not None:
+                port = str(p)
+            got = "{view.type} {addrs[0].address}:{port} {view.credentials.username}"
+        testing.assertEqual(got, want, label)
+    # The device's own configuration is unchanged.
+    testing.assertEqual(dmc.type, "a")
+    testing.assertEqual(list(dmc.address)[0].port, u64(830))
+    t.success()
+
+
+actor _test_netconf_primary_with_mock_extra(t: testing.EnvT):
+    """The NETCONF mock server as primary and a MockAdapter as extra adapter:
+    a get across both merges their data, and each RPC reaches the adapter of
+    its module."""
+    types = {"netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter, src_dnode=yang.compile([MODEL_A])),
+             "b": swdev.DeviceType("b", _no_adapter, yang.compile([MODEL_B]))}
+    dev = swdev.DeviceMgr(types, None, "netconf-and-mock", t.log_handler, lambda n: None, swdev.SchemaRegistry())
+    dmc = fixture.make_netconf_mock_dmc("netconf-and-mock")
+    dmc.extra_adapter.create("b")
+    dev.set_dmc(dmc)
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def after_rpcs(b: MockAdapter):
+        got = b.requests()
+        if got != ["get b-top", "rpc b-rpc"]:
+            fail("extra adapter requests: {got}")
+            return
+        done = True
+        t.success()
+
+    def on_get(b: MockAdapter, tree: ?ygdata.Node, err: ?Exception):
+        if err is not None:
+            fail("get: {err}")
+            return
+        got = _tops(tree)
+        if got != "a-top,b-top":
+            fail("get: {got}")
+            return
+        x = tree!.get_cnt(ygdata.Id(NS_A, "a-top")).get_opt_str(ygdata.Id(NS_A, "x"))
+        if x != "over-netconf":
+            fail("NETCONF data: {x}")
+            return
+
+        def on_netconf_rpc(reply: ?ygdata.Node, err: ?Exception):
+            # The mock server does not implement a-rpc; any answer shows that
+            # the RPC went to NETCONF and not to the extra adapter.
+            dev.rpc(lambda r, e: self.after_rpcs(b), ygdata.Container({ygdata.Id(NS_B, "b-rpc"): ygdata.Container({})}))
+
+        dev.rpc(on_netconf_rpc, ygdata.Container({ygdata.Id(NS_A, "a-rpc"): ygdata.Container({})}))
+
+    def start(n: int):
+        if done:
+            return
+        if not _has_modules(dev, ["mod-a", "mod-b"]):
+            if n > 300:
+                fail("the adapters did not connect")
+                return
+            after 0.01: start(n + 1)
+            return
+        primary = dev.get_adapter()
+        if isinstance(primary, swna.NetconfAdapter):
+            primary.get_mock_server()!.set_oper_ds(_data(NS_A, "a-top", "over-netconf"))
+        else:
+            fail("the primary is not the NETCONF adapter")
+            return
+        b = _mock(dev.get_extra_adapter("b"))
+        b.set_data(_data(NS_B, "b-top", "from-b"))
+        b.clear_requests()
+        dev.get(lambda tree, err: self.on_get(b, tree, err),
+                _filter([(NS_A, "a-top"), (NS_B, "b-top")]))
+
+    start(0)
