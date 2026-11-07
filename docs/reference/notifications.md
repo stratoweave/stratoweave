@@ -119,6 +119,25 @@ stream)` delivers synthetic events with the same matching rules the real
 driver uses, and the NETCONF mock server's `emit_event(...)` exercises the
 full wire path.
 
+## Watching notifications with ncurl
+
+`ncurl notifications` subscribes through a `DeviceMgr` the way a transform
+does, and prints each notification as it arrives. Without
+`--notification` it prints all of them, which shows what a device sends and
+on which channel:
+
+```sh
+out/bin/ncurl --host router notifications
+out/bin/ncurl --host router notifications --notification ietf-netconf-notifications:netconf-config-change
+out/bin/ncurl --host router notifications --stream snmpevents --format raw
+```
+
+A notification is named `module:name`. The line on stderr says how the
+adapter subscribed, for example
+`create-subscription stream=NETCONF (dedicated session, active)`.
+`--count` stops after that many notifications, and `--yang-dir` decodes them
+with local YANG files instead of downloaded schemas, as for `ncurl monitor`.
+
 ## Emitting notifications northbound
 
 StratoWeave's own NETCONF server serves RFC 5277 `create-subscription` and
