@@ -179,6 +179,36 @@ connection that can never come up.
 The northbound NETCONF server has its own equivalent settings, configured as
 system settings rather than as intent; see [Running StratoWeave](run.md).
 
+## Extra adapters
+
+A device can run more adapters beside the adapter of its device type, for what
+that adapter does not have. For example, a C8000V has no verify RPC over
+NETCONF, and a CLI adapter can give it. An extra adapter is a device type too,
+and the device entry lists it in `extra-adapter`:
+
+```acton title="src/sorespo/cfs.act"
+cli = dev.extra_adapter.create("CiscoIosXe_cli")
+cli.port = u64(22)
+```
+
+Each adapter reports the modules it serves. A module belongs to the first
+adapter that has it: the adapter of the device type, then the extra adapters
+in their order. Oper reads, subscriptions, RPCs and event notification
+subscriptions go to the adapters of the modules that their top-level nodes
+name. A module that no adapter has goes to the adapter of the device type, and
+so does all configuration.
+
+An extra adapter connects to the address that its `address` leaf names, or to
+the first address. It uses its own `port`, or its default port when `port` is
+not set: the port of the address is for the adapter of the device type. Its
+`credentials`, when set, replace the device's. `state/adapter` shows whether
+each adapter is connected.
+
+An adapter runs as an extra adapter when it reports its device type with its
+modules, `dev.on_connect(modules, schema_key, dmc.type)`, and a lost
+connection with `dev.on_disconnect(dmc.type)`. A report without the device type
+is the one of the adapter of the device type.
+
 ## Device logs
 
 Every device writes its own log file, `devices/<name>.log` in the log

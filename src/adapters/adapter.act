@@ -649,14 +649,10 @@ class MockAdapter(DeviceAdapter):
         return self._driver.get(cb, filt)
 
     def declare_subscriptions(self, owner_id: str, cb: proc(?ygdata.Node, ?Exception) -> None, want: set[ygdata.SubscriptionSpec], synced: ?action(str) -> None=None):
-        # TODO: can / should subscriptions do something on a MockAdapter ?
-        cb(None, NotConnectedError())
-        s = synced
-        if s is not None:
-            s(owner_id)
+        self._driver.declare_subscriptions(owner_id, cb, want, synced)
 
     def remove_subscriptions(self, owner_id: str):
-        pass
+        self._driver.remove_subscriptions(owner_id)
 
     def declare_notif_subscriptions(self, owner_id: str, cb: action(?NotifEvent, ?Exception) -> None, want: set[NotifSpec], synced: ?action(str) -> None=None):
         self._driver.declare_notif_subscriptions(owner_id, cb, want, synced)
@@ -674,6 +670,36 @@ class MockAdapter(DeviceAdapter):
         element."""
         self._driver.inject_notif(name, payload, stream)
 
+    def set_data(self, tree: ?ygdata.Node) -> None:
+        """Test hook: set the device data that get and subscriptions serve."""
+        self._driver.set_data(tree)
+
+    proc def requests(self) -> list[str]:
+        """Test hook: the last requests, one line each, like
+        "get a-top,b-top" or "rpc a-rpc"."""
+        return self._driver.get_requests()
+
+    def clear_requests(self) -> None:
+        """Test hook: forget the requests so far."""
+        self._driver.clear_requests()
+
+
+def _filter_names(filt: ?ygdata.FNode) -> str:
+    """Give the names of the top-level nodes of a filter, sorted, or "*" for
+    no filter."""
+    if filt is not None:
+        name = filt.name
+        if name is not None:
+            return name.name
+        names = []
+        for c in filt.children:
+            cn = c.name
+            if cn is not None:
+                names.append(cn.name)
+        return ",".join(sorted(names))
+    return "*"
+
+
 actor MockDriver(on_connect: action(dict[str, ModCap], ?SchemaKey) -> None, bundled_schema: DeviceSchema, log_handler: logging.Handler, env: ?Env):
     _log = logging.Logger(log_handler)
     _log.info("MockDriver starting up")
@@ -684,7 +710,37 @@ actor MockDriver(on_connect: action(dict[str, ModCap], ?SchemaKey) -> None, bund
     var conn_state: int = DISCONNECTED
     var running_conf: ?ygdata.Node = None
 
+    # Test hooks: the device data that get and subscriptions serve, and the
+    # last REQUESTS_KEPT requests.
+    var data: ?ygdata.Node = None
+    var requests: list[str] = []
+    REQUESTS_KEPT = 50
+
     NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
+
+    def set_data(tree: ?ygdata.Node) -> None:
+        data = tree
+
+    def get_requests() -> list[str]:
+        return list(requests)
+
+    def clear_requests() -> None:
+        requests = []
+
+    def _record(request: str) -> None:
+        requests.append(request)
+        if len(requests) > REQUESTS_KEPT:
+            del requests[0]
+
+    def _select(filt: ?ygdata.FNode) -> ygdata.Node:
+        """The device data that filt selects, an empty tree when it selects
+        nothing."""
+        d = data
+        if d is not None:
+            selected = ygdata.filter(d, filt)
+            if selected is not None:
+                return selected
+        return ygdata.Container({})
 
     # The bundled schema is the device's baseline module inventory; advertise it
     # so enabling mock connects without listing modules by hand. The mock/module
@@ -740,24 +796,50 @@ actor MockDriver(on_connect: action(dict[str, ModCap], ?SchemaKey) -> None, bund
         return running_conf
 
     def rpc(cb: action(?ygdata.Node, ?Exception) -> None, gdata_rpc: ygdata.Node) -> None:
+        _record("rpc " + ",".join(sorted([k.name for k in gdata_rpc.children.keys()])))
         cb(ygdata.Container({}), None)
 
     def rpc_xml(cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node) -> None:
+        _record("rpc_xml " + xml_rpc.tag)
         # The same answer rpc() gives, written as XML: accepted, nothing returned.
         cb(xml.Node("rpc-reply", [(None, NS_NC_1_0)], children=[xml.Node("ok")]), None)
 
     def get(cb: action(?ygdata.Node, ?Exception) -> None, filt: ?ygdata.FNode=None) -> None:
-        # The mock driver keeps no device data.
-        cb(ygdata.Container({}), None)
+        _record("get " + _filter_names(filt))
+        cb(_select(filt), None)
+
+    def declare_subscriptions(owner_id: str, cb: proc(?ygdata.Node, ?Exception) -> None, want: set[ygdata.SubscriptionSpec], synced: ?action(str) -> None=None) -> None:
+        """Deliver the data that the specs select once, then call synced.
+        Without data, report that there is no connection, as a device that
+        cannot be read."""
+        _record("subscribe {owner_id} " + ",".join(sorted([_filter_names(s.filt) for s in want])))
+        if data is not None:
+            tree: ?ygdata.Node = ygdata.Container({})
+            for spec in want:
+                tree = ygdata.patch(tree, _select(spec.filt))
+            cb(tree, None)
+        else:
+            cb(None, NotConnectedError())
+        if synced is not None:
+            synced(owner_id)
+
+    def remove_subscriptions(owner_id: str) -> None:
+        _record("unsubscribe {owner_id}")
 
     var notif_owners: dict[str, NotifOwner] = {}
 
     def declare_notif_subscriptions(owner_id: str, cb: action(?NotifEvent, ?Exception) -> None, want: set[NotifSpec], synced: ?action(str) -> None=None) -> None:
+        names = []
+        for spec in want:
+            n = spec.name
+            names.append(n.name if n is not None else "*")
+        _record("notif {owner_id} " + ",".join(sorted(names)))
         notif_owners[owner_id] = NotifOwner(cb, want)
         if synced is not None:
             synced(owner_id)
 
     def remove_notif_subscriptions(owner_id: str) -> None:
+        _record("unnotif {owner_id}")
         if owner_id in notif_owners:
             del notif_owners[owner_id]
 
