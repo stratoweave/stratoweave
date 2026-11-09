@@ -3,22 +3,20 @@
 ## Unreleased
 
 ### Core
-- Transform actors can write to the layer below at any time, each write in
-  its own transaction. Enable it with `sw:direct-output` under
-  `sw:transform`, and keep the transform function mute, or the output is
-  repeated. `fleetmgr.cfs.UpgradeCampaignTransform` is an example. A write
-  takes the transform's lock, is replayed after a conflicting commit, and is
-  stored as the transform's output. [#698] [#731]
+- Transform actors can write their output to the layer below at any time
+  with `write_output`, each write in its own transaction. Enable it with
+  `sw:direct-output` under `sw:transform`. The transform function should
+  then return an empty output, or the output is repeated. A write is
+  replayed after a conflicting commit. `fleetmgr.cfs.UpgradeCampaignTransform`
+  is an example. [#698] [#731]
 - A transform's output replaces the configuration it wrote before, instead of
-  being applied as a diff. This fixes source deletion, concurrent edits,
-  restored list membership and subscriptions on newly committed list
-  elements. [#680]
-- List elements and container children that are unchanged don't participate
-  in a full configuration replacement, like a transform's output. They get no
-  transaction, persistence write, lock or commit, and their transforms don't
-  run. Unchanged means the same node as in the last replacement committed
-  from that source, so an equal value in a new node participates, and so
-  does every element in the first replacement after a restart. [#731]
+  being applied as a diff. Fixed source deletion, concurrent edits, restored
+  list membership and subscriptions on newly committed list elements. [#680]
+- A full configuration replacement, like a transform's output, skips list
+  elements and container children that are the same node as in the last
+  replacement committed from that source. They get no transaction, lock or
+  commit, and their transforms don't run. An equal value in a newly built
+  node is not skipped. [#731]
 - A session commit reports `done` and `complete` only after every transform
   below it has committed. Before, a link subscriber could commit without its
   linked input. [#685]
@@ -27,15 +25,19 @@
 - Optional parameters declare explicit defaults, which newer Acton versions
   require. The transform generator emits them too.
 - Child processes, environment variables and stdin go through the `Env`
-  services: `env.process`, `env.vars` and `env.stdio`. [#704]
+  services `env.process`, `env.vars` and `env.stdio`. [#704]
 - Fixed the etcd store leaving a request without a result when etcd answers
   with an HTTP error whose body is not UTF-8. [#724]
+- Fixed subscription data running in the actor of the device adapter or TTT
+  layer that delivered it, when the consumer passed its own actor method.
+  `declare_subscriptions()` of `DeviceMgr`, `ttt.Layer` and
+  `adapters.adapter.DeviceAdapter` takes the data callback, and the layer's
+  `delta`, as an action instead of a proc. [#763]
 
 ### Northbound APIs
 - Fixed NETCONF `<get-config>` returning the operational state published by
   transforms. [#683]
-- RESTCONF supports the `content` query parameter on GET, which RFC 8040
-  requires. [#686]
+- RESTCONF supports the `content` query parameter on GET. [#686]
 - Fixed RESTCONF GET, NETCONF `<get>` and yang-push filters that could not
   reach an operational subtree under a config node, like
   `/software:software/upgrade-campaign=foo/state` in fleetmgr. [#677] [#681]
@@ -46,49 +48,95 @@
   still indented. [#684]
 - The `/layer/<idx>` inspection endpoint takes the same `content` query
   parameter, so it can return a layer's operational state too. [#736]
-- The NETCONF server serves the YANG library, `/yang-library` and
+- The NETCONF server serves the YANG library at `/yang-library` and
   `/modules-state`. Besides the modules of the CFS schema, it lists
-  ietf-subscribed-notifications and ietf-yang-push as implemented, with
-  their features `subtree`, `xpath` and `on-change`. The `<hello>` has one
+  ietf-subscribed-notifications and ietf-yang-push as implemented, with the
+  features `subtree`, `xpath` and `on-change`. The `<hello>` has one
   `yang-library:1.1` capability instead of a capability per module.
-  RESTCONF serves `/modules-state` too, which RFC 8040 requires. [#716]
+  RESTCONF serves `/modules-state` too. [#716]
+- The NETCONF server serves RFC 5277 `create-subscription` and advertises the
+  `:notification` and `:interleave` capabilities. Application code sends a
+  notification to the subscribed sessions with `publish()` on
+  `NetconfServer.event_hub()`. There is no replay yet, and a session with an
+  RFC 5277 subscription cannot also hold RFC 8639 subscriptions. [#752]
+- The `/device/<name>/modules` and `/device/<name>/info` inspection endpoints
+  give the adapter of each module. [#756]
 
 ### Devices & Adapters
-- New SNMP device adapters, built from MIBs. The system generator translates
-  the MIBs to YANG and generates Acton types and subscription paths from
-  them. Transforms choose the polling period, and the SNMPv2c adapter uses
-  `credentials/password` as the community. Mini has an example `ietf_snmp`
-  device type with SNMPv2-MIB and IF-MIB. See the SNMP devices reference.
-  [#701]
+- SNMP device adapters are generated from MIBs. The system generator
+  translates the MIBs to YANG and generates Acton types and subscription
+  paths from them. Transforms choose the polling period, and the SNMPv2c
+  adapter uses `credentials/password` as the community. Mini has an example
+  `ietf_snmp` device type with SNMPv2-MIB and IF-MIB. See the SNMP devices
+  reference. [#701]
 - Device and software adapters get the `Env` instead of a `TCPConnectCap`, so
   they can use other transports, like UDP for SNMP, or start subprocesses.
   [#702]
 - Each device publishes its operating system family, release, chassis model
   and serial number under `state/platform`. A platform probe reads them on
-  every connect and after a software install. StratoWeave comes with probes
-  for IOS XE, IOS XR, Junos, SR Linux, SR OS and ArcOS, and an app sets its
-  probes with `platform_probes` in its `device_types.act`. See the device
-  platform reference. [#712] [#717]
-- A device without yang-library or netconf-monitoring also gets its other
-  hello capabilities in its module set, named by their URI, but not the
-  NETCONF protocol ones. Before, a Junos from before YANG, like 10.4, had an
-  empty module set, so no platform probe applied and transforms computed
-  nothing for it. The Junos probe applies on its
-  `http://xml.juniper.net/netconf/junos/1.0` capability. [#721]
+  every connect and after a software install. There are probes for IOS XE,
+  IOS XR, Junos, SR Linux, SR OS and ArcOS, and an app sets its probes with
+  `platform_probes` in its `device_types.act`. See the device platform
+  reference. [#712] [#717]
+- Transforms can subscribe to a device's YANG event notifications with
+  `declare_notif_subscriptions()` on the `DeviceMgr`, naming them in
+  `NotifSpec`s. Each `NotifEvent` carries the event time, the payload decoded
+  against the device schema and the raw XML. The NETCONF adapter uses RFC 8639
+  `establish-subscription` on the main session where the device supports it,
+  and otherwise an RFC 5277 subscription on a session of its own. Delivery is
+  at most once, with no replay. Pass a `synced` action to learn when the
+  subscriptions are in place, before sending an RPC whose result arrives as
+  an event. See the event notifications reference. [#752]
+- `ncurl notifications` prints the event notifications a device sends, all of
+  them or those named with `--notification module:name`, and how the adapter
+  subscribed to them. [#752]
+- When a device advertises `ietf-netconf-notifications` (RFC 6470), the
+  `DeviceMgr` subscribes to `netconf-config-change` and resyncs the device's
+  running configuration when one arrives. A change made outside StratoWeave
+  is found without waiting for a reconnect. StratoWeave's own commits cause
+  a resync too, because the `DeviceMgr` does not check `changed-by`. [#753]
+- `adapters.iosxe_cli.IosXeCliAdapter` runs IOS XE exec commands over SSH
+  and returns the results in the `stratoweave-iosxe-cli` YANG module: the
+  files on a file system from `dir`, the release, model, serial number and
+  boot image from `show version`, and a `checksum` RPC that runs
+  `verify /md5` or `verify /sha512`. Image staging needs the checksum on
+  releases without the verify YANG RPC, like IOS XE 17.18 on the C8000V.
+  The adapter does not configure the device and has no subscriptions. After
+  a failed login it reports the connection as lost and tries again later. A
+  device type that uses it adds `adapters.iosxe_cli_yang.models` to its
+  schema. [#755] [#765]
+- A device can run extra adapters beside the adapter of its device type, for
+  what that adapter does not have, like a CLI adapter for an RPC that the
+  device lacks over NETCONF. An extra adapter is a device type too, listed in
+  the device's `extra-adapter` list with an optional `address`, `port` and
+  `credentials`. Without a `port` it uses its own default port, not the port
+  of the address. A module belongs to the first adapter that has it, the
+  adapter of the device type first. Gets, subscriptions, RPCs and event
+  notification subscriptions go to the adapters of the modules that their
+  top-level nodes name, and configuration goes only to the adapter of the
+  device type. `state/adapter` shows whether each adapter is connected. An
+  adapter runs as an extra adapter when it passes its device type to the
+  `DeviceMgr`'s `on_connect()` and `on_disconnect()`, as the NETCONF, SNMP
+  and IOS XE CLI adapters do. See the device management reference. [#756]
+  [#765]
+- Fixed devices without yang-library or netconf-monitoring, like Junos 10.4,
+  getting an empty module set, so transforms computed nothing for them.
+  Their module set has the other capabilities of their `<hello>`, named by
+  URI, except the NETCONF protocol ones. The Junos platform probe applies on
+  the `http://xml.juniper.net/netconf/junos/1.0` capability. [#721]
 - The NETCONF adapter fails a get whose filter names a node that the device
   schema lacks, with `Filter node <path> not found in device schema`. Before,
   those nodes were dropped from the reply without an error. [#712]
-- `ncurl` takes `--ssh-key-exchange`, `--ssh-host-key-algorithm`,
-  `--ssh-cipher` and `--ssh-mac`, each repeatable, for devices that only
-  offer old SSH algorithms, like Junos 10.4. Its new `platform` command
-  prints the platform the probes read. The default port is 830 instead of
-  42830, and without `--password` it asks for the password instead of using
-  `admin`. [#717] [#720]
-- The NETCONF adapter connects again after refused credentials, an untrusted
-  host key or no SSH algorithm in common once a minute instead of every
-  second. Retrying sooner piles up failed logins, which some devices count
-  towards locking the account. A change of the device's settings connects
-  at once. [#720]
+- `ncurl` takes the repeatable `--ssh-key-exchange`,
+  `--ssh-host-key-algorithm`, `--ssh-cipher` and `--ssh-mac` options for
+  devices that only offer old SSH algorithms, like Junos 10.4. Its new
+  `platform` command prints the platform the probes read. The default port
+  is 830 instead of 42830, and without `--password` it prompts for the
+  password instead of using `admin`. [#717] [#720]
+- After refused credentials, an untrusted host key or no common SSH
+  algorithm, the NETCONF adapter tries to connect again once a minute
+  instead of every second. Repeated failed logins can lock the account on
+  some devices. A change to the device's settings connects at once. [#720]
 - Fixed NETCONF RPCs to Junos 10.4 waiting until their timeout. Its replies
   carry `xmlns` twice, which is not valid XML. The NETCONF client drops the
   repeated attribute with the new `duplicate-attributes` fixup. [#719]
@@ -98,6 +146,12 @@
 - Fixed the mock NETCONF server keeping a session's yang-push subscriptions
   after the session ended. Every client restart added another set of
   updates. [#692]
+- Fixed a transform's subscriptions to a device being lost when they were
+  declared before the `DeviceMgr` had its adapter, for example when the
+  device and the transform's input are written in one transaction. The
+  `DeviceMgr` passes them on to the adapter it gets later. In Fleet Manager,
+  a campaign could keep upgraded devices pending because the top never
+  subscribed to their flotilla. [#747]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
@@ -106,6 +160,10 @@
   `stratoweave-images` module adds an image list, `/images/image`. Add
   `swyang.images` to the top layer to use it. The list and the folder are not
   kept in sync yet. [#703]
+- An image in `/images/image` has a `family`, like `c8000v-universalk9`, and
+  a `default` flag. A family has at most one default image.
+  `/images/url-base` says where devices fetch the images from: an image's URL
+  is `url-base` followed by the image name. [#742] [#743]
 - The device software state has two new leaves: `stage`, the step the
   run is in or ended in, and `reason`, set when a run fails or rolls back.
   The IOS XE adapter takes `reason` from the `txn-sub-state` of the failed
@@ -114,57 +172,49 @@
   mock failures use it: with `bgp-down` the pre-check refuses the install, and
   with `bgp-lost` the post-check fails and the device rolls back. [#667]
   [#678]
-- The release a device runs is only in `state/platform/version`, and the
-  device software state has no `running-release`. The platform is read
-  again when an install ends: after a success, after a rollback, also a
-  failed one, and when the device runs another release than the target
-  after the commit. [#718]
-- A mock device sets the platform that the IOS XE mock reports under
-  `mock/platform`: `version`, the release it runs before an upgrade, and
-  `model` and `serial-number`. Without them it runs 17.18.02 on a C8000V.
-  `version` replaces `mock/software/running-release`. The mock reports a
-  release the way a device does, 17.18.02 as 17.18.2, before and after an
-  install. [#718]
+- Removed `running-release` from the device software state. The release a
+  device runs is in `state/platform/version`, which is read again when a
+  software install ends, also after a rollback. [#718]
+- Mock devices set the platform that the IOS XE mock reports under
+  `mock/platform`: `version`, the release before an upgrade, `model` and
+  `serial-number`. Without them a mock runs 17.18.02 on a C8000V.
+  `mock/platform/version` replaces `mock/software/running-release`. The mock
+  reports a release the way a device does, 17.18.02 as 17.18.2. [#718]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
   stage and failure reason, and the web UI draws each run as a chain of
   steps. How long the checks wait is set per device under `upgrade-checks`.
   [#667] [#669] [#678] [#700]
-- Replanning a campaign keeps released devices at their real times and places
-  only the waiting ones again. Before, done and in-flight devices moved to
-  the time of the replan. A window that is already open is planned with the
-  time it has left, instead of counting the devices that don't fit as late.
-  [#672]
-- A campaign is paced by how many devices upgrade at the same time,
+- Fixed replanning a campaign moving done and in-flight devices to the time
+  of the replan. Released devices keep their real times, and only the
+  waiting ones are placed again. A window that is already open is planned
+  with the time it has left, instead of counting the devices that don't fit
+  as late. [#672]
+- Campaigns are paced by how many devices upgrade at the same time, with
   `target-concurrency` and `max-concurrency`, instead of `target-rate` and
   `max-rate` in devices per hour. With rates, slower upgrades put more
-  devices in flight, which overloaded the system further. The web UI edits
-  them as "At once" and "Max at once". [#723]
+  devices in flight, which overloaded the system further. [#723]
 - Fixed campaigns that never ended after a window of a schedule opened again
   while its earlier window still held released devices. The waiting devices
   were placed in both windows and counted twice. [#722]
-- The release decisions of a campaign are in the
-  `stratoweave.fleet_ctl.Controller` class instead of the campaign actor. The
-  controller has no clock and no I/O, so `test_fleet_ctl` runs it on times of
-  its own, without an actor. The move doesn't change the decisions. [#725]
+- The release decisions of a campaign moved from the campaign actor into the
+  `stratoweave.fleet_ctl.Controller` class. The controller has no clock and
+  no I/O, so `test_fleet_ctl` runs it without an actor. The move doesn't
+  change the decisions. [#725]
 - Removed the `stratoweave.fleet_sched` module. Its helpers moved into
   `stratoweave.fleet_ctl`, and the campaign simulator
-  `stratoweave.fleet_sched_sim` is now `stratoweave.fleet_ctl_sim`. The YANG
-  descriptions of `/device/software` no longer describe scheduler behavior
-  that never existed. Its input comes from an upgrade campaign or an
-  operator. [#740]
-- A campaign's plan is what its run does: the controller that releases the
-  devices makes the plan by running ahead at the expected upgrade durations.
-  Before, a campaign could plan without alarms and alarm as soon as it ran,
-  most of all in fleets that mix fast and slow devices. A window takes the
-  devices that the ramp starts before it closes, each device keeps the
-  window its plan gives it, and a device that misses its window moves to the
-  next one of its schedule. The controller goes above `target-concurrency`
-  only as far as those windows or the deadline need, up to
-  `max-concurrency`, which now counts the devices of the whole campaign. The
-  alarms name the devices. A window that opened on an earlier day and is
-  still open now counts. [#730]
+  `stratoweave.fleet_sched_sim` is now `stratoweave.fleet_ctl_sim`. [#740]
+- A campaign's plan comes from the controller that releases the devices, run
+  ahead at the expected upgrade durations. Before, a campaign could plan
+  without alarms and raise alarms as soon as it ran, especially in fleets
+  that mix fast and slow devices. Each device keeps the window its plan
+  gives it, and a device that misses its window moves to the next window of
+  its schedule. The controller goes above `target-concurrency`, up to
+  `max-concurrency`, only when the windows or the deadline need it.
+  `max-concurrency` counts the devices of the whole campaign. Plan alarms
+  name the affected devices. A window that opened on an earlier day and is
+  still open is used too. [#730]
 - Devices can be members of redundancy groups, set under
   `/fleet/device/redundancy-group` with a `redundancy-priority`. A
   campaign upgrades the members of a group one at a time, lower priority
@@ -177,11 +227,10 @@
   windows but wait until it reports a success, or an operator takes it out
   of the group or the campaign. The plan's alarms name the devices that
   wait. [#740]
-- A device that reports a final status before the campaign releases it, for
-  example one that already runs the target release, no longer counts as an
-  upgrade that took no time. Before, a few such devices made the campaign
-  expect every upgrade to take seconds, and the plan put every device in the
-  first windows. [#740]
+- Fixed upgrade duration estimates being reduced by devices that already
+  run the target release. These devices could cause the campaign to
+  underestimate upgrade times and schedule too many devices in the first
+  windows. [#740]
 - A campaign no longer raises its concurrency for good when a device
   reports a few seconds late or upgrade times scatter around the estimate.
   The expected pace is the mean of the last upgrades, a round and a
@@ -211,57 +260,78 @@
   concurrency, so a larger campaign starts faster. Before, a window that
   opened with room for many devices started them all in the same second.
   [#748]
-- A campaign decision in which only devices start takes the last plan
-  again instead of planning anew, while nothing came in and no device is
-  due. [#748]
-- A campaign plan looks only at the devices due next at each step ahead,
-  not at every device in flight. A plan that steps ahead often, as when
-  devices start and end at many different times, takes seconds instead of
-  minutes at 100,000 devices. [#748]
+- Campaign plans are computed faster. The first plan for 100,000 devices
+  takes seconds instead of minutes, and a decision that only starts devices
+  reuses the last plan while no report came in, no device is due and no
+  window opens or closes. [#748]
 - Each `/fleet/device` has the platform that its flotilla reads from the
-  device under `state/platform`: `os`, `version`, `model` and
-  `serial-number`. It is absent until the device has connected. A
-  campaign's `device-status` has each member's `version` and `model`
-  instead of `running-release`. The web UI shows the platform on the
-  devices and device pages, and each member's model and version on the
-  campaign page. The devices page filters by model. The demo fleets mix ten
-  IOS XE models. [#718]
+  device under `state/platform`, absent until the device has connected. A
+  campaign's `device-status` has each member's `version` and `model` instead
+  of `running-release`. The web UI shows the platform on the devices, device
+  and campaign pages, and the devices page filters by model. [#718]
 - The top always starts ten flotillas and places each device on `flotilla-N`
   by a hash of its name. Removed `/fleet/node` and `/fleet/device/shard`.
   Devices without a shard, which the top managed itself, are no longer
   supported. [#713]
-- The web UI has image pages. Drop image files on them to upload them. OS and
-  version are filled in from IOS XE file names. Deleting an image also
-  deletes its file. [#709]
-- The web UI has a Config page, which shows the top's configuration, the
-  state its transforms publish or both, as XML, JSON or AData. On the Apply
-  config page, JSON or XML configuration that is typed, pasted or dropped as
-  a file is merged into the running system with a RESTCONF PATCH, after a
-  confirmation. [#736]
+- Campaigns select an `image` for each device instead of setting one
+  `target-release` and `image-url` for the whole campaign. Images must be
+  listed under `/images/image` with a `version`. The campaign does not
+  configure an upgrade for a device if its image is missing from the list
+  or has no version. An alarm identifies the image and how many devices
+  are affected. The campaigns page no longer has a Release column. [#743]
+  [#759]
+- The new campaign page has three steps: pick devices by filtering or from
+  pasted names, pick an image for each model in the selection, and create
+  the campaign, which opens its page to set the schedule and pace. A
+  family's default image is preselected when exactly one default image lists
+  the model. Devices that haven't reported a model are left out, and a model
+  that no image lists prevents campaign creation. [#743]
+- The web UI has image pages. Image files dropped on them are uploaded, with
+  OS, version and family filled in from IOS XE file names. An image can be
+  made the default of its family, and the images page sets the image list's
+  `url-base`. Deleting an image also deletes its file. [#709] [#742] [#743]
+- The web UI has a Config page that shows the top's configuration, the state
+  its transforms publish, or both, as XML, JSON or AData. The Apply config
+  page merges JSON or XML configuration into the running system with a
+  RESTCONF PATCH, after a confirmation. [#736]
 - The web UI has a search, in the header or with Ctrl/⌘+K, that jumps to a
   page, campaign, image, device or schedule by name. [#737]
 - The device page is redesigned around the device's upgrade run. [#674]
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for
   all its devices. [#726]
-- The web UI is clearer, works on narrow screens and has better contrast and
-  accessibility. [#679]
-- The web UI reads less from the server and no longer redraws the timeline
-  every second, which helps with large campaigns. The devices, schedules and
-  new-campaign pages share one fleet read for 30 s, and the Refresh button
-  reloads it. A few UI bugs are fixed. [#671] [#687] [#689]
+- The web UI works on narrow screens and has better contrast and
+  accessibility. The campaign page leads with live progress and failures.
+  [#679]
+- The web UI no longer redraws the timeline every second and reads less from
+  the server. The devices, schedules and new-campaign pages share one fleet
+  read for 30 s, and the Refresh button reloads it. [#671] [#687] [#689]
+- Web UI pages show at once and fill in as their reads arrive, and the
+  sidebar marks the page that is loading. On large fleets the pages read
+  less: the device page reads only the device's own `device-status` entry,
+  a large campaign's page reads its state less often the longer the read
+  takes, and adding, importing, removing or scheduling devices updates the
+  devices list without reading the whole fleet again. Newly added devices
+  show no model or version until the page is loaded again. [#754]
+- Fixed the campaign plan timeline drawing a crowded window past its end.
+  Its columns grow taller instead. [#761]
+- fleetmgr and flotilla run Acton's generational garbage collector. Start
+  them with `ACTON_GC_MODE=ordinary` for the ordinary collector. [#764]
 - Removed the unused `cpe-device` model. The IOS XE device type directory is
   now `dev-iosxe`. [#694]
 - `just demo-all` deploys the CEs, starts the top and loads both campaigns.
   [#690]
 - `just run` starts the top and its ten flotillas with no devices, images or
   campaigns. [#736]
+- The web UI is built with SvelteKit 3, and `just gen-webui` needs Node 22.17
+  or newer. [#739] [#745]
 
 ### Dependencies
 
 #### Acton
 - Requires Acton newer than 0.31.0, for explicit parameter defaults
-  [acton#3211] and the `Env` services [acton#2768].
+  [acton#3211], the `Env` services [acton#2768] and the write barriers of
+  the generational garbage collector [acton#3390].
 
 #### acton-yang
 - gdata is encoded as compact XML and JSON by default, as in the Acton
@@ -282,15 +352,32 @@
 - YANG sources are parsed concurrently, which makes compiling large module
   sets faster. Removed `yang.parse_modules()` and `yang.compile_from_stmt()`,
   which were only needed for the statement cache. [acton-yang#550] [#734]
-- `yang.schema.DRoot.merge()` merges compiled schema roots into one, with
-  the top-level nodes, RPCs, identities and modules of all of them, like the
-  CFS schema and ietf-yang-library that a northbound server serves
-  together. It merges top-level nodes only, and raises `ValueError` when two
-  roots hold the same top-level node or different revisions of a module.
-  [acton-yang#548] [#716]
+- `yang.schema.DRoot.merge()` merges compiled schema roots into one, like the
+  CFS schema and ietf-yang-library that a northbound server serves together.
+  It raises `ValueError` when two roots hold the same top-level node or
+  different revisions of a module. [acton-yang#548] [#716]
 - `take_leaf()` and `take_leaflist()` of the `yang.data.YangData` protocol
   return no `t` type field. gdata keeps a union's value as its Acton type,
   so the field is no longer needed. [acton-yang#553] [#741]
+- The `take_container()`, `take_list()`, `take_leaf()` and `take_leaflist()`
+  methods of `yang.data.YangData` no longer take the node's adata attribute
+  name. The adata generator stores that name in the schema as the new
+  `adata_name` of each node, and `yang.data.from_data()` reads it from there
+  instead of computing it on every call. [acton-yang#552] [#762]
+- Removed `yang.schema.DNode.gname`. [acton-yang#557] [#762]
+- Fixed subscription data callbacks running in the provider's actor.
+  `yang.gdata.Dst` and the data callback of `TreeProvider.declare_subscriptions`
+  take an action again instead of a proc, so a consumer that passes its actor
+  method gets the data in its own actor. A generated `dst()` converts each
+  tree in an actor of its own instead of in the provider. [acton-yang#556]
+  [#758]
+- Fixed XML parser skipping a leaf with an empty tag, like `<k1/>` or
+  `<k1></k1>`. Its normalized value is an empty string. This makes it
+  possible to use the empty string as a key value too. [acton-yang#554]
+  [#744]
+- A `root_path` passed to `yang.data.from_data()` can lead to a notification,
+  top-level or nested in a container, so a notification payload decodes like
+  RPC output. [acton-yang#555] [#751]
 
 #### acton-ssh
 - Fixed SSH events being delivered out of the order libssh raises them.
@@ -309,6 +396,8 @@
   an `OSError` for everything. An `OSError` is left for failures before the
   server's SSH banner, like a refused TCP connect. `Client.on_connect` gets
   an exception instead of a string. [acton-ssh#21] [#720]
+- Stores GC pointers with write barriers, so programs that link it can run
+  in Acton's generational GC mode. [acton-ssh#23] [#764]
 
 #### acton-lmdb
 - Builds with Zig 0.17. [acton-lmdb#6] [#670]
@@ -332,10 +421,18 @@
   [#696]
 - Fixed the build of the multi-arch `ghcr.io/stratoweave/ncurl:latest` image
   on runners with Docker Engine 29. [#735]
+- The notconf tests connect to 127.0.0.1 instead of `localhost`, which macOS
+  resolves to IPv6 first, where Docker's published port does not answer.
+  [#751]
+- Fixed `just system-test` in fleetmgr timing out. It runs each system test
+  once. [#747]
+- The `gc-check` CI job runs the fleetmgr tests with `acton test --gc-check`
+  and the fleetmgr demo for a minute under the GC write-barrier checker.
+  [#764]
 
 ### Compatibility Notes
 - Requires Acton newer than 0.31.0. Regenerate generated code with `make gen`
-  after upgrading. [#704] [#714]
+  after upgrading. [#704] [#714] [#764]
 - `adapter_type` and `software_adapter_type` in a `DeviceType` take `?Env`
   instead of `?net.TCPConnectCap`. Adapters in other repositories, like
   sw-adapter-cisco-ios-cli, need the same change. [#702]
@@ -361,8 +458,13 @@
   from its configuration. [#713]
 - Fleet Manager campaigns take `target-concurrency` and `max-concurrency`
   instead of `target-rate` and `max-rate`. Move configuration that sets the
-  old leaves. A campaign that sets neither now upgrades up to 10 devices at
-  once, and there is no unlimited value. [#723]
+  old leaves. A campaign that sets neither upgrades 10 devices at once and
+  goes up to 50 when its windows or deadline need it. There is no unlimited
+  value. [#723] [#730]
+- Fleet Manager campaigns take an `image` in each `device` entry instead of
+  `target-release` and `image-url`. Add the images to `/images/image`, with
+  their `version`, set `/images/url-base`, and name an image for each member.
+  [#743]
 
 ## [26.10] - 2026-10-23
 
@@ -432,11 +534,32 @@ next. Give it a spin. We’d love to hear what you think.
 [#735]: https://github.com/stratoweave/stratoweave/pull/735
 [#736]: https://github.com/stratoweave/stratoweave/pull/736
 [#737]: https://github.com/stratoweave/stratoweave/pull/737
+[#739]: https://github.com/stratoweave/stratoweave/pull/739
 [#740]: https://github.com/stratoweave/stratoweave/pull/740
 [#741]: https://github.com/stratoweave/stratoweave/pull/741
+[#742]: https://github.com/stratoweave/stratoweave/pull/742
+[#743]: https://github.com/stratoweave/stratoweave/pull/743
+[#744]: https://github.com/stratoweave/stratoweave/pull/744
+[#745]: https://github.com/stratoweave/stratoweave/pull/745
 [#746]: https://github.com/stratoweave/stratoweave/pull/746
+[#747]: https://github.com/stratoweave/stratoweave/pull/747
+[#748]: https://github.com/stratoweave/stratoweave/pull/748
+[#751]: https://github.com/stratoweave/stratoweave/pull/751
+[#752]: https://github.com/stratoweave/stratoweave/pull/752
+[#753]: https://github.com/stratoweave/stratoweave/pull/753
+[#754]: https://github.com/stratoweave/stratoweave/pull/754
+[#755]: https://github.com/stratoweave/stratoweave/pull/755
+[#756]: https://github.com/stratoweave/stratoweave/pull/756
+[#758]: https://github.com/stratoweave/stratoweave/pull/758
+[#759]: https://github.com/stratoweave/stratoweave/pull/759
+[#761]: https://github.com/stratoweave/stratoweave/pull/761
+[#762]: https://github.com/stratoweave/stratoweave/pull/762
+[#763]: https://github.com/stratoweave/stratoweave/pull/763
+[#764]: https://github.com/stratoweave/stratoweave/pull/764
+[#765]: https://github.com/stratoweave/stratoweave/pull/765
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
+[acton#3390]: https://github.com/actonlang/acton/pull/3390
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
 [acton-ssh#6]: https://github.com/actonlang/acton-ssh/pull/6
 [acton-ssh#15]: https://github.com/actonlang/acton-ssh/pull/15
@@ -444,6 +567,7 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-ssh#18]: https://github.com/actonlang/acton-ssh/pull/18
 [acton-ssh#20]: https://github.com/actonlang/acton-ssh/pull/20
 [acton-ssh#21]: https://github.com/actonlang/acton-ssh/pull/21
+[acton-ssh#23]: https://github.com/actonlang/acton-ssh/pull/23
 [acton-yang#541]: https://github.com/stratoweave/acton-yang/pull/541
 [acton-yang#544]: https://github.com/stratoweave/acton-yang/pull/544
 [acton-yang#545]: https://github.com/stratoweave/acton-yang/pull/545
@@ -451,4 +575,9 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-yang#547]: https://github.com/stratoweave/acton-yang/pull/547
 [acton-yang#548]: https://github.com/stratoweave/acton-yang/pull/548
 [acton-yang#550]: https://github.com/stratoweave/acton-yang/pull/550
+[acton-yang#552]: https://github.com/stratoweave/acton-yang/pull/552
 [acton-yang#553]: https://github.com/stratoweave/acton-yang/pull/553
+[acton-yang#554]: https://github.com/stratoweave/acton-yang/pull/554
+[acton-yang#555]: https://github.com/stratoweave/acton-yang/pull/555
+[acton-yang#556]: https://github.com/stratoweave/acton-yang/pull/556
+[acton-yang#557]: https://github.com/stratoweave/acton-yang/pull/557
