@@ -258,11 +258,11 @@ way holding one entry with its keys, with an `Absent` holding its keys
 where a list entry is gone and nothing where a container is gone.
 `gdata.instances` splits a tree into such spines and `gdata.gone` turns
 one into the report of its instance gone. A generated `dst` wraps the
-callback in a lambda that converts the spine to the keys and the
-instance first; the provider calls it, so the conversion runs in the
-provider and no actor stands between provider and consumer. After an owner's first pass the provider
-calls `synced` with the owner id, sent after the data so it arrives after
-it; the manager counts those for the declaration.
+callback in an actor that converts the spine to the keys and the
+instance first; the provider sends each spine to it, so the conversion
+runs in that actor and not in the provider. After an owner's first pass
+the provider calls `synced` with the owner id, sent after the data so it
+arrives after it; the manager counts those for the declaration.
 
 ### On-Change Subscriptions
 
