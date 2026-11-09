@@ -1,0 +1,151 @@
+import http
+import net
+import testing
+import zlib
+
+import http_conn as swhttpconn
+
+
+def _big_json() -> str:
+    items = [r'{"name":"cpe-' + str(i) + r'","schedule":"europe"}' for i in range(200)]
+    return r'{"device":[' + ",".join(items) + r']}'
+
+
+def _test_accepts_deflate():
+    testing.assertTrue(swhttpconn.accepts_deflate({"accept-encoding": "gzip, deflate, br, zstd"}))
+    testing.assertTrue(swhttpconn.accepts_deflate({"accept-encoding": "Deflate"}))
+    testing.assertTrue(swhttpconn.accepts_deflate({"accept-encoding": "deflate;q=0.5"}))
+    testing.assertTrue(swhttpconn.accepts_deflate({"accept-encoding": "gzip, *"}))
+    testing.assertFalse(swhttpconn.accepts_deflate({}))
+    testing.assertFalse(swhttpconn.accepts_deflate({"accept-encoding": "gzip, br"}))
+    testing.assertFalse(swhttpconn.accepts_deflate({"accept-encoding": "deflate;q=0"}))
+    testing.assertFalse(swhttpconn.accepts_deflate({"accept-encoding": "deflate; q=0.000, *"}))
+    testing.assertFalse(swhttpconn.accepts_deflate({"accept-encoding": "*;q=0"}))
+
+
+def _test_compressible():
+    testing.assertTrue(swhttpconn.compressible("application/yang-data+json"))
+    testing.assertTrue(swhttpconn.compressible("application/yang-data+xml"))
+    testing.assertTrue(swhttpconn.compressible("text/javascript; charset=utf-8"))
+    testing.assertTrue(swhttpconn.compressible("image/svg+xml"))
+    testing.assertTrue(swhttpconn.compressible("application/json"))
+    testing.assertFalse(swhttpconn.compressible("image/png"))
+    testing.assertFalse(swhttpconn.compressible("application/octet-stream"))
+
+
+def _test_encode_body():
+    big = _big_json()
+
+    # Compressed when accepted, with the headers that say so
+    headers = {"Content-Type": "application/yang-data+json"}
+    out = swhttpconn.encode_body(headers, big, True)
+    testing.assertTrue(len(out) < len(big))
+    testing.assertEqual(zlib.decompress(out), big.encode())
+    testing.assertEqual(headers.get("Content-Encoding"), "deflate")
+    testing.assertEqual(headers.get("Vary"), "Accept-Encoding")
+
+    # Not accepted: sent as it is, but it varies with Accept-Encoding
+    headers = {"Content-Type": "application/yang-data+json"}
+    out = swhttpconn.encode_body(headers, big, False)
+    testing.assertEqual(out, big.encode())
+    testing.assertEqual(headers.get("Content-Encoding"), None)
+    testing.assertEqual(headers.get("Vary"), "Accept-Encoding")
+
+    # An existing Vary is kept
+    headers = {"Content-Type": "text/html; charset=utf-8", "Vary": "Accept"}
+    swhttpconn.encode_body(headers, big, True)
+    testing.assertEqual(headers.get("Vary"), "Accept, Accept-Encoding")
+
+    # Small, already encoded, or not text: untouched
+    for h, body in [({"Content-Type": "application/json"}, r"{}"),
+                    ({"Content-Type": "application/json", "Content-Encoding": "identity"}, big),
+                    ({"Content-Type": "image/png"}, big)]:
+        headers = dict(h.items())
+        out = swhttpconn.encode_body(headers, body, True)
+        testing.assertEqual(out, body.encode())
+        testing.assertEqual(headers, h)
+
+
+actor pipelined_requests_answered_in_order_and_compressed(t: testing.EnvT):
+    """Three pipelined requests on one connection: a big answer to a client
+    that accepts deflate is compressed, a small one is not, and the big one
+    again to a client that does not accept deflate is not. The answers come
+    in request order, though the first is answered last."""
+    tcp_cap = net.TCPCap(net.NetCap(t.env.cap))
+    big = _big_json()
+    var listener: ?net.TCPListener = None
+    var client: ?net.TCPConnection = None
+    var finished = False
+    var held: ?action(int, dict[str, str], str) -> None = None
+    parser = http.MessageParser()
+    var responses: list[http.Response] = []
+
+    def finish(error: ?Exception=None):
+        if finished:
+            return
+        finished = True
+        c = client
+        if c is not None:
+            c.close(lambda _: None)
+        l = listener
+        if l is not None:
+            l.close()
+        if error is not None:
+            t.failure(error)
+        else:
+            t.success()
+
+    def on_request(req: http.Request, respond: action(int, dict[str, str], str) -> None):
+        if req.path == "/first":
+            # Answered after the others
+            held = respond
+        elif req.path == "/small":
+            respond(200, {"Content-Type": "text/plain"}, "hi")
+        else:
+            respond(200, {"Content-Type": "application/yang-data+json"}, big)
+            h = held
+            if h is not None:
+                h(200, {"Content-Type": "application/yang-data+json"}, big)
+
+    def accepted(conn: net.TCPListenConnection):
+        s = swhttpconn.Conn(conn, on_request)
+        conn.cb_install(s.on_conn_receive, s.on_conn_error, None)
+
+    def check():
+        testing.assertEqual(len(responses), 3)
+        first, small, plain = responses[0], responses[1], responses[2]
+        testing.assertEqual(first.headers.get("content-encoding"), "deflate")
+        testing.assertEqual(first.headers.get("vary"), "Accept-Encoding")
+        testing.assertEqual(zlib.decompress(first.body), big.encode())
+        testing.assertEqual(small.headers.get("content-encoding"), None)
+        testing.assertEqual(small.body, b"hi")
+        testing.assertEqual(plain.headers.get("content-encoding"), None)
+        testing.assertEqual(plain.headers.get("vary"), "Accept-Encoding")
+        testing.assertEqual(plain.body, big.encode())
+
+    def received(conn: net.TCPConnection, data: bytes):
+        try:
+            for msg in parser.feed(data):
+                responses.append(http.response_from_message(msg))
+            if len(responses) == 3:
+                check()
+                finish()
+        except Exception as e:
+            finish(e)
+
+    def connected(conn: net.TCPConnection):
+        conn.write(b"GET /first HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip, deflate\r\n\r\n"
+                   + b"GET /small HTTP/1.1\r\nHost: t\r\nAccept-Encoding: deflate\r\n\r\n"
+                   + b"GET /plain HTTP/1.1\r\nHost: t\r\n\r\n")
+
+    def client_error(conn: net.TCPConnection, error: str):
+        finish(ValueError(error))
+
+    def listening(server: net.TCPListener, error: ?str):
+        if error is not None:
+            finish(ValueError(error))
+            return
+        client = net.TCPConnection(net.TCPConnectCap(tcp_cap), "127.0.0.1", server.local_port(), connected, received, client_error)
+
+    listener = net.TCPListener(net.TCPListenCap(tcp_cap), "127.0.0.1", 0, listening, accepted)
+    after 5: finish(AssertionError("Timed out waiting for the responses"))

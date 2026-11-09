@@ -1,0 +1,222 @@
+"""HTTP/1.x connections that send compressed answers
+
+Acton's http.Server sends a body as the UTF-8 encoding of a str, so it can
+not send a compressed one. Listener and Conn serve connections the way
+http.Listener and http.Server do, with the same request parser, and compress
+a text answer of 1 KiB or more when the request accepts deflate.
+
+TODO: drop this for http.Server once it can send bytes bodies.
+"""
+import http
+import logging
+import net
+import time
+import zlib
+
+# Answers smaller than this are sent as they are
+MIN_COMPRESS_SIZE = 1024
+
+
+def _header(headers: dict[str, str], name: str) -> ?str:
+    """The value of a response header, whatever the case of its name"""
+    for k, v in headers.items():
+        if k.lower() == name:
+            return v
+    return None
+
+
+def _zero_q(q: str) -> bool:
+    """Whether a qvalue, "0" to "1.000", is zero"""
+    if not q.startswith("0"):
+        return False
+    for c in q:
+        if c != "0" and c != ".":
+            return False
+    return True
+
+
+def accepts_deflate(headers: dict[str, str]) -> bool:
+    """Whether a request's Accept-Encoding allows deflate"""
+    value = headers.get("accept-encoding")
+    star = False
+    if value is not None:
+        for item in value.split(",", None):
+            parts = item.split(";", None)
+            coding = parts[0].strip(" \t").encode().lower().decode()
+            ok = True
+            for param in parts[1:]:
+                p = param.strip(" \t").encode().lower().decode()
+                if p.startswith("q="):
+                    ok = not _zero_q(p[2:].strip(" \t"))
+            if coding == "deflate":
+                return ok
+            if coding == "*":
+                star = ok
+    return star
+
+
+def compressible(content_type: str) -> bool:
+    """Whether an answer of this type is text worth compressing"""
+    t = content_type.split(";", 1)[0].strip(" \t").encode().lower().decode()
+    return t.startswith("text/") or t.endswith("json") or t.endswith("xml") or t == "application/javascript"
+
+
+def encode_body(headers: dict[str, str], body: str, deflate: bool) -> bytes:
+    """The body to send, compressed when deflate is accepted and it pays.
+    Sets Content-Encoding and Vary in headers."""
+    b = body.encode()
+    content_type = _header(headers, "content-type")
+    if len(b) < MIN_COMPRESS_SIZE or _header(headers, "content-encoding") is not None:
+        return b
+    if not compressible(content_type if content_type is not None else "text/html"):
+        return b
+    vary = _header(headers, "vary")
+    for k in list(headers.keys()):
+        if k.lower() == "vary":
+            del headers[k]
+    headers["Vary"] = "{vary}, Accept-Encoding" if vary is not None else "Accept-Encoding"
+    if deflate:
+        try:
+            z = zlib.compress(b)
+            if len(z) < len(b):
+                headers["Content-Encoding"] = "deflate"
+                return z
+        except ValueError:
+            pass
+    return b
+
+
+def build_response(version: bytes, status: int, headers: dict[str, str], body: bytes) -> bytes:
+    """http.build_response with a bytes body"""
+    status_line: bytes = b"HTTP/" + version + b" " + str(status).encode()
+    if status in http.responses:
+        status_line += b" " + http.responses[status]
+
+    r = [status_line]
+    header_keys = [k.lower() for k in headers.keys()]
+    if "server" not in header_keys:
+        headers["Server"] = "Acton HTTP Server"
+    if "content-type" not in header_keys:
+        headers["Content-Type"] = "text/html; charset=utf-8"
+    if "date" not in header_keys:
+        headers["Date"] = time.now().str_rfc1123()
+    for k, v in headers.items():
+        if k.lower() == "content-length":
+            # Computed from the body
+            continue
+        r.append(k.encode() + b": " + v.encode())
+    r.append(b"Content-Length: " + str(len(body)).encode())
+    r.append(b"\r\n")
+    res = b"\r\n".join(r)
+    if len(body) > 0:
+        res += body
+    return res
+
+
+actor Conn(conn: net.TCPListenConnection, on_request: action(http.Request, action(int, dict[str, str], str) -> None) -> None, log_handler: ?logging.Handler=None):
+    """One client connection, served like http.Server serves one
+
+    on_request gets each request and the action to answer it with.
+    Responses go out in request order: one to a later request waits until
+    those to all earlier requests have been sent. The body is compressed here,
+    in the connection's actor.
+    """
+    _log = logging.Logger(log_handler)
+    var version: ?bytes = None
+    var query_count: u64 = 0
+    var response_count: u64 = 0
+    var outstanding_responses: dict[u64, bytes] = {}
+    # Id of the request whose response ends the connection, 0 while there is none
+    var close_after: u64 = 0
+    _parser = http.MessageParser()
+    # Set when the client sent something that is not a valid request
+    var _bad_input: bool = False
+
+    def on_conn_receive(conn_obj, data: bytes) -> None:
+        if close_after != 0 or _bad_input:
+            # No further requests are processed on a connection that is closing
+            return
+        msgs = _parser.feed(data)
+        failure = _parser.error
+        requests = []
+        for msg in msgs:
+            try:
+                requests.append(http.request_from_message(msg))
+            except ValueError as e:
+                failure = e.error_message
+                break
+        for req in requests:
+            if close_after != 0:
+                break
+            _handle_request(req)
+        if failure is not None:
+            _log.notice("Malformed HTTP request, closing the connection", {"error": failure})
+            _bad_input = True
+            if close_after == 0:
+                # Answer the requests received before the malformed input, then close
+                if response_count == query_count:
+                    conn.close()
+                else:
+                    close_after = query_count
+
+    def _handle_request(req: http.Request):
+        if version is None:
+            version = req.version
+        elif version is not None and version != req.version:
+            _log.debug("Version mismatch", None)
+            conn.close()
+
+        query_count += 1
+        req_id = query_count
+        # The server does not keep HTTP/1.0 connections alive
+        if req.version == b"1.0" or "close" in http.connection_options(req.headers):
+            close_after = req_id
+        deflate = accepts_deflate(req.headers)
+
+        def respond(status_code: int, headers: dict[str, str], body: str):
+            v = version
+            if v is not None:
+                out_headers = dict(headers.items())
+                encoded = encode_body(out_headers, body, deflate)
+                _send(req_id, build_response(v, status_code, out_headers, encoded))
+
+        on_request(req, respond)
+
+    def _send(req_id: u64, res: bytes):
+        if req_id == response_count + 1:
+            conn.write(res)
+            response_count += 1
+            # Send buffered responses that are next in line
+            while response_count + 1 in outstanding_responses:
+                nxt = outstanding_responses[response_count + 1]
+                del outstanding_responses[response_count + 1]
+                conn.write(nxt)
+                response_count += 1
+            if response_count == close_after:
+                conn.close()
+        elif req_id > response_count + 1 and req_id not in outstanding_responses:
+            # Responses must go out in request order, so buffer this one
+            # until responses to all earlier requests have been sent
+            outstanding_responses[req_id] = res
+        else:
+            _log.notice("Duplicate response to query, ignoring", None)
+
+    def on_conn_error(conn_obj, error):
+        _log.trace("Connection error", {"error": error})
+
+
+actor Listener(cap: net.TCPListenCap, address: str, port: int, on_request: action(http.Request, action(int, dict[str, str], str) -> None) -> None, on_listen_error: ?action(net.TCPListener, str) -> None=None, log_handler: ?logging.Handler=None):
+    """Listens on address and port and serves each connection with a Conn"""
+    _log = logging.Logger(log_handler)
+
+    def _on_listen(listener, error):
+        if error is not None:
+            _log.notice("There was an error with the listener socket", {"error": error})
+            if on_listen_error is not None:
+                on_listen_error(listener, error)
+
+    def _on_accept(c):
+        s = Conn(c, on_request, log_handler)
+        c.cb_install(s.on_conn_receive, s.on_conn_error, None)
+
+    _listener = net.TCPListener(cap, address, port, _on_listen, _on_accept)

@@ -61,6 +61,10 @@
   lists the `fields` capability. An invalid `fields` value, `fields` on any
   method other than GET, and a query parameter given twice get 400 Bad
   Request. [#805]
+- The HTTP server compresses a text answer of 1 KiB or more with deflate when
+  the request's `Accept-Encoding` allows it, which browsers do. At 100k
+  devices the fleetmgr device list goes out as 1.3 MB instead of 14 MB, and a
+  campaign's state as 1 MB instead of 22 MB. With curl, add `--compressed`.
 - Fixed RESTCONF GET, NETCONF `<get>` and yang-push filters that could not
   reach an operational subtree under a config node, like
   `/software:software/upgrade-campaign=foo/state` in fleetmgr. [#677] [#681]
@@ -824,6 +828,10 @@
 - Query parameter names and values are percent-decoded.
   `Context.query()` gives every value of each name as a list, in request
   order, instead of one value, and `query_param()` gives the first. [#805]
+
+#### acton-zlib
+- New dependency, for HTTP compression. It is pinned newer than the version
+  acton-ssh asks for, which cut the compressed data at the first zero byte.
 
 ### Documentation
 - The software upgrade reference is rewritten to match the code, and is part

@@ -28,6 +28,17 @@ curl -H "Accept: application/yang-data+json" \
   "$STRATOWEAVE_API_ORIGIN/restconf/data"
 ```
 
+### Compression
+
+The server compresses an answer of 1 KiB or more with deflate when the
+request's `Accept-Encoding` allows it. Browsers ask for it on their own. With
+curl, add `--compressed`:
+
+```sh
+curl --compressed -H "Accept: application/yang-data+json" \
+  "$STRATOWEAVE_API_ORIGIN/restconf/data"
+```
+
 ## Editing northbound intent
 
 The RESTCONF root is also used for configuration operations such as `PATCH` and

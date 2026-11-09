@@ -23,6 +23,9 @@ A few conventions matter when you call these endpoints directly:
   the `Accept` header instead.
 - For Acton adata output, both `/device/<name>/*` and `/layer/<idx>` support a
   `loose` query parameter. It defaults to `true`.
+- A text answer of 1 KiB or more is compressed with deflate when the
+  request's `Accept-Encoding` allows it. Browsers ask for it on their own;
+  with curl, add `--compressed`.
 
 ## SORESPO quicklab examples
 
