@@ -95,6 +95,11 @@ export function formatClock(epochSeconds: number, now = Date.now() / 1000): stri
   return sameLocalDay(epochSeconds, now) ? time : `${localDate(new Date(epochSeconds * 1000))} ${time}`;
 }
 
+/** Epoch seconds -> "2026-10-05 14:30" on the local clock. */
+export function formatDateTime(epochSeconds: number): string {
+  return `${localDate(new Date(epochSeconds * 1000))} ${clockLabel(epochSeconds)}`;
+}
+
 /** Epoch seconds -> "2026-10-05T14:30" on the local clock, for a
  * `datetime-local` input. */
 export function toLocalInput(epochSeconds: number): string {

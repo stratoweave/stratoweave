@@ -194,7 +194,13 @@ clock, the real one once the controller has released the device; a marker
 shows now, and once the campaign runs the cells take the devices' live
 status; the same page changes the campaign's default schedule and its
 pace, set by a deadline or by how many devices upgrade at once, plus the
-most at once. The top serves the UI itself: the static build is embedded
+most at once. The plan's Export CSV downloads the maintenance window each
+device is upgraded in, in plan and in run: one row per device in upgrade
+order, with its model, image, status, schedule, the window's start and
+end, and the real start and finish once released; devices that fit no
+window come last as `not placed`. Times are on the browser's clock, its
+zone in the header.
+The top serves the UI itself: the static build is embedded
 in the `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so with
 `just demo` running the UI is at http://127.0.0.1:18200/. After a UI change,
 `just gen-webui` rebuilds the UI and regenerates that module (needs Node),

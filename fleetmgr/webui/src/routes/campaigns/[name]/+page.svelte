@@ -11,6 +11,7 @@
   import PlanTimeline from '#lib/software/PlanTimeline.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '#lib/core/restconf/client.ts';
   import { createPoller } from '#lib/core/polling/poller.ts';
+  import { downloadCsv } from '#lib/core/csv.ts';
   import { CampaignLive, FAST_MS, type LiveView } from '#lib/software/campaign-live.ts';
   import {
     planningChanges,
@@ -25,6 +26,7 @@
   import { formatEta } from '#lib/software/rate.ts';
   import { formatClock } from '#lib/core/time.ts';
   import { imageCounts } from '#lib/software/campaign-images.ts';
+  import { planToCsv } from '#lib/software/plan-csv.ts';
   import { nameMatcher } from '#lib/software/selection.ts';
   import {
     CAMPAIGN_LIST_ROOT,
@@ -239,6 +241,11 @@
     return `Delete campaign ${c.name}? Its targets are withdrawn from the devices.`;
   });
 
+  /** Download when each device is upgraded, as the plan shows it now. */
+  function exportPlan(): void {
+    if (campaign) downloadCsv(`${campaign.name}-plan.csv`, planToCsv(campaign));
+  }
+
   async function handleConfirm(): Promise<void> {
     const action = confirmAction;
     confirmAction = null;
@@ -356,7 +363,17 @@
     <section class="card">
       <div class="grids-head">
         <h2 class="panel-title">Plan</h2>
-        <span class="hint">estimates in your local time</span>
+        <span class="head-end">
+          <span class="hint">estimates in your local time</span>
+          <button
+            class="btn btn-secondary btn-sm"
+            type="button"
+            title="When each device is upgraded"
+            onclick={exportPlan}
+          >
+            Export CSV
+          </button>
+        </span>
       </div>
       {#if plan.alarms.length > 0 || plan.unplaced.length > 0}
         <ul class="alarms">
@@ -649,6 +666,12 @@
 
   .grids-head .panel-title {
     margin: 0;
+  }
+
+  .head-end {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
   }
 
   .hint {

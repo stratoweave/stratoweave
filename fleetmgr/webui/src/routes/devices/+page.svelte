@@ -8,6 +8,7 @@
   import FieldText from '#lib/core/ui/FieldText.svelte';
   import Section from '#lib/core/ui/Section.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson, restconfPatchText } from '#lib/core/restconf/client.ts';
+  import { downloadCsv } from '#lib/core/csv.ts';
   import { bindPatch, unbindDevice } from '#lib/maintenance/binding.ts';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
   import HealthPill from '#lib/software/HealthPill.svelte';
@@ -304,13 +305,7 @@
     try {
       exporting = true;
       statusMessage = null;
-      const text = await fetchDevicesCsv();
-      const url = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = 'devices.csv';
-      link.click();
-      URL.revokeObjectURL(url);
+      downloadCsv('devices.csv', await fetchDevicesCsv());
     } catch (exportError) {
       statusMessage = { type: 'error', text: errorText(exportError, 'Export failed.') };
     } finally {

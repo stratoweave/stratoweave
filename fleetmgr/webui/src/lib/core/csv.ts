@@ -88,3 +88,13 @@ function quote(cell: string): string {
 export function formatCsv(rows: string[][]): string {
   return rows.map((row) => row.map(quote).join(',')).join('\n') + (rows.length > 0 ? '\n' : '');
 }
+
+/** Save text as a CSV file through the browser's download. */
+export function downloadCsv(fileName: string, text: string): void {
+  const url = URL.createObjectURL(new Blob([text], { type: 'text/csv' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  link.click();
+  URL.revokeObjectURL(url);
+}
