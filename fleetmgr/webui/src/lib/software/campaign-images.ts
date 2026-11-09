@@ -84,15 +84,3 @@ export function imageCounts(images: string[]): [string, number][] {
   for (const image of images) counts.set(image, (counts.get(image) ?? 0) + 1);
   return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
-
-/** The releases a campaign upgrades to: the versions of its members'
- * images, newest first; images not in the list are skipped. */
-export function releasesOf(images: string[], catalog: CatalogImage[]): string[] {
-  const version = new Map(catalog.map((i) => [i.name, i.version]));
-  const releases = new Set<string>();
-  for (const image of images) {
-    const v = version.get(image);
-    if (v) releases.add(v);
-  }
-  return [...releases].sort((a, b) => compareVersions(b, a));
-}
