@@ -134,10 +134,11 @@ lookup instead.
 
 ## SSH transport parameters
 
-Every SSH-based adapter -- NETCONF over SSH today, CLI adapters later -- reads
-its transport settings from the device's `ssh` container. Leave it out and the
-SSH library's defaults apply; set it to deal with devices that need something
-narrower or older.
+Every SSH-based adapter -- NETCONF over SSH and the IOS XE CLI adapter -- reads
+its transport settings from the device's `ssh` container, or from the `ssh`
+container of its `extra-adapter` entry. Leave it out and the SSH library's
+defaults apply; set it to deal with devices that need something narrower or
+older.
 
 To expose these settings in another model, import `stratoweave-ssh` and use
 its `ssh-client-config` grouping inside an `ssh` container:
@@ -201,8 +202,10 @@ so does all configuration.
 An extra adapter connects to the address that its `address` leaf names, or to
 the first address. It uses its own `port`, or its default port when `port` is
 not set: the port of the address is for the adapter of the device type. Its
-`credentials`, when set, replace the device's. `state/adapter` shows whether
-each adapter is connected.
+`credentials` and its `ssh` settings, when set, replace the device's. Two SSH
+servers on one device can need different settings: on a C1111 with IOS XE
+17.9, an RSA key needs `public-key-algorithm ssh-rsa` on the CLI port but not
+on the NETCONF port. `state/adapter` shows whether each adapter is connected.
 
 An adapter runs as an extra adapter when it reports its device type with its
 modules, `dev.on_connect(modules, schema_key, dmc.type)`, and a lost
