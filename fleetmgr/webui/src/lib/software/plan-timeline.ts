@@ -312,8 +312,7 @@ function rowsCap(size: number, pitch: number, maxStack: number): number {
 /** Cells for one window: a column opens at a device's start and takes
  * every later start that falls within one pitch of it, so starts a cell's
  * width apart share a column instead of overlapping. A full column spills
- * into the next, so a crowded window degrades into a packed fill instead
- * of growing without bound. */
+ * into the next, so a crowded window degrades into a packed fill. */
 function layoutCells(p: Placed, size: number, pitch: number, cap: number): WindowCells {
   const maxX = p.xEnd - WINDOW_GAP - size;
   const cols: Column[] = [];
@@ -332,6 +331,30 @@ function layoutCells(p: Placed, size: number, pitch: number, cap: number): Windo
     if (col.count > rows) rows = col.count;
   }
   return { devices: p.devices, cols, rows, displaced };
+}
+
+/** layoutCells with columns taller than `cap` when spills would carry
+ * cells past the window's end: the least cap that keeps them inside. */
+function fitCells(p: Placed, size: number, pitch: number, cap: number): WindowCells {
+  const lastX = Math.max(p.x, p.xEnd - WINDOW_GAP - size);
+  const fits = (c: WindowCells) => c.cols.length === 0 || c.cols[c.cols.length - 1].x <= lastX;
+  const first = layoutCells(p, size, pitch, cap);
+  if (fits(first)) return first;
+  // A cap of all the devices never spills, so hi always fits.
+  let lo = cap;
+  let hi = p.xs.length;
+  let best: WindowCells | null = null;
+  while (hi - lo > 1) {
+    const mid = (lo + hi) >> 1;
+    const c = layoutCells(p, size, pitch, mid);
+    if (fits(c)) {
+      hi = mid;
+      best = c;
+    } else {
+      lo = mid;
+    }
+  }
+  return best ?? layoutCells(p, size, pitch, hi);
 }
 
 /** layoutCells' walk without building anything: whether some device
@@ -356,8 +379,8 @@ function displaces(p: Placed, size: number, pitch: number, cap: number): boolean
 
 /** The largest cell from MAX_SIZE down whose columns stay under maxStack
  * px with no device displaced; failing that, the smallest cell, with
- * spills. Columns open at a device's own start, so evenly spaced rounds
- * merge evenly at any size. */
+ * spills and taller columns. Columns open at a device's own start, so
+ * evenly spaced rounds merge evenly at any size. */
 export function fitCellSize(placed: Placed[], maxStack: number): number {
   for (let size = MAX_SIZE; size >= MIN_SIZE; size--) {
     const pitch = size + gutter(size);
@@ -376,7 +399,7 @@ export interface CellLayout {
 export function layoutAt(placed: Placed[], size: number, maxStack: number): CellLayout {
   const pitch = size + gutter(size);
   const cap = rowsCap(size, pitch, maxStack);
-  return { size, pitch, windows: placed.map((p) => layoutCells(p, size, pitch, cap)) };
+  return { size, pitch, windows: placed.map((p) => fitCells(p, size, pitch, cap)) };
 }
 
 export interface Fit {
