@@ -10,6 +10,7 @@ import ssh
 import testing
 import yang
 import yang.gdata as gdata
+import yang.schema as yschema
 
 from file import FileCap, ReadFile, ReadFileCap
 
@@ -17,12 +18,14 @@ import device as swdev
 import adapters.iosxe_cli as xecli
 import adapters.iosxe_cli_data as xecli_data
 import adapters.iosxe_cli_yang as xecli_yang
+import adapters.netconf as swna
 import device_oper as swdevoper
 from adapters.adapter import DeviceAdapter, MockAdapter
 from device_schema import DeviceSchema
 from device_meta_config import stratoweave_rfs__device_entry as Dmc, \
     stratoweave_rfs__device__credentials as Credentials, \
-    stratoweave_rfs__device__extra_adapter__credentials as ExtraCredentials
+    stratoweave_rfs__device__extra_adapter__credentials as ExtraCredentials, \
+    stratoweave_rfs__device__extra_adapter__ssh as ExtraSsh
 
 
 def _crlf(text: str) -> str:
@@ -139,6 +142,67 @@ VERIFY_MISSING = _crlf(r"""
 
 
 %Error computing MD5 hash bootflash:no-such-file.bin (No such file or directory)""")
+
+# The outputs below are from a C1111 that runs IOS XE 17.9.5a. In a check
+# of an image, the device draws the progress of the hash computation with
+# backspaces. The captures keep a few of its steps.
+SIGNED_IMAGE = "c1100-universalk9.17.09.05a.SPA.bin"
+OLD_IMAGE = "c1100-universalk9_ias.16.08.01.SPA.bin"
+OLD_IMAGE_MD5 = "8dee04c886aa00ae6c794d7c65f52f9d"
+OLD_IMAGE_SHA512 = "d114d9318991a756f78c32516f347611335542d5b9fc96cb074f2ed7bc9749bd322f2cf2df358c689e2594692757dd769ecc5d96001c15c1c1938c486fe554e6"
+_PROGRESS = "Hash Computation:    0  %\x08\x08\x08\x08  5  %\x08\x08\x08\x08100%Done!"
+
+## verify bootflash:c1100-universalk9.17.09.05a.SPA.bin
+VERIFY_IMAGE = _crlf(r"""
+
+
+Verifying file integrity of bootflash:c1100-universalk9.17.09.05a.SPA.bin..................
+Embedded Hash   SHA1 : A6C3F03F7C4D24EC124AB4EDD35EA46F34EEB6AB
+Computed Hash   SHA1 : A6C3F03F7C4D24EC124AB4EDD35EA46F34EEB6AB
+Starting image verification
+""" + _PROGRESS + r"""
+Computed Hash   SHA2: d4c20aa1a91df7cafa5fc108f1987fdf
+                      f539192d674232e2e36a5ee7f0531924
+                      3880e6ae02ea59f0349115372034868e
+                      4583669e7867d3bb9b51c91ab4664a67
+                      
+Embedded Hash   SHA2: d4c20aa1a91df7cafa5fc108f1987fdf
+                      f539192d674232e2e36a5ee7f0531924
+                      3880e6ae02ea59f0349115372034868e
+                      4583669e7867d3bb9b51c91ab4664a67
+                      
+Digital signature successfully verified in file bootflash:c1100-universalk9.17.09.05a.SPA.bin
+""")
+
+## verify /md5 bootflash:c1100-universalk9_ias.16.08.01.SPA.bin 8dee04c886aa00ae6c794d7c65f52f9d
+VERIFY_MD5_EQUAL = _crlf(r"""
+
+................Done!
+Verified (bootflash:c1100-universalk9_ias.16.08.01.SPA.bin) = 8dee04c886aa00ae6c794d7c65f52f9d
+""")
+
+## verify /md5 bootflash:c1100-universalk9_ias.16.08.01.SPA.bin 00000000000000000000000000000000
+VERIFY_MD5_DIFFERS = _crlf(r"""
+
+................Done!
+%Error verifying bootflash:c1100-universalk9_ias.16.08.01.SPA.bin
+Computed signature  = 8dee04c886aa00ae6c794d7c65f52f9d
+Submitted signature = 00000000000000000000000000000000
+
+""")
+
+## verify /sha512 bootflash:c1100-universalk9_ias.16.08.01.SPA.bin d114...
+VERIFY_SHA512_EQUAL = _crlf(r"""
+
+................Done!
+Verified (bootflash:c1100-universalk9_ias.16.08.01.SPA.bin) = d114d9318991a756f78c32516f347611335542d5b9fc96cb074f2ed7bc9749bd322f2cf2df358c689e2594692757dd769ecc5d96001c15c1c1938c486fe554e6
+""")
+
+## verify bootflash:vlan.dat
+VERIFY_NOT_IMAGE = _crlf("\n\n\nFile bootflash:vlan.dat does not support verification.")
+
+## verify bootflash:no-such-file.bin
+VERIFY_IMAGE_MISSING = _crlf("\n\n\n%ERROR: Unable to process embedded hash in bootflash:no-such-file.bin.")
 
 ## show version
 SHOW_VERSION = _crlf(r"""
@@ -286,6 +350,99 @@ def _test_parse_verify_errors():
         testing.assertTrue(got.startswith(want), name + ": " + got)
 
 
+def _image_error(output: str, file: str) -> str:
+    try:
+        xecli.parse_verify_image(output, "bootflash:", file)
+    except xecli.CommandError as e:
+        return e.error_message
+    return "no error"
+
+
+def _test_parse_verify_image():
+    signature = VERIFY_IMAGE.find("Digital signature")
+    sha2 = "3880e6ae02ea59f0349115372034868e"
+    cases = [
+        ("signed image", VERIFY_IMAGE, True),
+        ("lower-case SHA1", VERIFY_IMAGE.replace("A6C3F03F", "a6c3f03f"), True),
+        ("SHA1 differs", VERIFY_IMAGE.replace("Computed Hash   SHA1 : A6", "Computed Hash   SHA1 : B6"), False),
+        ("SHA2 differs on a later line", VERIFY_IMAGE.replace(sha2 + "\r\n                      4583669e7867d3bb9b51c91ab4664a67\r\n                      \r\nDigital",
+                                                              sha2 + "\r\n                      4583669e7867d3bb9b51c91ab4664a68\r\n                      \r\nDigital"), False),
+        ("no embedded SHA2", VERIFY_IMAGE.replace("Embedded Hash   SHA2: d4c20aa1", "d4c20aa1"), False),
+        ("no signature line", VERIFY_IMAGE[:signature], False),
+        ("signature of another file", VERIFY_IMAGE.replace("in file bootflash:c1100", "in file bootflash:c8000v"), False),
+    ]
+    for name, output, want in cases:
+        testing.assertEqual(xecli.parse_verify_image(output, "bootflash:", SIGNED_IMAGE), want, name)
+
+
+def _test_parse_verify_image_errors():
+    hashes = VERIFY_IMAGE.find("Embedded")
+    cases = [
+        ("missing file", VERIFY_IMAGE_MISSING, "no-such-file.bin", "%ERROR: Unable to process embedded hash in bootflash:no-such-file.bin."),
+        ("not an image", VERIFY_NOT_IMAGE, "vlan.dat", "File bootflash:vlan.dat does not support verification."),
+        ("no hashes", VERIFY_IMAGE[:hashes], SIGNED_IMAGE, "verify output has no hashes for bootflash:" + SIGNED_IMAGE),
+        ("hash line without a name", VERIFY_IMAGE.replace("Embedded Hash   SHA1 :", "Embedded Hash:"), SIGNED_IMAGE, "unexpected verify line: Embedded Hash:"),
+    ]
+    for name, output, file, want in cases:
+        got = _image_error(output, file)
+        testing.assertTrue(got.startswith(want), name + ": " + got)
+
+
+def _test_parse_verify_hash():
+    cases = [
+        ("equal MD5", VERIFY_MD5_EQUAL, "md5", OLD_IMAGE_MD5, True),
+        ("other MD5", VERIFY_MD5_DIFFERS, "md5", OLD_IMAGE_MD5, False),
+        ("equal SHA-512", VERIFY_SHA512_EQUAL, "sha512", OLD_IMAGE_SHA512, True),
+    ]
+    for name, output, algorithm, digest, verified in cases:
+        r = xecli.parse_verify_hash(output, "bootflash:", OLD_IMAGE, algorithm)
+        testing.assertEqual(r.digest, digest, name)
+        testing.assertEqual(r.verified, verified, name)
+
+
+def _hash_error(output: str, file: str) -> str:
+    try:
+        xecli.parse_verify_hash(output, "bootflash:", file, "md5")
+    except xecli.CommandError as e:
+        return e.error_message
+    return "no error"
+
+
+def _test_parse_verify_hash_errors():
+    computed = VERIFY_MD5_DIFFERS.find("Computed")
+    cases = [
+        ("missing file", VERIFY_MISSING, "no-such-file.bin", "%Error computing MD5 hash bootflash:no-such-file.bin"),
+        ("result for another file", VERIFY_MD5_EQUAL, "other.bin", "verify output has no result for bootflash:other.bin"),
+        ("no computed checksum", VERIFY_MD5_DIFFERS[:computed], OLD_IMAGE, "verify output has no computed checksum for bootflash:" + OLD_IMAGE),
+        ("short digest", VERIFY_MD5_EQUAL.replace("c65f52f9d", "c65f52f9"), OLD_IMAGE, "verify output has an invalid digest"),
+        ("short computed digest", VERIFY_MD5_DIFFERS.replace("c65f52f9d", "c65f52f9"), OLD_IMAGE, "verify output has an invalid digest"),
+    ]
+    for name, output, file, want in cases:
+        got = _hash_error(output, file)
+        testing.assertTrue(got.startswith(want), name + ": " + got)
+
+
+def _test_verify_command_forms():
+    cases: list[(?str, ?str, str)] = [
+        (None, None, "verify bootflash:" + OLD_IMAGE),
+        ("md5", OLD_IMAGE_MD5, "verify /md5 bootflash:" + OLD_IMAGE + " " + OLD_IMAGE_MD5),
+        ("md5", OLD_IMAGE_MD5.upper(), "verify /md5 bootflash:" + OLD_IMAGE + " " + OLD_IMAGE_MD5),
+        ("sha512", OLD_IMAGE_SHA512, "verify /sha512 bootflash:" + OLD_IMAGE + " " + OLD_IMAGE_SHA512),
+        (None, OLD_IMAGE_MD5, "error: a hash needs an algorithm"),
+        ("md5", OLD_IMAGE_MD5[:8], "error: invalid md5 hash: 8dee04c8. Use 32 hexadecimal digits"),
+        ("md5", OLD_IMAGE_SHA512, "error: invalid md5 hash"),
+        ("sha512", OLD_IMAGE_MD5, "error: invalid sha512 hash"),
+        ("md5", OLD_IMAGE_MD5[:31] + ";", "error: invalid md5 hash"),
+        ("md5", OLD_IMAGE_MD5[:30] + " x", "error: invalid md5 hash"),
+    ]
+    for algorithm, expected, want in cases:
+        try:
+            got = xecli.verify_command("bootflash:", OLD_IMAGE, algorithm, expected)
+        except ValueError as e:
+            got = "error: " + e.error_message
+        testing.assertTrue(got.startswith(want), "{algorithm} {expected}: {got}")
+
+
 def _command(file_system: str, file: str, algorithm: str) -> str:
     try:
         return xecli.verify_command(file_system, file, algorithm)
@@ -415,18 +572,29 @@ def _rpc_error(request: gdata.Node) -> str:
 
 
 def _test_rpc_call():
-    body = xecli_data.stratoweave_iosxe_cli__checksum__input("bootflash:", IMAGE, "md5").to_gdata()
-    c = xecli.rpc_call(gdata.Container({_q("checksum"): body}))
+    body = xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", IMAGE, "md5").to_gdata()
+    c = xecli.rpc_call(gdata.Container({_q("verify"): body}))
     testing.assertEqual(c.command, "verify /md5 bootflash:" + IMAGE)
-    out = xecli_data.stratoweave_iosxe_cli__checksum__output.from_gdata(c.reply(VERIFY_MD5))
+    out = xecli_data.stratoweave_iosxe_cli__verify__output.from_gdata(c.reply(VERIFY_MD5))
     testing.assertEqual(out.digest, IMAGE_MD5)
-    bad = xecli_data.stratoweave_iosxe_cli__checksum__input("bootflash:", "a;b", "md5").to_gdata()
+    testing.assertEqual(out.verified, None)
+    forms = [
+        ("an image", xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", SIGNED_IMAGE), VERIFY_IMAGE, None, True),
+        ("an equal hash", xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", OLD_IMAGE, "md5", OLD_IMAGE_MD5), VERIFY_MD5_EQUAL, OLD_IMAGE_MD5, True),
+        ("another hash", xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", OLD_IMAGE, "md5", "0" * 32), VERIFY_MD5_DIFFERS, OLD_IMAGE_MD5, False),
+    ]
+    for name, inp, output, digest, verified in forms:
+        call = xecli.rpc_call(gdata.Container({_q("verify"): inp.to_gdata()}))
+        got = xecli_data.stratoweave_iosxe_cli__verify__output.from_gdata(call.reply(output))
+        testing.assertEqual(got.digest, digest, name)
+        testing.assertEqual(got.verified, verified, name)
+    bad = xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", "a;b", "md5").to_gdata()
     other = gdata.Id("http://cisco.com/ns/yang/Cisco-IOS-XE-xcopy-rpc", "xcopy")
     cases = [
         ("another RPC", gdata.Container({other: body}), "RPC "),
-        ("two RPCs", gdata.Container({_q("checksum"): body, other: body}), "an RPC request must have exactly one child"),
+        ("two RPCs", gdata.Container({_q("verify"): body, other: body}), "an RPC request must have exactly one child"),
         ("no RPC", gdata.Container({}), "an RPC request must have exactly one child"),
-        ("bad file name", gdata.Container({_q("checksum"): bad}), "invalid file name: a;b"),
+        ("bad file name", gdata.Container({_q("verify"): bad}), "invalid file name: a;b"),
     ]
     for name, request, want in cases:
         got = _rpc_error(request)
@@ -510,7 +678,7 @@ def _device(t: testing.EnvT, adapter_type: proc(swdev.DeviceMgr, DeviceSchema, D
 
 
 actor _test_adapter_reads_and_checksums(t: testing.EnvT):
-    """Reads of each node and checksum RPCs through DeviceMgr, against a local SSH server."""
+    """Reads of each node and verify RPCs through DeviceMgr, against a local SSH server."""
     t.timeout(10.0)
     replies = {
         "dir bootflash:": DIR_BOOTFLASH,
@@ -535,7 +703,7 @@ actor _test_adapter_reads_and_checksums(t: testing.EnvT):
         else:
             t.success()
 
-    def missing_checked(out: ?xecli_data.stratoweave_iosxe_cli__checksum__output, err: ?Exception):
+    def missing_checked(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception):
         try:
             testing.assertTrue(isinstance(err, xecli.CommandError), "a missing file is a command error")
             if err is not None:
@@ -554,7 +722,7 @@ actor _test_adapter_reads_and_checksums(t: testing.EnvT):
             return
         finish(None)
 
-    def checksummed(out: ?xecli_data.stratoweave_iosxe_cli__checksum__output, err: ?Exception):
+    def checksummed(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception):
         r = rpcs
         try:
             if err is not None:
@@ -564,7 +732,7 @@ actor _test_adapter_reads_and_checksums(t: testing.EnvT):
             finish(e)
             return
         if r is not None:
-            r.checksum(missing_checked, xecli_data.stratoweave_iosxe_cli__checksum__input("bootflash:", "no-such-file.bin", "md5"))
+            r.verify(missing_checked, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", "no-such-file.bin", "md5"))
 
     def versioned(tree: ?gdata.Node, err: ?Exception):
         r = rpcs
@@ -580,7 +748,7 @@ actor _test_adapter_reads_and_checksums(t: testing.EnvT):
             finish(e)
             return
         if r is not None:
-            r.checksum(checksummed, xecli_data.stratoweave_iosxe_cli__checksum__input("bootflash:", IMAGE, "md5"))
+            r.verify(checksummed, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", IMAGE, "md5"))
 
     def listed(tree: ?gdata.Node, err: ?Exception):
         d = dev
@@ -717,7 +885,7 @@ actor _test_extra_adapter(t: testing.EnvT):
     server = _FakeXe(t, {"dir bootflash:": DIR_BOOTFLASH}, listening)
 
 
-# A test against a real IOS XE device over SSH. Run it with, for example:
+# Tests against a real IOS XE device over SSH. Run them with, for example:
 #
 #   IOSXE_CLI_PORT=28422 IOSXE_CLI_FILE=sw-xe-image-staging.bin \
 #   IOSXE_CLI_MD5=35a91bebe3b1f38606bd0a845426929f \
@@ -727,20 +895,42 @@ actor _test_extra_adapter(t: testing.EnvT):
 # IOSXE_CLI_USERNAME and IOSXE_CLI_PASSWORD (default admin, as in the lab)
 # select the device. IOSXE_CLI_KEY is a private key file to log in with
 # instead of the password. IOSXE_CLI_PUBLIC_KEY_ALGORITHMS lists the
-# signature algorithms of the key, comma separated: an RSA key needs ssh-rsa
-# on the IOS SSH server of 17.9. IOSXE_CLI_FILE is a file on bootflash: and
-# IOSXE_CLI_MD5 its MD5 checksum.
+# signature algorithms of the key for the CLI, comma separated: an RSA key
+# needs ssh-rsa on the IOS SSH server of 17.9. IOSXE_CLI_FILE is a file on
+# bootflash: and IOSXE_CLI_MD5 its MD5 checksum.
+#
+# The test beside NETCONF has the device compare the MD5 with IOSXE_CLI_MD5,
+# and checks IOSXE_CLI_IMAGE, an IOS XE image on bootflash:. It connects
+# NETCONF to IOSXE_NETCONF_PORT (default 830).
+
+proc def _setting(t: testing.EnvT, name: str, default: str) -> str:
+    value = t.env.vars.getenv(name)
+    return value if value is not None else default
+
+
+proc def _public_key_algorithms(t: testing.EnvT) -> list[str]:
+    return [a for a in _setting(t, "IOSXE_CLI_PUBLIC_KEY_ALGORITHMS", "").split(",") if a != ""]
+
+
+proc def _live_credentials(t: testing.EnvT) -> Credentials:
+    c = Credentials(_setting(t, "IOSXE_CLI_USERNAME", "admin"))
+    key_file = _setting(t, "IOSXE_CLI_KEY", "")
+    if key_file != "":
+        f = ReadFile(ReadFileCap(FileCap(t.env.cap)), key_file)
+        c.key.create("live", f.read().decode())
+        f.close()
+    else:
+        c.password = _setting(t, "IOSXE_CLI_PASSWORD", "admin")
+    return c
+
+
 actor _test_live_iosxe(t: testing.EnvT):
     """Read every node of a real device and verify the checksum of a file."""
     t.require("iosxe-cli")
     t.timeout(120.0)
 
-    def setting(name: str, default: str) -> str:
-        value = t.env.vars.getenv(name)
-        return value if value is not None else default
-
-    file = setting("IOSXE_CLI_FILE", "")
-    md5 = setting("IOSXE_CLI_MD5", "").lower()
+    file = _setting(t, "IOSXE_CLI_FILE", "")
+    md5 = _setting(t, "IOSXE_CLI_MD5", "").lower()
     var dev: ?swdev.DeviceMgr = None
     var rpcs: ?xecli_data.rpc_root = None
     var finished = False
@@ -754,7 +944,7 @@ actor _test_live_iosxe(t: testing.EnvT):
         else:
             t.success()
 
-    def sha512_checked(out: ?xecli_data.stratoweave_iosxe_cli__checksum__output, err: ?Exception):
+    def sha512_checked(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception):
         try:
             if err is not None:
                 raise err
@@ -765,7 +955,7 @@ actor _test_live_iosxe(t: testing.EnvT):
             return
         finish(None)
 
-    def md5_checked(out: ?xecli_data.stratoweave_iosxe_cli__checksum__output, err: ?Exception):
+    def md5_checked(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception):
         r = rpcs
         try:
             if err is not None:
@@ -775,7 +965,7 @@ actor _test_live_iosxe(t: testing.EnvT):
             finish(e)
             return
         if r is not None:
-            r.checksum(sha512_checked, xecli_data.stratoweave_iosxe_cli__checksum__input("bootflash:", file, "sha512"))
+            r.verify(sha512_checked, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", file, "sha512"))
 
     def listed(tree: ?gdata.Node, err: ?Exception):
         r = rpcs
@@ -795,7 +985,7 @@ actor _test_live_iosxe(t: testing.EnvT):
             finish(e)
             return
         if r is not None:
-            r.checksum(md5_checked, xecli_data.stratoweave_iosxe_cli__checksum__input("bootflash:", file, "md5"))
+            r.verify(md5_checked, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", file, "md5"))
 
     def connected():
         d = dev
@@ -808,21 +998,86 @@ actor _test_live_iosxe(t: testing.EnvT):
     def on_reconf(name: str):
         pass
 
-    def credentials() -> Credentials:
-        c = Credentials(setting("IOSXE_CLI_USERNAME", "admin"))
-        key_file = setting("IOSXE_CLI_KEY", "")
-        if key_file != "":
-            f = ReadFile(ReadFileCap(FileCap(t.env.cap)), key_file)
-            c.key.create("live", f.read().decode())
-            f.close()
-        else:
-            c.password = setting("IOSXE_CLI_PASSWORD", "admin")
-        return c
-
     if file == "" or md5 == "":
         finish(ValueError("set IOSXE_CLI_FILE and IOSXE_CLI_MD5"))
     else:
-        dev = _device(t, xecli.IosXeCliAdapter, on_reconf, setting("IOSXE_CLI_ADDRESS", "127.0.0.1"),
-                      int(setting("IOSXE_CLI_PORT", "22")), credentials(),
-                      [a for a in setting("IOSXE_CLI_PUBLIC_KEY_ALGORITHMS", "").split(",") if a != ""])
+        dev = _device(t, xecli.IosXeCliAdapter, on_reconf, _setting(t, "IOSXE_CLI_ADDRESS", "127.0.0.1"),
+                      int(_setting(t, "IOSXE_CLI_PORT", "22")), _live_credentials(t), _public_key_algorithms(t))
+        connected()
+
+
+actor _test_live_iosxe_beside_netconf(t: testing.EnvT):
+    """Run the RPCs of the CLI adapter on a real device that also has NETCONF.
+
+    NETCONF is the primary adapter. The CLI adapter is an extra adapter with
+    its own SSH settings.
+    """
+    t.require("iosxe-cli")
+    t.timeout(300.0)
+
+    file = _setting(t, "IOSXE_CLI_FILE", "")
+    md5 = _setting(t, "IOSXE_CLI_MD5", "").lower()
+    image = _setting(t, "IOSXE_CLI_IMAGE", "")
+    var dev: ?swdev.DeviceMgr = None
+    var rpcs: ?xecli_data.rpc_root = None
+    var finished = False
+
+    def finish(err: ?Exception):
+        if finished:
+            return
+        finished = True
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def image_checked(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception):
+        try:
+            if err is not None:
+                raise err
+            testing.assertEqual(out.verified if out is not None else None, True, image + " is verified")
+        except Exception as e:
+            finish(e)
+            return
+        finish(None)
+
+    def md5_checked(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception):
+        r = rpcs
+        try:
+            if err is not None:
+                raise err
+            testing.assertEqual(out.digest if out is not None else None, md5)
+            testing.assertEqual(out.verified if out is not None else None, True, "the device finds the MD5 equal")
+        except Exception as e:
+            finish(e)
+            return
+        if r is not None:
+            r.verify(image_checked, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", image))
+
+    def connected():
+        d = dev
+        if d is not None:
+            mods = d.get_modules().0
+            if xecli_yang.MODULE in mods and "Cisco-IOS-XE-native" in mods:
+                r = xecli_data.rpc_root(swdev.DeviceTreeProvider(d))
+                rpcs = r
+                r.verify(md5_checked, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", file, "md5", md5))
+                return
+        after 0.1: connected()
+
+    if file == "" or md5 == "" or image == "":
+        finish(ValueError("set IOSXE_CLI_FILE, IOSXE_CLI_MD5 and IOSXE_CLI_IMAGE"))
+    else:
+        types = {
+            "iosxe": swdev.DeviceType("iosxe", swna.NetconfAdapter, yschema.DRoot()),
+            "iosxe-cli": swdev.DeviceType("iosxe-cli", xecli.IosXeCliAdapter, yang.compile(xecli_yang.models)),
+        }
+        d = swdev.DeviceMgr(types, t.env, "xe", t.log_handler, lambda name: None, swdev.SchemaRegistry())
+        dmc = Dmc("xe", _live_credentials(t), type="iosxe")
+        dmc.address.create("primary", _setting(t, "IOSXE_CLI_ADDRESS", "127.0.0.1"),
+                           port=u64(int(_setting(t, "IOSXE_NETCONF_PORT", "830"))))
+        extra = dmc.extra_adapter.create("iosxe-cli", port=u64(int(_setting(t, "IOSXE_CLI_PORT", "22"))))
+        extra.ssh = ExtraSsh(public_key_algorithm=_public_key_algorithms(t))
+        d.set_dmc(dmc)
+        dev = d
         connected()

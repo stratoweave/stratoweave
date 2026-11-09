@@ -29,7 +29,7 @@ DEFAULT_FILE_SYSTEMS = ["bootflash:"]
 ## than a second on a C8000V.
 COMMAND_TIMEOUT = 60.0
 
-## Seconds that the command of an RPC can run. The checksum RPC runs verify:
+## Seconds that the command of an RPC can run. The verify RPC runs verify:
 ## MD5 of an 838 MB image takes 23 s on a C8000V.
 RPC_TIMEOUT = 600.0
 
@@ -78,13 +78,32 @@ def dir_command(file_system: str) -> str:
     return "dir " + file_system
 
 
-def verify_command(file_system: str, file: str, algorithm: str) -> str:
-    """Return the command that computes the checksum of a file."""
+def _digest_length(algorithm: str) -> int:
+    return 32 if algorithm == "md5" else 128
+
+
+def verify_command(file_system: str, file: str, algorithm: ?str=None, expected: ?str=None) -> str:
+    """Return the verify command for a file.
+
+    With an algorithm, the command computes the checksum of the file, and
+    with an expected hash it also compares the checksum with the hash.
+    Without an algorithm, the command checks an IOS XE image.
+    """
     check_file_system(file_system)
     check_file(file)
-    if algorithm not in ["md5", "sha512"]:
-        raise ValueError("unsupported checksum algorithm: " + algorithm)
-    return "verify /" + algorithm + " " + file_system + file
+    if algorithm is not None:
+        if algorithm not in ["md5", "sha512"]:
+            raise ValueError("unsupported checksum algorithm: " + algorithm)
+        command = "verify /" + algorithm + " " + file_system + file
+        if expected is not None:
+            length = _digest_length(algorithm)
+            if len(expected) != length or any([c not in _HEX for c in expected.lower()]):
+                raise ValueError("invalid " + algorithm + " hash: " + expected + ". Use " + str(length) + " hexadecimal digits")
+            command += " " + expected.lower()
+        return command
+    if expected is not None:
+        raise ValueError("a hash needs an algorithm")
+    return "verify " + file_system + file
 
 
 def _digits(s: str) -> bool:
@@ -197,19 +216,98 @@ def parse_verify(output: str, file_system: str, file: str, algorithm: str) -> st
     if err is not None:
         raise CommandError(err)
     marker = "verify /" + algorithm + " (" + file_system + file + ") = "
-    length = 32 if algorithm == "md5" else 128
     digest: ?str = None
     for line in lines:
         if line.startswith(marker):
             if digest is not None:
                 raise CommandError("verify output has more than one result")
-            value = line[len(marker):].lower()
-            if len(value) != length or any([c not in _HEX for c in value]):
-                raise CommandError("verify output has an invalid digest: " + line)
-            digest = value
+            digest = _digest(line, len(marker), algorithm)
     if digest is not None:
         return digest
     raise CommandError("verify output has no result for " + file_system + file)
+
+
+def _digest(line: str, start: int, algorithm: str) -> str:
+    """Return the digest at start of a result line of verify."""
+    value = line[start:].strip().lower()
+    if len(value) != _digest_length(algorithm) or any([c not in _HEX for c in value]):
+        raise CommandError("verify output has an invalid digest: " + line)
+    return value
+
+
+def parse_verify_hash(output: str, file_system: str, file: str, algorithm: str) -> (digest: str, verified: bool):
+    """Read the result of verify_command(file_system, file, algorithm, expected).
+
+    The device prints the checksum after Verified when it is equal to the
+    expected hash. When it is not, the device prints %Error verifying and
+    then the computed checksum. Raise CommandError when the output has
+    neither, or when the device reports another error.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    path = file_system + file
+    verified = "Verified (" + path + ") = "
+    computed = "Computed signature"
+    for i in range(len(lines)):
+        line = lines[i]
+        if line.startswith(verified):
+            return (digest=_digest(line, len(verified), algorithm), verified=True)
+        if line == "%Error verifying " + path:
+            for later in lines[i + 1:]:
+                if later.startswith(computed) and "=" in later:
+                    return (digest=_digest(later, later.find("=") + 1, algorithm), verified=False)
+            raise CommandError("verify output has no computed checksum for " + path)
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    raise CommandError("verify output has no result for " + path)
+
+
+def parse_verify_image(output: str, file_system: str, file: str) -> bool:
+    """Read the result of verify_command(file_system, file).
+
+    The output holds an embedded and a computed hash for each algorithm. A
+    long hash continues on the next lines. Return True if each pair of hashes
+    is equal and the device verified the digital signature of this file.
+    Return False if not. Raise CommandError if the device cannot check the
+    file, or if the output has no hashes.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    embedded: dict[str, str] = {}
+    computed: dict[str, str] = {}
+    signed = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if line.endswith("does not support verification."):
+            raise CommandError(line)
+        if line == "Digital signature successfully verified in file " + file_system + file:
+            signed = True
+        if line.startswith("Embedded Hash") or line.startswith("Computed Hash"):
+            colon = line.find(":")
+            words = line[:colon].split() if colon > 0 else []
+            if len(words) != 3:
+                raise CommandError("unexpected verify line: " + line)
+            value = line[colon + 1:].strip().lower()
+            while i < len(lines) and lines[i] != "" and all([c in _HEX for c in lines[i].lower()]):
+                value += lines[i].lower()
+                i += 1
+            if words[0] == "Embedded":
+                embedded[words[2]] = value
+            else:
+                computed[words[2]] = value
+    if len(embedded) == 0 and len(computed) == 0:
+        raise CommandError("verify output has no hashes for " + file_system + file)
+    if len(embedded) != len(computed):
+        return False
+    for algorithm, value in embedded.items():
+        got = computed.get(algorithm)
+        if got is None or got != value:
+            return False
+    return signed
 
 
 def parse_version(output: str) -> xecli_data.stratoweave_iosxe_cli__version:
@@ -347,21 +445,30 @@ class Call(object):
     reply: proc(output: str) -> gdata.Node
 
 
-class ChecksumCall(Call):
-    """Run the checksum RPC with verify."""
+class VerifyCall(Call):
+    """Run the verify RPC."""
     file_system: str
     file: str
-    algorithm: str
+    algorithm: ?str
+    expected: ?str
 
-    def __init__(self, inp: xecli_data.stratoweave_iosxe_cli__checksum__input):
-        self.command = verify_command(inp.file_system, inp.file, inp.algorithm)
+    def __init__(self, inp: xecli_data.stratoweave_iosxe_cli__verify__input):
+        self.command = verify_command(inp.file_system, inp.file, inp.algorithm, inp.hash)
         self.file_system = inp.file_system
         self.file = inp.file
         self.algorithm = inp.algorithm
+        self.expected = inp.hash
 
     def reply(self, output: str) -> gdata.Node:
-        digest = parse_verify(output, self.file_system, self.file, self.algorithm)
-        return xecli_data.stratoweave_iosxe_cli__checksum__output(digest=digest).to_gdata()
+        algorithm = self.algorithm
+        if algorithm is not None:
+            if self.expected is not None:
+                r = parse_verify_hash(output, self.file_system, self.file, algorithm)
+                return xecli_data.stratoweave_iosxe_cli__verify__output(digest=r.digest, verified=r.verified).to_gdata()
+            digest = parse_verify(output, self.file_system, self.file, algorithm)
+            return xecli_data.stratoweave_iosxe_cli__verify__output(digest=digest).to_gdata()
+        verified = parse_verify_image(output, self.file_system, self.file)
+        return xecli_data.stratoweave_iosxe_cli__verify__output(verified=verified).to_gdata()
 
 
 def rpc_call(request: gdata.Node) -> Call:
@@ -371,8 +478,8 @@ def rpc_call(request: gdata.Node) -> Call:
     if len(items) != 1:
         raise ValueError("an RPC request must have exactly one child")
     rpc_id, body = items[0]
-    if rpc_id == gdata.Id(xecli_yang.NS, "checksum"):
-        return ChecksumCall(xecli_data.stratoweave_iosxe_cli__checksum__input.from_gdata(body))
+    if rpc_id == gdata.Id(xecli_yang.NS, "verify"):
+        return VerifyCall(xecli_data.stratoweave_iosxe_cli__verify__input.from_gdata(body))
     raise ValueError("RPC " + str(rpc_id) + " is not supported by the IOS XE CLI adapter")
 
 
