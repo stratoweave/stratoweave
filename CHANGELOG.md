@@ -46,6 +46,9 @@
 - Reading a big list is faster. The list asks all its entries at once, so
   they are read on all worker threads instead of one after the other, and a
   transform entry no longer copies its data to add list keys it already has.
+  With the RESTCONF `fields` parameter on a path with no list entry in it,
+  each transform entry also returns only the selected nodes. At 100k devices
+  the fleetmgr device list reads in 0.5 s instead of 1 s.
 
 ### Northbound APIs
 - Fixed NETCONF `<get-config>` returning the operational state published by

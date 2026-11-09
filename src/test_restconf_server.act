@@ -11,8 +11,10 @@ import logging
 import testing
 
 import yang
+import yang.gdata as gdata
 
 import restconf as swrestconf
+import ttt
 import test_netconf_server as fixture
 
 
@@ -204,6 +206,132 @@ actor _test_get_fields(t: testing.AsyncT):
         _put("cpe-17", '<device xmlns="urn:demo-fleet"><name>cpe-17</name></device>', _on_put_cpe17)
 
     _put("cpe-16", '<device xmlns="urn:demo-fleet"><name>cpe-16</name><software><target>2.0</target></software></device>', _on_put_cpe16)
+
+
+# The device list of test_netconf_server in a container, so that a GET of
+# the container with fields has no list entry in its path
+FLEET_CONTAINER_YANG = r"""module demo-fleet {
+  yang-version "1.1";
+  namespace "urn:demo-fleet";
+  prefix df;
+  container fleet {
+    list device {
+      key name;
+      leaf name { type string; }
+      container software {
+        leaf target { type string; }
+        container state {
+          config false;
+          leaf status { type string; }
+        }
+      }
+    }
+  }
+}"""
+
+
+actor _test_get_fields_container(t: testing.AsyncT):
+    """A GET of a container with fields reads in each list entry below it
+    only what fields selects, and answers as if the container were read
+    whole and narrowed afterwards. That includes a container with no
+    devices, which is answered empty, or not at all for content=nonconfig."""
+    http_root = http_router.Router()
+    layer = ttt.Layer("top", ttt.Container({
+        gdata.Id(fixture.FLEET_NS, "fleet"): ttt.Container({gdata.Id(fixture.FLEET_NS, "device"): fixture.fleet_devices()}, ns=fixture.FLEET_NS, module="demo-fleet"),
+    }), None)
+    swrestconf.RestconfServer(http_root, logging.Logger(t.log_handler), yang.compile([FLEET_CONTAINER_YANG]), yang.compile([FLEET_CONTAINER_YANG]), layer)
+
+    fleet = "/restconf/data/demo-fleet:fleet"
+    xml = "application/yang-data+xml"
+    # Read before the devices are added
+    empty_requests: list[(str, ?str)] = [
+        ("{fleet}?fields=device(name)", None),
+        ("{fleet}?content=nonconfig&fields=device(name)", None),
+    ]
+    requests: list[(str, ?str)] = [
+        ("{fleet}?fields=device(software/target)", None),
+        ("{fleet}?fields=device(software/target)", xml),
+        ("{fleet}?fields=device(software(target;state))", None),
+        ("{fleet}?content=config&fields=device(software(target;state))", None),
+        ("{fleet}?content=nonconfig&fields=device(software/target)", None),
+        ("{fleet}?content=nonconfig&fields=device(software/state)", None),
+        ("{fleet}?fields=device(name)", None),
+        ("{fleet}?fields=device", None),
+    ]
+    devices = ["cpe-16", "cpe-17"]
+    var ready = 0
+    var current = 0
+    var res = []
+
+    def _get(path: str, accept: ?str, on_response: proc(int, dict[str, str], str) -> None):
+        headers = {"accept": accept} if accept is not None else {}
+        http_root.serve(http.Request("GET", path, b"1.1", headers, b""), on_response)
+
+    def _put(name: str, body: str, on_response: proc(int, dict[str, str], str) -> None):
+        headers = {"content-type": "application/yang-data+xml"}
+        http_root.serve(http.Request("PUT", "{fleet}/device={name}", b"1.1", headers, body.encode()), on_response)
+
+    def _record(path: str, accept: ?str, status: int, body: str):
+        suffix = " (XML)" if accept is not None else ""
+        res.append("GET {path}{suffix}\n{status} {body}")
+
+    def _send_empty():
+        path, accept = empty_requests[current]
+        _get(path, accept, _on_empty_response)
+
+    def _on_empty_response(status: int, headers: dict[str, str], body: str):
+        path, accept = empty_requests[current]
+        _record(path, accept, status, body)
+        current += 1
+        if current < len(empty_requests):
+            _send_empty()
+        else:
+            current = 0
+            _put("cpe-16", '<device xmlns="urn:demo-fleet"><name>cpe-16</name><software><target>2.0</target></software></device>', _on_put_cpe16)
+
+    def _on_put_cpe16(status: int, headers: dict[str, str], body: str):
+        if status != 201:
+            t.failure(ValueError("PUT cpe-16 returned {status}: {body}"))
+            return
+        # cpe-17 has no software/target
+        _put("cpe-17", '<device xmlns="urn:demo-fleet"><name>cpe-17</name></device>', _on_put_cpe17)
+
+    def _on_put_cpe17(status: int, headers: dict[str, str], body: str):
+        if status != 201:
+            t.failure(ValueError("PUT cpe-17 returned {status}: {body}"))
+            return
+        _wait_state()
+
+    def _wait_state():
+        """Wait for the oper state of each device, so it is in the GETs."""
+        if ready < len(devices):
+            _get("{fleet}/device={devices[ready]}/software/state", None, _on_state)
+        else:
+            _send()
+
+    def _on_state(status: int, headers: dict[str, str], body: str):
+        if status == 200:
+            ready += 1
+            _wait_state()
+        elif status == 404 and body == "No data at path":
+            after 0.01: _wait_state()
+        else:
+            t.failure(ValueError("GET state of {devices[ready]} returned {status}: {body}"))
+
+    def _send():
+        path, accept = requests[current]
+        _get(path, accept, _on_response)
+
+    def _on_response(status: int, headers: dict[str, str], body: str):
+        path, accept = requests[current]
+        _record(path, accept, status, body)
+        current += 1
+        if current < len(requests):
+            _send()
+        else:
+            t.success("\n".join(res))
+
+    _send_empty()
 
 
 actor _test_query_bad_request(t: testing.AsyncT):

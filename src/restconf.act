@@ -77,6 +77,31 @@ proc def _reject_query_repeats(next_handler: proc(http_router.Context, proc(int,
     return wrapped
 
 
+def _fields_content(content: ttt.Content) -> ttt.Content:
+    if isinstance(content, ttt.ContentConfig):
+        return ttt.ContentConfig(fields=True)
+    elif isinstance(content, ttt.ContentOper):
+        return ttt.ContentOper(fields=True)
+    return ttt.ContentAll(fields=True)
+
+
+def _path_fields_fnode(path_elements: list[ydata.PathElement], fields: list[ygdata.FNode]) -> ?ygdata.FNode:
+    """The read filter for a path with the fields selection under its
+    target, or None when the path goes through a list, where the key and
+    the selection would share the filter of the entry."""
+    inner: ?ygdata.FNode = None
+    for i in range(len(path_elements) - 1, -1, -1):
+        node = path_elements[i].node
+        if isinstance(node, yschema.DList):
+            return None
+        node_id = None if isinstance(node, yschema.DRoot) else node.gname
+        if inner is not None:
+            inner = ygdata.FNode(node_id, children=[inner])
+        else:
+            inner = ygdata.FNode(node_id, children=fields)
+    return inner
+
+
 def _path_elements_to_fnode(path_elements: list[ydata.PathElement]) -> ygdata.FNode:
     """Convert resolved path elements to an FNode filter tree.
 
@@ -151,10 +176,10 @@ def _node_with_ns(node: ygdata.Node, snode: yschema.DNode) -> ygdata.Node:
     raise ValueError("Unexpected node type for RESTCONF GET serialization: {type(node)}")
 
 
-def _respond_restconf_subtree(path_elements: list[ydata.PathElement], data: ?ygdata.Node, fields: ?list[ygdata.FNode], accept: ?str, respond: proc(int, dict[str, str], str) -> None,
-) -> None:
+def _target_node(path_elements: list[ydata.PathElement], data: ?ygdata.Node) -> ?ygdata.Node:
+    """The node at the end of path_elements in data, a read filtered by that
+    path, or None when it is not there."""
     if data is not None:
-        # Walk the (already filtered) tree to the target node so we only return its subtree.
         node = data
         for elem in path_elements[1:]:
             maybe_list = node  # avoids widening a narrowed loop var (node)
@@ -162,16 +187,21 @@ def _respond_restconf_subtree(path_elements: list[ydata.PathElement], data: ?ygd
                 # We already filtered the list to the matching entry;
                 # descend into that entry before looking for the next child.
                 if len(maybe_list.elements) == 0:
-                    respond(404, {}, "No data at path")
-                    return
+                    return None
                 node = list(maybe_list.elements.values())[0]
             child = node.children.get(elem.node.gname)
             if child is not None:
                 node = child
             else:
-                respond(404, {}, "No data at path")
-                return
+                return None
+        return node
+    return None
 
+
+def _respond_restconf_subtree(path_elements: list[ydata.PathElement], target: ?ygdata.Node, fields: ?list[ygdata.FNode], accept: ?str, respond: proc(int, dict[str, str], str) -> None,
+) -> None:
+    if target is not None:
+        node = target
         if fields is not None:
             # A list entry target is in the response whatever fields selects
             # in it, so its keys are selected too
@@ -284,7 +314,18 @@ actor RestconfServer(
                 data = northbound.read_data(cfs, _monitoring_gdata, None, content)
                 _respond_restconf_subtree(path_elements, data if data is not None else ygdata.Container(), fields, accept, respond)
             else:
-                _respond_restconf_subtree(path_elements, northbound.read_data(cfs, _monitoring_gdata, _path_elements_to_fnode(path_elements), content), fields, accept, respond)
+                pushed: ?ygdata.FNode = None
+                if fields is not None and path_elements[1].node.namespace not in _monitoring_gdata:
+                    pushed = _path_fields_fnode(path_elements, fields)
+                target: ?ygdata.Node = None
+                if pushed is not None:
+                    # Each transform reads only what fields selects
+                    target = _target_node(path_elements, northbound.read_data(cfs, _monitoring_gdata, pushed, _fields_content(content)))
+                if target is None:
+                    # A read with fields can't tell a target with nothing
+                    # selected in it from an absent one, so read the path
+                    target = _target_node(path_elements, northbound.read_data(cfs, _monitoring_gdata, _path_elements_to_fnode(path_elements), content))
+                _respond_restconf_subtree(path_elements, target, fields, accept, respond)
 
     def _router_handle_restconf_delete(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
         input_config = yang.restconf.from_json_path(top_schema, None, _split_restconf_path(ctx.param("rest_path")), ydata.OP_REMOVE, loose=True)
