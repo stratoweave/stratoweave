@@ -1,11 +1,11 @@
 import { restconfGetCachedOrNull } from '#lib/core/restconf/client.ts';
 import { devicesText, groupRows } from '#lib/software/groups.ts';
 import {
-  FLEET_ROOT,
+  CAMPAIGN_SETTINGS,
+  FLEET_LIST,
   IMAGES_ROOT,
   REDUNDANCY_GROUPS_ROOT,
   SCHEDULES_ROOT,
-  SOFTWARE_CONFIG,
   parseCampaigns,
   parseFleet,
   parseGroupSeparations,
@@ -50,14 +50,14 @@ function entries(route: string, items: { name: string; description?: string }[])
     .sort((a, b) => (a.label < b.label ? -1 : a.label > b.label ? 1 : 0));
 }
 
-// Reads go through the shared read cache, so the palette and the devices,
-// schedules and new-campaign pages fetch the fleet once per 30 s between them.
+// Reads go through the shared read cache, so the palette and the devices
+// and new-campaign pages fetch the fleet list once per 30 s between them.
 export const SOURCES: PaletteSource[] = [
   {
     category: 'Campaigns',
     listHref: () => '/campaigns',
     load: async () => {
-      const campaigns = parseCampaigns(await restconfGetCachedOrNull<unknown>(SOFTWARE_CONFIG));
+      const campaigns = parseCampaigns(await restconfGetCachedOrNull<unknown>(CAMPAIGN_SETTINGS));
       return entries('campaigns', campaigns.map((c) => ({ name: c.name, description: c.adminState })));
     }
   },
@@ -73,7 +73,7 @@ export const SOURCES: PaletteSource[] = [
     category: 'Devices',
     listHref: (query) => (query ? `/devices?name=${encodeURIComponent(query)}` : '/devices'),
     load: async () => {
-      const { devices } = parseFleet(await restconfGetCachedOrNull<unknown>(FLEET_ROOT));
+      const { devices } = parseFleet(await restconfGetCachedOrNull<unknown>(FLEET_LIST));
       return entries('devices', devices.map((d) => ({ name: d.name, description: d.address })));
     }
   },
@@ -82,7 +82,7 @@ export const SOURCES: PaletteSource[] = [
     listHref: () => '/groups',
     load: async () => {
       const [fleet, groups] = await Promise.all([
-        restconfGetCachedOrNull<unknown>(FLEET_ROOT),
+        restconfGetCachedOrNull<unknown>(FLEET_LIST),
         restconfGetCachedOrNull<unknown>(REDUNDANCY_GROUPS_ROOT)
       ]);
       const rows = groupRows(parseFleet(fleet).devices, parseGroupSeparations(groups));

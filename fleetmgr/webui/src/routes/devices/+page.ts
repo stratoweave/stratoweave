@@ -1,6 +1,6 @@
 import { errorText } from '#lib/core/errors.ts';
 import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
-import { FLEET_ROOT, SCHEDULES_ROOT, parseFleet, parseSchedules, type Device, type Schedule } from '#lib/software/model.ts';
+import { FLEET_LIST, SCHEDULES_ROOT, parseFleet, parseSchedules, type Device, type Schedule } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 
@@ -9,10 +9,10 @@ async function loadFleet(
 ): Promise<{ devices: Device[]; schedules: Schedule[]; loadError: string }> {
   try {
     // The small read first: the top answers GETs one at a time, and the
-    // fleet takes 4 s at 100k devices.
+    // fleet list takes over 3 s at 100k devices.
     const [schedules, fleet] = await Promise.all([
       restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch),
-      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch)
+      restconfGetCachedOrNull<unknown>(FLEET_LIST, fetch)
     ]);
     return { devices: parseFleet(fleet).devices, schedules: parseSchedules(schedules), loadError: '' };
   } catch (loadError) {

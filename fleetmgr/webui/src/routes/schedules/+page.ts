@@ -1,9 +1,9 @@
 import { errorText } from '#lib/core/errors.ts';
 import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import {
-  FLEET_ROOT,
+  CAMPAIGN_SETTINGS,
+  FLEET_SCHEDULES,
   SCHEDULES_ROOT,
-  SOFTWARE_CONFIG,
   parseCampaigns,
   parseFleet,
   parseSchedules
@@ -24,8 +24,8 @@ async function loadSchedules(fetch: typeof globalThis.fetch) {
 async function loadUsage(fetch: typeof globalThis.fetch) {
   try {
     const [software, fleet] = await Promise.all([
-      restconfGetOrNull<unknown>(SOFTWARE_CONFIG, fetch),
-      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch)
+      restconfGetOrNull<unknown>(CAMPAIGN_SETTINGS, fetch),
+      restconfGetCachedOrNull<unknown>(FLEET_SCHEDULES, fetch)
     ]);
     return { devices: parseFleet(fleet).devices, campaigns: parseCampaigns(software), loadError: '' };
   } catch (loadError) {
@@ -34,7 +34,7 @@ async function loadUsage(fetch: typeof globalThis.fetch) {
 }
 
 // Not awaited, and the schedules apart and first: the calendar shows
-// before the fleet is in, which takes 4 s at 100k devices.
+// before the schedule bindings, which take over 1 s at 100k devices.
 export const load: PageLoad = ({ fetch, depends }) => {
   depends('data:schedules');
   const schedules = loadSchedules(fetch);

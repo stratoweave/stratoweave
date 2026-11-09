@@ -18,6 +18,20 @@ export const FLEET_DEVICE_LIST_ROOT = 'data/fleetmgr:fleet/device';
 export const REDUNDANCY_GROUPS_ROOT = 'data/fleetmgr:redundancy-groups';
 export const REDUNDANCY_GROUP_LIST_ROOT = `${REDUNDANCY_GROUPS_ROOT}/redundancy-group`;
 
+// Smaller reads with the RFC 8040 fields parameter. A list entry with
+// nothing selected in it is left out, so a read that needs every entry
+// selects its key. Pages that share one of these share its cached read.
+/** The fleet as parseFleet reads it: no credentials or mock settings,
+ * which are most of a device entry. */
+export const FLEET_LIST = `${FLEET_ROOT}?fields=device(name;type;description;schedule;address(address;port);redundancy-group;redundancy-priority;state/platform(model;version;serial-number))`;
+/** The devices bound to a schedule, with the binding. Config only: the
+ * state of 100k devices doubles the time of the read. */
+export const FLEET_SCHEDULES = `${FLEET_ROOT}?content=config&fields=device/schedule`;
+/** The campaigns with their admin state and default schedule only. */
+export const CAMPAIGN_SETTINGS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign(name;admin-state;default-schedule)`;
+/** The campaigns that have devices, with the names of their devices only. */
+export const CAMPAIGN_MEMBERS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign/device/name`;
+
 export type AdminState = 'plan' | 'run';
 
 // ── Wire types: YANG-JSON exactly as it crosses /restconf/data ──
@@ -638,6 +652,18 @@ export function parseCampaignConfigs(json: unknown): CampaignConfig[] {
 export function parseDeviceStatusEntry(json: unknown, device: string): DeviceStatusRow {
   const rows = (json as { 'software:device-status'?: DeviceStatusJson[] })?.['software:device-status'];
   return parseRow(rows?.[0] ?? { device });
+}
+
+/** The image in a GET of one campaign's device={device}: '' for none,
+ * null when the device is not a member (404). */
+export function parseMemberImage(json: unknown): string | null {
+  const entries = (json as { 'software:device'?: CampaignMemberJson[] })?.['software:device'];
+  return entries && entries.length > 0 ? (entries[0].image ?? '') : null;
+}
+
+/** A campaign's state/plan with only what planStartOf reads. */
+export function planStartsPath(campaignEntry: string): string {
+  return `${campaignEntry}/state/plan?fields=window/device(name;started;estimated-start)`;
 }
 
 /** A device's start in a GET of one campaign's state/plan: real once
