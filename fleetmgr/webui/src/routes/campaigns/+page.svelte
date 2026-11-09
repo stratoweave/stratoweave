@@ -6,7 +6,6 @@
   import CampaignProgress from '#lib/software/CampaignProgress.svelte';
   import { createPoller, nextSeq } from '#lib/core/polling/poller.ts';
   import { withSignal } from '#lib/core/restconf/client.ts';
-  import { releasesOf } from '#lib/software/campaign-images.ts';
   import { fetchCounters } from '#lib/software/counters.ts';
   import type { Campaign, CampaignCounters } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
@@ -82,8 +81,8 @@
   <div>
     <h1>Upgrade campaigns</h1>
     <p>
-      Each campaign upgrades its own devices to a target release, a few at a
-      time, as their maintenance schedules open.
+      Each campaign upgrades its own devices, a few at a time, as their
+      maintenance schedules open.
     </p>
   </div>
   <div class="page-actions">
@@ -126,13 +125,12 @@
         <thead>
           <tr>
             <th>Campaign</th>
-            <th>Release</th>
             <th>Mode</th>
-            <th class="right">Devices</th>
+            <th>Devices</th>
             <th>Plan</th>
             <th class="state-col">State</th>
-            <th class="right">Succeeded</th>
-            <th class="right">Failed</th>
+            <th>Succeeded</th>
+            <th>Failed</th>
           </tr>
         </thead>
         <tbody>
@@ -143,11 +141,10 @@
                   {campaign.name}
                 </a>
               </td>
-              <td class="mono tn" data-label="Release">{releasesOf(campaign.images, data.images).join(', ') || '—'}</td>
               <td data-label="Mode">
                 <AdminStatePill state={campaign.adminState} />
               </td>
-              <td class="tn right" data-label="Devices">{campaign.devices.length.toLocaleString()}</td>
+              <td class="tn" data-label="Devices">{campaign.devices.length.toLocaleString()}</td>
               <td class="plan-cell" data-label="Plan">
                 {#if campaign.counters !== null}
                   {@const alarms = data.alarms[campaign.name] ?? []}
@@ -169,8 +166,8 @@
                   <span class="dim">—</span>
                 {/if}
               </td>
-              <td class="tn right" data-label="Succeeded">{campaign.counters?.succeeded.toLocaleString() ?? '—'}</td>
-              <td class="tn right" class:failed-cell={(campaign.counters?.failed ?? 0) > 0} data-label="Failed">
+              <td class="tn" data-label="Succeeded">{campaign.counters?.succeeded.toLocaleString() ?? '—'}</td>
+              <td class="tn" class:failed-cell={(campaign.counters?.failed ?? 0) > 0} data-label="Failed">
                 {campaign.counters?.failed.toLocaleString() ?? '—'}
               </td>
             </tr>
