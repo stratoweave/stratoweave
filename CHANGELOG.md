@@ -5,10 +5,11 @@
 ### Core
 - Transform actors can write their output to the layer below at any time
   with `write_output`, each write in its own transaction. Enable it with
-  `sw:direct-output` under `sw:transform`. The transform function should
-  then return an empty output, or the output is repeated. A write is
-  replayed after a conflicting commit. `fleetmgr.cfs.UpgradeCampaignTransform`
-  is an example. [#698] [#731]
+  `sw:direct-output` under `sw:transform`. The transform function then gets
+  the output written last, `prev_output`, and should return what the actor
+  would write for its input, so a recompute keeps the actor's output. A
+  write is replayed after a conflicting commit.
+  `fleetmgr.cfs.UpgradeCampaignTransform` is an example. [#698] [#731]
 - A transform's output replaces the configuration it wrote before, instead of
   being applied as a diff. Fixed source deletion, concurrent edits, restored
   list membership and subscriptions on newly committed list elements. [#680]
