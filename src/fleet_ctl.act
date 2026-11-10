@@ -560,15 +560,19 @@ class Controller(object):
     # Derived from the configuration and the state by rebuild().
     # Per window: the devices that can start in it, in order and by
     # estimate; the devices promised to it, in the order of the promises;
-    # each with the place where the devices not looked at yet begin; and
-    # how many devices that can start in it wait. A device that did not
-    # fit is looked at again when the slow time falls.
+    # and each with the place where the devices not looked at yet begin. A
+    # device that did not fit is looked at again when the slow time falls.
     queue: list[list[str]]
     by_est: list[list[str]]
     pqueue: list[list[str]]
     qcur: list[int]
     ecur: list[int]
     pcur: list[int]
+    # Per window: the place of its schedule in waiting and waiting_est, or
+    # -1 when the schedules do not give it. Per schedule with a window: how
+    # many of its devices wait, and their estimates in total. The windows of
+    # a schedule have the same waiting devices.
+    sched_at: list[int]
     waiting: list[int]
     waiting_est: list[int]
     # Per window: whether the schedules give it, and whether its promises
@@ -705,6 +709,7 @@ class Controller(object):
         self.qcur = []
         self.ecur = []
         self.pcur = []
+        self.sched_at = []
         self.waiting = []
         self.waiting_est = []
         self.is_current = []
@@ -1007,19 +1012,25 @@ class Controller(object):
         windows = [(k.1, k.0, k.2) for k in sorted([(w.1, w.0, w.2) for w in keys])]
         index: dict[(str, int, int), int] = {}
         queue: list[list[str]] = []
+        sched_at: list[int] = []
         waiting: list[int] = []
         waiting_est: list[int] = []
         by_schedule: dict[str, list[int]] = {}
+        place: dict[str, int] = {}
         for i in range(len(windows)):
             w = windows[i]
             index[w] = i
             queue.append([])
-            waiting.append(0)
-            waiting_est.append(0)
             if w in current:
                 if w.0 not in by_schedule:
                     by_schedule[w.0] = []
+                    place[w.0] = len(waiting)
+                    waiting.append(0)
+                    waiting_est.append(0)
                 by_schedule[w.0].append(i)
+                sched_at.append(place[w.0])
+            else:
+                sched_at.append(-1)
         windows_of: dict[str, list[int]] = {}
         promised: dict[str, (str, int, int)] = {}
         by_promise: list[list[(int, str)]] = [[] for _w in windows]
@@ -1028,9 +1039,10 @@ class Controller(object):
             windows_of[name] = wins
             for i in wins:
                 queue[i].append(name)
-                if name not in self.released:
-                    waiting[i] += 1
-                    waiting_est[i] += self.est[name]
+            if len(wins) > 0 and name not in self.released:
+                k = sched_at[wins[0]]
+                waiting[k] += 1
+                waiting_est[k] += self.est[name]
             # A promise holds to a window of the device's schedule; one to
             # a window the schedules no longer give moves on at the next
             # step.
@@ -1076,6 +1088,7 @@ class Controller(object):
         self.qcur = [0 for _w in windows]
         self.ecur = [0 for _w in windows]
         self.pcur = [0 for _w in windows]
+        self.sched_at = sched_at
         self.waiting = waiting
         self.waiting_est = waiting_est
         self.is_current = [w in current for w in windows]
@@ -1350,15 +1363,22 @@ class Controller(object):
             self.flying.add(name)
             s = self.windows[i].0
             self.in_flight[s] = self.in_flight.get_def(s, 0) + 1
-        for j in self.windows_of.get_def(name, []):
-            self.waiting[j] -= 1
-            self.waiting_est[j] -= self.est.get_def(name, self.estimate_s)
+        wins = self.windows_of.get_def(name, [])
+        if len(wins) > 0:
+            k = self.sched_at[wins[0]]
+            self.waiting[k] -= 1
+            self.waiting_est[k] -= self.est.get_def(name, self.estimate_s)
         if name in self.final_at:
             self.reported.add(name)
             heap_push(self.reports, (self.final_at[name], name))
             self.no_upgrade.add(name)
         elif name in self.est:
             heap_push(self.dues, (self.due[name], name))
+
+    def waiting_in(self, i: int) -> int:
+        """How many devices that can start in window i wait."""
+        k = self.sched_at[i]
+        return self.waiting[k] if k >= 0 else 0
 
     def move_promises(self, t: int) -> None:
         """Promise the devices still waiting for a window that has closed,
@@ -1595,7 +1615,7 @@ class Controller(object):
         open_of: dict[str, list[int]] = {}
         for i in range(len(self.windows)):
             win = self.windows[i]
-            if self.waiting[i] > 0 and win.1 <= t and t < win.2:
+            if self.waiting_in(i) > 0 and win.1 <= t and t < win.2:
                 if win.0 not in open_of:
                     turns.append(win.0)
                     open_of[win.0] = []
@@ -1640,7 +1660,7 @@ class Controller(object):
                 break
             turns = [name for name in turns if name in keep]
         for i in range(len(self.windows)):
-            if self.waiting[i] == 0:
+            if self.waiting_in(i) == 0:
                 continue
             win = self.windows[i]
             if win.1 > t:
@@ -1683,9 +1703,9 @@ class Controller(object):
         for name in turns:
             # Each open window of a schedule has the same waiting devices.
             wins = open_of[name]
-            i = wins[0]
-            work.append(imax(1, self.waiting_est[i] * self.observed_s // self.estimate_s))
-            mean = self.waiting_est[i] // imax(1, self.waiting[i])
+            k = self.sched_at[wins[0]]
+            work.append(imax(1, self.waiting_est[k] * self.observed_s // self.estimate_s))
+            mean = self.waiting_est[k] // imax(1, self.waiting[k])
             margin = mean * self.slow_s // self.estimate_s * self.close_margin // 100
             end = 0
             for j in wins:
@@ -1810,6 +1830,7 @@ class Controller(object):
         c.qcur = list(self.qcur)
         c.ecur = list(self.ecur)
         c.pcur = list(self.pcur)
+        c.sched_at = self.sched_at
         c.waiting = list(self.waiting)
         c.waiting_est = list(self.waiting_est)
         c.parked = copy_set(self.parked)
