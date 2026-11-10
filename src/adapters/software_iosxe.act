@@ -569,6 +569,71 @@ def unsaved_configuration(root: ?ygdata.Node) -> ?str:
     return None
 
 
+def _days_from_civil(y: int, m: int, d: int) -> int:
+    """Days since 1970-01-01 of a proleptic Gregorian date."""
+    yy = y - 1 if m <= 2 else y
+    era = (yy if yy >= 0 else yy - 399) // 400
+    yoe = yy - era * 400
+    mp = m - 3 if m > 2 else m + 9
+    doy = (153 * mp + 2) // 5 + d - 1
+    doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+    return era * 146097 + doe - 719468
+
+
+def epoch_seconds(text: str) -> ?int:
+    """Return the seconds since 1970-01-01 UTC of a yang:date-and-time, as
+    2026-11-10T23:41:31+00:00, with or without fractions of a second, or
+    None when text is not one."""
+    if len(text) < 20 or text[4] != "-" or text[7] != "-" or text[10] != "T" \
+       or text[13] != ":" or text[16] != ":":
+        return None
+    fields = [text[0:4], text[5:7], text[8:10], text[11:13], text[14:16], text[17:19]]
+    if any([len(f) == 0 or any([c not in DIGITS for c in f]) for f in fields]):
+        return None
+    rest = text[19:]
+    if rest.startswith("."):
+        i = 1
+        while i < len(rest) and rest[i] in DIGITS:
+            i += 1
+        rest = rest[i:]
+    offset = 0
+    if rest == "Z":
+        offset = 0
+    elif len(rest) == 6 and (rest[0] == "+" or rest[0] == "-") and rest[3] == ":" \
+         and all([c in DIGITS for c in rest[1:3] + rest[4:6]]):
+        offset = (int(rest[1:3]) * 60 + int(rest[4:6])) * 60
+        if rest[0] == "-":
+            offset = -offset
+    else:
+        return None
+    days = _days_from_civil(int(fields[0]), int(fields[1]), int(fields[2]))
+    return days * 86400 + int(fields[3]) * 3600 + int(fields[4]) * 60 + int(fields[5]) - offset
+
+
+def abort_timer_left(root: ?ygdata.Node, now: int) -> ?int:
+    """Return the seconds before the device goes back to the committed
+    release on its own, from the end time of its auto-abort timer over
+    NETCONF, or from show install summary over the CLI, which says "active ,
+    time before rollback - 00:25:36". None when the timer is not active, or
+    the reply does not say. now is in seconds since 1970-01-01 UTC."""
+    iod = ixoper.root.from_gdata(root).install_oper_data
+    for loc in iod.install_location_information:
+        timer = loc.oper_state.auto_abort_timer
+        state = timer.state
+        end = timer.end_time
+        if state is not None and state == "install-timer-state-active" and end is not None:
+            at = epoch_seconds(end)
+            if at is not None:
+                return at - now
+    text = xecli_data.root.from_gdata(root).install_summary.auto_abort_timer
+    marker = "time before rollback - "
+    if text is not None and text.startswith("active") and marker in text:
+        hms = text[text.find(marker) + len(marker):].strip().split(":")
+        if len(hms) == 3 and all([len(p) > 0 and all([c in DIGITS for c in p]) for p in hms]):
+            return int(hms[0]) * 3600 + int(hms[1]) * 60 + int(hms[2])
+    return None
+
+
 def bundle_image(root: ?ygdata.Node) -> ?str:
     """The image that a device in bundle mode booted, from show version, as
     bootflash:x.bin. None in install mode, which boots packages.conf, and
@@ -1332,12 +1397,23 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _rpcs.install_commit(_on_rpc(_gen, poll_period), commit_input(_uuid))
 
     def commit_window(done: action(?int) -> None) -> None:
+        """The seconds before the device goes back on its own: what its
+        auto-abort timer says, else the timer counted from the activate."""
         a = _activated_at
         if a is None or _committed:
             done(None)
             return
         secs, nanos = time.get_monotonic()
-        done(AUTO_ABORT_TIMER_MIN * 60 - (secs - a!))
+        estimate = AUTO_ABORT_TIMER_MIN * 60 - (secs - a!)
+        def on_versions(root: ?ygdata.Node, err: ?Exception) -> None:
+            now, ns = time.get_realtime()
+            left = abort_timer_left(root, now) if err is None else None
+            if left is not None:
+                _log.info("software: commit window from the device", {"seconds": left, "estimate": estimate})
+                done(left)
+            else:
+                done(estimate)
+        dev.get(on_versions, _versions_filter())
 
     ####################################################################
     # rollback: abort the uncommitted release; device reloads
