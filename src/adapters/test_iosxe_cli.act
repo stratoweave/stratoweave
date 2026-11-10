@@ -15,10 +15,12 @@ import device as swdev
 import adapters.iosxe_cli as xecli
 import adapters.iosxe_cli_data as xecli_data
 import adapters.iosxe_cli_yang as xecli_yang
-from adapters.adapter import DeviceAdapter
+import device_oper as swdevoper
+from adapters.adapter import DeviceAdapter, MockAdapter
 from device_schema import DeviceSchema
 from device_meta_config import stratoweave_rfs__device_entry as Dmc, \
-    stratoweave_rfs__device__credentials as Credentials
+    stratoweave_rfs__device__credentials as Credentials, \
+    stratoweave_rfs__device__extra_adapter__credentials as ExtraCredentials
 
 
 def _crlf(text: str) -> str:
@@ -610,6 +612,105 @@ actor _test_adapter_reads_and_checksums(t: testing.EnvT):
         connected()
 
     server = _FakeXe(t, replies, listening)
+
+
+MODEL_PRIMARY = r"""module xe-primary {
+  yang-version 1.1;
+  namespace "urn:test:xe-primary";
+  prefix xp;
+  container system { config false; leaf hostname { type string; } }
+}"""
+
+
+def _mock_primary(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, dmc: Dmc, registry: swdev.SchemaRegistry,
+                  log_handler: logging.Handler, env: ?Env) -> DeviceAdapter:
+    """A primary adapter that connects at once and serves the modules of its schema."""
+    return MockAdapter(lambda mods, key: dev.on_connect(mods, key), bundled_schema, log_handler, env)
+
+
+actor _test_extra_adapter(t: testing.EnvT):
+    """The CLI adapter as an extra adapter beside a primary. It connects on its
+    own port with its own credentials, serves the reads of its module, and
+    shows as disconnected when its login fails."""
+    t.timeout(10.0)
+    var server: ?_FakeXe = None
+    var dev: ?swdev.DeviceMgr = None
+    var port = 0
+    var step = "connect"
+    var finished = False
+
+    def finish(err: ?Exception):
+        if finished:
+            return
+        finished = True
+        s = server
+        if s is not None:
+            s.close()
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def config(cli_password: str) -> Dmc:
+        """The primary's address and credentials do not work for the CLI."""
+        dmc = Dmc("xe", Credentials("netconf", "secret"), type="primary")
+        dmc.address.create("mgmt", "127.0.0.1", port=u64(830))
+        cli = dmc.extra_adapter.create("iosxe-cli", port=u64(port))
+        cli.credentials = ExtraCredentials("admin", cli_password)
+        return dmc
+
+    def listed(tree: ?gdata.Node, err: ?Exception):
+        d = dev
+        try:
+            if err is not None:
+                raise err
+            fs = xecli_data.root.from_gdata(tree).file_systems.file_system["bootflash:"]
+            testing.assertEqual([f.name + " " + str(f.size) + " " + str(f.modified) for f in fs.file], BOOTFLASH_FILES)
+        except Exception as e:
+            finish(e)
+            return
+        if d is not None:
+            step = "lose"
+            d.set_dmc(config("wrong"))
+
+    def on_oper(n: ?gdata.Node):
+        d = dev
+        if n is not None and d is not None and not finished:
+            entries = []
+            for e in swdevoper.stratoweave_rfs__device_entry.from_gdata(n).state.adapter:
+                c = e.connected
+                connected = "no"
+                if c is not None and c:
+                    connected = "yes"
+                entries.append(e.type + "=" + connected)
+            adapters = sorted(entries)
+            if step == "connect" and adapters == ["iosxe-cli=yes", "primary=yes"]:
+                step = "read"
+                served_by = d.get_module_adapters().get(xecli_yang.MODULE)
+                if served_by != "iosxe-cli":
+                    finish(ValueError("the CLI module is served by {served_by}"))
+                    return
+                d.get(listed, _top([_fs(["bootflash:"])]))
+            elif step == "lose" and adapters == ["iosxe-cli=no", "primary=yes"]:
+                finish(None)
+
+    def on_reconf(name: str):
+        pass
+
+    def listening(p: int):
+        if p == 0:
+            finish(ValueError("the SSH server did not start"))
+            return
+        port = p
+        schema = yang.compile(xecli_yang.models)
+        types = {"primary": swdev.DeviceType("primary", _mock_primary, yang.compile([MODEL_PRIMARY])),
+                 "iosxe-cli": swdev.DeviceType("iosxe-cli", _fast_adapter, schema, oper_src_dnode=schema)}
+        d = swdev.DeviceMgr(types, t.env, "xe", t.log_handler, on_reconf, swdev.SchemaRegistry())
+        dev = d
+        d.set_update_oper(on_oper)
+        d.set_dmc(config("admin"))
+
+    server = _FakeXe(t, {"dir bootflash:": DIR_BOOTFLASH}, listening)
 
 
 # A test against a real IOS XE device over SSH. Run it with, for example:
