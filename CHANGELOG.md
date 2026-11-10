@@ -165,19 +165,19 @@
   forms of the IOS XE command. Without an algorithm, the device checks the
   hashes and the signature that an image holds. With `md5` or `sha512`, it
   computes the digest, and with a `hash` too, it compares them and
-  `verified` says whether they match.
+  `verified` says whether they match. [#777]
 - The IOS XE CLI adapter runs install commands with its `install` RPC: add,
   activate with an abort timer, commit, abort, remove and rollback. It says
   whether the device reloads. A device in bundle mode refuses `install add`
   alone, and `install add file F activate commit` converts it to install
-  mode. The adapter reads `show install summary` and `show bootvar`.
+  mode. The adapter reads `show install summary` and `show bootvar`. [#777]
 - The `configure` RPC of the IOS XE CLI adapter types configuration lines in
   `configure terminal` over an SSH shell, one at a time, and stops at the
   first line that the device rejects. `write-memory` saves the
   configuration. Install mode boots `bootflash:packages.conf`, which the
-  boot statement has to name, and a conversion sets it this way.
+  boot statement has to name, and a conversion sets it this way. [#777]
 - In mock mode, the IOS XE CLI adapter answers from a `CliMock`, which a test
-  gets with `get_mock()` and gives the replies of the device.
+  gets with `get_mock()` and gives the replies of the device. [#777]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
