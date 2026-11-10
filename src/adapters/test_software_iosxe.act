@@ -1271,6 +1271,8 @@ def _test_usable_checksum_prefers_sha512():
 HASH = "3ad02abe" * 16
 OTHER_HASH = "0" * 128
 VERIFY_COMMAND = "verify /sha512 bootflash:" + IMAGE_FILE + " " + HASH
+## What the CLI reads before an install, to tell whether the configuration is saved.
+CONFIG_CHANGE_COMMANDS = [clitest.RUNNING_CHANGE_COMMAND, clitest.STARTUP_CHANGE_COMMAND]
 
 
 def _dir(files: list[str], free: int=1458692096) -> str:
@@ -1391,6 +1393,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         cli = c
         m.attach()
         c.set_reply("dir bootflash:", dir_output)
+        c.set_reply(clitest.RUNNING_CHANGE_COMMAND, clitest.CONFIG_CHANGE_SAVED)
+        c.set_reply(clitest.STARTUP_CHANGE_COMMAND, clitest.CONFIG_CHANGE_SAVED)
         c.set_reply(VERIFY_COMMAND, verify_output)
         c.set_reply(VERIFY_IMAGE_COMMAND, image_output)
         c.set_delay(VERIFY_COMMAND, verify_delay)
@@ -1456,7 +1460,8 @@ actor _test_iosxe_added_release_needs_no_image(t: testing.EnvT):
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
             testing.assertEqual(["activate", "install-commit", "remove"], m.get_rpcs())
-            testing.assertEqual([], c.get_commands(), "no listing and no check")
+            testing.assertEqual(CONFIG_CHANGE_COMMANDS, c.get_commands(),
+                                "no listing and no check of the image, only of the configuration")
             t.success()
         except Exception as e:
             t.failure(e)
@@ -1514,7 +1519,7 @@ actor _test_iosxe_missing_image_is_copied_and_verified(t: testing.EnvT):
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
             testing.assertEqual(["xcopy", "install", "activate", "install-commit", "remove"], m.get_rpcs())
-            testing.assertEqual(c.get_commands(), [VERIFY_COMMAND, VERIFY_COMMAND],
+            testing.assertEqual(c.get_commands(), [VERIFY_COMMAND, VERIFY_COMMAND] + CONFIG_CHANGE_COMMANDS,
                                 "NETCONF lists; the CLI verifies the copy in prepare and again in install")
             t.success()
         except Exception as e:
@@ -1528,7 +1533,7 @@ actor _test_iosxe_slow_verify_runs_once(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual([VERIFY_COMMAND, VERIFY_COMMAND], c.get_commands(),
+            testing.assertEqual([VERIFY_COMMAND, VERIFY_COMMAND] + CONFIG_CHANGE_COMMANDS, c.get_commands(),
                                 "one check after the transfer in prepare, one in install")
             t.success()
         except Exception as e:
@@ -1740,7 +1745,7 @@ def _test_cli_version_reads():
 
 actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
                   settled: action(xecli.CliMock, swdev.DeviceMgr, str) -> None,
-                  short: bool=False):
+                  short: bool=False, unsaved: bool=False):
     """Drive a mock device whose NETCONF never connects, over the CLI only,
     from a software intent with a sha512 checksum to a settled status. The
     image is not on bootflash. The device runs OLD_RELEASE, in bundle mode
@@ -1748,7 +1753,8 @@ actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
     command changes what show version and show install summary say. Each
     such command takes 0.1 s, so the replies change before its output
     comes. When short, the intent has an image size of 600 MB and bootflash
-    has 100 MB free until a remove makes room."""
+    has 100 MB free until a remove makes room. When unsaved, the running
+    configuration changed after the last write memory."""
     var dev_ref: ?swdev.DeviceMgr = None
     var cli: ?xecli.CliMock = None
     var finished = False
@@ -1813,6 +1819,8 @@ actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
         c.set_reply("install commit", COMMIT_DONE)
         c.set_reply("write memory", clitest.WRITE_MEMORY)
         c.set_question("install remove inactive", clitest.REMOVE_BEFORE, "y", clitest.REMOVE_AFTER)
+        c.set_reply(clitest.RUNNING_CHANGE_COMMAND, clitest.CONFIG_CHANGE_LATER if unsaved else clitest.CONFIG_CHANGE_SAVED)
+        c.set_reply(clitest.STARTUP_CHANGE_COMMAND, clitest.CONFIG_CHANGE_SAVED)
         for command in [ADD_COMMAND, ACTIVATE_COMMAND, ONE_SHOT_COMMAND, "install commit", "install remove inactive"]:
             c.set_delay(command, 0.1)
         software = Software("camp-1", NEW_REQUESTED, IMAGE_URL)
@@ -1917,3 +1925,36 @@ def _test_free_space_and_room():
                         "a listing without sizes")
     testing.assertEqual(swxe.room_needed(u64(734643332)), u64(1616215330))
     testing.assertEqual(swxe.room_needed(None), None)
+
+
+actor _test_iosxe_unsaved_configuration_refuses_the_install(t: testing.EnvT):
+    """The running configuration changed after the last write memory: the
+    install stops before the add, since the reload would lose the change."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("failed", st)
+            reason = d.get_swmgr().get_reason()
+            testing.assertTrue(reason is not None and "not saved" in reason!, str(reason))
+            steps = [cmd for cmd in c.get_commands() if cmd.startswith("install ")]
+            testing.assertEqual([], steps, "nothing installed")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-unsaved", False, settled, False, True)
+
+
+def _test_unsaved_configuration():
+    def root(running: str, startup: ?str) -> ygdata.Node:
+        r = xecli_data.root()
+        xecli.RunningChangeRead().parse(r, running)
+        if startup is not None:
+            xecli.StartupChangeRead().parse(r, startup)
+        return r.to_gdata()
+    cases: list[(label: str, running: str, startup: ?str, unsaved: bool)] = [
+        (label="saved", running=clitest.CONFIG_CHANGE_SAVED, startup=clitest.CONFIG_CHANGE_SAVED, unsaved=False),
+        (label="changed later", running=clitest.CONFIG_CHANGE_LATER, startup=clitest.CONFIG_CHANGE_SAVED, unsaved=True),
+        (label="no change since the boot", running=clitest.CONFIG_NOT_CHANGED, startup=clitest.CONFIG_CHANGE_SAVED, unsaved=False),
+        (label="no startup line", running=clitest.CONFIG_CHANGE_SAVED, startup=None, unsaved=True),
+    ]
+    for c in cases:
+        testing.assertEqual(swxe.unsaved_configuration(root(c.running, c.startup)) is not None, c.unsaved, c.label)
