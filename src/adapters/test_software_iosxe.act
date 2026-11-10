@@ -22,6 +22,8 @@ import yang
 import yang.gdata as ygdata
 
 import device as swdev
+import adapters.iosxe_cli as xecli
+import adapters.iosxe_cli_yang as xecli_yang
 import adapters.netconf as swna
 import adapters.software_iosxe as swxe
 import adapters.software_iosxe_mock as swxemock
@@ -30,6 +32,7 @@ import adapters.software_iosxe_yang as swxe_yang
 
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__software__image_checksum_entry as ImageChecksum, \
     stratoweave_rfs__device__credentials as Credentials, \
     stratoweave_rfs__device__software as Software
 
@@ -1000,3 +1003,211 @@ actor _test_iosxe_release_follows_the_image(t: testing.EnvT):
     _UpgradeRun(t, "d-image", 0.0, swxemock.FAILURE_NONE, OLD_RELEASE, "17.18.04",
                 "scp://root:labpass@10.0.0.9:/images/c8000v-universalk9.17.18.04.bin",
                 settled)
+
+
+#############################################################################
+# The plan and the staging check
+#############################################################################
+
+def _test_upgrade_plan_follows_the_modules():
+    netconf = {swxe.XCOPY_MODULE, swxe.INSTALL_MODULE}
+    cli = {xecli_yang.MODULE}
+    cases = [
+        ("NETCONF and the CLI, as a C1111 with 17.9.5a", netconf | cli, ("netconf", "cli", "netconf")),
+        ("only the CLI, as a C1111 with 16.8.1", cli, ("", "cli", "")),
+        ("only NETCONF, as a C8000V without the CLI adapter", netconf, ("netconf", "", "netconf")),
+        ("nothing", set(), ("", "", "")),
+    ]
+    for name, modules, want in cases:
+        p = swxe.upgrade_plan(modules)
+        testing.assertEqual((p.transfer, p.verify, p.install), want, name)
+
+
+def _test_usable_checksum_prefers_sha512():
+    md5 = (algorithm="md5", digest="aa")
+    sha256 = (algorithm="sha256", digest="bb")
+    sha512 = (algorithm="sha512", digest="cc")
+    cases = [
+        ("sha512 before md5", [md5, sha512], "sha512"),
+        ("md5 alone", [md5], "md5"),
+        ("sha256 cannot be checked", [sha256], "-"),
+        ("none", [], "-"),
+    ]
+    for name, checksums, want in cases:
+        c = swxe.usable_checksum(checksums)
+        testing.assertEqual(c.algorithm if c is not None else "-", want, name)
+
+
+HASH = "3ad02abe" * 16
+OTHER_HASH = "0" * 128
+VERIFY_COMMAND = "verify /sha512 bootflash:" + IMAGE_FILE + " " + HASH
+
+
+def _dir(files: list[str]) -> str:
+    """dir bootflash: of a C1111, with these files."""
+    lines = ["", "", "Directory of bootflash:/", ""]
+    i = 15
+    for f in files:
+        lines.append("   " + str(i) + "  -rw-        427968764  Jun 18 2019 18:22:26 +00:00  " + f)
+        i += 1
+    lines.extend(["", "2885718016 bytes total (1458692096 bytes free)", ""])
+    return "\r\n".join(lines)
+
+
+DIR_STAGED = _dir(["packages.conf", IMAGE_FILE])
+DIR_EMPTY = _dir(["packages.conf"])
+VERIFY_EQUAL = "\r\n\r\n.....Done!\r\nVerified (bootflash:" + IMAGE_FILE + ") = " + HASH + "\r\n"
+VERIFY_DIFFERS = "\r\n\r\n.....Done!\r\n%Error verifying bootflash:" + IMAGE_FILE + \
+    "\r\nComputed signature  = " + OTHER_HASH + "\r\nSubmitted signature = " + HASH + "\r\n\r\n"
+
+
+def new_iosxe_cli_mock_device_mgr(t: testing.EnvT, name: str,
+                                  on_reconf: action(str) -> None) -> swdev.DeviceMgr:
+    """A mock device with NETCONF and the IOS XE CLI adapter beside it."""
+    schema = yang.compile(swxe_yang.models)
+    cli_schema = yang.compile(xecli_yang.models)
+    dev_types = {
+        "iosxe": swdev.DeviceType(name="iosxe", adapter_type=swna.NetconfAdapter, src_dnode=schema,
+                                  oper_src_dnode=schema, software_adapter_type=_fast_adapter),
+        "iosxe-cli": swdev.DeviceType(name="iosxe-cli", adapter_type=xecli.IosXeCliAdapter,
+                                      src_dnode=cli_schema, oper_src_dnode=cli_schema),
+    }
+    dev = swdev.DeviceMgr(dev_types, t.env, name, t.log_handler, on_reconf, swdev.SchemaRegistry())
+    dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe")
+    dmc.mock.enabled = True
+    dmc.extra_adapter.create("iosxe-cli")
+    dev.set_dmc(dmc)
+    return dev
+
+
+actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: str,
+                  settled: action(swxemock.IosXeSoftwareMock, xecli.CliMock, swdev.DeviceMgr, str) -> None,
+                  timeout: float=2.5):
+    """Drive one mock device with a sha512 image checksum from software intent
+    to a settled status. The CliMock answers dir bootflash: with dir_output,
+    and with a listing that has the image once the device took an xcopy, and
+    the verify of the image with verify_output. When dir_output lists the
+    image, the image is on bootflash from the start."""
+    var dev_ref: ?swdev.DeviceMgr = None
+    var mock: ?swxemock.IosXeSoftwareMock = None
+    var cli: ?xecli.CliMock = None
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def poll() -> None:
+        m = mock
+        c = cli
+        d = dev_ref
+        if finished or m is None or c is None or d is None:
+            return
+        if "xcopy" in m!.get_rpcs():
+            c!.set_reply("dir bootflash:", DIR_STAGED)
+        st = d!.get_swmgr().get_status()
+        if st == "unknown" or st == "in-progress":
+            after 0.02: poll()
+            return
+        finished = True
+        settled(m!, c!, d!, st)
+
+    def start() -> None:
+        d = dev_ref
+        if d is not None:
+            mods = d.get_modules().0
+            if "Cisco-IOS-XE-install-oper" not in mods or xecli_yang.MODULE not in mods:
+                after 0.01: start()
+                return
+            _attach(d)
+
+    def _attach(d: swdev.DeviceMgr) -> None:
+        dev_adapter = d.get_adapter()
+        extra = d.get_extra_adapter("iosxe-cli")
+        if isinstance(dev_adapter, swna.NetconfAdapter):
+            if isinstance(extra, xecli.IosXeCliAdapter):
+                ms = dev_adapter.get_mock_server()
+                c = extra.get_mock()
+                if ms is not None:
+                    if c is not None:
+                        _run(d, ms, c)
+                        return
+        finished = True
+        t.failure(ValueError("no mock server or CliMock on the device"))
+
+    def _run(d: swdev.DeviceMgr, ms: swna.NetconfMockServer, c: xecli.CliMock) -> None:
+        prestaged = IMAGE_FILE if dir_output == DIR_STAGED else None
+        m = swxemock.IosXeSoftwareMock(ms, t.log_handler, upgrade_duration=0.0,
+                                       failure=swxemock.FAILURE_NONE, running=OLD_RELEASE,
+                                       prestaged=prestaged)
+        mock = m
+        cli = c
+        m.attach()
+        c.set_reply("dir bootflash:", dir_output)
+        c.set_reply(VERIFY_COMMAND, verify_output)
+        software = Software("camp-1", NEW_REQUESTED, IMAGE_URL)
+        software.image_checksum.create("sha512", HASH)
+        dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe", software=software)
+        dmc.mock.enabled = True
+        dmc.extra_adapter.create("iosxe-cli")
+        d.set_dmc(dmc)
+        after 0.02: poll()
+
+    def report_timeout() -> None:
+        if finished:
+            return
+        finished = True
+        m = mock
+        c = cli
+        d = dev_ref
+        rpcs = m!.get_rpcs() if m is not None else []
+        commands = c!.get_commands() if c is not None else []
+        st = d!.get_swmgr().get_status() if d is not None else "?"
+        t.failure(ValueError("timed out: rpcs={rpcs} commands={commands} status={st}"))
+
+    dev_ref = new_iosxe_cli_mock_device_mgr(t, name, on_reconf)
+    after 0.01: start()
+    after timeout: report_timeout()
+
+
+actor _test_iosxe_staged_image_is_not_copied_again(t: testing.EnvT):
+    """An image on bootflash that matches its checksum stays: the run installs
+    it without an xcopy."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["install", "activate", "install-commit"], m.get_rpcs())
+            testing.assertTrue(VERIFY_COMMAND in c.get_commands(), "the image is verified")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-staged", DIR_STAGED, VERIFY_EQUAL, settled)
+
+
+actor _test_iosxe_missing_image_is_copied_and_verified(t: testing.EnvT):
+    """An image that is not on bootflash is copied, then verified."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["xcopy", "install", "activate", "install-commit"], m.get_rpcs())
+            commands = c.get_commands()
+            testing.assertEqual(commands[:2], ["dir bootflash:", VERIFY_COMMAND], "list, then verify the copy")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-missing", DIR_EMPTY, VERIFY_EQUAL, settled)
+
+
+actor _test_iosxe_checksum_mismatch_fails_in_prepare(t: testing.EnvT):
+    """An image that differs from its checksum is copied again; when the copy
+    differs too, the run fails in prepare and nothing is installed."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("failed", status)
+            testing.assertEqual(["xcopy"], m.get_rpcs(), "nothing is installed")
+            testing.assertEqual("download failed: checksum mismatch: sha512 of " + IMAGE_FILE + " is " +
+                                OTHER_HASH + ", not " + HASH, d.get_swmgr().get_reason())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-mismatch", DIR_STAGED, VERIFY_DIFFERS, settled)
+

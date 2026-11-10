@@ -26,6 +26,8 @@ import time
 import yang.gdata as ygdata
 
 import device as swdev
+import adapters.iosxe_cli_data as xecli_data
+import adapters.iosxe_cli_yang as xecli_yang
 import adapters.software_iosxe_oper as ixoper
 import adapters.software_iosxe_rpc as ixrpc
 
@@ -288,6 +290,52 @@ def aggregate(root: ?ygdata.Node, uuid: str, expect_stage: str,
 
 
 #############################################################################
+# Pure: the plan for a device
+#
+# How each step runs depends on what the device has, not on its release:
+# the modules that its adapters report. The IOS XE CLI adapter reports its
+# own module, stratoweave-iosxe-cli. See the table in adapters.iosxe_cli.
+#############################################################################
+
+XCOPY_MODULE = "Cisco-IOS-XE-xcopy-rpc"
+INSTALL_MODULE = "Cisco-IOS-XE-install-rpc"
+
+
+def upgrade_plan(modules: set[str]) -> (transfer: str, verify: str, install: str):
+    """Return how each step of an upgrade runs on a device with these modules:
+    "netconf", "cli", or "" when the driver cannot run the step there."""
+    transfer = "netconf" if XCOPY_MODULE in modules else ""
+    verify = "cli" if xecli_yang.MODULE in modules else ""
+    install = "netconf" if INSTALL_MODULE in modules else ""
+    return (transfer=transfer, verify=verify, install=install)
+
+
+def usable_checksum(checksums: list[(algorithm: str, digest: str)]) -> ?(algorithm: str, digest: str):
+    """Return a checksum that IOS XE can compute, sha512 before md5. IOS XE
+    verify has no sha256."""
+    for algorithm in ["sha512", "md5"]:
+        for c in checksums:
+            if c.algorithm == algorithm:
+                return c
+    return None
+
+
+def staged_file(root: ?ygdata.Node, filename: str) -> bool:
+    """Return True if the listing of bootflash: in root has filename."""
+    fs = xecli_data.root.from_gdata(root).file_systems.file_system.get("bootflash:")
+    if fs is not None:
+        return fs.file.get(filename) is not None
+    return False
+
+
+def bootflash_filter() -> ygdata.FNode:
+    """Select the files of bootflash: from the IOS XE CLI adapter."""
+    q = lambda name: ygdata.Id(xecli_yang.NS, name)
+    return ygdata.FNode(children=[ygdata.FNode(q("file-systems"), children=[
+        ygdata.FNode(q("file-system"), children=[ygdata.FNode(q("name"), value_match="bootflash:")])])])
+
+
+#############################################################################
 # Pure: filters and RPC bodies
 #############################################################################
 
@@ -433,6 +481,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     # The adapter is built inside DeviceMgr.set_dmc. Calling dev.tree_provider()
     # synchronously here would call back into the same actor and deadlock.
     _rpcs = ixrpc.rpc_root(swdev.DeviceTreeProvider(dev))
+    _cli = xecli_data.rpc_root(swdev.DeviceTreeProvider(dev))
 
     var _phase = ""          # stage | add | activate | commit | abort
     var _gen = 0
@@ -451,6 +500,11 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     var _activate_booting = False
     # Monotonic seconds when activate was sent; the device timer runs from there.
     var _activated_at: ?int = None
+    var _url = ""
+    # The checksum that staging checks the image against, if any.
+    var _check: ?(algorithm: str, digest: str) = None
+    # Install stages the image first, then adds it.
+    var _then_add = False
 
     def _finish(err: ?Exception) -> None:
         d = _done
@@ -474,6 +528,19 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         """A timestamp token with microsecond resolution."""
         secs, nanos = time.get_realtime()
         return "{secs}-{nanos // 1000}"
+
+    def _modules() -> set[str]:
+        return set(dev.get_modules().0.keys())
+
+    def _staging_check() -> ?(algorithm: str, digest: str):
+        """The checksum that the device can check the staged image against,
+        or None when there is none or the device cannot check."""
+        if upgrade_plan(_modules()).verify != "cli":
+            return None
+        checksums: list[(algorithm: str, digest: str)] = []
+        for c in dev.get_dmc().software.image_checksum:
+            checksums.append((algorithm=c.algorithm, digest=c.digest))
+        return usable_checksum(checksums)
 
     def _image_url() -> ?str:
         """Read the image URL at job start so configuration changes take effect."""
@@ -538,37 +605,108 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         if url is None:
             _finish(ValueError("no image-url configured for release {release}"))
             return
+        _url = url!
         _filename = image_filename(url!)
+        _then_add = False
+        _stage()
+
+    def _stage() -> None:
+        """Make sure the image is on bootflash. With a checksum that the
+        device can check, an image already there that matches stays; one
+        that is missing or differs is transferred and checked again."""
+        _check = _staging_check()
+        if _check is None:
+            _transfer()
+            return
+        gen = _gen
+        def listed(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!))
+            elif staged_file(root, _filename):
+                _verify(gen, True)
+            else:
+                _transfer()
+        dev.get(listed, bootflash_filter())
+
+    def _verify(gen: int, before_transfer: bool) -> None:
+        c = _check
+        if c is not None:
+            _verify_against(gen, before_transfer, c)
+        else:
+            _staged()
+
+    def _verify_against(gen: int, before_transfer: bool, c: (algorithm: str, digest: str)) -> None:
+        def verified(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail("verify: " + swdev.error_text(err!))
+                return
+            ok = out.verified if out is not None else None
+            if ok is not None and ok:
+                _log.info("software: image verified", {"file": _filename, "algorithm": c.algorithm})
+                _staged()
+            elif before_transfer:
+                _log.info("software: staged image differs, transferring it again", {"file": _filename})
+                _transfer()
+            else:
+                computed = out.digest if out is not None else None
+                _fail("checksum mismatch: {c.algorithm} of {_filename} is {computed}, not {c.digest}")
+        _cli.verify(verified, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", _filename, c.algorithm, c.digest))
+
+    def _staged() -> None:
+        if _then_add:
+            _add()
+        else:
+            _finish(None)
+
+    def _transfer() -> None:
+        if upgrade_plan(_modules()).transfer != "netconf":
+            _fail("the device has no way to transfer the image: no {XCOPY_MODULE}")
+            return
+        url = _url
         _expect_stage = STAGE_DOWNLOAD
         gen = _gen
         _log.info("software: staging image",
-                  {"url": redact_url(url!), "uuid": _uuid})
+                  {"url": redact_url(url), "uuid": _uuid})
         def on_rpc(out: ?ixrpc.Cisco_IOS_XE_xcopy_rpc__xcopy__output,
                    err: ?Exception) -> None:
             if gen != _gen:
                 return
             if err is not None:
                 # The device may quote the source, credentials and all.
-                _fail(swdev.error_text(err!).replace(url!, redact_url(url!)))
+                _fail(swdev.error_text(err!).replace(url, redact_url(url)))
                 return
             after now poll_period: _poll(gen)
-        _rpcs.xcopy(on_rpc, xcopy_input(_uuid, url!, _filename))
+        _rpcs.xcopy(on_rpc, xcopy_input(_uuid, url, _filename))
 
     ####################################################################
     # install: add, then activate the added image; device reloads
     ####################################################################
 
     def install(done: action(?Exception) -> None, release: str) -> None:
-        # TODO: Verify the image is still staged and repeat prepare if needed.
-        if not _start("add", done, release):
+        """Stage the image again when the device can check it, then add it.
+        Without a check, trust what prepare staged."""
+        if not _start("stage", done, release):
             return
         url = _image_url()
         if url is None:
             _finish(ValueError("no image-url configured for release {release}"))
             return
+        _url = url!
         _filename = image_filename(url!)
-        _expect_stage = STAGE_ADD_END
         _activated_at = None
+        _then_add = True
+        if _staging_check() is None:
+            _add()
+        else:
+            _stage()
+
+    def _add() -> None:
+        _enter("add")
+        _expect_stage = STAGE_ADD_END
         _log.info("software: adding image", {"file": _filename, "uuid": _uuid})
         _rpcs.install(_on_rpc(_gen, poll_period), install_input(_uuid, _filename))
 
@@ -703,6 +841,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def _end_phase() -> None:
         if _phase == "add":
             _after_add()
+        elif _phase == "stage":
+            _verify(_gen, False)
         else:
             _finish(None)
 
