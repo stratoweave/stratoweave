@@ -216,8 +216,9 @@ the whole list.
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription on the flotilla
 to the device's `/device/software/state` and `/device/state/platform`, and
-publishes the status, stage, reason and check verdicts in the entry's own
-`state` and the platform as its `state/platform`. A change on one device
+publishes the status, the campaign and target release the status is for,
+the stage, reason and check verdicts in the entry's own `state` and the
+platform as its `state/platform`. A change on one device
 publishes one entry. Removing the entry closes the subscription and clears
 the state. Each campaign transform subscribes to the `state` of every entry,
 one subscription, and aggregates its own members, each with the version and
