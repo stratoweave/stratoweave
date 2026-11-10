@@ -3,9 +3,11 @@
 The adapter implements the stratoweave-iosxe-cli module only. It reads and
 runs commands; it does not configure the device.
 
-Each command opens its own SSH connection, because IOS XE closes the
-connection when an exec channel ends. The exit status is always 0, so the
-adapter finds errors in the output text.
+The adapter logs in once and keeps an SSH shell open, in which it types
+one command at a time. A command is done when the prompt follows its
+output. IOS XE closes the connection when an exec channel ends, so the
+shell saves a login for each command. The adapter finds errors in the
+output text.
 
 What the IOS XE releases that we tried give for software management, over
 NETCONF and over the CLI:
@@ -87,6 +89,15 @@ INSTALL_TIMEOUT = 3600.0
 ## Seconds to wait for the prompt after each configuration command.
 CONFIG_LINE_TIMEOUT = 30.0
 
+## Seconds without a command after which the shell gets an empty line, so a
+## dead connection shows and the device does not end the session. IOS XE
+## ends a session after 10 idle minutes by default.
+KEEPALIVE_INTERVAL = 60.0
+
+## The commands that set up the shell after login: no paging, and lines up
+## to 511 characters.
+SHELL_SETUP = ["terminal length 0", "terminal width 511"]
+
 ## The start of a line in which the device rejects a configuration command.
 _CONFIG_ERRORS = ["% Invalid input", "% Incomplete command", "% Ambiguous command", "% Unknown command",
                   "%Error", "% Error", "ERROR:"]
@@ -100,6 +111,7 @@ _RFS_NS = "http://stratoweave.org/yang/stratoweave-rfs"
 _FILE_SYSTEM_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789-"
 _FILE_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
 _DIGITS = "0123456789"
+_PROMPT_START = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 _HEX = "0123456789abcdef"
 # A file, a URL or a label in an install command.
 _LOCATION_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~:/@%+=,-"
@@ -774,30 +786,59 @@ def config_error(output: str) -> ?str:
     return None
 
 
+def looks_like_prompt(line: str) -> bool:
+    """Return True if line looks like an IOS XE prompt: a host name that
+    starts with a letter or a digit, maybe a mode in parentheses, then # or
+    >, without spaces."""
+    if len(line) < 2 or len(line) > 80 or " " in line or "\t" in line:
+        return False
+    return line[0] in _PROMPT_START and (line.endswith("#") or line.endswith(">"))
+
+
+def last_line(text: str) -> str:
+    """Return the last line of text, without the spaces around it."""
+    return text[text.rfind("\n") + 1:].strip()
+
+
+def command_output(text: str, prompt: str) -> ?str:
+    """Return the output of a command typed into a shell, or None while the
+    command runs. text is what the device printed since the command was
+    typed: the echo of the command, the output, then prompt on a line of its
+    own."""
+    newline = text.rfind("\n")
+    if newline < 0 or text[newline + 1:].strip() != prompt:
+        return None
+    first = text.find("\n")
+    return text[first + 1:newline] if first < newline else ""
+
+
 class ConfigDialog(object):
     """Type configuration commands into an IOS XE shell, one at a time.
 
+    start gives what to type at the exec prompt: configure terminal.
     received takes what the device prints and returns what to type next. A
     command is done when the echo of the command has ended and the last line
-    is a prompt, which ends with #. The dialog types configure terminal at
-    the first prompt, then each line, then end. It types end after the first
-    line that the device rejects, and keeps the error.
+    is a prompt, which ends with #. The dialog types each line, then end. It
+    types end after the first line that the device rejects, and keeps the
+    error. prompt is the last prompt that the device printed.
     """
     lines: list[str]
     sent: int
     step: int
     pending: str
     transcript: str
+    prompt: str
     error: ?str
 
     def __init__(self, lines: list[str]):
         self.lines = lines
         self.sent = 0
-        # 0: wait for the prompt, 1: configure terminal typed, 2: a line
-        # typed, 3: end typed, 4: done.
+        # 0: not started, 1: configure terminal typed, 2: a line typed,
+        # 3: end typed, 4: done.
         self.step = 0
         self.pending = ""
         self.transcript = ""
+        self.prompt = ""
         self.error = None
 
     def finished(self) -> bool:
@@ -811,21 +852,23 @@ class ConfigDialog(object):
             return self.lines[self.sent - 1]
         return "end"
 
+    mut def start(self) -> list[str]:
+        self.step = 1
+        return ["configure terminal\r"]
+
     mut def received(self, text: str) -> list[str]:
         self.transcript += text
         self.pending += text
         newline = self.pending.rfind("\n")
-        if self.step != 0 and newline < 0:
+        if self.step == 0 or newline < 0:
             return []
         prompt = self.pending[newline + 1:].strip()
         if not prompt.endswith("#"):
             return []
         first = self.pending.find("\n")
-        output = self.pending[first + 1:newline] if 0 <= first and first < newline else ""
+        output = self.pending[first + 1:newline] if first < newline else ""
         self.pending = ""
-        if self.step == 0:
-            self.step = 1
-            return ["configure terminal\r"]
+        self.prompt = prompt
         if self.step == 1 and "(config" not in prompt:
             self.error = "configure terminal: " + (output.strip() if output.strip() != "" else "no configuration prompt")
             self.step = 4
@@ -968,132 +1011,232 @@ def _client(cap: net.TCPConnectCap, dmc: DeviceMetaConfig,
                       transport=ssh_transport_config(dmc.ssh))
 
 
-actor _Session(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, command: ?str, timeout: float,
-               done: action(?str, ?Exception) -> None):
-    """Log in to the device over SSH and run command, or only log in when
-    command is None. Call done once with the output, then close the connection.
-    When the command fails, done gets the error and the output so far.
-    """
-    var client: ?ssh.Client = None
-    var finished = False
-
-    def _finish(output: ?str, err: ?Exception):
-        if finished:
-            return
-        finished = True
-        c = client
-        client = None
-        if c is not None:
-            c.close()
-        done(output, err)
-
-    def _on_hostkey(c: ssh.Client, state: str, info: ssh.HostKeyInfo):
-        # The NETCONF adapter does not check host keys either.
-        c.accept_hostkey()
-
-    def _on_exit(ch: ssh.Channel, code: int, signal: ?str, stdout: bytes, stderr: bytes, error: ?str):
-        if error is not None:
-            partial: ?str = None
-            try:
-                partial = stdout.decode()
-            except Exception:
-                pass
-            _finish(partial, TransientError("SSH command failed: " + error))
-            return
-        if signal is not None or code != 0:
-            _finish(None, CommandError("SSH command ended with exit status " + str(code)))
-            return
-        try:
-            text = stdout.decode()
-        except Exception:
-            _finish(None, CommandError("SSH command output is not UTF-8"))
-        else:
-            _finish(text, None)
-
-    def _on_connect(c: ssh.Client, err: ?Exception):
-        if err is not None:
-            _finish(None, NotConnectedError("SSH login failed: " + swdev.error_text(err)))
-            return
-        cmd = command
-        if cmd is not None:
-            ssh.RunCommand(c, cmd, _on_exit, timeout=timeout)
-        else:
-            _finish("", None)
-
-    def _on_close(c: ssh.Client, reason: str):
-        # IOS XE closes the connection when the command ends. RunCommand
-        # reports the result of the command.
-        pass
-
-    def _start():
-        try:
-            client = _client(cap, dmc, _on_connect, _on_close, _on_hostkey)
-        except Exception as e:
-            _finish(None, e)
-
-    _start()
+def _job(command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None) \
+        -> (command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None):
+    """Return a job for the shell: a command, or configuration lines when
+    lines is not empty. done gets what the device printed."""
+    return (command=command, lines=lines, timeout=timeout, done=done)
 
 
-actor _ConfigSession(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, lines: list[str],
-                     done: action(?str, ?Exception) -> None):
-    """Log in to the device over SSH, open a shell, and type lines in
-    configure terminal with a ConfigDialog. Call done once with what the
-    device printed, then close the connection.
+def _after_echo(text: str) -> str:
+    """Return what a shell printed after the echo of the typed command."""
+    first = text.find("\n")
+    return text[first + 1:] if first >= 0 else ""
 
-    The session fails when the device rejects a line, or when no prompt
-    follows a command within CONFIG_LINE_TIMEOUT, as after a question.
+
+actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock, login_timeout: float,
+                 on_ready: action() -> None, on_end: action(Exception) -> None):
+    """One login to an IOS XE device with a shell that runs one command at a
+    time.
+
+    The session logs in over SSH, or types into mock when it has one, and
+    waits for the first prompt. It types SHELL_SETUP and then calls
+    on_ready. A command is done when the prompt follows its output.
+    configure types lines with a ConfigDialog. After KEEPALIVE_INTERVAL
+    without a command, the session types an empty line.
+
+    The session ends when the connection closes, or when the login or a
+    command does not end within its time, because the state of the shell is
+    then unknown. It fails the command that runs, with the output so far
+    when the connection closed, and the commands in the queue. Then it calls
+    on_end. close ends the session without on_end.
     """
     var client: ?ssh.Client = None
     var channel: ?ssh.Channel = None
-    var finished = False
-    var progress = 0
-    dialog = ConfigDialog(lines)
+    # The exec prompt, such as Router#.
+    var prompt = ""
+    var started = False
+    var ended = False
+    var setup_left = len(SHELL_SETUP)
+    # What the device printed for the job that runs.
+    var text = ""
+    # Received bytes that are not complete UTF-8 yet.
+    var raw = b""
+    var queue: list[(command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None)] = []
+    var job: ?(command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None) = None
+    var dialog: ?ConfigDialog = None
+    # Bumped when a job starts, types or ends, so an old timer does nothing.
+    var serial = 0
 
-    def _finish(err: ?Exception):
-        if finished:
+    def run(command: str, timeout: float, done: action(?str, ?Exception) -> None) -> None:
+        """Run command and give done its output."""
+        _add(_job(command, [], timeout, done))
+
+    def configure(lines: list[str], done: action(?str, ?Exception) -> None) -> None:
+        """Type lines in configure terminal and give done what the device
+        printed."""
+        _add(_job("configure terminal", lines, CONFIG_LINE_TIMEOUT, done))
+
+    def close() -> None:
+        _end(NotConnectedError("the SSH session is closed"), False, False)
+
+    def _add(j: (command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None)):
+        if ended:
+            j.done(None, NotConnectedError("the SSH session has ended"))
             return
-        finished = True
+        queue.append(j)
+        _next()
+
+    def _next():
+        if ended or not started or job is not None or len(queue) == 0:
+            return
+        j = queue[0]
+        queue = queue[1:]
+        job = j
+        text = ""
+        if len(j.lines) > 0:
+            d = ConfigDialog(j.lines)
+            dialog = d
+            _type(d.start())
+        else:
+            dialog = None
+            _type([j.command + "\r"])
+        _watch(j.timeout)
+
+    def _watch(timeout: float):
+        serial += 1
+        at = serial
+        after timeout: _stalled(at, timeout)
+
+    def _stalled(at: int, timeout: float):
+        if ended or at != serial:
+            return
+        what = "login"
+        j = job
+        if j is not None:
+            what = j.command
+            d = dialog
+            if d is not None:
+                what = d.current()
+        _end(TransientError("no prompt after " + what + " within " + str(int(timeout)) + " s"), True, False)
+
+    def _finish_job(output: str, err: ?Exception):
+        j = job
+        job = None
+        dialog = None
+        text = ""
+        serial += 1
+        if j is not None:
+            j.done(output, err)
+        if len(queue) > 0:
+            _next()
+        elif mock is None:
+            at = serial
+            after KEEPALIVE_INTERVAL: _keepalive(at)
+
+    def _keepalive(at: int):
+        if not ended and at == serial and job is None and len(queue) == 0:
+            _add(_job("", [], login_timeout, _kept_alive))
+
+    def _kept_alive(output: ?str, err: ?Exception):
+        pass
+
+    def _set_up(output: ?str, err: ?Exception):
+        if err is None:
+            setup_left -= 1
+            if setup_left == 0:
+                on_ready()
+
+    def _end(err: Exception, notify: bool, with_output: bool):
+        if ended:
+            return
+        ended = True
+        serial += 1
+        j = job
+        job = None
+        waiting = queue
+        queue = []
+        if j is not None:
+            output: ?str = None
+            if with_output:
+                d = dialog
+                if d is not None:
+                    output = d.transcript
+                else:
+                    output = _after_echo(text)
+            j.done(output, err)
+        for w in waiting:
+            w.done(None, NotConnectedError(swdev.error_text(err)))
         c = client
         client = None
+        channel = None
         if c is not None:
             c.close()
-        done(dialog.transcript, err)
+        if notify:
+            on_end(err)
+
+    def _on_text(chunk: str):
+        if ended:
+            return
+        if not started:
+            text += chunk
+            p = last_line(text)
+            if looks_like_prompt(p):
+                if p.endswith(">"):
+                    _end(PermanentError("the user gets no privileged prompt, only " + p), True, False)
+                    return
+                prompt = p
+                started = True
+                text = ""
+                serial += 1
+                queue = [_job(c, [], login_timeout, _set_up) for c in SHELL_SETUP] + queue
+                _next()
+            return
+        # Output between commands, such as a log message, is dropped.
+        j = job
+        if j is not None:
+            d = dialog
+            if d is not None:
+                typed = d.received(chunk)
+                if d.finished():
+                    p = d.prompt
+                    if looks_like_prompt(p) and p.endswith("#") and "(" not in p:
+                        # A hostname command changes the prompt.
+                        prompt = p
+                    err = d.error
+                    _finish_job(d.transcript, CommandError(err) if err is not None else None)
+                elif len(typed) > 0:
+                    _type(typed)
+                    _watch(j.timeout)
+            else:
+                text += chunk
+                out = command_output(text, prompt)
+                if out is not None:
+                    _finish_job(out, None)
 
     def _type(texts: list[str]):
+        m = mock
+        if m is not None:
+            replies = ""
+            for t in texts:
+                replies += m.type_text(t.rstrip())
+            after 0: _on_text(replies)
+            return
         ch = channel
         if ch is not None:
-            for text in texts:
-                ch.write(text.encode())
+            for t in texts:
+                ch.write(t.encode())
 
-    def _stalled(at: int):
-        if finished or at != progress:
-            return
-        _type(["\x03", "end\r"])
-        _finish(CommandError("no prompt after " + dialog.current()))
+    def _decode():
+        """Pass on the complete UTF-8 in raw. A character can be split
+        between two reads."""
+        n = 0
+        while n < 4 and n < len(raw):
+            try:
+                t = raw[:len(raw) - n].decode()
+            except Exception:
+                n += 1
+            else:
+                raw = raw[len(raw) - n:]
+                _on_text(t)
+                return
+        if len(raw) > 3:
+            _end(CommandError("the SSH shell output is not UTF-8"), True, False)
 
     def _on_stdout(ch: ssh.Channel, data: ?bytes):
-        if data is not None:
-            if not finished:
-                _received(data)
-
-    def _received(data: bytes):
-        try:
-            text = data.decode()
-        except Exception:
-            _finish(CommandError("SSH shell output is not UTF-8"))
-        else:
-            _answer(text)
-
-    def _answer(text: str):
-        progress += 1
-        _type(dialog.received(text))
-        if dialog.finished():
-            _type(["exit\r"])
-            err = dialog.error
-            _finish(CommandError(err) if err is not None else None)
-            return
-        at = progress
-        after CONFIG_LINE_TIMEOUT: _stalled(at)
+        if data is not None and not ended:
+            raw += data
+            _decode()
 
     def _on_stderr(ch: ssh.Channel, data: ?bytes):
         pass
@@ -1102,15 +1245,14 @@ actor _ConfigSession(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, lines: list[
         pass
 
     def _on_channel_close(ch: ssh.Channel, reason: str):
-        _finish(TransientError("SSH shell closed: " + reason))
+        _end(TransientError("SSH shell closed: " + reason), True, True)
 
     def _on_open(ch: ssh.Channel, err: ?str):
         if err is not None:
-            _finish(TransientError("SSH shell failed: " + err))
+            _end(TransientError("SSH shell failed: " + err), True, False)
             return
         # A wide terminal keeps the device from scrolling long commands.
         ch.request_shell(cols=500)
-        after CONFIG_LINE_TIMEOUT: _stalled(0)
 
     def _on_hostkey(c: ssh.Client, state: str, info: ssh.HostKeyInfo):
         # The NETCONF adapter does not check host keys either.
@@ -1118,60 +1260,88 @@ actor _ConfigSession(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, lines: list[
 
     def _on_connect(c: ssh.Client, err: ?Exception):
         if err is not None:
-            _finish(NotConnectedError("SSH login failed: " + swdev.error_text(err)))
+            _end(NotConnectedError("SSH login failed: " + swdev.error_text(err)), True, False)
             return
         channel = ssh.Channel(c, _on_open, _on_stdout, _on_stderr, _on_exit, _on_channel_close)
 
     def _on_close(c: ssh.Client, reason: str):
-        _finish(TransientError("SSH connection closed: " + reason))
+        _end(TransientError("SSH connection closed: " + reason), True, True)
 
-    try:
-        client = _client(cap, dmc, _on_connect, _on_close, _on_hostkey)
-    except Exception as e:
-        _finish(e)
+    def _start():
+        _watch(login_timeout)
+        m = mock
+        if m is not None:
+            banner = m.login()
+            after 0: _on_text(banner)
+            return
+        k = cap
+        if k is not None:
+            try:
+                client = _client(k, dmc, _on_connect, _on_close, _on_hostkey)
+            except Exception as e:
+                _end(e, True, False)
+        else:
+            _end(NotConnectedError("the IOS XE CLI adapter cannot open network connections"), True, False)
+
+    _start()
 
 
 actor CliMock():
     """A device for the IOS XE CLI adapter in mock mode.
 
-    run answers a command with the output that set_reply gave it, or as IOS
-    XE answers a command that it does not know. type_text answers what a
-    configuration session types, with the prompts of a device: a line is
-    accepted and kept unless set_reply gave it an output, as for a line
-    that the device rejects.
+    type_text answers a line typed into the shell as IOS XE does: the echo,
+    the output, then the prompt. A command gets the output that set_reply
+    gave it, or the error of IOS XE for a command that it does not know.
+    The terminal commands of the session are accepted. In configure
+    terminal, a line is accepted and kept unless set_reply gave it what the
+    device prints, as for a line that the device rejects.
     """
     var replies: dict[str, str] = {}
     var commands: list[str] = []
     var configured: list[str] = []
+    var config_mode = False
 
     def set_reply(command: str, output: str) -> None:
         replies[command] = output
 
     def get_commands() -> list[str]:
+        """Return the commands typed at the exec prompt, without the terminal
+        commands and configure terminal."""
         return commands
 
     def get_configured() -> list[str]:
         return configured
 
-    def run(command: str) -> str:
-        commands.append(command)
-        reply = replies.get(command)
-        if reply is not None:
-            return reply
-        return "\r\n\r\n\r\nLine has invalid autocommand \"" + command + "\""
+    def login() -> str:
+        """Return what the device prints when a shell opens."""
+        config_mode = False
+        return "\r\n\r\nRouter#"
 
     def type_text(text: str) -> str:
+        if config_mode:
+            if text == "end":
+                config_mode = False
+                return "end\r\nRouter#"
+            if text == "":
+                return "\r\nRouter(config)#"
+            reply = replies.get(text)
+            if reply is not None:
+                return reply
+            configured.append(text)
+            return text + "\r\nRouter(config)#"
         if text == "":
-            return "\r\n\r\n\r\nRouter#"
+            return "\r\nRouter#"
         if text == "configure terminal":
+            config_mode = True
             return "configure terminal\r\nEnter configuration commands, one per line.  End with CNTL/Z.\r\nRouter(config)#"
-        if text == "end":
-            return "end\r\nRouter#"
+        if text.startswith("terminal "):
+            return text + "\r\nRouter#"
+        commands.append(text)
+        output = (" " * (len(text) + 7)) + "^\r\n% Invalid input detected at '^' marker.\r\n"
         reply = replies.get(text)
         if reply is not None:
-            return reply
-        configured.append(text)
-        return text + "\r\nRouter(config)#"
+            output = reply
+        return text + "\r\n" + output + ("" if output.endswith("\n") else "\r\n") + "Router#"
 
 
 def mock_mode(dmc: DeviceMetaConfig, env: ?Env) -> bool:
@@ -1181,14 +1351,16 @@ def mock_mode(dmc: DeviceMetaConfig, env: ?Env) -> bool:
 
 
 actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?Env,
-                     command_timeout: float, rpc_timeout: float):
+                     command_timeout: float, rpc_timeout: float, given_mock: ?CliMock):
     """Run the commands of one device and turn their output into YANG data.
 
     A change of the address, the credentials or the SSH settings starts a
-    login. When the login succeeds, the driver reports its modules to
-    DeviceMgr with its device type. When it fails, the driver reports a lost
-    connection and tries again later. In mock mode, the driver runs the
-    commands against a CliMock.
+    new CliSession. When its shell is ready, the driver tells DeviceMgr that
+    the device is connected. When the session ends or the login fails, the
+    driver tells DeviceMgr that the device is not connected and logs in
+    again later. The driver reports its device type, so it can run beside
+    the adapter of another device type. In mock mode, the session types into
+    a CliMock: given_mock, or a new one.
     """
     _log = logging.Logger(log_handler)
     tcp = _tcp(env)
@@ -1198,51 +1370,60 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
     var generation = 0
     var closed = False
     var mock: ?CliMock = None
+    var session: ?CliSession = None
+    var ready = False
 
     def get_mock() -> ?CliMock:
         return mock
 
-    def _session(command: ?str, timeout: float, done: action(?str, ?Exception) -> None):
-        d = dmc
-        m = mock
-        if m is not None:
-            done(m.run(command) if command is not None else "", None)
-        elif d is not None and tcp is not None and not closed:
-            _Session(tcp, d, command, timeout, done)
+    def _session(command: str, timeout: float, done: action(?str, ?Exception) -> None):
+        s = session
+        if s is not None and ready:
+            s.run(command, timeout, done)
         else:
-            done(None, NotConnectedError("the IOS XE CLI adapter has no SSH connection settings"))
+            done(None, NotConnectedError("the IOS XE CLI adapter has no SSH session"))
 
-    def _mock_configure(m: CliMock, lines: list[str], done: action(?str, ?Exception) -> None):
-        """Type lines into the CliMock with a ConfigDialog."""
-        dialog = ConfigDialog(lines)
-        queue = [""]
-        while len(queue) > 0 and not dialog.finished():
-            text = queue[0]
-            queue = queue[1:]
-            for typed in dialog.received(m.type_text(text)):
-                queue.append(typed.rstrip())
-        err = dialog.error
-        done(dialog.transcript, CommandError(err) if err is not None else None)
-
-    def _login(gen: int, delay: float):
+    def _start_session(gen: int, delay: float):
         if closed or gen != generation:
             return
-        def logged_in(output: ?str, err: ?Exception):
-            if closed or gen != generation:
-                return
-            d = dmc
-            dev_type = d.type if d is not None else None
-            if err is not None:
-                _log.warning("IOS XE CLI: SSH login failed", {"error": err, "retry_in": delay})
-                dev.on_disconnect(dev_type)
-                next_delay = delay * 2.0
-                if next_delay > RETRY_MAX:
-                    next_delay = RETRY_MAX
-                after now delay: _login(gen, next_delay)
-                return
-            _log.info("IOS XE CLI: SSH login succeeded")
-            dev.on_connect(modules(), None, dev_type)
-        _session(None, command_timeout, logged_in)
+        d = dmc
+        if d is not None:
+            session = CliSession(tcp, d, mock, command_timeout,
+                                 lambda: _session_ready(gen),
+                                 lambda err: _session_ended(gen, delay, err))
+
+    def _session_ready(gen: int):
+        if closed or gen != generation:
+            return
+        ready = True
+        d = dmc
+        _log.info("IOS XE CLI: SSH session ready")
+        async dev.on_connect(modules(), None, d.type if d is not None else None)
+
+    def _session_ended(gen: int, delay: float, err: Exception):
+        if closed or gen != generation:
+            return
+        # A session that was ready logs in again soon; a failed login waits
+        # longer each time.
+        wait = RETRY_FIRST if ready else delay
+        next_delay = wait * 2.0
+        if next_delay > RETRY_MAX:
+            next_delay = RETRY_MAX
+        ready = False
+        session = None
+        d = dmc
+        _log.warning("IOS XE CLI: SSH session ended", {"error": err, "retry_in": wait})
+        dev.on_disconnect(d.type if d is not None else None)
+        after now wait: _start_session(gen, next_delay)
+
+    def _restart():
+        generation += 1
+        ready = False
+        s = session
+        session = None
+        if s is not None:
+            s.close()
+        _start_session(generation, RETRY_FIRST)
 
     def set_dmc(new_dmc: DeviceMetaConfig):
         if closed:
@@ -1250,11 +1431,12 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
         dmc = new_dmc
         if mock_mode(new_dmc, env):
             if mock is None:
-                generation += 1
-                mock = CliMock()
-                async dev.on_connect(modules(), None, new_dmc.type)
+                mock = given_mock if given_mock is not None else CliMock()
+                _restart()
             return
-        mock = None
+        if mock is not None:
+            mock = None
+            configured = False
         selected = gdata.FNode(children=[gdata.FNode(gdata.Id(_RFS_NS, name))
                                        for name in ["address", "credentials", "ssh"]])
         new_settings = gdata.filter(new_dmc.to_gdata(), selected)
@@ -1262,9 +1444,8 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
             return
         configured = True
         settings = new_settings
-        generation += 1
         if len(new_dmc.address) > 0:
-            _login(generation, RETRY_FIRST)
+            _restart()
 
     def _read(rs: list[Read], i: int, r: xecli_data.root, filt: ?gdata.FNode,
               cb: action(?gdata.Node, ?Exception) -> None):
@@ -1319,14 +1500,11 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
                 cb(None, err)
             else:
                 cb(gdata.Container({}), None)
-        d = dmc
-        m = mock
-        if m is not None:
-            _mock_configure(m, lines, received)
-        elif d is not None and tcp is not None and not closed:
-            _ConfigSession(tcp, d, lines, received)
+        s = session
+        if s is not None and ready:
+            s.configure(lines, received)
         else:
-            received(None, NotConnectedError("the IOS XE CLI adapter has no SSH connection settings"))
+            received(None, NotConnectedError("the IOS XE CLI adapter has no SSH session"))
 
     def _exec(cb: action(?gdata.Node, ?Exception) -> None, request: gdata.Node):
         try:
@@ -1350,6 +1528,10 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
     def close(on_close: ?action() -> None=None):
         closed = True
         generation += 1
+        s = session
+        session = None
+        if s is not None:
+            s.close()
         if on_close is not None:
             on_close()
 
@@ -1358,15 +1540,16 @@ class IosXeCliAdapter(DeviceAdapter):
     """Device adapter for the IOS XE CLI over SSH.
 
     The device address and port are those of the SSH server, port 22 by
-    default. command_timeout and rpc_timeout are in seconds.
+    default. command_timeout and rpc_timeout are in seconds. In mock mode,
+    the adapter runs against mock, or a new CliMock.
     """
     def __init__(self, dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc: DeviceMetaConfig,
                  schema_registry: swdev.SchemaRegistry, log_handler, env: ?Env,
-                 command_timeout: float=COMMAND_TIMEOUT, rpc_timeout: float=RPC_TIMEOUT):
+                 command_timeout: float=COMMAND_TIMEOUT, rpc_timeout: float=RPC_TIMEOUT, mock: ?CliMock=None):
         self._log_handler = log_handler
         self._env = env
         self._modules = modules()
-        self._driver = IosXeCliDriver(dev, log_handler, env, command_timeout, rpc_timeout)
+        self._driver = IosXeCliDriver(dev, log_handler, env, command_timeout, rpc_timeout, mock)
 
     def set_dmc(self, new_dmc: DeviceMetaConfig):
         self._driver.set_dmc(new_dmc)
