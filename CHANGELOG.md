@@ -178,6 +178,16 @@
   boot statement has to name, and a conversion sets it this way. [#777]
 - In mock mode, the IOS XE CLI adapter answers from a `CliMock`, which a test
   gets with `get_mock()` and gives the replies of the device. [#777]
+- The IOS XE CLI adapter logs in once and keeps an SSH shell open per
+  device, in which it types one command at a time; IOS XE closes the
+  connection when an exec channel ends. The device is connected while the
+  shell is ready. When the connection closes, or a command gets no prompt
+  within its time, the adapter reports the device as disconnected and logs
+  in again. After a minute without a command, it types an empty line, so a
+  dead connection shows.
+- The `install` RPC of the IOS XE CLI adapter answers the question that
+  `install remove` asks before it deletes files, which has no
+  `prompt-level none` on IOS XE 17.15.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
