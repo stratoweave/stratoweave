@@ -3,13 +3,22 @@
 #
 # IOS XE workflow:
 #
-#   prepare  = xcopy the image onto bootflash                non-impacting
-#   install  = install (add), then activate with an
-#              auto-abort timer; the device reloads          impacting
+#   prepare  = make sure that the device has the image       non-impacting
+#   install  = prepare again, add the image unless the
+#              device has added it, then activate it with
+#              an auto-abort timer; the device reloads       impacting
 #   commit   = install-commit, stops the timer
 #   rollback = abort; the device reloads on the old release  impacting
 #
 # Without a commit the device reverts on its own when the timer runs out.
+#
+# Prepare and install can run again at any time and do only what is left. A
+# release that the device has added needs no image file. An image file on
+# bootflash that passes a check stays: the checksum of the software intent,
+# else the signature that the image holds, both with the verify RPC of the
+# IOS XE CLI adapter. A missing file, or one that fails, is transferred with
+# xcopy and checked again. Without the CLI adapter, prepare transfers the
+# file and install trusts what prepare staged.
 #
 # Cleanup and retry are not implemented. Cleanup leaves the previous image on
 # the device.
@@ -26,6 +35,8 @@ import time
 import yang.gdata as ygdata
 
 import device as swdev
+import adapters.iosxe_cli_data as xecli_data
+import adapters.iosxe_cli_yang as xecli_yang
 import adapters.software_iosxe_oper as ixoper
 import adapters.software_iosxe_rpc as ixrpc
 
@@ -55,6 +66,12 @@ STAGE_ADD_END = "install-txn-add-postchk"
 
 POLL_PERIOD = 10.0
 RELOAD_POLL_PERIOD = 20.0
+# Seconds that staging waits for adapters that are not connected, such as an
+# IOS XE CLI adapter that connects after NETCONF. Without them the plan
+# lacks their steps: without the CLI, the image cannot be checked, so it is
+# transferred again.
+ADAPTER_WAIT = 120.0
+ADAPTER_POLL = 5.0
 # Generous: the transfer and the add each take minutes.
 MAX_POLLS = 180
 
@@ -288,6 +305,91 @@ def aggregate(root: ?ygdata.Node, uuid: str, expect_stage: str,
 
 
 #############################################################################
+# Pure: the plan for a device
+#
+# How each step runs depends on what the device has, not on its release:
+# the modules that its adapters report. The IOS XE CLI adapter reports its
+# own module, stratoweave-iosxe-cli. See the table in adapters.iosxe_cli.
+#############################################################################
+
+XCOPY_MODULE = "Cisco-IOS-XE-xcopy-rpc"
+INSTALL_MODULE = "Cisco-IOS-XE-install-rpc"
+FILES_MODULE = "Cisco-IOS-XE-platform-software-oper"
+CISCO_RPC_MODULE = "Cisco-IOS-XE-rpc"
+## Causes of a failed add that say that the image file is bad. The driver
+## deletes the file, so that the next run transfers it again.
+BAD_IMAGE_CAUSES = ["install-verify-pkg-fail", "install-status-invalid-image-file"]
+FILES_NS = "http://cisco.com/ns/yang/Cisco-IOS-XE-platform-software-oper"
+
+
+def upgrade_plan(modules: set[str]) -> (transfer: str, listing: str, verify: str, install: str):
+    """Return how each step of an upgrade runs on a device with these modules:
+    "netconf", "cli", or "" when the driver cannot run the step there. A step
+    runs over NETCONF when the device has the module for it, and over the CLI
+    only when it has not. No NETCONF module checks a file's content, so the
+    check of an image runs over the CLI."""
+    transfer = "netconf" if XCOPY_MODULE in modules else ""
+    listing = "netconf" if FILES_MODULE in modules else ("cli" if xecli_yang.MODULE in modules else "")
+    verify = "cli" if xecli_yang.MODULE in modules else ""
+    install = "netconf" if INSTALL_MODULE in modules else ""
+    return (transfer=transfer, listing=listing, verify=verify, install=install)
+
+
+def usable_checksum(checksums: list[(algorithm: str, digest: str)]) -> ?(algorithm: str, digest: str):
+    """Return a checksum that IOS XE can compute, sha512 before md5. IOS XE
+    verify has no sha256."""
+    for algorithm in ["sha512", "md5"]:
+        for c in checksums:
+            if c.algorithm == algorithm:
+                return c
+    return None
+
+
+def staged_file(root: ?ygdata.Node, filename: str) -> bool:
+    """Return True if the files of bootflash: in root have filename, in a
+    listing over NETCONF or over the CLI."""
+    for q in ixoper.root.from_gdata(root).cisco_platform_software.q_filesystem:
+        p = q.partitions.get("bootflash:")
+        if p is not None and p.partition_content.get("/bootflash/" + filename) is not None:
+            return True
+    fs = xecli_data.root.from_gdata(root).file_systems.file_system.get("bootflash:")
+    if fs is not None:
+        return fs.file.get(filename) is not None
+    return False
+
+
+def staged_size(root: ?ygdata.Node, filename: str) -> ?u64:
+    """Return the size of filename on bootflash: in root, from a listing
+    over NETCONF or over the CLI, or None when the listing has no size for
+    it."""
+    for q in ixoper.root.from_gdata(root).cisco_platform_software.q_filesystem:
+        p = q.partitions.get("bootflash:")
+        if p is not None:
+            f = p.partition_content.get("/bootflash/" + filename)
+            if f is not None:
+                return f.size
+    fs = xecli_data.root.from_gdata(root).file_systems.file_system.get("bootflash:")
+    if fs is not None:
+        c = fs.file.get(filename)
+        if c is not None:
+            return c.size
+    return None
+
+
+def bootflash_filter(listing: str) -> ygdata.FNode:
+    """Select the files of bootflash: over NETCONF, from
+    Cisco-IOS-XE-platform-software-oper, or over the CLI."""
+    if listing == "netconf":
+        f = lambda name: ygdata.Id(FILES_NS, name)
+        return ygdata.FNode(children=[ygdata.FNode(f("cisco-platform-software"), children=[
+            ygdata.FNode(f("q-filesystem"), children=[
+                ygdata.FNode(f("partitions"), children=[ygdata.FNode(f("name"), value_match="bootflash:")])])])])
+    q = lambda name: ygdata.Id(xecli_yang.NS, name)
+    return ygdata.FNode(children=[ygdata.FNode(q("file-systems"), children=[
+        ygdata.FNode(q("file-system"), children=[ygdata.FNode(q("name"), value_match="bootflash:")])])])
+
+
+#############################################################################
 # Pure: filters and RPC bodies
 #############################################################################
 
@@ -321,21 +423,57 @@ def versions_filter() -> ygdata.FNode:
     return paths.subscribe(select=[paths.install_location_information]).filt!
 
 
-def added_version(root: ?ygdata.Node, release: str) -> ?str:
-    """The device's version string for an added image of `release`.
+# The states of a version in install-version-state-info, from
+# Cisco-IOS-XE-install-oper on a C1111 with 17.15.04c.
+VS_INSTALLED = "install-version-state-installed"
+VS_IN_PROGRESS = "install-version-state-in-progress"
+VS_UNCOMMITTED = "install-version-state-provisioned-uncommitted"
+VS_COMMITTED = "install-version-state-provisioned-committed"
+## The states of a version whose packages the device has: added, marked for
+## activation, activated, or committed. An invalid version lacks part of its
+## image.
+USABLE_VERSION_STATES = [VS_INSTALLED, VS_IN_PROGRESS, VS_UNCOMMITTED, VS_COMMITTED]
 
-    The device names an added image like 17.18.03a.0.5540, which `activate`
-    needs; the running image is there too, so match on the release the version
-    starts with rather than on the state, which changes through the add.
+
+def _release_of_version(version: str) -> str:
+    """The release of a device version: 17.15.04c of 17.15.04c.0.107."""
+    return ".".join(version.split(".")[:3])
+
+
+def version_of(root: ?ygdata.Node, release: str) -> ?(version: str, state: str):
+    """The device's version and its state for `release`, from
+    install-version-state-info.
+
+    The device names a version like 17.18.03a.0.5540, which `activate`
+    needs, so match on the release that the version starts with.
     """
     iod = ixoper.root.from_gdata(root).install_oper_data
     for loc in iod.install_location_information:
         for v in loc.install_version_state_info:
             ver = v.version
-            if ver is not None:
-                parts = ver.split(".")
-                if len(parts) >= 3 and releases_equal(".".join(parts[:3]), release):
-                    return ver
+            if ver is not None and releases_equal(_release_of_version(ver), release):
+                state = v.version_state
+                return (version=ver, state=state if state is not None else "")
+    return None
+
+
+def added_version(root: ?ygdata.Node, release: str) -> ?str:
+    """The device's version for `release` when the device has its packages."""
+    v = version_of(root, release)
+    if v is not None and v.state in USABLE_VERSION_STATES:
+        return v.version
+    return None
+
+
+def committed_release(root: ?ygdata.Node) -> ?str:
+    """The release that the device keeps: the committed version."""
+    iod = ixoper.root.from_gdata(root).install_oper_data
+    for loc in iod.install_location_information:
+        for v in loc.install_version_state_info:
+            ver = v.version
+            state = v.version_state
+            if ver is not None and state is not None and state == VS_COMMITTED:
+                return _release_of_version(ver)
     return None
 
 
@@ -421,7 +559,8 @@ def abort_input(uuid: str) -> ixrpc.Cisco_IOS_XE_install_rpc__abort__input:
 
 actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                           poll_period: float=POLL_PERIOD,
-                          reload_poll_period: float=RELOAD_POLL_PERIOD):
+                          reload_poll_period: float=RELOAD_POLL_PERIOD,
+                          adapter_wait: float=ADAPTER_WAIT):
     """Serializes IOS XE software jobs and owns their polling state.
 
     One job at a time. Install is two phases: add, then activate the added
@@ -433,6 +572,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     # The adapter is built inside DeviceMgr.set_dmc. Calling dev.tree_provider()
     # synchronously here would call back into the same actor and deadlock.
     _rpcs = ixrpc.rpc_root(swdev.DeviceTreeProvider(dev))
+    _cli = xecli_data.rpc_root(swdev.DeviceTreeProvider(dev))
 
     var _phase = ""          # stage | add | activate | commit | abort
     var _gen = 0
@@ -451,6 +591,11 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     var _activate_booting = False
     # Monotonic seconds when activate was sent; the device timer runs from there.
     var _activated_at: ?int = None
+    var _url = ""
+    # The checksum that staging checks the image against, if any.
+    var _check: ?(algorithm: str, digest: str) = None
+    # Install stages the image first, then adds it.
+    var _then_add = False
 
     def _finish(err: ?Exception) -> None:
         d = _done
@@ -474,6 +619,27 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         """A timestamp token with microsecond resolution."""
         secs, nanos = time.get_realtime()
         return "{secs}-{nanos // 1000}"
+
+    def _modules() -> set[str]:
+        return set(dev.get_modules().0.keys())
+
+    def _staging_check() -> ?(algorithm: str, digest: str):
+        """The checksum that the device can check the staged image against,
+        or None when there is none or the device cannot check."""
+        if upgrade_plan(_modules()).verify != "cli":
+            return None
+        checksums: list[(algorithm: str, digest: str)] = []
+        for c in dev.get_dmc().software.image_checksum:
+            checksums.append((algorithm=c.algorithm, digest=c.digest))
+        return usable_checksum(checksums)
+
+    def _size_check(plan: (transfer: str, listing: str, verify: str, install: str)) -> ?u64:
+        """The size that the staged image is checked against: the image
+        size of the intent, when the device can list files but compute no
+        checksum."""
+        if plan.verify != "cli" and plan.listing != "":
+            return dev.get_dmc().software.image_size
+        return None
 
     def _image_url() -> ?str:
         """Read the image URL at job start so configuration changes take effect."""
@@ -520,12 +686,32 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     ####################################################################
 
     def check(done: action(?str, ?Exception) -> None) -> None:
+        """Report the release that the device keeps. That is the running
+        release, unless the device has activated it and not committed it:
+        then the committed release, so that a new run commits the running
+        one rather than calling the device up to date."""
         def on_reply(root: ?ygdata.Node, err: ?Exception) -> None:
             if err is not None:
                 done(None, err)
                 return
-            done(running_release(root), None)
+            running = running_release(root)
+            if running is not None:
+                _check_committed(done, running)
+            else:
+                done(None, None)
         dev.get(on_reply, version_filter())
+
+    def _check_committed(done: action(?str, ?Exception) -> None, running: str) -> None:
+        def on_versions(root: ?ygdata.Node, err: ?Exception) -> None:
+            v = version_of(root, running) if err is None else None
+            if v is not None and v.state == VS_UNCOMMITTED:
+                kept = committed_release(root)
+                _log.info("software: the running release is not committed",
+                          {"running": running, "committed": kept})
+                done(kept, None)
+            else:
+                done(running, None)
+        dev.get(on_versions, versions_filter())
 
     ####################################################################
     # prepare: stage the image, touching no install state
@@ -538,37 +724,221 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         if url is None:
             _finish(ValueError("no image-url configured for release {release}"))
             return
+        _url = url!
         _filename = image_filename(url!)
+        _then_add = False
+        _stage_when_connected(_gen, adapter_wait)
+
+    def _stage_when_connected(gen: int, left: float) -> None:
+        """Stage once every adapter of the device is connected, because the
+        plan follows the modules of the adapters that are connected. After
+        adapter_wait, stage with the adapters that are there."""
+        if gen != _gen:
+            return
+        missing = dev.get_unconnected_adapters()
+        if len(missing) == 0:
+            _stage()
+        elif left <= 0.0:
+            _log.warning("software: staging without adapters that are not connected", {"adapters": missing})
+            _stage()
+        else:
+            if left == adapter_wait:
+                _log.info("software: waiting for adapters before staging", {"adapters": missing})
+            step = ADAPTER_POLL if ADAPTER_POLL < left else left
+            after now step: _stage_when_connected(gen, left - step)
+
+    def _stage() -> None:
+        """Make sure that the device has the image. A release that the
+        device has added needs no image file: activate uses the packages
+        that the add made."""
+        gen = _gen
+        def on_versions(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            ver = added_version(root, _release) if err is None else None
+            if ver is not None:
+                _log.info("software: release added already, no image needed", {"version": ver})
+                _staged()
+            else:
+                _stage_file()
+        dev.get(on_versions, versions_filter())
+
+    def _stage_file() -> None:
+        """Make sure that the image file is on bootflash. When the device can
+        check the file, against a checksum or else against the signature in
+        the image, a file there that passes stays; one that is missing or
+        fails is transferred and checked again. A device that can compute
+        no checksum compares the size of the file with the image size of
+        the intent instead."""
+        _check = _staging_check()
+        plan = upgrade_plan(_modules())
+        if _check is None and plan.verify != "cli" and _size_check(plan) is None:
+            if _then_add:
+                # Install cannot check the file either: trust what prepare
+                # staged.
+                _staged()
+            else:
+                _transfer()
+            return
+        gen = _gen
+        def listed(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!))
+            elif staged_file(root, _filename):
+                _verify(gen, True)
+            else:
+                _transfer()
+        dev.get(listed, bootflash_filter(plan.listing))
+
+    def _verify(gen: int, before_transfer: bool) -> None:
+        c = _check
+        plan = upgrade_plan(_modules())
+        size = _size_check(plan)
+        if c is not None:
+            _verify_against(gen, before_transfer, c)
+        elif plan.verify == "cli":
+            _verify_image(gen, before_transfer)
+        elif size is not None:
+            _verify_size(gen, before_transfer, size, plan.listing)
+        else:
+            _staged()
+
+    def _verify_size(gen: int, before_transfer: bool, size: u64, listing: str) -> None:
+        """Compare the size of the staged image with the image size of the
+        intent, which finds a transfer that stopped early."""
+        def listed(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!))
+                return
+            got = staged_size(root, _filename)
+            if got is not None and got == size:
+                _log.info("software: image size matches", {"file": _filename, "size": size})
+                _staged()
+            elif before_transfer:
+                _log.info("software: staged image has another size, transferring it again",
+                          {"file": _filename, "size": got, "want": size})
+                _transfer()
+            else:
+                _fail("size mismatch: {_filename} is {got} bytes, not {size}")
+        dev.get(listed, bootflash_filter(listing))
+
+    def _verify_image(gen: int, before_transfer: bool) -> None:
+        """Check the hashes and the signature that the image holds."""
+        def verified(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail("verify: " + swdev.error_text(err!))
+                return
+            ok = out.verified if out is not None else None
+            if ok is not None and ok:
+                _log.info("software: image signature verified", {"file": _filename})
+                _staged()
+            elif before_transfer:
+                _log.info("software: staged image fails its signature check, transferring it again", {"file": _filename})
+                _transfer()
+            else:
+                _fail("{_filename} fails its signature check")
+        _cli.verify(verified, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", _filename))
+
+    def _verify_against(gen: int, before_transfer: bool, c: (algorithm: str, digest: str)) -> None:
+        def verified(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail("verify: " + swdev.error_text(err!))
+                return
+            ok = out.verified if out is not None else None
+            if ok is not None and ok:
+                _log.info("software: image verified", {"file": _filename, "algorithm": c.algorithm})
+                _staged()
+            elif before_transfer:
+                _log.info("software: staged image differs, transferring it again", {"file": _filename})
+                _transfer()
+            else:
+                computed = out.digest if out is not None else None
+                _fail("checksum mismatch: {c.algorithm} of {_filename} is {computed}, not {c.digest}")
+        _cli.verify(verified, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", _filename, c.algorithm, c.digest))
+
+    def _staged() -> None:
+        if _then_add:
+            _add_unless_added()
+        else:
+            _finish(None)
+
+    def _transfer() -> None:
+        if upgrade_plan(_modules()).transfer != "netconf":
+            _fail("the device has no way to transfer the image: no {XCOPY_MODULE}")
+            return
+        url = _url
         _expect_stage = STAGE_DOWNLOAD
         gen = _gen
         _log.info("software: staging image",
-                  {"url": redact_url(url!), "uuid": _uuid})
+                  {"url": redact_url(url), "uuid": _uuid})
         def on_rpc(out: ?ixrpc.Cisco_IOS_XE_xcopy_rpc__xcopy__output,
                    err: ?Exception) -> None:
             if gen != _gen:
                 return
             if err is not None:
                 # The device may quote the source, credentials and all.
-                _fail(swdev.error_text(err!).replace(url!, redact_url(url!)))
+                _fail(swdev.error_text(err!).replace(url, redact_url(url)))
                 return
             after now poll_period: _poll(gen)
-        _rpcs.xcopy(on_rpc, xcopy_input(_uuid, url!, _filename))
+        _rpcs.xcopy(on_rpc, xcopy_input(_uuid, url, _filename))
 
     ####################################################################
     # install: add, then activate the added image; device reloads
     ####################################################################
 
     def install(done: action(?Exception) -> None, release: str) -> None:
-        # TODO: Verify the image is still staged and repeat prepare if needed.
-        if not _start("add", done, release):
+        """Stage again, as prepare does, but without a transfer when the
+        device cannot check the file: then trust what prepare staged. Then
+        add the image unless the device has added it, and activate it."""
+        if not _start("stage", done, release):
             return
         url = _image_url()
         if url is None:
             _finish(ValueError("no image-url configured for release {release}"))
             return
+        _url = url!
         _filename = image_filename(url!)
-        _expect_stage = STAGE_ADD_END
         _activated_at = None
+        _then_add = True
+        _stage_when_connected(_gen, adapter_wait)
+
+    def _add_unless_added() -> None:
+        """Activate the image when the device has added it already, as after
+        an install that stopped after the add. IOS XE refuses to add an image
+        again: the add pre-check fails with install-add-prechk-fail. When the
+        device runs the release, activated and not committed, install is
+        done."""
+        gen = _gen
+        def on_versions(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!))
+                return
+            v = version_of(root, _release)
+            if v is not None and v.state == VS_UNCOMMITTED:
+                # Activated before, as by a run that stopped before the
+                # commit: the device runs it, and the commit follows.
+                _log.info("software: release activated already", {"version": v.version})
+                _finish(None)
+            elif v is not None and v.state in USABLE_VERSION_STATES:
+                _log.info("software: image added already", {"file": _filename, "version": v.version})
+                _activate(v.version)
+            else:
+                _add()
+        dev.get(on_versions, versions_filter())
+
+    def _add() -> None:
+        _enter("add")
+        _expect_stage = STAGE_ADD_END
         _log.info("software: adding image", {"file": _filename, "uuid": _uuid})
         _rpcs.install(_on_rpc(_gen, poll_period), install_input(_uuid, _filename))
 
@@ -694,15 +1064,45 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if not v.done:
                 return
             if v.failed:
-                _fail(v.detail)
+                if _phase == "add" and v.detail in BAD_IMAGE_CAUSES:
+                    _delete_bad_image(v.detail)
+                else:
+                    _fail(v.detail)
                 return
             _log.info("software: {_phase} done", {"uuid": _uuid})
             _end_phase()
         dev.get(on_oper, records_filter())
 
+    def _delete_bad_image(cause: str) -> None:
+        """Delete the image file that the device refused to add, so that the
+        next run transfers it again, then fail with the cause."""
+        _gen += 1
+        gen = _gen
+        path = "bootflash:" + _filename
+        if CISCO_RPC_MODULE not in _modules():
+            _fail(cause)
+            return
+        def deleted(out: ?ixrpc.Cisco_IOS_XE_rpc__delete__output, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                why = swdev.error_text(err!)
+                _fail("{cause}; could not delete {path}: {why}")
+            else:
+                _log.warning("software: deleted the image that the device refused",
+                             {"file": path, "cause": cause})
+                _fail("{cause}; deleted {path}")
+        _rpcs.delete(deleted, ixrpc.Cisco_IOS_XE_rpc__delete__input(path))
+
     def _end_phase() -> None:
+        """Go on from a phase that its records report done. Bumping _gen
+        stops the polls of the phase, so that the next one does not run the
+        next step again."""
+        _gen += 1
         if _phase == "add":
             _after_add()
+        elif _phase == "stage":
+            _verify(_gen, False)
         else:
             _finish(None)
 
@@ -752,13 +1152,14 @@ class IosXeSoftwareAdapter(swdev.SoftwareAdapter):
     def __init__(self, dev: swdev.DeviceMgr, dmc: DeviceMetaConfig,
                  log_handler: logging.Handler, env: ?Env,
                  poll_period: float=POLL_PERIOD,
-                 reload_poll_period: float=RELOAD_POLL_PERIOD):
-        # The poll periods are parameters only so a test can drive them fast.
+                 reload_poll_period: float=RELOAD_POLL_PERIOD,
+                 adapter_wait: float=ADAPTER_WAIT):
+        # The periods are parameters only so a test can drive them fast.
         # A device type names a small factory that calls this with defaults;
         # `_fast_adapter` in adapters.test_software_iosxe is the pattern.
         self._log_handler = log_handler
         self._driver = IosXeSoftwareDriver(dev, log_handler, poll_period,
-                                          reload_poll_period)
+                                          reload_poll_period, adapter_wait)
 
     def supports_mocking(self) -> bool:
         return True

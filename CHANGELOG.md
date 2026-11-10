@@ -247,6 +247,25 @@
   campaign copies them with the image URL into the software intent of each
   device, as `software/image-checksum` and `software/image-size`, for the
   device's adapter to check the staged image against. [#778]
+- The IOS XE software adapter picks how each step of an upgrade runs from the
+  modules that the device's adapters report: over NETCONF where the device
+  has the module for the step, else over the IOS XE CLI adapter. It lists
+  `bootflash:` over NETCONF (`Cisco-IOS-XE-platform-software-oper`) or the
+  CLI, and checks a staged image with the CLI adapter's `verify`: against
+  the image checksum of the intent, sha512 before md5, or else against the
+  signature that the image holds. A device that can compute no checksum
+  compares the size of the staged file with `software/image-size`. [#781]
+- IOS XE prepare and install can run again at any time and do only what is
+  left. A release that the device has added needs no image file, and a
+  staged file that passes its check stays; a missing or failing file is
+  transferred and checked again. Install activates a release that the
+  device has added, and a release that the device runs activated and not
+  committed is committed instead of reported up to date. When install add
+  refuses an image as bad, the adapter deletes the file over NETCONF, so the
+  next run transfers it again. [#781]
+- IOS XE staging waits up to 2 minutes for adapters of the device that are
+  not connected, such as a CLI adapter that connects after NETCONF, before it
+  picks how to run. [#781]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
