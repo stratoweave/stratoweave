@@ -1,0 +1,219 @@
+#
+# IOS XE platform probe over the CLI: the filter, the parse, its place after
+# the NETCONF probe, and what DeviceMgr publishes with and without NETCONF.
+#
+
+import logging
+import testing
+import yang
+import yang.gdata as ygdata
+
+import device as swdev
+import device_oper as swdevoper
+import platform_probes
+import adapters.iosxe_cli as xecli
+import adapters.iosxe_cli_data as xecli_data
+import adapters.iosxe_cli_yang as xecli_yang
+import adapters.netconf as swna
+import adapters.platform_iosxe as swxeplat
+import adapters.platform_iosxe_cli as swxecliplat
+import adapters.software_iosxe_mock as swxemock
+import adapters.software_iosxe_yang as swxe_yang
+import adapters.test_iosxe_cli as clitest
+from adapters.adapter import DeviceAdapter, ModCap, NoAdapter
+from device_schema import DeviceSchema
+
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials
+
+## show version on a C1111 running 17.15.06: the lines that the parse reads.
+SHOW_VERSION_C1111 = (r"""
+
+Cisco IOS XE Software, Version 17.15.06
+Cisco IOS Software [IOSXE], ISR Software (ARMV8EL_LINUX_IOSD-UNIVERSALK9-M), Version 17.15.6, RELEASE SOFTWARE (fc2)
+Router uptime is 3 hours, 15 minutes
+System image file is "bootflash:packages.conf"
+cisco C1111-4PLTEEA (1RU) processor with 1336342K/6147K bytes of memory.
+Processor board ID FCZ23259186
+""").replace("\n", "\r\n")
+
+
+def _reply(output: str) -> ygdata.Node:
+    """The reply of the CLI adapter to the probe's get when show version gives
+    output."""
+    r = xecli_data.root()
+    xecli.VersionRead().parse(r, output)
+    return r.to_gdata()
+
+
+def _test_filter_reads_show_version():
+    testing.assertEqual([r.command for r in xecli.reads(swxecliplat.platform_filter())],
+                        ["show version"])
+
+
+def _test_platform_from_reply():
+    """The release is spelled as the device banner spells it, as the NETCONF
+    probe gives it."""
+    head = clitest.SHOW_VERSION[:clitest.SHOW_VERSION.find("Technical Support")]
+    cases: list[(label: str, output: str, want: str)] = [
+        (label="c1111", output=SHOW_VERSION_C1111,
+         want="ios-xe 17.15.6 C1111-4PLTEEA FCZ23259186"),
+        (label="c8000v", output=clitest.SHOW_VERSION,
+         want="ios-xe 17.18.2 C8000V 9KSKL403GG7"),
+        (label="release only", output=head, want="ios-xe 17.18.2 None None"),
+    ]
+    for c in cases:
+        p = swxecliplat.platform(_reply(c.output))
+        if p is not None:
+            testing.assertEqual(c.want, "{p.os} {p.version} {p.model} {p.serial_number}", c.label)
+        else:
+            testing.error("{c.label}: no platform")
+
+
+def _test_platform_without_values():
+    testing.assertTrue(swxecliplat.platform(None) is None, "no reply")
+    testing.assertTrue(swxecliplat.platform(ygdata.Container({})) is None, "an empty reply")
+
+
+def _first_probe(modules: list[str]) -> str:
+    """The name of the first probe in PROBES that applies to a device with
+    these modules."""
+    modset: dict[str, ModCap] = {}
+    for m in modules:
+        modset[m] = ModCap(m, "urn:" + m)
+    for p in platform_probes.PROBES:
+        if p.applies(modset):
+            return p.name
+    return ""
+
+
+def _test_netconf_probe_comes_first():
+    cases: list[(label: str, modules: list[str], want: str)] = [
+        (label="CLI only", modules=[xecli_yang.MODULE], want=swxecliplat.NAME),
+        (label="NETCONF and CLI", modules=[swxeplat.MODULE, xecli_yang.MODULE], want=swxeplat.OS),
+        (label="NETCONF only", modules=[swxeplat.MODULE], want=swxeplat.OS),
+    ]
+    for c in cases:
+        testing.assertEqual(c.want, _first_probe(c.modules), c.label)
+
+
+class _SilentAdapter(NoAdapter):
+    """An adapter that never connects, as NETCONF on IOS XE 16.8, which does
+    not start. It mocks, so that mock mode keeps it."""
+    def supports_mocking(self) -> bool:
+        return True
+
+
+def _never_connects(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, dmc: DeviceMetaConfig,
+                    registry: swdev.SchemaRegistry, log_handler: logging.Handler, env: ?Env) -> DeviceAdapter:
+    return _SilentAdapter(bundled_schema, log_handler, env)
+
+
+actor _PlatformRun(t: testing.EnvT, name: str, netconf: bool, want: str):
+    """A mock device with the IOS XE CLI adapter as extra adapter, which
+    answers show version on a C1111. With netconf, the primary adapter is a
+    NETCONF mock with another model; without, it never connects. Succeed
+    when DeviceMgr publishes want as "os version model serial probe" with
+    both adapters' modules known, or with the CLI's when there is no
+    NETCONF."""
+    var finished = False
+    var dev_ref: ?swdev.DeviceMgr = None
+    var attached = False
+
+    def end(err: ?Exception) -> None:
+        if finished:
+            return
+        finished = True
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        d = dev_ref
+        if oper is None or d is None:
+            return
+        p = swdevoper.stratoweave_rfs__device_entry.from_gdata(oper!).state.platform
+        if p.probe is None:
+            return
+        mods = d!.get_modules().0
+        if netconf and swxeplat.MODULE not in mods:
+            return
+        got = "{p.os} {p.version} {p.model} {p.serial_number} {p.probe}"
+        if got == want:
+            end(None)
+
+    def attach() -> None:
+        d = dev_ref
+        if d is None or attached:
+            return
+        mods = d!.get_modules().0
+        if xecli_yang.MODULE not in mods or (netconf and "Cisco-IOS-XE-install-oper" not in mods):
+            after 0.01: attach()
+            return
+        attached = True
+        extra = d!.get_extra_adapter("iosxe-cli")
+        if isinstance(extra, xecli.IosXeCliAdapter):
+            c = extra.get_mock()
+            if c is not None:
+                c.set_reply("show version", SHOW_VERSION_C1111)
+            else:
+                end(ValueError("no CliMock"))
+                return
+        else:
+            end(ValueError("no CLI adapter"))
+            return
+        if netconf:
+            a = d!.get_adapter()
+            if isinstance(a, swna.NetconfAdapter):
+                ms = a.get_mock_server()
+                if ms is not None:
+                    swxemock.IosXeSoftwareMock(ms, t.log_handler, model="C8300-1N1S-4T2X",
+                                                serial="FGL2231L0AB").attach()
+                    return
+            end(ValueError("no NETCONF mock server"))
+
+    def timeout() -> None:
+        d = dev_ref
+        mods = list(d!.get_modules().0.keys()) if d is not None else []
+        end(ValueError("timed out: modules {mods}"))
+
+    schema = yang.compile(swxe_yang.models)
+    cli_schema = yang.compile(xecli_yang.models)
+    cli_type = swdev.DeviceType(name="iosxe-cli", adapter_type=xecli.IosXeCliAdapter,
+                                src_dnode=cli_schema, oper_src_dnode=cli_schema)
+    dev_types = {
+        "iosxe": swdev.DeviceType(name="iosxe", adapter_type=swna.NetconfAdapter,
+                                  src_dnode=schema, oper_src_dnode=schema),
+        "iosxe-cli": cli_type,
+    }
+    if not netconf:
+        dev_types["iosxe"] = swdev.DeviceType(name="iosxe", adapter_type=_never_connects,
+                                              src_dnode=schema, oper_src_dnode=schema)
+    d = swdev.DeviceMgr(dev_types, t.env, name, t.log_handler, on_reconf,
+                        swdev.SchemaRegistry(), platform_probes=platform_probes.PROBES)
+    dev_ref = d
+    d.set_platform_retry(0.05)
+    d.set_update_oper(on_state)
+    dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe")
+    dmc.mock.enabled = True
+    dmc.extra_adapter.create("iosxe-cli")
+    d.set_dmc(dmc)
+    after 0.01: attach()
+    after 2.5: timeout()
+
+
+actor _test_platform_from_the_cli_without_netconf(t: testing.EnvT):
+    """NETCONF never connects, as on IOS XE 16.8: the CLI probe reads the
+    platform."""
+    _PlatformRun(t, "d-cli-only", False, "ios-xe 17.15.6 C1111-4PLTEEA FCZ23259186 ios-xe-cli")
+
+
+actor _test_platform_from_netconf_beside_the_cli(t: testing.EnvT):
+    """Both adapters connect: the NETCONF probe reads the platform."""
+    _PlatformRun(t, "d-both", True,
+                 "ios-xe {swxemock.OLD_REPORTED} C8300-1N1S-4T2X FGL2231L0AB ios-xe")

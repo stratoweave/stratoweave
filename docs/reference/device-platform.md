@@ -191,6 +191,7 @@ so a probe that reads two subtrees sends two gets.
 | Probe | Applies when the device lists | Reads | Model | Serial number |
 | --- | --- | --- | --- | --- |
 | `ios-xe` | `Cisco-IOS-XE-device-hardware-oper` | one get: inventory and version banner | chassis part number | chassis entry |
+| `ios-xe-cli` | `stratoweave-iosxe-cli`, from the IOS XE CLI adapter | one get: `show version` | the word after `cisco` on the processor line | `Processor board ID` |
 | `ios-xr` | `Cisco-IOS-XR-install-oper` | two gets: `install/version`, the rack inventory | `chassis-pid`, else the rack's model | the rack with the lowest name |
 | `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information` | `product-model` | `serial-number` of system information |
 | `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis |
@@ -201,7 +202,8 @@ Each probe but Junos reads through YANG that its module ships pruned in
 `platform_<os>_yang.act` (`software_iosxe_yang.act` for IOS XE), with the
 namespaces and node names of the real modules. A device type for that OS
 adds those models, unless its schema has the real modules. The probes apply
-to different modules, so a device's modules pick one of them.
+to different modules, so a device's modules pick one of them, except an
+IOS XE device with both adapters: there `ios-xe` comes first and runs.
 
 ### IOS XE
 
@@ -220,6 +222,19 @@ returned invalid UTF-8 in that tree.
 number `9ABCDEFGHIJ`, or the `model` and `serial` it is given. A mock device
 sets them as `mock/platform/model` and `mock/platform/serial-number`, and the
 release it starts on as `mock/platform/version`.
+
+### IOS XE over the CLI
+
+`ios-xe-cli` reads a device that has the IOS XE CLI adapter as an extra
+adapter. It comes after `ios-xe` in `PROBES`, so it reads only while the
+device's NETCONF has not connected, as on IOS XE 16.8 on a C1111, where the
+NETCONF server does not start. When NETCONF connects, `ios-xe` reads again
+and its values replace these.
+
+It gives the release as the banner spells it, `17.15.6` where `show version`
+says `Cisco IOS XE Software, Version 17.15.06`, so the release stays the same
+when `ios-xe` takes over. The model and the serial number of a C1111 are the
+same in both.
 
 ### IOS XR
 
