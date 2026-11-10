@@ -199,6 +199,19 @@ VERIFY_SHA512_EQUAL = _crlf(r"""
 Verified (bootflash:c1100-universalk9_ias.16.08.01.SPA.bin) = d114d9318991a756f78c32516f347611335542d5b9fc96cb074f2ed7bc9749bd322f2cf2df358c689e2594692757dd769ecc5d96001c15c1c1938c486fe554e6
 """)
 
+# A configuration session on 17.9.5a, split into what the device prints
+# after the login and after each command that the dialog types.
+CONFIG_REPLIES = {
+    "": "\r\n\r\n\r\nRouter#",
+    "configure terminal": "configure terminal\r\nEnter configuration commands, one per line.  End with CNTL/Z.\r\nRouter(config)#",
+    "hostname Router": "hostname Router\r\nRouter(config)#",
+    "hostnme Router": "hostnme Router\r\n                    ^\r\n% Invalid input detected at '^' marker.\r\n\r\nRouter(config)#",
+    "end": "end\r\nRouter#",
+}
+
+## write memory
+WRITE_MEMORY = "Building configuration...\r\n[OK]\r\n"
+
 ## show bootvar, on 17.9.5a in install mode
 BOOTVAR_INSTALL = "\r\n\r\n\r\nBOOT variable = bootflash:packages.conf,1;\r\nCONFIG_FILE variable does not exist\r\nBOOTLDR variable does not exist\r\nConfiguration register is 0x2102\r\n\r\nStandby not ready to show bootvar\r\n"
 
@@ -555,6 +568,111 @@ def _test_install_reload():
         ("the session of an add ends", _install_ended(add, started), "error: "),
     ]
     for name, got, want in cases:
+        testing.assertTrue(got.startswith(want), name + ": " + got)
+
+
+def _dialog(lines: list[str], replies: dict[str, str], piece: int) -> (typed: list[str], error: ?str, finished: bool):
+    """Run a ConfigDialog against replies, which map a typed command to what
+    the device prints. The device output arrives in pieces of piece
+    characters."""
+    d = xecli.ConfigDialog(lines)
+    typed: list[str] = []
+    queue = [""]
+    while len(queue) > 0 and len(typed) < 20:
+        command = queue[0]
+        queue = queue[1:]
+        reply = replies.get(command)
+        if reply is not None:
+            i = 0
+            while i < len(reply):
+                for t in d.received(reply[i:i + piece]):
+                    typed.append(t.rstrip())
+                    queue.append(t.rstrip())
+                i += piece
+    return (typed=typed, error=d.error, finished=d.finished())
+
+
+def _test_config_dialog():
+    rejected = "hostnme Router: % Invalid input detected at '^' marker."
+    locked = {"": CONFIG_REPLIES[""],
+              # Constructed: the device answers configure terminal without a
+              # configuration prompt.
+              "configure terminal": "configure terminal\r\n% Configuration mode is locked\r\nRouter#"}
+    cases = [
+        ("an accepted line", ["hostname Router"], CONFIG_REPLIES, 1000,
+         ["configure terminal", "hostname Router", "end"], None),
+        ("output in pieces", ["hostname Router"], CONFIG_REPLIES, 3,
+         ["configure terminal", "hostname Router", "end"], None),
+        ("a rejected line stops the session", ["hostnme Router", "hostname Router"], CONFIG_REPLIES, 1000,
+         ["configure terminal", "hostnme Router", "end"], rejected),
+        ("a rejected line after an accepted one", ["hostname Router", "hostnme Router"], CONFIG_REPLIES, 7,
+         ["configure terminal", "hostname Router", "hostnme Router", "end"], rejected),
+        ("no configuration prompt", ["hostname Router"], locked, 1000,
+         ["configure terminal"], "configure terminal: % Configuration mode is locked"),
+    ]
+    for name, lines, replies, piece, typed, error in cases:
+        got = _dialog(lines, replies, piece)
+        testing.assertEqual(got.typed, typed, name)
+        testing.assertEqual(got.error, error, name)
+        testing.assertTrue(got.finished, name + ": finished")
+
+
+def _test_check_config_line():
+    cases = [
+        ("boot system flash bootflash:packages.conf", ""),
+        ("no boot system", ""),
+        ("hostname a?b", "invalid configuration command"),
+        ("hostname a\nreload", "invalid configuration command"),
+        ("hostname a\tb", "invalid configuration command"),
+        ("hostname a\x7fb", "invalid configuration command"),
+        ("   ", "invalid configuration command"),
+    ]
+    for line, want in cases:
+        got = ""
+        try:
+            xecli.check_config_line(line)
+        except ValueError as e:
+            got = e.error_message
+        testing.assertTrue(got.startswith(want), line + ": " + got)
+
+
+def _test_write_memory_reply():
+    call = xecli.rpc_call(gdata.Container({_q("write-memory"): gdata.Container({})}))
+    testing.assertEqual(call.command, "write memory")
+    call.reply(WRITE_MEMORY)
+    for name, output, want in [
+        ("no [OK]", "Building configuration...\r\n", "write memory output has no [OK]"),
+        ("an error", "\r\n%Error opening nvram:startup-config\r\n", "%Error opening"),
+    ]:
+        try:
+            call.reply(output)
+            testing.assertTrue(False, name + ": no error")
+        except xecli.CommandError as e:
+            testing.assertTrue(e.error_message.startswith(want), name + ": " + e.error_message)
+
+
+def _configure_request(lines: list[str]) -> gdata.Node:
+    inp = xecli_data.stratoweave_iosxe_cli__configure__input(line=lines)
+    return gdata.Container({_q("configure"): inp.to_gdata()})
+
+
+def _test_configure_lines():
+    boot = ["no boot system", "boot system flash bootflash:packages.conf"]
+    write = gdata.Container({_q("write-memory"): gdata.Container({})})
+    cases = [
+        ("two lines", _configure_request(boot), "no boot system | boot system flash bootflash:packages.conf"),
+        ("another RPC", write, "none"),
+        ("a line with ?", _configure_request(["hostname a?"]), "error: invalid configuration command"),
+        ("two RPCs", gdata.Container({_q("configure"): gdata.Container({}), _q("write-memory"): gdata.Container({})}),
+         "error: an RPC request must have exactly one child"),
+    ]
+    for name, request, want in cases:
+        got = ""
+        try:
+            lines = xecli.configure_lines(request)
+            got = " | ".join(lines) if lines is not None else "none"
+        except ValueError as e:
+            got = "error: " + e.error_message
         testing.assertTrue(got.startswith(want), name + ": " + got)
 
 
@@ -1506,6 +1624,88 @@ actor _test_live_install(t: testing.EnvT):
 
     if image == "" or release == "":
         finish(ValueError("set IOSXE_INSTALL_FILE and IOSXE_INSTALL_VERSION"))
+    else:
+        dev = _device(t, xecli.IosXeCliAdapter, on_reconf, _setting(t, "IOSXE_CLI_ADDRESS", "127.0.0.1"),
+                      int(_setting(t, "IOSXE_CLI_PORT", "22")), _live_credentials(t), _live_ssh(t))
+        connected()
+
+
+# The configure test changes the configuration of a real device and saves
+# it. Run it on a lab device only, with --tag iosxe-configure and the
+# settings above. It sets the BOOT variable to IOSXE_BOOT_FILE, e.g.
+# bootflash:packages.conf for a device in install mode.
+
+actor _test_live_configure(t: testing.EnvT):
+    """Configure a real device: a rejected command fails the RPC, the boot
+    statements change, write memory saves them, and show bootvar has them."""
+    t.require("iosxe-configure")
+    t.timeout(300.0)
+    boot = _setting(t, "IOSXE_BOOT_FILE", "")
+    var dev: ?swdev.DeviceMgr = None
+    var rpcs: ?xecli_data.rpc_root = None
+    var finished = False
+
+    def finish(err: ?Exception):
+        if finished:
+            return
+        finished = True
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def booted(tree: ?gdata.Node, err: ?Exception):
+        try:
+            if err is not None:
+                raise err
+            r = xecli_data.root.from_gdata(tree)
+            testing.assertEqual(list(r.bootvar.boot), [boot], "the BOOT variable")
+        except Exception as e:
+            finish(e)
+            return
+        finish(None)
+
+    def saved(err: ?Exception):
+        d = dev
+        if err is not None:
+            finish(err)
+        elif d is not None:
+            d.get(booted, _top([gdata.FNode(_q("bootvar"))]))
+
+    def configured(err: ?Exception):
+        r = rpcs
+        if err is not None:
+            finish(err)
+        elif r is not None:
+            r.write_memory(saved)
+
+    def rejected(err: ?Exception):
+        r = rpcs
+        try:
+            testing.assertTrue(isinstance(err, xecli.CommandError), "a misspelled command fails")
+            if err is not None:
+                testing.assertTrue("% Invalid input" in err.error_message, err.error_message)
+        except Exception as e:
+            finish(e)
+            return
+        if r is not None:
+            r.configure(configured, xecli_data.stratoweave_iosxe_cli__configure__input(
+                line=["no boot system", "boot system flash " + boot]))
+
+    def connected():
+        d = dev
+        if d is not None and xecli_yang.MODULE in d.get_modules().0:
+            r = xecli_data.rpc_root(swdev.DeviceTreeProvider(d))
+            rpcs = r
+            r.configure(rejected, xecli_data.stratoweave_iosxe_cli__configure__input(line=["hostnme Router"]))
+            return
+        after 0.5: connected()
+
+    def on_reconf(name: str):
+        pass
+
+    if boot == "":
+        finish(ValueError("set IOSXE_BOOT_FILE"))
     else:
         dev = _device(t, xecli.IosXeCliAdapter, on_reconf, _setting(t, "IOSXE_CLI_ADDRESS", "127.0.0.1"),
                       int(_setting(t, "IOSXE_CLI_PORT", "22")), _live_credentials(t), _live_ssh(t))

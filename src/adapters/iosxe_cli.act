@@ -11,10 +11,10 @@ What the IOS XE releases that we tried give for software management, over
 NETCONF and over the CLI:
 
                        NETCONF                    CLI
-  Release   Platform   files verify install ev    dir sum hash image install bootvar  Notes
-  16.8.1    C1111      -     -      -       -     yes yes -    yes   yes     yes      1 2 3 4 5 9
-  17.9.5a   C1111      yes   no     has     yes   yes yes yes  yes   has     yes      6 7 9
-  17.18.2   C8000V     -     no     yes     yes   yes yes -    -     -       -        8
+  Release   Platform   files verify install ev    dir sum hash image install bootvar config  Notes
+  16.8.1    C1111      -     -      -       -     yes yes -    yes   yes     yes     yes     1 2 3 4 5 9
+  17.9.5a   C1111      yes   no     has     yes   yes yes yes  yes   has     yes     yes     6 7 9
+  17.18.2   C8000V     -     no     yes     yes   yes yes -    -     -       -       -       8
 
   files    Cisco-IOS-XE-platform-software-oper, the files of each partition
   verify   Cisco-IOS-XE-verify-rpc and Cisco-IOS-XE-verify-events
@@ -28,6 +28,7 @@ NETCONF and over the CLI:
            its digital signature
   install  install add, activate, commit, abort, remove and rollback
   bootvar  show bootvar: the files that ROMMON boots
+  config   configure terminal in an SSH shell, and write memory
 
   yes      tried, and it works
   no       the device does not have it
@@ -82,6 +83,13 @@ RPC_TIMEOUT = 600.0
 ## Seconds that an install command can run. install add copies and expands
 ## an image, from a URL too.
 INSTALL_TIMEOUT = 3600.0
+
+## Seconds to wait for the prompt after each configuration command.
+CONFIG_LINE_TIMEOUT = 30.0
+
+## The start of a line in which the device rejects a configuration command.
+_CONFIG_ERRORS = ["% Invalid input", "% Incomplete command", "% Ambiguous command", "% Unknown command",
+                  "%Error", "% Error", "ERROR:"]
 
 ## Seconds between login attempts after a failure: the first delay, and the
 ## limit for the delay that doubles after each failure.
@@ -679,7 +687,9 @@ def reads(filt: ?gdata.FNode) -> list[Read]:
 
 
 class Call(object):
-    """An exec command that runs an RPC of the module.
+    """An exec command that runs an RPC of the module. The configure RPC is
+    a dialog in configure terminal, not an exec command: see
+    configure_lines.
 
     A subclass sets command and implements reply.
     """
@@ -744,6 +754,100 @@ def check_install_output(output: str) -> None:
             raise CommandError(reason if reason is not None else line)
 
 
+def check_config_line(line: str) -> None:
+    """Raise ValueError if line cannot be typed as one configuration command.
+
+    A control character would end the command early or type another one, and
+    ? asks the device for help instead of running the command.
+    """
+    if line.strip() == "" or any([c == "?" or ord(c) < 32 or ord(c) == 127 for c in line]):
+        raise ValueError("invalid configuration command: " + line.replace("\n", "\\n").replace("\r", "\\r"))
+
+
+def config_error(output: str) -> ?str:
+    """Return the line in output where the device rejects a configuration
+    command, or None."""
+    for line in output.splitlines():
+        text = line.strip()
+        if any([text.startswith(e) for e in _CONFIG_ERRORS]):
+            return text
+    return None
+
+
+class ConfigDialog(object):
+    """Type configuration commands into an IOS XE shell, one at a time.
+
+    received takes what the device prints and returns what to type next. A
+    command is done when the echo of the command has ended and the last line
+    is a prompt, which ends with #. The dialog types configure terminal at
+    the first prompt, then each line, then end. It types end after the first
+    line that the device rejects, and keeps the error.
+    """
+    lines: list[str]
+    sent: int
+    step: int
+    pending: str
+    transcript: str
+    error: ?str
+
+    def __init__(self, lines: list[str]):
+        self.lines = lines
+        self.sent = 0
+        # 0: wait for the prompt, 1: configure terminal typed, 2: a line
+        # typed, 3: end typed, 4: done.
+        self.step = 0
+        self.pending = ""
+        self.transcript = ""
+        self.error = None
+
+    def finished(self) -> bool:
+        return self.step == 4
+
+    def current(self) -> str:
+        """Return what the dialog typed last."""
+        if self.step == 1:
+            return "configure terminal"
+        if self.step == 2:
+            return self.lines[self.sent - 1]
+        return "end"
+
+    mut def received(self, text: str) -> list[str]:
+        self.transcript += text
+        self.pending += text
+        newline = self.pending.rfind("\n")
+        if self.step != 0 and newline < 0:
+            return []
+        prompt = self.pending[newline + 1:].strip()
+        if not prompt.endswith("#"):
+            return []
+        first = self.pending.find("\n")
+        output = self.pending[first + 1:newline] if 0 <= first and first < newline else ""
+        self.pending = ""
+        if self.step == 0:
+            self.step = 1
+            return ["configure terminal\r"]
+        if self.step == 1 and "(config" not in prompt:
+            self.error = "configure terminal: " + (output.strip() if output.strip() != "" else "no configuration prompt")
+            self.step = 4
+            return []
+        if self.step == 2:
+            err = config_error(output)
+            if err is not None:
+                self.error = self.lines[self.sent - 1] + ": " + err
+                self.step = 3
+                return ["end\r"]
+        if self.step == 1 or self.step == 2:
+            if self.sent < len(self.lines):
+                line = self.lines[self.sent]
+                self.sent += 1
+                self.step = 2
+                return [line + "\r"]
+            self.step = 3
+            return ["end\r"]
+        self.step = 4
+        return []
+
+
 def install_reloads(output: str) -> bool:
     """Return True if the output of an install command says that the device
     reloads now."""
@@ -778,17 +882,58 @@ class InstallCall(Call):
         return INSTALL_TIMEOUT if INSTALL_TIMEOUT > default else default
 
 
-def rpc_call(request: gdata.Node) -> Call:
-    """Return the call for an RPC request. Raise ValueError for an RPC that
-    the adapter does not run, or for input that is not valid."""
+class WriteMemoryCall(Call):
+    """Run the write-memory RPC."""
+    def __init__(self):
+        self.command = "write memory"
+
+    def reply(self, output: str) -> gdata.Node:
+        lines = [line.strip() for line in output.splitlines()]
+        err = _device_error(lines)
+        if err is not None:
+            raise CommandError(err)
+        if "[OK]" not in lines:
+            raise CommandError("write memory output has no [OK]")
+        return gdata.Container({})
+
+
+def _rpc_of(request: gdata.Node) -> (rpc_id: gdata.Id, body: gdata.Node):
+    """Return the RPC of a request and its input."""
     items = list(request.children.items())
     if len(items) != 1:
         raise ValueError("an RPC request must have exactly one child")
     rpc_id, body = items[0]
+    return (rpc_id=rpc_id, body=body)
+
+
+def configure_lines(request: gdata.Node) -> ?list[str]:
+    """Return the lines of a configure RPC request, or None for another RPC.
+    Raise ValueError when there is no line, or a line is not one
+    configuration command."""
+    r = _rpc_of(request)
+    if r.rpc_id != gdata.Id(xecli_yang.NS, "configure"):
+        return None
+    lines = list(xecli_data.stratoweave_iosxe_cli__configure__input.from_gdata(r.body).line)
+    if len(lines) == 0:
+        raise ValueError("configure needs at least one line")
+    for line in lines:
+        check_config_line(line)
+    return lines
+
+
+def rpc_call(request: gdata.Node) -> Call:
+    """Return the call for the request of an RPC that runs an exec command.
+    Raise ValueError for an RPC that the adapter does not run that way, or
+    for input that is not valid."""
+    r = _rpc_of(request)
+    rpc_id = r.rpc_id
+    body = r.body
     if rpc_id == gdata.Id(xecli_yang.NS, "verify"):
         return VerifyCall(xecli_data.stratoweave_iosxe_cli__verify__input.from_gdata(body))
     if rpc_id == gdata.Id(xecli_yang.NS, "install"):
         return InstallCall(xecli_data.stratoweave_iosxe_cli__install__input.from_gdata(body))
+    if rpc_id == gdata.Id(xecli_yang.NS, "write-memory"):
+        return WriteMemoryCall()
     raise ValueError("RPC " + str(rpc_id) + " is not supported by the IOS XE CLI adapter")
 
 
@@ -796,6 +941,31 @@ def _tcp(env: ?Env) -> ?net.TCPConnectCap:
     if env is not None:
         return net.TCPConnectCap(net.TCPCap(net.NetCap(env.cap)))
     return None
+
+
+def _client(cap: net.TCPConnectCap, dmc: DeviceMetaConfig,
+            on_connect: action(ssh.Client, ?Exception) -> None,
+            on_close: action(ssh.Client, str) -> None,
+            on_hostkey: action(ssh.Client, str, ssh.HostKeyInfo) -> None) -> ssh.Client:
+    """Return an SSH client that logs in to the first address of the device
+    with its credentials and SSH settings. Raise NotConnectedError when the
+    device has no address."""
+    addresses = list(dmc.address)
+    if len(addresses) == 0:
+        raise NotConnectedError("the device has no address")
+    address = addresses[0]
+    port = address.port
+    keys: list[ssh.PrivateKey] = []
+    for key in dmc.credentials.key:
+        material = key.private_key
+        if material is not None:
+            keys.append(ssh.PrivateKey(material.encode()))
+    return ssh.Client(cap, address.address, dmc.credentials.username,
+                      on_connect, on_close, on_hostkey,
+                      password=dmc.credentials.password,
+                      private_keys=keys if len(keys) > 0 else None,
+                      port=u16(port) if port is not None else u16(22),
+                      transport=ssh_transport_config(dmc.ssh))
 
 
 actor _Session(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, command: ?str, timeout: float,
@@ -856,28 +1026,109 @@ actor _Session(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, command: ?str, tim
         pass
 
     def _start():
-        addresses = list(dmc.address)
-        if len(addresses) == 0:
-            _finish(None, NotConnectedError("the device has no address"))
-            return
-        address = addresses[0]
-        port = address.port
-        keys: list[ssh.PrivateKey] = []
-        for key in dmc.credentials.key:
-            material = key.private_key
-            if material is not None:
-                keys.append(ssh.PrivateKey(material.encode()))
         try:
-            client = ssh.Client(cap, address.address, dmc.credentials.username,
-                                _on_connect, _on_close, _on_hostkey,
-                                password=dmc.credentials.password,
-                                private_keys=keys if len(keys) > 0 else None,
-                                port=u16(port) if port is not None else u16(22),
-                                transport=ssh_transport_config(dmc.ssh))
+            client = _client(cap, dmc, _on_connect, _on_close, _on_hostkey)
         except Exception as e:
             _finish(None, e)
 
     _start()
+
+
+actor _ConfigSession(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, lines: list[str],
+                     done: action(?str, ?Exception) -> None):
+    """Log in to the device over SSH, open a shell, and type lines in
+    configure terminal with a ConfigDialog. Call done once with what the
+    device printed, then close the connection.
+
+    The session fails when the device rejects a line, or when no prompt
+    follows a command within CONFIG_LINE_TIMEOUT, as after a question.
+    """
+    var client: ?ssh.Client = None
+    var channel: ?ssh.Channel = None
+    var finished = False
+    var progress = 0
+    dialog = ConfigDialog(lines)
+
+    def _finish(err: ?Exception):
+        if finished:
+            return
+        finished = True
+        c = client
+        client = None
+        if c is not None:
+            c.close()
+        done(dialog.transcript, err)
+
+    def _type(texts: list[str]):
+        ch = channel
+        if ch is not None:
+            for text in texts:
+                ch.write(text.encode())
+
+    def _stalled(at: int):
+        if finished or at != progress:
+            return
+        _type(["\x03", "end\r"])
+        _finish(CommandError("no prompt after " + dialog.current()))
+
+    def _on_stdout(ch: ssh.Channel, data: ?bytes):
+        if data is not None:
+            if not finished:
+                _received(data)
+
+    def _received(data: bytes):
+        try:
+            text = data.decode()
+        except Exception:
+            _finish(CommandError("SSH shell output is not UTF-8"))
+        else:
+            _answer(text)
+
+    def _answer(text: str):
+        progress += 1
+        _type(dialog.received(text))
+        if dialog.finished():
+            _type(["exit\r"])
+            err = dialog.error
+            _finish(CommandError(err) if err is not None else None)
+            return
+        at = progress
+        after CONFIG_LINE_TIMEOUT: _stalled(at)
+
+    def _on_stderr(ch: ssh.Channel, data: ?bytes):
+        pass
+
+    def _on_exit(ch: ssh.Channel, code: int, signal: ?str):
+        pass
+
+    def _on_channel_close(ch: ssh.Channel, reason: str):
+        _finish(TransientError("SSH shell closed: " + reason))
+
+    def _on_open(ch: ssh.Channel, err: ?str):
+        if err is not None:
+            _finish(TransientError("SSH shell failed: " + err))
+            return
+        # A wide terminal keeps the device from scrolling long commands.
+        ch.request_shell(cols=500)
+        after CONFIG_LINE_TIMEOUT: _stalled(0)
+
+    def _on_hostkey(c: ssh.Client, state: str, info: ssh.HostKeyInfo):
+        # The NETCONF adapter does not check host keys either.
+        c.accept_hostkey()
+
+    def _on_connect(c: ssh.Client, err: ?Exception):
+        if err is not None:
+            _finish(NotConnectedError("SSH login failed: " + swdev.error_text(err)))
+            return
+        channel = ssh.Channel(c, _on_open, _on_stdout, _on_stderr, _on_exit, _on_channel_close)
+
+    def _on_close(c: ssh.Client, reason: str):
+        _finish(TransientError("SSH connection closed: " + reason))
+
+    try:
+        client = _client(cap, dmc, _on_connect, _on_close, _on_hostkey)
+    except Exception as e:
+        _finish(e)
 
 
 actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?Env,
@@ -985,13 +1236,37 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
                 cb(reply, None)
         _session(c.command, c.timeout(rpc_timeout), received)
 
-    def rpc(cb: action(?gdata.Node, ?Exception) -> None, request: gdata.Node):
+    def _configure(cb: action(?gdata.Node, ?Exception) -> None, lines: list[str]):
+        def received(output: ?str, err: ?Exception):
+            _log.debug("IOS XE CLI: configure ended", {"lines": lines, "output": output, "error": err})
+            if err is not None:
+                cb(None, err)
+            else:
+                cb(gdata.Container({}), None)
+        d = dmc
+        if d is not None and tcp is not None and not closed:
+            _ConfigSession(tcp, d, lines, received)
+        else:
+            received(None, NotConnectedError("the IOS XE CLI adapter has no SSH connection settings"))
+
+    def _exec(cb: action(?gdata.Node, ?Exception) -> None, request: gdata.Node):
         try:
             c = rpc_call(request)
         except Exception as e:
             cb(None, e)
         else:
             _call(cb, c)
+
+    def rpc(cb: action(?gdata.Node, ?Exception) -> None, request: gdata.Node):
+        try:
+            lines = configure_lines(request)
+        except Exception as e:
+            cb(None, e)
+        else:
+            if lines is not None:
+                _configure(cb, lines)
+            else:
+                _exec(cb, request)
 
     def close(on_close: ?action() -> None=None):
         closed = True
