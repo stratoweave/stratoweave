@@ -183,7 +183,7 @@
 - Each mock upgrade takes its own time: `mock/software/upgrade-duration-variance`
   draws it within that percentage of `upgrade-duration`, either way, 20 by
   default, so devices released together no longer all finish together. 0
-  keeps every upgrade at exactly `upgrade-duration`.
+  keeps every upgrade at exactly `upgrade-duration`. [#770]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -282,7 +282,7 @@
   with time of its own at the end leaves the slots to one that closes
   first, and a deadline needs about the concurrency it needed before.
   Windows that close together share in proportion to the upgrade time
-  waiting in them.
+  waiting in them. [#770]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
