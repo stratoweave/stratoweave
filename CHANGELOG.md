@@ -351,6 +351,39 @@
   groups or member devices, removing the software intent of the devices
   that the campaign had released, until the campaign wrote it again a
   moment later. An upgrade that had not reached its install could fail.
+- Campaigns acquire their members in `plan` and in `run`. Each member in
+  the fleet gets the campaign's name, its target release and image URL, and
+  a veto with the holder `campaign:NAME`, which holds the install. So each
+  member reads the release it runs and answers `up-to-date` or
+  `upgrade-needed`, and nothing is installed. A member added to a running
+  campaign is acquired the same way. In `run`, the campaign removes a
+  member's veto when it releases the member, and puts it back when the
+  member is done. Before, a campaign wrote nothing until it released a
+  member in a window.
+- A device in the fleet is in one campaign at most, also while the
+  campaign is in `plan` and after it is done. An edit that names a device
+  in a second campaign fails with "Cannot merge leaves with different
+  values at /software/upgrade-campaign". To move a device, remove it from
+  its campaign, or delete the campaign, in an earlier edit. A device that
+  is not in the fleet gets nothing from a campaign, so two campaigns can
+  name it; the edit that adds it to the fleet then fails with the same
+  error until only one campaign names it.
+- A campaign's `device-status` shows a member's status only when the status
+  is for the campaign's intent, its name and the member's target release,
+  and `pending` otherwise. Its new `upgrade-campaign` and `target-release`
+  say which intent the device's status is for. The counters count only
+  those statuses. Before, a `succeeded` left from an earlier campaign made
+  a member done at its release, with no upgrade.
+- Setting a running campaign back to `plan` pauses it: members in flight
+  stop before their install, and are released again when the campaign runs
+  again. A member that still reports `in-progress` for the campaign when it
+  runs again, or after a restart of fleetmgr, counts in flight and keeps
+  the campaign's veto until it is done, or until it stops before its
+  install. Stopping a campaign and running it again no longer retries its
+  failed members. To retry a member, remove it from the campaign, wait
+  until the device's software state has no `upgrade-campaign`, and add it
+  again: the campaign takes it as a new member.
+- `allow-staging` on a campaign is no longer passed to the devices.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -557,6 +590,9 @@
   `target-release` and `image-url`. Add the images to `/images/image`, with
   their `version`, set `/images/url-base`, and name an image for each member.
   [#743]
+- A device can be in one Fleet Manager campaign only. Before you upgrade,
+  remove each device that two campaigns name from one of them. Otherwise
+  Fleet Manager cannot load its configuration and does not start.
 
 ## [26.10] - 2026-10-23
 
