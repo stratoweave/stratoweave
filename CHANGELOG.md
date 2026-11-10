@@ -184,10 +184,10 @@
   shell is ready. When the connection closes, or a command gets no prompt
   within its time, the adapter reports the device as disconnected and logs
   in again. After a minute without a command, it types an empty line, so a
-  dead connection shows.
+  dead connection shows. [#780]
 - The `install` RPC of the IOS XE CLI adapter answers the question that
   `install remove` asks before it deletes files, which has no
-  `prompt-level none` on IOS XE 17.15.
+  `prompt-level none` on IOS XE 17.15. [#780]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
