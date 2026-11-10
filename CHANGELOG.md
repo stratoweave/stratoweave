@@ -397,6 +397,11 @@
   campaigns. [#736]
 - The web UI is built with SvelteKit 3, and `just gen-webui` needs Node 22.17
   or newer. [#739] [#745]
+- A fleet device can have extra adapters, as a StratoWeave device can: the
+  `extra-adapter` list with the type, address, port, credentials and SSH
+  settings of each, which the transforms pass to the device on its
+  flotilla. The flotillas register the device type `iosxe-cli`, the IOS XE
+  CLI adapter, so an IOS XE device can have the CLI beside NETCONF. [#779]
 
 ### Dependencies
 
