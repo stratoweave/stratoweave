@@ -153,15 +153,24 @@ member added later, also while the campaign runs, is acquired the same way.
 In `run`, the campaign removes the veto of a member when it releases the
 member in a window, and puts the veto back when the member is done.
 
-A member's `device-status` shows its status only when the status answers
-the campaign's intent: the campaign's name and the member's target release.
-Otherwise it shows `pending`, and the counters do not count it. Its
-`upgrade-campaign` and `target-release` say which intent the device's
-status answers.
+A member's `device-status` shows its status only when the status is for
+the campaign's intent: the device reports it for the campaign's name and
+the member's target release. Otherwise it shows `pending`, and the counters
+do not count it. Its `upgrade-campaign` and `target-release` say which
+intent the device's status is for.
 
-A device is in one campaign at most, also while the campaign is in `plan`
-and after it is done. An edit that names a device in a second campaign
-fails with "Cannot merge leaves with different values at
+The campaign releases a member only once the member has answered its
+target: its status is `upgrade-needed`, or a final status. A member that
+shows `pending` or `unknown` has not answered. Until it answers, the plan
+holds the member in its window, and the plan's alarms name it. A campaign
+in `plan` plans again as the answers come in. Its plan is that of a run
+that starts now, so it shows what `run` would do. A campaign created
+directly in `run` promises its windows in the order its members answer.
+Create it in `plan` first to keep the campaign's order.
+
+A device in the fleet is in one campaign at most, also while the campaign
+is in `plan` and after it is done. An edit that names a device in a second
+campaign fails with "Cannot merge leaves with different values at
 /software/upgrade-campaign". To move a device to another campaign, first
 remove it from its campaign, or delete the campaign. Then add it to the
 other campaign in a later edit. A move in one edit fails too. A campaign

@@ -357,10 +357,13 @@ def _test_campaign_function_renders_the_claim():
 
 
 actor _test_campaign_edit_keeps_its_output(t: testing.AsyncT):
-    """An edit of a running campaign keeps a member that the campaign
-    released in flight, without the campaign's veto. The edit runs the
-    campaign's transform function, and its output replaces what the actor
-    wrote."""
+    """An edit of a running campaign keeps the intent that the campaign
+    wrote for its member. The edit runs the campaign's transform function,
+    and its output replaces what the actor wrote. The flotillas of the test
+    system are mocks that report no device state, so cpe-1 never answers
+    the campaign's target, and the campaign holds it under its veto, also
+    after the edit. _test_campaign_function_renders_the_claim covers a
+    member in flight."""
     root = _with_images(y_0.root())
     root.fleet.device.create(
         "cpe-1",
@@ -391,33 +394,33 @@ actor _test_campaign_edit_keeps_its_output(t: testing.AsyncT):
         if isinstance(result, Exception):
             fail("campaign edit failed: {result}")
             return
-        # Read before the actor writes its output again after the edit.
         found = intent()
-        if found == "17.18.03a held False":
+        if found == "17.18.03a held True":
             if not done:
                 done = True
                 t.success()
         else:
-            fail("the edit did not keep cpe-1 in flight: {found}")
+            fail("the edit did not keep cpe-1's intent: {found}")
 
-    def released(attempts: int) -> None:
+    def still_held() -> None:
         if done:
             return
-        if intent() == "17.18.03a held False":
+        # The campaign has decided by now. cpe-1 has not answered, so the
+        # campaign has not released it.
+        found = intent()
+        if found == "17.18.03a held True":
             campaign = root.software.upgrade_campaign.get("xe-upgrade")
             if campaign is not None:
                 campaign.target_concurrency = u64(2)
             tr.edit_config(root.to_gdata(), on_edit)
-        elif attempts > 0:
-            after 0.25: released(attempts - 1)
         else:
-            fail("the campaign did not release cpe-1")
+            fail("cpe-1 is not held for its answer: {found}")
 
     def on_campaign(result) -> None:
         if isinstance(result, Exception):
             fail("campaign create failed: {result}")
             return
-        released(20)
+        after float(cfs.campaign_debounce_s(1)) + 0.5: still_held()
 
     def on_inventory(result) -> None:
         if isinstance(result, Exception):
@@ -586,19 +589,23 @@ def _with_nightly(linked: y_0.root) -> y_0.root:
 
 def _plan(campaign: InputCampaign, linked: y_0.root,
           now: int) -> (list[(str, int, int, list[(str, int, int)])], list[str], int):
-    """The campaign's plan at time now, before a run: the layout, the
-    alarms and the concurrency."""
+    """The campaign's plan at time now, before a run, with every member
+    answered that it needs the upgrade: the layout, the alarms and the
+    concurrency."""
     ctl = fctl.Controller()
     cfs.configure_campaign(ctl, campaign, linked, now)
+    sim.answer_all(ctl, now)
     p = ctl.plan(now)
     return (ctl.layout(p), p.alarms, p.c)
 
 
 def _replanned(campaign: InputCampaign, linked: y_0.root, now: int) -> fctl.Controller:
     """A run of the campaign in which cpe-1 was released at 10 in last
-    night's window and reported done at 14, planned again at time now."""
+    night's window and reported done at 14, planned again at time now.
+    Every member answered at 0 that it needs the upgrade."""
     ctl = fctl.Controller()
     cfs.configure_campaign(ctl, campaign, linked, 0)
+    sim.answer_all(ctl, 0)
     ctl.start()
     ctl.resume("cpe-1", 10, ("nightly", 0, 600))
     ctl.report("cpe-1", "succeeded", 14)
@@ -1467,6 +1474,7 @@ def _test_campaign_replan_keeps_the_ramp():
     campaign.admin_state = "run"
     ctl = fctl.Controller()
     cfs.configure_campaign(ctl, campaign, linked, 0)
+    sim.answer_all(ctl, 0)
     ctl.start()
     sim.drive(ctl, 0, {}, 50000)
     cfs.configure_campaign(ctl, campaign, linked, 50000)
@@ -1653,6 +1661,7 @@ def _test_mixed_fleet_runs_its_plan_without_alarm():
     testing.assertEqual(cfs.estimated_duration(campaign, linked), 191)
     ctl = fctl.Controller()
     cfs.configure_campaign(ctl, campaign, linked, 0)
+    sim.answer_all(ctl, 0)
     ctl.start()
     s = ctl.decide(0)
     testing.assertEqual(s.started, ["f0"])
@@ -1994,54 +2003,127 @@ actor _test_campaign_veto_back_when_done(t: testing.AsyncT):
     ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, lambda o: None, None)
     controller = ctl
     ctl.on_conf(_now_campaign("run", ["cpe-1"]), _flat_inventory(["cpe-1"]).to_gdata())
+    ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+               _tagged("upgrade-needed", "now", "17.18.03a"), None)
     ctl.on_subscriptions_synced()
     after float(cfs.campaign_debounce_s(1)) + 2.0: timeout()
 
 
-actor _ReleaseWatch(t: testing.AsyncT, what: str):
-    """Pass t when an output of the campaign called now has cpe-1 without
-    the campaign's veto, and fail it with what when none does in time."""
+actor _test_campaign_holds_a_member_with_a_stale_status(t: testing.AsyncT):
+    """A member whose final status answers another campaign has not
+    answered this one. The campaign holds it, shows it pending and names it
+    in an alarm, until it answers. Then the campaign releases it, and it
+    runs."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var phase = 0
     var done = False
+    alarm = "1 device(s) have not answered the campaign's target: cpe-1"
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def report(status: str, campaign: str) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+                      _tagged(status, campaign, "17.18.03a"), None)
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        r = o.state.device_status.get("cpe-1")
+        if r is not None:
+            held = False
+            if r.status == "pending" and alarm in o.state.plan.alarm:
+                held = True
+            if phase == 0 and held:
+                # The first decision holds cpe-1, which has not reported yet.
+                phase = 1
+                report("succeeded", "other")
+            elif phase == 1 and held and r.upgrade_campaign == "other":
+                phase = 2
+                report("upgrade-needed", "now")
 
     def on_output(out: gdata.Node) -> None:
         if done:
             return
         vetoed, free, targeted, unnamed = _vetoed(out, "now")
         if free == ["cpe-1"]:
-            done = True
-            t.success()
+            if phase == 2:
+                done = True
+                t.success()
+            else:
+                fail("cpe-1 was released at phase {phase}, before it answered")
 
     def timeout() -> None:
+        fail("at phase {phase}, cpe-1 was not released")
+
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, on_oper, None)
+    controller = ctl
+    ctl.on_conf(_now_campaign("run", ["cpe-1"]), _flat_inventory(["cpe-1"]).to_gdata())
+    ctl.on_subscriptions_synced()
+    after 5.0: timeout()
+
+
+actor _test_campaign_image_change_holds_a_member_again(t: testing.AsyncT):
+    """A member that answered up-to-date for the campaign's target in plan
+    has not answered when the campaign runs with an image of another
+    version: the device sends no new status for the change. The campaign
+    holds it until it answers the new target, and then releases it, and it
+    runs."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var phase = 0
+    var done = False
+    alarm = "1 device(s) have not answered the campaign's target: cpe-1"
+
+    def fail(message: str) -> None:
         if not done:
             done = True
-            t.failure(ValueError(what))
+            t.failure(ValueError(message))
 
-    after 2.5: timeout()
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        r = o.state.device_status.get("cpe-1")
+        cc = controller
+        if r is not None and cc is not None:
+            if phase == 0 and r.status == "up-to-date" and len(o.state.plan.alarm) == 0:
+                # In plan, cpe-1 answered. Run with a newer image.
+                phase = 1
+                cc.on_conf(_now_campaign("run", ["cpe-1"]),
+                           _with_version(_flat_inventory(["cpe-1"]), "17.18.04").to_gdata())
+            elif phase == 1 and r.status == "pending" and alarm in o.state.plan.alarm:
+                phase = 2
+                cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+                          _tagged("upgrade-needed", "now", "17.18.04"), None)
 
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "now")
+        if free == ["cpe-1"]:
+            if phase == 2:
+                done = True
+                t.success()
+            else:
+                fail("cpe-1 was released at phase {phase}, before it answered")
 
-actor _test_campaign_releases_a_member_with_a_stale_status(t: testing.AsyncT):
-    """A member whose final status answers another campaign is released
-    and runs. Its status does not count as done for this campaign."""
-    watch = _ReleaseWatch(t, "cpe-1 was not released")
-    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), watch.on_output, lambda o: None, None)
-    ctl.on_conf(_now_campaign("run", ["cpe-1"]), _flat_inventory(["cpe-1"]).to_gdata())
-    ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
-               _tagged("succeeded", "other", "17.18.03a"), None)
-    ctl.on_subscriptions_synced()
+    def timeout() -> None:
+        fail("at phase {phase}, cpe-1 was not released")
 
-
-actor _test_campaign_image_change_releases_a_member_again(t: testing.AsyncT):
-    """A member that answered up-to-date for the campaign's target in plan
-    is released and runs when the campaign runs with an image of another
-    version. The device sends no new status for the change."""
-    watch = _ReleaseWatch(t, "cpe-1 was not released after the image change")
-    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), watch.on_output, lambda o: None, None)
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, on_oper, None)
+    controller = ctl
     ctl.on_conf(_now_campaign("plan", ["cpe-1"]), _flat_inventory(["cpe-1"]).to_gdata())
     ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
                _tagged("up-to-date", "now", "17.18.03a"), None)
     ctl.on_subscriptions_synced()
-    ctl.on_conf(_now_campaign("run", ["cpe-1"]),
-                _with_version(_flat_inventory(["cpe-1"]), "17.18.04").to_gdata())
+    after 5.0: timeout()
 
 
 actor _test_campaign_image_change_makes_answers_stale(t: testing.AsyncT):
@@ -2160,14 +2242,199 @@ actor _test_campaign_counts_only_answers(t: testing.AsyncT):
 
 
 actor _test_campaign_acquires_a_member_added_in_run(t: testing.AsyncT):
-    """A member added to a campaign that runs gets the campaign's intent at
-    once, held by the campaign's veto, as every member does. The member in
-    flight keeps no veto. When the member in flight is done, the campaign
-    releases the new member."""
+    """A member added to a campaign that runs is acquired as every member
+    is: it gets the campaign's intent at once, held by the campaign's
+    veto. The member in flight keeps no veto. The campaign holds the new
+    member until it answers, also once the member in flight is done, and
+    the plan names it in an alarm. When it answers, the campaign plans it
+    and releases it."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var stage = 0
+    # Once cpe-1 is done: whether the output has its veto back, and whether
+    # a publication still holds cpe-2.
+    var veto_back = False
+    var still_held = False
+    var done = False
+    linked = _flat_inventory(["cpe-1", "cpe-2"]).to_gdata()
+    alarm = "1 device(s) have not answered the campaign's target: cpe-2"
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def report(name: str, status: str) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                      _tagged(status, "now", "17.18.03a"), None)
+
+    def answer() -> None:
+        """Let cpe-2 answer once cpe-1 is done and cpe-2 is still held. The
+        output and the publication of a decision come in either order."""
+        if stage == 2 and veto_back and still_held:
+            stage = 3
+            report("cpe-2", "upgrade-needed")
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "now")
+        if "cpe-2" in free and stage < 3:
+            fail("cpe-2 was released at stage {stage}, before it answered")
+        elif stage == 0:
+            if free == ["cpe-1"]:
+                # cpe-1 is in flight. Add cpe-2.
+                stage = 1
+                cc = controller
+                if cc is not None:
+                    cc.on_conf(_now_campaign("run", ["cpe-1", "cpe-2"]), linked)
+        elif stage == 1:
+            if vetoed == ["cpe-2"] and free == ["cpe-1"] and targeted == ["cpe-1", "cpe-2"] \
+               and unnamed == []:
+                # cpe-2 is acquired. cpe-1 is done; cpe-2 has not answered.
+                stage = 2
+                report("cpe-1", "succeeded")
+            else:
+                fail("cpe-2 was not acquired: vetoed {vetoed}, not vetoed {free}, "
+                     + "with a target {targeted}")
+        elif stage == 2 and vetoed == ["cpe-1", "cpe-2"]:
+            # cpe-1 is done: it has the veto again.
+            veto_back = True
+            answer()
+        elif stage == 3 and free == ["cpe-2"]:
+            done = True
+            t.success()
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None or stage != 2:
+            return
+        o = oper!
+        finished = False
+        for win in o.state.plan.window:
+            for dev in win.device:
+                if dev.name == "cpe-1" and dev.finished is not None:
+                    finished = True
+        if finished:
+            alarms = list(o.state.plan.alarm)
+            if alarms == [alarm]:
+                # The decision that saw cpe-1 done still holds cpe-2.
+                still_held = True
+                answer()
+            else:
+                fail("once cpe-1 is done, the alarms are {alarms}")
+
+    def timeout() -> None:
+        fail("at stage {stage}, cpe-2 was not released")
+
+    t.timeout(8.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, on_oper, None)
+    controller = ctl
+    ctl.on_conf(_now_campaign("run", ["cpe-1"]), linked)
+    report("cpe-1", "upgrade-needed")
+    ctl.on_subscriptions_synced()
+    after 6.0: timeout()
+
+
+actor _JoinsAgain(t: testing.AsyncT, failed: bool):
+    """Run a campaign called now over cpe-1 and cpe-2, one at a time in a
+    window that is open. cpe-2 never answers. The campaign releases cpe-1.
+    When failed is true, cpe-1 then fails, and gets the veto back. cpe-1
+    leaves the campaign, its device loses the intent and keeps its last
+    status, and cpe-1 joins the campaign again. Pass t when cpe-1 is held
+    after it joins again, and is released once it answers again."""
     var controller: ?cfs.UpgradeCampaignTransform = None
     var stage = 0
     var done = False
-    linked = _flat_inventory(["cpe-1", "cpe-2"]).to_gdata()
+    both = ["cpe-1", "cpe-2"]
+    linked = _flat_inventory(both).to_gdata()
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def report(status: str, campaign: ?str, target: ?str) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+                      _tagged(status, campaign, target), None)
+
+    def members(names: list[str]) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_conf(_now_campaign("run", names), linked)
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "now")
+        if stage == 0:
+            if free == ["cpe-1"]:
+                # cpe-1 is in flight.
+                if failed:
+                    stage = 1
+                    report("failed", "now", "17.18.03a")
+                else:
+                    stage = 2
+                    members(["cpe-2"])
+        elif stage == 1:
+            if vetoed == both:
+                # cpe-1 is done, and has the veto back.
+                stage = 2
+                members(["cpe-2"])
+        elif stage == 2:
+            if vetoed == ["cpe-2"] and free == []:
+                stage = 3
+                report("failed", None, None)
+                members(both)
+            else:
+                fail("cpe-1 left: vetoed {vetoed}, not vetoed {free}")
+        elif stage == 3:
+            if vetoed == both and free == []:
+                # cpe-1 is a new member: held until it answers.
+                stage = 4
+                report("upgrade-needed", "now", "17.18.03a")
+            else:
+                fail("cpe-1 joined again: vetoed {vetoed}, not vetoed {free}")
+        elif stage == 4 and free == ["cpe-1"]:
+            done = True
+            t.success()
+
+    def timeout() -> None:
+        fail("at stage {stage}, cpe-1 was not released again")
+
+    t.timeout(8.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, lambda o: None, None)
+    controller = ctl
+    ctl.on_conf(_now_campaign("run", both), linked)
+    report("upgrade-needed", "now", "17.18.03a")
+    ctl.on_subscriptions_synced()
+    after 6.0: timeout()
+
+
+actor _test_campaign_retries_a_failed_member_that_joins_again(t: testing.AsyncT):
+    """A member that failed, left the campaign and joined it again is
+    released again once it answers. That is the retry of a failed
+    member."""
+    _JoinsAgain(t, True)
+
+
+actor _test_campaign_holds_a_member_that_left_in_flight_and_joins_again(t: testing.AsyncT):
+    """A member that left the campaign while in flight, and joins it again,
+    gets the veto and is released only once it answers again."""
+    _JoinsAgain(t, False)
+
+
+actor _test_campaign_holds_a_member_still_upgrading(t: testing.AsyncT):
+    """cpe-1 reports in-progress for the campaign, which has not released
+    it: it still upgrades from before, as after a restart of fleetmgr. The
+    campaign counts it in flight and keeps its veto, so cpe-2 does not
+    start while it runs, one at a time. When cpe-1 is done, the campaign
+    releases cpe-2."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var stage = 0
+    var done = False
 
     def fail(message: str) -> None:
         if not done:
@@ -2184,37 +2451,188 @@ actor _test_campaign_acquires_a_member_added_in_run(t: testing.AsyncT):
         if done:
             return
         vetoed, free, targeted, unnamed = _vetoed(out, "now")
-        if stage == 0:
-            if free == ["cpe-1"]:
-                # cpe-1 is in flight. Add cpe-2.
-                stage = 1
-                cc = controller
-                if cc is not None:
-                    cc.on_conf(_now_campaign("run", ["cpe-1", "cpe-2"]), linked)
-        elif stage == 1:
-            if vetoed == ["cpe-2"] and free == ["cpe-1"] and targeted == ["cpe-1", "cpe-2"] \
-               and unnamed == []:
-                stage = 2
-                report("cpe-2", "upgrade-needed")
-                report("cpe-1", "succeeded")
-            else:
-                fail("cpe-2 was not acquired: vetoed {vetoed}, not vetoed {free}, "
-                     + "with a target {targeted}")
-        elif vetoed == ["cpe-1"] and free == ["cpe-2"]:
+        if stage == 0 and free != []:
+            fail("{free} released while cpe-1 still upgrades")
+        elif stage == 1 and free == ["cpe-2"]:
             done = True
             t.success()
-        elif free != []:
-            fail("after cpe-1 is done: vetoed {vetoed}, not vetoed {free}")
+        elif stage == 1 and free != []:
+            fail("once cpe-1 is done: not vetoed {free}")
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None or stage != 0:
+            return
+        started: list[str] = []
+        for win in oper!.state.plan.window:
+            for dev in win.device:
+                if dev.started is not None:
+                    started.append(dev.name)
+        if "cpe-2" in started:
+            fail("cpe-2 started while cpe-1 still upgrades")
+        elif "cpe-1" in started:
+            # A decision has cpe-1 in flight.
+            stage = 1
+            report("cpe-1", "succeeded")
 
     def timeout() -> None:
         fail("at stage {stage}, cpe-2 was not released")
 
     t.timeout(6.0)
-    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, lambda o: None, None)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, on_oper, None)
+    controller = ctl
+    ctl.on_conf(_now_campaign("run", ["cpe-1", "cpe-2"]),
+                _flat_inventory(["cpe-1", "cpe-2"]).to_gdata())
+    report("cpe-1", "in-progress")
+    report("cpe-2", "upgrade-needed")
+    ctl.on_subscriptions_synced()
+    after 5.0: timeout()
+
+
+actor _test_campaign_in_plan_shows_a_new_run(t: testing.AsyncT):
+    """A campaign set back from run to plan publishes the plan of a new run:
+    cpe-1, which the paused run released, waits in it again, with an
+    estimated start and no start."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var paused = False
+    var done = False
+    linked = _flat_inventory(["cpe-1"]).to_gdata()
+
+    def on_output(out: gdata.Node) -> None:
+        if paused:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "now")
+        if free == ["cpe-1"]:
+            paused = True
+            cc = controller
+            if cc is not None:
+                cc.on_conf(_now_campaign("plan", ["cpe-1"]), linked)
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or not paused or oper is None:
+            return
+        for win in oper!.state.plan.window:
+            for dev in win.device:
+                if dev.name == "cpe-1" and dev.started is None \
+                   and dev.estimated_start is not None:
+                    done = True
+                    t.success()
+
+    def timeout() -> None:
+        if not done:
+            done = True
+            if paused:
+                t.failure(ValueError("in plan, the plan still shows cpe-1 started"))
+            else:
+                t.failure(ValueError("cpe-1 was not released"))
+
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, on_oper, None)
     controller = ctl
     ctl.on_conf(_now_campaign("run", ["cpe-1"]), linked)
+    ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+               _tagged("upgrade-needed", "now", "17.18.03a"), None)
     ctl.on_subscriptions_synced()
-    after float(cfs.campaign_debounce_s(2)) + 3.0: timeout()
+    after 3.0: timeout()
+
+
+actor _test_campaign_in_plan_replans_on_answers(t: testing.AsyncT):
+    """A campaign in plan plans again when its members answer: the alarm
+    that names the members that have not answered goes once they
+    answer."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var answered = False
+    var done = False
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    waiting = ["3 device(s) have not answered the campaign's target: cpe-1, cpe-2, cpe-3"]
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        alarms = list(oper!.state.plan.alarm)
+        if not answered:
+            if alarms == waiting:
+                answered = True
+                cc = controller
+                if cc is not None:
+                    for name in names:
+                        cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                                  _tagged("upgrade-needed", "paced", "17.18.03a"), None)
+            else:
+                fail("before the answers, the alarms are {alarms}")
+        elif alarms == []:
+            done = True
+            t.success()
+        elif alarms != waiting:
+            fail("after the answers, the alarms are {alarms}")
+
+    def timeout() -> None:
+        fail("the campaign did not plan again after the answers")
+
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+    controller = ctl
+    ctl.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+    ctl.on_subscriptions_synced()
+    after float(cfs.campaign_debounce_s(len(names))) + 1.5: timeout()
+
+
+actor _PlanAfterReplay(t: testing.AsyncT, reports: list[(str, str)], want: list[str]):
+    """Run a campaign called paced in plan over cpe-1 to cpe-3. Before the
+    sync, each member in reports, as (name, campaign), reports
+    upgrade-needed for that campaign and the target 17.18.03a, as the
+    replay of the subscription does. Pass t when the publication after the
+    sync has the alarms, followed by the status of each member as "name
+    status", that want gives."""
+    var publications = 0
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if oper is None:
+            return
+        publications += 1
+        # The first publication comes from on_conf, before the reports.
+        if publications == 2:
+            o = oper!
+            got = list(o.state.plan.alarm)
+            for name in names:
+                r = o.state.device_status.get(name)
+                if r is not None:
+                    got.append("{name} {r.status}")
+            if got == want:
+                t.success()
+            else:
+                t.failure(ValueError("after the sync: {got}"))
+
+    conf = _paced_campaign(names)
+    conf.admin_state = "plan"
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+    ctl.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+    for r in reports:
+        ctl.on_rfs((rfs_name=cfs.flotilla_of(r.0), device_name=r.0),
+                   _tagged("upgrade-needed", r.1, "17.18.03a"), None)
+    ctl.on_subscriptions_synced()
+
+
+actor _test_campaign_in_plan_plans_with_the_replay(t: testing.AsyncT):
+    """The statuses of the replay come before the sync, and the plan that
+    the campaign publishes at the sync has them: every member has
+    answered, so there is no alarm."""
+    _PlanAfterReplay(t, [("cpe-1", "paced"), ("cpe-2", "paced"), ("cpe-3", "paced")],
+                     ["cpe-1 upgrade-needed", "cpe-2 upgrade-needed", "cpe-3 upgrade-needed"])
+
+
+actor _test_campaign_holds_a_member_of_another_campaign(t: testing.AsyncT):
+    """cpe-2's status answers another campaign, so cpe-2 has not answered
+    this one: it shows pending, and the plan holds it and names it in an
+    alarm."""
+    _PlanAfterReplay(t, [("cpe-1", "paced"), ("cpe-2", "other"), ("cpe-3", "paced")],
+                     ["1 device(s) have not answered the campaign's target: cpe-2",
+                      "cpe-1 upgrade-needed", "cpe-2 pending", "cpe-3 upgrade-needed"])
 
 
 def _claims_root(campaigns: list[(str, str, list[(str, str)])]) -> y_0.root:

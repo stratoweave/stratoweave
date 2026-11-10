@@ -593,8 +593,14 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     run, with the campaign's veto. So each member reads the release it runs
     and answers, but installs nothing. In run, the actor removes the veto of
     the members in flight, and puts it back when they are done. A status
-    counts only when it answers the campaign's intent: its campaign and the
-    member's target release.
+    counts only when it is for the campaign's intent: the device reports
+    the campaign and the member's target release with it. The controller
+    releases only the members whose status answers the target,
+    upgrade-needed or a final status, and its plan holds the others with an
+    alarm. A member that still upgrades from before a pause or a restart
+    counts in flight, and keeps the veto. In plan, the actor plans what a
+    new run would do, again when what the members report changes. A member
+    that leaves the campaign is forgotten: added again, it is a new member.
     """
     var members: list[str] = []
     var member_names: set[str] = set()
@@ -620,6 +626,9 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var debounce_armed = False
     var debounce_s = 0.0
     var ctl = fctl.Controller()
+    # The controller that made the published plan: ctl in run, and in plan
+    # a copy of it that starts a new run.
+    var shown = fctl.Controller()
     # The campaign and the inventory from the last on_conf, the target
     # release of each member, the output written last, and the members in
     # flight that it was written with.
@@ -632,10 +641,11 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     def unheld_now() -> set[str]:
         """Return the members in flight that run an upgrade. A member whose
         final status came before its release runs none, so it keeps the
-        veto."""
+        veto. So does a member that still upgrades from before the run: it
+        stops if it has not reached its install."""
         names: set[str] = set()
         for name in ctl.flying:
-            if name not in ctl.no_upgrade:
+            if name not in ctl.no_upgrade and name not in ctl.resumed:
                 names.add(name)
         return names
 
@@ -646,6 +656,21 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         if current is not None:
             return status_for(current.name, targets.get(name), tag_campaign, tag_target, status)
         return None
+
+    def plan_now(now: int) -> None:
+        """Plan at time now. A campaign that does not run plans on a copy of
+        the controller that starts a run now, so the plan shows what run
+        would do: the members that a paused run released wait again, and
+        the ramp and the pace start over."""
+        if running:
+            shown = ctl
+        else:
+            c = ctl.copy()
+            c.start()
+            shown = c
+        p = shown.plan(now)
+        plan_layout = shown.layout(p)
+        plan_alarms = p.alarms
 
     def publish() -> None:
         oper = base.UpgradeCampaign.new_state(path)
@@ -703,10 +728,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 win.end = u64(pw.2)
             for entry in pw.3:
                 pd = win.device.create(entry.0)
-                started = ctl.released_at.get(entry.0)
+                started = shown.released_at.get(entry.0)
                 if started is not None:
                     pd.started = u64(started)
-                    finished = ctl.done_at.get(entry.0)
+                    finished = shown.done_at.get(entry.0)
                     if finished is not None:
                         pd.finished = u64(finished)
                 else:
@@ -736,10 +761,21 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             else:
                 after now debounce_s: publish_settled(gen)
 
+    def replan(now: int) -> None:
+        """Plan again at time now when the campaign does not run, so the
+        plan holds only the members that have not answered yet. A campaign
+        that runs plans at each decision, and one whose run has finished
+        does not plan again."""
+        current = campaign
+        if not running and current is not None:
+            configure_campaign(ctl, current, inventory, now)
+            plan_now(now)
+
     def publish_settled(gen: int) -> None:
         if gen != generation:
             return
         debounce_armed = False
+        replan(time.time().unix_s())
         publish()
 
     def on_rfs(
@@ -786,6 +822,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         if active:
             after 0.0: decide(gen)
         else:
+            # The replay's statuses came before the sync. Plan with them.
+            replan(time.time().unix_s())
             publish()
 
     def shutdown() -> None:
@@ -813,6 +851,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         if current is not None:
             configure_campaign(ctl, current, inventory, t)
         s = ctl.decide(t)
+        shown = ctl
         plan_layout = ctl.layout(s.plan)
         plan_alarms = s.plan.alarms
         # Write only the members that went in flight or left it.
@@ -848,6 +887,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         for member in conf.device:
             ms.append(member.name)
             names.add(member.name)
+        left: set[str] = set()
+        for name in member_names:
+            if name not in names:
+                left.add(name)
         members = ms
         member_names = names
         debounce_s = float(campaign_debounce_s(len(members)))
@@ -858,6 +901,9 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         # The released devices, the ramp and the promises stay: a replan
         # goes on from where the run is.
         configure_campaign(ctl, conf, inventory, now)
+        # The controller forgets the members that left. Added again, a
+        # member waits until it answers, and starts in a window.
+        ctl.drop(left)
         run_now = conf.admin_state == "run"
         if run_now and not running:
             ctl.start()
@@ -882,10 +928,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             output if isinstance(output, ygdata.Container) else None)
         write_output(output)
         member_alarms = image_alarms(conf, inventory)
-
-        p = ctl.plan(now)
-        plan_layout = ctl.layout(p)
-        plan_alarms = p.alarms
+        plan_now(now)
 
         # New intent invalidates every armed timer. The first decision after
         # subscription sync arms the exact timers the fresh plan needs.

@@ -384,6 +384,20 @@
   until the device's software state has no `upgrade-campaign`, and add it
   again: the campaign takes it as a new member.
 - `allow-staging` on a campaign is no longer passed to the devices.
+- A campaign releases a member only once the member's status answers the
+  campaign's target: `upgrade-needed`, or a final status. Until then the
+  plan holds the member in its window, with the alarm "N device(s) have not
+  answered the campaign's target", and the members after it in its
+  redundancy groups with "N device(s) wait behind a redundancy group member
+  that has not answered". `unknown` and `pending` are no answer. A campaign
+  in `plan` plans again as its members answer, and plans a run that starts
+  now, so its plan shows what `run` would do. So a member added to a
+  running campaign waits until it has read the release it runs, and is then
+  planned and released. A campaign created directly in `run` promises its
+  windows in the order its members answer; create it in `plan` first to
+  keep the campaign's order. A decision that only starts devices still
+  takes the last plan again when the plan's only alarms are for held
+  devices.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
