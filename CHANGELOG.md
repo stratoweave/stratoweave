@@ -264,6 +264,11 @@
   takes seconds instead of minutes, and a decision that only starts devices
   reuses the last plan while no report came in, no device is due and no
   window opens or closes. [#748]
+- A campaign device whose final report came before its release, such as a
+  device that is up to date when the campaign starts, ran no upgrade, also
+  when the report and the release fall in the same second. Before, it
+  counted as an upgrade of one second and dragged the campaign's pace down.
+  [#766]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
