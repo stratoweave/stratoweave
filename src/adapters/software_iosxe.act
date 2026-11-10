@@ -177,15 +177,19 @@ def reported_release(release: str) -> str:
 
 
 def running_release(root: ?ygdata.Node) -> ?str:
-    """The release the device reports running, from device-hardware-oper.
+    """The release the device reports running, from device-hardware-oper
+    over NETCONF, or from show version over the CLI.
 
-    The leaf carries a whole banner line, so pull the version out of it.
+    The NETCONF leaf carries a whole banner line, so pull the version out of
+    it. The CLI release is spelled as the banner spells it: 17.15.6 for
+    17.15.06.
     """
     oper = ixoper.root.from_gdata(root)
     hardware = oper.device_hardware_data.device_hardware
     text = hardware.device_system_data.software_version
     if text is None:
-        return None
+        cli = xecli_data.root.from_gdata(root).version.version
+        return reported_release(cli) if cli is not None else None
     # "Cisco IOS XE Software, Version 17.18.02" -> "17.18.02"
     marker = "Version "
     body = text!
@@ -308,6 +312,7 @@ def aggregate(root: ?ygdata.Node, uuid: str, expect_stage: str,
 # own module, stratoweave-iosxe-cli. See the table in adapters.iosxe_cli.
 #############################################################################
 
+HARDWARE_MODULE = "Cisco-IOS-XE-device-hardware-oper"
 XCOPY_MODULE = "Cisco-IOS-XE-xcopy-rpc"
 INSTALL_MODULE = "Cisco-IOS-XE-install-rpc"
 FILES_MODULE = "Cisco-IOS-XE-platform-software-oper"
@@ -318,17 +323,21 @@ BAD_IMAGE_CAUSES = ["install-verify-pkg-fail", "install-status-invalid-image-fil
 FILES_NS = "http://cisco.com/ns/yang/Cisco-IOS-XE-platform-software-oper"
 
 
-def upgrade_plan(modules: set[str]) -> (transfer: str, listing: str, verify: str, install: str):
+def upgrade_plan(modules: set[str]) -> (check: str, transfer: str, listing: str, verify: str, install: str, delete: str):
     """Return how each step of an upgrade runs on a device with these modules:
     "netconf", "cli", or "" when the driver cannot run the step there. A step
     runs over NETCONF when the device has the module for it, and over the CLI
-    only when it has not. No NETCONF module checks a file's content, so the
-    check of an image runs over the CLI."""
-    transfer = "netconf" if XCOPY_MODULE in modules else ""
-    listing = "netconf" if FILES_MODULE in modules else ("cli" if xecli_yang.MODULE in modules else "")
-    verify = "cli" if xecli_yang.MODULE in modules else ""
-    install = "netconf" if INSTALL_MODULE in modules else ""
-    return (transfer=transfer, listing=listing, verify=verify, install=install)
+    only when it has not, as on IOS XE 16.8 without NETCONF. No NETCONF
+    module checks a file's content, so the check of an image runs over the
+    CLI. check reads the running release, install also reads the versions
+    that the device has."""
+    cli = "cli" if xecli_yang.MODULE in modules else ""
+    check = "netconf" if HARDWARE_MODULE in modules else cli
+    transfer = "netconf" if XCOPY_MODULE in modules else cli
+    listing = "netconf" if FILES_MODULE in modules else cli
+    install = "netconf" if INSTALL_MODULE in modules else cli
+    delete = "netconf" if CISCO_RPC_MODULE in modules else cli
+    return (check=check, transfer=transfer, listing=listing, verify=cli, install=install, delete=delete)
 
 
 def usable_checksum(checksums: list[(algorithm: str, digest: str)]) -> ?(algorithm: str, digest: str):
@@ -395,6 +404,13 @@ def version_filter() -> ygdata.FNode:
     return paths.software_version.filt()!
 
 
+def cli_filter(top: str) -> ygdata.FNode:
+    """Select one top-level node of the CLI adapter's module, such as
+    version for show version or install-summary for show install
+    summary."""
+    return ygdata.FNode(children=[ygdata.FNode(ygdata.Id(xecli_yang.NS, top))])
+
+
 def records_filter() -> ygdata.FNode:
     """Select the active and finished operation lists.
 
@@ -436,20 +452,47 @@ def _release_of_version(version: str) -> str:
     return ".".join(version.split(".")[:3])
 
 
-def version_of(root: ?ygdata.Node, release: str) -> ?(version: str, state: str):
-    """The device's version and its state for `release`, from
-    install-version-state-info.
+## The NETCONF version state of each package state in show install summary.
+_SUMMARY_STATES = {"inactive": VS_INSTALLED, "activated-uncommitted": VS_UNCOMMITTED,
+                   "activated-committed": VS_COMMITTED}
 
-    The device names a version like 17.18.03a.0.5540, which `activate`
-    needs, so match on the release that the version starts with.
-    """
+
+def device_versions(root: ?ygdata.Node) -> list[(version: str, state: str)]:
+    """The versions of the device's software and their states, from
+    install-version-state-info over NETCONF, or from the IMG packages of
+    show install summary over the CLI. A CLI state is given as the NETCONF
+    state with the same meaning. A device in bundle mode has none."""
+    out: list[(version: str, state: str)] = []
     iod = ixoper.root.from_gdata(root).install_oper_data
     for loc in iod.install_location_information:
         for v in loc.install_version_state_info:
             ver = v.version
-            if ver is not None and releases_equal(_release_of_version(ver), release):
+            if ver is not None:
                 state = v.version_state
-                return (version=ver, state=state if state is not None else "")
+                out.append((version=ver, state=state if state is not None else ""))
+    for loc in xecli_data.root.from_gdata(root).install_summary.location:
+        for p in loc.package:
+            ptype = p.type
+            if ptype is not None and ptype == "IMG":
+                state = ""
+                pstate = p.state
+                if pstate is not None:
+                    mapped = _SUMMARY_STATES.get(pstate)
+                    if mapped is not None:
+                        state = mapped
+                out.append((version=p.name, state=state))
+    return out
+
+
+def version_of(root: ?ygdata.Node, release: str) -> ?(version: str, state: str):
+    """The device's version and its state for `release`.
+
+    The device names a version like 17.18.03a.0.5540, which `activate`
+    needs, so match on the release that the version starts with.
+    """
+    for v in device_versions(root):
+        if releases_equal(_release_of_version(v.version), release):
+            return v
     return None
 
 
@@ -463,14 +506,27 @@ def added_version(root: ?ygdata.Node, release: str) -> ?str:
 
 def committed_release(root: ?ygdata.Node) -> ?str:
     """The release that the device keeps: the committed version."""
-    iod = ixoper.root.from_gdata(root).install_oper_data
-    for loc in iod.install_location_information:
-        for v in loc.install_version_state_info:
-            ver = v.version
-            state = v.version_state
-            if ver is not None and state is not None and state == VS_COMMITTED:
-                return _release_of_version(ver)
+    for v in device_versions(root):
+        if v.state == VS_COMMITTED:
+            return _release_of_version(v.version)
     return None
+
+
+def bundle_image(root: ?ygdata.Node) -> ?str:
+    """The image that a device in bundle mode booted, from show version, as
+    bootflash:x.bin. None in install mode, which boots packages.conf, and
+    when the reply has no show version."""
+    image = xecli_data.root.from_gdata(root).version.system_image
+    if image is not None and image.endswith(".bin"):
+        return image
+    return None
+
+
+def conversion_boot_lines(image: str) -> list[str]:
+    """The boot statements for a conversion to install mode: packages.conf,
+    which install mode boots, then the image that the device runs, which
+    ROMMON boots when packages.conf is missing or fails."""
+    return ["no boot system", "boot system flash bootflash:packages.conf", "boot system flash " + image]
 
 
 def image_filename(url: str) -> str:
@@ -592,6 +648,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     var _check: ?(algorithm: str, digest: str) = None
     # Install stages the image first, then adds it.
     var _then_add = False
+    # The conversion to install mode committed the release with its
+    # activation, so commit has nothing left to do and abort cannot undo it.
+    var _committed = False
 
     def _finish(err: ?Exception) -> None:
         d = _done
@@ -619,6 +678,23 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def _modules() -> set[str]:
         return set(dev.get_modules().0.keys())
 
+    def _release_filter() -> ygdata.FNode:
+        """Select the running release, over NETCONF or else over the CLI."""
+        return version_filter() if upgrade_plan(_modules()).check == "netconf" else cli_filter("version")
+
+    def _versions_filter() -> ygdata.FNode:
+        """Select the versions that the device has, over NETCONF or else
+        over the CLI."""
+        return versions_filter() if upgrade_plan(_modules()).install == "netconf" else cli_filter("install-summary")
+
+    def _cli_install(done: action(?Exception) -> None,
+                     inp: xecli_data.stratoweave_iosxe_cli__install__input) -> None:
+        """Run an install command over the CLI. The RPC returns when the
+        command ends, or when the session ends as the device reloads."""
+        def ran(out: ?xecli_data.stratoweave_iosxe_cli__install__output, err: ?Exception) -> None:
+            done(err)
+        _cli.install(ran, inp)
+
     def _staging_check() -> ?(algorithm: str, digest: str):
         """The checksum that the device can check the staged image against,
         or None when there is none or the device cannot check."""
@@ -629,11 +705,11 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             checksums.append((algorithm=c.algorithm, digest=c.digest))
         return usable_checksum(checksums)
 
-    def _size_check(plan: (transfer: str, listing: str, verify: str, install: str)) -> ?u64:
+    def _size_check(verify: str, listing: str) -> ?u64:
         """The size that the staged image is checked against: the image
         size of the intent, when the device can list files but compute no
         checksum."""
-        if plan.verify != "cli" and plan.listing != "":
+        if verify != "cli" and listing != "":
             return dev.get_dmc().software.image_size
         return None
 
@@ -695,7 +771,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _check_committed(done, running)
             else:
                 done(None, None)
-        dev.get(on_reply, version_filter())
+        dev.get(on_reply, _release_filter())
 
     def _check_committed(done: action(?str, ?Exception) -> None, running: str) -> None:
         def on_versions(root: ?ygdata.Node, err: ?Exception) -> None:
@@ -707,7 +783,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 done(kept, None)
             else:
                 done(running, None)
-        dev.get(on_versions, versions_filter())
+        dev.get(on_versions, _versions_filter())
 
     ####################################################################
     # prepare: stage the image, touching no install state
@@ -757,7 +833,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _staged()
             else:
                 _stage_file()
-        dev.get(on_versions, versions_filter())
+        dev.get(on_versions, _versions_filter())
 
     def _stage_file() -> None:
         """Make sure that the image file is on bootflash. When the device can
@@ -768,7 +844,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         the intent instead."""
         _check = _staging_check()
         plan = upgrade_plan(_modules())
-        if _check is None and plan.verify != "cli" and _size_check(plan) is None:
+        if _check is None and plan.verify != "cli" and _size_check(plan.verify, plan.listing) is None:
             if _then_add:
                 # Install cannot check the file either: trust what prepare
                 # staged.
@@ -791,7 +867,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def _verify(gen: int, before_transfer: bool) -> None:
         c = _check
         plan = upgrade_plan(_modules())
-        size = _size_check(plan)
+        size = _size_check(plan.verify, plan.listing)
         if c is not None:
             _verify_against(gen, before_transfer, c)
         elif plan.verify == "cli":
@@ -862,13 +938,17 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
 
     def _staged() -> None:
         if _then_add:
-            _add_unless_added()
+            _install_mode()
         else:
             _finish(None)
 
     def _transfer() -> None:
-        if upgrade_plan(_modules()).transfer != "netconf":
-            _fail("the device has no way to transfer the image: no {XCOPY_MODULE}")
+        how = upgrade_plan(_modules()).transfer
+        if how == "cli":
+            _transfer_cli()
+            return
+        if how != "netconf":
+            _fail("the device has no way to transfer the image: no {XCOPY_MODULE} and no CLI adapter")
             return
         url = _url
         _expect_stage = STAGE_DOWNLOAD
@@ -885,6 +965,22 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 return
             after now poll_period: _poll(gen)
         _rpcs.xcopy(on_rpc, xcopy_input(_uuid, url, _filename))
+
+    def _transfer_cli() -> None:
+        """Copy the image with the CLI's copy, which returns when the copy
+        ends. Then check it, as after xcopy."""
+        url = _url
+        gen = _gen
+        _log.info("software: staging image over the CLI", {"url": redact_url(url)})
+        def copied(out: ?xecli_data.stratoweave_iosxe_cli__copy__output, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!).replace(url, redact_url(url)))
+                return
+            _log.info("software: image copied", {"file": _filename, "size": out.size if out is not None else None})
+            _end_phase()
+        _cli.copy(copied, xecli_data.stratoweave_iosxe_cli__copy__input(url, "bootflash:", _filename))
 
     ####################################################################
     # install: add, then activate the added image; device reloads
@@ -904,7 +1000,70 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _filename = image_filename(url!)
         _activated_at = None
         _then_add = True
+        _committed = False
         _stage_when_connected(_gen, adapter_wait)
+
+    def _install_mode() -> None:
+        """A device in bundle mode refuses install add alone, so convert it
+        to install mode. Only an install over the CLI looks: the conversion
+        runs over the CLI, and a device with the NETCONF install RPCs is
+        taken to be in install mode."""
+        if upgrade_plan(_modules()).install != "cli":
+            _add_unless_added()
+            return
+        gen = _gen
+        def on_version(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!))
+                return
+            image = bundle_image(root)
+            if image is not None:
+                _convert(image)
+            else:
+                _add_unless_added()
+        dev.get(on_version, cli_filter("version"))
+
+    def _convert(image: str) -> None:
+        """Convert a device in bundle mode to install mode with the release.
+        Point the boot statements at packages.conf, with the running image
+        after it, save them, then add, activate and commit the image in one
+        command: in bundle mode the device takes no other form. The device
+        reloads, and the release is committed with the activation, so there
+        is no commit window."""
+        _enter("activate")
+        _want = _release
+        _committed = True
+        gen = _gen
+        lines = conversion_boot_lines(image)
+        _log.info("software: converting to install mode, device will reload",
+                  {"running": image, "file": _filename, "boot": lines})
+        def activated(err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!))
+                return
+            _activate_booting = True
+            after now reload_poll_period: _poll(gen)
+        def saved(err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail("write memory: " + swdev.error_text(err!))
+                return
+            _cli_install(activated, xecli_data.stratoweave_iosxe_cli__install__input(
+                add=xecli_data.stratoweave_iosxe_cli__install__input__add(
+                    "bootflash:" + _filename, activate=True, commit=True, prompt_level="none")))
+        def configured(err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail("boot system: " + swdev.error_text(err!))
+                return
+            _cli.write_memory(saved)
+        _cli.configure(configured, xecli_data.stratoweave_iosxe_cli__configure__input(lines))
 
     def _add_unless_added() -> None:
         """Activate the image when the device has added it already, as after
@@ -930,10 +1089,24 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _activate(v.version)
             else:
                 _add()
-        dev.get(on_versions, versions_filter())
+        dev.get(on_versions, _versions_filter())
 
     def _add() -> None:
         _enter("add")
+        if upgrade_plan(_modules()).install == "cli":
+            gen = _gen
+            _log.info("software: adding image over the CLI", {"file": _filename})
+            def added(err: ?Exception) -> None:
+                if gen != _gen:
+                    return
+                if err is not None:
+                    _fail(swdev.error_text(err!))
+                    return
+                _log.info("software: add done", {"file": _filename})
+                _end_phase()
+            _cli_install(added, xecli_data.stratoweave_iosxe_cli__install__input(
+                add=xecli_data.stratoweave_iosxe_cli__install__input__add("bootflash:" + _filename)))
+            return
         _expect_stage = STAGE_ADD_END
         _log.info("software: adding image", {"file": _filename, "uuid": _uuid})
         _rpcs.install(_on_rpc(_gen, poll_period), install_input(_uuid, _filename))
@@ -953,13 +1126,28 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _fail("added image for {_release} not found")
                 return
             _activate(ver!)
-        dev.get(on_versions, versions_filter())
+        dev.get(on_versions, _versions_filter())
 
     def _activate(version: str) -> None:
         _enter("activate")
         _want = _release
         secs, nanos = time.get_monotonic()
         _activated_at = secs
+        if upgrade_plan(_modules()).install == "cli":
+            gen = _gen
+            _log.info("software: activating over the CLI, device will reload", {"version": version})
+            def activated(err: ?Exception) -> None:
+                if gen != _gen:
+                    return
+                if err is not None:
+                    _fail(swdev.error_text(err!))
+                    return
+                _activate_booting = True
+                after now reload_poll_period: _poll(gen)
+            _cli_install(activated, xecli_data.stratoweave_iosxe_cli__install__input(
+                activate=xecli_data.stratoweave_iosxe_cli__install__input__activate(
+                    auto_abort_timer=u64(AUTO_ABORT_TIMER_MIN), prompt_level="none")))
+            return
         _log.info("software: activating, device will reload",
                   {"version": version, "uuid": _uuid})
         _rpcs.activate(_on_rpc(_gen, poll_period),
@@ -972,6 +1160,22 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def commit(done: action(?Exception) -> None) -> None:
         if not _start("commit", done, _release):
             return
+        if _committed:
+            _log.info("software: committed with the activation", {"release": _release})
+            _finish(None)
+            return
+        if upgrade_plan(_modules()).install == "cli":
+            gen = _gen
+            _log.info("software: committing over the CLI", {"release": _release})
+            def committed(err: ?Exception) -> None:
+                if gen != _gen:
+                    return
+                if err is not None:
+                    _fail(swdev.error_text(err!))
+                    return
+                _finish(None)
+            _cli_install(committed, xecli_data.stratoweave_iosxe_cli__install__input(commit=True))
+            return
         # One record and no reload, so completion alone ends the job. A no-op
         # means nothing was uncommitted: the device had already reverted.
         _allow_noop = False
@@ -980,7 +1184,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
 
     def commit_window(done: action(?int) -> None) -> None:
         a = _activated_at
-        if a is None:
+        if a is None or _committed:
             done(None)
             return
         secs, nanos = time.get_monotonic()
@@ -994,6 +1198,21 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         if not _start("abort", done, _release):
             return
         _want = previous
+        if _committed:
+            _fail("the conversion to install mode committed {_release}: nothing to abort")
+            return
+        if upgrade_plan(_modules()).install == "cli":
+            gen = _gen
+            _log.info("software: aborting over the CLI, device will reload", {"previous": str(previous)})
+            def aborted(err: ?Exception) -> None:
+                if gen != _gen:
+                    return
+                if err is not None:
+                    _fail(swdev.error_text(err!))
+                    return
+                after now reload_poll_period: _poll(gen)
+            _cli_install(aborted, xecli_data.stratoweave_iosxe_cli__install__input(abort=True))
+            return
         _log.info("software: aborting, device will reload",
                   {"previous": str(previous), "uuid": _uuid})
         _rpcs.abort(_on_rpc(_gen, reload_poll_period), abort_input(_uuid))
@@ -1122,7 +1341,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if _reached(got!):
                 _log.info("software: device booted", {"release": got!})
                 _end_phase()
-        dev.get(on_version, version_filter())
+        dev.get(on_version, _release_filter())
 
     ####################################################################
     # not implemented -- continues without acting

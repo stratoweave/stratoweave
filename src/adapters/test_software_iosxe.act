@@ -1202,19 +1202,22 @@ actor _test_iosxe_release_follows_the_image(t: testing.EnvT):
 #############################################################################
 
 def _test_upgrade_plan_follows_the_modules():
-    netconf = {swxe.XCOPY_MODULE, swxe.INSTALL_MODULE, swxe.FILES_MODULE}
-    no_files = {swxe.XCOPY_MODULE, swxe.INSTALL_MODULE}
     cli = {xecli_yang.MODULE}
+    netconf = {swxe.HARDWARE_MODULE, swxe.XCOPY_MODULE, swxe.INSTALL_MODULE, swxe.FILES_MODULE, swxe.CISCO_RPC_MODULE}
+    no_files = {swxe.HARDWARE_MODULE, swxe.XCOPY_MODULE, swxe.INSTALL_MODULE}
+    # Columns: check, transfer, listing, verify, install, delete.
     cases = [
-        ("NETCONF and the CLI, as a C1111 with 17.15", netconf | cli, ("netconf", "netconf", "cli", "netconf")),
-        ("NETCONF without the files, and the CLI", no_files | cli, ("netconf", "cli", "cli", "netconf")),
-        ("only the CLI, as a C1111 with 16.8.1", cli, ("", "cli", "cli", "")),
-        ("only NETCONF, without the CLI adapter", netconf, ("netconf", "netconf", "", "netconf")),
-        ("nothing", set(), ("", "", "", "")),
+        ("NETCONF and the CLI, as a C1111 with 17.15", netconf | cli,
+         ("netconf", "netconf", "netconf", "cli", "netconf", "netconf")),
+        ("NETCONF without the files and delete, and the CLI", no_files | cli,
+         ("netconf", "netconf", "cli", "cli", "netconf", "cli")),
+        ("only the CLI, as a C1111 with 16.8.1", cli, ("cli", "cli", "cli", "cli", "cli", "cli")),
+        ("only NETCONF, without the CLI adapter", netconf, ("netconf", "netconf", "netconf", "", "netconf", "netconf")),
+        ("nothing", set(), ("", "", "", "", "", "")),
     ]
     for name, modules, want in cases:
         p = swxe.upgrade_plan(modules)
-        testing.assertEqual((p.transfer, p.listing, p.verify, p.install), want, name)
+        testing.assertEqual((p.check, p.transfer, p.listing, p.verify, p.install, p.delete), want, name)
 
 
 def _files_root(partitions: list[(name: str, paths: list[str])]) -> ygdata.Node:
@@ -1683,3 +1686,194 @@ actor _test_live_software_upgrade(t: testing.EnvT):
         dmc = m
         dev = d
         after 1.0: connected(600)
+
+
+#############################################################################
+# Over the CLI only, as IOS XE 16.8 on a C1111, where NETCONF does not start
+#############################################################################
+
+## The old image that a device in bundle mode boots.
+BUNDLE_IMAGE = "bootflash:c8000v-universalk9.17.18.02.SPA.bin"
+COPY_COMMAND = "copy " + IMAGE_URL + " bootflash:" + IMAGE_FILE
+COPY_QUESTION = "Destination filename [" + IMAGE_FILE + "]? "
+COPY_DONE = "\r\nAccessing " + IMAGE_URL + "...\r\nLoading " + IMAGE_URL + " !!\r\n1000 bytes copied in 0.128 secs (7812 bytes/sec)"
+ADD_COMMAND = "install add file bootflash:" + IMAGE_FILE
+ACTIVATE_COMMAND = "install activate auto-abort-timer 30 prompt-level none"
+ONE_SHOT_COMMAND = "install add file bootflash:" + IMAGE_FILE + " activate commit prompt-level none"
+ADD_DONE = "\r\ninstall_add: START Tue Nov 10 09:43:02 UTC 2026\r\ninstall_add: Adding PACKAGE\r\nFinished Add\r\nSUCCESS: install_add  Tue Nov 10 09:45:02 UTC 2026\r\n"
+ACTIVATE_DONE = "\r\ninstall_activate: START Tue Nov 10 09:46:02 UTC 2026\r\nFinished Activate\r\nInstall will reload the system now!\r\nSUCCESS: install_activate  Tue Nov 10 09:48:02 UTC 2026\r\n"
+COMMIT_DONE = "\r\ninstall_commit: START Tue Nov 10 10:06:02 UTC 2026\r\nFinished Commit\r\nSUCCESS: install_commit  Tue Nov 10 10:06:12 UTC 2026\r\n"
+
+
+def _show_version(release: str, image: str) -> str:
+    """show version of the C8000V capture, running release from image."""
+    return clitest.SHOW_VERSION.replace("Cisco IOS XE Software, Version 17.18.02",
+                                        "Cisco IOS XE Software, Version " + release) \
+        .replace("System image file is \"bootflash:packages.conf\"", "System image file is \"" + image + "\"")
+
+
+def _summary(packages: list[str]) -> str:
+    """show install summary with these package lines, as IMG   C    17.18.02.0.5540.
+    No lines is a device in bundle mode."""
+    return clitest.INSTALL_SUMMARY.replace("IMG   C    17.09.05a.0.6476\r\n", "".join([p + "\r\n" for p in packages]))
+
+
+def _test_cli_version_reads():
+    """The release, the versions and the mode, from what the CLI reads."""
+    r = xecli_data.root()
+    xecli.VersionRead().parse(r, _show_version(OLD_RELEASE, BUNDLE_IMAGE))
+    xecli.InstallRead().parse(r, _summary(["IMG   I    " + NEW_VERSION, "IMG   C    " + OLD_VERSION]))
+    root = r.to_gdata()
+    testing.assertEqual(swxe.running_release(root), OLD_REPORTED)
+    testing.assertEqual(swxe.device_versions(root), [(version=NEW_VERSION, state=swxe.VS_INSTALLED),
+                                                     (version=OLD_VERSION, state=swxe.VS_COMMITTED)])
+    testing.assertEqual(swxe.added_version(root, NEW_REQUESTED), NEW_VERSION)
+    testing.assertEqual(swxe.committed_release(root), OLD_RELEASE)
+    testing.assertEqual(swxe.bundle_image(root), BUNDLE_IMAGE)
+    r2 = xecli_data.root()
+    xecli.VersionRead().parse(r2, _show_version(OLD_RELEASE, "bootflash:packages.conf"))
+    testing.assertEqual(swxe.bundle_image(r2.to_gdata()), None, "install mode")
+    testing.assertEqual(swxe.conversion_boot_lines(BUNDLE_IMAGE),
+                        ["no boot system", "boot system flash bootflash:packages.conf",
+                         "boot system flash " + BUNDLE_IMAGE])
+
+
+actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
+                  settled: action(xecli.CliMock, swdev.DeviceMgr, str) -> None):
+    """Drive a mock device whose NETCONF never connects, over the CLI only,
+    from a software intent with a sha512 checksum to a settled status. The
+    image is not on bootflash. The device runs OLD_RELEASE, in bundle mode
+    or in install mode. The CliMock answers as the device does: each install
+    command changes what show version and show install summary say. Each
+    such command takes 0.1 s, so the replies change before its output
+    comes."""
+    var dev_ref: ?swdev.DeviceMgr = None
+    var cli: ?xecli.CliMock = None
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def poll() -> None:
+        c = cli
+        d = dev_ref
+        if finished or c is None or d is None:
+            return
+        commands = c!.get_commands()
+        if COPY_COMMAND in commands:
+            c!.set_reply("dir bootflash:", DIR_STAGED)
+        if ADD_COMMAND in commands:
+            c!.set_reply("show install summary", _summary(["IMG   I    " + NEW_VERSION, "IMG   C    " + OLD_VERSION]))
+        if ACTIVATE_COMMAND in commands or ONE_SHOT_COMMAND in commands:
+            c!.set_reply("show version", _show_version(NEW_REQUESTED, "bootflash:packages.conf"))
+            if ONE_SHOT_COMMAND in commands:
+                c!.set_reply("show install summary", _summary(["IMG   C    " + NEW_VERSION]))
+            else:
+                c!.set_reply("show install summary", _summary(["IMG   U    " + NEW_VERSION, "IMG   I    " + OLD_VERSION]))
+        if "install commit" in commands:
+            c!.set_reply("show install summary", _summary(["IMG   C    " + NEW_VERSION]))
+        st = d!.get_swmgr().get_status()
+        if st == "unknown" or st == "in-progress":
+            after 0.02: poll()
+            return
+        finished = True
+        settled(c!, d!, st)
+
+    def start() -> None:
+        d = dev_ref
+        if d is None:
+            return
+        if xecli_yang.MODULE not in d!.get_modules().0:
+            after 0.01: start()
+            return
+        extra = d!.get_extra_adapter("iosxe-cli")
+        if isinstance(extra, xecli.IosXeCliAdapter):
+            c = extra.get_mock()
+            if c is not None:
+                _run(d!, c)
+                return
+        finished = True
+        t.failure(ValueError("no CliMock on the device"))
+
+    def _run(d: swdev.DeviceMgr, c: xecli.CliMock) -> None:
+        cli = c
+        image = BUNDLE_IMAGE if bundle else "bootflash:packages.conf"
+        c.set_reply("show version", _show_version(OLD_RELEASE, image))
+        c.set_reply("show install summary", _summary([] if bundle else ["IMG   C    " + OLD_VERSION]))
+        c.set_reply("dir bootflash:", DIR_EMPTY)
+        c.set_question(COPY_COMMAND, COPY_QUESTION, "", COPY_DONE)
+        c.set_reply(VERIFY_COMMAND, VERIFY_EQUAL)
+        c.set_reply(ADD_COMMAND, ADD_DONE)
+        c.set_reply(ACTIVATE_COMMAND, ACTIVATE_DONE)
+        c.set_reply(ONE_SHOT_COMMAND, clitest.INSTALL_ONE_SHOT)
+        c.set_reply("install commit", COMMIT_DONE)
+        c.set_reply("write memory", clitest.WRITE_MEMORY)
+        for command in [ADD_COMMAND, ACTIVATE_COMMAND, ONE_SHOT_COMMAND, "install commit"]:
+            c.set_delay(command, 0.1)
+        software = Software("camp-1", NEW_REQUESTED, IMAGE_URL)
+        software.image_checksum.create("sha512", HASH)
+        dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe", software=software)
+        dmc.mock.enabled = True
+        dmc.extra_adapter.create("iosxe-cli")
+        d.set_dmc(dmc)
+        after 0.02: poll()
+
+    def report_timeout() -> None:
+        if finished:
+            return
+        finished = True
+        c = cli
+        d = dev_ref
+        commands = c!.get_commands() if c is not None else []
+        st = d!.get_swmgr().get_status() if d is not None else "?"
+        reason = d!.get_swmgr().get_reason() if d is not None else None
+        t.failure(ValueError("timed out: commands={commands} status={st} reason={reason}"))
+
+    schema = yang.compile(swxe_yang.models)
+    cli_schema = yang.compile(xecli_yang.models)
+    dev_types = {
+        "iosxe": swdev.DeviceType(name="iosxe", adapter_type=_never_connects, src_dnode=schema,
+                                  oper_src_dnode=schema, software_adapter_type=_fast_adapter),
+        "iosxe-cli": swdev.DeviceType(name="iosxe-cli", adapter_type=xecli.IosXeCliAdapter,
+                                      src_dnode=cli_schema, oper_src_dnode=cli_schema),
+    }
+    dev = swdev.DeviceMgr(dev_types, t.env, name, t.log_handler, on_reconf, swdev.SchemaRegistry())
+    dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe")
+    dmc.mock.enabled = True
+    dmc.extra_adapter.create("iosxe-cli")
+    dev.set_dmc(dmc)
+    dev_ref = dev
+    after 0.01: start()
+    after 5.0: report_timeout()
+
+
+actor _test_iosxe_cli_only_install_mode(t: testing.EnvT):
+    """Without NETCONF, a device in install mode is upgraded over the CLI:
+    copy, check, add, activate with the abort timer, commit."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands() if cmd.startswith("copy ") or cmd.startswith("install ")]
+            testing.assertEqual([COPY_COMMAND, ADD_COMMAND, ACTIVATE_COMMAND, "install commit"], steps)
+            testing.assertEqual([], c.get_configured(), "install mode needs no boot statement")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-install", False, settled)
+
+
+actor _test_iosxe_cli_only_bundle_mode(t: testing.EnvT):
+    """Without NETCONF, a device in bundle mode is converted: the boot
+    statements name packages.conf and then the old image, the configuration
+    is saved, and one command adds, activates and commits."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands()
+                     if cmd.startswith("copy ") or cmd.startswith("install ") or cmd == "write memory"]
+            testing.assertEqual([COPY_COMMAND, "write memory", ONE_SHOT_COMMAND], steps)
+            testing.assertEqual(swxe.conversion_boot_lines(BUNDLE_IMAGE), c.get_configured())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-bundle", True, settled)
