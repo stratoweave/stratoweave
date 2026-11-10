@@ -88,11 +88,13 @@ images or campaigns.
 For bottom-node development, `just flotilla` still starts one standalone
 instance on the first flotilla's ports. Do not run it alongside `just demo`.
 
-Mock devices take two leaves under `mock/software`. `upgrade-duration` is how many
+Mock devices take three leaves under `mock/software`. `upgrade-duration` is how many
 seconds a whole software upgrade takes; the mock spreads it over the
 operations as measured on a lab c8000v (the numbers are in
 `docs/reference/software-upgrade.md`), and absent or 0 completes each
-operation at once. `failure`
+operation at once. `upgrade-duration-variance` lets each upgrade take up to
+that percentage longer or shorter, 20 by default, drawn at random per
+upgrade, so devices released together do not all finish together. `failure`
 names one IOS XE failure to reproduce: `download-failed`, `add-failed`,
 `activate-refused`, `commit-failed` or `reverts`, or one that fails a BGP
 check: `bgp-down` keeps the session idle from the start, so the pre-check

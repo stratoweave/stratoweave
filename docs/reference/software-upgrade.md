@@ -186,6 +186,7 @@ device sets these leaves under `mock/software`:
 | Leaf | Meaning |
 | --- | --- |
 | `upgrade-duration` | Seconds a whole upgrade takes. Absent or 0 ends each step at once. |
+| `upgrade-duration-variance` | Percent by which each upgrade's duration can differ from `upgrade-duration`, either way. Each upgrade draws its duration evenly in that range when its `xcopy` starts. Default 20; 0 makes every upgrade exact. |
 | `failure` | One device failure to reproduce, see below. |
 
 `mock/platform/version` is the release before the upgrade. Default `17.18.02`,

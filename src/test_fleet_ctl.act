@@ -366,6 +366,46 @@ def _test_the_plan_is_the_run_at_a_stagger():
     testing.assertEqual(sizes, [30, 45, 25])
 
 
+def overlapping(days: int) -> list[(str, int, int)]:
+    """Three schedules whose daily windows of an hour overlap: eu opens
+    first, uk half an hour later and us 45 minutes later."""
+    return daily("eu", 0, HOUR, days) + daily("uk", 1800, HOUR, days) \
+        + daily("us", 2700, HOUR, days)
+
+
+def overlapping_devices() -> list[(str, int, str)]:
+    """40 devices of 600 s on eu, 20 on uk and 15 on us."""
+    return devices("eu", 40, 600, "eu") + devices("uk", 20, 600, "uk") \
+        + devices("us", 15, 600, "us")
+
+
+def _test_the_plan_is_the_run_overlapping_windows():
+    """The devices of three schedules whose windows overlap, 5 at once and
+    at most 10."""
+    # (stagger, every device must start in a window)
+    cases = [(0, False), (25, False), (100, False), (0, True), (25, True)]
+    for case in cases:
+        plan_is_run(overlapping(9), overlapping_devices(), 5, 10, case.1, 600,
+                    stagger=case.0)
+
+
+def _test_overlapping_windows_share_the_slots_in_the_plan():
+    """eu has more devices than its first window takes. In the first plan,
+    uk starts devices in its first window while eu still starts devices
+    in its own, not only once eu takes no more."""
+    c = controller(overlapping(9), overlapping_devices(), 5, 5, debounce=1)
+    p = c.plan(0)
+    eu_last = 0
+    uk_first = -1
+    for name, s in p.starts.items():
+        if name.startswith("eu") and s.0 == 0:
+            eu_last = fleet_ctl.imax(eu_last, s.1)
+        if name.startswith("uk") and (uk_first < 0 or s.1 < uk_first):
+            uk_first = s.1
+    testing.assertTrue(uk_first >= 0 and uk_first < eu_last,
+                       "uk first starts at {uk_first}, eu last at {eu_last}")
+
+
 def _test_a_decision_that_takes_the_last_plan_again_decides_as_a_new_plan():
     """60 devices of 600 s in a 1 h window every day, 5 at once and at most
     10. Their upgrades take 85 to 115 percent of the estimate, or every
@@ -391,6 +431,23 @@ def _test_a_decision_that_takes_the_last_plan_again_decides_as_a_new_plan():
                        stagger=case.0)
         again = same_as_a_new_plan(c, case.1, 9 * DAY, case.2)
         if case.2 == 0:
+            testing.assertTrue(again > 0,
+                               "stagger {case.0}: {again} decisions took the plan again")
+
+
+def _test_with_overlapping_windows_a_decision_that_takes_the_last_plan_again_decides_as_a_new_plan():
+    """The same with three schedules whose windows overlap, 5 at once and
+    at most 10."""
+    scatter: dict[str, int] = {}
+    for d in overlapping_devices():
+        k = int(d.0[2:])
+        scatter[d.0] = 600 * (85 + (k * 7) % 31) // 100
+    # (stagger, how late each decision comes)
+    cases = [(100, 0), (25, 0), (25, 1)]
+    for case in cases:
+        c = controller(overlapping(9), overlapping_devices(), 5, 10, False, 1, stagger=case.0)
+        again = same_as_a_new_plan(c, scatter, 9 * DAY, case.1)
+        if case.1 == 0:
             testing.assertTrue(again > 0,
                                "stagger {case.0}: {again} decisions took the plan again")
 
@@ -673,12 +730,217 @@ def _test_a_removed_device_frees_its_slot():
 
 def _test_concurrency_counts_the_whole_campaign():
     """Two schedules whose windows overlap share the concurrency: at two
-    at once, two devices start in all."""
+    at once, two devices start in all, one in each window."""
     wins = [("a", 0, fleet_ctl.OPEN_END), ("b", 0, fleet_ctl.OPEN_END)]
     devs = devices("a", 3, 600, "a") + devices("b", 3, 600, "b")
     c = controller(wins, devs, 2, 2)
     c.start(2)
+    testing.assertEqual(c.decide(0).started, ["a0", "b0"])
+
+
+def _test_open_windows_share_the_slots():
+    """Two windows that never close, with the same upgrade time waiting,
+    take two of four slots each. Five slots give the fifth to the window
+    that opened first."""
+    wins = [("a", 0, fleet_ctl.OPEN_END), ("b", 0, fleet_ctl.OPEN_END)]
+    devs = devices("a", 3, 600, "a") + devices("b", 3, 600, "b")
+    c = controller(wins, devs, 4, 4, rung=4)
+    testing.assertEqual(c.decide(0).started, ["a0", "a1", "b0", "b1"])
+    c = controller(wins, devs, 5, 5, rung=5)
+    testing.assertEqual(c.decide(0).started, ["a0", "a1", "a2", "b0", "b1"])
+
+
+def _test_a_window_that_opens_while_another_runs_gets_the_free_slots():
+    """Window b opens at 100 while the devices of window a hold both
+    slots. The slot a0 frees goes to b, which has no device in flight,
+    though a opened first and has devices waiting. The slot a1 frees goes
+    to a, which then has none in flight and b one."""
+    wins = [("a", 0, fleet_ctl.OPEN_END), ("b", 100, fleet_ctl.OPEN_END)]
+    devs = devices("a", 4, 600, "a") + devices("b", 2, 600, "b")
+    c = controller(wins, devs, 2, 2, rung=2)
     testing.assertEqual(c.decide(0).started, ["a0", "a1"])
+    testing.assertEqual(c.decide(100).started, [])
+    c.report("a0", "succeeded", 600)
+    testing.assertEqual(c.decide(600).started, ["b0"])
+    c.report("a1", "succeeded", 650)
+    testing.assertEqual(c.decide(650).started, ["a2"])
+
+
+def _test_a_window_with_nothing_to_start_passes_its_turn():
+    """Window a closes before its devices could end, so the other open
+    window takes every slot."""
+    wins = [("a", 0, 500), ("b", 0, fleet_ctl.OPEN_END)]
+    devs = devices("a", 2, 600, "a") + devices("b", 2, 600, "b")
+    c = controller(wins, devs, 2, 2, rung=2)
+    testing.assertEqual(c.decide(0).started, ["b0", "b1"])
+
+
+def _test_shares():
+    """The slots go one at a time, each to the window whose devices in
+    flight plus a half, times its weight, are the fewest, the first window
+    on a tie: each share is rounded to the nearest slot."""
+    # (devices in flight, weights, slots, shares)
+    cases = [
+        ([0, 0], [1, 1], 4, [2, 2]),
+        ([0, 0], [1, 1], 3, [2, 1]),
+        ([3, 0], [1, 1], 2, [0, 2]),
+        ([3, 0], [1, 1], 5, [1, 4]),
+        ([0, 3], [1, 1], 5, [4, 1]),
+        ([1, 1, 1], [1, 1, 1], 2, [1, 1, 0]),
+        ([5, 0], [1, 1], 0, [0, 0]),
+        ([0], [1], 7, [7]),
+        ([0, 0], [1, 2], 3, [2, 1]),
+        # Shares of 3.33 and 0.67 round to 3 and 1.
+        ([0, 0], [1, 5], 4, [3, 1]),
+        ([2, 0], [1, 3], 4, [3, 1]),
+        ([0, 0], [1000, fleet_ctl.NO_SHARE], 3, [3, 0]),
+    ]
+    for case in cases:
+        testing.assertEqual(fleet_ctl.shares(case.0, case.1, case.2), case.3,
+                            "shares of {case.2} for {case.0} at weights {case.1}")
+
+
+def _test_an_open_window_that_changes_keeps_its_devices_in_flight():
+    """Windows a and b grow from two hours to three while a0 and b0 run.
+    a0 still counts for a, so the slot b0 frees goes to b."""
+    devs = devices("a", 4, 600, "a") + devices("b", 4, 600, "b")
+    c = controller([("a", 0, 2 * HOUR), ("b", 0, 2 * HOUR)], devs, 2, 2, rung=2)
+    testing.assertEqual(c.decide(0).started, ["a0", "b0"])
+    c.configure([("a", 0, 3 * HOUR), ("b", 0, 3 * HOUR)], devs, 2, 2, False, 0, 600)
+    c.report("b0", "succeeded", 400)
+    testing.assertEqual(c.decide(400).started, ["b1"])
+
+
+def _test_window_needs():
+    """A schedule needs the upgrade time it must start before the first
+    last start. The time after a last start goes to the schedules that
+    can still start devices then, in proportion to their upgrade time
+    left, c devices at once."""
+    # (waiting upgrade time, last starts, now, concurrency, needs)
+    cases = [
+        ([1000], [500], 0, 4, [1000]),
+        # One hour after eu's last start at 111 at once starts 399600 s of
+        # uk's 600000.
+        ([1200000, 600000], [13800, 17400], 3600, 111, [1200000, 200400]),
+        # The time of its own holds all of the later schedule's upgrade time.
+        ([100, 50], [1000, 2000], 0, 1, [100, 0]),
+        # The last 100 s go to the third schedule alone; the 100 s before
+        # them to the second and third, 3 to 2.
+        ([300, 300, 300], [100, 200, 300], 0, 1, [300, 240, 160]),
+        ([600, 300], [1000, 1000], 0, 4, [600, 300]),
+        # Windows that never close have no time of their own.
+        ([3600, 7200], [fleet_ctl.OPEN_END, fleet_ctl.OPEN_END], 0, 4, [3600, 7200]),
+        # A last start that has passed counts from now.
+        ([100, 100], [-5, 50], 10, 2, [100, 22]),
+        # 30 days at 1000 at once start 2.592e9 s of 3.6e9: past 64 bits
+        # in between.
+        ([10, 3600000000], [10, 2592010], 0, 1000, [10, 1008000000]),
+    ]
+    for case in cases:
+        testing.assertEqual(fleet_ctl.window_needs(case.0, case.1, case.2, case.3), case.4,
+                            "needs of {case.0} at last starts {case.1}")
+
+def _test_a_window_with_time_of_its_own_leaves_the_slots_to_the_other():
+    """Window a closes at 2 h with ten devices of 600 s, b at 3 h with two.
+    b can start its two in the hour after a's last start, so a takes all
+    four slots."""
+    wins = [("a", 0, 2 * HOUR), ("b", 0, 3 * HOUR)]
+    devs = devices("a", 10, 600, "a") + devices("b", 2, 600, "b")
+    c = controller(wins, devs, 4, 4, rung=4)
+    testing.assertEqual(c.decide(0).started, ["a0", "a1", "a2", "a3"])
+
+
+def _test_windows_that_close_together_share_by_their_waiting_upgrade_time():
+    """Six devices wait in a and two in b, all of 600 s: a takes three of
+    four slots."""
+    wins = [("a", 0, fleet_ctl.OPEN_END), ("b", 0, fleet_ctl.OPEN_END)]
+    devs = devices("a", 6, 600, "a") + devices("b", 2, 600, "b")
+    c = controller(wins, devs, 4, 4, rung=4)
+    testing.assertEqual(c.decide(0).started, ["a0", "a1", "a2", "b0"])
+
+
+def _test_windows_that_never_close_share_by_their_waiting_upgrade_time():
+    """a waits 3600 s in six devices of 600 s, b 7200 s in six of 1200 s,
+    both in windows that never close: b takes three of four slots,
+    whatever the lengths of their devices."""
+    wins = [("a", 0, fleet_ctl.OPEN_END), ("b", 0, fleet_ctl.OPEN_END)]
+    devs = devices("a", 6, 600, "a") + devices("b", 6, 1200, "b")
+    c = controller(wins, devs, 4, 4, rung=4)
+    testing.assertEqual(c.decide(0).started, ["b0", "b1", "b2", "a0"])
+
+
+def _test_a_window_that_needs_no_slot_leaves_it_to_one_that_does():
+    """a holds 20 devices of 20 s in flight and closes at 45; its last
+    start is at 15. b never closes and needs nothing now. The slot a0
+    frees at 5 goes to a's last device, not to b."""
+    wins = [("a", 0, 45), ("b", 0, fleet_ctl.OPEN_END)]
+    devs = devices("a", 21, 20, "a") + devices("b", 5, 20, "b")
+    c = controller(wins, devs, 20, 20, rung=20)
+    testing.assertEqual(len(c.decide(0).started), 20)
+    c.report("a0", "succeeded", 5)
+    testing.assertEqual(c.decide(5).started, ["a20"])
+
+
+def _test_overlapping_windows_of_one_schedule_take_one_share():
+    """Schedule a has two windows open, b one, all never closing, with
+    four devices of 600 s on each schedule: a and b take two of four
+    slots each, a in its window that opened first."""
+    wins = [("a", 0, fleet_ctl.OPEN_END), ("a", 100, fleet_ctl.OPEN_END),
+            ("b", 0, fleet_ctl.OPEN_END)]
+    devs = devices("a", 4, 600, "a") + devices("b", 4, 600, "b")
+    c = controller(wins, devs, 4, 4, rung=4)
+    testing.assertEqual(c.decide(100).started, ["a0", "a1", "b0", "b1"])
+
+
+def _test_nothing_starts_before_the_turn_of_a_held_start():
+    """a and b never close, three devices of 600 s each, four at once,
+    staggered over a whole upgrade: 150 s from one start to the next. b0
+    reports up to date at 0. At 0, a0 starts and a1 waits for its turn at
+    150. A decision at 50 starts nothing, not even b0, as the plan of 0
+    said: that plan starts b0 and b1 at 150."""
+    wins = [("a", 0, fleet_ctl.OPEN_END), ("b", 0, fleet_ctl.OPEN_END)]
+    devs = devices("a", 3, 600, "a") + devices("b", 3, 600, "b")
+    c = controller(wins, devs, 4, 4, rung=4, stagger=100)
+    c.report("b0", "up-to-date", 0)
+    s = c.decide(0)
+    testing.assertEqual(s.started, ["a0"])
+    testing.assertEqual(s.plan.starts["b0"].1, 150)
+    testing.assertEqual(c.decide(50).started, [])
+    testing.assertEqual(c.decide(150).started, ["b0", "b1"])
+
+
+def _test_a_short_window_next_to_a_long_one_starts_all_its_devices():
+    """200 devices of 30 s in a daily 20 minute window and 20 of 1800 s in
+    a daily 4 h window, both at midnight, 10 at once: the long window's
+    devices fit after the short one closes, so the short window starts all
+    200 the first night."""
+    wins = daily("fast", 0, 1200, 3) + daily("slow", 0, 4 * HOUR, 3)
+    devs = devices("f", 200, 30, "fast") + devices("s", 20, 1800, "slow")
+    c = controller(wins, devs, 10, 20, debounce=1, estimate=191, stagger=25)
+    sizes = [(w.0, w.1, len(w.3)) for w in c.layout(c.plan(0))]
+    testing.assertEqual(sizes, [("fast", 0, 200), ("slow", 0, 20)])
+
+
+def _test_a_window_whose_devices_all_started_sets_no_wake():
+    """Two overlapping windows of one schedule. Both devices start in the
+    first, so the opening of the second at 300 is no reason to decide: the
+    next decision is when the upgrades are expected to end."""
+    c = controller([("a", 0, HOUR), ("a", 300, 300 + HOUR)], devices("a", 2, 600, "a"), 2, 2,
+                   rung=2)
+    s = c.decide(0)
+    testing.assertEqual(s.started, ["a0", "a1"])
+    testing.assertEqual(s.wake, 600)
+
+
+def _test_the_stagger_takes_turns_between_open_windows():
+    """Two windows open at 0, two devices of 600 s at a time, staggered
+    over a whole upgrade: a start every 300 s. The next start goes to the
+    window with the fewest devices in flight."""
+    wins = [("a", 0, fleet_ctl.OPEN_END), ("b", 0, fleet_ctl.OPEN_END)]
+    devs = devices("a", 2, 600, "a") + devices("b", 2, 600, "b")
+    c = controller(wins, devs, 2, 2, rung=2, stagger=100)
+    testing.assertEqual(c.decide(0).started, ["a0"])
+    testing.assertEqual(c.decide(300).started, ["b0"])
 
 
 def _test_new_limits_start_the_concurrency_over():
