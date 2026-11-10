@@ -18,6 +18,7 @@ import yang.gdata as ygdata
 
 OLD = "17.15.01a"
 NEW = "17.18.03a"
+OTHER = "17.18.04"
 
 
 def _devmgr(t: testing.EnvT, on_reconf: action(str) -> None) -> swdev.DeviceMgr:
@@ -66,6 +67,15 @@ def _pub_reason(oper: ?ygdata.Node) -> ?str:
     if oper is not None:
         return swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).software.state.reason
     return None
+
+
+def _pub_answers(oper: ?ygdata.Node) -> (?str, ?str):
+    """The campaign and the target release that the published status
+    answers."""
+    if oper is not None:
+        st = swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).software.state
+        return (st.upgrade_campaign, st.target_release)
+    return (None, None)
 
 
 actor _test_target_release_installs(t: testing.EnvT):
@@ -162,28 +172,362 @@ actor _test_no_target_release_does_nothing(t: testing.EnvT):
     after 0.05: verify()
 
 
-actor _test_veto_blocks_the_install(t: testing.EnvT):
-    """A veto from any holder stops the impacting step before it starts."""
+actor _test_a_veto_holds_only_the_install(t: testing.EnvT):
+    """Under a veto the manager reads the device and answers, and installs
+    nothing: a device on the old release needs the upgrade, one on the
+    target is up to date. Each status answers camp-1 and the target."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    # (release the device runs, status)
+    cases = [(OLD, "upgrade-needed"), (NEW, "up-to-date")]
+    var left = len(cases)
+
+    def run(case: (str, str)) -> None:
+        adapter = swmock.MockSoftwareAdapter(t.log_handler, case.0)
+        dev = _devmgr(t, noop_on_reconf)
+
+        def on_state(oper: ?ygdata.Node) -> None:
+            status = _pub_status(oper)
+            if status == "in-progress" or status == "succeeded":
+                t.failure(ValueError("nothing may be installed under a veto, got {status}"))
+            elif status == case.1:
+                testing.assertEqual(adapter.calls(), ["check"], "only the read may run")
+                testing.assertEqual(_pub_answers(oper), ("camp-1", NEW),
+                                    "the status should answer the intent")
+                left -= 1
+                if left == 0:
+                    t.success()
+
+        dev.set_update_oper(on_state)
+        mgr = dev.get_swmgr()
+        mgr.set_adapter(adapter)
+        mgr.set_config("camp-1", NEW, False, {"noc-monitoring": "maintenance freeze"})
+
+    for case in cases:
+        run(case)
+
+
+actor _test_removing_the_veto_runs_the_upgrade(t: testing.EnvT):
+    """A device held at upgrade-needed upgrades once the veto goes: it is
+    read again, then staged, installed and committed."""
     def noop_on_reconf(name: str) -> None:
         pass
 
     adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
     dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var released = False
 
     def on_state(oper: ?ygdata.Node) -> None:
         status = _pub_status(oper)
-        if status != "unknown":
-            t.failure(ValueError("status should not have changed, got {status}"))
-
-    def verify() -> None:
-        testing.assertEqual(adapter.calls(), [], "install must not run under veto")
-        t.success()
+        if status == "upgrade-needed" and not released:
+            released = True
+            mgr.set_config("camp-1", NEW, False, {})
+        elif status == "succeeded":
+            testing.assertEqual(adapter.calls(),
+                                ["check", "check", "prepare", "install", "commit", "check"],
+                                "the release should read, then upgrade")
+            t.success()
 
     dev.set_update_oper(on_state)
-    mgr = dev.get_swmgr()
     mgr.set_adapter(adapter)
-    mgr.set_config("camp-1", NEW, False, {"noc-monitoring": "maintenance freeze"})
-    after 0.05: verify()
+    mgr.set_config("camp-1", NEW, False, {"camp-1": "waiting for its window"})
+
+
+actor _test_a_veto_added_during_the_prechecks_holds_the_install(t: testing.EnvT):
+    """A veto that comes while the pre-checks run holds the install: the
+    device is left on its release, upgrade-needed, and the reason names the
+    holder."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+
+    def precheck(done: action(bool, str) -> None) -> None:
+        mgr.set_config("camp-1", NEW, False, {"noc": "freeze"})
+        done(True, "")
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        status = _pub_status(oper)
+        if status == "upgrade-needed":
+            testing.assertEqual(adapter.calls(), ["check", "prepare"], "nothing may be installed")
+            testing.assertEqual(_pub_reason(oper), "held by noc before install",
+                                "the reason should name the holder")
+            t.success()
+        elif status == "succeeded":
+            t.failure(ValueError("the install ran under a veto"))
+
+    dev.set_update_oper(on_state)
+    mgr.add_precheck("freezer", precheck)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_a_target_changed_during_the_prechecks_is_not_installed(t: testing.EnvT):
+    """A new target while the pre-checks run: the run ends without
+    installing the old one, and the new target runs after it."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var changed = False
+
+    def precheck(done: action(bool, str) -> None) -> None:
+        if not changed:
+            changed = True
+            mgr.set_config("camp-1", OTHER, False, {})
+        done(True, "")
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if _pub_status(oper) == "succeeded":
+            testing.assertEqual(adapter.calls(),
+                                ["check", "prepare", "check", "prepare", "install", "commit",
+                                 "check"],
+                                "one install, of the new target")
+            testing.assertEqual(adapter.running(), OTHER, "the device should run the new target")
+            testing.assertEqual(_pub_answers(oper), ("camp-1", OTHER),
+                                "the status should answer the new target")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.add_precheck("changer", precheck)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_a_target_withdrawn_during_the_prechecks_fails(t: testing.EnvT):
+    """A target removed while the pre-checks run fails the run without an
+    install, and the status then answers no intent."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var failed = False
+
+    def precheck(done: action(bool, str) -> None) -> None:
+        mgr.set_config(None, None, False, {})
+        done(True, "")
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        status = _pub_status(oper)
+        if status == "failed" and not failed:
+            testing.assertEqual(_pub_reason(oper), "target release withdrawn before install",
+                                "the reason should say why")
+            testing.assertEqual(adapter.calls(), ["check", "prepare"], "nothing may be installed")
+            failed = True
+        elif failed and _pub_answers(oper) == (None, None):
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.add_precheck("withdrawer", precheck)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_a_target_changed_after_install_finishes_the_old_run_first(t: testing.EnvT):
+    """A new target while the post-checks run: the run of the old target
+    commits and succeeds, answering the old intent, then the new target
+    runs."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var changed = False
+    var first: ?(?str, ?str) = None
+
+    def postcheck(done: action(bool, str) -> None) -> None:
+        if not changed:
+            changed = True
+            mgr.set_config("camp-1", OTHER, False, {})
+        done(True, "")
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if _pub_status(oper) == "succeeded":
+            answers = _pub_answers(oper)
+            if first is None:
+                testing.assertEqual(answers, ("camp-1", NEW), "the old run answers the old intent")
+                first = answers
+            elif first is not None and answers == ("camp-1", OTHER):
+                testing.assertEqual(adapter.running(), OTHER, "the device should run the new target")
+                t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.add_postcheck("changer", postcheck)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_a_new_campaign_with_the_same_answer_publishes_its_name(t: testing.EnvT):
+    """A device up to date for camp-1 is read again for camp-2, and the
+    status then answers camp-2."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, NEW)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var moved = False
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if _pub_status(oper) != "up-to-date":
+            return
+        answers = _pub_answers(oper)
+        if answers == ("camp-1", NEW) and not moved:
+            moved = True
+            mgr.set_config("camp-2", NEW, False, {"camp-2": "waiting for its window"})
+        elif answers == ("camp-2", NEW):
+            testing.assertEqual(adapter.calls(), ["check", "check"], "one read per campaign")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_a_failed_status_that_answers_is_kept(t: testing.EnvT):
+    """A failed run is not run again by config that keeps the intent, with
+    or without a veto. Removing the target and setting it again runs it
+    again."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "install")
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var step = 0
+
+    def restate() -> None:
+        testing.assertEqual(adapter.calls(), ["check", "prepare", "install"],
+                            "the failed run must not run again")
+        mgr.set_config("camp-1", None, False, {})
+        mgr.set_config("camp-1", NEW, False, {})
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        # Removing the target publishes the failed status without an intent.
+        if _pub_status(oper) != "failed" or _pub_answers(oper) != ("camp-1", NEW):
+            return
+        step += 1
+        if step == 1:
+            mgr.set_config("camp-1", NEW, False, {})
+            mgr.set_config("camp-1", NEW, False, {"noc": "freeze"})
+            mgr.set_config("camp-1", NEW, False, {})
+            after 0.05: restate()
+        elif step == 2:
+            testing.assertEqual(adapter.calls(),
+                                ["check", "prepare", "install", "check", "prepare", "install"],
+                                "a target set again runs again")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
+
+
+actor _test_a_failed_read_under_a_veto_is_read_again(t: testing.EnvT):
+    """A read that fails under a veto leaves the release unknown, with the
+    reason, and is read again after a while."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "check", fail_times=1)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var unknown = False
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        status = _pub_status(oper)
+        if status == "unknown" and _pub_reason(oper) is not None:
+            testing.assertEqual(_pub_reason(oper),
+                                "could not read the running release: mock: check failed",
+                                "the reason should say what failed")
+            unknown = True
+        elif status == "upgrade-needed":
+            testing.assertTrue(unknown, "the failed read should have been published")
+            testing.assertEqual(adapter.calls(), ["check", "check"], "read twice, nothing else")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.set_read_retry(0.01)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {"camp-1": "waiting for its window"})
+
+
+actor _test_a_device_not_connected_under_a_veto_is_read_on_connect(t: testing.EnvT):
+    """Under a veto, a device that is not connected has an unknown release
+    until it connects; then it is read again and needs the upgrade."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    # (vetoes, final status, the adapter calls)
+    cases = [
+        ({"camp-1": "waiting for its window"}, "upgrade-needed", ["check", "check"]),
+    ]
+    var left = len(cases)
+    # Per case: whether its device has connected.
+    var connected: list[bool] = [False for _c in cases]
+
+    def run(k: int, case: (dict[str, str], str, list[str])) -> None:
+        adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+        adapter.set_connected(False)
+        dev = _devmgr(t, noop_on_reconf)
+        mgr = dev.get_swmgr()
+
+        def on_state(oper: ?ygdata.Node) -> None:
+            status = _pub_status(oper)
+            if status == "unknown" and _pub_reason(oper) is not None and not connected[k]:
+                connected[k] = True
+                adapter.set_connected(True)
+                mgr.on_connect()
+            elif status == case.1:
+                testing.assertTrue(connected[k], "nothing may run before the device connects")
+                testing.assertEqual(adapter.calls(), case.2, "read again on connect")
+                left -= 1
+                if left == 0:
+                    t.success()
+
+        dev.set_update_oper(on_state)
+        mgr.set_adapter(adapter)
+        mgr.set_config("camp-1", NEW, False, case.0)
+
+    for k in range(len(cases)):
+        run(k, cases[k])
+
+
+actor _test_a_new_intent_drops_the_last_runs_stage_and_verdicts(t: testing.EnvT):
+    """After a failed run, a new target under a veto answers upgrade-needed
+    without the stage, the reason or the verdicts of the failed run."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "install")
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var failed = False
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        status = _pub_status(oper)
+        if status == "failed" and not failed:
+            failed = True
+            mgr.set_config("camp-2", OTHER, False, {"camp-2": "waiting for its window"})
+        elif status == "upgrade-needed":
+            testing.assertEqual(_pub_answers(oper), ("camp-2", OTHER), "the new intent")
+            testing.assertNone(_pub_stage(oper), "no stage of the failed run")
+            testing.assertNone(_pub_reason(oper), "no reason of the failed run")
+            testing.assertEqual(_pub_verdict(oper, "precheck"), "not-run", "no verdict")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
 
 
 actor _test_failed_install_is_reported(t: testing.EnvT):
@@ -320,7 +664,8 @@ actor _test_device_already_on_target_does_nothing(t: testing.EnvT):
 
 
 actor _test_reached_target_is_not_reinstalled(t: testing.EnvT):
-    """Intent restated after a successful upgrade must not install again.
+    """Intent restated after a successful upgrade must not install again:
+    the status answers it, so nothing runs, and it stays succeeded.
 
     Measured on a c8000v: sent the sequence a second time, it staged the image,
     accepted the install and reported success -- having changed nothing, which
@@ -334,21 +679,19 @@ actor _test_reached_target_is_not_reinstalled(t: testing.EnvT):
     mgr = dev.get_swmgr()
 
     def verify() -> None:
-        # The second round ends in up-to-date; wait for it under load.
-        if mgr.get_status() != "up-to-date":
-            after 0.05: verify()
-            return
-        testing.assertEqual(adapter.calls(),
-                            ["check", "prepare", "install", "commit", "check", "check"],
-                            "the second round should have stopped at the check")
+        testing.assertEqual(mgr.get_status(), "succeeded", "the status should stay")
+        testing.assertEqual(adapter.calls(), ["check", "prepare", "install", "commit", "check"],
+                            "the restated intent should run nothing")
         t.success()
 
     def again() -> None:
-        # The same intent again, once the first round has finished.
+        # The same intent again, once the first round has finished, and a
+        # reconnect, which looks at the intent again.
         if mgr.get_status() != "succeeded":
             after 0.05: again()
             return
         mgr.set_config("camp-1", NEW, False, {})
+        mgr.on_connect()
         after 0.05: verify()
 
     mgr.set_adapter(adapter)
@@ -381,7 +724,9 @@ actor _test_unreadable_release_still_installs(t: testing.EnvT):
 
 
 actor _test_install_runs_once(t: testing.EnvT):
-    """Repeated config does not re-run an install already under way."""
+    """Config that changes during a run, but not its intent, does not run
+    the install again: the run's end looks at it once, and the status then
+    answers it."""
     def noop_on_reconf(name: str) -> None:
         pass
 
@@ -400,7 +745,7 @@ actor _test_install_runs_once(t: testing.EnvT):
 
     mgr.set_adapter(adapter)
     mgr.set_config("camp-1", NEW, False, {})
-    mgr.set_config("camp-1", NEW, False, {})
+    mgr.set_config("camp-1", NEW, True, {})
     mgr.set_config("camp-1", NEW, False, {})
     after 0.05: verify()
 
