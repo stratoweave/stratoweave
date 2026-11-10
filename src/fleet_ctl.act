@@ -616,6 +616,10 @@ class Controller(object):
     # Released devices that are not done and have a final status: a step
     # marks them done once their report counts.
     reported: set[str]
+    # The devices in reported by when their report came: a heap of (time,
+    # name). An entry is stale once its device is no longer in reported or
+    # its report came at another time.
+    reports: list[(int, str)]
     # Released devices whose final report came before their release: they
     # ran no upgrade.
     no_upgrade: set[str]
@@ -723,6 +727,7 @@ class Controller(object):
         self.failed = set()
         self.down = set()
         self.reported = set()
+        self.reports = []
         self.no_upgrade = set()
         self.released = set()
         self.released_at = {}
@@ -846,6 +851,7 @@ class Controller(object):
         self.due = {}
         self.done_at = {}
         self.reported = set()
+        self.reports = []
         self.no_upgrade = set()
         self.resumed = set()
         self.failed = set()
@@ -1106,6 +1112,7 @@ class Controller(object):
                 self.final_status[name] = status
                 if name in self.released and name not in self.done_at:
                     self.reported.add(name)
+                    heap_push(self.reports, (at, name))
                 self.quiet_until = 0
             elif not is_failure(status) and self.final_status[name] != status:
                 self.final_status[name] = status
@@ -1178,6 +1185,7 @@ class Controller(object):
         self.prepare_state = {}
         self.progress = {}
         self.reported = set()
+        self.reports = []
         self.no_upgrade = set()
         self.dues = sorted([(self.due[name], name) for name in self.flying])
         self.overdue = set()
@@ -1347,6 +1355,7 @@ class Controller(object):
             self.waiting_est[j] -= self.est.get_def(name, self.estimate_s)
         if name in self.final_at:
             self.reported.add(name)
+            heap_push(self.reports, (self.final_at[name], name))
             self.no_upgrade.add(name)
         elif name in self.est:
             heap_push(self.dues, (self.due[name], name))
@@ -1491,12 +1500,14 @@ class Controller(object):
         sampled = False
         succeeded = 0
         # The reports that count by now, in the order they came.
-        due_reports: list[(int, str)] = []
-        for name in self.reported:
-            at = self.final_at[name]
-            if at + self.debounce <= t:
-                due_reports.append((at, name))
-        for fr in sorted(due_reports):
+        while len(self.reports) > 0:
+            fr = self.reports[0]
+            if not self.in_reports(fr):
+                heap_pop(self.reports)
+                continue
+            if fr.0 + self.debounce > t:
+                break
+            heap_pop(self.reports)
             name = fr.1
             self.reported.discard(name)
             at = self.released_at.get_def(name, 0)
@@ -1699,13 +1710,23 @@ class Controller(object):
         more upgrade from t."""
         w = -1
         q = -1
-        for name in self.reported:
-            # Its report counts one debounce after it came. The report of a
-            # device no longer in the campaign counts too: it takes the pace.
-            r = imax(self.final_at[name] + self.debounce, t + 1)
+        # A report counts one debounce after it came. The report of a device
+        # no longer in the campaign counts too: it takes the pace. The first
+        # report gives q, and the first of a device in flight gives w.
+        aside: list[(int, str)] = []
+        while len(self.reports) > 0:
+            e = self.reports[0]
+            if not self.in_reports(e):
+                heap_pop(self.reports)
+                continue
+            r = imax(e.0 + self.debounce, t + 1)
             q = earliest(q, r)
-            if name in self.flying:
-                w = earliest(w, r)
+            if e.1 in self.flying:
+                w = r
+                break
+            aside.append(heap_pop(self.reports))
+        for e in aside:
+            heap_push(self.reports, e)
         # The devices whose report would have counted by now leave the heap.
         while len(self.dues) > 0:
             e = self.dues[0]
@@ -1733,6 +1754,10 @@ class Controller(object):
             w = earliest(w, self.dues[0].0 + self.debounce)
             q = earliest(q, self.dues[0].0)
         return (w, q)
+
+    def in_reports(self, e: (int, str)) -> bool:
+        """True when e is the entry in reports of a device in reported."""
+        return e.1 in self.reported and self.final_at.get_def(e.1, -1) == e.0
 
     def in_dues(self, e: (int, str)) -> bool:
         """True when e is the entry in dues of a device in flight without a
@@ -1807,6 +1832,7 @@ class Controller(object):
         c.failed = copy_set(self.failed)
         c.down = copy_set(self.down)
         c.reported = copy_set(self.reported)
+        c.reports = list(self.reports)
         c.no_upgrade = copy_set(self.no_upgrade)
         c.released = copy_set(self.released)
         c.released_at = {k: v for k, v in self.released_at.items()}
