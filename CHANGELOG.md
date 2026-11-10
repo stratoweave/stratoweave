@@ -152,6 +152,15 @@
   `DeviceMgr` passes them on to the adapter it gets later. In Fleet Manager,
   a campaign could keep upgraded devices pending because the top never
   subscribed to their flotilla. [#747]
+- The NETCONF adapter logs in with the first private key in the device's
+  `credentials/key`, with or without a password, on the main session and on
+  the RFC 5277 notification sessions. Before, it connected only with a
+  password. `ncurl` takes a private key file with `--key`. [#776]
+- An extra adapter can have SSH settings of its own in `extra-adapter/ssh`,
+  which replace the device's `ssh` for that adapter, as `credentials` does.
+  The IOS SSH server of a C1111 sends no server-sig-algs, so an RSA key needs
+  `public-key-algorithm` `ssh-rsa` on its CLI port, while its NETCONF port
+  takes the RSA SHA-2 signatures. [#776]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with

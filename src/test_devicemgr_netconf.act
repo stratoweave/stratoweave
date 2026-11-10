@@ -1,6 +1,7 @@
 """DeviceMgr tests for adapter-level NETCONF mocking."""
 
 import logging
+import net
 import testing
 import std.xml as xml
 import yang
@@ -10,6 +11,7 @@ import yang.schema as yschema
 import device as swdev
 import adapters.netconf as swna
 import netconf
+import ssh.pipe as sshpipe
 import swyang
 import yp
 from device_schema import DeviceSchema
@@ -17,6 +19,7 @@ from device_schema import DeviceSchema
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
     stratoweave_rfs__device__credentials as Credentials, \
+    stratoweave_rfs__device__credentials__key_entry as CredentialsKey, \
     stratoweave_rfs__device__address_entry as Address, \
     stratoweave_rfs__device__mock as Mock
 
@@ -1618,3 +1621,75 @@ actor _test_device_rejects_mixed_rooted_periods(t: testing.EnvT):
             fail("Expected NetconfAdapter from DeviceMgr")
 
     start()
+
+
+# A key pair made for the key login test only.
+TEST_PRIVATE_KEY = """-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDgjfQUrEMlqNGp0I3jrLdNQjVSXkfQ1229bCdIwRg6HQAAAIgXM1oGFzNa
+BgAAAAtzc2gtZWQyNTUxOQAAACDgjfQUrEMlqNGp0I3jrLdNQjVSXkfQ1229bCdIwRg6HQ
+AAAECr9T5H5jEjsuF8usTgKrjTrGUFz2azFXpmhXBZBms47+CN9BSsQyWo0anQjeOst01C
+NVJeR9DXbb1sJ0jBGDodAAAAAAECAwQF
+-----END OPENSSH PRIVATE KEY-----
+"""
+TEST_PUBLIC_KEY = b"ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOCN9BSsQyWo0anQjeOst01CNVJeR9DXbb1sJ0jBGDod"
+
+
+actor _test_key_login(t: testing.EnvT):
+    """A device whose credentials have a private key and no password logs in
+    with the key.
+
+    The NETCONF server on loopback SSH accepts only TEST_PUBLIC_KEY. The device
+    connects when its module set arrives from the hello.
+    """
+    var done = False
+    var listener: ?sshpipe.SshPipeListener = None
+    var sessions: list[netconf.Server] = []
+
+    def finish(err: ?Exception):
+        if done:
+            return
+        done = True
+        l = listener
+        if l is not None:
+            l.close()
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def auth(user: str, password: ?str, pubkey: ?bytes, respond: action(bool) -> None):
+        if user == "admin" and password is None and pubkey is not None and pubkey == TEST_PUBLIC_KEY:
+            respond(True)
+        else:
+            respond(False)
+
+    def on_rpc(s: netconf.Server, message_id: str, op: xml.Node):
+        s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: " + op.tag)
+
+    def on_accept(l: sshpipe.SshPipeListener, p: sshpipe.SshListenPipe):
+        caps = [netconf.CAP_NC_1_0, netconf.CAP_NC_1_1, IETF_SYSTEM_NS + "?module=" + IETF_SYSTEM_MODULE]
+        sessions.append(netconf.Server(pipe=p, on_rpc=on_rpc, capabilities=caps, log_handler=t.log_handler))
+
+    def on_reconf(name: str):
+        finish(None)
+
+    def on_listen(l: sshpipe.SshPipeListener, err: ?Exception):
+        if err is not None:
+            finish(err)
+            return
+        dev_types = {
+            "netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter,
+                                        src_dnode=yang.compile([IETF_SYSTEM_YANG]))
+        }
+        dev = swdev.DeviceMgr(dev_types, t.env, "keyed", t.log_handler, on_reconf, swdev.SchemaRegistry())
+        creds = Credentials("admin", key=[CredentialsKey("test", TEST_PRIVATE_KEY)])
+        dmc = DeviceMetaConfig(name="keyed", credentials=creds, type="netconf",
+                               address=[Address(name="primary", address="127.0.0.1", port=u64(l.bound_port()))])
+        dev.set_dmc(dmc)
+
+    listener = sshpipe.SshPipeListener(net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))),
+                                       address="127.0.0.1", port=0,
+                                       on_listen=on_listen, on_accept=on_accept, auth_check=auth,
+                                       subsystem="netconf", log_handler=t.log_handler)
+    after 2.0: finish(ValueError("the device did not log in with its key"))
