@@ -26,6 +26,11 @@ PLAN_ROUNDS = 3
 # Microseconds in a second: the stagger times the starts in them.
 MICRO = 1000000
 
+# The weight that need_weights() gives a schedule that needs no slot now.
+# While another schedule needs one, the slots are shared without it, and
+# it takes only the slots the others leave. Every other weight is below it.
+NO_SHARE = 1000000000
+
 
 def is_final(status: ?str) -> bool:
     """True when the status ends an upgrade attempt."""
@@ -142,6 +147,83 @@ def slow_time(took: list[int], pace: int) -> int:
     return imax(pace, s[(98 * len(s) + 99) // 100 - 1])
 
 
+def below(level: int, weight: int, k: int) -> int:
+    """How many slots a window takes before its next slot would count k or
+    more: a slot counts twice the devices in flight before it, plus one,
+    times the weight."""
+    return imax(0, (k + weight - 1) // weight // 2 - level)
+
+
+def shares(levels: list[int], weights: list[int], n: int) -> list[int]:
+    """Share n slots between windows, given each window's devices in flight
+    and its weight of at least 1, in the order the windows open. The slots
+    go one at a time, each to the window whose devices in flight plus a
+    half, times its weight, are the fewest, the first window on a tie. So
+    the devices in flight follow the inverse of the weights, each window's
+    share rounded to the nearest slot; the weights are whole numbers, so a
+    tie is a tie of those products. Return how many slots each window
+    takes."""
+    m = len(levels)
+    # The largest count k for which the slots that count less than k fit
+    # in n. Every slot that counts less is taken, and the slots that count
+    # k go to the first windows.
+    lo = 0
+    hi = 0
+    for j in range(m):
+        hi = imax(hi, (2 * (levels[j] + n) + 1) * weights[j])
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        total = 0
+        for j in range(m):
+            total += below(levels[j], weights[j], mid)
+        if total <= n:
+            lo = mid
+        else:
+            hi = mid - 1
+    out = [below(levels[j], weights[j], lo) for j in range(m)]
+    rest = n
+    for q in out:
+        rest -= q
+    for j in range(m):
+        if rest > 0 and (2 * (levels[j] + out[j]) + 1) * weights[j] == lo:
+            out[j] += 1
+            rest -= 1
+    return out
+
+
+def window_needs(work: list[int], ends: list[int], t: int, c: int) -> list[int]:
+    """What each schedule with an open window needs at time t: the upgrade
+    time of its waiting devices that it must start before the first of
+    the schedules' last starts, at concurrency c. work gives each
+    schedule's waiting upgrade time and ends its last start, in seconds.
+    The time after a last start counts for the schedules that can still
+    start devices then: from the last of the last starts back to the
+    first, the time between two goes to those schedules in proportion to
+    the upgrade time they have left, as c devices at once over that time.
+    The devices still in flight at a last start are not taken off that
+    time."""
+    k = len(work)
+    by_end = sorted([(imax(t + 1, ends[j]), j) for j in range(k)])
+    rest = list(work)
+    for q in range(k - 1):
+        m = k - 1 - q
+        span = by_end[m].0 - by_end[m - 1].0
+        if span > 0:
+            room = c * span
+            total = 0
+            for p in range(m, k):
+                total += rest[by_end[p].1]
+            for p in range(m, k):
+                j = by_end[p].1
+                if total <= room:
+                    rest[j] = 0
+                else:
+                    # In bigint: the product passes 64 bits beyond about
+                    # 3e9 s of waiting upgrade time.
+                    rest[j] -= int(bigint(rest[j]) * bigint(room) // bigint(total))
+    return rest
+
+
 def copy_set(s: set[str]) -> set[str]:
     out: set[str] = set()
     for x in s:
@@ -208,16 +290,35 @@ class Controller(object):
     up to the concurrency. So the ramp takes four times as many devices
     each round, but it does not wait for a round to end, and when the
     concurrency rises, the ramp follows it as devices finish. A failed
-    upgrade does not grow the ramp. Then it starts waiting devices, window
-    by window in the order the windows open, while fewer devices than the
-    ramp are in flight. With a stagger, a device that starts holds the
+    upgrade does not grow the ramp. Then it starts waiting devices while
+    fewer devices than the ramp are in flight. The schedules with an open
+    window share the free slots by what each needs: the expected upgrade
+    time of its waiting devices that it must start before the first of
+    their last starts. A schedule's last start is the close of its last
+    open window less the close margin of its mean waiting device; a window
+    that never closes has none. The time after a last start counts for the
+    schedules that can still start devices then: from the last of the last
+    starts back to the first, the time between two goes to those schedules
+    in proportion to the upgrade time they have left, as many devices at
+    once as the concurrency. So a schedule with time of its own
+    at the end leaves the slots to one whose window closes first, and
+    schedules whose windows close together share in proportion to the
+    upgrade time waiting in them. When none needs a slot before the first
+    last start, they share in that proportion too. Each schedule then has
+    its share of the devices in flight, rounded to the nearest slot as
+    shares() rounds it, and starts it in its open windows in the order
+    they open. A schedule that needs no slot now, or has nothing more to
+    start, leaves its slots to the others. With a stagger, a device that
+    starts holds the
     next start back by the stagger's percent of its expected upgrade time,
     divided by the concurrency. So as many devices as the concurrency
     start over that part of an upgrade, also when a window opens with room
     for many, and the starts go faster in a larger campaign. At 100 percent
     the starts can go as fast as devices end on average; below it they can
     also catch up when more devices end at once. The stagger does not hold
-    a device that reported before its release: it runs no upgrade. A
+    a device that reported before its release: it runs no upgrade. But
+    while the stagger holds back another start, nothing starts before that
+    start's turn. A
     window starts only a device that is ready and
     that has its close margin left before the window closes: its slow
     time times the close margin, one and a half by default. A device that
@@ -362,6 +463,7 @@ class Controller(object):
     ecur: list[int]
     pcur: list[int]
     waiting: list[int]
+    waiting_est: list[int]
     # Per window: whether the schedules give it, and whether its promises
     # have moved on since it closed or the schedules stopped giving it.
     is_current: list[bool]
@@ -399,8 +501,10 @@ class Controller(object):
     # is expected to end.
     released_est: dict[str, int]
     due: dict[str, int]
-    # The devices of the campaign in flight.
+    # The devices of the campaign in flight, and per schedule how many of
+    # them were released in its windows.
     flying: set[str]
+    in_flight: dict[str, int]
     # The devices in flight without a report, by when their upgrade is
     # expected to end: a heap of (due, name). An entry is stale once its
     # device reported, is done, or is due at another time. The devices
@@ -471,6 +575,7 @@ class Controller(object):
         self.ecur = []
         self.pcur = []
         self.waiting = []
+        self.waiting_est = []
         self.is_current = []
         self.moved = []
         self.windows_of = {}
@@ -491,6 +596,7 @@ class Controller(object):
         self.released_est = {}
         self.due = {}
         self.flying = set()
+        self.in_flight = {}
         self.dues = []
         self.overdue = set()
         self.done_at = {}
@@ -679,12 +785,14 @@ class Controller(object):
         index: dict[(str, int, int), int] = {}
         queue: list[list[str]] = []
         waiting: list[int] = []
+        waiting_est: list[int] = []
         by_schedule: dict[str, list[int]] = {}
         for i in range(len(windows)):
             w = windows[i]
             index[w] = i
             queue.append([])
             waiting.append(0)
+            waiting_est.append(0)
             if w in current:
                 if w.0 not in by_schedule:
                     by_schedule[w.0] = []
@@ -699,6 +807,7 @@ class Controller(object):
                 queue[i].append(name)
                 if name not in self.released:
                     waiting[i] += 1
+                    waiting_est[i] += self.est[name]
             # A promise holds to a window of the device's schedule; one to
             # a window the schedules no longer give moves on at the next
             # step.
@@ -726,6 +835,7 @@ class Controller(object):
                         groups_of[m] = []
                     groups_of[m].append(g)
         flying: set[str] = set()
+        in_flight: dict[str, int] = {}
         devices_done = 0
         for name in self.released:
             if name in self.est:
@@ -733,6 +843,8 @@ class Controller(object):
                     devices_done += 1
                 else:
                     flying.add(name)
+                    s = self.released_in[name].0
+                    in_flight[s] = in_flight.get_def(s, 0) + 1
         self.windows = windows
         self.index = index
         self.queue = queue
@@ -742,6 +854,7 @@ class Controller(object):
         self.ecur = [0 for _w in windows]
         self.pcur = [0 for _w in windows]
         self.waiting = waiting
+        self.waiting_est = waiting_est
         self.is_current = [w in current for w in windows]
         self.moved = [False for _w in windows]
         self.windows_of = windows_of
@@ -753,6 +866,7 @@ class Controller(object):
         self.spreads = spreads
         self.promised = promised
         self.flying = flying
+        self.in_flight = in_flight
         self.dues = sorted([(self.due[name], name) for name in flying
                             if name not in self.reported])
         self.overdue = set()
@@ -946,8 +1060,11 @@ class Controller(object):
         self.due[name] = t + self.duration(name)
         if name in self.est:
             self.flying.add(name)
+            s = self.windows[i].0
+            self.in_flight[s] = self.in_flight.get_def(s, 0) + 1
         for j in self.windows_of.get_def(name, []):
             self.waiting[j] -= 1
+            self.waiting_est[j] -= self.est.get_def(name, self.estimate_s)
         if name in self.final_at:
             self.reported.add(name)
             self.no_upgrade.add(name)
@@ -1125,6 +1242,7 @@ class Controller(object):
                 sampled = True
             if name in self.flying:
                 self.flying.discard(name)
+                self.in_flight[self.released_in[name].0] -= 1
                 self.devices_done += 1
                 if not is_failure(self.final_status.get(name)):
                     succeeded += 1
@@ -1173,12 +1291,62 @@ class Controller(object):
 
         self.move_promises(t)
         started: list[str] = []
-        slots = imin(self.rung, c) - len(self.flying)
-        n = slots
+        n = imin(self.rung, c) - len(self.flying)
         # True when the stagger holds back devices that wait in an open
         # window while slots are left.
         held_back = False
         wake = -1
+        # The schedules with an open window that has devices waiting, in the
+        # order their first such window opens, each with those windows in
+        # the order they open.
+        turns: list[str] = []
+        open_of: dict[str, list[int]] = {}
+        for i in range(len(self.windows)):
+            win = self.windows[i]
+            if self.waiting[i] > 0 and win.1 <= t and t < win.2:
+                if win.0 not in open_of:
+                    turns.append(win.0)
+                    open_of[win.0] = []
+                open_of[win.0].append(i)
+        if n > 0 and len(turns) > 0 and self.stagger > 0 and self.held \
+           and self.first_start(t, c) >= (t + 1) * MICRO:
+            # The last step held a start: nothing starts before its turn.
+            held_back = True
+        # Share the free slots, then start each schedule's share in its open
+        # windows, the schedule that takes the first slot first. A schedule
+        # that cannot use all of its share starts nothing more now; the
+        # slots it leaves are shared again between the others.
+        while n > 0 and len(turns) > 0 and not held_back:
+            levels = [self.in_flight.get_def(name, 0) for name in turns]
+            weights = self.need_weights(turns, open_of, t, c)
+            # The schedules that need a slot share them; the others wait for
+            # the slots those leave.
+            needy = [k for k in range(len(turns)) if weights[k] < NO_SHARE]
+            share = [0 for _k in turns]
+            some = shares([levels[k] for k in needy], [weights[k] for k in needy], n)
+            for q in range(len(needy)):
+                share[needy[q]] = some[q]
+            order = sorted([((2 * levels[k] + 1) * weights[k], k) for k in range(len(turns))])
+            keep: list[str] = []
+            for e in order:
+                k = e.1
+                left = share[k]
+                if not held_back:
+                    for i in open_of[turns[k]]:
+                        if left > 0 and not held_back:
+                            before = len(started)
+                            rest = self.fill(i, t, left, started, c)
+                            took = len(started) - before
+                            n -= took
+                            left -= took
+                            if rest == 0 and left > 0:
+                                # The stagger holds the next start.
+                                held_back = True
+                if held_back or left == 0:
+                    keep.append(turns[k])
+            if len(keep) == len(turns):
+                break
+            turns = [name for name in turns if name in keep]
         for i in range(len(self.windows)):
             if self.waiting[i] == 0:
                 continue
@@ -1186,15 +1354,9 @@ class Controller(object):
             if win.1 > t:
                 if wake < 0 or win.1 < wake:
                     wake = win.1
-            elif t < win.2:
-                if n > 0:
-                    n = self.fill(i, t, n, started, c)
-                if self.stagger > 0 and n <= 0 and len(started) < slots \
-                   and self.waiting[i] > 0:
-                    held_back = True
-                if win.2 != OPEN_END and self.waiting[i] > 0:
-                    if wake < 0 or win.2 < wake:
-                        wake = win.2
+            elif t < win.2 and win.2 != OPEN_END:
+                if wake < 0 or win.2 < wake:
+                    wake = win.2
         if len(self.timed) > 0 and (wake < 0 or self.timed[0].0 < wake):
             wake = self.timed[0].0
         # Until quiet the run ahead only starts devices: no report counts,
@@ -1213,6 +1375,41 @@ class Controller(object):
         self.quiet_from = t
         self.quiet_until = quiet if quiet >= 0 else OPEN_END
         return (started, wake, self.devices_done >= len(self.est))
+
+    def need_weights(self, turns: list[str], open_of: dict[str, list[int]], t: int,
+                     c: int) -> list[int]:
+        """The weight of each schedule in turns, whose open windows open_of
+        gives, at time t and concurrency c, for shares(): a thousand times
+        the total of what the schedules need, divided by its own need. When
+        none needs anything before the first last start, their waiting
+        upgrade time takes the place of the needs. A schedule that needs
+        nothing gets NO_SHARE. A schedule's last start is the close of its
+        last open window less the close margin of its mean waiting device;
+        a window that never closes has none."""
+        work: list[int] = []
+        ends: list[int] = []
+        for name in turns:
+            # Each open window of a schedule has the same waiting devices.
+            wins = open_of[name]
+            i = wins[0]
+            work.append(imax(1, self.waiting_est[i] * self.observed_s // self.estimate_s))
+            mean = self.waiting_est[i] // imax(1, self.waiting[i])
+            margin = mean * self.slow_s // self.estimate_s * self.close_margin // 100
+            end = 0
+            for j in wins:
+                close = self.windows[j].2
+                end = imax(end, OPEN_END if close == OPEN_END else close - margin)
+            ends.append(end)
+        part = window_needs(work, ends, t, c)
+        total = 0
+        for x in part:
+            total += x
+        if total == 0:
+            part = work
+            for x in part:
+                total += x
+        return [NO_SHARE if x == 0 else imin(NO_SHARE - 1, imax(1, total * 1000 // x))
+                for x in part]
 
     def flying_times(self, t: int) -> (int, int):
         """For the devices in flight at time t: the next time to decide for
@@ -1306,6 +1503,7 @@ class Controller(object):
         c.ecur = list(self.ecur)
         c.pcur = list(self.pcur)
         c.waiting = list(self.waiting)
+        c.waiting_est = list(self.waiting_est)
         c.parked = copy_set(self.parked)
         c.retry = [list(r) for r in self.retry]
         c.timed = list(self.timed)
@@ -1325,6 +1523,7 @@ class Controller(object):
         c.released_est = {k: v for k, v in self.released_est.items()}
         c.due = {k: v for k, v in self.due.items()}
         c.flying = copy_set(self.flying)
+        c.in_flight = {k: v for k, v in self.in_flight.items()}
         c.dues = list(self.dues)
         c.overdue = copy_set(self.overdue)
         c.done_at = {k: v for k, v in self.done_at.items()}

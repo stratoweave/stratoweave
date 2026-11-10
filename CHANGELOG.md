@@ -273,6 +273,16 @@
   when the report and the release fall in the same second. Before, it
   counted as an upgrade of one second and dragged the campaign's pace down.
   [#766]
+- Maintenance windows that are open at the same time share a campaign's
+  free slots. Before, the window that opened first took every slot it
+  could use, and a window that opened later waited until the first had
+  nothing left to start. Each schedule with an open window now gets slots
+  by the upgrade time it must start before the first of their last
+  starts, counting the time it has after the others close. So a schedule
+  with time of its own at the end leaves the slots to one that closes
+  first, and a deadline needs about the concurrency it needed before.
+  Windows that close together share in proportion to the upgrade time
+  waiting in them.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
