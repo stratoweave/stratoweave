@@ -26,16 +26,26 @@ Set under `stratoweave-rfs:device=<name>/software`:
 
 | Leaf | Meaning |
 | --- | --- |
-| `target-release` | Release the device should run. Setting it starts an upgrade. |
+| `target-release` | Release the device should run. Setting it makes the manager read the device, and upgrade it if no veto holds the install. |
 | `image-url` | URL the device downloads the image from. The last part of the path is the file name on the device. |
-| `veto[holder]` | While any entry exists, no upgrade starts. An upgrade already running goes on. |
-| `upgrade-campaign` | Campaign that owns the device. Stored, not used by the manager. |
-| `allow-staging` | Stored, not used by the manager. |
+| `veto[holder]` | While any entry exists, no install starts. The manager still reads the device. An install already running goes on. |
+| `upgrade-campaign` | Campaign whose intent this is. With `target-release` it is the intent that the status answers. |
+| `allow-staging` | While a veto holds the install, prepare the target once per intent: copy its image to the device ahead of the window. |
+
+The manager acts when `target-release`, `upgrade-campaign`, `allow-staging`
+or a veto changes, when the device type changes, and when the device
+connects. A new `image-url` alone does not make it act. A status that ends
+a read or a run (`up-to-date`, `succeeded`, `failed` or `rolled-back`) is
+kept while the intent, the campaign and the target, and the device type stay
+the same. So a reconnect or another config change does not run a failed
+upgrade again. To run it again, remove `target-release` and set it again.
 
 ## Upgrade steps
 
 ```text
 check ──> already on target ──> up-to-date
+  │
+  ├─> a veto holds the install ──> upgrade-needed ──> with allow-staging: prepare once
   │
   └─> prepare ─> pre-checks ─> install ─> post-checks ─> commit ─> succeeded
          │           │            │            │            │
@@ -44,7 +54,7 @@ check ──> already on target ──> up-to-date
 
 | Step | What happens |
 | --- | --- |
-| check | Read the running release. If it is the target, stop with `up-to-date`. If the read fails, go on. |
+| check | Read the running release. If it is the target, stop with `up-to-date`. If a veto holds the install, stop with `upgrade-needed`, and with `allow-staging` prepare the target once. If the read fails, go on, but see the rules. |
 | prepare | Copy the image to the device. No outage. |
 | pre-checks | Ask every pre-check. A refusal, or no answer within 60 seconds, ends with `failed`. Nothing is activated. |
 | install | Activate the new release. The device reboots. The step ends when the device runs the target. |
@@ -64,10 +74,20 @@ Rules:
   set time (IOS XE does), the limit is cut so the commit is sent at least 2
   minutes before that. With less than 2 minutes left, the manager rolls back
   at once.
-- A device runs one upgrade at a time.
-- Run state lives in memory. A failed run is not remembered: the next config
-  change for the device starts a new run if the target still differs. After a
-  restart, the stored config can start a new run.
+- A device runs one upgrade at a time. A change of intent during a run is
+  taken up when the run ends.
+- Under a veto, a read that fails gives `unknown`, with the error in
+  `reason`. If the device was not connected, the manager reads it again when
+  it connects; after another error, after 5 seconds, then twice as long each
+  time, up to 5 minutes. Without a veto, a read that fails goes on to the
+  upgrade, which reports what fails.
+- Right before the install, after the pre-checks, the manager looks at the
+  config again. A veto now holds the install, with `upgrade-needed` and the
+  holders in `reason`. A changed target or campaign ends the run with
+  `upgrade-needed`, and the new intent is read. A removed target ends it with
+  `failed`. The install installs the release the run read the device for.
+- Run state lives in memory. After a restart the status is `unknown`, and
+  the stored config makes the manager read the device again.
 
 ## Checks
 
@@ -100,10 +120,12 @@ Published under `stratoweave-rfs:device=<name>/software/state`:
 
 | Leaf | Value |
 | --- | --- |
-| `status` | `unknown`, `up-to-date`, `in-progress`, `succeeded`, `failed` or `rolled-back` |
+| `status` | `unknown`, `up-to-date`, `upgrade-needed`, `in-progress`, `succeeded`, `failed` or `rolled-back` |
+| `upgrade-campaign`, `target-release` | The intent the status answers: the campaign and target of the read or run that set it |
 | `stage` | The step the run is in, or the step it ended in |
-| `reason` | Why the run failed or rolled back |
+| `reason` | Why the run failed or rolled back, why the release could not be read, or what held the install |
 | `precheck`, `postcheck` | `verdict` (`not-run`, `pass` or `fail`), `detail`, and `at`, the time of the verdict |
+| `job[prepare]` | The last prepare: `state` (`running`, `done` or `failed`), `release`, `started`, `ended` and, when it failed, `message` |
 
 The release the device runs is `state/platform/version` (see
 `device-platform.md`). The manager reads the platform again when an install
@@ -111,9 +133,20 @@ ends, also after a rollback.
 
 Every change goes into the device's operational data, so reads and oper
 subscriptions see it right away. A new run removes `reason` and sets both
-verdicts back to `not-run`. State is not saved; after a restart it is
-`unknown`. The model also has `upgrade-needed` and a `job` list, which the
-manager does not set.
+verdicts back to `not-run`. So does a status that answers a new intent; it
+also removes `stage`. Removing `target-release` removes the intent from the
+state and keeps the status. A status from another campaign or target does
+not answer the current intent, however final it is. State is not saved;
+after a restart it is `unknown`.
+
+A prepare under a veto runs once per intent, the campaign and the target,
+and again after a device type change or a restart. Its result is only in
+`job[prepare]`: a failed prepare leaves the status `upgrade-needed`, and is
+not run again, also not when `allow-staging` goes off and on. Turning
+`allow-staging` off does not stop a prepare that runs. When the veto goes,
+the run prepares again, since the IOS XE adapter copies the image every
+time, and fills the same job entry. A new intent removes the jobs of the
+last one.
 
 ## Adapter API
 

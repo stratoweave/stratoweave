@@ -184,6 +184,28 @@
   draws it within that percentage of `upgrade-duration`, either way, 20 by
   default, so devices released together no longer all finish together. 0
   keeps every upgrade at exactly `upgrade-duration`. [#770]
+- A software veto holds only the install. The software manager still reads
+  the release the device runs and reports `up-to-date`, or the new
+  `upgrade-needed` when it differs. The vetoes are read again right before
+  the install, so a veto added during the pre-checks holds it too. Before, a
+  veto stopped even the read. [#775]
+- The software state says which intent its status answers, in
+  `state/upgrade-campaign` and `state/target-release`. A final status is
+  kept while that intent and the device type stay the same, so a reconnect
+  or an unrelated config change no longer runs a failed upgrade again.
+  Remove the target and set it again to retry. The install installs the
+  release the run read the device for, and a target changed during the
+  pre-checks is read again before anything is installed. [#775]
+- Under a veto, a read of the release that fails gives `unknown` with the
+  error, and is read again when the device connects, or after a while.
+  With `runtime-schema-fetch`, a NETCONF get or RPC on a device that has not
+  connected yet fails as not connected, instead of with a missing schema. [#775]
+- With `allow-staging`, the software manager prepares the target while a
+  veto holds the install: it copies the image to the device ahead of the
+  window, once per intent. The result is in `state/job[prepare]`, which also
+  says which `release` it is for; a failed prepare leaves the status
+  `upgrade-needed`. The prepare of a run reports in the same entry. Before,
+  `allow-staging` was stored and not used. [#775]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
