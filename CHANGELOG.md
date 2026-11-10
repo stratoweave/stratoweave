@@ -200,6 +200,12 @@
   error, and is read again when the device connects, or after a while.
   With `runtime-schema-fetch`, a NETCONF get or RPC on a device that has not
   connected yet fails as not connected, instead of with a missing schema.
+- With `allow-staging`, the software manager prepares the target while a
+  veto holds the install: it copies the image to the device ahead of the
+  window, once per intent. The result is in `state/job[prepare]`, which also
+  says which `release` it is for; a failed prepare leaves the status
+  `upgrade-needed`. The prepare of a run reports in the same entry. Before,
+  `allow-staging` was stored and not used.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade

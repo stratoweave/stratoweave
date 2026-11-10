@@ -194,6 +194,12 @@ VERDICT_NOT_RUN = "not-run"
 VERDICT_PASS = "pass"
 VERDICT_FAIL = "fail"
 
+# state/job: the one job the manager reports, and its states.
+JOB_PREPARE = "prepare"
+JOB_RUNNING = "running"
+JOB_DONE = "done"
+JOB_FAILED = "failed"
+
 # state/stage. The check rounds use their kind, "precheck" or "postcheck".
 STAGE_PREPARE = "prepare"
 STAGE_INSTALL = "install"
@@ -237,8 +243,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     to devmgr.on_software_state.
 
     Implemented so far: check, prepare, pre-checks, install, post-checks,
-    commit or rollback, then a check to read the release back, and a resync.
-    Cleanup and early staging are still stubs.
+    commit or rollback, then a check to read the release back, and a resync;
+    and a prepare under a veto. Cleanup is still a stub.
 
     Declarative like the rest of StratoWeave: the manager is told a target
     release and reconciles toward it, rather than being handed a command to
@@ -264,8 +270,10 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     * Under a hold, a read that fails says the release is unknown and is
       tried again when the device connects, or after a while. Without one
       the run goes on, as a failed read is no proof of being up to date.
-    * Staging is never a precondition; install re-runs the prepare steps.
-      `allow_staging` only decides whether that work may happen early.
+    * A prepare is never a precondition; a run prepares again. Under a veto,
+      `allow_staging` lets the manager prepare the target once per intent,
+      ahead of the install. The result goes in job[prepare], never in the
+      status: a failed prepare leaves the status upgrade-needed.
     * Every pre-check must pass for install to proceed. A failing pre-check,
       or one that does not answer within PRECHECK_TIMEOUT, ends the run failed
       with nothing activated, which is the whole point of the gate.
@@ -466,6 +474,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             state.reason = None
             state.precheck = PrecheckResult(VERDICT_NOT_RUN, None, None)
             state.postcheck = PostcheckResult(VERDICT_NOT_RUN, None, None)
+            for job in [e.name for e in state.job]:
+                del state.job[job]
             unpublished = True
         else:
             unpublished = False
@@ -518,11 +528,59 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             if s in ST_FINAL:
                 return
             if s == ST_UPGRADE_NEEDED and len(vetoes) > 0:
+                if allow_staging and not _prepared(t!):
+                    busy = True
+                    run_campaign = upgrade_campaign
+                    run_target = t
+                    _prepare_ahead()
                 return
         busy = True
         run_campaign = upgrade_campaign
         run_target = t
         adapter.check(_on_check_done)
+
+    def _prepared(release: str) -> bool:
+        """True when the prepare job runs or has a result for release."""
+        job = state.job.get(JOB_PREPARE)
+        return job is not None and job.release == release
+
+    def _job_start(release: str) -> None:
+        """Publish the prepare job as running for release."""
+        job = state.job.get(JOB_PREPARE)
+        if job is not None:
+            job.state = JOB_RUNNING
+            job.release = release
+            job.started = _now()
+            job.ended = None
+            job.message = None
+        else:
+            state.job.create(JOB_PREPARE, state=JOB_RUNNING, release=release, started=_now())
+        devmgr.on_software_state(state.copy())
+
+    def _job_end(err: ?Exception) -> None:
+        """Publish the end of the prepare job: done, or failed with the error."""
+        job = state.job.get(JOB_PREPARE)
+        if job is not None:
+            job.state = JOB_FAILED if err is not None else JOB_DONE
+            job.ended = _now()
+            job.message = error_text(err!) if err is not None else None
+            devmgr.on_software_state(state.copy())
+
+    def _prepare_ahead() -> None:
+        """Prepare the target while a veto holds the install: copy the image to
+        the device ahead of the window. The status stays upgrade-needed."""
+        t = run_target!
+        _log.info("software: preparing ahead of the install",
+                  {"device": name, "target": t})
+        _job_start(t)
+        adapter.prepare(_on_ahead_done, t)
+
+    def _on_ahead_done(err: ?Exception) -> None:
+        if err is not None:
+            _log.warning("software: prepare ahead of the install failed",
+                         {"device": name, "error": str(err)})
+        _job_end(err)
+        _done()
 
     def _retry_read(gen: int) -> None:
         if gen == read_gen:
@@ -578,7 +636,10 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             _set_answers(run_campaign, run_target)
             _clear_reason()
             _record(ST_UPGRADE_NEEDED)
-            _done()
+            if allow_staging and not _prepared(t):
+                _prepare_ahead()
+            else:
+                _done()
             return
         previous_release = running
         _set_answers(run_campaign, run_target)
@@ -588,9 +649,11 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         state.precheck = PrecheckResult(VERDICT_NOT_RUN, None, None)
         state.postcheck = PostcheckResult(VERDICT_NOT_RUN, None, None)
         _record(ST_IN_PROGRESS)
+        _job_start(t)
         adapter.prepare(_on_prepare_done, t)
 
     def _on_prepare_done(err: ?Exception) -> None:
+        _job_end(err)
         if err is not None:
             _log.error("software staging failed", {"device": name, "error": str(err)})
             _fail(error_text(err!))

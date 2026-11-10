@@ -69,6 +69,17 @@ def _pub_reason(oper: ?ygdata.Node) -> ?str:
     return None
 
 
+def _pub_prepare(oper: ?ygdata.Node) -> (?str, ?str, ?str):
+    """The state, release and message of the published prepare job, all
+    None without one."""
+    if oper is not None:
+        st = swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).software.state
+        job = st.job.get("prepare")
+        if job is not None:
+            return (job.state, job.release, job.message)
+    return (None, None, None)
+
+
 def _pub_answers(oper: ?ygdata.Node) -> (?str, ?str):
     """The campaign and the target release that the published status
     answers."""
@@ -661,6 +672,164 @@ actor _test_device_already_on_target_does_nothing(t: testing.EnvT):
     mgr.set_adapter(adapter)
     mgr.set_config("camp-1", NEW, False, {})
     after 0.05: verify()
+
+
+actor _test_allow_staging_prepares_under_a_veto(t: testing.EnvT):
+    """Under a veto, allow-staging prepares the target once: the image is
+    copied, the job says so, and the status stays upgrade-needed. Nothing
+    is installed."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        status = _pub_status(oper)
+        if status == "in-progress" or status == "succeeded":
+            t.failure(ValueError("nothing may be installed under a veto, got {status}"))
+        elif _pub_prepare(oper) == ("done", NEW, None):
+            testing.assertEqual(status, "upgrade-needed", "the status should not change")
+            testing.assertEqual(adapter.calls(), ["check", "prepare"], "read, then prepare")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, True, {"camp-1": "waiting for its window"})
+
+
+actor _test_a_prepare_runs_once_per_target(t: testing.EnvT):
+    """A target is prepared once: turning allow-staging off and on again,
+    or a reconnect, does not prepare it again. A failed prepare is a job
+    result, not a status, and is not run again either."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    # (the job the mock fails, the published job)
+    cases = [(None, ("done", NEW, None)), ("prepare", ("failed", NEW, "mock: prepare failed"))]
+    var left = len(cases)
+    var toggled: list[bool] = [False for _c in cases]
+
+    def run(k: int, case: (?str, (?str, ?str, ?str))) -> None:
+        adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, case.0)
+        dev = _devmgr(t, noop_on_reconf)
+        mgr = dev.get_swmgr()
+        veto = {"camp-1": "waiting for its window"}
+
+        def verify() -> None:
+            testing.assertEqual(mgr.get_status(), "upgrade-needed", "the status should stay")
+            testing.assertEqual(adapter.calls(), ["check", "prepare"], "one prepare only")
+            left -= 1
+            if left == 0:
+                t.success()
+
+        def on_state(oper: ?ygdata.Node) -> None:
+            if _pub_prepare(oper) == case.1 and not toggled[k]:
+                testing.assertEqual(_pub_status(oper), "upgrade-needed", "never a failed status")
+                toggled[k] = True
+                mgr.set_config("camp-1", NEW, False, veto)
+                mgr.set_config("camp-1", NEW, True, veto)
+                mgr.on_connect()
+                after 0.05: verify()
+
+        dev.set_update_oper(on_state)
+        mgr.set_adapter(adapter)
+        mgr.set_config("camp-1", NEW, True, veto)
+
+    for k in range(len(cases)):
+        run(k, cases[k])
+
+
+actor _test_removing_the_veto_after_a_prepare_runs_the_upgrade(t: testing.EnvT):
+    """A device upgrades when the veto goes. The run prepares again for
+    now, and fills the same job: here the prepare ahead failed, and the
+    run's prepare leaves the job done."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "prepare", fail_times=1)
+    dev = _devmgr(t, noop_on_reconf)
+    mgr = dev.get_swmgr()
+    var released = False
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if _pub_prepare(oper) == ("failed", NEW, "mock: prepare failed") and not released:
+            # The release can come while the prepare runs or after it.
+            released = True
+            mgr.set_config("camp-1", NEW, True, {})
+        elif _pub_status(oper) == "succeeded":
+            testing.assertEqual(adapter.calls(),
+                                ["check", "prepare", "check", "prepare", "install", "commit",
+                                 "check"],
+                                "prepare ahead, then the whole run")
+            testing.assertEqual(_pub_prepare(oper), ("done", NEW, None), "the run's prepare")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, True, {"camp-1": "waiting for its window"})
+
+
+actor _test_a_new_intent_prepares_again(t: testing.EnvT):
+    """A new intent, a new target or the same target for a new campaign,
+    answers without the prepare job of the last one, and is prepared in
+    its turn."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    # (the new campaign and target)
+    cases = [("camp-1", OTHER), ("camp-2", NEW)]
+    var left = len(cases)
+    var moved: list[bool] = [False for _c in cases]
+    var cleared: list[bool] = [False for _c in cases]
+
+    def run(k: int, case: (str, str)) -> None:
+        adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+        dev = _devmgr(t, noop_on_reconf)
+        mgr = dev.get_swmgr()
+
+        def on_state(oper: ?ygdata.Node) -> None:
+            job = _pub_prepare(oper)
+            if job == ("done", NEW, None) and not moved[k]:
+                moved[k] = True
+                mgr.set_config(case.0, case.1, True, {case.0: "waiting for its window"})
+            elif moved[k] and _pub_answers(oper) == (case.0, case.1) \
+                 and _pub_status(oper) == "upgrade-needed" and not cleared[k]:
+                testing.assertEqual(job, (None, None, None), "no job of the last intent")
+                cleared[k] = True
+            elif cleared[k] and job == ("done", case.1, None):
+                testing.assertEqual(adapter.calls(), ["check", "prepare", "check", "prepare"],
+                                    "one prepare per intent")
+                left -= 1
+                if left == 0:
+                    t.success()
+
+        dev.set_update_oper(on_state)
+        mgr.set_adapter(adapter)
+        mgr.set_config("camp-1", NEW, True, {"camp-1": "waiting for its window"})
+
+    for k in range(len(cases)):
+        run(k, cases[k])
+
+
+actor _test_the_prepare_of_a_run_is_reported_as_the_job(t: testing.EnvT):
+    """A run without a veto reports its prepare in the job too."""
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD)
+    dev = _devmgr(t, noop_on_reconf)
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if _pub_status(oper) == "succeeded":
+            testing.assertEqual(_pub_prepare(oper), ("done", NEW, None), "the run's prepare")
+            t.success()
+
+    dev.set_update_oper(on_state)
+    mgr = dev.get_swmgr()
+    mgr.set_adapter(adapter)
+    mgr.set_config("camp-1", NEW, False, {})
 
 
 actor _test_reached_target_is_not_reinstalled(t: testing.EnvT):
