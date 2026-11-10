@@ -3,13 +3,22 @@
 #
 # IOS XE workflow:
 #
-#   prepare  = xcopy the image onto bootflash                non-impacting
-#   install  = install (add), then activate with an
-#              auto-abort timer; the device reloads          impacting
+#   prepare  = make sure that the device has the image       non-impacting
+#   install  = prepare again, add the image unless the
+#              device has added it, then activate it with
+#              an auto-abort timer; the device reloads       impacting
 #   commit   = install-commit, stops the timer
 #   rollback = abort; the device reloads on the old release  impacting
 #
 # Without a commit the device reverts on its own when the timer runs out.
+#
+# Prepare and install can run again at any time and do only what is left. A
+# release that the device has added needs no image file. An image file on
+# bootflash that passes a check stays: the checksum of the software intent,
+# else the signature that the image holds, both with the verify RPC of the
+# IOS XE CLI adapter. A missing file, or one that fails, is transferred with
+# xcopy and checked again. Without the CLI adapter, prepare transfers the
+# file and install trusts what prepare staged.
 #
 # Cleanup and retry are not implemented. Cleanup leaves the previous image on
 # the device.
@@ -369,21 +378,57 @@ def versions_filter() -> ygdata.FNode:
     return paths.subscribe(select=[paths.install_location_information]).filt!
 
 
-def added_version(root: ?ygdata.Node, release: str) -> ?str:
-    """The device's version string for an added image of `release`.
+# The states of a version in install-version-state-info, from
+# Cisco-IOS-XE-install-oper on a C1111 with 17.15.04c.
+VS_INSTALLED = "install-version-state-installed"
+VS_IN_PROGRESS = "install-version-state-in-progress"
+VS_UNCOMMITTED = "install-version-state-provisioned-uncommitted"
+VS_COMMITTED = "install-version-state-provisioned-committed"
+## The states of a version whose packages the device has: added, marked for
+## activation, activated, or committed. An invalid version lacks part of its
+## image.
+USABLE_VERSION_STATES = [VS_INSTALLED, VS_IN_PROGRESS, VS_UNCOMMITTED, VS_COMMITTED]
 
-    The device names an added image like 17.18.03a.0.5540, which `activate`
-    needs; the running image is there too, so match on the release the version
-    starts with rather than on the state, which changes through the add.
+
+def _release_of_version(version: str) -> str:
+    """The release of a device version: 17.15.04c of 17.15.04c.0.107."""
+    return ".".join(version.split(".")[:3])
+
+
+def version_of(root: ?ygdata.Node, release: str) -> ?(version: str, state: str):
+    """The device's version and its state for `release`, from
+    install-version-state-info.
+
+    The device names a version like 17.18.03a.0.5540, which `activate`
+    needs, so match on the release that the version starts with.
     """
     iod = ixoper.root.from_gdata(root).install_oper_data
     for loc in iod.install_location_information:
         for v in loc.install_version_state_info:
             ver = v.version
-            if ver is not None:
-                parts = ver.split(".")
-                if len(parts) >= 3 and releases_equal(".".join(parts[:3]), release):
-                    return ver
+            if ver is not None and releases_equal(_release_of_version(ver), release):
+                state = v.version_state
+                return (version=ver, state=state if state is not None else "")
+    return None
+
+
+def added_version(root: ?ygdata.Node, release: str) -> ?str:
+    """The device's version for `release` when the device has its packages."""
+    v = version_of(root, release)
+    if v is not None and v.state in USABLE_VERSION_STATES:
+        return v.version
+    return None
+
+
+def committed_release(root: ?ygdata.Node) -> ?str:
+    """The release that the device keeps: the committed version."""
+    iod = ixoper.root.from_gdata(root).install_oper_data
+    for loc in iod.install_location_information:
+        for v in loc.install_version_state_info:
+            ver = v.version
+            state = v.version_state
+            if ver is not None and state is not None and state == VS_COMMITTED:
+                return _release_of_version(ver)
     return None
 
 
@@ -587,12 +632,32 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     ####################################################################
 
     def check(done: action(?str, ?Exception) -> None) -> None:
+        """Report the release that the device keeps. That is the running
+        release, unless the device has activated it and not committed it:
+        then the committed release, so that a new run commits the running
+        one rather than calling the device up to date."""
         def on_reply(root: ?ygdata.Node, err: ?Exception) -> None:
             if err is not None:
                 done(None, err)
                 return
-            done(running_release(root), None)
+            running = running_release(root)
+            if running is not None:
+                _check_committed(done, running)
+            else:
+                done(None, None)
         dev.get(on_reply, version_filter())
+
+    def _check_committed(done: action(?str, ?Exception) -> None, running: str) -> None:
+        def on_versions(root: ?ygdata.Node, err: ?Exception) -> None:
+            v = version_of(root, running) if err is None else None
+            if v is not None and v.state == VS_UNCOMMITTED:
+                kept = committed_release(root)
+                _log.info("software: the running release is not committed",
+                          {"running": running, "committed": kept})
+                done(kept, None)
+            else:
+                done(running, None)
+        dev.get(on_versions, versions_filter())
 
     ####################################################################
     # prepare: stage the image, touching no install state
@@ -611,12 +676,34 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _stage()
 
     def _stage() -> None:
-        """Make sure the image is on bootflash. With a checksum that the
-        device can check, an image already there that matches stays; one
-        that is missing or differs is transferred and checked again."""
+        """Make sure that the device has the image. A release that the
+        device has added needs no image file: activate uses the packages
+        that the add made."""
+        gen = _gen
+        def on_versions(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            ver = added_version(root, _release) if err is None else None
+            if ver is not None:
+                _log.info("software: release added already, no image needed", {"version": ver})
+                _staged()
+            else:
+                _stage_file()
+        dev.get(on_versions, versions_filter())
+
+    def _stage_file() -> None:
+        """Make sure that the image file is on bootflash. When the device can
+        check the file, against a checksum or else against the signature in
+        the image, a file there that passes stays; one that is missing or
+        fails is transferred and checked again."""
         _check = _staging_check()
-        if _check is None:
-            _transfer()
+        if _check is None and upgrade_plan(_modules()).verify != "cli":
+            if _then_add:
+                # Install cannot check the file either: trust what prepare
+                # staged.
+                _staged()
+            else:
+                _transfer()
             return
         gen = _gen
         def listed(root: ?ygdata.Node, err: ?Exception) -> None:
@@ -634,8 +721,29 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         c = _check
         if c is not None:
             _verify_against(gen, before_transfer, c)
+        elif upgrade_plan(_modules()).verify == "cli":
+            _verify_image(gen, before_transfer)
         else:
             _staged()
+
+    def _verify_image(gen: int, before_transfer: bool) -> None:
+        """Check the hashes and the signature that the image holds."""
+        def verified(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail("verify: " + swdev.error_text(err!))
+                return
+            ok = out.verified if out is not None else None
+            if ok is not None and ok:
+                _log.info("software: image signature verified", {"file": _filename})
+                _staged()
+            elif before_transfer:
+                _log.info("software: staged image fails its signature check, transferring it again", {"file": _filename})
+                _transfer()
+            else:
+                _fail("{_filename} fails its signature check")
+        _cli.verify(verified, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", _filename))
 
     def _verify_against(gen: int, before_transfer: bool, c: (algorithm: str, digest: str)) -> None:
         def verified(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception) -> None:
@@ -658,7 +766,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
 
     def _staged() -> None:
         if _then_add:
-            _add()
+            _add_unless_added()
         else:
             _finish(None)
 
@@ -687,8 +795,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     ####################################################################
 
     def install(done: action(?Exception) -> None, release: str) -> None:
-        """Stage the image again when the device can check it, then add it.
-        Without a check, trust what prepare staged."""
+        """Stage again, as prepare does, but without a transfer when the
+        device cannot check the file: then trust what prepare staged. Then
+        add the image unless the device has added it, and activate it."""
         if not _start("stage", done, release):
             return
         url = _image_url()
@@ -699,10 +808,33 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _filename = image_filename(url!)
         _activated_at = None
         _then_add = True
-        if _staging_check() is None:
-            _add()
-        else:
-            _stage()
+        _stage()
+
+    def _add_unless_added() -> None:
+        """Activate the image when the device has added it already, as after
+        an install that stopped after the add. IOS XE refuses to add an image
+        again: the add pre-check fails with install-add-prechk-fail. When the
+        device runs the release, activated and not committed, install is
+        done."""
+        gen = _gen
+        def on_versions(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!))
+                return
+            v = version_of(root, _release)
+            if v is not None and v.state == VS_UNCOMMITTED:
+                # Activated before, as by a run that stopped before the
+                # commit: the device runs it, and the commit follows.
+                _log.info("software: release activated already", {"version": v.version})
+                _finish(None)
+            elif v is not None and v.state in USABLE_VERSION_STATES:
+                _log.info("software: image added already", {"file": _filename, "version": v.version})
+                _activate(v.version)
+            else:
+                _add()
+        dev.get(on_versions, versions_filter())
 
     def _add() -> None:
         _enter("add")

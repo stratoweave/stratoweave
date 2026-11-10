@@ -23,6 +23,7 @@ import yang.gdata as ygdata
 
 import device as swdev
 import adapters.iosxe_cli as xecli
+import adapters.test_iosxe_cli as clitest
 import adapters.iosxe_cli_yang as xecli_yang
 import adapters.netconf as swna
 import adapters.software_iosxe as swxe
@@ -1060,6 +1061,15 @@ VERIFY_EQUAL = "\r\n\r\n.....Done!\r\nVerified (bootflash:" + IMAGE_FILE + ") = 
 VERIFY_DIFFERS = "\r\n\r\n.....Done!\r\n%Error verifying bootflash:" + IMAGE_FILE + \
     "\r\nComputed signature  = " + OTHER_HASH + "\r\nSubmitted signature = " + HASH + "\r\n\r\n"
 
+## verify without an algorithm: the hashes and the signature that the image
+## holds, as the C1111 printed them for another image.
+VERIFY_IMAGE_COMMAND = "verify bootflash:" + IMAGE_FILE
+IMAGE_SIGNED = clitest.VERIFY_IMAGE.replace(clitest.SIGNED_IMAGE, IMAGE_FILE)
+## Constructed: the computed SHA1 differs from the embedded one, and the
+## device verifies no signature.
+IMAGE_UNSIGNED = IMAGE_SIGNED.replace("Computed Hash   SHA1 : A6C3", "Computed Hash   SHA1 : 0000") \
+    .replace("Digital signature successfully verified in file bootflash:" + IMAGE_FILE, "")
+
 
 def new_iosxe_cli_mock_device_mgr(t: testing.EnvT, name: str,
                                   on_reconf: action(str) -> None) -> swdev.DeviceMgr:
@@ -1082,12 +1092,17 @@ def new_iosxe_cli_mock_device_mgr(t: testing.EnvT, name: str,
 
 actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: str,
                   settled: action(swxemock.IosXeSoftwareMock, xecli.CliMock, swdev.DeviceMgr, str) -> None,
-                  timeout: float=2.5):
+                  timeout: float=2.5, preadded: ?str=None, checksum: bool=True, image_output: str="",
+                  running: str=OLD_RELEASE, committed: ?str=None):
     """Drive one mock device with a sha512 image checksum from software intent
     to a settled status. The CliMock answers dir bootflash: with dir_output,
     and with a listing that has the image once the device took an xcopy, and
     the verify of the image with verify_output. When dir_output lists the
-    image, the image is on bootflash from the start."""
+    image, the image is on bootflash from the start. preadded is a release
+    that the device has added from the start. Without checksum, the intent
+    has no checksum, and the CliMock answers the check of the image's
+    signature with image_output. The device runs running, and keeps
+    committed when it differs."""
     var dev_ref: ?swdev.DeviceMgr = None
     var mock: ?swxemock.IosXeSoftwareMock = None
     var cli: ?xecli.CliMock = None
@@ -1137,15 +1152,17 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
     def _run(d: swdev.DeviceMgr, ms: swna.NetconfMockServer, c: xecli.CliMock) -> None:
         prestaged = IMAGE_FILE if dir_output == DIR_STAGED else None
         m = swxemock.IosXeSoftwareMock(ms, t.log_handler, upgrade_duration=0.0,
-                                       failure=swxemock.FAILURE_NONE, running=OLD_RELEASE,
-                                       prestaged=prestaged)
+                                       failure=swxemock.FAILURE_NONE, running=running,
+                                       prestaged=prestaged, preadded=preadded, committed_release=committed)
         mock = m
         cli = c
         m.attach()
         c.set_reply("dir bootflash:", dir_output)
         c.set_reply(VERIFY_COMMAND, verify_output)
+        c.set_reply(VERIFY_IMAGE_COMMAND, image_output)
         software = Software("camp-1", NEW_REQUESTED, IMAGE_URL)
-        software.image_checksum.create("sha512", HASH)
+        if checksum:
+            software.image_checksum.create("sha512", HASH)
         dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe", software=software)
         dmc.mock.enabled = True
         dmc.extra_adapter.create("iosxe-cli")
@@ -1181,6 +1198,80 @@ actor _test_iosxe_staged_image_is_not_copied_again(t: testing.EnvT):
         except Exception as e:
             t.failure(e)
     _StagingRun(t, "d-staged", DIR_STAGED, VERIFY_EQUAL, settled)
+
+
+actor _test_iosxe_added_image_is_activated(t: testing.EnvT):
+    """An image that the device has added already, as after an install that
+    stopped after the add, is activated without a new add, which the device
+    would refuse."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["activate", "install-commit"], m.get_rpcs())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-added", DIR_STAGED, VERIFY_EQUAL, settled,
+                preadded=swxe.release_from_filename(IMAGE_FILE))
+
+
+actor _test_iosxe_added_release_needs_no_image(t: testing.EnvT):
+    """A release that the device has added needs no image file, so prepare
+    neither copies nor checks one."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["activate", "install-commit"], m.get_rpcs())
+            testing.assertEqual([], c.get_commands(), "no listing and no check")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-added-no-file", DIR_EMPTY, VERIFY_EQUAL, settled,
+                preadded=swxe.release_from_filename(IMAGE_FILE))
+
+
+actor _test_iosxe_uncommitted_release_is_committed(t: testing.EnvT):
+    """A device that runs the target activated and not committed, as after a
+    run that stopped before the commit, is not up to date: the run commits
+    the release without an add or an activate."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["install-commit"], m.get_rpcs())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-uncommitted", DIR_STAGED, VERIFY_EQUAL, settled,
+                preadded=NEW_REQUESTED, running=NEW_REQUESTED, committed=OLD_RELEASE)
+
+
+actor _test_iosxe_signed_image_stays_without_a_checksum(t: testing.EnvT):
+    """Without a checksum, an image on bootflash whose signature the device
+    verifies stays."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["install", "activate", "install-commit"], m.get_rpcs())
+            testing.assertTrue(VERIFY_IMAGE_COMMAND in c.get_commands(), "the signature is checked")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-signed", DIR_STAGED, VERIFY_EQUAL, settled, checksum=False, image_output=IMAGE_SIGNED)
+
+
+actor _test_iosxe_unsigned_image_fails_prepare(t: testing.EnvT):
+    """Without a checksum, an image that fails its signature check is copied
+    again; when the copy fails too, prepare fails and nothing is installed."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("failed", status)
+            testing.assertEqual(["xcopy"], m.get_rpcs(), "nothing is installed")
+            testing.assertEqual("download failed: " + IMAGE_FILE + " fails its signature check",
+                                d.get_swmgr().get_reason())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-unsigned", DIR_STAGED, VERIFY_EQUAL, settled, checksum=False, image_output=IMAGE_UNSIGNED)
 
 
 actor _test_iosxe_missing_image_is_copied_and_verified(t: testing.EnvT):
