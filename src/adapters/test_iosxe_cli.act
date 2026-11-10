@@ -273,6 +273,27 @@ VERIFY_NOT_IMAGE = _crlf("\n\n\nFile bootflash:vlan.dat does not support verific
 ## verify bootflash:no-such-file.bin
 VERIFY_IMAGE_MISSING = _crlf("\n\n\n%ERROR: Unable to process embedded hash in bootflash:no-such-file.bin.")
 
+## copy http://192.168.1.234:8081/sw-copy-test.bin bootflash:sw-copy-test.bin
+## on a C1111 running 17.15.06: the question, then what follows the answer.
+COPY_QUESTION = "Destination filename [sw-copy-test.bin]? "
+COPY_SOURCE = "http://192.168.1.234:8081/sw-copy-test.bin"
+COPY_DONE = _crlf("""Accessing http://192.168.1.234:8081/sw-copy-test.bin...
+Loading http://192.168.1.234:8081/sw-copy-test.bin !!
+300000 bytes copied in 0.128 secs (2343750 bytes/sec)""")
+## The same copy when the file is there.
+COPY_OVERWRITE = _crlf("""%Warning:There is a file already existing with this name
+Do you want to over write? [confirm]
+Accessing http://192.168.1.234:8081/sw-copy-test.bin...
+Loading http://192.168.1.234:8081/sw-copy-test.bin !!
+300000 bytes copied in 0.164 secs (1829268 bytes/sec)""")
+## A source that the server does not have.
+COPY_MISSING = _crlf("""Accessing http://192.168.1.234:8081/no-such-file.bin...
+%Error opening http://192.168.1.234:8081/no-such-file.bin (No such file or directory)""")
+## delete bootflash:sw-copy-test.bin, the file gone.
+DELETE_MISSING = _crlf("""Delete bootflash:/sw-copy-test.bin? [confirm]
+%Error deleting bootflash:/sw-copy-test.bin (No such file or directory)""")
+
+
 ## show version
 SHOW_VERSION = _crlf(r"""
 
@@ -813,6 +834,94 @@ actor _test_adapter_remove(t: testing.EnvT):
             r = xecli_data.rpc_root(swdev.DeviceTreeProvider(d))
             r.install(removed, xecli_data.stratoweave_iosxe_cli__install__input(
                 remove=xecli_data.stratoweave_iosxe_cli__install__input__remove(inactive=True)))
+            return
+        after 0.01: connected()
+
+    dev = _mock_device(t, m)
+    connected()
+
+
+def _test_copy_and_delete_commands():
+    cases = [
+        ("copy", lambda: xecli.copy_command(COPY_SOURCE, "bootflash:", "sw-copy-test.bin"),
+         "copy " + COPY_SOURCE + " bootflash:sw-copy-test.bin"),
+        ("copy with credentials", lambda: xecli.copy_command("http://u:p@10.0.0.1/a.bin", "bootflash:", "a.bin"),
+         "copy http://u:p@10.0.0.1/a.bin bootflash:a.bin"),
+        ("source with a space", lambda: xecli.copy_command("http://h/a.bin bootflash:b", "bootflash:", "a.bin"),
+         "error: invalid file or URL"),
+        ("file with a slash", lambda: xecli.copy_command(COPY_SOURCE, "bootflash:", "a/b.bin"), "error: invalid file name"),
+        ("bad file system", lambda: xecli.copy_command(COPY_SOURCE, "boot flash:", "a.bin"), "error: invalid file system name"),
+        ("delete", lambda: xecli.delete_command("bootflash:", "a.bin"), "delete bootflash:a.bin"),
+        ("delete a path", lambda: xecli.delete_command("bootflash:", "../a.bin"), "error: invalid file name"),
+    ]
+    for name, f, want in cases:
+        got = ""
+        try:
+            got = f()
+        except ValueError as e:
+            got = "error: " + e.error_message
+        testing.assertTrue(got.startswith(want), name + ": " + got)
+
+
+def _copy_result(output: str) -> str:
+    try:
+        return str(xecli.parse_copy(output))
+    except xecli.CommandError as e:
+        return "error: " + e.error_message
+
+
+def _test_parse_copy():
+    cases = [
+        ("copied", COPY_DONE, "300000"),
+        ("overwritten", COPY_OVERWRITE, "300000"),
+        ("missing source", COPY_MISSING, "error: %Error opening http://192.168.1.234:8081/no-such-file.bin"),
+        ("no count", _crlf("Accessing http://h/a.bin...\nLoading http://h/a.bin !!"), "error: copy output has no count"),
+    ]
+    for name, output, want in cases:
+        got = _copy_result(output)
+        testing.assertTrue(got.startswith(want), name + ": " + got)
+
+
+def _test_copy_and_delete_answers():
+    copy = xecli.CopyCall(xecli_data.stratoweave_iosxe_cli__copy__input(COPY_SOURCE, "bootflash:", "sw-copy-test.bin"))
+    testing.assertEqual(copy.answers(), [(question="Destination filename [sw-copy-test.bin]?", answer=""),
+                                         (question="[confirm]", answer="")])
+    testing.assertEqual(copy.timeout(60.0), xecli.INSTALL_TIMEOUT)
+    delete = xecli.DeleteCall(xecli_data.stratoweave_iosxe_cli__delete__input("bootflash:", "sw-copy-test.bin"))
+    testing.assertEqual(delete.answers(), [(question="Delete filename [sw-copy-test.bin]?", answer=""),
+                                           (question="[confirm]", answer="")])
+    try:
+        delete.reply(DELETE_MISSING)
+        testing.error("a delete of a missing file passed")
+    except xecli.CommandError as e:
+        testing.assertTrue(e.error_message.startswith("%Error deleting"), e.error_message)
+
+
+actor _test_adapter_copy(t: testing.EnvT):
+    """The copy RPC answers the question for the destination file name and
+    reports the size that the device copied."""
+    t.timeout(10.0)
+    m = xecli.CliMock()
+    command = "copy " + COPY_SOURCE + " bootflash:sw-copy-test.bin"
+    m.set_question(command, COPY_QUESTION, "", COPY_DONE)
+    var dev: ?swdev.DeviceMgr = None
+
+    def copied(out: ?xecli_data.stratoweave_iosxe_cli__copy__output, err: ?Exception):
+        try:
+            if err is not None:
+                raise err
+            testing.assertEqual(out.size if out is not None else None, u64(300000))
+            testing.assertEqual(m.get_commands(), [command])
+        except Exception as e:
+            t.failure(e)
+            return
+        t.success()
+
+    def connected():
+        d = dev
+        if d is not None and xecli_yang.MODULE in d.get_modules().0:
+            r = xecli_data.rpc_root(swdev.DeviceTreeProvider(d))
+            r.copy(copied, xecli_data.stratoweave_iosxe_cli__copy__input(COPY_SOURCE, "bootflash:", "sw-copy-test.bin"))
             return
         after 0.01: connected()
 
