@@ -525,3 +525,332 @@ actor _test_schedule_windows(t: testing.EnvT):
     def run(size: int, client: http.Client, done: action(?Exception) -> None) -> None:
         ScheduledRollout(size, client, done)
     test_scale.FleetMgrTest(t, run)
+
+
+class PreparedView(object):
+    """What PreparedRollout reads from the campaign's state: the counters,
+    the plan's alarms, each member's status and prepare, and each
+    prepare-start of the plan."""
+    preparing: int
+    prepared: int
+    succeeded: int
+    failed: int
+    alarms: list[str]
+    statuses: dict[str, str]
+    prepares: dict[str, str]
+    starts: dict[str, int]
+
+    def __init__(self):
+        self.preparing = 0
+        self.prepared = 0
+        self.succeeded = 0
+        self.failed = 0
+        self.alarms = []
+        self.statuses = {}
+        self.prepares = {}
+        self.starts = {}
+
+
+def parse_prepared(body: str) -> ?PreparedView:
+    """The state of the one campaign in body, or None."""
+    data = json.decode(body)
+    if isinstance(data, dict):
+        campaigns = data.get("software:upgrade-campaign")
+        if isinstance(campaigns, list) and len(campaigns) == 1:
+            campaign = campaigns[0]
+            if isinstance(campaign, dict):
+                state = campaign.get("state")
+                if isinstance(state, dict):
+                    view = PreparedView()
+                    v = state.get("preparing")
+                    if isinstance(v, int):
+                        view.preparing = v
+                    v = state.get("prepared")
+                    if isinstance(v, int):
+                        view.prepared = v
+                    v = state.get("succeeded")
+                    if isinstance(v, int):
+                        view.succeeded = v
+                    v = state.get("failed")
+                    if isinstance(v, int):
+                        view.failed = v
+                    rows = state.get("device-status")
+                    if isinstance(rows, list):
+                        for row in rows:
+                            if isinstance(row, dict):
+                                name = row.get("device")
+                                st = row.get("status")
+                                if isinstance(name, str) and isinstance(st, str):
+                                    view.statuses[name] = st
+                                    prep = row.get("prepare")
+                                    if isinstance(prep, dict):
+                                        ps = prep.get("state")
+                                        pr = prep.get("release")
+                                        if isinstance(ps, str) and isinstance(pr, str):
+                                            view.prepares[name] = ps + " " + pr
+                    plan = state.get("plan")
+                    if isinstance(plan, dict):
+                        windows = plan.get("window")
+                        if isinstance(windows, list):
+                            for w in windows:
+                                if isinstance(w, dict):
+                                    devices = w.get("device")
+                                    if isinstance(devices, list):
+                                        for d in devices:
+                                            if isinstance(d, dict):
+                                                # A uint64 leaf: RESTCONF JSON may
+                                                # give it as a string.
+                                                name = d.get("name")
+                                                s = d.get("prepare-start")
+                                                if isinstance(name, str):
+                                                    if isinstance(s, int):
+                                                        view.starts[name] = s
+                                                    elif isinstance(s, str):
+                                                        view.starts[name] = int(s)
+                        al = plan.get("alarm")
+                        if isinstance(al, list):
+                            for a in al:
+                                if isinstance(a, str):
+                                    view.alarms.append(a)
+                    return view
+    return None
+
+
+actor PreparedRollout(size: int, client: http.Client, done: action(?Exception) -> None):
+    """Six members on a schedule whose window opens two minutes after the
+    schedules are added, for an hour, and one member on a schedule whose
+    window is open now. The mocks take 20 s, so the copy takes about 6.6 s,
+    the prepare estimate is 6 s and the lead 9 s. The campaign has
+    allow-staging.
+
+    In plan, the plan gives each member of the later window a
+    prepare-start, and nothing is copied. In run, before the later window
+    opens, no member of it upgrades, at most one prepares at once, each
+    shows its prepare done before it upgrades, and the prepare-starts
+    spread over at least 40 s. The member in the open window has no
+    prepare-start, upgrades at once, and never counts as preparing. Every
+    member succeeds."""
+    path = "/restconf/data/software:software/upgrade-campaign=prepared"
+    n = 7
+    later = 6
+    opens_in = 120
+    open_member = test_scale.device_name(later)
+    var opening = 0
+    var polls = 0
+    var plan_tries = 0
+    var most_preparing = 0
+    var prepared_first: set[str] = set()
+    var starts: dict[str, int] = {}
+    var open_started = False
+
+    def is_later(name: str) -> bool:
+        # device-0 through device-5 wait for the later window.
+        for i in range(later):
+            if name == test_scale.device_name(i):
+                return True
+        return False
+
+    def watched(client: http.Client, response: http.Response) -> None:
+        if response.status != 200:
+            done(test_scale.status_error(response, 200))
+            return
+        view = parse_prepared(response.body.decode())
+        if view is None:
+            done(ValueError("invalid campaign status: " + response.body.decode()))
+            return
+        v = view!
+        if v.failed > 0:
+            done(ValueError("{v.failed} device(s) failed"))
+            return
+        now = time.time().unix_s()
+        if v.preparing > most_preparing:
+            most_preparing = v.preparing
+        if most_preparing > 1:
+            done(ValueError("{most_preparing} members prepared at once"))
+            return
+        if open_member in v.starts:
+            done(ValueError("{open_member}, in the open window, has a prepare-start"))
+            return
+        for name, s in v.starts.items():
+            starts[name] = s
+        for name, st in v.statuses.items():
+            prep = v.prepares.get_def(name, "")
+            if name == open_member:
+                if st == "in-progress" or st == "succeeded":
+                    if not open_started and now >= opening:
+                        done(ValueError("{open_member} started only after the later window opened"))
+                        return
+                    open_started = True
+                elif st == "upgrade-needed" and prep.startswith("running "):
+                    done(ValueError("{open_member} prepares ahead of its open window"))
+                    return
+            elif st == "upgrade-needed":
+                if prep == "done 17.18.03a":
+                    prepared_first.add(name)
+            elif st == "in-progress" or st == "succeeded":
+                if now < opening - 2:
+                    done(ValueError("{name} started {opening - now} s before its window"))
+                    return
+                if name not in prepared_first:
+                    done(ValueError("{name} started before it showed its prepare done"))
+                    return
+        if v.succeeded == n:
+            first = -1
+            last = -1
+            count = 0
+            for name, s in starts.items():
+                if is_later(name):
+                    count += 1
+                    if first < 0 or s < first:
+                        first = s
+                    if s > last:
+                        last = s
+            if count != later:
+                done(ValueError("prepare-start of {count} of {later} members"))
+            elif last - first < 40:
+                done(ValueError("the prepare-starts spread over {last - first} s"))
+            elif not open_started:
+                done(ValueError("{open_member} was never seen upgrading"))
+            else:
+                print("prepares: spread over {last - first} s, at most {most_preparing} at once, "
+                      + "{n} of {n} succeeded")
+                done(None)
+            return
+        polls += 1
+        if polls > 400:
+            done(ValueError("rollout did not complete: {v.succeeded} of {n}"))
+            return
+        after 0.5: watch()
+
+    def watch() -> None:
+        client.get(path, watched, {"Accept": "application/yang-data+json"})
+
+    def running(client: http.Client, response: http.Response) -> None:
+        if response.status not in {200, 201, 204}:
+            done(test_scale.status_error(response, 204))
+            return
+        watch()
+
+    def campaign_payload(admin: str) -> bytes:
+        return json.encode({"software:upgrade-campaign": [{
+            "name": "prepared",
+            "target-concurrency": 8,
+            "max-concurrency": 16,
+            "default-schedule": "soon",
+            "allow-staging": True,
+            "device": [{"name": test_scale.device_name(i), "image": test_scale.IMAGE} for i in range(n)],
+            "admin-state": admin,
+        }]}).encode()
+
+    def run_campaign() -> None:
+        client.put(path, campaign_payload("run"), running,
+                   {"Content-Type": "application/yang-data+json", "async": "true"})
+
+    def later_with_start(v: PreparedView) -> int:
+        count = 0
+        for name in v.starts.keys():
+            if is_later(name):
+                count += 1
+        return count
+
+    def planned(client: http.Client, response: http.Response) -> None:
+        # The plan holds each member, with an alarm, until it has answered.
+        if response.status != 200:
+            done(test_scale.status_error(response, 200))
+            return
+        view = parse_prepared(response.body.decode())
+        if view is not None:
+            v = view!
+            for st in v.statuses.values():
+                if st == "in-progress" or st == "succeeded":
+                    done(ValueError("a member started while still in plan"))
+                    return
+            if v.preparing != 0 or v.prepared != 0:
+                done(ValueError("in plan, preparing {v.preparing} and prepared {v.prepared}"))
+                return
+            if open_member in v.starts:
+                done(ValueError("{open_member}, in the open window, has a prepare-start"))
+                return
+            if len(v.alarms) == 0 and later_with_start(v) == later:
+                print("prepares: plan ok, {later} prepare-starts, nothing copied")
+                run_campaign()
+                return
+        plan_tries += 1
+        if plan_tries > 80:
+            done(ValueError("the plan has alarms, or no prepare-start for every later "
+                            + "member: " + response.body.decode()))
+            return
+        after 0.25: check_plan()
+
+    def check_plan() -> None:
+        client.get(path, planned, {"Accept": "application/yang-data+json"})
+
+    def created(client: http.Client, response: http.Response) -> None:
+        if response.status == 201:
+            check_plan()
+        else:
+            done(test_scale.status_error(response, 201))
+
+    def put_campaign() -> None:
+        client.put(path, campaign_payload("plan"), created,
+                   {"Content-Type": "application/yang-data+json"})
+
+    def devices_added(client: http.Client, response: http.Response) -> None:
+        if response.status != 201:
+            done(test_scale.status_error(response, 201))
+            return
+        test_scale.AddImages(client, put_campaign, done)
+
+    def schedules_added(client: http.Client, response: http.Response) -> None:
+        if response.status not in {200, 201, 204}:
+            done(test_scale.status_error(response, 201))
+            return
+        devices = []
+        for i in range(n):
+            name = test_scale.device_name(i)
+            entry = {
+                "name": name,
+                "type": "iosxe",
+                "description": "Prepared {name}",
+                "credentials": {"username": "admin", "password": "admin"},
+                "mock": {"enabled": True, "software": {"upgrade-duration": 20,
+                                                       "upgrade-duration-variance": 0}},
+            }
+            if i == later:
+                entry["schedule"] = "open"
+            devices.append(entry)
+        payload = json.encode({"fleetmgr:fleet": {"device": devices}}).encode()
+        client.post("/restconf/data", payload, devices_added,
+                    {"Content-Type": "application/yang-data+json"})
+
+    def add_schedules() -> None:
+        # Asked for asynchronously, as in ScheduledRollout. The UTC offset
+        # puts local time near noon, so no rule wraps midnight: the open
+        # window is open now, and the later one opens in opens_in seconds.
+        now = time.time().unix_s()
+        opening = now + opens_in
+        off_min = (43200 - now % 86400) // 60
+        if off_min < -720:
+            off_min = -720
+        if off_min > 840:
+            off_min = 840
+        local_now = (now + off_min * 60) % 86400
+        payload = json.encode({"maintenance:schedules": {"schedule": [
+            {"name": "open", "utc-offset": off_min,
+             "window": [{"at": local_now - 600, "duration": 7200}]},
+            {"name": "soon", "utc-offset": off_min,
+             "window": [{"at": local_now + opens_in, "duration": 3600}]},
+        ]}}).encode()
+        client.put("/restconf/data/maintenance:schedules", payload, schedules_added,
+                   {"Content-Type": "application/yang-data+json", "async": "true"})
+
+    add_schedules()
+
+
+actor _test_prepares_before_the_window(t: testing.EnvT):
+    """With allow-staging, members prepare one at a time before their
+    window, and upgrade only in it."""
+    t.require("fleetmgr-system")
+    def run(size: int, client: http.Client, done: action(?Exception) -> None) -> None:
+        PreparedRollout(size, client, done)
+    test_scale.FleetMgrTest(t, run)
