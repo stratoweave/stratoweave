@@ -545,6 +545,16 @@ def other_added_version(root: ?ygdata.Node, release: str) -> ?str:
     return None
 
 
+def pending_other_version(root: ?ygdata.Node, release: str) -> ?str:
+    """The version of another release than `release` that the device runs
+    activated and not committed, as after a run that stopped before its
+    commit."""
+    for v in device_versions(root):
+        if v.state == VS_UNCOMMITTED and not releases_equal(_release_of_version(v.version), release):
+            return v.version
+    return None
+
+
 def committed_release(root: ?ygdata.Node) -> ?str:
     """The release that the device keeps: the committed version."""
     for v in device_versions(root):
@@ -779,6 +789,10 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     var _committed = False
     # What a remove goes on with: "stage" lists bootflash again and
     # transfers, "restage" stages again, "cleanup" ends the job.
+    # An abort of another release pending commit, which the install goes
+    # on from, and the release that it leaves.
+    var _abort_then_install = False
+    var _leaving = ""
     var _after_remove = ""
 
     def _finish(err: ?Exception) -> None:
@@ -1194,6 +1208,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _activated_at = None
         _then_add = True
         _committed = False
+        _abort_then_install = False
+        _leaving = ""
         _stage_when_connected(_gen, adapter_wait)
 
     def _install_mode() -> None:
@@ -1293,17 +1309,43 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _fail(swdev.error_text(err!))
                 return
             v = version_of(root, _release)
+            pending = pending_other_version(root, _release)
             if v is not None and v.state == VS_UNCOMMITTED:
                 # Activated before, as by a run that stopped before the
                 # commit: the device runs it, and the commit follows.
                 _log.info("software: release activated already", {"version": v.version})
                 _finish(None)
+            elif pending is not None:
+                _abort_pending(pending)
             elif v is not None and v.state in USABLE_VERSION_STATES:
                 _log.info("software: image added already", {"file": _filename, "version": v.version})
                 _activate(v.version)
             else:
                 _add()
         dev.get(on_versions, _versions_filter())
+
+    def _abort_pending(version: str) -> None:
+        """Abort another release that the device runs activated and not
+        committed: the device adds nothing while one is. The device reloads
+        to the committed release, then the install stages again, which
+        removes the aborted release if it stays added."""
+        _enter("abort")
+        _abort_then_install = True
+        _leaving = _release_of_version(version)
+        _log.info("software: aborting another release pending commit, device will reload",
+                  {"version": version})
+        if upgrade_plan(_modules()).install == "cli":
+            gen = _gen
+            def aborted(err: ?Exception) -> None:
+                if gen != _gen:
+                    return
+                if err is not None:
+                    _fail(swdev.error_text(err!))
+                    return
+                after now reload_poll_period: _poll(gen)
+            _cli_install(aborted, xecli_data.stratoweave_iosxe_cli__install__input(abort=True))
+            return
+        _rpcs.abort(_on_rpc(_gen, reload_poll_period), abort_input(_uuid))
 
     def _add() -> None:
         _enter("add")
@@ -1422,6 +1464,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def rollback(done: action(?Exception) -> None, previous: ?str) -> None:
         if not _start("abort", done, _release):
             return
+        _abort_then_install = False
+        _leaving = ""
         _want = previous
         if _committed:
             _fail("the conversion to install mode committed {_release}: nothing to abort")
@@ -1548,6 +1592,11 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         elif _phase == "remove" and _after_remove == "restage":
             _enter("stage")
             _stage(True)
+        elif _phase == "abort" and _abort_then_install:
+            _abort_then_install = False
+            _leaving = ""
+            _enter("stage")
+            _stage()
         else:
             _finish(None)
 
@@ -1555,7 +1604,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         w = _want
         if w is not None:
             return releases_equal(got, w)
-        return not releases_equal(got, _release)
+        return not releases_equal(got, _leaving if _leaving != "" else _release)
 
     def _poll_version(gen: int) -> None:
         after now reload_poll_period: _poll(gen)
