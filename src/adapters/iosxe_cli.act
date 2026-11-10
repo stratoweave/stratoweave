@@ -89,6 +89,10 @@ INSTALL_TIMEOUT = 3600.0
 ## Seconds to wait for the prompt after each configuration command.
 CONFIG_LINE_TIMEOUT = 30.0
 
+## The question that install remove asks before it deletes files, on a C1111
+## with 17.15.04c. It has no prompt-level none.
+REMOVE_QUESTION = "Do you want to remove the above files? [y/n]"
+
 ## Seconds without a command after which the shell gets an empty line, so a
 ## dead connection shows and the device does not end the session. IOS XE
 ## ends a session after 10 idle minutes by default.
@@ -720,6 +724,10 @@ class Call(object):
         """Return the seconds that the command can run."""
         return default
 
+    def answers(self) -> list[(question: str, answer: str)]:
+        """Return the questions that command asks, with their answers."""
+        return []
+
 
 class VerifyCall(Call):
     """Run the verify RPC."""
@@ -924,6 +932,12 @@ class InstallCall(Call):
     def timeout(self, default: float) -> float:
         return INSTALL_TIMEOUT if INSTALL_TIMEOUT > default else default
 
+    def answers(self) -> list[(question: str, answer: str)]:
+        """install remove asks before it deletes files; the RPC means yes."""
+        if self.command.startswith("install remove"):
+            return [(question=REMOVE_QUESTION, answer="y")]
+        return []
+
 
 class WriteMemoryCall(Call):
     """Run the write-memory RPC."""
@@ -1011,11 +1025,13 @@ def _client(cap: net.TCPConnectCap, dmc: DeviceMetaConfig,
                       transport=ssh_transport_config(dmc.ssh))
 
 
-def _job(command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None) \
-        -> (command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None):
+def _job(command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None,
+         answers: list[(question: str, answer: str)]=[]) -> (command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None, answers: list[(question: str, answer: str)]):
     """Return a job for the shell: a command, or configuration lines when
-    lines is not empty. done gets what the device printed."""
-    return (command=command, lines=lines, timeout=timeout, done=done)
+    lines is not empty. done gets what the device printed. When the output
+    of the command stops at a question in answers, the job types its
+    answer."""
+    return (command=command, lines=lines, timeout=timeout, done=done, answers=answers)
 
 
 def _after_echo(text: str) -> str:
@@ -1050,17 +1066,21 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
     var setup_left = len(SHELL_SETUP)
     # What the device printed for the job that runs.
     var text = ""
+    # The length of text when the job last typed an answer.
+    var answered = 0
     # Received bytes that are not complete UTF-8 yet.
     var raw = b""
-    var queue: list[(command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None)] = []
-    var job: ?(command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None) = None
+    var queue: list[(command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None, answers: list[(question: str, answer: str)])] = []
+    var job: ?(command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None, answers: list[(question: str, answer: str)]) = None
     var dialog: ?ConfigDialog = None
     # Bumped when a job starts, types or ends, so an old timer does nothing.
     var serial = 0
 
-    def run(command: str, timeout: float, done: action(?str, ?Exception) -> None) -> None:
-        """Run command and give done its output."""
-        _add(_job(command, [], timeout, done))
+    def run(command: str, timeout: float, done: action(?str, ?Exception) -> None,
+            answers: list[(question: str, answer: str)]=[]) -> None:
+        """Run command and give done its output. When the output stops at a
+        question in answers, type its answer."""
+        _add(_job(command, [], timeout, done, answers))
 
     def configure(lines: list[str], done: action(?str, ?Exception) -> None) -> None:
         """Type lines in configure terminal and give done what the device
@@ -1070,7 +1090,7 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
     def close() -> None:
         _end(NotConnectedError("the SSH session is closed"), False, False)
 
-    def _add(j: (command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None)):
+    def _add(j: (command: str, lines: list[str], timeout: float, done: action(?str, ?Exception) -> None, answers: list[(question: str, answer: str)])):
         if ended:
             j.done(None, NotConnectedError("the SSH session has ended"))
             return
@@ -1084,6 +1104,7 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
         queue = queue[1:]
         job = j
         text = ""
+        answered = 0
         if len(j.lines) > 0:
             d = ConfigDialog(j.lines)
             dialog = d
@@ -1203,6 +1224,17 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
                 out = command_output(text, prompt)
                 if out is not None:
                     _finish_job(out, None)
+                else:
+                    _answer(j.answers)
+
+    def _answer(answers: list[(question: str, answer: str)]):
+        """Type the answer to a question that ends the output so far."""
+        tail = last_line(text)
+        for a in answers:
+            if tail.endswith(a.question) and text.rfind(a.question) >= answered:
+                answered = len(text)
+                _type([a.answer + "\r"])
+                return
 
     def _type(texts: list[str]):
         m = mock
@@ -1297,12 +1329,25 @@ actor CliMock():
     device prints, as for a line that the device rejects.
     """
     var replies: dict[str, str] = {}
+    # The answer to the question of a command, and what follows it.
+    var answer_of: dict[str, str] = {}
+    var after_answer: dict[str, str] = {}
+    # The command whose question waits for a line.
+    var asking: ?str = None
     var commands: list[str] = []
     var configured: list[str] = []
     var config_mode = False
 
     def set_reply(command: str, output: str) -> None:
         replies[command] = output
+
+    def set_question(command: str, output: str, answer: str, rest: str) -> None:
+        """Make command print output, which ends with a question, and wait
+        for a line. The line answer gets rest and the prompt; another line
+        ends the command."""
+        replies[command] = output
+        answer_of[command] = answer
+        after_answer[command] = rest
 
     def get_commands() -> list[str]:
         """Return the commands typed at the exec prompt, without the terminal
@@ -1318,6 +1363,14 @@ actor CliMock():
         return "\r\n\r\nRouter#"
 
     def type_text(text: str) -> str:
+        c = asking
+        if c is not None:
+            asking = None
+            want = answer_of.get(c)
+            rest = after_answer.get(c)
+            if want is not None and rest is not None and text == want:
+                return text + "\r\n" + rest + "\r\nRouter#"
+            return text + "\r\nAborted.\r\nRouter#"
         if config_mode:
             if text == "end":
                 config_mode = False
@@ -1337,10 +1390,13 @@ actor CliMock():
         if text.startswith("terminal "):
             return text + "\r\nRouter#"
         commands.append(text)
+        r = replies.get(text)
+        if r is not None and text in answer_of:
+            asking = text
+            return text + "\r\n" + r
         output = (" " * (len(text) + 7)) + "^\r\n% Invalid input detected at '^' marker.\r\n"
-        reply = replies.get(text)
-        if reply is not None:
-            output = reply
+        if r is not None:
+            output = r
         return text + "\r\n" + output + ("" if output.endswith("\n") else "\r\n") + "Router#"
 
 
@@ -1491,7 +1547,11 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
                 cb(None, e)
             else:
                 cb(reply, None)
-        _session(c.command, c.timeout(rpc_timeout), received)
+        s = session
+        if s is not None and ready:
+            s.run(c.command, c.timeout(rpc_timeout), received, c.answers())
+        else:
+            received(None, NotConnectedError("the IOS XE CLI adapter has no SSH session"))
 
     def _configure(cb: action(?gdata.Node, ?Exception) -> None, lines: list[str]):
         def received(output: ?str, err: ?Exception):
