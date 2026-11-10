@@ -37,7 +37,7 @@
   `delta`, as an action instead of a proc. [#763]
 - A software adapter has a static `prepare_estimate()`: the seconds the copy
   of the image takes, for planners. The IOS XE adapter gives 130. The unused
-  `estimate(staged)` is removed.
+  `estimate(staged)` is removed. [#784]
 
 ### Northbound APIs
 - Fixed NETCONF `<get-config>` returning the operational state published by
@@ -421,7 +421,7 @@
   their release. New plan alarms: "N device(s) cannot prepare before their
   window opens" and "N device(s) failed to prepare and copy the image in
   their window". The upgrade in the window still copies the image again.
-  Before, `allow-staging` on a campaign had no effect.
+  Before, `allow-staging` on a campaign had no effect. [#784]
 - A campaign releases a member only once the member's status answers the
   campaign's target: `upgrade-needed`, or a final status. Until then the
   plan holds the member in its window, with the alarm "N device(s) have not
