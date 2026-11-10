@@ -308,15 +308,21 @@ def aggregate(root: ?ygdata.Node, uuid: str, expect_stage: str,
 
 XCOPY_MODULE = "Cisco-IOS-XE-xcopy-rpc"
 INSTALL_MODULE = "Cisco-IOS-XE-install-rpc"
+FILES_MODULE = "Cisco-IOS-XE-platform-software-oper"
+FILES_NS = "http://cisco.com/ns/yang/Cisco-IOS-XE-platform-software-oper"
 
 
-def upgrade_plan(modules: set[str]) -> (transfer: str, verify: str, install: str):
+def upgrade_plan(modules: set[str]) -> (transfer: str, listing: str, verify: str, install: str):
     """Return how each step of an upgrade runs on a device with these modules:
-    "netconf", "cli", or "" when the driver cannot run the step there."""
+    "netconf", "cli", or "" when the driver cannot run the step there. A step
+    runs over NETCONF when the device has the module for it, and over the CLI
+    only when it has not. No NETCONF module checks a file's content, so the
+    check of an image runs over the CLI."""
     transfer = "netconf" if XCOPY_MODULE in modules else ""
+    listing = "netconf" if FILES_MODULE in modules else ("cli" if xecli_yang.MODULE in modules else "")
     verify = "cli" if xecli_yang.MODULE in modules else ""
     install = "netconf" if INSTALL_MODULE in modules else ""
-    return (transfer=transfer, verify=verify, install=install)
+    return (transfer=transfer, listing=listing, verify=verify, install=install)
 
 
 def usable_checksum(checksums: list[(algorithm: str, digest: str)]) -> ?(algorithm: str, digest: str):
@@ -330,15 +336,26 @@ def usable_checksum(checksums: list[(algorithm: str, digest: str)]) -> ?(algorit
 
 
 def staged_file(root: ?ygdata.Node, filename: str) -> bool:
-    """Return True if the listing of bootflash: in root has filename."""
+    """Return True if the files of bootflash: in root have filename, in a
+    listing over NETCONF or over the CLI."""
+    for q in ixoper.root.from_gdata(root).cisco_platform_software.q_filesystem:
+        p = q.partitions.get("bootflash:")
+        if p is not None and p.partition_content.get("/bootflash/" + filename) is not None:
+            return True
     fs = xecli_data.root.from_gdata(root).file_systems.file_system.get("bootflash:")
     if fs is not None:
         return fs.file.get(filename) is not None
     return False
 
 
-def bootflash_filter() -> ygdata.FNode:
-    """Select the files of bootflash: from the IOS XE CLI adapter."""
+def bootflash_filter(listing: str) -> ygdata.FNode:
+    """Select the files of bootflash: over NETCONF, from
+    Cisco-IOS-XE-platform-software-oper, or over the CLI."""
+    if listing == "netconf":
+        f = lambda name: ygdata.Id(FILES_NS, name)
+        return ygdata.FNode(children=[ygdata.FNode(f("cisco-platform-software"), children=[
+            ygdata.FNode(f("q-filesystem"), children=[
+                ygdata.FNode(f("partitions"), children=[ygdata.FNode(f("name"), value_match="bootflash:")])])])])
     q = lambda name: ygdata.Id(xecli_yang.NS, name)
     return ygdata.FNode(children=[ygdata.FNode(q("file-systems"), children=[
         ygdata.FNode(q("file-system"), children=[ygdata.FNode(q("name"), value_match="bootflash:")])])])
@@ -697,7 +714,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         the image, a file there that passes stays; one that is missing or
         fails is transferred and checked again."""
         _check = _staging_check()
-        if _check is None and upgrade_plan(_modules()).verify != "cli":
+        plan = upgrade_plan(_modules())
+        if _check is None and plan.verify != "cli":
             if _then_add:
                 # Install cannot check the file either: trust what prepare
                 # staged.
@@ -715,7 +733,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _verify(gen, True)
             else:
                 _transfer()
-        dev.get(listed, bootflash_filter())
+        dev.get(listed, bootflash_filter(plan.listing))
 
     def _verify(gen: int, before_transfer: bool) -> None:
         c = _check

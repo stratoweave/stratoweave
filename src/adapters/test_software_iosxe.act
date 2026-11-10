@@ -23,6 +23,7 @@ import yang.gdata as ygdata
 
 import device as swdev
 import adapters.iosxe_cli as xecli
+import adapters.iosxe_cli_data as xecli_data
 import adapters.test_iosxe_cli as clitest
 import adapters.iosxe_cli_yang as xecli_yang
 import adapters.netconf as swna
@@ -1012,17 +1013,52 @@ actor _test_iosxe_release_follows_the_image(t: testing.EnvT):
 #############################################################################
 
 def _test_upgrade_plan_follows_the_modules():
-    netconf = {swxe.XCOPY_MODULE, swxe.INSTALL_MODULE}
+    netconf = {swxe.XCOPY_MODULE, swxe.INSTALL_MODULE, swxe.FILES_MODULE}
+    no_files = {swxe.XCOPY_MODULE, swxe.INSTALL_MODULE}
     cli = {xecli_yang.MODULE}
     cases = [
-        ("NETCONF and the CLI, as a C1111 with 17.9.5a", netconf | cli, ("netconf", "cli", "netconf")),
-        ("only the CLI, as a C1111 with 16.8.1", cli, ("", "cli", "")),
-        ("only NETCONF, as a C8000V without the CLI adapter", netconf, ("netconf", "", "netconf")),
-        ("nothing", set(), ("", "", "")),
+        ("NETCONF and the CLI, as a C1111 with 17.15", netconf | cli, ("netconf", "netconf", "cli", "netconf")),
+        ("NETCONF without the files, and the CLI", no_files | cli, ("netconf", "cli", "cli", "netconf")),
+        ("only the CLI, as a C1111 with 16.8.1", cli, ("", "cli", "cli", "")),
+        ("only NETCONF, without the CLI adapter", netconf, ("netconf", "netconf", "", "netconf")),
+        ("nothing", set(), ("", "", "", "")),
     ]
     for name, modules, want in cases:
         p = swxe.upgrade_plan(modules)
-        testing.assertEqual((p.transfer, p.verify, p.install), want, name)
+        testing.assertEqual((p.transfer, p.listing, p.verify, p.install), want, name)
+
+
+def _files_root(partitions: list[(name: str, paths: list[str])]) -> ygdata.Node:
+    r = ixoper.root()
+    q = r.cisco_platform_software.q_filesystem.create()
+    for p in partitions:
+        entry = q.partitions.create(p.name)
+        for path in p.paths:
+            entry.partition_content.create(path, size=u64(1))
+    return r.to_gdata()
+
+
+def _dir_root(files: list[str]) -> ygdata.Node:
+    r = xecli_data.root()
+    fs = r.file_systems.file_system.create("bootflash:")
+    for f in files:
+        fs.file.create(f, size=u64(1))
+    return r.to_gdata()
+
+
+def _test_staged_file_reads_both_listings():
+    image = "c1100-universalk9.17.15.04c.SPA.bin"
+    cases = [
+        ("NETCONF: on bootflash", _files_root([(name="bootflash:", paths=["/bootflash/packages.conf", "/bootflash/" + image])]), True),
+        ("NETCONF: in a subdirectory", _files_root([(name="bootflash:", paths=["/bootflash/old/" + image])]), False),
+        ("NETCONF: on another partition", _files_root([(name="webui:", paths=["/bootflash/" + image])]), False),
+        ("NETCONF: not there", _files_root([(name="bootflash:", paths=["/bootflash/packages.conf"])]), False),
+        ("CLI: on bootflash", _dir_root([image]), True),
+        ("CLI: not there", _dir_root(["packages.conf"]), False),
+        ("no data", None, False),
+    ]
+    for name, root, want in cases:
+        testing.assertEqual(swxe.staged_file(root, image), want, name)
 
 
 def _test_usable_checksum_prefers_sha512():
@@ -1073,9 +1109,12 @@ IMAGE_UNSIGNED = IMAGE_SIGNED.replace("Computed Hash   SHA1 : A6C3", "Computed H
 
 
 def new_iosxe_cli_mock_device_mgr(t: testing.EnvT, name: str,
-                                  on_reconf: action(str) -> None) -> swdev.DeviceMgr:
-    """A mock device with NETCONF and the IOS XE CLI adapter beside it."""
-    schema = yang.compile(swxe_yang.models)
+                                  on_reconf: action(str) -> None, files: bool=True) -> swdev.DeviceMgr:
+    """A mock device with NETCONF and the IOS XE CLI adapter beside it.
+    Without files, its NETCONF has no Cisco-IOS-XE-platform-software-oper."""
+    models = list(swxe_yang.models) if files else [swxe_yang.xcopy_rpc, swxe_yang.install_rpc,
+                                                   swxe_yang.install_oper, swxe_yang.device_hardware_oper]
+    schema = yang.compile(models)
     cli_schema = yang.compile(xecli_yang.models)
     dev_types = {
         "iosxe": swdev.DeviceType(name="iosxe", adapter_type=swna.NetconfAdapter, src_dnode=schema,
@@ -1094,7 +1133,7 @@ def new_iosxe_cli_mock_device_mgr(t: testing.EnvT, name: str,
 actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: str,
                   settled: action(swxemock.IosXeSoftwareMock, xecli.CliMock, swdev.DeviceMgr, str) -> None,
                   timeout: float=2.5, preadded: ?str=None, checksum: bool=True, image_output: str="",
-                  running: str=OLD_RELEASE, committed: ?str=None):
+                  running: str=OLD_RELEASE, committed: ?str=None, files: bool=True):
     """Drive one mock device with a sha512 image checksum from software intent
     to a settled status. The CliMock answers dir bootflash: with dir_output,
     and with a listing that has the image once the device took an xcopy, and
@@ -1182,7 +1221,7 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         st = d!.get_swmgr().get_status() if d is not None else "?"
         t.failure(ValueError("timed out: rpcs={rpcs} commands={commands} status={st}"))
 
-    dev_ref = new_iosxe_cli_mock_device_mgr(t, name, on_reconf)
+    dev_ref = new_iosxe_cli_mock_device_mgr(t, name, on_reconf, files)
     after 0.01: start()
     after timeout: report_timeout()
 
@@ -1281,12 +1320,26 @@ actor _test_iosxe_missing_image_is_copied_and_verified(t: testing.EnvT):
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
             testing.assertEqual(["xcopy", "install", "activate", "install-commit"], m.get_rpcs())
-            commands = c.get_commands()
-            testing.assertEqual(commands[:2], ["dir bootflash:", VERIFY_COMMAND], "list, then verify the copy")
+            testing.assertEqual(c.get_commands(), [VERIFY_COMMAND, VERIFY_COMMAND],
+                                "NETCONF lists; the CLI verifies the copy in prepare and again in install")
             t.success()
         except Exception as e:
             t.failure(e)
     _StagingRun(t, "d-missing", DIR_EMPTY, VERIFY_EQUAL, settled)
+
+
+actor _test_iosxe_listing_falls_back_to_the_cli(t: testing.EnvT):
+    """A device without Cisco-IOS-XE-platform-software-oper lists bootflash
+    over the CLI."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["install", "activate", "install-commit"], m.get_rpcs())
+            testing.assertEqual(c.get_commands()[:2], ["dir bootflash:", VERIFY_COMMAND], "list, then verify")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-cli-listing", DIR_STAGED, VERIFY_EQUAL, settled, files=False)
 
 
 actor _test_iosxe_checksum_mismatch_fails_in_prepare(t: testing.EnvT):
