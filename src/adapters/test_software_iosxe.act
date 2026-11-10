@@ -31,6 +31,8 @@ import adapters.software_iosxe as swxe
 import adapters.software_iosxe_mock as swxemock
 import adapters.software_iosxe_oper as ixoper
 import adapters.software_iosxe_yang as swxe_yang
+from adapters.adapter import DeviceAdapter, NoAdapter
+from device_schema import DeviceSchema
 
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
@@ -407,7 +409,7 @@ def _fast_adapter(dev: swdev.DeviceMgr, dmc: DeviceMetaConfig,
     the device type here names a factory instead of the class.
     """
     return swxe.IosXeSoftwareAdapter(dev, dmc, log_handler, env,
-                                     0.02, 0.02)
+                                     0.02, 0.02, 0.3)
 
 
 def new_iosxe_mock_device_mgr(t: testing.EnvT, name: str,
@@ -427,6 +429,85 @@ def new_iosxe_mock_device_mgr(t: testing.EnvT, name: str,
     dmc.mock.enabled = True
     dev.set_dmc(dmc)
     return dev
+
+
+class _SilentAdapter(NoAdapter):
+    """An adapter that never connects, as an IOS XE CLI adapter whose device
+    does not answer. It mocks, so that mock mode keeps it."""
+    def supports_mocking(self) -> bool:
+        return True
+
+
+def _never_connects(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, dmc: DeviceMetaConfig,
+                    registry: swdev.SchemaRegistry, log_handler: logging.Handler, env: ?Env) -> DeviceAdapter:
+    return _SilentAdapter(bundled_schema, log_handler, env)
+
+
+actor _test_iosxe_staging_waits_for_adapters(t: testing.EnvT):
+    """Staging waits for an adapter that is not connected, then stages with
+    the adapters that are there: without the CLI, it transfers the image."""
+    t.timeout(10.0)
+    var dev_ref: ?swdev.DeviceMgr = None
+    var mock: ?swxemock.IosXeSoftwareMock = None
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def poll() -> None:
+        m = mock
+        d = dev_ref
+        if finished or m is None or d is None:
+            return
+        st = d!.get_swmgr().get_status()
+        if st == "unknown" or st == "in-progress":
+            after 0.02: poll()
+            return
+        finished = True
+        try:
+            testing.assertEqual("succeeded", st, d!.get_swmgr().get_reason())
+            testing.assertEqual(["never"], d!.get_unconnected_adapters())
+            testing.assertEqual(["xcopy", "install", "activate", "install-commit"], m!.get_rpcs())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def start() -> None:
+        d = dev_ref
+        if d is not None:
+            if swxe.INSTALL_MODULE not in d.get_modules().0:
+                after 0.01: start()
+                return
+            a = d.get_adapter()
+            if isinstance(a, swna.NetconfAdapter):
+                ms = a.get_mock_server()
+                if ms is not None:
+                    m = swxemock.IosXeSoftwareMock(ms, t.log_handler, running=OLD_RELEASE)
+                    mock = m
+                    m.attach()
+                    dmc = DeviceMetaConfig("d-waits", Credentials("admin", "admin"), type="iosxe",
+                                           software=Software("camp-1", NEW_REQUESTED, IMAGE_URL))
+                    dmc.mock.enabled = True
+                    dmc.extra_adapter.create("never")
+                    d.set_dmc(dmc)
+                    after 0.02: poll()
+                    return
+            finished = True
+            t.failure(ValueError("no NETCONF mock server"))
+
+    schema = yang.compile(swxe_yang.models)
+    dev_types = {
+        "iosxe": swdev.DeviceType(name="iosxe", adapter_type=swna.NetconfAdapter, src_dnode=schema,
+                                  oper_src_dnode=schema, software_adapter_type=_fast_adapter),
+        "never": swdev.DeviceType(name="never", adapter_type=_never_connects, src_dnode=schema),
+    }
+    d = swdev.DeviceMgr(dev_types, t.env, "d-waits", t.log_handler, on_reconf, swdev.SchemaRegistry())
+    dmc = DeviceMetaConfig("d-waits", Credentials("admin", "admin"), type="iosxe")
+    dmc.mock.enabled = True
+    dmc.extra_adapter.create("never")
+    d.set_dmc(dmc)
+    dev_ref = d
+    after 0.01: start()
 
 
 actor _test_iosxe_upgrade_through_the_software_manager(t: testing.EnvT):
