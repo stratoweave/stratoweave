@@ -80,8 +80,9 @@ Rules:
 - Under a veto, a read that fails gives `unknown`, with the error in
   `reason`. If the device was not connected, the manager reads it again when
   it connects; after another error, after 5 seconds, then twice as long each
-  time, up to 5 minutes. Without a veto, a read that fails goes on to the
-  upgrade, which reports what fails.
+  time, up to 5 minutes. Without a veto, a device that is not connected
+  gives `unknown` too, and is read again when it connects; another read
+  error goes on to the upgrade, which reports what fails.
 - Right before the install, after the pre-checks, the manager looks at the
   config again. A veto now holds the install, with `upgrade-needed` and the
   holders in `reason`. A changed target or campaign ends the run with
