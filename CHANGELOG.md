@@ -35,6 +35,9 @@
   `declare_subscriptions()` of `DeviceMgr`, `ttt.Layer` and
   `adapters.adapter.DeviceAdapter` takes the data callback, and the layer's
   `delta`, as an action instead of a proc. [#763]
+- A software adapter has a static `prepare_estimate()`: the seconds the copy
+  of the image takes, for planners. The IOS XE adapter gives 130. The unused
+  `estimate(staged)` is removed.
 
 ### Northbound APIs
 - Fixed NETCONF `<get-config>` returning the operational state published by

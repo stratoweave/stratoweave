@@ -162,8 +162,8 @@ A platform adapter is a subclass of `SoftwareAdapter` in `src/device.act`.
 | `commit_window(done)` | Seconds left before the device goes back on its own, or `None`. |
 | `rollback(done, previous)` | Go back to `previous`. Call `done` only once the device runs it. |
 | `cleanup(done)` | Remove old images. The manager does not call it. |
-| `estimate(staged)` | Seconds an install takes. The manager does not call it. |
 | `plan_estimate()` | Seconds a whole upgrade takes, for planners. Static. |
+| `prepare_estimate()` | Seconds the copy of the image takes, for planners. Static. |
 | `supports_mocking()` | Whether the adapter works with the device mock. |
 
 Jobs report through `done`. The error message becomes the run's `reason`, so
