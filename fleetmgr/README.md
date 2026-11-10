@@ -190,7 +190,29 @@ Stopping and running a campaign again does not retry its failed members.
 To retry a member, remove it from the campaign, wait until the device's
 software state has no `upgrade-campaign`, and add the member again. The
 campaign then takes it as a new member: it holds it until it answers, and
-releases it in a window. `allow-staging` on a campaign has no effect yet.
+releases it in a window.
+
+With `allow-staging`, a campaign in `run` lets each member that needs the
+upgrade, and that the plan gives a window, prepare once before its window:
+the device copies its image, with no outage, while the campaign's veto
+holds the install. The first member prepares as soon as the campaign runs.
+The others follow, as far apart as their deadlines allow. In a campaign
+of thousands of members, the members whose turns fall in the same few
+seconds, up to 30, start together. A member's deadline is the opening of
+the next window of its schedule, less `close-margin` percent of its
+expected prepare time: 195 s at the IOS XE estimate of 130 s and the
+default 150. Members whose window opens first go first. No member prepares
+while a window of its schedule is open. In `plan` nothing is copied: the
+plan shows each member's `prepare-start` in a run that starts now, and
+`prepare-concurrency`, the most copies at once. There is no cap on that
+number. `device-status` shows each member's `prepare`, and `preparing` and
+`prepared` count the members that wait for their release. The plan's
+alarms name the members that cannot prepare before their window opens and
+the members that wait for their window after a failed prepare. A failed
+prepare is not tried again. Turning `allow-staging` off, or setting the
+campaign to `plan`, stops the prepares; a copy that runs finishes. The
+upgrade in the window still copies the image again, so windows are not
+shorter yet.
 
 ## Web UI
 

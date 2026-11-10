@@ -407,7 +407,21 @@
   failed members. To retry a member, remove it from the campaign, wait
   until the device's software state has no `upgrade-campaign`, and add it
   again: the campaign takes it as a new member. [#783]
-- `allow-staging` on a campaign is no longer passed to the devices. [#783]
+- With `allow-staging`, a campaign in `run` lets each member that needs the
+  upgrade, and that the plan gives a window, prepare its image once before
+  its window, under the campaign's veto. The first member prepares at once.
+  The others follow as far apart as their deadlines allow: the opening of
+  the next window of the member's schedule, less `close-margin` percent of
+  its expected prepare time. No member prepares while a window of its
+  schedule is open, and a failed prepare is not tried again. In `plan`
+  nothing is copied. The plan's new `prepare-start` says when each member
+  prepares, and `prepare-concurrency` how many copies run at most at once;
+  there is no cap. `device-status` shows each member's `prepare`, and the
+  new counters `preparing` and `prepared` count the members that wait for
+  their release. New plan alarms: "N device(s) cannot prepare before their
+  window opens" and "N device(s) failed to prepare and copy the image in
+  their window". The upgrade in the window still copies the image again.
+  Before, `allow-staging` on a campaign had no effect.
 - A campaign releases a member only once the member's status answers the
   campaign's target: `upgrade-needed`, or a final status. Until then the
   plan holds the member in its window, with the alarm "N device(s) have not

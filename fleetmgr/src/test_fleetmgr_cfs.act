@@ -3270,3 +3270,226 @@ actor _test_campaign_lets_a_member_added_late_prepare(t: testing.AsyncT):
     ctl.on_subscriptions_synced()
     after 5.0: fail("at stage {stage}, no output came")
 
+
+def _prepare_starts(o: y0_oper.software__software__upgrade_campaign_entry) -> dict[str, int]:
+    """The prepare-start of each device in the plan of o that has one."""
+    starts: dict[str, int] = {}
+    for win in o.state.plan.window:
+        for dev in win.device:
+            s = dev.prepare_start
+            if s is not None:
+                starts[dev.name] = int(s)
+    return starts
+
+
+def _by_start(starts: dict[str, int]) -> list[str]:
+    """The names in starts, by their start."""
+    pairs: list[(int, str)] = []
+    for name, s in starts.items():
+        pairs.append((s, name))
+    return [e.1 for e in sorted(pairs)]
+
+
+def _with_image(campaign: InputCampaign, name: str, image: str) -> InputCampaign:
+    """campaign with image as the image of its member name."""
+    member = campaign.device.get(name)
+    if member is not None:
+        member.image = image
+    return campaign
+
+
+actor _test_campaign_in_plan_shows_prepares_and_writes_none(t: testing.AsyncT):
+    """The campaign soon in plan with allow-staging, once its members have
+    answered: the plan shows when each member would prepare in a run that
+    starts now, 30 minutes apart and one at a time. The campaign lets no
+    member prepare, and no member counts as preparing or prepared."""
+    var staged: list[str] = []
+    var outputs = 0
+    var done = False
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    now = time.time().unix_s()
+    soon = _soon(names, "plan", True, now)
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_output(out: gdata.Node) -> None:
+        outputs += 1
+        for name in _staged(out):
+            staged.append(name)
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        starts = _prepare_starts(o)
+        # The first publication comes before the answers, with no turns.
+        if len(starts) < len(names):
+            return
+        done = True
+        order = _by_start(starts)
+        first = starts.get_def("cpe-1", 0)
+        gaps = [starts.get_def("cpe-2", 0) - first, starts.get_def("cpe-3", 0) - first]
+        got = ("order {order}, first {first - now}, gaps {gaps}, "
+               + "concurrency {o.state.plan.prepare_concurrency}, "
+               + "preparing {o.state.preparing}, prepared {o.state.prepared}, "
+               + "{outputs} output(s), let prepare {staged}")
+        if order != names or first < now or first > now + 2 \
+           or gaps[0] < 1795 or gaps[0] > 1800 or gaps[1] < 3590 or gaps[1] > 3600 \
+           or o.state.plan.prepare_concurrency != u64(1) \
+           or o.state.preparing != u64(0) or o.state.prepared != u64(0) \
+           or outputs == 0 or len(staged) > 0:
+            t.failure(ValueError(got))
+        else:
+            t.success()
+
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), on_output, on_oper, None)
+    ctl.on_conf(soon.0, soon.1.to_gdata())
+    for name in names:
+        ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                   _tagged("upgrade-needed", "soon", "17.18.03a"), None)
+    ctl.on_subscriptions_synced()
+    after 5.0: fail("no plan showed a prepare-start for every member")
+
+
+actor _test_campaign_shows_the_prepares(t: testing.AsyncT):
+    """The campaign soon in run with allow-staging. cpe-1 has prepared,
+    cpe-2 failed to prepare, cpe-3 is in its upgrade and its run prepares,
+    cpe-4 waits to prepare, and the image of cpe-5 is not in the image
+    list. Only cpe-1 counts, as prepared: the run of cpe-3 is not a
+    prepare. The rows show each prepare as the device reports it. The
+    alarms are the plan's, then the failed prepare, then the image's. The
+    campaign lets cpe-4 prepare at once, and it alone prepares."""
+    var done = False
+    names = ["cpe-1", "cpe-2", "cpe-3", "cpe-4", "cpe-5"]
+    soon = _soon(names, "run", True, time.time().unix_s())
+    campaign = _with_image(soon.0, "cpe-5", "missing.bin")
+    reports = [
+        ("cpe-1", _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "done", "17.18.03a")),
+        ("cpe-2", _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "failed", "17.18.03a")),
+        ("cpe-3", _tagged_prepare("in-progress", "soon", "17.18.03a", "running", "17.18.03a")),
+        ("cpe-4", _tagged("upgrade-needed", "soon", "17.18.03a")),
+    ]
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def row(o: y0_oper.software__software__upgrade_campaign_entry, name: str) -> str:
+        r = o.state.device_status.get(name)
+        if r is not None:
+            return "{name} {r.status} prepare {r.prepare.state} {r.prepare.release}"
+        return "{name} missing"
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        rows = [row(o, name) for name in names]
+        # Wait for the publication that has every report.
+        if rows[:4] != ["cpe-1 upgrade-needed prepare done 17.18.03a",
+                        "cpe-2 upgrade-needed prepare failed 17.18.03a",
+                        "cpe-3 in-progress prepare running 17.18.03a",
+                        "cpe-4 upgrade-needed prepare None None"]:
+            return
+        done = True
+        got = ["preparing {o.state.preparing}, prepared {o.state.prepared}",
+               "starts " + ", ".join(_by_start(_prepare_starts(o))),
+               "concurrency {o.state.plan.prepare_concurrency}"] + list(o.state.plan.alarm)
+        want = ["preparing 0, prepared 1",
+                "starts cpe-4",
+                "concurrency 1",
+                "1 device(s) have not answered the campaign's target: cpe-5",
+                "1 device(s) failed to prepare and copy the image in their window: cpe-2",
+                "image missing.bin is not in the image list (1 device)"]
+        if got != want:
+            t.failure(ValueError("{got}"))
+        else:
+            t.success()
+
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), lambda o: None, on_oper, None)
+    ctl.on_conf(campaign, soon.1.to_gdata())
+    for r in reports:
+        ctl.on_rfs((rfs_name=cfs.flotilla_of(r.0), device_name=r.0), r.1, None)
+    ctl.on_subscriptions_synced()
+    after 5.0: fail("no publication had every report")
+
+
+actor _PrepareAlarm(t: testing.AsyncT, event: str):
+    """Run the campaign soon over cpe-1 and cpe-2 with allow-staging. cpe-1
+    failed to prepare, and cpe-2 has prepared. Once the campaign shows the
+    alarm for cpe-1 and counts cpe-2 as prepared, the event happens:
+
+    - "gone": cpe-1's state goes, as when its flotilla no longer has it.
+    - "image": the image gets a new version, so neither prepare is for the
+      campaign's intent any more.
+
+    The campaign must then drop the alarm. cpe-2 still counts as prepared
+    after "gone", and no longer after "image"."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var phase = 0
+    var done = False
+    names = ["cpe-1", "cpe-2"]
+    now = time.time().unix_s()
+    soon = _soon(names, "run", True, now)
+    newer = _with_version(_soon(names, "run", True, now).1, "17.18.04").to_gdata()
+    alarm = "1 device(s) failed to prepare and copy the image in their window: cpe-1"
+    after_event = u64(1) if event == "gone" else u64(0)
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        alarms = list(o.state.plan.alarm)
+        cc = controller
+        if phase == 0:
+            if alarm not in alarms:
+                return
+            if o.state.prepared != u64(1):
+                fail("before {event}: prepared {o.state.prepared}")
+            elif cc is not None:
+                phase = 1
+                if event == "gone":
+                    cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), None,
+                              None)
+                else:
+                    cc.on_conf(soon.0, newer)
+        elif alarm not in alarms:
+            if o.state.prepared != after_event:
+                fail("after {event}: prepared {o.state.prepared}")
+            else:
+                done = True
+                t.success()
+
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), lambda o: None, on_oper, None)
+    controller = ctl
+    ctl.on_conf(soon.0, soon.1.to_gdata())
+    ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+               _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "failed", "17.18.03a"), None)
+    ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-2"), device_name="cpe-2"),
+               _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "done", "17.18.03a"), None)
+    ctl.on_subscriptions_synced()
+    after 5.0: fail("at phase {phase} of {event}, the alarm stayed")
+
+
+actor _test_campaign_forgets_the_prepare_of_a_member_that_goes(t: testing.AsyncT):
+    """A member whose state goes takes its failed prepare, and the alarm
+    for it, with it."""
+    _PrepareAlarm(t, "gone")
+
+
+actor _test_campaign_image_change_ends_the_prepare_alarm(t: testing.AsyncT):
+    """A new image version makes the prepares of the old target stale: the
+    alarm for a failed prepare goes, and a done prepare no longer counts."""
+    _PrepareAlarm(t, "image")
