@@ -358,6 +358,24 @@ def staged_file(root: ?ygdata.Node, filename: str) -> bool:
     return False
 
 
+def staged_size(root: ?ygdata.Node, filename: str) -> ?u64:
+    """Return the size of filename on bootflash: in root, from a listing
+    over NETCONF or over the CLI, or None when the listing has no size for
+    it."""
+    for q in ixoper.root.from_gdata(root).cisco_platform_software.q_filesystem:
+        p = q.partitions.get("bootflash:")
+        if p is not None:
+            f = p.partition_content.get("/bootflash/" + filename)
+            if f is not None:
+                return f.size
+    fs = xecli_data.root.from_gdata(root).file_systems.file_system.get("bootflash:")
+    if fs is not None:
+        c = fs.file.get(filename)
+        if c is not None:
+            return c.size
+    return None
+
+
 def bootflash_filter(listing: str) -> ygdata.FNode:
     """Select the files of bootflash: over NETCONF, from
     Cisco-IOS-XE-platform-software-oper, or over the CLI."""
@@ -615,6 +633,14 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             checksums.append((algorithm=c.algorithm, digest=c.digest))
         return usable_checksum(checksums)
 
+    def _size_check(plan: (transfer: str, listing: str, verify: str, install: str)) -> ?u64:
+        """The size that the staged image is checked against: the image
+        size of the intent, when the device can list files but compute no
+        checksum."""
+        if plan.verify != "cli" and plan.listing != "":
+            return dev.get_dmc().software.image_size
+        return None
+
     def _image_url() -> ?str:
         """Read the image URL at job start so configuration changes take effect."""
         url = dev.get_dmc().software.image_url
@@ -741,10 +767,12 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         """Make sure that the image file is on bootflash. When the device can
         check the file, against a checksum or else against the signature in
         the image, a file there that passes stays; one that is missing or
-        fails is transferred and checked again."""
+        fails is transferred and checked again. A device that can compute
+        no checksum compares the size of the file with the image size of
+        the intent instead."""
         _check = _staging_check()
         plan = upgrade_plan(_modules())
-        if _check is None and plan.verify != "cli":
+        if _check is None and plan.verify != "cli" and _size_check(plan) is None:
             if _then_add:
                 # Install cannot check the file either: trust what prepare
                 # staged.
@@ -766,12 +794,37 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
 
     def _verify(gen: int, before_transfer: bool) -> None:
         c = _check
+        plan = upgrade_plan(_modules())
+        size = _size_check(plan)
         if c is not None:
             _verify_against(gen, before_transfer, c)
-        elif upgrade_plan(_modules()).verify == "cli":
+        elif plan.verify == "cli":
             _verify_image(gen, before_transfer)
+        elif size is not None:
+            _verify_size(gen, before_transfer, size, plan.listing)
         else:
             _staged()
+
+    def _verify_size(gen: int, before_transfer: bool, size: u64, listing: str) -> None:
+        """Compare the size of the staged image with the image size of the
+        intent, which finds a transfer that stopped early."""
+        def listed(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!))
+                return
+            got = staged_size(root, _filename)
+            if got is not None and got == size:
+                _log.info("software: image size matches", {"file": _filename, "size": size})
+                _staged()
+            elif before_transfer:
+                _log.info("software: staged image has another size, transferring it again",
+                          {"file": _filename, "size": got, "want": size})
+                _transfer()
+            else:
+                _fail("size mismatch: {_filename} is {got} bytes, not {size}")
+        dev.get(listed, bootflash_filter(listing))
 
     def _verify_image(gen: int, before_transfer: bool) -> None:
         """Check the hashes and the signature that the image holds."""

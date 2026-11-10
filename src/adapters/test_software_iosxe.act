@@ -808,6 +808,109 @@ actor _test_iosxe_device_failure_is_reported(t: testing.EnvT):
     after 2.5: t.failure(ValueError("timed out"))
 
 
+actor _NetconfOnlyRun(t: testing.EnvT, name: str,
+                      settled: action(swxemock.IosXeSoftwareMock, swdev.DeviceMgr, str) -> None,
+                      image_size: int, mock_image_size: int=swxemock.IMAGE_SIZE,
+                      prestaged: bool=False, prestaged_size: ?int=None):
+    """Drive one mock device with NETCONF and no CLI adapter, so that it can
+    compute no checksum, from software intent with image_size to a settled
+    status. The mock fetches images of mock_image_size, and with prestaged
+    has the image on bootflash from the start, of prestaged_size."""
+    var dev_ref: ?swdev.DeviceMgr = None
+    var mock: ?swxemock.IosXeSoftwareMock = None
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def poll() -> None:
+        m = mock
+        d = dev_ref
+        if finished or m is None or d is None:
+            return
+        st = d!.get_swmgr().get_status()
+        if st == "unknown" or st == "in-progress":
+            after 0.02: poll()
+            return
+        finished = True
+        settled(m!, d!, st)
+
+    def start() -> None:
+        d = dev_ref
+        if d is not None:
+            if swxe.INSTALL_MODULE not in d.get_modules().0:
+                after 0.01: start()
+                return
+            a = d.get_adapter()
+            if isinstance(a, swna.NetconfAdapter):
+                ms = a.get_mock_server()
+                if ms is not None:
+                    m = swxemock.IosXeSoftwareMock(ms, t.log_handler, running=OLD_RELEASE,
+                                                   prestaged=IMAGE_FILE if prestaged else None,
+                                                   image_size=mock_image_size, prestaged_size=prestaged_size)
+                    mock = m
+                    m.attach()
+                    software = Software("camp-1", NEW_REQUESTED, IMAGE_URL)
+                    software.image_size = u64(image_size)
+                    dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe", software=software)
+                    dmc.mock.enabled = True
+                    d.set_dmc(dmc)
+                    after 0.02: poll()
+                    return
+            finished = True
+            t.failure(ValueError("no NETCONF mock server"))
+
+    def report_timeout() -> None:
+        if not finished:
+            finished = True
+            m = mock
+            rpcs = m!.get_rpcs() if m is not None else []
+            t.failure(ValueError("timed out: rpcs={rpcs}"))
+
+    dev_ref = new_iosxe_mock_device_mgr(t, name, on_reconf)
+    after 0.01: start()
+    after 2.5: report_timeout()
+
+
+actor _test_iosxe_size_keeps_a_staged_image(t: testing.EnvT):
+    """Without the CLI, an image on bootflash of the image size stays."""
+    def settled(m: swxemock.IosXeSoftwareMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["install", "activate", "install-commit"], m.get_rpcs())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _NetconfOnlyRun(t, "d-size-same", settled, swxemock.IMAGE_SIZE, prestaged=True)
+
+
+actor _test_iosxe_size_mismatch_transfers_again(t: testing.EnvT):
+    """Without the CLI, an image on bootflash of another size is transferred
+    again, and the copy has the image size."""
+    def settled(m: swxemock.IosXeSoftwareMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["xcopy", "install", "activate", "install-commit"], m.get_rpcs())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _NetconfOnlyRun(t, "d-size-other", settled, swxemock.IMAGE_SIZE, prestaged=True, prestaged_size=500)
+
+
+actor _test_iosxe_short_transfer_fails_prepare(t: testing.EnvT):
+    """Without the CLI, a transfer that stopped early fails prepare."""
+    def settled(m: swxemock.IosXeSoftwareMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("failed", status)
+            testing.assertEqual(["xcopy"], m.get_rpcs(), "nothing is installed")
+            testing.assertEqual("download failed: size mismatch: " + IMAGE_FILE + " is 999 bytes, not 1000",
+                                d.get_swmgr().get_reason())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _NetconfOnlyRun(t, "d-size-short", settled, swxemock.IMAGE_SIZE, mock_image_size=999)
+
+
 actor _test_iosxe_failed_postcheck_aborts(t: testing.EnvT):
     """A failing post-check sends abort instead of install-commit, and the
     device returns to the old release."""
