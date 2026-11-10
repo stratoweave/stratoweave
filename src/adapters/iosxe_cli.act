@@ -1131,6 +1131,55 @@ actor _ConfigSession(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, lines: list[
         _finish(e)
 
 
+actor CliMock():
+    """A device for the IOS XE CLI adapter in mock mode.
+
+    run answers a command with the output that set_reply gave it, or as IOS
+    XE answers a command that it does not know. type_text answers what a
+    configuration session types, with the prompts of a device: a line is
+    accepted and kept unless set_reply gave it an output, as for a line
+    that the device rejects.
+    """
+    var replies: dict[str, str] = {}
+    var commands: list[str] = []
+    var configured: list[str] = []
+
+    def set_reply(command: str, output: str) -> None:
+        replies[command] = output
+
+    def get_commands() -> list[str]:
+        return commands
+
+    def get_configured() -> list[str]:
+        return configured
+
+    def run(command: str) -> str:
+        commands.append(command)
+        reply = replies.get(command)
+        if reply is not None:
+            return reply
+        return "\r\n\r\n\r\nLine has invalid autocommand \"" + command + "\""
+
+    def type_text(text: str) -> str:
+        if text == "":
+            return "\r\n\r\n\r\nRouter#"
+        if text == "configure terminal":
+            return "configure terminal\r\nEnter configuration commands, one per line.  End with CNTL/Z.\r\nRouter(config)#"
+        if text == "end":
+            return "end\r\nRouter#"
+        reply = replies.get(text)
+        if reply is not None:
+            return reply
+        configured.append(text)
+        return text + "\r\nRouter(config)#"
+
+
+def mock_mode(dmc: DeviceMetaConfig, env: ?Env) -> bool:
+    """Return True if the adapter runs against a CliMock: without an
+    environment, or for a device in mock mode."""
+    return env is None or dmc.mock.enabled or len(dmc.mock.module) > 0
+
+
 actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?Env,
                      command_timeout: float, rpc_timeout: float):
     """Run the commands of one device and turn their output into YANG data.
@@ -1138,7 +1187,8 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
     A change of the address, the credentials or the SSH settings starts a
     login. When the login succeeds, the driver reports its modules to
     DeviceMgr with its device type. When it fails, the driver reports a lost
-    connection and tries again later.
+    connection and tries again later. In mock mode, the driver runs the
+    commands against a CliMock.
     """
     _log = logging.Logger(log_handler)
     tcp = _tcp(env)
@@ -1147,13 +1197,32 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
     var configured = False
     var generation = 0
     var closed = False
+    var mock: ?CliMock = None
+
+    def get_mock() -> ?CliMock:
+        return mock
 
     def _session(command: ?str, timeout: float, done: action(?str, ?Exception) -> None):
         d = dmc
-        if d is not None and tcp is not None and not closed:
+        m = mock
+        if m is not None:
+            done(m.run(command) if command is not None else "", None)
+        elif d is not None and tcp is not None and not closed:
             _Session(tcp, d, command, timeout, done)
         else:
             done(None, NotConnectedError("the IOS XE CLI adapter has no SSH connection settings"))
+
+    def _mock_configure(m: CliMock, lines: list[str], done: action(?str, ?Exception) -> None):
+        """Type lines into the CliMock with a ConfigDialog."""
+        dialog = ConfigDialog(lines)
+        queue = [""]
+        while len(queue) > 0 and not dialog.finished():
+            text = queue[0]
+            queue = queue[1:]
+            for typed in dialog.received(m.type_text(text)):
+                queue.append(typed.rstrip())
+        err = dialog.error
+        done(dialog.transcript, CommandError(err) if err is not None else None)
 
     def _login(gen: int, delay: float):
         if closed or gen != generation:
@@ -1179,6 +1248,13 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
         if closed:
             return
         dmc = new_dmc
+        if mock_mode(new_dmc, env):
+            if mock is None:
+                generation += 1
+                mock = CliMock()
+                async dev.on_connect(modules(), None, new_dmc.type)
+            return
+        mock = None
         selected = gdata.FNode(children=[gdata.FNode(gdata.Id(_RFS_NS, name))
                                        for name in ["address", "credentials", "ssh"]])
         new_settings = gdata.filter(new_dmc.to_gdata(), selected)
@@ -1244,7 +1320,10 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
             else:
                 cb(gdata.Container({}), None)
         d = dmc
-        if d is not None and tcp is not None and not closed:
+        m = mock
+        if m is not None:
+            _mock_configure(m, lines, received)
+        elif d is not None and tcp is not None and not closed:
             _ConfigSession(tcp, d, lines, received)
         else:
             received(None, NotConnectedError("the IOS XE CLI adapter has no SSH connection settings"))
@@ -1291,6 +1370,13 @@ class IosXeCliAdapter(DeviceAdapter):
 
     def set_dmc(self, new_dmc: DeviceMetaConfig):
         self._driver.set_dmc(new_dmc)
+
+    def supports_mocking(self) -> bool:
+        return True
+
+    proc def get_mock(self) -> ?CliMock:
+        """Return the CliMock that the adapter runs against in mock mode."""
+        return self._driver.get_mock()
 
     def configure(self, done, new_diff, new_conf, running_conf):
         done(ConfigError("the IOS XE CLI adapter does not configure devices", new_diff, new_conf), None)
