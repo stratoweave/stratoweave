@@ -20,7 +20,7 @@ import adapters.iosxe_cli_data as xecli_data
 import adapters.iosxe_cli_yang as xecli_yang
 import adapters.netconf as swna
 import device_oper as swdevoper
-from adapters.adapter import DeviceAdapter, MockAdapter
+from adapters.adapter import DeviceAdapter, MockAdapter, NotConnectedError
 from device_schema import DeviceSchema
 from device_meta_config import stratoweave_rfs__device_entry as Dmc, \
     stratoweave_rfs__device__credentials as Credentials, \
@@ -208,6 +208,39 @@ CONFIG_REPLIES = {
     "hostnme Router": "hostnme Router\r\n                    ^\r\n% Invalid input detected at '^' marker.\r\n\r\nRouter(config)#",
     "end": "end\r\nRouter#",
 }
+
+## install remove inactive on a C1111 with 17.15.04c: the output up to the
+## question, and after the answer y
+REMOVE_BEFORE = _crlf(r"""install_remove: START Tue Nov 10 13:57:06 UTC 2026
+install_remove: Removing IMG
+Cleaning up unnecessary package files
+No path specified, will use booted path /bootflash/packages.conf
+
+Cleaning /bootflash
+  Scanning boot directory for packages ... done.
+  Preparing packages list to delete ...
+    [R0]: /bootflash/packages.conf File is in use, will not delete.
+    [R0]: /bootflash/c1100-mono-universalk9.17.15.04c.SPA.pkg File is in use, will not delete.
+    [R0]: /bootflash/c1100-universalk9.17.15.04c.SPA.conf File is in use, will not delete.
+    [R0]: /bootflash/c1100-rpboot.17.15.04c.SPA.pkg File is in use, will not delete.
+
+The following files will be deleted:
+    [R0]: /bootflash/c1100-universalk9.17.15.04c.SPA.bin
+    [R0]: /bootflash/c1100-mono-universalk9.17.09.05a.SPA.pkg
+    [R0]: /bootflash/c1100-rpboot.17.09.05a.SPA.pkg
+
+Do you want to remove the above files? [y/n]""")
+REMOVE_AFTER = _crlf(r"""
+
+Deleting file /bootflash/c1100-universalk9.17.15.04c.SPA.bin ... done.
+Deleting file /bootflash/c1100-mono-universalk9.17.09.05a.SPA.pkg ... done.
+Deleting file /bootflash/c1100-rpboot.17.09.05a.SPA.pkg ... done.
+SUCCESS: Files deleted.
+
+--- Starting Post_Remove_Cleanup ---
+Performing REMOVE_POSTCHECK on all members
+Finished Post_Remove_Cleanup
+SUCCESS: install_remove Tue Nov 10 13:57:46 UTC 2026""")
 
 ## write memory
 WRITE_MEMORY = "Building configuration...\r\n[OK]\r\n"
@@ -576,8 +609,8 @@ def _dialog(lines: list[str], replies: dict[str, str], piece: int) -> (typed: li
     the device prints. The device output arrives in pieces of piece
     characters."""
     d = xecli.ConfigDialog(lines)
-    typed: list[str] = []
-    queue = [""]
+    typed = [t.rstrip() for t in d.start()]
+    queue = list(typed)
     while len(queue) > 0 and len(typed) < 20:
         command = queue[0]
         queue = queue[1:]
@@ -594,8 +627,7 @@ def _dialog(lines: list[str], replies: dict[str, str], piece: int) -> (typed: li
 
 def _test_config_dialog():
     rejected = "hostnme Router: % Invalid input detected at '^' marker."
-    locked = {"": CONFIG_REPLIES[""],
-              # Constructed: the device answers configure terminal without a
+    locked = {# Constructed: the device answers configure terminal without a
               # configuration prompt.
               "configure terminal": "configure terminal\r\n% Configuration mode is locked\r\nRouter#"}
     cases = [
@@ -615,6 +647,177 @@ def _test_config_dialog():
         testing.assertEqual(got.typed, typed, name)
         testing.assertEqual(got.error, error, name)
         testing.assertTrue(got.finished, name + ": finished")
+
+
+def _test_looks_like_prompt():
+    cases = [
+        ("Router#", True),
+        ("Router(config)#", True),
+        ("Router(config-if)#", True),
+        ("c1111>", True),
+        ("C8000V-1#", True),
+        ("#", False),
+        ("##########", False),
+        ("Router #", False),
+        ("% Invalid input detected at '^' marker.", False),
+        ("[OK]", False),
+        ("", False),
+    ]
+    for line, want in cases:
+        testing.assertEqual(xecli.looks_like_prompt(line), want, line)
+
+
+def _test_command_output():
+    cases = [
+        ("output, then the prompt", "show version\r\nCisco IOS XE Software\r\nRouter#", "Cisco IOS XE Software\r"),
+        ("no output", "terminal length 0\r\nRouter#", ""),
+        ("an empty line", "\r\nRouter#", ""),
+        ("still running", "verify /md5 bootflash:a.bin\r\n.......", None),
+        ("only the echo", "show version", None),
+        ("the prompt of another mode", "end\r\nRouter(config)#", None),
+        ("the prompt in the output", "show history\r\nRouter#\r\n  show version\r\n", None),
+        ("the prompt without its line", "show version\r\nRouter#show", None),
+    ]
+    for name, text, want in cases:
+        testing.assertEqual(xecli.command_output(text, "Router#"), want, name)
+
+
+actor _test_session(t: testing.EnvT):
+    """A CliSession against a CliMock: commands run one at a time in the
+    order they came, configure types into configure terminal, and a closed
+    session fails the commands that come after."""
+    t.timeout(10.0)
+    m = _mock({"show version": SHOW_VERSION})
+    var outputs: list[str] = []
+    var finished = False
+    var session: ?xecli.CliSession = None
+
+    def finish(err: ?Exception):
+        if not finished:
+            finished = True
+            if err is not None:
+                t.failure(err)
+            else:
+                t.success()
+
+    def after_close(output: ?str, err: ?Exception):
+        try:
+            testing.assertTrue(isinstance(err, NotConnectedError), "a closed session fails the command")
+            testing.assertEqual(m.get_commands(), ["show version", "show versoin", "show version"])
+            testing.assertEqual(m.get_configured(), ["hostname Router"])
+        except Exception as e:
+            finish(e)
+            return
+        finish(None)
+
+    def collect(output: ?str, err: ?Exception):
+        if err is not None:
+            finish(err)
+            return
+        outputs.append(output if output is not None else "")
+        if len(outputs) < 4:
+            return
+        s = session
+        try:
+            testing.assertTrue("Cisco IOS XE Software, Version 17.18.02" in outputs[0], "the output of show version")
+            testing.assertTrue("% Invalid input detected" in outputs[1], "an unknown command: " + outputs[1])
+            testing.assertTrue(outputs[2].endswith("Router#"), "configure ends at the exec prompt")
+            testing.assertEqual(outputs[3], outputs[0], "show version after configure")
+        except Exception as e:
+            finish(e)
+            return
+        if s is not None:
+            s.close()
+            s.run("show version", 2.0, after_close)
+
+    def ready():
+        s = session
+        if s is not None:
+            s.run("show version", 2.0, collect)
+            s.run("show versoin", 2.0, collect)
+            s.configure(["hostname Router"], collect)
+            s.run("show version", 2.0, collect)
+
+    def ended(err: Exception):
+        finish(err)
+
+    session = xecli.CliSession(None, Dmc("xe", Credentials("admin", "admin")), m, 2.0, ready, ended)
+
+
+def _test_install_answers():
+    question = [(question=xecli.REMOVE_QUESTION, answer="y")]
+    cases = [
+        ("remove inactive", xecli_data.stratoweave_iosxe_cli__install__input(
+            remove=xecli_data.stratoweave_iosxe_cli__install__input__remove(inactive=True)), question),
+        ("remove a file", xecli_data.stratoweave_iosxe_cli__install__input(
+            remove=xecli_data.stratoweave_iosxe_cli__install__input__remove(file="bootflash:a.bin")), question),
+        ("commit", xecli_data.stratoweave_iosxe_cli__install__input(commit=True), []),
+    ]
+    for name, inp, want in cases:
+        testing.assertEqual(xecli.InstallCall(inp).answers(), want, name)
+
+
+actor _test_session_answers_a_question(t: testing.EnvT):
+    """A command that stops at a question in its answers gets the answer, and
+    its output goes on to the prompt."""
+    t.timeout(10.0)
+    m = xecli.CliMock()
+    m.set_question("install remove inactive", REMOVE_BEFORE, "y", REMOVE_AFTER)
+    var session: ?xecli.CliSession = None
+
+    def removed(output: ?str, err: ?Exception):
+        try:
+            if err is not None:
+                raise err
+            text = output if output is not None else ""
+            testing.assertTrue(xecli.REMOVE_QUESTION + "y" in text, "the answer follows the question")
+            testing.assertTrue(text.rstrip().endswith("SUCCESS: install_remove Tue Nov 10 13:57:46 UTC 2026"), text)
+            xecli.check_install_output(text)
+        except Exception as e:
+            t.failure(e)
+            return
+        t.success()
+
+    def ready():
+        s = session
+        if s is not None:
+            s.run("install remove inactive", 2.0, removed, [(question=xecli.REMOVE_QUESTION, answer="y")])
+
+    def ended(err: Exception):
+        t.failure(err)
+
+    session = xecli.CliSession(None, Dmc("xe", Credentials("admin", "admin")), m, 2.0, ready, ended)
+
+
+actor _test_adapter_remove(t: testing.EnvT):
+    """The install RPC with remove answers the question of the device."""
+    t.timeout(10.0)
+    m = xecli.CliMock()
+    m.set_question("install remove inactive", REMOVE_BEFORE, "y", REMOVE_AFTER)
+    var dev: ?swdev.DeviceMgr = None
+
+    def removed(out: ?xecli_data.stratoweave_iosxe_cli__install__output, err: ?Exception):
+        try:
+            if err is not None:
+                raise err
+            testing.assertEqual(out.reloading if out is not None else None, False)
+            testing.assertEqual(m.get_commands(), ["install remove inactive"])
+        except Exception as e:
+            t.failure(e)
+            return
+        t.success()
+
+    def connected():
+        d = dev
+        if d is not None and xecli_yang.MODULE in d.get_modules().0:
+            r = xecli_data.rpc_root(swdev.DeviceTreeProvider(d))
+            r.install(removed, xecli_data.stratoweave_iosxe_cli__install__input(
+                remove=xecli_data.stratoweave_iosxe_cli__install__input__remove(inactive=True)))
+            return
+        after 0.01: connected()
+
+    dev = _mock_device(t, m)
+    connected()
 
 
 def _test_check_config_line():
@@ -890,73 +1093,16 @@ def _test_rpc_call():
         testing.assertTrue(got.startswith(want), name + ": " + got)
 
 
-actor _FakeXe(t: testing.EnvT, replies: dict[str, str], on_listen: action(int) -> None):
-    """An SSH server that answers exec commands with captured C8000V output.
-
-    It answers a command it does not know as IOS XE does.
-    """
-    var commands: list[str] = []
-
-    def _on_listen(s: ssh.Server, err: ?str):
-        if err is not None:
-            on_listen(0)
-        else:
-            on_listen(int(s.bound_port()))
-
-    def _on_server_close(s: ssh.Server, reason: str):
-        pass
-
-    def _on_session(session: ssh.ServerSession):
-        pass
-
-    def _on_auth(session: ssh.ServerSession, request: ssh.AuthRequest):
-        if request.method == "password" and request.user == "admin" and request.password == "admin":
-            session.accept_auth()
-        else:
-            session.reject_auth("invalid credentials")
-
-    def _on_data(channel: ssh.ServerChannel, data: ?bytes):
-        pass
-
-    def _on_channel_close(channel: ssh.ServerChannel, reason: str):
-        pass
-
-    def _on_channel(session: ssh.ServerSession):
-        session.accept_channel(ssh.ServerChannel(session, _on_data, _on_data, _on_channel_close))
-
-    def _on_exec(session: ssh.ServerSession, channel: ssh.ServerChannel, command: str):
-        commands.append(command)
-        channel.accept_request()
-        reply = replies.get(command)
-        if reply is not None:
-            channel.write(reply.encode())
-        else:
-            channel.write(_crlf("\n\n\nLine has invalid autocommand \"" + command + "\"").encode())
-        channel.send_exit_status(0)
-        channel.close()
-
-    def get_commands() -> list[str]:
-        return commands
-
-    server = ssh.Server(net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))),
-                        "127.0.0.1", u16(0), _on_listen, _on_server_close,
-                        _on_session, _on_auth, _on_channel, _on_exec)
-
-    def close():
-        server.close()
-
-
 actor _test_adapter_install(t: testing.EnvT):
     """The install RPC and a read of the version and the install summary
-    together, through DeviceMgr, against a local SSH server."""
+    together, through DeviceMgr."""
     t.timeout(10.0)
     image = "bootflash:" + SIGNED_IMAGE
-    replies = {
+    m = _mock({
         "show version": SHOW_VERSION,
         "show install summary": INSTALL_SUMMARY,
         "install add file " + image: _crlf("\n\n"),
-    }
-    var server: ?_FakeXe = None
+    })
     var dev: ?swdev.DeviceMgr = None
     var rpcs: ?xecli_data.rpc_root = None
     var finished = False
@@ -965,9 +1111,6 @@ actor _test_adapter_install(t: testing.EnvT):
         if finished:
             return
         finished = True
-        s = server
-        if s is not None:
-            s.close()
         if err is not None:
             t.failure(err)
         else:
@@ -978,9 +1121,7 @@ actor _test_adapter_install(t: testing.EnvT):
             if err is not None:
                 raise err
             testing.assertEqual(out.reloading if out is not None else None, False)
-            s = server
-            if s is not None:
-                testing.assertEqual(s.get_commands(), ["show version", "show install summary", "install add file " + image])
+            testing.assertEqual(m.get_commands(), ["show version", "show install summary", "install add file " + image])
         except Exception as e:
             finish(e)
             return
@@ -1010,17 +1151,8 @@ actor _test_adapter_install(t: testing.EnvT):
             return
         after 0.01: connected()
 
-    def on_reconf(name: str):
-        pass
-
-    def listening(port: int):
-        if port == 0:
-            finish(ValueError("the SSH server did not start"))
-            return
-        dev = _device(t, _fast_adapter, on_reconf, "127.0.0.1", port, Credentials("admin", "admin"))
-        connected()
-
-    server = _FakeXe(t, replies, listening)
+    dev = _mock_device(t, m)
+    connected()
 
 
 actor _test_mock_mode(t: testing.EnvT):
@@ -1119,6 +1251,32 @@ def _fast_adapter(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, dmc: Dmc, 
                                  command_timeout=2.0, rpc_timeout=2.0)
 
 
+def _mock(replies: dict[str, str]) -> xecli.CliMock:
+    """Return a CliMock that answers the commands in replies."""
+    m = xecli.CliMock()
+    for command, output in replies.items():
+        m.set_reply(command, output)
+    return m
+
+
+def _mock_adapter(m: xecli.CliMock) -> proc(swdev.DeviceMgr, DeviceSchema, Dmc, swdev.SchemaRegistry, logging.Handler, ?Env) -> DeviceAdapter:
+    """Return an adapter type whose adapters run against m."""
+    def adapter(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, dmc: Dmc, registry: swdev.SchemaRegistry,
+                log_handler: logging.Handler, env: ?Env) -> DeviceAdapter:
+        return xecli.IosXeCliAdapter(dev, bundled_schema, dmc, registry, log_handler, None,
+                                     command_timeout=2.0, rpc_timeout=2.0, mock=m)
+    return adapter
+
+
+def _mock_device(t: testing.EnvT, m: xecli.CliMock) -> swdev.DeviceMgr:
+    """Return a DeviceMgr for one device whose CLI runs against m."""
+    schema = yang.compile(xecli_yang.models)
+    types = {"iosxe-cli": swdev.DeviceType("iosxe-cli", _mock_adapter(m), schema, oper_src_dnode=schema)}
+    dev = swdev.DeviceMgr(types, t.env, "xe", t.log_handler, lambda name: None, swdev.SchemaRegistry())
+    dev.set_dmc(Dmc("xe", Credentials("admin", "admin"), type="iosxe-cli"))
+    return dev
+
+
 def _device(t: testing.EnvT, adapter_type: proc(swdev.DeviceMgr, DeviceSchema, Dmc, swdev.SchemaRegistry, logging.Handler, ?Env) -> DeviceAdapter,
             on_reconf: action(str) -> None, address: str, port: int, credentials: Credentials,
             ssh: ?Ssh=None) -> swdev.DeviceMgr:
@@ -1135,15 +1293,14 @@ def _device(t: testing.EnvT, adapter_type: proc(swdev.DeviceMgr, DeviceSchema, D
 
 
 actor _test_adapter_reads_and_checksums(t: testing.EnvT):
-    """Reads of each node and verify RPCs through DeviceMgr, against a local SSH server."""
+    """Reads of each node and verify RPCs through DeviceMgr."""
     t.timeout(10.0)
-    replies = {
+    m = _mock({
         "dir bootflash:": DIR_BOOTFLASH,
         "show version": SHOW_VERSION,
         "verify /md5 bootflash:" + IMAGE: VERIFY_MD5,
         "verify /md5 bootflash:no-such-file.bin": VERIFY_MISSING,
-    }
-    var server: ?_FakeXe = None
+    })
     var dev: ?swdev.DeviceMgr = None
     var rpcs: ?xecli_data.rpc_root = None
     var finished = False
@@ -1152,9 +1309,6 @@ actor _test_adapter_reads_and_checksums(t: testing.EnvT):
         if finished:
             return
         finished = True
-        s = server
-        if s is not None:
-            s.close()
         if err is not None:
             t.failure(err)
         else:
@@ -1165,15 +1319,12 @@ actor _test_adapter_reads_and_checksums(t: testing.EnvT):
             testing.assertTrue(isinstance(err, xecli.CommandError), "a missing file is a command error")
             if err is not None:
                 testing.assertTrue(err.error_message.startswith("%Error computing MD5 hash"), err.error_message)
-            s = server
-            if s is not None:
-                # The first connection only logs in.
-                testing.assertEqual(s.get_commands(), [
-                    "dir bootflash:",
-                    "show version",
-                    "verify /md5 bootflash:" + IMAGE,
-                    "verify /md5 bootflash:no-such-file.bin",
-                ])
+            testing.assertEqual(m.get_commands(), [
+                "dir bootflash:",
+                "show version",
+                "verify /md5 bootflash:" + IMAGE,
+                "verify /md5 bootflash:no-such-file.bin",
+            ])
         except Exception as e:
             finish(e)
             return
@@ -1230,17 +1381,85 @@ actor _test_adapter_reads_and_checksums(t: testing.EnvT):
             return
         after 0.01: connected()
 
-    def on_reconf(name: str):
+    dev = _mock_device(t, m)
+    connected()
+
+
+actor _FakeXe(t: testing.EnvT, replies: dict[str, str], on_listen: action(int) -> None):
+    """An SSH server that acts as the shell of an IOS XE device. It prints a
+    prompt, echoes each line that the client types, and answers it with the
+    output in replies, or as IOS XE answers a command that it does not know.
+    It accepts the terminal commands of a session. It takes the password
+    admin of the user admin only.
+    """
+    var commands: list[str] = []
+    var typed = b""
+
+    def _on_listen(s: ssh.Server, err: ?str):
+        if err is not None:
+            on_listen(0)
+        else:
+            on_listen(int(s.bound_port()))
+
+    def _on_server_close(s: ssh.Server, reason: str):
         pass
 
-    def listening(port: int):
-        if port == 0:
-            finish(ValueError("the SSH server did not start"))
-            return
-        dev = _device(t, _fast_adapter, on_reconf, "127.0.0.1", port, Credentials("admin", "admin"))
-        connected()
+    def _on_session(session: ssh.ServerSession):
+        pass
 
-    server = _FakeXe(t, replies, listening)
+    def _on_auth(session: ssh.ServerSession, request: ssh.AuthRequest):
+        if request.method == "password" and request.user == "admin" and request.password == "admin":
+            session.accept_auth()
+        else:
+            session.reject_auth("invalid credentials")
+
+    def _run(channel: ssh.ServerChannel, line: str):
+        if line == "":
+            channel.write(b"\r\nRouter#")
+            return
+        if line.startswith("terminal "):
+            channel.write((line + "\r\nRouter#").encode())
+            return
+        commands.append(line)
+        output = (" " * (len(line) + 7)) + "^\r\n% Invalid input detected at '^' marker.\r\n"
+        reply = replies.get(line)
+        if reply is not None:
+            output = reply
+        end = "" if output.endswith("\n") else "\r\n"
+        channel.write((line + "\r\n" + output + end + "Router#").encode())
+
+    def _on_data(channel: ssh.ServerChannel, data: ?bytes):
+        if data is not None:
+            typed += data
+        cr = typed.find(b"\r")
+        while cr >= 0:
+            line = typed[:cr].decode().strip()
+            typed = typed[cr + 1:]
+            _run(channel, line)
+            cr = typed.find(b"\r")
+
+    def _on_stderr(channel: ssh.ServerChannel, data: ?bytes):
+        pass
+
+    def _on_channel_close(channel: ssh.ServerChannel, reason: str):
+        pass
+
+    def _on_channel(session: ssh.ServerSession):
+        session.accept_channel(ssh.ServerChannel(session, _on_data, _on_stderr, _on_channel_close))
+
+    def _on_shell(session: ssh.ServerSession, channel: ssh.ServerChannel, pty: ?ssh.PtyRequest):
+        channel.accept_request()
+        channel.write(b"\r\nRouter#")
+
+    def get_commands() -> list[str]:
+        return commands
+
+    server = ssh.Server(net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))),
+                        "127.0.0.1", u16(0), _on_listen, _on_server_close,
+                        _on_session, _on_auth, _on_channel, on_shell=_on_shell)
+
+    def close():
+        server.close()
 
 
 MODEL_PRIMARY = r"""module xe-primary {
