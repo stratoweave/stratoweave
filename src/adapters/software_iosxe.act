@@ -363,6 +363,33 @@ def staged_file(root: ?ygdata.Node, filename: str) -> bool:
     return False
 
 
+def free_space(root: ?ygdata.Node) -> ?u64:
+    """Return the free bytes of bootflash: in root, from a listing over
+    NETCONF, which counts in KiB, or over the CLI. None when the listing has
+    no sizes."""
+    for q in ixoper.root.from_gdata(root).cisco_platform_software.q_filesystem:
+        p = q.partitions.get("bootflash:")
+        if p is not None:
+            total = p.total_size
+            used = p.used_size
+            if total is not None and used is not None and total >= used:
+                return (total - used) * u64(1024)
+    fs = xecli_data.root.from_gdata(root).file_systems.file_system.get("bootflash:")
+    if fs is not None:
+        return fs.free
+    return None
+
+
+def room_needed(image_size: ?u64) -> ?u64:
+    """Return the free space that the transfer and the add of an image need,
+    or None without an image size. The add unpacks the image into packages
+    next to it: on a C1111 the packages of 17.15.06 take 807 MB, 1.1 times
+    the 735 MB image. So the room is 2.2 times the image."""
+    if image_size is not None:
+        return image_size * u64(11) // u64(5)
+    return None
+
+
 def staged_size(root: ?ygdata.Node, filename: str) -> ?u64:
     """Return the size of filename on bootflash: in root, from a listing
     over NETCONF or over the CLI, or None when the listing has no size for
@@ -605,6 +632,10 @@ def abort_input(uuid: str) -> ixrpc.Cisco_IOS_XE_install_rpc__abort__input:
     return ixrpc.Cisco_IOS_XE_install_rpc__abort__input(uuid=uuid)
 
 
+def remove_inactive_input(uuid: str) -> ixrpc.Cisco_IOS_XE_install_rpc__remove__input:
+    return ixrpc.Cisco_IOS_XE_install_rpc__remove__input(uuid=uuid, inactive=True)
+
+
 #############################################################################
 # The adapter
 #############################################################################
@@ -651,6 +682,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     # The conversion to install mode committed the release with its
     # activation, so commit has nothing left to do and abort cannot undo it.
     var _committed = False
+    # What a remove goes on with: "stage" lists bootflash again and
+    # transfers, "cleanup" ends the job.
+    var _after_remove = ""
 
     def _finish(err: ?Exception) -> None:
         d = _done
@@ -861,8 +895,64 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             elif staged_file(root, _filename):
                 _verify(gen, True)
             else:
-                _transfer()
+                _transfer_with_room(root, False)
         dev.get(listed, bootflash_filter(plan.listing))
+
+    def _transfer_with_room(root: ?ygdata.Node, removed: bool) -> None:
+        """Transfer the image when bootflash has room for it and for the
+        packages that the add makes of it. Without the room, remove the
+        software that the device does not run, once, and look again: the
+        running release stays. Without an image size or a free space, just
+        transfer."""
+        need = room_needed(dev.get_dmc().software.image_size)
+        free = free_space(root)
+        if need is None or free is None or free! >= need!:
+            _transfer()
+        elif removed:
+            _fail("bootflash: has {free} bytes free, the image and its packages need {need}")
+        else:
+            _log.info("software: removing inactive software to make room", {"free": free, "need": need})
+            _remove_inactive("stage")
+
+    def _list_again() -> None:
+        """After a remove that made room: list bootflash, then transfer."""
+        _enter("stage")
+        gen = _gen
+        def listed(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!))
+            else:
+                _transfer_with_room(root, True)
+        dev.get(listed, bootflash_filter(upgrade_plan(_modules()).listing))
+
+    def _remove_inactive(after_remove: str) -> None:
+        """Remove the software that the device does not run and the image
+        files that it does not use, with the NETCONF remove RPC or else over
+        the CLI. Then go on as after_remove says."""
+        _enter("remove")
+        _after_remove = after_remove
+        how = upgrade_plan(_modules()).install
+        if how == "cli":
+            gen = _gen
+            def removed(err: ?Exception) -> None:
+                if gen != _gen:
+                    return
+                if err is not None:
+                    _fail(swdev.error_text(err!))
+                    return
+                _log.info("software: remove done")
+                _end_phase()
+            _cli_install(removed, xecli_data.stratoweave_iosxe_cli__install__input(
+                remove=xecli_data.stratoweave_iosxe_cli__install__input__remove(inactive=True)))
+            return
+        if how != "netconf":
+            _fail("the device has no way to remove software: no {INSTALL_MODULE} and no CLI adapter")
+            return
+        # Nothing to remove completes as a no-op, which is fine.
+        _log.info("software: removing inactive software", {"uuid": _uuid})
+        _rpcs.remove(_on_rpc(_gen, poll_period), remove_inactive_input(_uuid))
 
     def _verify(gen: int, before_transfer: bool) -> None:
         c = _check
@@ -1318,6 +1408,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             _after_add()
         elif _phase == "stage":
             _verify(_gen, False)
+        elif _phase == "remove" and _after_remove == "stage":
+            _list_again()
         else:
             _finish(None)
 
@@ -1348,9 +1440,13 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     ####################################################################
 
     def cleanup(done: action(?Exception) -> None) -> None:
-        # Keep the previous image for manual recovery.
-        _log.info("software: cleanup is not implemented, continuing")
-        done(None)
+        """Remove the software that the device does not run and the image
+        files that it does not use. The manager calls it after the commit,
+        when the release that passed the post-checks is the one to keep,
+        and the next upgrade needs the room."""
+        if not _start("cleanup", done, _release):
+            return
+        _remove_inactive("cleanup")
 
 
 class IosXeSoftwareAdapter(swdev.SoftwareAdapter):
