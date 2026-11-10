@@ -292,6 +292,110 @@ actor _test_campaign_link_routes_existing_inventory(t: testing.AsyncT):
     after 8.0: fail("timed out waiting for linked campaign")
 
 
+def _test_campaign_function_keeps_its_output():
+    """The campaign's transform function returns the intent of the members
+    in its last output, the members the campaign released. A campaign that
+    does not run has none."""
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    inventory = _with_nightly(_flat_inventory(names))
+    linked = inventory.to_gdata()
+    prev = cfs.campaign_config(_paced_campaign(names), inventory, {"cpe-2"}).to_gdata()
+    testing.assertEqual(cfs.released_in(prev, _paced_campaign(names)), {"cpe-2"},
+                        "the last output holds cpe-2")
+    empty = cfs.campaign_config(_paced_campaign(names), inventory, set()).to_gdata()
+    cases: list[(str, str, ?gdata.Node, gdata.Node)] = [
+        ("run, prev holds cpe-2", "run", prev, prev),
+        ("run, no prev", "run", None, empty),
+        ("plan, with prev", "plan", prev, empty),
+    ]
+    for case in cases:
+        campaign = _paced_campaign(names)
+        campaign.admin_state = case.1
+        out = cfs.UpgradeCampaign().transform(campaign, linked, case.2).to_gdata()
+        testing.assertEqual(out, case.3, case.0)
+
+    # With nothing changed the wrapper returns the last output itself, so
+    # TTT skips the members.
+    wrapped = cfs.UpgradeCampaign().transform_wrapper(
+        _paced_campaign(names).to_gdata(), linked, None, None, prev)
+    testing.assertTrue(ttt.same_node(wrapped.0, prev), "the wrapper returns prev itself")
+
+
+actor _test_campaign_edit_keeps_its_output(t: testing.AsyncT):
+    """An edit of a running campaign keeps the target release of a member
+    that the campaign released. The edit runs the campaign's transform
+    function, and its output replaces what the actor wrote."""
+    root = _with_images(y_0.root())
+    root.fleet.device.create(
+        "cpe-1",
+        type="iosxe",
+        credentials=InputCredentials(username="admin"),
+    )
+    tr = stratoweave.test_main(sysspec.SYSSPEC, t.log_handler)
+    var done = False
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def target() -> ?str:
+        """cpe-1's target release in the layer below the campaigns."""
+        lower = y_1.root.from_gdata(tr.cfs.below().newsession().get_data())
+        flotilla = lower.rfs.get(cfs.flotilla_of("cpe-1"))
+        if flotilla is not None:
+            out = flotilla.device.get("cpe-1")
+            if out is not None:
+                return out.software.target_release
+        return None
+
+    def on_edit(result) -> None:
+        if isinstance(result, Exception):
+            fail("campaign edit failed: {result}")
+            return
+        # Read before the actor writes its output again after the edit.
+        release = target()
+        if release == "17.18.03a":
+            if not done:
+                done = True
+                t.success()
+        else:
+            fail("the edit removed cpe-1's target release: {release}")
+
+    def released(attempts: int) -> None:
+        if done:
+            return
+        if target() == "17.18.03a":
+            campaign = root.software.upgrade_campaign.get("xe-upgrade")
+            if campaign is not None:
+                campaign.target_concurrency = u64(2)
+            tr.edit_config(root.to_gdata(), on_edit)
+        elif attempts > 0:
+            after 0.25: released(attempts - 1)
+        else:
+            fail("the campaign did not release cpe-1")
+
+    def on_campaign(result) -> None:
+        if isinstance(result, Exception):
+            fail("campaign create failed: {result}")
+            return
+        released(20)
+
+    def on_inventory(result) -> None:
+        if isinstance(result, Exception):
+            fail("inventory edit failed: {result}")
+            return
+        campaign = root.software.upgrade_campaign.create(
+            "xe-upgrade",
+            admin_state="run",
+        )
+        campaign.device.create("cpe-1", image=IMAGE)
+        tr.edit_config(root.to_gdata(), on_campaign)
+
+    tr.edit_config(root.to_gdata(), on_inventory)
+    after 8.0: fail("timed out waiting for the campaign edit")
+
+
 mut def _lab_device() -> InputDevice:
     """Return a device with every option set."""
     credentials: InputCredentials = InputCredentials(

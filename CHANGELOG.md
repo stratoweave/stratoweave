@@ -347,6 +347,10 @@
   first, and a deadline needs about the concurrency it needed before.
   Windows that close together share in proportion to the upgrade time
   waiting in them. [#770]
+- Fixed an edit of a campaign, or of its schedules, images, redundancy
+  groups or member devices, removing the software intent of the devices
+  that the campaign had released, until the campaign wrote it again a
+  moment later. An upgrade that had not reached its install could fail.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
