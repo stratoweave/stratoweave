@@ -401,7 +401,7 @@
   `extra-adapter` list with the type, address, port, credentials and SSH
   settings of each, which the transforms pass to the device on its
   flotilla. The flotillas register the device type `iosxe-cli`, the IOS XE
-  CLI adapter, so an IOS XE device can have the CLI beside NETCONF.
+  CLI adapter, so an IOS XE device can have the CLI beside NETCONF. [#779]
 
 ### Dependencies
 
