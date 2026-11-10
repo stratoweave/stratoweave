@@ -254,7 +254,7 @@
   CLI, and checks a staged image with the CLI adapter's `verify`: against
   the image checksum of the intent, sha512 before md5, or else against the
   signature that the image holds. A device that can compute no checksum
-  compares the size of the staged file with `software/image-size`.
+  compares the size of the staged file with `software/image-size`. [#781]
 - IOS XE prepare and install can run again at any time and do only what is
   left. A release that the device has added needs no image file, and a
   staged file that passes its check stays; a missing or failing file is
@@ -262,10 +262,10 @@
   device has added, and a release that the device runs activated and not
   committed is committed instead of reported up to date. When install add
   refuses an image as bad, the adapter deletes the file over NETCONF, so the
-  next run transfers it again.
+  next run transfers it again. [#781]
 - IOS XE staging waits up to 2 minutes for adapters of the device that are
   not connected, such as a CLI adapter that connects after NETCONF, before it
-  picks how to run.
+  picks how to run. [#781]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
