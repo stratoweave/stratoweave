@@ -5,10 +5,12 @@
 ### Core
 - Transform actors can write their output to the layer below at any time
   with `write_output`, each write in its own transaction. Enable it with
-  `sw:direct-output` under `sw:transform`. The transform function should
-  then return an empty output, or the output is repeated. A write is
-  replayed after a conflicting commit. `fleetmgr.cfs.UpgradeCampaignTransform`
-  is an example. [#698] [#731]
+  `sw:direct-output` under `sw:transform`. The transform function then gets
+  the output written last, `prev_output`, and should return what the actor
+  would write for its input, so a recompute keeps the actor's output. A
+  write is replayed after a conflicting commit.
+  `fleetmgr.cfs.UpgradeCampaignTransform` is an example. [#698] [#731]
+  [#783]
 - A transform's output replaces the configuration it wrote before, instead of
   being applied as a diff. Fixed source deletion, concurrent edits, restored
   list membership and subscriptions on newly committed list elements. [#680]
@@ -365,6 +367,58 @@
   first, and a deadline needs about the concurrency it needed before.
   Windows that close together share in proportion to the upgrade time
   waiting in them. [#770]
+- Fixed an edit of a campaign, or of its schedules, images, redundancy
+  groups or member devices, removing the software intent of the devices
+  that the campaign had released, until the campaign wrote it again a
+  moment later. An upgrade that had not reached its install could fail.
+  [#783]
+- Campaigns acquire their members in `plan` and in `run`. Each member in
+  the fleet gets the campaign's name, its target release and image URL, and
+  a veto with the holder `campaign:NAME`, which holds the install. So each
+  member reads the release it runs and answers `up-to-date` or
+  `upgrade-needed`, and nothing is installed. A member added to a running
+  campaign is acquired the same way. In `run`, the campaign removes a
+  member's veto when it releases the member, and puts it back when the
+  member is done. Before, a campaign wrote nothing until it released a
+  member in a window. [#783]
+- A device in the fleet is in one campaign at most, also while the
+  campaign is in `plan` and after it is done. An edit that names a device
+  in a second campaign fails with "Cannot merge leaves with different
+  values at /software/upgrade-campaign". To move a device, remove it from
+  its campaign, or delete the campaign, in an earlier edit. A device that
+  is not in the fleet gets nothing from a campaign, so two campaigns can
+  name it; the edit that adds it to the fleet then fails with the same
+  error until only one campaign names it. [#783]
+- A campaign's `device-status` shows a member's status only when the status
+  is for the campaign's intent, its name and the member's target release,
+  and `pending` otherwise. Its new `upgrade-campaign` and `target-release`
+  say which intent the device's status is for. The counters count only
+  those statuses. Before, a `succeeded` left from an earlier campaign made
+  a member done at its release, with no upgrade. [#783]
+- Setting a running campaign back to `plan` pauses it: members in flight
+  stop before their install, and are released again when the campaign runs
+  again. A member that still reports `in-progress` for the campaign when it
+  runs again, or after a restart of fleetmgr, counts in flight and keeps
+  the campaign's veto until it is done, or until it stops before its
+  install. Stopping a campaign and running it again no longer retries its
+  failed members. To retry a member, remove it from the campaign, wait
+  until the device's software state has no `upgrade-campaign`, and add it
+  again: the campaign takes it as a new member. [#783]
+- `allow-staging` on a campaign is no longer passed to the devices. [#783]
+- A campaign releases a member only once the member's status answers the
+  campaign's target: `upgrade-needed`, or a final status. Until then the
+  plan holds the member in its window, with the alarm "N device(s) have not
+  answered the campaign's target", and the members after it in its
+  redundancy groups with "N device(s) wait behind a redundancy group member
+  that has not answered". `unknown` and `pending` are no answer. A campaign
+  in `plan` plans again as its members answer, and plans a run that starts
+  now, so its plan shows what `run` would do. So a member added to a
+  running campaign waits until it has read the release it runs, and is then
+  planned and released. A campaign created directly in `run` promises its
+  windows in the order its members answer; create it in `plan` first to
+  keep the campaign's order. A decision that only starts devices still
+  takes the last plan again when the plan's only alarms are for held
+  devices. [#783]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -571,6 +625,9 @@
   `target-release` and `image-url`. Add the images to `/images/image`, with
   their `version`, set `/images/url-base`, and name an image for each member.
   [#743]
+- A device can be in one Fleet Manager campaign only. Before you upgrade,
+  remove each device that two campaigns name from one of them. Otherwise
+  Fleet Manager cannot load its configuration and does not start. [#783]
 
 ## [26.10] - 2026-10-23
 

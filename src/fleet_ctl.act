@@ -45,6 +45,15 @@ def is_failure(status: ?str) -> bool:
     return status == "failed" or status == "rolled-back"
 
 
+def is_answer(status: ?str) -> bool:
+    """True when the status answers the campaign's target: the device
+    needs the upgrade, or its status is final. No status, unknown and
+    in-progress are no answer."""
+    if status == "upgrade-needed":
+        return True
+    return is_final(status)
+
+
 def names_text(names: list[str]) -> str:
     """The first names of a list, for an alarm."""
     shown = ", ".join(names[:ALARM_NAMES])
@@ -236,11 +245,14 @@ class Plan(object):
 
     c is the concurrency the run uses. starts gives each waiting device
     that starts the window it starts in, as an index into the
-    controller's windows, and the time. held gives each device that waits
-    behind a failed or down redundancy group member the window promised to
-    it, or else the first window of its schedule that has not closed, and
-    the earliest time it could start there. alarms says which promises the
-    run breaks and which devices are held."""
+    controller's windows, and the time. held gives each device that is
+    held the window promised to it, or else the first window of its
+    schedule that has not closed, and the earliest time it could start
+    there. A device is held while it waits behind a failed or down
+    redundancy group member, while it has not answered the campaign's
+    target, and while it waits behind a group member that has not
+    answered. alarms says which promises the run breaks and which devices
+    are held."""
     c: int
     starts: dict[str, (int, int)]
     held: dict[str, (int, int)]
@@ -344,11 +356,33 @@ class Controller(object):
     start. A member that failed or is down holds the other waiting members
     of its groups, and a held member holds the members after it in its
     other groups. A member that is down while it upgrades holds no one:
-    the plan expects it back up when its upgrade ends. A held device keeps
-    the window promised to it, and the plan gives an alarm for it. A held
-    device without a promise gets none while it is held: the plan shows it
-    in the first window of its schedule that has not closed, and other
-    devices can take that window.
+    the plan expects it back up when its upgrade ends.
+
+    A device starts only when its latest report answers the campaign's
+    target: it needs the upgrade, or its status is final. A device that
+    has not answered is held, also before a run, and it holds the members
+    after it in its redundancy groups. It is looked at again when it
+    answers. So a plan made before the first run shows what that run would
+    do if it started now. After a run, a copy of the controller that starts
+    a new run shows what the new run would do.
+
+    A waiting device that reports in-progress during a run still upgrades
+    from before the run: a pause or a restart did not stop it. The run
+    takes it in flight at once, in the first window of its schedule that
+    has not closed, so it holds a slot and its redundancy groups until it
+    is done. resumed has it: the campaign keeps holding it, so it stops if
+    it has not reached its install, and its upgrade gives no pace sample.
+    When it reports upgrade-needed, it stopped before its install, and it
+    waits again.
+
+    drop() forgets the devices that left the campaign. A device that
+    joins again is then a new member: it waits until it answers, and
+    starts in a window.
+
+    A held device keeps the window promised to it, and the plan gives an
+    alarm for it. A held device without a promise gets none while it is
+    held: the plan shows it in the first window of its schedule that has
+    not closed, and other devices can take that window.
 
     The observed pace is kept at the scale of the campaign's estimate: an
     upgrade that took twice its device's estimate counts as twice the
@@ -484,6 +518,14 @@ class Controller(object):
     final_at: dict[str, int]
     # The final status of the reports in final_at.
     final_status: dict[str, str]
+    # The devices whose latest report answers the campaign's target.
+    answered: set[str]
+    # The devices whose latest report is in-progress, with the time the
+    # first of those reports came.
+    progress: dict[str, int]
+    # Released devices that a run took in flight because they still
+    # upgraded from before the run.
+    resumed: set[str]
     # The devices done whose upgrade failed or rolled back, and the
     # devices known down.
     failed: set[str]
@@ -540,9 +582,9 @@ class Controller(object):
     last_est: int
     held: bool
     # The last plan when a decision can take it again: made during a run,
-    # with its promises settled and no alarm. From the step at quiet_from
-    # until quiet_until the run ahead only starts devices; anything that
-    # comes in ends that time.
+    # with its promises settled and no alarm other than for held devices.
+    # From the step at quiet_from until quiet_until the run ahead only
+    # starts devices; anything that comes in ends that time.
     last_plan: ?Plan
     quiet_from: int
     quiet_until: int
@@ -586,6 +628,9 @@ class Controller(object):
         self.running = False
         self.final_at = {}
         self.final_status = {}
+        self.answered = set()
+        self.progress = {}
+        self.resumed = set()
         self.failed = set()
         self.down = set()
         self.reported = set()
@@ -687,7 +732,9 @@ class Controller(object):
         """Begin a run: nothing is released or promised, the observed
         pace is observed_s or else the campaign's estimate, the ramp is at
         rung devices, the concurrency at the target, and a device may start
-        now. The reports and the configuration stay."""
+        now. The reports, the answers among them, and the configuration
+        stay. The run takes in flight each device that still reports
+        in-progress (take_running)."""
         self.running = True
         self.released = set()
         self.released_at = {}
@@ -697,6 +744,7 @@ class Controller(object):
         self.done_at = {}
         self.reported = set()
         self.no_upgrade = set()
+        self.resumed = set()
         self.failed = set()
         self.promised = {}
         self.promise_seq = {}
@@ -707,6 +755,10 @@ class Controller(object):
         self.held = False
         self.quiet_until = 0
         self.rebuild()
+        for name in self.order:
+            at = self.progress.get(name)
+            if at is not None:
+                self.take_running(name, at)
 
     def set_pace(self, pace: int) -> None:
         """Set the observed pace and the slow time to pace, as if each of
@@ -766,6 +818,64 @@ class Controller(object):
         if i is not None:
             self.release(name, at, i)
             self.quiet_until = 0
+
+    def take_running(self, name: str, at: int) -> None:
+        """Take in flight a waiting device that reported in-progress at time
+        at: it still upgrades from before the run. It is released at at in
+        the first window of its schedule that had not closed then, and holds
+        its slot and its redundancy groups until it is done. A device whose
+        schedule has no such window stays held."""
+        for j in self.windows_of.get_def(name, []):
+            if at < self.windows[j].2:
+                self.release(name, at, j)
+                self.resumed.add(name)
+                self.quiet_until = 0
+                return
+
+    def take_back(self, name: str) -> None:
+        """A device that the run took in flight because it reported
+        in-progress stopped before its install: it waits again, as if it
+        had not been released."""
+        self.resumed.discard(name)
+        self.released.discard(name)
+        self.released_at.pop(name)
+        self.released_in.pop(name)
+        self.released_est.pop(name)
+        self.due.pop(name)
+        self.reported.discard(name)
+        self.no_upgrade.discard(name)
+        self.quiet_until = 0
+        self.rebuild()
+
+    def drop(self, names: set[str]) -> None:
+        """Forget all that the run knows of the devices in names, which left
+        the campaign: their release, their reports and answers, and whether
+        they are done or failed. A device that joins the campaign again is
+        then a new member: it waits until it answers, and starts in a
+        window. configure() alone keeps this for a device that leaves, so
+        that its report still counts."""
+        if len(names) == 0:
+            return
+        for name in names:
+            self.released.discard(name)
+            self.released_at.pop(name)
+            self.released_in.pop(name)
+            self.released_est.pop(name)
+            self.due.pop(name)
+            self.done_at.pop(name)
+            self.final_at.pop(name)
+            self.final_status.pop(name)
+            self.progress.pop(name)
+            self.promised.pop(name)
+            self.promise_seq.pop(name)
+            self.answered.discard(name)
+            self.resumed.discard(name)
+            self.failed.discard(name)
+            self.reported.discard(name)
+            self.no_upgrade.discard(name)
+            self.overdue.discard(name)
+        self.quiet_until = 0
+        self.rebuild()
 
     def rebuild(self) -> None:
         """Derive the windows, queues and counts from the configuration
@@ -876,7 +986,13 @@ class Controller(object):
         """Take the latest status of a device, which came at time at. A
         final report after another final report keeps the time of the
         first. A failed device that reports a success is done again at that
-        time, and no longer holds the other members of its groups."""
+        time, and no longer holds the other members of its groups. The
+        device has answered the campaign's target while its latest status
+        is an answer. A waiting device that reports in-progress during a
+        run still upgrades from before the run, and the run takes it in
+        flight (take_running). If it reports upgrade-needed before it is
+        done, it stopped before its install, and it waits again
+        (take_back)."""
         if status is not None and is_final(status):
             if name not in self.final_at:
                 self.final_at[name] = at
@@ -895,9 +1011,40 @@ class Controller(object):
                 self.quiet_until = 0
         elif name in self.final_at:
             self.lost(name)
+        if status == "in-progress":
+            if name not in self.progress:
+                self.progress[name] = at
+        elif name in self.progress:
+            del self.progress[name]
+        if status == "upgrade-needed" and name in self.resumed and name not in self.done_at:
+            self.take_back(name)
+        self.take_answer(name, is_answer(status))
+        if status == "in-progress" and self.running and name in self.est \
+           and name not in self.released:
+            self.take_running(name, self.progress[name])
+
+    def take_answer(self, name: str, answers: bool) -> None:
+        """Take whether the latest status of a device answers the campaign's
+        target. A waiting device that starts to answer is looked at again,
+        once its groups let it start. A change of answer of a waiting
+        device ends the quiet time; a released device's answer counts for
+        nothing, so its change does not."""
+        if answers == (name in self.answered):
+            return
+        if answers:
+            self.answered.add(name)
+            if name in self.parked and self.gate(name) >= 0:
+                self.parked.discard(name)
+                self.look_again(name)
+        else:
+            self.answered.discard(name)
+        if name in self.est and name not in self.released:
+            self.quiet_until = 0
 
     def lost(self, name: str) -> None:
         """Forget the status of a device."""
+        self.take_answer(name, False)
+        self.progress.pop(name)
         if name in self.final_at:
             del self.final_at[name]
             del self.final_status[name]
@@ -911,6 +1058,8 @@ class Controller(object):
         """Forget the status of every device."""
         self.final_at = {}
         self.final_status = {}
+        self.answered = set()
+        self.progress = {}
         self.reported = set()
         self.no_upgrade = set()
         self.dues = sorted([(self.due[name], name) for name in self.flying])
@@ -935,11 +1084,15 @@ class Controller(object):
         return self.separation.get_def(g, (False, 0)).1
 
     def gate(self, name: str) -> int:
-        """The time from which the redundancy groups of a waiting device let
-        it start, or -1 while it must wait for them: while the member before
-        it in a group is not done, or a member of its groups, itself
-        included, is in flight, down or failed. The time is when the member
-        before it was done, and the group's min-separation after that."""
+        """The time from which a waiting device may start, or -1 while it
+        must wait: while it has not answered the campaign's target, or
+        while its redundancy groups hold it. A group holds it while the
+        member before it in the group is not done, or a member of its
+        groups, itself included, is in flight, down or failed. The time is
+        when the member before it was done, and the group's min-separation
+        after that."""
+        if name not in self.answered:
+            return -1
         if name not in self.groups_of:
             return 0
         gs = self.groups_of[name]
@@ -984,14 +1137,16 @@ class Controller(object):
                         out.add(d)
         return out
 
-    def stuck(self) -> (list[str], list[str]):
+    def stuck(self) -> (list[str], list[str], list[str]):
         """The waiting devices that no concurrency can start: the ones held
-        behind a member of their redundancy groups that failed, and the
-        ones held behind a member that is down; each with the devices
-        after them. A failure report holds the other members at once,
+        behind a member of their redundancy groups that failed, the ones
+        held behind a member that is down, and the ones that have not
+        answered the campaign's target; each with the devices after them.
+        A device that has not answered holds only the members after it in
+        its groups. A failure report holds the other members at once,
         before a step marks the device done. A member that is down while
         it upgrades is expected to come back up when its upgrade ends,
-        until it reports."""
+        until it reports. Each device is in the first list that has it."""
         later: dict[str, list[str]] = {}
         for name, bs in self.before.items():
             if name not in self.released:
@@ -1007,17 +1162,25 @@ class Controller(object):
         for name in self.down:
             if name not in self.flying or name in self.reported:
                 down.add(name)
+        unanswered: set[str] = set()
+        for name in self.order:
+            if name not in self.released and name not in self.answered:
+                unanswered.add(name)
         behind_failed = follow(self.waiting_members(failed), later)
         behind_down = follow(self.waiting_members(down), later)
+        behind_unanswered = follow(unanswered, later)
         after_failed: list[str] = []
         after_down: list[str] = []
+        after_unanswered: list[str] = []
         for name in self.order:
             if name not in self.released:
                 if name in behind_failed:
                     after_failed.append(name)
                 elif name in behind_down:
                     after_down.append(name)
-        return (after_failed, after_down)
+                elif name in behind_unanswered:
+                    after_unanswered.append(name)
+        return (after_failed, after_down, after_unanswered)
 
     def duration(self, name: str) -> int:
         """The expected duration of a device's upgrade at the observed
@@ -1168,11 +1331,11 @@ class Controller(object):
 
     def try_start(self, name: str, i: int, t: int, end: int, n: int,
                   started: list[str], c: int) -> int:
-        """Start the device name in window i at t if it waits, its groups
-        let it start, it fits and the stagger at concurrency c lets it
-        start. Park it while it must wait for its groups, and keep it until
-        its separation has passed. Return the slots left, 0 when the
-        stagger holds it."""
+        """Start the device name in window i at t if it waits, gate() lets
+        it start, it fits and the stagger at concurrency c lets it start.
+        Park it while it must wait for its answer or its groups, and keep
+        it until its separation has passed. Return the slots left, 0 when
+        the stagger holds it."""
         if name in self.released:
             return n
         if n == 0:
@@ -1229,8 +1392,9 @@ class Controller(object):
             if is_failure(self.final_status.get(name)):
                 self.failed.add(name)
             # At the scale of the campaign's estimate; an upgrade that
-            # ends when it was expected to leaves the pace as it is.
-            if ran and end != self.due.get_def(name, end + 1):
+            # ends when it was expected to leaves the pace as it is. An
+            # upgrade from before the run has no known start.
+            if ran and name not in self.resumed and end != self.due.get_def(name, end + 1):
                 took = imax(1, imax(1, end - at) * self.estimate_s
                             // self.released_est.get_def(name, self.estimate_s))
                 n = len(self.took_s)
@@ -1513,6 +1677,10 @@ class Controller(object):
         c.running = self.running
         c.final_at = {k: v for k, v in self.final_at.items()}
         c.final_status = {k: v for k, v in self.final_status.items()}
+        # The run ahead reports into its copy.
+        c.answered = copy_set(self.answered)
+        c.progress = {k: v for k, v in self.progress.items()}
+        c.resumed = copy_set(self.resumed)
         c.failed = copy_set(self.failed)
         c.down = copy_set(self.down)
         c.reported = copy_set(self.reported)
@@ -1824,15 +1992,19 @@ class Controller(object):
         promises and the concurrency."""
         self.move_promises(t)
         # The devices that no concurrency can start keep their windows, but
-        # break no promise. They are looked at again when their groups let
-        # them start.
+        # break no promise. The ones held by their groups are looked at
+        # again when their groups let them start. The ones held for an
+        # answer are not parked here: parked, they would be looked at again
+        # in the order they answer, not in the campaign's order.
         stuck = self.stuck()
         skip: set[str] = set()
         for name in stuck.0 + stuck.1:
             skip.add(name)
             self.parked.add(name)
+        for name in stuck.2:
+            skip.add(name)
         s = self.copy()
-        held = s.held_windows(stuck.0 + stuck.1, t)
+        held = s.held_windows(stuck.0 + stuck.1 + stuck.2, t)
         c, run, b = s.choose(t, skip)
         settled = False
         for _round in range(PLAN_ROUNDS):
@@ -1858,6 +2030,21 @@ class Controller(object):
         if len(stuck.1) > 0:
             alarms.append("{len(stuck.1)} device(s) wait while a redundancy group member is "
                           + "down: {names_text(stuck.1)}")
+        own: list[str] = []
+        behind: list[str] = []
+        for name in stuck.2:
+            if name in self.answered:
+                behind.append(name)
+            else:
+                own.append(name)
+        if len(own) > 0:
+            alarms.append("{len(own)} device(s) have not answered the campaign's target: "
+                          + names_text(own))
+        if len(behind) > 0:
+            alarms.append("{len(behind)} device(s) wait behind a redundancy group member that "
+                          + "has not answered: {names_text(behind)}")
+        # A plan whose only alarms are for held devices can be taken again.
+        n_hold = len(alarms)
         at_max = " even at max-concurrency {self.maxc}" if c >= self.maxc else ""
         missed = b.0
         if len(missed) > 0:
@@ -1882,7 +2069,7 @@ class Controller(object):
                           + "longer than the time left in every window of their schedule: "
                           + names_text(short))
         p = Plan(c, starts, held, alarms)
-        self.last_plan = p if self.running and settled and len(alarms) == 0 else None
+        self.last_plan = p if self.running and settled and len(alarms) == n_hold else None
         return p
 
     def windows_too_short(self, names: list[str], t: int) -> list[str]:
@@ -1915,15 +2102,19 @@ class Controller(object):
 
     def decide(self, t: int) -> Step:
         """Plan at time t and take the plan's first step. The last plan
-        holds when it has no alarm, nothing came in since the last step,
-        and from that step until t the run ahead only starts devices: no
-        report counts, no device is due, and no window opens or closes.
-        Then the decision takes that plan again, without the devices that
-        started since, and only starts the devices it starts now."""
+        holds when it has no alarm other than for held devices, nothing
+        came in since the last step, and from that step until t the run
+        ahead only starts devices: no report counts, no device is due, and
+        no window opens or closes. A status of a device in flight that is
+        not final, such as in-progress, brings in nothing. Then the
+        decision takes that plan again, without the devices that started
+        since, with the held devices at the earliest times they could
+        start from t, and only starts the devices it starts now."""
         last = self.last_plan
         if last is not None and self.quiet_from <= t and t < self.quiet_until:
             p = Plan(last.c, {name: s for name, s in last.starts.items()
-                              if name not in self.released}, last.held, last.alarms)
+                              if name not in self.released},
+                     self.held_windows(list(last.held.keys()), t), last.alarms)
             self.last_plan = p
         else:
             p = self.plan(t)

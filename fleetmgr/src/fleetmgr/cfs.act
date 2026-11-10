@@ -372,22 +372,40 @@ class Schedules(base.Schedules):
         return base.o_root()
 
 
+# The reason of the veto a campaign puts on its members. It is the same in
+# plan, while a member waits and after it is done, so the veto entry does
+# not change when the campaign starts to run.
+CAMPAIGN_VETO_REASON = "waiting for its release by the campaign"
+
+
+def veto_holder(campaign: str) -> str:
+    """Return the holder of the veto that the campaign puts on its
+    members."""
+    return "campaign:" + campaign
+
+
 def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_entry,
                    i: y_0.software__software__upgrade_campaign_entry,
-                   image: y_0.stratoweave_images__images__image_entry, url_base: ?str) -> None:
+                   image: ?y_0.stratoweave_images__images__image_entry, url_base: ?str,
+                   held: bool) -> None:
     """Write the software intent of campaign i for one device to its
-    flotilla: the release of the device's image, the URL to fetch it
-    from, url_base followed by the image name, and its checksums and
-    size."""
+    flotilla. The intent is the campaign's name, the release of the
+    device's image, the URL to fetch it from, url_base followed by the
+    image name, and the image's checksums and size. Without an image, only
+    the name is written. When held is true, the campaign's veto is written
+    too: the device reads the release it runs, but does not install the
+    target."""
     software = o.rfs.create(flotilla_of(fleet_device.name)).device.create(fleet_device.name).software
-    software.target_release = image.version
     software.upgrade_campaign = i.name
-    if url_base is not None and url_base != "":
-        software.image_url = url_base + image.name
-    for c in image.checksum:
-        software.image_checksum.create(c.algorithm, digest=c.digest)
-    software.image_size = image.size
-    software.allow_staging = i.allow_staging
+    if image is not None:
+        software.target_release = image.version
+        if url_base is not None and url_base != "":
+            software.image_url = url_base + image.name
+        for c in image.checksum:
+            software.image_checksum.create(c.algorithm, digest=c.digest)
+        software.image_size = image.size
+    if held:
+        software.veto.create(veto_holder(i.name), reason=CAMPAIGN_VETO_REASON)
 
 
 def member_image(inventory: y_0.root, name: ?str) -> ?y_0.stratoweave_images__images__image_entry:
@@ -402,20 +420,52 @@ def member_image(inventory: y_0.root, name: ?str) -> ?y_0.stratoweave_images__im
     return None
 
 
+def member_targets(i: y_0.software__software__upgrade_campaign_entry,
+                   inventory: y_0.root) -> dict[str, str]:
+    """Return the target release that campaign i writes for each member: the
+    version of the member's image. A member that is not in the fleet, or
+    whose image is not in the image list or has no version, has none."""
+    targets: dict[str, str] = {}
+    for member in i.device:
+        if inventory.fleet.device.get(member.name) is not None:
+            image = member_image(inventory, member.image)
+            if image is not None:
+                version = image.version
+                if version is not None:
+                    targets[member.name] = version
+    return targets
+
+
 def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory: y_0.root,
-                    released: set[str]) -> y_1_loose.root:
-    """Return the software intent of campaign i for its members in released.
-    A campaign that does not run has no configuration, and a member whose
-    image is not in the image list, or has no version, gets none."""
+                    unheld: set[str], names: ?set[str]) -> y_1_loose.root:
+    """Return the software intent of campaign i for its members, or only for
+    the members in names when names is not None.
+
+    Each member in the fleet gets the campaign's name, and the target
+    release and image URL of its image when the image is in the image list
+    and has a version. Each member also gets the campaign's veto, except
+    when the campaign runs and the member is in unheld, the members in
+    flight. A member that is not in the fleet gets nothing."""
     o = base.o_root()
-    if i.admin_state == "run":
-        for member in i.device:
-            if member.name in released:
-                fleet_device = inventory.fleet.device.get(member.name)
-                if fleet_device is not None:
-                    image = member_image(inventory, member.image)
-                    if image is not None:
-                        route_software(o, fleet_device, i, image, inventory.images.url_base)
+    run = i.admin_state == "run"
+    url_base = inventory.images.url_base
+    members: list[y_0.software__software__upgrade_campaign__device_entry] = []
+    if names is not None:
+        for name in names:
+            m = i.device.get(name)
+            if m is not None:
+                members.append(m)
+    else:
+        for m in i.device:
+            members.append(m)
+    for member in members:
+        fleet_device = inventory.fleet.device.get(member.name)
+        if fleet_device is not None:
+            held = True
+            if run and member.name in unheld:
+                held = False
+            route_software(o, fleet_device, i, member_image(inventory, member.image),
+                           url_base, held)
     return o
 
 
@@ -450,9 +500,78 @@ def image_alarms(i: y_0.software__software__upgrade_campaign_entry, inventory: y
     return alarms
 
 
+def unheld_in(prev: ?ygdata.Node, i: y_0.software__software__upgrade_campaign_entry) -> set[str]:
+    """Return the devices that prev, the output campaign i wrote last, gives
+    the campaign's name without the campaign's veto: the members in flight.
+    A campaign that does not run has none."""
+    unheld: set[str] = set()
+    if i.admin_state == "run" and prev is not None:
+        holder = veto_holder(i.name)
+        o = y_1_loose.root.from_gdata(prev)
+        for flotilla in o.rfs:
+            for dev in flotilla.device:
+                if dev.software.upgrade_campaign == i.name and dev.software.veto.get(holder) is None:
+                    unheld.add(dev.name)
+    return unheld
+
+
+def release_patch(output: ygdata.Node, i: y_0.software__software__upgrade_campaign_entry,
+                  inventory: y_0.root, old: set[str], new: set[str]) -> ?ygdata.Node:
+    """Return output, the intent of campaign i with the members in old in
+    flight, changed to have the members in new in flight. Only the members
+    in one set and not in the other change: a member that goes in flight
+    loses the campaign's veto, and a member that leaves flight gets it
+    back. Return None when nothing changes.
+
+    The change is a diff, because a patch removes a veto entry only when it
+    says that the entry is absent."""
+    changed: set[str] = set()
+    for name in old:
+        if name not in new:
+            changed.add(name)
+    for name in new:
+        if name not in old:
+            changed.add(name)
+    if len(changed) == 0:
+        return None
+    a = campaign_config(i, inventory, old, changed).to_gdata()
+    b = campaign_config(i, inventory, new, changed).to_gdata()
+    d = ygdata.diff(a, b)
+    if d is None:
+        return None
+    patched = ygdata.patch(output, d)
+    if patched is not None:
+        return patched
+    # The patch removed everything.
+    return base.o_root().to_gdata()
+
+
+def status_for(campaign: str, target: ?str, tag_campaign: ?str, tag_target: ?str,
+               status: ?str) -> ?str:
+    """Return status when it is for the intent of the campaign for a member
+    with the target release target: the device says that its status is for
+    this campaign and this target. Return None otherwise. Such a status
+    answers the target only when it is upgrade-needed or final; the
+    controller decides that."""
+    if target is not None and tag_campaign == campaign and tag_target == target:
+        return status
+    return None
+
+
 class UpgradeCampaign(base.UpgradeCampaign):
-    def transform(self, i, linked):
-        return base.o_root()
+    def transform(self, i, linked, prev_output):
+        """Return the software intent of campaign i for its members, as the
+        actor writes it. The members that prev_output, the output written
+        last, has in flight stay in flight. So an edit of the campaign, or
+        of its linked input, keeps what the actor wrote.
+
+        The output gives each member in the fleet the campaign's name in the
+        operator's transaction. So an edit that puts a device of the fleet
+        in two campaigns fails: the two names do not merge. A member that is
+        not in the fleet gets nothing, so two campaigns can name it. The
+        edit that adds it to the fleet then fails, while both campaigns
+        name it."""
+        return campaign_config(i, y_0.root.from_gdata(linked), unheld_in(prev_output, i), None)
 
 
 actor UpgradeCampaignTransform(path: ttt.Path,
@@ -468,14 +587,28 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     a window opening or when an upgrade is expected to end, and the actor
     arms an exact timer for it. Each decision plans and takes the plan's
     first step, and the actor publishes that plan. Releases start small
-    and grow as devices finish without a failure. The actor sends the
-    configuration of the released devices directly.
+    and grow as devices finish without a failure.
+
+    The actor writes the intent of every member directly, in plan and in
+    run, with the campaign's veto. So each member reads the release it runs
+    and answers, but installs nothing. In run, the actor removes the veto of
+    the members in flight, and puts it back when they are done. A status
+    counts only when it is for the campaign's intent: the device reports
+    the campaign and the member's target release with it. The controller
+    releases only the members whose status answers the target,
+    upgrade-needed or a final status, and its plan holds the others with an
+    alarm. A member that still upgrades from before a pause or a restart
+    counts in flight, and keeps the veto. In plan, the actor plans what a
+    new run would do, again when what the members report changes. A member
+    that leaves the campaign is forgotten: added again, it is a new member.
     """
     var members: list[str] = []
     var member_names: set[str] = set()
-    # What each device reports: its software state and the version and
-    # model its platform has.
-    var latest: dict[str, (status: ?str, version: ?str, model: ?str, stage: ?str,
+    # What each device reports: its software state, the campaign and the
+    # target release that its status is for, and the version and model its
+    # platform has.
+    var latest: dict[str, (status: ?str, upgrade_campaign: ?str, target_release: ?str,
+                           version: ?str, model: ?str, stage: ?str,
                            reason: ?str,
                            precheck: (verdict: ?str, detail: ?str, at: ?str),
                            postcheck: (verdict: ?str, detail: ?str, at: ?str))] = {}
@@ -493,21 +626,51 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var debounce_armed = False
     var debounce_s = 0.0
     var ctl = fctl.Controller()
-    # The campaign and the inventory from the last on_conf, and the
-    # configuration they give for the released devices.
+    # The controller that made the published plan: ctl in run, and in plan
+    # a copy of it that starts a new run.
+    var shown = fctl.Controller()
+    # The campaign and the inventory from the last on_conf, the target
+    # release of each member, the output written last, and the members in
+    # flight that it was written with.
     var campaign: ?y_0.software__software__upgrade_campaign_entry = None
     var inventory = y_0.root()
+    var targets: dict[str, str] = {}
     var output: ygdata.Node = base.o_root().to_gdata()
+    var unheld: set[str] = set()
 
-    def patch_output(names: set[str]) -> None:
-        """Patch the configuration of the devices in names into output and emit it."""
+    def unheld_now() -> set[str]:
+        """Return the members in flight that run an upgrade. A member whose
+        final status came before its release runs none, so it keeps the
+        veto. So does a member that still upgrades from before the run: it
+        stops if it has not reached its install."""
+        names: set[str] = set()
+        for name in ctl.flying:
+            if name not in ctl.no_upgrade and name not in ctl.resumed:
+                names.add(name)
+        return names
+
+    def own_status(name: str, tag_campaign: ?str, tag_target: ?str, status: ?str) -> ?str:
+        """Return the status of the device name when it is for the
+        campaign's intent for the device, and None otherwise."""
         current = campaign
         if current is not None:
-            patched = ygdata.patch(output, campaign_config(current, inventory, names).to_gdata())
-            # None is an empty result: output stays empty.
-            if patched is not None:
-                output = patched
-            write_output(output)
+            return status_for(current.name, targets.get(name), tag_campaign, tag_target, status)
+        return None
+
+    def plan_now(now: int) -> None:
+        """Plan at time now. A campaign that does not run plans on a copy of
+        the controller that starts a run now, so the plan shows what run
+        would do: the members that a paused run released wait again, and
+        the ramp and the pace start over."""
+        if running:
+            shown = ctl
+        else:
+            c = ctl.copy()
+            c.start()
+            shown = c
+        p = shown.plan(now)
+        plan_layout = shown.layout(p)
+        plan_alarms = p.alarms
 
     def publish() -> None:
         oper = base.UpgradeCampaign.new_state(path)
@@ -522,15 +685,20 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             model: ?str = None
             observed = latest.get(d)
             if observed is not None:
-                status = observed.status
+                status = own_status(d, observed.upgrade_campaign, observed.target_release,
+                                    observed.status)
                 version = observed.version
                 model = observed.model
 
+            # A status that is not for this campaign's intent shows as
+            # pending, and counts nowhere.
             ds = st.device_status.create(d)
             ds.status = status if status is not None else "pending"
             ds.version = version
             ds.model = model
             if observed is not None:
+                ds.upgrade_campaign = observed.upgrade_campaign
+                ds.target_release = observed.target_release
                 ds.stage = observed.stage
                 ds.reason = observed.reason
                 ds.precheck.verdict = observed.precheck.verdict
@@ -560,10 +728,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 win.end = u64(pw.2)
             for entry in pw.3:
                 pd = win.device.create(entry.0)
-                started = ctl.released_at.get(entry.0)
+                started = shown.released_at.get(entry.0)
                 if started is not None:
                     pd.started = u64(started)
-                    finished = ctl.done_at.get(entry.0)
+                    finished = shown.done_at.get(entry.0)
                     if finished is not None:
                         pd.finished = u64(finished)
                 else:
@@ -593,10 +761,21 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             else:
                 after now debounce_s: publish_settled(gen)
 
+    def replan(now: int) -> None:
+        """Plan again at time now when the campaign does not run, so the
+        plan holds only the members that have not answered yet. A campaign
+        that runs plans at each decision, and one whose run has finished
+        does not plan again."""
+        current = campaign
+        if not running and current is not None:
+            configure_campaign(ctl, current, inventory, now)
+            plan_now(now)
+
     def publish_settled(gen: int) -> None:
         if gen != generation:
             return
         debounce_armed = False
+        replan(time.time().unix_s())
         publish()
 
     def on_rfs(
@@ -614,7 +793,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             if state is not None:
                 pre = state.precheck
                 post = state.postcheck
-                value = (status=state.status, version=state.platform.version,
+                value = (status=state.status, upgrade_campaign=state.upgrade_campaign,
+                         target_release=state.target_release, version=state.platform.version,
                          model=state.platform.model, stage=state.stage, reason=state.reason,
                          precheck=(verdict=pre.verdict, detail=pre.detail, at=pre.at),
                          postcheck=(verdict=post.verdict, detail=post.detail, at=post.at))
@@ -622,7 +802,11 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 # model, so a delivery can change nothing it keeps.
                 if value != latest.get(name):
                     latest[name] = value
-                    ctl.report(name, state.status, time.time().unix_s())
+                    # The controller gets only a status that is for this
+                    # campaign's intent, and None for any other.
+                    ctl.report(name, own_status(name, state.upgrade_campaign,
+                                                state.target_release, state.status),
+                               time.time().unix_s())
                     relevant = name in member_names
             else:
                 forget(name)
@@ -638,6 +822,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         if active:
             after 0.0: decide(gen)
         else:
+            # The replay's statuses came before the sync. Plan with them.
+            replan(time.time().unix_s())
             publish()
 
     def shutdown() -> None:
@@ -651,8 +837,9 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         update_oper(None)
 
     def decide(gen: int) -> None:
-        """Plan and take the plan's first step, start the devices it
-        releases, and arm the next decision at the time the step says."""
+        """Plan and take the plan's first step, lift the veto of the
+        devices it releases, put the veto back on the devices that are
+        done, and arm the next decision at the time the step says."""
         if gen != generation or not active:
             return
         debounce_armed = False
@@ -664,10 +851,17 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         if current is not None:
             configure_campaign(ctl, current, inventory, t)
         s = ctl.decide(t)
+        shown = ctl
         plan_layout = ctl.layout(s.plan)
         plan_alarms = s.plan.alarms
-        if len(s.started) > 0:
-            patch_output(set(s.started))
+        # Write only the members that went in flight or left it.
+        in_flight = unheld_now()
+        if current is not None:
+            patched = release_patch(output, current, inventory, unheld, in_flight)
+            if patched is not None:
+                output = patched
+                write_output(output)
+            unheld = in_flight
         wake = s.wake
         if not s.finished and (wake < 0 or wake > t + HORIZON_REFRESH):
             # Devices that wait for windows beyond the horizon.
@@ -693,6 +887,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         for member in conf.device:
             ms.append(member.name)
             names.add(member.name)
+        left: set[str] = set()
+        for name in member_names:
+            if name not in names:
+                left.add(name)
         members = ms
         member_names = names
         debounce_s = float(campaign_debounce_s(len(members)))
@@ -703,19 +901,34 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         # The released devices, the ramp and the promises stay: a replan
         # goes on from where the run is.
         configure_campaign(ctl, conf, inventory, now)
+        # The controller forgets the members that left. Added again, a
+        # member waits until it answers, and starts in a window.
+        ctl.drop(left)
         run_now = conf.admin_state == "run"
         if run_now and not running:
             ctl.start()
         elif running and not run_now:
             ctl.stop()
         running = run_now
-        output = campaign_config(conf, inventory, ctl.released).to_gdata()
+        targets = member_targets(conf, inventory)
+        # A new image makes the answers for the old target stale, and no
+        # device reports that. So report every member again.
+        for name in members:
+            observed = latest.get(name)
+            if observed is not None:
+                ctl.report(name, own_status(name, observed.upgrade_campaign,
+                                            observed.target_release, observed.status),
+                           now)
+        # In plan every member is held.
+        unheld = unheld_now() if run_now else set()
+        # The members that did not change keep the nodes of the output
+        # written last. The transform function reused the same nodes, so
+        # TTT writes again only the members that this edit changed.
+        output = campaign_config(conf, inventory, unheld, None).to_gdata(
+            output if isinstance(output, ygdata.Container) else None)
         write_output(output)
         member_alarms = image_alarms(conf, inventory)
-
-        p = ctl.plan(now)
-        plan_layout = ctl.layout(p)
-        plan_alarms = p.alarms
+        plan_now(now)
 
         # New intent invalidates every armed timer. The first decision after
         # subscription sync arms the exact timers the fresh plan needs.

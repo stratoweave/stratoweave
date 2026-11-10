@@ -26,10 +26,12 @@ def controller(windows: list[(str, int, int)], devs: list[(str, int, str)], targ
                priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
                rung: int=1, close_margin: int=fleet_ctl.CLOSE_MARGIN,
                stagger: int=0) -> Controller:
-    """A controller at the start of a run."""
+    """A controller at the start of a run, every device answered that it
+    needs the upgrade."""
     c = Controller()
     c.configure(windows, devs, target, maxc, must_place, debounce, estimate, groups, priority,
                 separation, close_margin, stagger)
+    sim.answer_all(c, 0)
     c.start(rung)
     return c
 
@@ -53,6 +55,24 @@ def _test_final_statuses():
     for case in cases:
         testing.assertEqual(fleet_ctl.is_final(case.0), case.1, case.0)
     testing.assertEqual(fleet_ctl.is_final(None), False, "no status")
+
+
+def _test_answers():
+    """A status answers the campaign's target when the device needs the
+    upgrade or the status is final. No status, unknown and in-progress
+    are no answer."""
+    cases: list[(?str, bool)] = [
+        ("upgrade-needed", True),
+        ("up-to-date", True),
+        ("succeeded", True),
+        ("failed", True),
+        ("rolled-back", True),
+        (None, False),
+        ("unknown", False),
+        ("in-progress", False),
+    ]
+    for case in cases:
+        testing.assertEqual(fleet_ctl.is_answer(case.0), case.1, str(case.0))
 
 
 def _test_first_step_starts_one_device():
@@ -298,14 +318,20 @@ def plan_is_run(windows: list[(str, int, int)], devs: list[(str, int, str)], tar
 
 
 def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
-                       late: int=0) -> int:
+                       late: int=0, answers: list[(int, str)]=[],
+                       in_progress: bool=False) -> int:
     """Run c the way the campaign actor does, each decision late seconds
     after its time, next to a copy of it that plans at every decision.
     Each decision of c starts the same devices, wakes at the same time and
-    has the same plan as the copy's. Return how many decisions of c took
-    the last plan again."""
+    has the same plan as the copy's. answers holds the devices that answer
+    the campaign's target later, as (time, name): each reports to both
+    that it needs the upgrade at its time, and the next decision is one
+    debounce later at the latest. With in_progress, each device that
+    starts reports in-progress to both at its start. Return how many
+    decisions of c took the last plan again."""
     d = c.copy()
     flying: list[(int, str)] = []
+    pending = sorted(answers)
     again = 0
     t = 0
     while t <= until:
@@ -317,6 +343,14 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
             else:
                 still.append(f)
         flying = still
+        later: list[(int, str)] = []
+        for a in pending:
+            if a.0 <= t:
+                c.report(a.1, "upgrade-needed", a.0)
+                d.report(a.1, "upgrade-needed", a.0)
+            else:
+                later.append(a)
+        pending = later
         if c.last_plan is not None and c.quiet_from <= t and t < c.quiet_until:
             again += 1
         d.quiet_until = 0
@@ -327,15 +361,21 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
         testing.assertEqual(s.finished, n.finished, "finished at {t}")
         testing.assertEqual(s.plan.c, n.plan.c, "concurrency at {t}")
         testing.assertEqual(s.plan.starts, n.plan.starts, "plan at {t}")
+        testing.assertEqual(s.plan.held, n.plan.held, "held at {t}")
         testing.assertEqual(s.plan.alarms, n.plan.alarms, "alarms at {t}")
         for name in s.started:
             flying.append((t + dur_of.get_def(name, c.est.get_def(name, 1)), name))
+            if in_progress:
+                c.report(name, "in-progress", t)
+                d.report(name, "in-progress", t)
         if s.finished:
             break
         nxt = s.wake
         for f in flying:
             if nxt < 0 or f.0 + c.debounce < nxt:
                 nxt = f.0 + c.debounce
+        if len(pending) > 0 and (nxt < 0 or pending[0].0 + c.debounce < nxt):
+            nxt = pending[0].0 + c.debounce
         if nxt < 0:
             break
         t = nxt + late
@@ -527,6 +567,7 @@ def _test_promises_raise_the_concurrency_when_upgrades_run_slow():
     10 to keep them."""
     c = Controller()
     c.configure([("w", 0, HOUR)], devices("d", 50, 600, "w"), 10, 20, False, 0, 600)
+    sim.answer_all(c, 0)
     c.start(10)
     c.plan(0)
     durations = {"d{i}": 900 for i in range(50)}
@@ -641,6 +682,7 @@ def _test_a_device_without_a_promise_that_a_free_slot_passed_starts_when_it_fits
         took["f{i}"] = 90 if (i // 2) % 2 == 0 else 80
     c = Controller()
     c.configure([("w", 0, 7000)], devs, 2, 2, False, 0, 100)
+    sim.answer_all(c, 0)
     c.start(2, 300)
     testing.assertEqual(sim.planned(c, c.plan(0)).get("x"), None)
     sim.drive(c, 0, took, 7000)
@@ -948,6 +990,7 @@ def _test_new_limits_start_the_concurrency_over():
     start it over at the new target."""
     c = Controller()
     c.configure([("w", 0, HOUR)], devices("d", 50, 600, "w"), 10, 20, False, 0, 600)
+    sim.answer_all(c, 0)
     c.start(10)
     c.plan(0)
     sim.drive(c, 0, {"d{i}": 900 for i in range(50)}, 1000)
@@ -971,7 +1014,8 @@ def _test_finished_when_every_device_is_done():
 
 def _test_start_begins_a_new_run():
     """start() forgets the released devices and the ramp, and the next
-    decision starts from one device again."""
+    decision starts from one device again. d0 answers again that it needs
+    the upgrade, so it no longer has its success."""
     c = open_window(4, 2, 2)
     c.decide(0)
     c.report("d0", "succeeded", 600)
@@ -979,9 +1023,9 @@ def _test_start_begins_a_new_run():
     c.start()
     testing.assertEqual(c.released, set())
     testing.assertEqual(c.rung, 1)
-    c.report("d0", "in-progress", 700)
-    c.report("d1", "in-progress", 700)
-    c.report("d2", "in-progress", 700)
+    c.report("d0", "upgrade-needed", 700)
+    c.report("d1", "upgrade-needed", 700)
+    c.report("d2", "upgrade-needed", 700)
     testing.assertEqual(c.decide(1200).started, ["d0"])
 
 
@@ -1114,6 +1158,7 @@ def _test_a_device_fits_with_one_and_a_half_times_its_slow_time_left():
         for late in [0, 1]:
             c = Controller()
             c.configure([("w", 0, 10000)], [("x", case.0, "w")], 1, 1, False, 0, 600)
+            sim.answer_all(c, 0)
             c.start(1, case.1)
             t = 10000 - case.2 + late
             expect = ["x"] if late == 0 else []
@@ -1626,6 +1671,7 @@ def _test_a_member_added_before_a_member_in_flight_waits_for_it():
     testing.assertEqual(c.decide(0).started, ["b"])
     c.configure(wins, [("a", 600, "w"), ("b", 600, "w")], 2, 2, False, 0, 600,
                 {"g": ["a", "b"]}, {"a": 1, "b": 2})
+    sim.answer_all(c, 100)
     testing.assertEqual(c.decide(100).started, [])
     c.report("b", "succeeded", 600)
     testing.assertEqual(c.decide(600).started, ["a"])
@@ -1693,6 +1739,7 @@ def _test_a_failed_member_holds_a_member_added_before_it():
     c.decide(600)
     c.configure(wins, [("a", 600, "w"), ("b", 600, "w")], 1, 1, False, 0, 600,
                 {"g": ["a", "b"]}, {"a": 1, "b": 2})
+    sim.answer_all(c, 700)
     s = c.decide(700)
     testing.assertEqual(s.started, [])
     testing.assertEqual(s.plan.alarms,
@@ -2051,6 +2098,7 @@ def _test_a_spread_member_keeps_an_earlier_promise():
     testing.assertEqual(c.plan(0).starts["r2"].0, 0)
     c.configure(daily("day", 0, HOUR, 9), devs + devices("e", 90, 600, "day"), 10, 10, False, 1,
                 600, groups, priority, separation)
+    sim.answer_all(c, 0)
     testing.assertEqual(c.plan(0).starts["r2"].0, 0)
 
 
@@ -2212,6 +2260,348 @@ def _test_the_plan_is_the_run_chains():
     separation = {"a": (True, 0), "b": (True, 0)}
     plan_is_run(daily("day", 0, HOUR, 2), devices("d", 20, 600, "day"), 4, 8, True, 600,
                 groups, priority, separation)
+
+
+#############################################################################
+# Answers to the campaign's target
+#############################################################################
+
+def _test_an_unanswered_device_waits():
+    """d0, d1 and d2, three at a time with the ramp at three. d0's answer is
+    lost. The plan holds d0 with an alarm, and d1 and d2 start. d0's
+    answer ends the quiet time, and the plan at the next decision starts
+    d0. In a window that is open, the first decision passed d0 over, and
+    the answer looks at it again. In a window that opens at 1000, no
+    decision passed d0 over before its answer at 500: d0 starts at the
+    opening, after d1 and d2, which were promised the window first."""
+    # (the window, the devices the decision at 0 starts, d0's held window
+    # and time, the time of the answer, the time of the next decision, the
+    # devices it starts)
+    cases: list[((str, int, int), list[str], (int, int), int, int, list[str])] = [
+        (("w", 0, fleet_ctl.OPEN_END), ["d1", "d2"], (0, 0), 5, 5, ["d0"]),
+        (("w", 1000, fleet_ctl.OPEN_END), [], (0, 1000), 500, 1000, ["d1", "d2", "d0"]),
+    ]
+    for case in cases:
+        label = "a window from {case.0.1}"
+        c = controller([case.0], devices("d", 3, 600, "w"), 3, 3, rung=3)
+        c.lost("d0")
+        s = c.decide(0)
+        testing.assertEqual(s.started, case.1, label)
+        testing.assertEqual(s.plan.alarms,
+                            ["1 device(s) have not answered the campaign's target: d0"], label)
+        testing.assertEqual(s.plan.held, {"d0": case.2}, label)
+        testing.assertTrue(c.quiet_until > case.3, "quiet until {c.quiet_until}, " + label)
+        c.report("d0", "upgrade-needed", case.3)
+        testing.assertEqual(c.quiet_until, 0, label)
+        s = c.decide(case.4)
+        testing.assertEqual(s.started, case.5, label)
+        testing.assertEqual(s.plan.alarms, [], label)
+
+
+def _test_an_unanswered_device_keeps_its_promise():
+    """One at a time, a window of an hour every day. The first decision
+    starts d0 and promises d1 the first window. d1's answer is lost: d1
+    is held and keeps its promise, and the plan says that it has not
+    answered, not that it misses its window. d1 answers, and starts in the
+    first window when d0 is done."""
+    wins = daily("w", 0, HOUR, 2)
+    c = controller(wins, devices("d", 2, 600, "w"), 1, 1)
+    testing.assertEqual(c.decide(0).started, ["d0"])
+    testing.assertEqual(c.promised.get("d1"), wins[0])
+    c.lost("d1")
+    p = c.decide(100).plan
+    testing.assertEqual(p.alarms, ["1 device(s) have not answered the campaign's target: d1"])
+    testing.assertEqual(p.held, {"d1": (0, 100)})
+    testing.assertEqual(c.promised.get("d1"), wins[0])
+    c.report("d1", "upgrade-needed", 300)
+    c.report("d0", "succeeded", 600)
+    testing.assertEqual(c.decide(600).started, ["d1"])
+    testing.assertEqual(c.released_in.get("d1"), wins[0])
+
+
+def _test_a_member_behind_an_unanswered_member():
+    """a and b pack, a first, in a window that opens at 1000. The first
+    decision promises both the window. When a's answer is lost, the plan
+    holds a, and b behind it, each with its own alarm, and says that no
+    one misses the window. A member that has not answered holds only the
+    members after it: when b's answer is lost, a still starts."""
+    # (the device whose answer is lost, the alarms, the held devices, the
+    # devices the plan starts)
+    cases: list[(str, list[str], list[str], list[str])] = [
+        ("a", ["1 device(s) have not answered the campaign's target: a",
+               "1 device(s) wait behind a redundancy group member that has not answered: b"],
+         ["a", "b"], []),
+        ("b", ["1 device(s) have not answered the campaign's target: b"], ["b"], ["a"]),
+    ]
+    for case in cases:
+        c = controller([("w", 1000, fleet_ctl.OPEN_END)], [("a", 600, "w"), ("b", 600, "w")], 1,
+                       1, groups={"g": ["a", "b"]}, priority={"a": 1, "b": 2})
+        testing.assertEqual(sorted(list(c.decide(0).plan.starts.keys())), ["a", "b"], case.0)
+        c.lost(case.0)
+        p = c.decide(10).plan
+        testing.assertEqual(p.alarms, case.1, case.0)
+        testing.assertEqual(p.held, {name: (0, 1000) for name in case.2}, case.0)
+        testing.assertEqual(sorted(list(p.starts.keys())), case.3, case.0)
+
+
+def _test_the_plan_holds_unanswered_devices_before_a_run():
+    """Before a run, only d1 has answered. The plan holds d0 and d2, and
+    says so."""
+    c = Controller()
+    c.configure([("w", 0, fleet_ctl.OPEN_END)], devices("d", 3, 600, "w"), 1, 1, False, 0, 600)
+    c.report("d1", "upgrade-needed", 0)
+    p = c.plan(0)
+    testing.assertEqual(p.alarms, ["2 device(s) have not answered the campaign's target: d0, d2"])
+    testing.assertEqual(p.held, {"d0": (0, 0), "d2": (0, 0)})
+    testing.assertEqual(p.starts, {"d1": (0, 0)})
+
+
+def _test_answers_keep_the_campaign_order():
+    """One at a time, a window that opens at 100, and d1 answers before d0.
+    When both answer before the run, or in one batch after a decision of
+    the run, d0 starts first, in the campaign's order. A plan does not
+    park the devices that have not answered, or the answers would put them
+    in the order they come. In a run in which d1 answers in a batch of its
+    own, the decision after it promises d1 the window, and d1 starts
+    first: a campaign created in run promises its windows in the order its
+    members answer."""
+    # (what happens, the steps before the decision at 100, each a name and
+    # a time: start, plan, decide, or a device that answers, and the
+    # device that starts at 100)
+    cases: list[(str, list[(str, int)], str)] = [
+        ("both answer before the run",
+         [("plan", 0), ("d1", 0), ("plan", 1), ("d0", 5), ("plan", 6), ("start", 50)], "d0"),
+        ("both answer in one batch of the run",
+         [("start", 0), ("decide", 0), ("d1", 3), ("d0", 5), ("decide", 6)], "d0"),
+        ("d1 answers in a batch of its own",
+         [("start", 0), ("decide", 0), ("d1", 3), ("decide", 4), ("d0", 5), ("decide", 6)],
+         "d1"),
+    ]
+    for case in cases:
+        c = Controller()
+        c.configure([("w", 100, fleet_ctl.OPEN_END)], devices("d", 2, 600, "w"), 1, 1, False, 0,
+                    600)
+        for st in case.1:
+            if st.0 == "start":
+                c.start()
+            elif st.0 == "plan":
+                c.plan(st.1)
+            elif st.0 == "decide":
+                c.decide(st.1)
+            else:
+                c.report(st.0, "upgrade-needed", st.1)
+        testing.assertEqual(c.decide(100).started, [case.2], case.0)
+
+
+def _test_answers_before_release():
+    """x and y pack, x first, one at a time, in a window that opens at
+    1000. x reports before the window opens. A final status answers: x is
+    released at the opening, and done at the next step with no upgrade,
+    so the pace stays. A failure then holds y. in-progress says that x
+    still upgrades from before the run: x is in flight from its report,
+    and y waits for it. unknown is no answer: x is held, and y behind
+    it."""
+    not_answered = ["1 device(s) have not answered the campaign's target: x",
+                    "1 device(s) wait behind a redundancy group member that has not answered: y"]
+    # (x's report, the devices that start at 1000, the devices that start
+    # at the next step, the alarms then, whether x is done, whether it
+    # failed)
+    cases: list[(str, list[str], list[str], list[str], bool, bool)] = [
+        ("failed", ["x"], [],
+         ["1 device(s) wait behind a failed redundancy group member: y"], True, True),
+        ("up-to-date", ["x"], ["y"], [], True, False),
+        ("in-progress", [], [], [], False, False),
+        ("unknown", [], [], not_answered, False, False),
+    ]
+    for case in cases:
+        c = controller([("w", 1000, fleet_ctl.OPEN_END)], [("x", 600, "w"), ("y", 600, "w")], 1,
+                       1, groups={"g": ["x", "y"]}, priority={"x": 1, "y": 2})
+        c.report("x", case.0, 500)
+        testing.assertEqual(c.decide(1000).started, case.1, case.0)
+        s = c.decide(1001)
+        testing.assertEqual(s.started, case.2, case.0)
+        testing.assertEqual(s.plan.alarms, case.3, case.0)
+        testing.assertEqual("x" in c.done_at, case.4, case.0)
+        testing.assertEqual("x" in c.failed, case.5, case.0)
+        testing.assertEqual(c.observed_s, 600, case.0)
+        testing.assertEqual("x" in c.released, case.0 != "unknown", case.0)
+
+
+def _test_a_device_still_upgrading_holds_its_slot():
+    """One at a time, in a window that is open. d0 reports in-progress at
+    10: a run released it, and the campaign was stopped and run again, as
+    a pause does; or the report reaches a run that has started, as after a
+    restart. d0 still upgrades from before the run, so the run takes it in
+    flight from 10, keeps holding it, and d1 does not start. When d0 is
+    done, d1 starts, and d0 gave no pace sample: the start of its upgrade
+    is not known. When d0 stops before its install instead, it reports
+    upgrade-needed and waits again; d1, promised the window while d0 was
+    in flight, starts first."""
+    # (how d0 comes to report in-progress, d0's next status at 900)
+    cases: list[(str, str)] = [
+        ("pause", "succeeded"),
+        ("pause", "upgrade-needed"),
+        ("restart", "succeeded"),
+        ("restart", "upgrade-needed"),
+    ]
+    for case in cases:
+        label = "{case.0}, then {case.1}"
+        c = open_window(2, 1, 1)
+        if case.0 == "pause":
+            testing.assertEqual(c.decide(0).started, ["d0"], label)
+            c.report("d0", "in-progress", 10)
+            c.stop()
+            c.start()
+        else:
+            c.report("d0", "in-progress", 10)
+        testing.assertEqual(sorted(list(c.resumed)), ["d0"], label)
+        testing.assertEqual(sorted(list(c.flying)), ["d0"], label)
+        testing.assertEqual(c.released_at, {"d0": 10}, label)
+        s = c.decide(20)
+        testing.assertEqual(s.started, [], label)
+        testing.assertEqual(s.plan.alarms, [], label)
+        c.report("d0", case.1, 900)
+        testing.assertEqual(c.decide(900).started, ["d1"], label)
+        done = case.1 == "succeeded"
+        testing.assertEqual("d0" in c.done_at, done, label)
+        testing.assertEqual("d0" in c.released, done, label)
+        testing.assertEqual("d0" in c.resumed, done, label)
+        testing.assertEqual(c.observed_s, 600, label)
+
+
+def one_at_a_time(c: Controller, windows: list[(str, int, int)],
+                  devs: list[(str, int, str)]) -> None:
+    """Configure c again with windows and devs, one device at a time."""
+    c.configure(windows, devs, 1, 1, False, 0, 600)
+
+
+def _test_a_device_that_joins_again_is_a_new_member():
+    """d0 runs in the first of two daily windows of an hour. It fails, or
+    it leaves the campaign while in flight. It leaves, and drop() forgets
+    it. It joins again at 4000, when the window has closed: it is not in
+    flight, and the plan holds it until it answers. It then starts at the
+    next opening, not before."""
+    wins = daily("w", 0, HOUR, 2)
+    devs = devices("d", 1, 600, "w")
+    for case in ["failed", "in flight"]:
+        c = controller(wins, devs, 1, 1)
+        testing.assertEqual(c.decide(0).started, ["d0"], case)
+        if case == "failed":
+            c.report("d0", "failed", 600)
+            c.decide(600)
+            testing.assertEqual(sorted(list(c.failed)), ["d0"], case)
+        one_at_a_time(c, wins, [])
+        c.drop({"d0"})
+        one_at_a_time(c, wins, devs)
+        testing.assertEqual(len(c.released), 0, case)
+        testing.assertEqual(len(c.failed), 0, case)
+        testing.assertEqual(len(c.done_at), 0, case)
+        held = c.decide(4000)
+        testing.assertEqual(held.started, [], case)
+        testing.assertEqual(held.plan.alarms,
+                            ["1 device(s) have not answered the campaign's target: d0"], case)
+        c.report("d0", "upgrade-needed", 4100)
+        closed = c.decide(4100)
+        testing.assertEqual(closed.started, [], case)
+        testing.assertEqual(closed.wake, DAY, case)
+        testing.assertEqual(c.decide(DAY).started, ["d0"], case)
+
+
+def _test_a_lost_answer_holds_the_device_again():
+    """d0 answers up-to-date, and then reports no status. Its final status
+    is gone, and the plan holds it."""
+    c = open_window(2, 1, 1)
+    c.report("d0", "up-to-date", 0)
+    c.report("d0", None, 1)
+    testing.assertEqual("d0" in c.final_at, False)
+    p = c.plan(2)
+    testing.assertEqual(p.alarms, ["1 device(s) have not answered the campaign's target: d0"])
+    testing.assertEqual(list(p.held.keys()), ["d0"])
+
+
+def _test_lost_all_forgets_the_answers():
+    """d0 is in flight when every status is lost. The plan holds the
+    devices that wait, d1 and d2."""
+    c = open_window(3, 1, 1)
+    testing.assertEqual(c.decide(0).started, ["d0"])
+    c.lost_all()
+    testing.assertEqual(c.plan(1).alarms,
+                        ["2 device(s) have not answered the campaign's target: d1, d2"])
+
+
+def _test_a_released_device_in_progress_keeps_the_quiet_time():
+    """d0 starts. Its in-progress is no answer, but a device in flight
+    needs none, so the quiet time stays. The same status from d1, which
+    waits, says that d1 still upgrades from before the run: the run takes
+    it in flight, and the quiet time ends."""
+    # (the device that reports in-progress, whether the quiet time stays)
+    cases: list[(str, bool)] = [("d0", True), ("d1", False)]
+    for case in cases:
+        c = open_window(3, 1, 1)
+        testing.assertEqual(c.decide(0).started, ["d0"])
+        quiet = c.quiet_until
+        testing.assertTrue(quiet > 1, "quiet until {quiet}")
+        c.report(case.0, "in-progress", 1)
+        testing.assertEqual(c.quiet_until == quiet, case.1, case.0)
+
+
+def _test_a_plan_with_only_holds_is_taken_again():
+    """20 devices of 600 s in a 1 h window every day, two at a time and at
+    most four, staggered over a whole upgrade. d7 never answers, so every
+    plan holds it with an alarm. The decisions in which only devices start
+    still take the last plan again, and decide as a new plan would, also
+    when each device reports in-progress when it starts."""
+    for in_progress in [False, True]:
+        c = controller(daily("day", 0, HOUR, 9), devices("d", 20, 600, "day"), 2, 4, False, 1,
+                       stagger=100)
+        c.lost("d7")
+        again = same_as_a_new_plan(c, {}, 9 * DAY, in_progress=in_progress)
+        testing.assertTrue(again > 0, "in-progress {in_progress}: {again} decisions took the "
+                           + "plan again")
+        testing.assertEqual(sorted(list(c.released)),
+                            sorted(["d{i}" for i in range(20) if i != 7]), str(in_progress))
+
+
+def late_answers() -> list[(int, str)]:
+    """d3 answers at 300 and d8 at 1300."""
+    return [(300, "d3"), (1300, "d8")]
+
+
+def _test_the_plan_is_the_run_with_late_answers():
+    """20 devices of 600 s in a 1 h window every day, two at a time and at
+    most four. d3 and d8 answer late, the others at the start. Each
+    decision decides as a new plan would, staggered or not. Once the
+    last answer is in, the plan of that decision is the run from then
+    on."""
+    for stagger in [0, 100]:
+        c = controller(daily("day", 0, HOUR, 9), devices("d", 20, 600, "day"), 2, 4, False, 1,
+                       stagger=stagger)
+        c.lost("d3")
+        c.lost("d8")
+        same_as_a_new_plan(c, {}, 9 * DAY, answers=late_answers())
+        testing.assertEqual(len(c.done_at), 20, "stagger {stagger}")
+
+        r = controller(daily("day", 0, HOUR, 9), devices("d", 20, 600, "day"), 2, 4, False, 1,
+                       stagger=stagger)
+        r.lost("d3")
+        r.lost("d8")
+        ds = sim.drive(r, 0, {}, 9 * DAY, answers=late_answers())
+        last: ?sim.Decision = None
+        for d in ds:
+            if last is None and d.t >= 1300:
+                last = d
+        if last is not None:
+            p = last.plan
+            testing.assertEqual(p.alarms, [], "stagger {stagger}")
+            planned = sim.planned(r, p)
+            started = sim.started(r)
+            before = [n for n, st in started.items() if st.1 < last.t]
+            testing.assertEqual(len(planned) + len(before), 20,
+                                "stagger {stagger}: every device placed")
+            testing.assertEqual({n: started[n] for n in planned.keys() if n in started}, planned,
+                                "stagger {stagger}: the run after {last.t}")
+        else:
+            testing.assertTrue(False, "stagger {stagger}: no decision after the last answer")
 
 
 #############################################################################

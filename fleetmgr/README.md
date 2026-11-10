@@ -52,8 +52,9 @@ when the file was generated so the grids show no pattern, fail in one of
 the mock's seven ways, two per kind, and `cpe-003` already runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
 campaign over the 99 devices `upgrade.xml` does not use, bound to a
 `nightly` schedule with a one-hour window at midnight UTC, so the web UI
-has a plan to show; it does nothing until set to `run`, and then waits
-for the window. `demo-images.xml` fills the image list with test IOS XE
+has a plan to show. When the demo starts, each of its members reads the
+release it runs, and the campaign holds every install until it is set to
+`run` and its window opens. `demo-images.xml` fills the image list with test IOS XE
 images; `just demo-fleet` loads it too. Both demos keep image files
 uploaded in the web UI in `out/images`. The processes use these ports:
 
@@ -141,6 +142,56 @@ The submission and observation steps are also available separately:
 
 Set `FLEETMGR_API` to point these targets at a top node on another address.
 
+## Campaigns
+
+A campaign acquires its members as soon as it exists, in `plan` and in
+`run`. Each member in the fleet gets the campaign's name, the target
+release and image URL of its image, and a veto with the holder
+`campaign:NAME`, which holds the install. The member reads the release it
+runs and answers `up-to-date` or `upgrade-needed`. Nothing is installed. A
+member added later, also while the campaign runs, is acquired the same way.
+In `run`, the campaign removes the veto of a member when it releases the
+member in a window, and puts the veto back when the member is done.
+
+A member's `device-status` shows its status only when the status is for
+the campaign's intent: the device reports it for the campaign's name and
+the member's target release. Otherwise it shows `pending`, and the counters
+do not count it. Its `upgrade-campaign` and `target-release` say which
+intent the device's status is for.
+
+The campaign releases a member only once the member has answered its
+target: its status is `upgrade-needed`, or a final status. A member that
+shows `pending` or `unknown` has not answered. Until it answers, the plan
+holds the member in its window, and the plan's alarms name it. A campaign
+in `plan` plans again as the answers come in. Its plan is that of a run
+that starts now, so it shows what `run` would do. A campaign created
+directly in `run` promises its windows in the order its members answer.
+Create it in `plan` first to keep the campaign's order.
+
+A device in the fleet is in one campaign at most, also while the campaign
+is in `plan` and after it is done. An edit that names a device in a second
+campaign fails with "Cannot merge leaves with different values at
+/software/upgrade-campaign". To move a device to another campaign, first
+remove it from its campaign, or delete the campaign. Then add it to the
+other campaign in a later edit. A move in one edit fails too. A campaign
+gives a member that is not in the fleet nothing, so two campaigns can name
+it. The edit that adds such a device to the fleet then fails with the same
+error, until only one campaign names it.
+
+Setting a running campaign back to `plan` pauses it. A member in flight
+stops before its install and shows `upgrade-needed`. A member past its
+install finishes. Setting the campaign to `run` again releases the paused
+members again. A member that still reports `in-progress` for the campaign
+then, or after a restart of fleetmgr, counts in flight and keeps the
+campaign's veto: it holds a slot and its redundancy groups until it is
+done, or until it stops before its install and waits again.
+
+Stopping and running a campaign again does not retry its failed members.
+To retry a member, remove it from the campaign, wait until the device's
+software state has no `upgrade-campaign`, and add the member again. The
+campaign then takes it as a new member: it holds it until it answers, and
+releases it in a window. `allow-staging` on a campaign has no effect yet.
+
 ## Web UI
 
 `webui/` is a SvelteKit UI for the same northbound: fleet inventory,
@@ -200,8 +251,9 @@ routing each member to its flotilla before merging all software intent into the
 same device entry that the inventory transform writes. Each member names its
 `image` from `/images`: the device's target release is the image's
 `version`, and its image URL is the list's `url-base` followed by the image
-name. A member whose image is not in the list, or has no version, gets no
-software intent, and the campaign's plan alarms say so.
+name. A member whose image is not in the list, or has no version, gets
+only the campaign's name and veto, with no target release, and the
+campaign's plan alarms say so.
 
 `/images` is the StratoWeave image list (`swyang.images`): software images
 by file name, each with its `os`, `version`, `family` and the hardware
@@ -216,8 +268,9 @@ the whole list.
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription on the flotilla
 to the device's `/device/software/state` and `/device/state/platform`, and
-publishes the status, stage, reason and check verdicts in the entry's own
-`state` and the platform as its `state/platform`. A change on one device
+publishes the status, the campaign and target release the status is for,
+the stage, reason and check verdicts in the entry's own `state` and the
+platform as its `state/platform`. A change on one device
 publishes one entry. Removing the entry closes the subscription and clears
 the state. Each campaign transform subscribes to the `state` of every entry,
 one subscription, and aggregates its own members, each with the version and
