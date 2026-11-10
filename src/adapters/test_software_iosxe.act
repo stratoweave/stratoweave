@@ -1745,7 +1745,7 @@ def _test_cli_version_reads():
 
 actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
                   settled: action(xecli.CliMock, swdev.DeviceMgr, str) -> None,
-                  short: bool=False, unsaved: bool=False):
+                  short: bool=False, unsaved: bool=False, other_added: bool=False):
     """Drive a mock device whose NETCONF never connects, over the CLI only,
     from a software intent with a sha512 checksum to a settled status. The
     image is not on bootflash. The device runs OLD_RELEASE, in bundle mode
@@ -1754,7 +1754,8 @@ actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
     such command takes 0.1 s, so the replies change before its output
     comes. When short, the intent has an image size of 600 MB and bootflash
     has 100 MB free until a remove makes room. When unsaved, the running
-    configuration changed after the last write memory."""
+    configuration changed after the last write memory. When other_added,
+    the device has added 17.15.04c until a remove."""
     var dev_ref: ?swdev.DeviceMgr = None
     var cli: ?xecli.CliMock = None
     var finished = False
@@ -1772,6 +1773,8 @@ actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
             c!.set_reply("dir bootflash:", DIR_STAGED)
         elif "install remove inactive" in commands:
             c!.set_reply("dir bootflash:", DIR_EMPTY)
+            if other_added and ADD_COMMAND not in commands:
+                c!.set_reply("show install summary", _summary(["IMG   C    " + OLD_VERSION]))
         if ADD_COMMAND in commands:
             c!.set_reply("show install summary", _summary(["IMG   I    " + NEW_VERSION, "IMG   C    " + OLD_VERSION]))
         if ACTIVATE_COMMAND in commands or ONE_SHOT_COMMAND in commands:
@@ -1809,7 +1812,10 @@ actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
         cli = c
         image = BUNDLE_IMAGE if bundle else "bootflash:packages.conf"
         c.set_reply("show version", _show_version(OLD_RELEASE, image))
-        c.set_reply("show install summary", _summary([] if bundle else ["IMG   C    " + OLD_VERSION]))
+        packages = [] if bundle else ["IMG   C    " + OLD_VERSION]
+        if other_added:
+            packages = ["IMG   I    17.15.04c.0.107"] + packages
+        c.set_reply("show install summary", _summary(packages))
         c.set_reply("dir bootflash:", _dir(["packages.conf"], 100000000) if short else DIR_EMPTY)
         c.set_question(COPY_COMMAND, COPY_QUESTION, "", COPY_DONE)
         c.set_reply(VERIFY_COMMAND, VERIFY_EQUAL)
@@ -1958,3 +1964,36 @@ def _test_unsaved_configuration():
     ]
     for c in cases:
         testing.assertEqual(swxe.unsaved_configuration(root(c.running, c.startup)) is not None, c.unsaved, c.label)
+
+
+def _test_other_added_version():
+    """Another release that the device added and does not run is removed
+    before staging; the committed and the running ones are not."""
+    def root(packages: list[str]) -> ygdata.Node:
+        r = xecli_data.root()
+        xecli.InstallRead().parse(r, _summary(packages))
+        return r.to_gdata()
+    cases: list[(label: str, packages: list[str], want: ?str)] = [
+        (label="another added", packages=["IMG   I    17.15.04c.0.107", "IMG   C    " + OLD_VERSION], want="17.15.04c.0.107"),
+        (label="the target added", packages=["IMG   I    " + NEW_VERSION, "IMG   C    " + OLD_VERSION], want=None),
+        (label="only the committed", packages=["IMG   C    " + OLD_VERSION], want=None),
+        (label="another release activated, not committed",
+         packages=["IMG   U    17.15.04c.0.107", "IMG   I    " + OLD_VERSION], want=None),
+    ]
+    for c in cases:
+        testing.assertEqual(swxe.other_added_version(root(c.packages), NEW_REQUESTED), c.want, c.label)
+
+
+actor _test_iosxe_cli_only_removes_another_added_release(t: testing.EnvT):
+    """A run that stopped after the add left 17.15.04c added: the next run
+    removes it before staging its own release."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands() if cmd.startswith("copy ") or cmd.startswith("install ")]
+            testing.assertEqual(["install remove inactive", COPY_COMMAND, ADD_COMMAND, ACTIVATE_COMMAND,
+                                 "install commit", "install remove inactive"], steps)
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-other", False, settled, False, False, True)
