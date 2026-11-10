@@ -33,6 +33,10 @@ COMMAND_TIMEOUT = 60.0
 ## MD5 of an 838 MB image takes 23 s on a C8000V.
 RPC_TIMEOUT = 600.0
 
+## Seconds that an install command can run. install add copies and expands
+## an image, from a URL too.
+INSTALL_TIMEOUT = 3600.0
+
 ## Seconds between login attempts after a failure: the first delay, and the
 ## limit for the delay that doubles after each failure.
 RETRY_FIRST = 1.0
@@ -43,6 +47,11 @@ _FILE_SYSTEM_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789-"
 _FILE_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
 _DIGITS = "0123456789"
 _HEX = "0123456789abcdef"
+# A file, a URL or a label in an install command.
+_LOCATION_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~:/@%+=,-"
+_LABEL_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+_INSTALL_STATES = {"I": "inactive", "U": "activated-uncommitted", "C": "activated-committed",
+                   "D": "deactivated-uncommitted"}
 _MONTHS = {"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04", "May": "05", "Jun": "06",
            "Jul": "07", "Aug": "08", "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12"}
 
@@ -104,6 +113,78 @@ def verify_command(file_system: str, file: str, algorithm: ?str=None, expected: 
     if expected is not None:
         raise ValueError("a hash needs an algorithm")
     return "verify " + file_system + file
+
+
+def check_location(location: str) -> None:
+    """Raise ValueError if location is not a file or a URL for an install command."""
+    if ":" not in location or any([c not in _LOCATION_CHARS for c in location]):
+        raise ValueError("invalid file or URL: " + location + ". Use a file system or a scheme, and only letters, digits and ._~:/@%+=,-")
+
+
+def install_command(inp: xecli_data.stratoweave_iosxe_cli__install__input) -> str:
+    """Return the install command of an install RPC request.
+
+    Raise ValueError unless the request has exactly one command, with input
+    that is valid.
+    """
+    add = inp.add
+    activate = inp.activate
+    remove = inp.remove
+    rollback = inp.rollback
+    given = [c for c in [add is not None, activate is not None, inp.commit is not None,
+                         inp.abort is not None, remove is not None, rollback is not None] if c]
+    if len(given) != 1:
+        raise ValueError("an install request must have exactly one command")
+    if add is not None:
+        check_location(add.file)
+        command = "install add file " + add.file
+        if add.activate is not None:
+            command += " activate"
+            if add.commit is not None:
+                command += " commit"
+        elif add.commit is not None:
+            raise ValueError("install add needs activate to commit")
+        level = add.prompt_level
+        if level is not None:
+            command += " prompt-level " + level
+        return command
+    if activate is not None:
+        command = "install activate"
+        f = activate.file
+        if f is not None:
+            check_location(f)
+            command += " file " + f
+        timer = activate.auto_abort_timer
+        if timer is not None:
+            command += " auto-abort-timer " + str(timer)
+        level = activate.prompt_level
+        if level is not None:
+            command += " prompt-level " + level
+        return command
+    if inp.commit is not None:
+        return "install commit"
+    if inp.abort is not None:
+        return "install abort"
+    if remove is not None:
+        f = remove.file
+        if f is not None:
+            check_location(f)
+            return "install remove file " + f
+        return "install remove inactive"
+    if rollback is not None:
+        if rollback.base is not None:
+            return "install rollback to base"
+        if rollback.committed is not None:
+            return "install rollback to committed"
+        point = rollback.id
+        if point is not None:
+            return "install rollback to id " + str(point)
+        label = rollback.label
+        if label is not None:
+            if label == "" or any([c not in _LABEL_CHARS for c in label]):
+                raise ValueError("invalid label: " + label)
+            return "install rollback to label " + label
+    raise ValueError("an install request must have exactly one command")
 
 
 def _digits(s: str) -> bool:
@@ -310,6 +391,49 @@ def parse_verify_image(output: str, file_system: str, file: str) -> bool:
     return signed
 
 
+def parse_install_summary(output: str) -> xecli_data.stratoweave_iosxe_cli__install_summary:
+    """Read the packages and the auto-abort timer from show install summary.
+
+    A location starts with a line such as [ R0 ] Installed Package(s)
+    Information. Its packages are the rows between the Type St header and
+    the next dashed line. A device in bundle mode prints nothing. Raise
+    CommandError when the device reports an error or a line is not as
+    expected.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    result = xecli_data.stratoweave_iosxe_cli__install_summary()
+    location: ?xecli_data.stratoweave_iosxe_cli__install_summary__location_entry = None
+    in_rows = False
+    for line in lines:
+        if line.startswith("[") and "]" in line:
+            location = result.location.create(line[1:line.find("]")].strip())
+            in_rows = False
+        elif line.startswith("Type") and "Filename/Version" in line:
+            in_rows = True
+        elif line.startswith("---"):
+            # A dashed line follows the header too, before any row.
+            loc = location
+            if in_rows and loc is not None:
+                if len(loc.package) > 0:
+                    in_rows = False
+        elif line.startswith("Auto abort timer:"):
+            result.auto_abort_timer = line[len("Auto abort timer:"):].strip()
+            in_rows = False
+        elif in_rows and line != "":
+            fields = line.split()
+            loc = location
+            if loc is not None:
+                if len(fields) != 3 or fields[1] not in _INSTALL_STATES:
+                    raise CommandError("unexpected show install summary line: " + line)
+                loc.package.create(fields[2], type=fields[0], state=_INSTALL_STATES[fields[1]])
+    if len(result.location) == 0 and any([line != "" for line in lines]):
+        raise CommandError("show install summary output has no location")
+    return result
+
+
 def parse_version(output: str) -> xecli_data.stratoweave_iosxe_cli__version:
     """Read the release and the hardware from the output of show version.
 
@@ -403,6 +527,15 @@ class VersionRead(Read):
         r.version = parse_version(output)
 
 
+class InstallRead(Read):
+    """Read the installed packages with show install summary."""
+    def __init__(self):
+        self.command = "show install summary"
+
+    def parse(self, r: xecli_data.root, output: str) -> None:
+        r.install_summary = parse_install_summary(output)
+
+
 def _node_reads(top: gdata.FNode) -> list[Read]:
     """Return the reads for one top-level node of a filter. A node of
     another module gives no reads."""
@@ -410,6 +543,8 @@ def _node_reads(top: gdata.FNode) -> list[Read]:
         return [DirRead(name) for name in file_systems_selected(top)]
     if top.name == gdata.Id(xecli_yang.NS, "version"):
         return [VersionRead()]
+    if top.name == gdata.Id(xecli_yang.NS, "install-summary"):
+        return [InstallRead()]
     return []
 
 
@@ -444,6 +579,15 @@ class Call(object):
     ## when the output is not as expected.
     reply: proc(output: str) -> gdata.Node
 
+    def ended(self, output: ?str, err: Exception) -> gdata.Node:
+        """Return the RPC output when the session ended with err, after
+        output. The session of a command fails when it ends early."""
+        raise err
+
+    def timeout(self, default: float) -> float:
+        """Return the seconds that the command can run."""
+        return default
+
 
 class VerifyCall(Call):
     """Run the verify RPC."""
@@ -471,6 +615,59 @@ class VerifyCall(Call):
         return xecli_data.stratoweave_iosxe_cli__verify__output(verified=verified).to_gdata()
 
 
+def check_install_output(output: str) -> None:
+    """Raise CommandError when the output of an install command reports an
+    error or a failure.
+
+    A failed install command prints the reason on an ERROR line before its
+    FAILED line. The error has the reason when the output has one.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    reason: ?str = None
+    for line in lines:
+        if line.startswith("ERROR:") and reason is None:
+            reason = line
+        if line.startswith("FAILED:"):
+            raise CommandError(reason if reason is not None else line)
+
+
+def install_reloads(output: str) -> bool:
+    """Return True if the output of an install command says that the device
+    reloads now."""
+    return any([line.strip().startswith("Install will reload the system") for line in output.splitlines()])
+
+
+class InstallCall(Call):
+    """Run the install RPC."""
+    reloads: bool
+
+    def __init__(self, inp: xecli_data.stratoweave_iosxe_cli__install__input):
+        self.command = install_command(inp)
+        add = inp.add
+        self.reloads = inp.activate is not None or inp.rollback is not None or (add is not None and add.activate is not None)
+
+    def reply(self, output: str) -> gdata.Node:
+        check_install_output(output)
+        reloading = self.reloads and install_reloads(output)
+        return xecli_data.stratoweave_iosxe_cli__install__output(reloading=reloading).to_gdata()
+
+    def ended(self, output: ?str, err: Exception) -> gdata.Node:
+        """A command that activates software reloads the device. When the
+        session ends early and the output reports no failure, the reload has
+        begun."""
+        if self.reloads:
+            if output is not None:
+                check_install_output(output)
+                return xecli_data.stratoweave_iosxe_cli__install__output(reloading=True).to_gdata()
+        raise err
+
+    def timeout(self, default: float) -> float:
+        return INSTALL_TIMEOUT if INSTALL_TIMEOUT > default else default
+
+
 def rpc_call(request: gdata.Node) -> Call:
     """Return the call for an RPC request. Raise ValueError for an RPC that
     the adapter does not run, or for input that is not valid."""
@@ -480,6 +677,8 @@ def rpc_call(request: gdata.Node) -> Call:
     rpc_id, body = items[0]
     if rpc_id == gdata.Id(xecli_yang.NS, "verify"):
         return VerifyCall(xecli_data.stratoweave_iosxe_cli__verify__input.from_gdata(body))
+    if rpc_id == gdata.Id(xecli_yang.NS, "install"):
+        return InstallCall(xecli_data.stratoweave_iosxe_cli__install__input.from_gdata(body))
     raise ValueError("RPC " + str(rpc_id) + " is not supported by the IOS XE CLI adapter")
 
 
@@ -493,6 +692,7 @@ actor _Session(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, command: ?str, tim
                done: action(?str, ?Exception) -> None):
     """Log in to the device over SSH and run command, or only log in when
     command is None. Call done once with the output, then close the connection.
+    When the command fails, done gets the error and the output so far.
     """
     var client: ?ssh.Client = None
     var finished = False
@@ -513,7 +713,12 @@ actor _Session(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, command: ?str, tim
 
     def _on_exit(ch: ssh.Channel, code: int, signal: ?str, stdout: bytes, stderr: bytes, error: ?str):
         if error is not None:
-            _finish(None, TransientError("SSH command failed: " + error))
+            partial: ?str = None
+            try:
+                partial = stdout.decode()
+            except Exception:
+                pass
+            _finish(partial, TransientError("SSH command failed: " + error))
             return
         if signal is not None or code != 0:
             _finish(None, CommandError("SSH command ended with exit status " + str(code)))
@@ -661,16 +866,14 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
 
     def _call(cb: action(?gdata.Node, ?Exception) -> None, c: Call):
         def received(output: ?str, err: ?Exception):
-            if err is not None:
-                cb(None, err)
-                return
+            _log.debug("IOS XE CLI: RPC command ended", {"command": c.command, "output": output, "error": err})
             try:
-                reply = c.reply(output if output is not None else "")
+                reply = c.ended(output, err) if err is not None else c.reply(output if output is not None else "")
             except Exception as e:
                 cb(None, e)
             else:
                 cb(reply, None)
-        _session(c.command, rpc_timeout, received)
+        _session(c.command, c.timeout(rpc_timeout), received)
 
     def rpc(cb: action(?gdata.Node, ?Exception) -> None, request: gdata.Node):
         try:
