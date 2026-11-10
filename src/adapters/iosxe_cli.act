@@ -6,6 +6,53 @@ runs commands; it does not configure the device.
 Each command opens its own SSH connection, because IOS XE closes the
 connection when an exec channel ends. The exit status is always 0, so the
 adapter finds errors in the output text.
+
+What the IOS XE releases that we tried give for software management, over
+NETCONF and over the CLI:
+
+                       NETCONF                    CLI
+  Release   Platform   files verify install ev    dir sum hash image install bootvar config  Notes
+  16.8.1    C1111      -     -      -       -     yes yes -    yes   yes     yes     yes     1 2 3 4 5 9
+  17.9.5a   C1111      yes   no     has     yes   yes yes yes  yes   has     yes     yes     6 7 9
+  17.18.2   C8000V     -     no     yes     yes   yes yes -    -     -       -       -       8
+
+  files    Cisco-IOS-XE-platform-software-oper, the files of each partition
+  verify   Cisco-IOS-XE-verify-rpc and Cisco-IOS-XE-verify-events
+  install  Cisco-IOS-XE-install-rpc and Cisco-IOS-XE-xcopy-rpc
+  ev       netconf-config-change on the NETCONF stream, also for CLI changes,
+           and the -events-oper modules on yang-notif-native only
+  dir      dir of a file system
+  sum      verify /md5 and verify /sha512
+  hash     verify /md5 or /sha512 with a hash: Verified or %Error verifying
+  image    verify without an algorithm: the hashes that an image holds and
+           its digital signature
+  install  install add, activate, commit, abort, remove and rollback
+  bootvar  show bootvar: the files that ROMMON boots
+  config   configure terminal in an SSH shell, and write memory
+
+  yes      tried, and it works
+  no       the device does not have it
+  has      the device has it; not tried
+  -        not tried
+
+Notes:
+
+1. The NETCONF SSH server does not start: the trustpoint has no certificate.
+2. In bundle mode the device refuses install add alone. The one command
+   install add file F activate commit converts it to install mode.
+3. Install mode boots bootflash:packages.conf, which boot system must name.
+   The conversion on 16.8.1 does not set it.
+4. With prompt-level none, install refuses to run while the configuration
+   has unsaved changes.
+5. The SSH server offers only diffie-hellman-group14-sha1,
+   diffie-hellman-group-exchange-sha1 and ssh-rsa host keys.
+6. The files of a partition are recursive, without hidden entries.
+   q-filesystem comes without its location keys.
+7. The sha1sum of an image is the hash that the image holds, not a checksum
+   of the file.
+8. The device answers the verify RPC with the rpc-error unknown-namespace.
+9. The CLI SSH server sends no server-sig-algs, so an RSA user key needs
+   public-key-algorithm ssh-rsa.
 """
 
 import logging
@@ -29,9 +76,20 @@ DEFAULT_FILE_SYSTEMS = ["bootflash:"]
 ## than a second on a C8000V.
 COMMAND_TIMEOUT = 60.0
 
-## Seconds that the command of an RPC can run. The checksum RPC runs verify:
+## Seconds that the command of an RPC can run. The verify RPC runs verify:
 ## MD5 of an 838 MB image takes 23 s on a C8000V.
 RPC_TIMEOUT = 600.0
+
+## Seconds that an install command can run. install add copies and expands
+## an image, from a URL too.
+INSTALL_TIMEOUT = 3600.0
+
+## Seconds to wait for the prompt after each configuration command.
+CONFIG_LINE_TIMEOUT = 30.0
+
+## The start of a line in which the device rejects a configuration command.
+_CONFIG_ERRORS = ["% Invalid input", "% Incomplete command", "% Ambiguous command", "% Unknown command",
+                  "%Error", "% Error", "ERROR:"]
 
 ## Seconds between login attempts after a failure: the first delay, and the
 ## limit for the delay that doubles after each failure.
@@ -43,6 +101,11 @@ _FILE_SYSTEM_CHARS = "abcdefghijklmnopqrstuvwxyz0123456789-"
 _FILE_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
 _DIGITS = "0123456789"
 _HEX = "0123456789abcdef"
+# A file, a URL or a label in an install command.
+_LOCATION_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._~:/@%+=,-"
+_LABEL_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-"
+_INSTALL_STATES = {"I": "inactive", "U": "activated-uncommitted", "C": "activated-committed",
+                   "D": "deactivated-uncommitted"}
 _MONTHS = {"Jan": "01", "Feb": "02", "Mar": "03", "Apr": "04", "May": "05", "Jun": "06",
            "Jul": "07", "Aug": "08", "Sep": "09", "Oct": "10", "Nov": "11", "Dec": "12"}
 
@@ -78,13 +141,104 @@ def dir_command(file_system: str) -> str:
     return "dir " + file_system
 
 
-def verify_command(file_system: str, file: str, algorithm: str) -> str:
-    """Return the command that computes the checksum of a file."""
+def _digest_length(algorithm: str) -> int:
+    return 32 if algorithm == "md5" else 128
+
+
+def verify_command(file_system: str, file: str, algorithm: ?str=None, expected: ?str=None) -> str:
+    """Return the verify command for a file.
+
+    With an algorithm, the command computes the checksum of the file, and
+    with an expected hash it also compares the checksum with the hash.
+    Without an algorithm, the command checks an IOS XE image.
+    """
     check_file_system(file_system)
     check_file(file)
-    if algorithm not in ["md5", "sha512"]:
-        raise ValueError("unsupported checksum algorithm: " + algorithm)
-    return "verify /" + algorithm + " " + file_system + file
+    if algorithm is not None:
+        if algorithm not in ["md5", "sha512"]:
+            raise ValueError("unsupported checksum algorithm: " + algorithm)
+        command = "verify /" + algorithm + " " + file_system + file
+        if expected is not None:
+            length = _digest_length(algorithm)
+            if len(expected) != length or any([c not in _HEX for c in expected.lower()]):
+                raise ValueError("invalid " + algorithm + " hash: " + expected + ". Use " + str(length) + " hexadecimal digits")
+            command += " " + expected.lower()
+        return command
+    if expected is not None:
+        raise ValueError("a hash needs an algorithm")
+    return "verify " + file_system + file
+
+
+def check_location(location: str) -> None:
+    """Raise ValueError if location is not a file or a URL for an install command."""
+    if ":" not in location or any([c not in _LOCATION_CHARS for c in location]):
+        raise ValueError("invalid file or URL: " + location + ". Use a file system or a scheme, and only letters, digits and ._~:/@%+=,-")
+
+
+def install_command(inp: xecli_data.stratoweave_iosxe_cli__install__input) -> str:
+    """Return the install command of an install RPC request.
+
+    Raise ValueError unless the request has exactly one command, with input
+    that is valid.
+    """
+    add = inp.add
+    activate = inp.activate
+    remove = inp.remove
+    rollback = inp.rollback
+    given = [c for c in [add is not None, activate is not None, inp.commit is not None,
+                         inp.abort is not None, remove is not None, rollback is not None] if c]
+    if len(given) != 1:
+        raise ValueError("an install request must have exactly one command")
+    if add is not None:
+        check_location(add.file)
+        command = "install add file " + add.file
+        if add.activate is not None:
+            command += " activate"
+            if add.commit is not None:
+                command += " commit"
+        elif add.commit is not None:
+            raise ValueError("install add needs activate to commit")
+        level = add.prompt_level
+        if level is not None:
+            command += " prompt-level " + level
+        return command
+    if activate is not None:
+        command = "install activate"
+        f = activate.file
+        if f is not None:
+            check_location(f)
+            command += " file " + f
+        timer = activate.auto_abort_timer
+        if timer is not None:
+            command += " auto-abort-timer " + str(timer)
+        level = activate.prompt_level
+        if level is not None:
+            command += " prompt-level " + level
+        return command
+    if inp.commit is not None:
+        return "install commit"
+    if inp.abort is not None:
+        return "install abort"
+    if remove is not None:
+        f = remove.file
+        if f is not None:
+            check_location(f)
+            return "install remove file " + f
+        return "install remove inactive"
+    if rollback is not None:
+        if rollback.base is not None:
+            return "install rollback to base"
+        if rollback.committed is not None:
+            return "install rollback to committed"
+        point = rollback.id
+        if point is not None:
+            return "install rollback to id " + str(point)
+        label = rollback.label
+        if label is not None:
+            if label == "" or any([c not in _LABEL_CHARS for c in label]):
+                raise ValueError("invalid label: " + label)
+            return "install rollback to label " + label
+    raise ValueError("an install request must have exactly one command")
 
 
 def _digits(s: str) -> bool:
@@ -197,19 +351,194 @@ def parse_verify(output: str, file_system: str, file: str, algorithm: str) -> st
     if err is not None:
         raise CommandError(err)
     marker = "verify /" + algorithm + " (" + file_system + file + ") = "
-    length = 32 if algorithm == "md5" else 128
     digest: ?str = None
     for line in lines:
         if line.startswith(marker):
             if digest is not None:
                 raise CommandError("verify output has more than one result")
-            value = line[len(marker):].lower()
-            if len(value) != length or any([c not in _HEX for c in value]):
-                raise CommandError("verify output has an invalid digest: " + line)
-            digest = value
+            digest = _digest(line, len(marker), algorithm)
     if digest is not None:
         return digest
     raise CommandError("verify output has no result for " + file_system + file)
+
+
+def _digest(line: str, start: int, algorithm: str) -> str:
+    """Return the digest at start of a result line of verify."""
+    value = line[start:].strip().lower()
+    if len(value) != _digest_length(algorithm) or any([c not in _HEX for c in value]):
+        raise CommandError("verify output has an invalid digest: " + line)
+    return value
+
+
+def parse_verify_hash(output: str, file_system: str, file: str, algorithm: str) -> (digest: str, verified: bool):
+    """Read the result of verify_command(file_system, file, algorithm, expected).
+
+    The device prints the checksum after Verified when it is equal to the
+    expected hash. When it is not, the device prints %Error verifying and
+    then the computed checksum. Raise CommandError when the output has
+    neither, or when the device reports another error.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    path = file_system + file
+    verified = "Verified (" + path + ") = "
+    computed = "Computed signature"
+    for i in range(len(lines)):
+        line = lines[i]
+        if line.startswith(verified):
+            return (digest=_digest(line, len(verified), algorithm), verified=True)
+        if line == "%Error verifying " + path:
+            for later in lines[i + 1:]:
+                if later.startswith(computed) and "=" in later:
+                    return (digest=_digest(later, later.find("=") + 1, algorithm), verified=False)
+            raise CommandError("verify output has no computed checksum for " + path)
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    raise CommandError("verify output has no result for " + path)
+
+
+def parse_verify_image(output: str, file_system: str, file: str) -> bool:
+    """Read the result of verify_command(file_system, file).
+
+    The output holds an embedded and a computed hash for each algorithm. A
+    long hash continues on the next lines. Return True if each pair of hashes
+    is equal and the device verified the digital signature of this file.
+    Return False if not. Raise CommandError if the device cannot check the
+    file, or if the output has no hashes.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    embedded: dict[str, str] = {}
+    computed: dict[str, str] = {}
+    signed = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        i += 1
+        if line.endswith("does not support verification."):
+            raise CommandError(line)
+        if line == "Digital signature successfully verified in file " + file_system + file:
+            signed = True
+        if line.startswith("Embedded Hash") or line.startswith("Computed Hash"):
+            colon = line.find(":")
+            words = line[:colon].split() if colon > 0 else []
+            if len(words) != 3:
+                raise CommandError("unexpected verify line: " + line)
+            value = line[colon + 1:].strip().lower()
+            while i < len(lines) and lines[i] != "" and all([c in _HEX for c in lines[i].lower()]):
+                value += lines[i].lower()
+                i += 1
+            if words[0] == "Embedded":
+                embedded[words[2]] = value
+            else:
+                computed[words[2]] = value
+    if len(embedded) == 0 and len(computed) == 0:
+        raise CommandError("verify output has no hashes for " + file_system + file)
+    if len(embedded) != len(computed):
+        return False
+    for algorithm, value in embedded.items():
+        got = computed.get(algorithm)
+        if got is None or got != value:
+            return False
+    return signed
+
+
+def _variable(line: str, name: str) -> ?str:
+    """Return the value in a line such as CONFIG_FILE variable = X, or None
+    when the variable does not exist."""
+    marker = name + " variable = "
+    if line.startswith(marker):
+        return line[len(marker):].strip()
+    return None
+
+
+def parse_bootvar(output: str) -> xecli_data.stratoweave_iosxe_cli__bootvar:
+    """Read the boot variables from show bootvar.
+
+    The BOOT variable lists files with a number after each, as in
+    bootflash:packages.conf,1; the number is not kept. An empty BOOT variable
+    gives no files. Raise CommandError when the device reports an error or
+    the output has no BOOT variable.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    result = xecli_data.stratoweave_iosxe_cli__bootvar()
+    found = False
+    for line in lines:
+        if line.startswith("BOOT variable ="):
+            found = True
+            for entry in line[len("BOOT variable ="):].strip().split(";"):
+                f = entry.strip()
+                comma = f.rfind(",")
+                if comma > 0:
+                    f = f[:comma]
+                if f != "":
+                    result.boot.append(f)
+        elif line.startswith("CONFIG_FILE variable"):
+            result.config_file = _variable(line, "CONFIG_FILE")
+        elif line.startswith("BOOTLDR variable"):
+            result.bootldr = _variable(line, "BOOTLDR")
+        elif line.startswith("Configuration register is "):
+            # Configuration register is 0x2142 (will be 0x2102 at next reload)
+            rest = line[len("Configuration register is "):]
+            words = rest.split()
+            if len(words) > 0:
+                result.configuration_register = words[0]
+            at = rest.find("(will be ")
+            if at >= 0:
+                upcoming = rest[at + len("(will be "):].split()
+                if len(upcoming) > 0:
+                    result.next_configuration_register = upcoming[0]
+    if not found:
+        raise CommandError("show bootvar output has no BOOT variable")
+    return result
+
+
+def parse_install_summary(output: str) -> xecli_data.stratoweave_iosxe_cli__install_summary:
+    """Read the packages and the auto-abort timer from show install summary.
+
+    A location starts with a line such as [ R0 ] Installed Package(s)
+    Information. Its packages are the rows between the Type St header and
+    the next dashed line. A device in bundle mode prints nothing. Raise
+    CommandError when the device reports an error or a line is not as
+    expected.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    result = xecli_data.stratoweave_iosxe_cli__install_summary()
+    location: ?xecli_data.stratoweave_iosxe_cli__install_summary__location_entry = None
+    in_rows = False
+    for line in lines:
+        if line.startswith("[") and "]" in line:
+            location = result.location.create(line[1:line.find("]")].strip())
+            in_rows = False
+        elif line.startswith("Type") and "Filename/Version" in line:
+            in_rows = True
+        elif line.startswith("---"):
+            # A dashed line follows the header too, before any row.
+            loc = location
+            if in_rows and loc is not None:
+                if len(loc.package) > 0:
+                    in_rows = False
+        elif line.startswith("Auto abort timer:"):
+            result.auto_abort_timer = line[len("Auto abort timer:"):].strip()
+            in_rows = False
+        elif in_rows and line != "":
+            fields = line.split()
+            loc = location
+            if loc is not None:
+                if len(fields) != 3 or fields[1] not in _INSTALL_STATES:
+                    raise CommandError("unexpected show install summary line: " + line)
+                loc.package.create(fields[2], type=fields[0], state=_INSTALL_STATES[fields[1]])
+    if len(result.location) == 0 and any([line != "" for line in lines]):
+        raise CommandError("show install summary output has no location")
+    return result
 
 
 def parse_version(output: str) -> xecli_data.stratoweave_iosxe_cli__version:
@@ -305,6 +634,24 @@ class VersionRead(Read):
         r.version = parse_version(output)
 
 
+class BootvarRead(Read):
+    """Read the boot variables with show bootvar."""
+    def __init__(self):
+        self.command = "show bootvar"
+
+    def parse(self, r: xecli_data.root, output: str) -> None:
+        r.bootvar = parse_bootvar(output)
+
+
+class InstallRead(Read):
+    """Read the installed packages with show install summary."""
+    def __init__(self):
+        self.command = "show install summary"
+
+    def parse(self, r: xecli_data.root, output: str) -> None:
+        r.install_summary = parse_install_summary(output)
+
+
 def _node_reads(top: gdata.FNode) -> list[Read]:
     """Return the reads for one top-level node of a filter. A node of
     another module gives no reads."""
@@ -312,6 +659,10 @@ def _node_reads(top: gdata.FNode) -> list[Read]:
         return [DirRead(name) for name in file_systems_selected(top)]
     if top.name == gdata.Id(xecli_yang.NS, "version"):
         return [VersionRead()]
+    if top.name == gdata.Id(xecli_yang.NS, "install-summary"):
+        return [InstallRead()]
+    if top.name == gdata.Id(xecli_yang.NS, "bootvar"):
+        return [BootvarRead()]
     return []
 
 
@@ -336,7 +687,9 @@ def reads(filt: ?gdata.FNode) -> list[Read]:
 
 
 class Call(object):
-    """An exec command that runs an RPC of the module.
+    """An exec command that runs an RPC of the module. The configure RPC is
+    a dialog in configure terminal, not an exec command: see
+    configure_lines.
 
     A subclass sets command and implements reply.
     """
@@ -346,33 +699,241 @@ class Call(object):
     ## when the output is not as expected.
     reply: proc(output: str) -> gdata.Node
 
+    def ended(self, output: ?str, err: Exception) -> gdata.Node:
+        """Return the RPC output when the session ended with err, after
+        output. The session of a command fails when it ends early."""
+        raise err
 
-class ChecksumCall(Call):
-    """Run the checksum RPC with verify."""
+    def timeout(self, default: float) -> float:
+        """Return the seconds that the command can run."""
+        return default
+
+
+class VerifyCall(Call):
+    """Run the verify RPC."""
     file_system: str
     file: str
-    algorithm: str
+    algorithm: ?str
+    expected: ?str
 
-    def __init__(self, inp: xecli_data.stratoweave_iosxe_cli__checksum__input):
-        self.command = verify_command(inp.file_system, inp.file, inp.algorithm)
+    def __init__(self, inp: xecli_data.stratoweave_iosxe_cli__verify__input):
+        self.command = verify_command(inp.file_system, inp.file, inp.algorithm, inp.hash)
         self.file_system = inp.file_system
         self.file = inp.file
         self.algorithm = inp.algorithm
+        self.expected = inp.hash
 
     def reply(self, output: str) -> gdata.Node:
-        digest = parse_verify(output, self.file_system, self.file, self.algorithm)
-        return xecli_data.stratoweave_iosxe_cli__checksum__output(digest=digest).to_gdata()
+        algorithm = self.algorithm
+        if algorithm is not None:
+            if self.expected is not None:
+                r = parse_verify_hash(output, self.file_system, self.file, algorithm)
+                return xecli_data.stratoweave_iosxe_cli__verify__output(digest=r.digest, verified=r.verified).to_gdata()
+            digest = parse_verify(output, self.file_system, self.file, algorithm)
+            return xecli_data.stratoweave_iosxe_cli__verify__output(digest=digest).to_gdata()
+        verified = parse_verify_image(output, self.file_system, self.file)
+        return xecli_data.stratoweave_iosxe_cli__verify__output(verified=verified).to_gdata()
 
 
-def rpc_call(request: gdata.Node) -> Call:
-    """Return the call for an RPC request. Raise ValueError for an RPC that
-    the adapter does not run, or for input that is not valid."""
+def check_install_output(output: str) -> None:
+    """Raise CommandError when the output of an install command reports an
+    error or a failure.
+
+    A failed install command prints the reason on an ERROR line before its
+    FAILED line. The error has the reason when the output has one.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    reason: ?str = None
+    for line in lines:
+        if line.startswith("ERROR:") and reason is None:
+            reason = line
+        if line.startswith("FAILED:"):
+            raise CommandError(reason if reason is not None else line)
+
+
+def check_config_line(line: str) -> None:
+    """Raise ValueError if line cannot be typed as one configuration command.
+
+    A control character would end the command early or type another one, and
+    ? asks the device for help instead of running the command.
+    """
+    if line.strip() == "" or any([c == "?" or ord(c) < 32 or ord(c) == 127 for c in line]):
+        raise ValueError("invalid configuration command: " + line.replace("\n", "\\n").replace("\r", "\\r"))
+
+
+def config_error(output: str) -> ?str:
+    """Return the line in output where the device rejects a configuration
+    command, or None."""
+    for line in output.splitlines():
+        text = line.strip()
+        if any([text.startswith(e) for e in _CONFIG_ERRORS]):
+            return text
+    return None
+
+
+class ConfigDialog(object):
+    """Type configuration commands into an IOS XE shell, one at a time.
+
+    received takes what the device prints and returns what to type next. A
+    command is done when the echo of the command has ended and the last line
+    is a prompt, which ends with #. The dialog types configure terminal at
+    the first prompt, then each line, then end. It types end after the first
+    line that the device rejects, and keeps the error.
+    """
+    lines: list[str]
+    sent: int
+    step: int
+    pending: str
+    transcript: str
+    error: ?str
+
+    def __init__(self, lines: list[str]):
+        self.lines = lines
+        self.sent = 0
+        # 0: wait for the prompt, 1: configure terminal typed, 2: a line
+        # typed, 3: end typed, 4: done.
+        self.step = 0
+        self.pending = ""
+        self.transcript = ""
+        self.error = None
+
+    def finished(self) -> bool:
+        return self.step == 4
+
+    def current(self) -> str:
+        """Return what the dialog typed last."""
+        if self.step == 1:
+            return "configure terminal"
+        if self.step == 2:
+            return self.lines[self.sent - 1]
+        return "end"
+
+    mut def received(self, text: str) -> list[str]:
+        self.transcript += text
+        self.pending += text
+        newline = self.pending.rfind("\n")
+        if self.step != 0 and newline < 0:
+            return []
+        prompt = self.pending[newline + 1:].strip()
+        if not prompt.endswith("#"):
+            return []
+        first = self.pending.find("\n")
+        output = self.pending[first + 1:newline] if 0 <= first and first < newline else ""
+        self.pending = ""
+        if self.step == 0:
+            self.step = 1
+            return ["configure terminal\r"]
+        if self.step == 1 and "(config" not in prompt:
+            self.error = "configure terminal: " + (output.strip() if output.strip() != "" else "no configuration prompt")
+            self.step = 4
+            return []
+        if self.step == 2:
+            err = config_error(output)
+            if err is not None:
+                self.error = self.lines[self.sent - 1] + ": " + err
+                self.step = 3
+                return ["end\r"]
+        if self.step == 1 or self.step == 2:
+            if self.sent < len(self.lines):
+                line = self.lines[self.sent]
+                self.sent += 1
+                self.step = 2
+                return [line + "\r"]
+            self.step = 3
+            return ["end\r"]
+        self.step = 4
+        return []
+
+
+def install_reloads(output: str) -> bool:
+    """Return True if the output of an install command says that the device
+    reloads now."""
+    return any([line.strip().startswith("Install will reload the system") for line in output.splitlines()])
+
+
+class InstallCall(Call):
+    """Run the install RPC."""
+    reloads: bool
+
+    def __init__(self, inp: xecli_data.stratoweave_iosxe_cli__install__input):
+        self.command = install_command(inp)
+        add = inp.add
+        self.reloads = inp.activate is not None or inp.rollback is not None or (add is not None and add.activate is not None)
+
+    def reply(self, output: str) -> gdata.Node:
+        check_install_output(output)
+        reloading = self.reloads and install_reloads(output)
+        return xecli_data.stratoweave_iosxe_cli__install__output(reloading=reloading).to_gdata()
+
+    def ended(self, output: ?str, err: Exception) -> gdata.Node:
+        """A command that activates software reloads the device. When the
+        session ends early and the output reports no failure, the reload has
+        begun."""
+        if self.reloads:
+            if output is not None:
+                check_install_output(output)
+                return xecli_data.stratoweave_iosxe_cli__install__output(reloading=True).to_gdata()
+        raise err
+
+    def timeout(self, default: float) -> float:
+        return INSTALL_TIMEOUT if INSTALL_TIMEOUT > default else default
+
+
+class WriteMemoryCall(Call):
+    """Run the write-memory RPC."""
+    def __init__(self):
+        self.command = "write memory"
+
+    def reply(self, output: str) -> gdata.Node:
+        lines = [line.strip() for line in output.splitlines()]
+        err = _device_error(lines)
+        if err is not None:
+            raise CommandError(err)
+        if "[OK]" not in lines:
+            raise CommandError("write memory output has no [OK]")
+        return gdata.Container({})
+
+
+def _rpc_of(request: gdata.Node) -> (rpc_id: gdata.Id, body: gdata.Node):
+    """Return the RPC of a request and its input."""
     items = list(request.children.items())
     if len(items) != 1:
         raise ValueError("an RPC request must have exactly one child")
     rpc_id, body = items[0]
-    if rpc_id == gdata.Id(xecli_yang.NS, "checksum"):
-        return ChecksumCall(xecli_data.stratoweave_iosxe_cli__checksum__input.from_gdata(body))
+    return (rpc_id=rpc_id, body=body)
+
+
+def configure_lines(request: gdata.Node) -> ?list[str]:
+    """Return the lines of a configure RPC request, or None for another RPC.
+    Raise ValueError when there is no line, or a line is not one
+    configuration command."""
+    r = _rpc_of(request)
+    if r.rpc_id != gdata.Id(xecli_yang.NS, "configure"):
+        return None
+    lines = list(xecli_data.stratoweave_iosxe_cli__configure__input.from_gdata(r.body).line)
+    if len(lines) == 0:
+        raise ValueError("configure needs at least one line")
+    for line in lines:
+        check_config_line(line)
+    return lines
+
+
+def rpc_call(request: gdata.Node) -> Call:
+    """Return the call for the request of an RPC that runs an exec command.
+    Raise ValueError for an RPC that the adapter does not run that way, or
+    for input that is not valid."""
+    r = _rpc_of(request)
+    rpc_id = r.rpc_id
+    body = r.body
+    if rpc_id == gdata.Id(xecli_yang.NS, "verify"):
+        return VerifyCall(xecli_data.stratoweave_iosxe_cli__verify__input.from_gdata(body))
+    if rpc_id == gdata.Id(xecli_yang.NS, "install"):
+        return InstallCall(xecli_data.stratoweave_iosxe_cli__install__input.from_gdata(body))
+    if rpc_id == gdata.Id(xecli_yang.NS, "write-memory"):
+        return WriteMemoryCall()
     raise ValueError("RPC " + str(rpc_id) + " is not supported by the IOS XE CLI adapter")
 
 
@@ -382,10 +943,36 @@ def _tcp(env: ?Env) -> ?net.TCPConnectCap:
     return None
 
 
+def _client(cap: net.TCPConnectCap, dmc: DeviceMetaConfig,
+            on_connect: action(ssh.Client, ?Exception) -> None,
+            on_close: action(ssh.Client, str) -> None,
+            on_hostkey: action(ssh.Client, str, ssh.HostKeyInfo) -> None) -> ssh.Client:
+    """Return an SSH client that logs in to the first address of the device
+    with its credentials and SSH settings. Raise NotConnectedError when the
+    device has no address."""
+    addresses = list(dmc.address)
+    if len(addresses) == 0:
+        raise NotConnectedError("the device has no address")
+    address = addresses[0]
+    port = address.port
+    keys: list[ssh.PrivateKey] = []
+    for key in dmc.credentials.key:
+        material = key.private_key
+        if material is not None:
+            keys.append(ssh.PrivateKey(material.encode()))
+    return ssh.Client(cap, address.address, dmc.credentials.username,
+                      on_connect, on_close, on_hostkey,
+                      password=dmc.credentials.password,
+                      private_keys=keys if len(keys) > 0 else None,
+                      port=u16(port) if port is not None else u16(22),
+                      transport=ssh_transport_config(dmc.ssh))
+
+
 actor _Session(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, command: ?str, timeout: float,
                done: action(?str, ?Exception) -> None):
     """Log in to the device over SSH and run command, or only log in when
     command is None. Call done once with the output, then close the connection.
+    When the command fails, done gets the error and the output so far.
     """
     var client: ?ssh.Client = None
     var finished = False
@@ -406,7 +993,12 @@ actor _Session(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, command: ?str, tim
 
     def _on_exit(ch: ssh.Channel, code: int, signal: ?str, stdout: bytes, stderr: bytes, error: ?str):
         if error is not None:
-            _finish(None, TransientError("SSH command failed: " + error))
+            partial: ?str = None
+            try:
+                partial = stdout.decode()
+            except Exception:
+                pass
+            _finish(partial, TransientError("SSH command failed: " + error))
             return
         if signal is not None or code != 0:
             _finish(None, CommandError("SSH command ended with exit status " + str(code)))
@@ -434,28 +1026,158 @@ actor _Session(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, command: ?str, tim
         pass
 
     def _start():
-        addresses = list(dmc.address)
-        if len(addresses) == 0:
-            _finish(None, NotConnectedError("the device has no address"))
-            return
-        address = addresses[0]
-        port = address.port
-        keys: list[ssh.PrivateKey] = []
-        for key in dmc.credentials.key:
-            material = key.private_key
-            if material is not None:
-                keys.append(ssh.PrivateKey(material.encode()))
         try:
-            client = ssh.Client(cap, address.address, dmc.credentials.username,
-                                _on_connect, _on_close, _on_hostkey,
-                                password=dmc.credentials.password,
-                                private_keys=keys if len(keys) > 0 else None,
-                                port=u16(port) if port is not None else u16(22),
-                                transport=ssh_transport_config(dmc.ssh))
+            client = _client(cap, dmc, _on_connect, _on_close, _on_hostkey)
         except Exception as e:
             _finish(None, e)
 
     _start()
+
+
+actor _ConfigSession(cap: net.TCPConnectCap, dmc: DeviceMetaConfig, lines: list[str],
+                     done: action(?str, ?Exception) -> None):
+    """Log in to the device over SSH, open a shell, and type lines in
+    configure terminal with a ConfigDialog. Call done once with what the
+    device printed, then close the connection.
+
+    The session fails when the device rejects a line, or when no prompt
+    follows a command within CONFIG_LINE_TIMEOUT, as after a question.
+    """
+    var client: ?ssh.Client = None
+    var channel: ?ssh.Channel = None
+    var finished = False
+    var progress = 0
+    dialog = ConfigDialog(lines)
+
+    def _finish(err: ?Exception):
+        if finished:
+            return
+        finished = True
+        c = client
+        client = None
+        if c is not None:
+            c.close()
+        done(dialog.transcript, err)
+
+    def _type(texts: list[str]):
+        ch = channel
+        if ch is not None:
+            for text in texts:
+                ch.write(text.encode())
+
+    def _stalled(at: int):
+        if finished or at != progress:
+            return
+        _type(["\x03", "end\r"])
+        _finish(CommandError("no prompt after " + dialog.current()))
+
+    def _on_stdout(ch: ssh.Channel, data: ?bytes):
+        if data is not None:
+            if not finished:
+                _received(data)
+
+    def _received(data: bytes):
+        try:
+            text = data.decode()
+        except Exception:
+            _finish(CommandError("SSH shell output is not UTF-8"))
+        else:
+            _answer(text)
+
+    def _answer(text: str):
+        progress += 1
+        _type(dialog.received(text))
+        if dialog.finished():
+            _type(["exit\r"])
+            err = dialog.error
+            _finish(CommandError(err) if err is not None else None)
+            return
+        at = progress
+        after CONFIG_LINE_TIMEOUT: _stalled(at)
+
+    def _on_stderr(ch: ssh.Channel, data: ?bytes):
+        pass
+
+    def _on_exit(ch: ssh.Channel, code: int, signal: ?str):
+        pass
+
+    def _on_channel_close(ch: ssh.Channel, reason: str):
+        _finish(TransientError("SSH shell closed: " + reason))
+
+    def _on_open(ch: ssh.Channel, err: ?str):
+        if err is not None:
+            _finish(TransientError("SSH shell failed: " + err))
+            return
+        # A wide terminal keeps the device from scrolling long commands.
+        ch.request_shell(cols=500)
+        after CONFIG_LINE_TIMEOUT: _stalled(0)
+
+    def _on_hostkey(c: ssh.Client, state: str, info: ssh.HostKeyInfo):
+        # The NETCONF adapter does not check host keys either.
+        c.accept_hostkey()
+
+    def _on_connect(c: ssh.Client, err: ?Exception):
+        if err is not None:
+            _finish(NotConnectedError("SSH login failed: " + swdev.error_text(err)))
+            return
+        channel = ssh.Channel(c, _on_open, _on_stdout, _on_stderr, _on_exit, _on_channel_close)
+
+    def _on_close(c: ssh.Client, reason: str):
+        _finish(TransientError("SSH connection closed: " + reason))
+
+    try:
+        client = _client(cap, dmc, _on_connect, _on_close, _on_hostkey)
+    except Exception as e:
+        _finish(e)
+
+
+actor CliMock():
+    """A device for the IOS XE CLI adapter in mock mode.
+
+    run answers a command with the output that set_reply gave it, or as IOS
+    XE answers a command that it does not know. type_text answers what a
+    configuration session types, with the prompts of a device: a line is
+    accepted and kept unless set_reply gave it an output, as for a line
+    that the device rejects.
+    """
+    var replies: dict[str, str] = {}
+    var commands: list[str] = []
+    var configured: list[str] = []
+
+    def set_reply(command: str, output: str) -> None:
+        replies[command] = output
+
+    def get_commands() -> list[str]:
+        return commands
+
+    def get_configured() -> list[str]:
+        return configured
+
+    def run(command: str) -> str:
+        commands.append(command)
+        reply = replies.get(command)
+        if reply is not None:
+            return reply
+        return "\r\n\r\n\r\nLine has invalid autocommand \"" + command + "\""
+
+    def type_text(text: str) -> str:
+        if text == "":
+            return "\r\n\r\n\r\nRouter#"
+        if text == "configure terminal":
+            return "configure terminal\r\nEnter configuration commands, one per line.  End with CNTL/Z.\r\nRouter(config)#"
+        if text == "end":
+            return "end\r\nRouter#"
+        reply = replies.get(text)
+        if reply is not None:
+            return reply
+        configured.append(text)
+        return text + "\r\nRouter(config)#"
+
+
+def mock_mode(dmc: DeviceMetaConfig, env: ?Env) -> bool:
+    """Return True if the adapter runs against a CliMock: without an
+    environment, or for a device in mock mode."""
+    return env is None or dmc.mock.enabled or len(dmc.mock.module) > 0
 
 
 actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?Env,
@@ -465,7 +1187,8 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
     A change of the address, the credentials or the SSH settings starts a
     login. When the login succeeds, the driver reports its modules to
     DeviceMgr with its device type. When it fails, the driver reports a lost
-    connection and tries again later.
+    connection and tries again later. In mock mode, the driver runs the
+    commands against a CliMock.
     """
     _log = logging.Logger(log_handler)
     tcp = _tcp(env)
@@ -474,13 +1197,32 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
     var configured = False
     var generation = 0
     var closed = False
+    var mock: ?CliMock = None
+
+    def get_mock() -> ?CliMock:
+        return mock
 
     def _session(command: ?str, timeout: float, done: action(?str, ?Exception) -> None):
         d = dmc
-        if d is not None and tcp is not None and not closed:
+        m = mock
+        if m is not None:
+            done(m.run(command) if command is not None else "", None)
+        elif d is not None and tcp is not None and not closed:
             _Session(tcp, d, command, timeout, done)
         else:
             done(None, NotConnectedError("the IOS XE CLI adapter has no SSH connection settings"))
+
+    def _mock_configure(m: CliMock, lines: list[str], done: action(?str, ?Exception) -> None):
+        """Type lines into the CliMock with a ConfigDialog."""
+        dialog = ConfigDialog(lines)
+        queue = [""]
+        while len(queue) > 0 and not dialog.finished():
+            text = queue[0]
+            queue = queue[1:]
+            for typed in dialog.received(m.type_text(text)):
+                queue.append(typed.rstrip())
+        err = dialog.error
+        done(dialog.transcript, CommandError(err) if err is not None else None)
 
     def _login(gen: int, delay: float):
         if closed or gen != generation:
@@ -506,6 +1248,13 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
         if closed:
             return
         dmc = new_dmc
+        if mock_mode(new_dmc, env):
+            if mock is None:
+                generation += 1
+                mock = CliMock()
+                async dev.on_connect(modules(), None, new_dmc.type)
+            return
+        mock = None
         selected = gdata.FNode(children=[gdata.FNode(gdata.Id(_RFS_NS, name))
                                        for name in ["address", "credentials", "ssh"]])
         new_settings = gdata.filter(new_dmc.to_gdata(), selected)
@@ -554,24 +1303,49 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
 
     def _call(cb: action(?gdata.Node, ?Exception) -> None, c: Call):
         def received(output: ?str, err: ?Exception):
-            if err is not None:
-                cb(None, err)
-                return
+            _log.debug("IOS XE CLI: RPC command ended", {"command": c.command, "output": output, "error": err})
             try:
-                reply = c.reply(output if output is not None else "")
+                reply = c.ended(output, err) if err is not None else c.reply(output if output is not None else "")
             except Exception as e:
                 cb(None, e)
             else:
                 cb(reply, None)
-        _session(c.command, rpc_timeout, received)
+        _session(c.command, c.timeout(rpc_timeout), received)
 
-    def rpc(cb: action(?gdata.Node, ?Exception) -> None, request: gdata.Node):
+    def _configure(cb: action(?gdata.Node, ?Exception) -> None, lines: list[str]):
+        def received(output: ?str, err: ?Exception):
+            _log.debug("IOS XE CLI: configure ended", {"lines": lines, "output": output, "error": err})
+            if err is not None:
+                cb(None, err)
+            else:
+                cb(gdata.Container({}), None)
+        d = dmc
+        m = mock
+        if m is not None:
+            _mock_configure(m, lines, received)
+        elif d is not None and tcp is not None and not closed:
+            _ConfigSession(tcp, d, lines, received)
+        else:
+            received(None, NotConnectedError("the IOS XE CLI adapter has no SSH connection settings"))
+
+    def _exec(cb: action(?gdata.Node, ?Exception) -> None, request: gdata.Node):
         try:
             c = rpc_call(request)
         except Exception as e:
             cb(None, e)
         else:
             _call(cb, c)
+
+    def rpc(cb: action(?gdata.Node, ?Exception) -> None, request: gdata.Node):
+        try:
+            lines = configure_lines(request)
+        except Exception as e:
+            cb(None, e)
+        else:
+            if lines is not None:
+                _configure(cb, lines)
+            else:
+                _exec(cb, request)
 
     def close(on_close: ?action() -> None=None):
         closed = True
@@ -596,6 +1370,13 @@ class IosXeCliAdapter(DeviceAdapter):
 
     def set_dmc(self, new_dmc: DeviceMetaConfig):
         self._driver.set_dmc(new_dmc)
+
+    def supports_mocking(self) -> bool:
+        return True
+
+    proc def get_mock(self) -> ?CliMock:
+        """Return the CliMock that the adapter runs against in mock mode."""
+        return self._driver.get_mock()
 
     def configure(self, done, new_diff, new_conf, running_conf):
         done(ConfigError("the IOS XE CLI adapter does not configure devices", new_diff, new_conf), None)
