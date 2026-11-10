@@ -236,7 +236,7 @@
   publishes, `md5`, `sha256` and `sha512`, and its `size` in bytes. A
   campaign copies them with the image URL into the software intent of each
   device, as `software/image-checksum` and `software/image-size`, for the
-  device's adapter to check the staged image against.
+  device's adapter to check the staged image against. [#778]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
