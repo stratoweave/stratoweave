@@ -280,24 +280,43 @@ def occurrences(sched: y_0.maintenance__schedules__schedule_entry, now: int) -> 
     return sorted(out)
 
 
-def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_campaign_entry,
-                       inventory: y_0.root, now: int) -> None:
-    """Give the campaign's controller the windows, the devices and the
-    limits that the campaign and the inventory give at time now.
+class CampaignMembers(object):
+    """The members of a campaign as its controller takes them: the
+    devices as (name, estimated duration, schedule) by name, the schedules
+    they are bound to, their redundancy groups, priorities and the groups'
+    separation, the campaign's estimated duration, and each member's
+    expected prepare time. When no member is bound to a schedule, every
+    member is in the synthetic schedule "default"."""
+    devices: list[(str, int, str)]
+    referenced: list[str]
+    groups: dict[str, list[str]]
+    priority: dict[str, int]
+    separation: dict[str, (bool, int)]
+    estimate: int
+    prepare_est: dict[str, int]
 
-    A member device goes in the windows of the schedule it is bound to,
-    or else of the campaign's default schedule. A campaign with no
-    default and no bound members gets one synthetic window that opens at
-    launch and never closes. The deadline cuts off the windows - the
-    synthetic one included - and every device must start before it when
-    the planner sees every window before it. The members' redundancy
-    groups and priorities go with them, and each group's separation: a
-    group with no entry under /redundancy-groups spreads. So do the
-    campaign's allow-staging and each member's expected prepare time."""
-    deadline = 0
-    dl = i.deadline
-    if dl is not None:
-        deadline = int(dl)
+    def __init__(self, devices: list[(str, int, str)], referenced: list[str],
+                 groups: dict[str, list[str]], priority: dict[str, int],
+                 separation: dict[str, (bool, int)], estimate: int,
+                 prepare_est: dict[str, int]):
+        self.devices = devices
+        self.referenced = referenced
+        self.groups = groups
+        self.priority = priority
+        self.separation = separation
+        self.estimate = estimate
+        self.prepare_est = prepare_est
+
+
+def campaign_members(i: y_0.software__software__upgrade_campaign_entry,
+                     inventory: y_0.root) -> CampaignMembers:
+    """Return the members of campaign i as its controller takes them, from
+    the campaign and the inventory.
+
+    A member device goes in the schedule it is bound to, or else in the
+    campaign's default schedule. The members' redundancy groups and
+    priorities go with them, and each group's separation: a group with no
+    entry under /redundancy-groups spreads."""
     default: ?str = i.default_schedule
 
     members = sorted([member.name for member in i.device])
@@ -321,24 +340,7 @@ def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_
         if binding is not None and binding not in referenced:
             referenced.append(binding)
 
-    windows: list[(str, int, int)] = []
     synthetic = len(referenced) == 0
-    if synthetic:
-        windows.append(("default", 0, deadline if deadline > 0 else OPEN_END))
-    for sname in referenced:
-        sched = inventory.schedules.schedule.get(sname)
-        if sched is not None:
-            for we in occurrences(sched, now):
-                wstart = we.0
-                wend = we.1
-                if deadline > 0:
-                    # The deadline cuts off the window supply.
-                    if wstart >= deadline:
-                        continue
-                    if wend > deadline:
-                        wend = deadline
-                windows.append((sname, wstart, wend))
-
     devices: list[(str, int, str)] = []
     prepare_est: dict[str, int] = {}
     for name in members:
@@ -357,12 +359,53 @@ def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_
             separation[g] = (policy.separation_policy == "spread", int(policy.min_separation))
         else:
             separation[g] = (True, 0)
+    return CampaignMembers(devices, referenced, groups, priority, separation,
+                           estimated_duration(i, inventory), prepare_est)
+
+
+def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_campaign_entry,
+                       inventory: y_0.root, now: int,
+                       members: ?CampaignMembers=None) -> None:
+    """Give the campaign's controller the windows, the devices and the
+    limits that the campaign and the inventory give at time now. members
+    is campaign_members() of the campaign and the inventory; without it,
+    configure_campaign() takes it again.
+
+    A member device goes in the windows of its schedule. A campaign with
+    no default and no bound members gets one synthetic window that opens
+    at launch and never closes. The deadline cuts off the windows - the
+    synthetic one included - and every device must start before it when
+    the planner sees every window before it. So do the campaign's
+    allow-staging and each member's expected prepare time."""
+    m = members if members is not None else campaign_members(i, inventory)
+    deadline = 0
+    dl = i.deadline
+    if dl is not None:
+        deadline = int(dl)
+
+    windows: list[(str, int, int)] = []
+    synthetic = len(m.referenced) == 0
+    if synthetic:
+        windows.append(("default", 0, deadline if deadline > 0 else OPEN_END))
+    for sname in m.referenced:
+        sched = inventory.schedules.schedule.get(sname)
+        if sched is not None:
+            for we in occurrences(sched, now):
+                wstart = we.0
+                wend = we.1
+                if deadline > 0:
+                    # The deadline cuts off the window supply.
+                    if wstart >= deadline:
+                        continue
+                    if wend > deadline:
+                        wend = deadline
+                windows.append((sname, wstart, wend))
 
     must_place = deadline > 0 and (synthetic or deadline - now <= (HORIZON_DAYS - 1) * 86400)
-    ctl.configure(windows, devices, int(i.target_concurrency), int(i.max_concurrency),
-                  must_place, campaign_debounce_s(len(members)),
-                  estimated_duration(i, inventory), groups, priority, separation,
-                  int(i.close_margin), int(i.stagger), i.allow_staging, prepare_est)
+    ctl.configure(windows, m.devices, int(i.target_concurrency), int(i.max_concurrency),
+                  must_place, campaign_debounce_s(len(m.devices)), m.estimate, m.groups,
+                  m.priority, m.separation, int(i.close_margin), int(i.stagger),
+                  i.allow_staging, m.prepare_est)
 
 
 class RedundancyGroups(base.RedundancyGroups):
@@ -704,6 +747,9 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     # flight and the members let prepare that it was written with.
     var campaign: ?y_0.software__software__upgrade_campaign_entry = None
     var inventory = y_0.root()
+    # The members of the campaign as the controller takes them, from the
+    # campaign and the inventory of the last on_conf.
+    var member_info: ?CampaignMembers = None
     var targets: dict[str, str] = {}
     var output: ygdata.Node = base.o_root().to_gdata()
     var unheld: set[str] = set()
@@ -714,11 +760,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         final status came before its release runs none, so it keeps the
         veto. So does a member that still upgrades from before the run: it
         stops if it has not reached its install."""
-        names: set[str] = set()
-        for name in ctl.flying:
-            if name not in ctl.no_upgrade and name not in ctl.resumed:
-                names.add(name)
-        return names
+        return ctl.upgrading()
 
     def own_status(name: str, tag_campaign: ?str, tag_target: ?str, status: ?str) -> ?str:
         """Return the status of the device name when it is for the
@@ -830,10 +872,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 win.end = u64(pw.2)
             for entry in pw.3:
                 pd = win.device.create(entry.0)
-                started = shown.released_at.get(entry.0)
+                started = shown.release_time(entry.0)
                 if started is not None:
                     pd.started = u64(started)
-                    finished = shown.done_at.get(entry.0)
+                    finished = shown.done_time(entry.0)
                     if finished is not None:
                         pd.finished = u64(finished)
                 else:
@@ -876,7 +918,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         does not plan again."""
         current = campaign
         if not running and current is not None:
-            configure_campaign(ctl, current, inventory, now)
+            configure_campaign(ctl, current, inventory, now, member_info)
             plan_now(now)
 
     def publish_settled(gen: int) -> None:
@@ -965,7 +1007,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         # The schedules give new windows as time passes.
         current = campaign
         if current is not None:
-            configure_campaign(ctl, current, inventory, t)
+            configure_campaign(ctl, current, inventory, t, member_info)
         s = ctl.decide(t)
         shown = ctl
         plan_layout = ctl.layout(s.plan)
@@ -1020,9 +1062,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         campaign = conf
         inventory = y_0.root.from_gdata(linked)
         now = time.time().unix_s()
+        member_info = campaign_members(conf, inventory)
         # The released devices, the ramp and the promises stay: a replan
         # goes on from where the run is.
-        configure_campaign(ctl, conf, inventory, now)
+        configure_campaign(ctl, conf, inventory, now, member_info)
         # The controller forgets the members that left. Added again, a
         # member waits until it answers, and starts in a window.
         ctl.drop(left)
