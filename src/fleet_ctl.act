@@ -233,6 +233,25 @@ def window_needs(work: list[int], ends: list[int], t: int, c: int) -> list[int]:
     return rest
 
 
+def prepare_gap(deadlines: list[int], upto: list[int], lo: int, taken: int, last: int) -> int:
+    """The time from the turn last to the next turn, in microseconds: the
+    longest at which each member left still has its turn by its deadline.
+    deadlines holds the members' deadlines, each once and in order, and
+    upto how many members have that deadline or an earlier one. lo is the
+    first deadline with members left, and taken is how many members have
+    a turn. For each deadline D, the members left with deadline D or
+    earlier share the time from last to D. The gap is the smallest of
+    those shares, and never below 0."""
+    gap = -1
+    for j in range(lo, len(deadlines)):
+        share = 0
+        if deadlines[j] > last:
+            share = (deadlines[j] - last) // (upto[j] - taken)
+        if gap < 0 or share < gap:
+            gap = share
+    return imax(0, gap)
+
+
 def copy_set(s: set[str]) -> set[str]:
     out: set[str] = set()
     for x in s:
@@ -266,23 +285,47 @@ class Plan(object):
         self.alarms = alarms
 
 
+class Prepares(object):
+    """The prepares of a campaign at a time t.
+
+    starts gives the second at which each member prepares: when it was
+    let in this run, or, for a member that waits to prepare, the start of
+    the debounce slot of its turn, and not before t. c is the most members
+    that prepare at once, each from its start for its expected prepare
+    time, the prepares that run now included. alarms names the members
+    that cannot prepare before their window opens and the members that
+    wait for their release and whose prepare failed."""
+    starts: dict[str, int]
+    c: int
+    alarms: list[str]
+
+    def __init__(self, starts: dict[str, int], c: int, alarms: list[str]):
+        self.starts = starts
+        self.c = c
+        self.alarms = alarms
+
+
 class Step(object):
     """What one decision did.
 
     started holds the devices to start now. wake is the next time to
     decide if no report comes first, or -1 when only a report can change
     what starts. finished is true when every device is done. plan is
-    the plan the decision followed."""
+    the plan the decision followed. prepares is the prepares after the
+    decision."""
     started: list[str]
     wake: int
     finished: bool
     plan: Plan
+    prepares: Prepares
 
-    def __init__(self, started: list[str], wake: int, finished: bool, plan: Plan):
+    def __init__(self, started: list[str], wake: int, finished: bool, plan: Plan,
+                 prepares: Prepares):
         self.started = started
         self.wake = wake
         self.finished = finished
         self.plan = plan
+        self.prepares = prepares
 
 
 class Controller(object):
@@ -442,7 +485,33 @@ class Controller(object):
     alarm starts every device where and when the plan said. A plan holds
     one concurrency for the whole run ahead; when it breaks promises, a
     later decision can find that rising then keeps some of them, and the
-    run follows that later plan."""
+    run follows that later plan.
+
+    With prepare on, a run lets members prepare: copy their image before
+    their window, once per run. A member waits to prepare while it is not
+    released, its latest report says that it needs the upgrade, it has a
+    promise, it was not let prepare in this run, it reports no prepare,
+    and it has a deadline. Its deadline is the opening of the first window
+    of its schedule that has not closed, less the close margin of its
+    expected prepare time. It has none while that window is open, or when
+    its schedule has no window in view. A member whose deadline has passed
+    cannot prepare in time, and the prepares give an alarm for it. The
+    waiting members take turns: by deadline, then in the order of their
+    promises, then in the campaign's order. The first turn is now, or one
+    gap after the last turn. Each gap is as long as it can be while every
+    member left has its turn by its deadline. So the turns are as far
+    apart as the deadlines allow, and they cover the whole time to the
+    last deadline. A turn depends only on the last turn and the members
+    left. A decision lets each member whose turn is before the end of the
+    decision's debounce slot, and wakes at the slot of the next turn: the
+    members whose turns are in one slot start together. So when nothing
+    comes in, each member is let at the time that prepares() showed. When a decision comes after a turn's slot, it lets
+    one member now and spreads the rest from now. A member stops being let
+    when its prepare is done or failed, it is released, its latest report
+    no longer says that it needs the upgrade, it leaves the campaign, a
+    window of its schedule opens, prepare goes off, or the run stops.
+    Prepares change no release decision: step(), plan() and the quiet time
+    read nothing of them."""
     # Configuration.
     # The windows: schedule, start, end, by start. They include the
     # windows that released devices were released in, also when the
@@ -483,6 +552,10 @@ class Controller(object):
     # The time over which as many devices as the concurrency start, in
     # percent of the expected upgrade time; 0 starts them at once.
     stagger: int
+    # Whether the members may prepare their image before their window, and
+    # each member's expected prepare time, in seconds.
+    prepare: bool
+    prepare_est: dict[str, int]
 
     # Derived from the configuration and the state by rebuild().
     # Per window: the devices that can start in it, in order and by
@@ -520,6 +593,16 @@ class Controller(object):
     final_status: dict[str, str]
     # The devices whose latest report answers the campaign's target.
     answered: set[str]
+    # The latest prepare state each member reports for the campaign's
+    # target: running, done or failed. It outlives a run, as final_at does.
+    prepare_state: dict[str, str]
+    # The members let prepare in this run, with the second they were let,
+    # and the members let prepare now.
+    prepare_at: dict[str, int]
+    allowed: set[str]
+    # The turn of the last member let prepare, in microseconds; -1 when no
+    # member was let since the last turns ended.
+    prep_last: int
     # The devices whose latest report is in-progress, with the time the
     # first of those reports came.
     progress: dict[str, int]
@@ -609,6 +692,8 @@ class Controller(object):
         self.debounce = 0
         self.close_margin = CLOSE_MARGIN
         self.stagger = 0
+        self.prepare = False
+        self.prepare_est = {}
         self.estimate_s = 1
         self.queue = []
         self.by_est = []
@@ -629,6 +714,10 @@ class Controller(object):
         self.final_at = {}
         self.final_status = {}
         self.answered = set()
+        self.prepare_state = {}
+        self.prepare_at = {}
+        self.allowed = set()
+        self.prep_last = -1
         self.progress = {}
         self.resumed = set()
         self.failed = set()
@@ -667,7 +756,8 @@ class Controller(object):
                   target: int, maxc: int, must_place: bool, debounce: int,
                   estimate_s: int, groups: dict[str, list[str]]={},
                   priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
-                  close_margin: int=CLOSE_MARGIN, stagger: int=0) -> None:
+                  close_margin: int=CLOSE_MARGIN, stagger: int=0, prepare: bool=False,
+                  prepare_est: dict[str, int]={}) -> None:
         """Take the windows the schedules give, the devices as (name,
         estimated duration, schedule) in the order they start, the target
         and the max concurrency, whether every device must start in a
@@ -675,11 +765,20 @@ class Controller(object):
         duration, the redundancy groups of the devices as their members,
         the priority of each device, per group whether it spreads and its
         min-separation in seconds, the close margin in percent of the slow
-        time, and the stagger in percent of the expected upgrade time. A
-        group without a separation packs with none. New limits start the
-        concurrency over at the target, and the ramp at most at the target.
-        New limits keep the last upgrade times, and the pace and the slow
-        time are taken from them again."""
+        time, the stagger in percent of the expected upgrade time, whether
+        the members may prepare, and each member's expected prepare time in
+        seconds. A group without a separation packs with none. New limits
+        start the concurrency over at the target, and the ramp at most at
+        the target. New limits keep the last upgrade times, and the pace
+        and the slow time are taken from them again. Prepare and the
+        prepare times change no release decision. When prepare goes off,
+        no member is let prepare any more."""
+        self.prepare_est = prepare_est
+        if prepare != self.prepare:
+            self.prepare = prepare
+            if not prepare:
+                self.allowed = set()
+                self.prep_last = -1
         m = imax(target, maxc)
         e = imax(1, estimate_s)
         margin = imax(100, close_margin)
@@ -732,10 +831,14 @@ class Controller(object):
         """Begin a run: nothing is released or promised, the observed
         pace is observed_s or else the campaign's estimate, the ramp is at
         rung devices, the concurrency at the target, and a device may start
-        now. The reports, the answers among them, and the configuration
-        stay. The run takes in flight each device that still reports
-        in-progress (take_running)."""
+        now. No member is let prepare yet, and the first turn to prepare is
+        now. The reports, the answers and the prepare states among them,
+        and the configuration stay. The run takes in flight each device
+        that still reports in-progress (take_running)."""
         self.running = True
+        self.prepare_at = {}
+        self.allowed = set()
+        self.prep_last = -1
         self.released = set()
         self.released_at = {}
         self.released_in = {}
@@ -802,9 +905,10 @@ class Controller(object):
         return total
 
     def stop(self) -> None:
-        """End the run: no promises are kept. The released devices stay
-        released."""
+        """End the run: no promises are kept, and no member is let prepare.
+        The released devices stay released."""
         self.running = False
+        self.allowed = set()
         self.promised = {}
         self.promise_seq = {}
         self.quiet_until = 0
@@ -849,11 +953,11 @@ class Controller(object):
 
     def drop(self, names: set[str]) -> None:
         """Forget all that the run knows of the devices in names, which left
-        the campaign: their release, their reports and answers, and whether
-        they are done or failed. A device that joins the campaign again is
-        then a new member: it waits until it answers, and starts in a
-        window. configure() alone keeps this for a device that leaves, so
-        that its report still counts."""
+        the campaign: their release, their reports and answers, their
+        prepares, and whether they are done or failed. A device that joins
+        the campaign again is then a new member: it waits until it answers,
+        and starts in a window. configure() alone keeps this for a device
+        that leaves, so that its report still counts."""
         if len(names) == 0:
             return
         for name in names:
@@ -869,6 +973,9 @@ class Controller(object):
             self.promised.pop(name)
             self.promise_seq.pop(name)
             self.answered.discard(name)
+            self.prepare_state.pop(name)
+            self.prepare_at.pop(name)
+            self.allowed.discard(name)
             self.resumed.discard(name)
             self.failed.discard(name)
             self.reported.discard(name)
@@ -1041,6 +1148,15 @@ class Controller(object):
         if name in self.est and name not in self.released:
             self.quiet_until = 0
 
+    def report_prepare(self, name: str, state: ?str) -> None:
+        """Take the latest prepare state of a member for the campaign's
+        target: running, done or failed, or None when it reports none. It
+        changes no release decision, so the quiet time stays."""
+        if state is not None:
+            self.prepare_state[name] = state
+        else:
+            self.prepare_state.pop(name)
+
     def lost(self, name: str) -> None:
         """Forget the status of a device."""
         self.take_answer(name, False)
@@ -1055,10 +1171,11 @@ class Controller(object):
             self.quiet_until = 0
 
     def lost_all(self) -> None:
-        """Forget the status of every device."""
+        """Forget the status and the prepare state of every device."""
         self.final_at = {}
         self.final_status = {}
         self.answered = set()
+        self.prepare_state = {}
         self.progress = {}
         self.reported = set()
         self.no_upgrade = set()
@@ -1659,6 +1776,8 @@ class Controller(object):
         c.estimate_s = self.estimate_s
         c.close_margin = self.close_margin
         c.stagger = self.stagger
+        c.prepare = self.prepare
+        c.prepare_est = self.prepare_est
         c.queue = self.queue
         c.by_est = self.by_est
         c.windows_of = self.windows_of
@@ -1679,6 +1798,10 @@ class Controller(object):
         c.final_status = {k: v for k, v in self.final_status.items()}
         # The run ahead reports into its copy.
         c.answered = copy_set(self.answered)
+        c.prepare_state = {k: v for k, v in self.prepare_state.items()}
+        c.prepare_at = {k: v for k, v in self.prepare_at.items()}
+        c.allowed = copy_set(self.allowed)
+        c.prep_last = self.prep_last
         c.progress = {k: v for k, v in self.progress.items()}
         c.resumed = copy_set(self.resumed)
         c.failed = copy_set(self.failed)
@@ -2109,7 +2232,8 @@ class Controller(object):
         not final, such as in-progress, brings in nothing. Then the
         decision takes that plan again, without the devices that started
         since, with the held devices at the earliest times they could
-        start from t, and only starts the devices it starts now."""
+        start from t, and only starts the devices it starts now. Then it
+        lets members prepare whose turn has come (take_prepares)."""
         last = self.last_plan
         if last is not None and self.quiet_from <= t and t < self.quiet_until:
             p = Plan(last.c, {name: s for name, s in last.starts.items()
@@ -2119,7 +2243,187 @@ class Controller(object):
         else:
             p = self.plan(t)
         started, wake, finished = self.step(t, p.c)
-        return Step(started, wake, finished, p)
+        wake = earliest(wake, self.take_prepares(t))
+        return Step(started, wake, finished, p, self.prepares(t))
+
+    def slot(self, s: int) -> int:
+        """The start of the debounce slot of the second s, in seconds."""
+        q = imax(1, self.debounce)
+        return s // q * q
+
+    def in_window(self, name: str, t: int) -> bool:
+        """True when the first window of the device's schedule that has not
+        closed at t is open at t."""
+        for j in self.windows_of.get_def(name, []):
+            w = self.windows[j]
+            if t < w.2:
+                return w.1 <= t
+        return False
+
+    def prepare_deadline(self, name: str, t: int) -> ?int:
+        """The time by which a member must start to prepare, in
+        microseconds: the opening of the first window of its schedule that
+        has not closed at t, less the close margin of its expected prepare
+        time. None while that window is open at t, or when its schedule has
+        no such window."""
+        for j in self.windows_of.get_def(name, []):
+            w = self.windows[j]
+            if t < w.2:
+                if w.1 <= t:
+                    return None
+                return w.1 * MICRO \
+                    - self.prepare_est.get_def(name, 1) * self.close_margin * (MICRO // 100)
+        return None
+
+    def turns(self, t: int) -> (list[(int, str)], list[str]):
+        """The turns to prepare of the members that wait to prepare at t,
+        in order, as (time in microseconds, name), and the members whose
+        deadline has passed, in the campaign's order. A member waits to
+        prepare while the run is on, prepare is on, it is not released,
+        its latest report says that it needs the upgrade, it has a promise,
+        it was not let prepare in this run, it reports no prepare, and it
+        has a deadline. The turns go by deadline, then by the order of the
+        promises, then by the campaign's order. The first turn is t, or one
+        gap after the last turn let, and t when that is before the start
+        of t's debounce slot. Each next turn is one gap after the turn
+        before it (prepare_gap)."""
+        late: list[str] = []
+        if not self.running or not self.prepare:
+            return ([], late)
+        waiting: list[(int, int, int, str)] = []
+        for k in range(len(self.order)):
+            name = self.order[k]
+            if name in self.released or name not in self.answered or name in self.final_at \
+               or name in self.prepare_at or name in self.prepare_state \
+               or self.promise(name, t) < 0:
+                continue
+            d = self.prepare_deadline(name, t)
+            if d is not None:
+                if d < t * MICRO:
+                    late.append(name)
+                else:
+                    waiting.append((d, self.promise_seq.get_def(name, 0), k, name))
+        if len(waiting) == 0:
+            return ([], late)
+        ordered = sorted(waiting)
+        # Each deadline once, with how many members have it or an earlier
+        # one.
+        deadlines: list[int] = []
+        upto: list[int] = []
+        for k in range(len(ordered)):
+            d = ordered[k].0
+            if len(deadlines) > 0 and deadlines[-1] == d:
+                upto[-1] = k + 1
+            else:
+                deadlines.append(d)
+                upto.append(k + 1)
+        turn = t * MICRO
+        if self.prep_last >= 0:
+            turn = self.prep_last + prepare_gap(deadlines, upto, 0, 0, self.prep_last)
+            if turn < self.slot(t) * MICRO:
+                # Behind: one member now, and the rest spread from now.
+                turn = t * MICRO
+        out: list[(int, str)] = [(turn, ordered[0].3)]
+        lo = 0
+        for k in range(1, len(ordered)):
+            while upto[lo] <= k:
+                lo += 1
+            turn += prepare_gap(deadlines, upto, lo, k, turn)
+            out.append((turn, ordered[k].3))
+        return (out, late)
+
+    def prepares(self, t: int) -> Prepares:
+        """The prepares at t, as turns() gives them and without changing
+        anything. The members let prepare in this run start when they were
+        let, and each waiting member at the start of the debounce slot of
+        its turn, and not before t. The most members that prepare at once
+        counts each waiting member from that start for its expected prepare
+        time, and the prepares that run now: the members let prepare now,
+        and the members not released that report their prepare running,
+        each from when it was let, or else from t. The failed prepares are
+        those of the members that wait for their release: not released,
+        and their latest report says that they need the upgrade."""
+        tr = self.turns(t)
+        starts: dict[str, int] = {}
+        for name, at in self.prepare_at.items():
+            starts[name] = at
+        for e in tr.0:
+            starts[e.1] = imax(t, self.slot(e.0 // MICRO))
+        now = copy_set(self.allowed)
+        for name, st in self.prepare_state.items():
+            if st == "running" and name not in self.released:
+                now.add(name)
+        # Each prepare as (start, end, name), in microseconds.
+        spans: list[(int, int, str)] = []
+        for name in now:
+            begin = self.prepare_at.get_def(name, t) * MICRO
+            end = begin + self.prepare_est.get_def(name, 1) * MICRO
+            if end > t * MICRO:
+                spans.append((begin, end, name))
+        for e in tr.0:
+            begin = starts[e.1] * MICRO
+            spans.append((begin, begin + self.prepare_est.get_def(e.1, 1) * MICRO, e.1))
+        # The ends of the prepares that run at each start.
+        ends: list[(int, str)] = []
+        c = 0
+        for sp in sorted(spans):
+            while len(ends) > 0 and ends[0].0 <= sp.0:
+                heap_pop(ends)
+            heap_push(ends, (sp.1, sp.2))
+            c = imax(c, len(ends))
+        alarms: list[str] = []
+        if len(tr.1) > 0:
+            alarms.append("{len(tr.1)} device(s) cannot prepare before their window opens: "
+                          + names_text(tr.1))
+        failed = [name for name in self.order if name not in self.released
+                  and name in self.answered and name not in self.final_at
+                  and self.prepare_state.get(name) == "failed"]
+        if len(failed) > 0:
+            alarms.append("{len(failed)} device(s) failed to prepare and copy the image in "
+                          + "their window: {names_text(failed)}")
+        return Prepares(starts, c, alarms)
+
+    def revoke_prepares(self, t: int) -> None:
+        """Stop letting prepare each member that may no longer prepare at
+        t: all of them when the run is off or prepare is off, and each one
+        that is released, whose latest report no longer says that it needs
+        the upgrade, that left the campaign, whose prepare is done or
+        failed, or for which a window of its schedule is open."""
+        if len(self.allowed) == 0:
+            return
+        if not self.running or not self.prepare:
+            self.allowed = set()
+            return
+        keep: set[str] = set()
+        for name in self.allowed:
+            st = self.prepare_state.get(name)
+            if name in self.released or name not in self.answered or name in self.final_at \
+               or name not in self.est or st == "done" or st == "failed" \
+               or self.in_window(name, t):
+                continue
+            keep.add(name)
+        self.allowed = keep
+
+    def take_prepares(self, t: int) -> int:
+        """Stop letting prepare the members that may no longer prepare
+        (revoke_prepares), and let prepare each member whose turn is
+        before the end of t's debounce slot. Return the start of the
+        debounce slot of the next turn, or -1 when no turn is left. With no
+        turn left, the next member that comes to wait goes at once."""
+        self.revoke_prepares(t)
+        tr = self.turns(t)
+        end = (self.slot(t) + imax(1, self.debounce)) * MICRO
+        wake = -1
+        for e in tr.0:
+            if e.0 < end:
+                self.allowed.add(e.1)
+                self.prepare_at[e.1] = t
+                self.prep_last = e.0
+            elif wake < 0:
+                wake = self.slot(e.0 // MICRO)
+        if wake < 0:
+            self.prep_last = -1
+        return wake
 
     def layout(self, p: Plan) -> list[(str, int, int, list[(str, int, int)])]:
         """The windows with their devices, by start: one (schedule, start,

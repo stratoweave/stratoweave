@@ -1,5 +1,6 @@
 import logging
 import testing
+import time
 import std.xml as xml
 import yang.gdata as gdata
 import yang.xml as yxml
@@ -213,9 +214,10 @@ actor _test_campaign_transform(t: testing.AsyncT):
     )
     campaign.device.create("cpe-1", image=IMAGE)
 
-    # cpe-1 is in flight, so it has no veto.
+    # cpe-1 is in flight, so it has no veto, and no allow-staging: the run
+    # prepares anyway.
     o: y_1.root = y_1.root.from_gdata(
-        cfs.campaign_config(campaign, inventory, {"cpe-1"}, None).to_gdata()
+        cfs.campaign_config(campaign, inventory, {"cpe-1"}, {"cpe-1"}, None).to_gdata()
     )
     dev = o.rfs.get(cfs.flotilla_of("cpe-1"))!.device.get("cpe-1")!
 
@@ -230,7 +232,7 @@ actor _test_campaign_transform(t: testing.AsyncT):
        dev.software.image_size != u64(IMAGE_SIZE):
         t.failure(ValueError("campaign was not routed to the device's flotilla: md5 {digest}, size {dev.software.image_size}"))
     elif dev.software.allow_staging is not None:
-        t.failure(ValueError("the campaign passed allow-staging to the device"))
+        t.failure(ValueError("a member in flight has allow-staging"))
     elif len(dev.software.veto) != 0:
         t.failure(ValueError("a member in flight has a veto"))
     else:
@@ -314,23 +316,50 @@ def _vetoed(out: gdata.Node, campaign: str) -> (list[str], list[str], list[str],
     return (sorted(vetoed), sorted(free), sorted(targeted), sorted(unnamed))
 
 
+def _staged(out: gdata.Node) -> list[str]:
+    """Return the devices in out, the output of a campaign, that have
+    allow-staging, sorted. A device with allow-staging false shows as
+    "name false"."""
+    staged: list[str] = []
+    for flotilla in y_1.root.from_gdata(out).rfs:
+        for dev in flotilla.device:
+            a = dev.software.allow_staging
+            if a is not None:
+                staged.append(dev.name if a else dev.name + " false")
+    return sorted(staged)
+
+
 def _test_campaign_function_renders_the_claim():
     """The campaign's transform function gives every member the campaign's
     name, target and veto. In run, the members that the output written last
     has in flight, without the veto, keep no veto. A prev of another
-    campaign gives none in flight."""
+    campaign gives none in flight. In run with allow-staging, the members
+    that prev lets prepare stay let, while the campaign gives them the
+    same target release."""
     names = ["cpe-1", "cpe-2", "cpe-3"]
     inventory = _with_nightly(_flat_inventory(names))
     linked = inventory.to_gdata()
     run = _paced_campaign(names)
-    prev = cfs.campaign_config(run, inventory, {"cpe-2"}, None).to_gdata()
+    prev = cfs.campaign_config(run, inventory, {"cpe-2"}, set(), None).to_gdata()
     other = InputCampaign(name="other", admin_state="run")
     for name in names:
         other.device.create(name, image=IMAGE)
-    prev_other = cfs.campaign_config(other, inventory, {"cpe-2"}, None).to_gdata()
-    testing.assertEqual(cfs.unheld_in(prev, run), {"cpe-2"}, "prev has cpe-2 in flight")
-    testing.assertEqual(cfs.unheld_in(prev_other, run), set(),
-                        "the prev of another campaign has none of this one in flight")
+    prev_other = cfs.campaign_config(other, inventory, {"cpe-2"}, set(), None).to_gdata()
+    staging = _paced_campaign(names)
+    staging.allow_staging = True
+    prev_staged = cfs.campaign_config(staging, inventory, set(), {"cpe-2"}, None).to_gdata()
+    testing.assertEqual(_staged(prev_staged), ["cpe-2"], "prev lets cpe-2 prepare")
+    # (case, prev, the campaign, the members in flight and let prepare)
+    written: list[(str, gdata.Node, InputCampaign, set[str], set[str])] = [
+        ("prev has cpe-2 in flight", prev, run, {"cpe-2"}, set()),
+        ("the prev of another campaign has none of this one", prev_other, run, set(), set()),
+        ("prev lets cpe-2 prepare", prev_staged, staging, set(), {"cpe-2"}),
+        ("without allow-staging no member is let prepare", prev_staged, run, set(), set()),
+    ]
+    for case in written:
+        w = cfs.written_in(case.1, case.2, inventory)
+        testing.assertEqual(w.0, case.3, case.0)
+        testing.assertEqual(w.1, case.4, case.0)
     # (case, admin-state, prev, the vetoed members)
     cases: list[(str, str, ?gdata.Node, list[str])] = [
         ("plan, no prev", "plan", None, names),
@@ -348,12 +377,40 @@ def _test_campaign_function_renders_the_claim():
         testing.assertEqual(sorted(vetoed + free), names, case.0)
         testing.assertEqual(targeted, names, case.0)
         testing.assertEqual(unnamed, [], case.0)
+        testing.assertEqual(_staged(out), [], case.0)
+
+    # prev is in run with allow-staging, and lets cpe-2 prepare. (case,
+    # admin-state, allow-staging, the version of the image, and the members
+    # with allow-staging)
+    staged_cases: list[(str, str, bool, str, list[str])] = [
+        ("run, on", "run", True, "17.18.03a", ["cpe-2"]),
+        ("run, off", "run", False, "17.18.03a", []),
+        ("plan, on", "plan", True, "17.18.03a", []),
+        ("run, on, the image's version is now 17.18.04", "run", True, "17.18.04", []),
+    ]
+    for case in staged_cases:
+        campaign = _paced_campaign(names)
+        campaign.admin_state = case.1
+        campaign.allow_staging = case.2
+        lk = _with_version(_with_nightly(_flat_inventory(names)), case.3).to_gdata()
+        out = cfs.UpgradeCampaign().transform(campaign, lk, prev_staged).to_gdata()
+        vetoed, free, targeted, unnamed = _vetoed(out, "paced")
+        testing.assertEqual(vetoed, names, case.0)
+        testing.assertEqual(_staged(out), case.4, case.0)
 
     # With nothing changed the wrapper returns the last output itself, so
     # TTT skips the members.
-    wrapped = cfs.UpgradeCampaign().transform_wrapper(run.to_gdata(), linked, None, None, prev)
-    testing.assertEqual(wrapped.0, prev, "the function gives what the actor wrote")
-    testing.assertTrue(ttt.same_node(wrapped.0, prev), "the wrapper returns prev itself")
+    # (case, the campaign, prev)
+    unchanged: list[(str, InputCampaign, gdata.Node)] = [
+        ("cpe-2 in flight", run, prev),
+        ("cpe-2 let prepare", staging, prev_staged),
+    ]
+    for case in unchanged:
+        wrapped = cfs.UpgradeCampaign().transform_wrapper(case.1.to_gdata(), linked, None, None,
+                                                          case.2)
+        testing.assertEqual(wrapped.0, case.2, "the function gives what the actor wrote: " + case.0)
+        testing.assertTrue(ttt.same_node(wrapped.0, case.2),
+                           "the wrapper returns prev itself: " + case.0)
 
 
 actor _test_campaign_edit_keeps_its_output(t: testing.AsyncT):
@@ -649,10 +706,10 @@ actor _test_campaign_without_windows_gets_default_window(t: testing.AsyncT):
     layout, alarms, conc = _plan(campaign, linked, 0)
     testing.assertEqual(_window_names(layout, "default"), ["cpe-1"], None)
     vetoed, free, targeted, unnamed = _vetoed(
-        cfs.campaign_config(campaign, linked, set(), None).to_gdata(), "now")
+        cfs.campaign_config(campaign, linked, set(), set(), None).to_gdata(), "now")
     testing.assertEqual((vetoed, free), (["cpe-1"], []), "an unreleased device is held")
     vetoed, free, targeted, unnamed = _vetoed(
-        cfs.campaign_config(campaign, linked, {"cpe-1"}, None).to_gdata(), "now")
+        cfs.campaign_config(campaign, linked, {"cpe-1"}, set(), None).to_gdata(), "now")
     testing.assertEqual((vetoed, free), ([], ["cpe-1"]), "a released device is not held")
     t.success()
 
@@ -660,7 +717,7 @@ actor _test_campaign_without_windows_gets_default_window(t: testing.AsyncT):
 def _routed(campaign: InputCampaign, inventory: y_0.root) -> list[str]:
     """The members campaign gives a target release, with no member in
     flight."""
-    o = cfs.campaign_config(campaign, inventory, set(), None).to_gdata()
+    o = cfs.campaign_config(campaign, inventory, set(), set(), None).to_gdata()
     vetoed, free, targeted, unnamed = _vetoed(o, campaign.name)
     return targeted
 
@@ -676,7 +733,7 @@ def _test_campaign_member_images():
     campaign.device.create("cpe-2", image="gone.bin")
     campaign.device.create("cpe-3", image="no-version.bin")
     testing.assertEqual(_routed(campaign, inventory), ["cpe-1"])
-    o = cfs.campaign_config(campaign, inventory, set(), None).to_gdata()
+    o = cfs.campaign_config(campaign, inventory, set(), set(), None).to_gdata()
     vetoed, free, targeted, unnamed = _vetoed(o, "images")
     testing.assertEqual(vetoed, ["cpe-1", "cpe-2", "cpe-3"], "every member is held")
     testing.assertEqual(unnamed, [], "every member has the campaign's name")
@@ -698,7 +755,7 @@ def _test_campaign_without_url_base():
     inventory.images.url_base = None
     campaign = InputCampaign(name="no-url", admin_state="run")
     campaign.device.create("cpe-1", image=IMAGE)
-    o: y_1.root = y_1.root.from_gdata(cfs.campaign_config(campaign, inventory, {"cpe-1"}, None).to_gdata())
+    o: y_1.root = y_1.root.from_gdata(cfs.campaign_config(campaign, inventory, {"cpe-1"}, set(), None).to_gdata())
     dev = o.rfs.get(cfs.flotilla_of("cpe-1"))!.device.get("cpe-1")!
     testing.assertEqual(dev.software.target_release, "17.18.03a")
     testing.assertEqual(dev.software.image_url, None)
@@ -732,7 +789,7 @@ actor _test_campaign_plan_state_holds_every_member(t: testing.AsyncT):
     testing.assertEqual(_window_names(layout, "nightly"), ["cpe-1", "cpe-2"], None)
     # In plan a member in flight is held too.
     out = cfs.campaign_config(campaign, _with_nightly(_flat_inventory(["cpe-1", "cpe-2"])),
-                              {"cpe-2"}, None)
+                              {"cpe-2"}, set(), None)
     testing.assertEqual(_vetoed(out.to_gdata(), "paced"),
                         (["cpe-1", "cpe-2"], [], ["cpe-1", "cpe-2"], []))
     t.success()
@@ -743,7 +800,7 @@ actor _test_campaign_lifts_the_veto_only_in_flight(t: testing.AsyncT):
     flight have no veto."""
     campaign = _paced_campaign(["cpe-1", "cpe-2", "cpe-3"])
     out = cfs.campaign_config(
-        campaign, _with_nightly(_flat_inventory(["cpe-1", "cpe-2", "cpe-3"])), {"cpe-2"}, None)
+        campaign, _with_nightly(_flat_inventory(["cpe-1", "cpe-2", "cpe-3"])), {"cpe-2"}, set(), None)
     testing.assertEqual(_vetoed(out.to_gdata(), "paced"),
                         (["cpe-1", "cpe-3"], ["cpe-2"], ["cpe-1", "cpe-2", "cpe-3"], []))
     t.success()
@@ -754,7 +811,7 @@ actor _test_campaign_full_release_actuates_all(t: testing.AsyncT):
     campaign = _paced_campaign(["cpe-1", "cpe-2", "cpe-3"])
     released = {"cpe-1", "cpe-2", "cpe-3"}
     out = cfs.campaign_config(
-        campaign, _with_nightly(_flat_inventory(["cpe-1", "cpe-2", "cpe-3"])), released, None)
+        campaign, _with_nightly(_flat_inventory(["cpe-1", "cpe-2", "cpe-3"])), released, set(), None)
     testing.assertEqual(_vetoed(out.to_gdata(), "paced"),
                         ([], ["cpe-1", "cpe-2", "cpe-3"], ["cpe-1", "cpe-2", "cpe-3"], []))
     t.success()
@@ -765,57 +822,104 @@ def _test_campaign_config_per_member():
     image with a version, cpe-3 names an image that is not in the image
     list, and cpe-9 is not in the fleet. Every member in the fleet gets the
     campaign's name. Only a member in flight in a campaign that runs has no
-    veto. With names, only those members are written. allow-staging is
-    never written."""
+    veto. Only a member with the veto that is let prepare, in a campaign
+    that runs with allow-staging, has allow-staging. With names, only those
+    members are written."""
     inventory = _flat_inventory(["cpe-1", "cpe-2", "cpe-3"])
-    # (admin-state, the members in flight, the members to write, and the
-    # members vetoed, not vetoed and with a target)
-    cases: list[(str, set[str], ?set[str], list[str], list[str], list[str])] = [
-        ("plan", set(), None, ["cpe-1", "cpe-2", "cpe-3"], [], ["cpe-1", "cpe-2"]),
-        ("plan", {"cpe-2"}, None, ["cpe-1", "cpe-2", "cpe-3"], [], ["cpe-1", "cpe-2"]),
-        ("run", set(), None, ["cpe-1", "cpe-2", "cpe-3"], [], ["cpe-1", "cpe-2"]),
-        ("run", {"cpe-2"}, None, ["cpe-1", "cpe-3"], ["cpe-2"], ["cpe-1", "cpe-2"]),
-        ("run", {"cpe-2"}, {"cpe-2"}, [], ["cpe-2"], ["cpe-2"]),
+    every = ["cpe-1", "cpe-2", "cpe-3"]
+    targets = ["cpe-1", "cpe-2"]
+    # (admin-state, allow-staging, the members in flight, the members let
+    # prepare, the members to write, and the members vetoed, not vetoed,
+    # with a target and with allow-staging)
+    cases: list[(str, bool, set[str], set[str], ?set[str], list[str], list[str], list[str],
+                 list[str])] = [
+        ("plan", True, set(), set(), None, every, [], targets, []),
+        ("plan", True, {"cpe-2"}, set(), None, every, [], targets, []),
+        ("run", True, set(), set(), None, every, [], targets, []),
+        ("run", True, {"cpe-2"}, set(), None, ["cpe-1", "cpe-3"], ["cpe-2"], targets, []),
+        ("run", True, {"cpe-2"}, set(), {"cpe-2"}, [], ["cpe-2"], ["cpe-2"], []),
+        ("run", True, set(), {"cpe-1"}, None, every, [], targets, ["cpe-1"]),
+        ("run", False, set(), {"cpe-1"}, None, every, [], targets, []),
+        ("plan", True, set(), {"cpe-1"}, None, every, [], targets, []),
+        # In flight: the run prepares anyway.
+        ("run", True, {"cpe-1"}, {"cpe-1"}, None, ["cpe-2", "cpe-3"], ["cpe-1"], targets, []),
+        # Not in the fleet.
+        ("run", True, set(), {"cpe-9"}, None, every, [], targets, []),
+        ("run", True, set(), {"cpe-1", "cpe-2"}, {"cpe-2"}, ["cpe-2"], [], ["cpe-2"],
+         ["cpe-2"]),
     ]
     for case in cases:
-        campaign = InputCampaign(name="paced", admin_state=case.0, allow_staging=True)
+        campaign = InputCampaign(name="paced", admin_state=case.0, allow_staging=case.1)
         campaign.device.create("cpe-1", image=IMAGE)
         campaign.device.create("cpe-2", image=IMAGE)
         campaign.device.create("cpe-3", image="gone.bin")
         campaign.device.create("cpe-9", image=IMAGE)
-        label = "{case.0}, in flight {case.1}, names {case.2}"
-        o = cfs.campaign_config(campaign, inventory, case.1, case.2).to_gdata()
-        testing.assertEqual(_vetoed(o, "paced"), (case.3, case.4, case.5, []), label)
+        label = "{case.0}, allow-staging {case.1}, in flight {case.2}, let prepare {case.3}, " \
+                + "names {case.4}"
+        o = cfs.campaign_config(campaign, inventory, case.2, case.3, case.4).to_gdata()
+        testing.assertEqual(_vetoed(o, "paced"), (case.5, case.6, case.7, []), label)
+        testing.assertEqual(_staged(o), case.8, label)
         for flotilla in y_1.root.from_gdata(o).rfs:
             for dev in flotilla.device:
-                testing.assertEqual(dev.software.allow_staging, None, label)
                 vetoes = [(v.holder, v.reason) for v in dev.software.veto]
-                if dev.name in case.3:
+                if dev.name in case.5:
                     testing.assertEqual(vetoes, [("campaign:paced", cfs.CAMPAIGN_VETO_REASON)],
                                         label)
 
 
-def _test_release_patch():
-    """The patch of a decision changes the veto of the members that went in
-    flight or left it, and gives the same output as writing the whole
+def _test_intent_patch():
+    """The patch of a decision changes the veto and allow-staging of the
+    members that went in flight or left it, and of the members let prepare
+    or no longer let, and gives the same output as writing the whole
     campaign again. With no change there is no patch."""
     names = ["cpe-1", "cpe-2", "cpe-3"]
     inventory = _with_nightly(_flat_inventory(names))
     campaign = _paced_campaign(names)
-    # (case, the members in flight before and after)
-    cases: list[(str, set[str], set[str])] = [
-        ("cpe-2 is released", set(), {"cpe-2"}),
-        ("cpe-2 is done", {"cpe-2"}, set()),
-        ("cpe-1 is done and cpe-2 is released", {"cpe-1"}, {"cpe-2"}),
+    campaign.allow_staging = True
+    # (case, the members in flight and let prepare before, and after)
+    cases: list[(str, (set[str], set[str]), (set[str], set[str]))] = [
+        ("cpe-2 is released", (set(), set()), ({"cpe-2"}, set())),
+        ("cpe-2 is done", ({"cpe-2"}, set()), (set(), set())),
+        ("cpe-1 is done and cpe-2 is released", ({"cpe-1"}, set()), ({"cpe-2"}, set())),
+        ("cpe-2 is let prepare", (set(), set()), (set(), {"cpe-2"})),
+        ("cpe-2 is done preparing", (set(), {"cpe-2"}), (set(), set())),
+        ("cpe-2 is released while it prepares", (set(), {"cpe-2"}), ({"cpe-2"}, set())),
+        ("cpe-1 is done preparing and cpe-3 is let", (set(), {"cpe-1"}), (set(), {"cpe-3"})),
     ]
     for case in cases:
-        first = cfs.campaign_config(campaign, inventory, case.1, None).to_gdata()
-        then = cfs.campaign_config(campaign, inventory, case.2, None).to_gdata()
-        patched = cfs.release_patch(first, campaign, inventory, case.1, case.2)
+        old = case.1
+        new = case.2
+        first = cfs.campaign_config(campaign, inventory, old.0, old.1, None).to_gdata()
+        then = cfs.campaign_config(campaign, inventory, new.0, new.1, None).to_gdata()
+        testing.assertNotEqual(first, then, case.0)
+        patched = cfs.intent_patch(first, campaign, inventory, old, new)
         testing.assertEqual(patched, then, case.0)
-    unchanged = cfs.campaign_config(campaign, inventory, {"cpe-2"}, None).to_gdata()
-    testing.assertEqual(cfs.release_patch(unchanged, campaign, inventory, {"cpe-2"}, {"cpe-2"}),
-                        None, "nothing changes")
+    same = ({"cpe-2"}, {"cpe-1"})
+    unchanged = cfs.campaign_config(campaign, inventory, same.0, same.1, None).to_gdata()
+    testing.assertEqual(cfs.intent_patch(unchanged, campaign, inventory, same, same), None,
+                        "nothing changes")
+
+
+def _test_prepare_for():
+    """A prepare counts for the campaign only when the device says that its
+    status answers the campaign's name and the member's target release, and
+    the prepare copies or copied that release."""
+    # (case, the tag's campaign and target, the member's target, the
+    # prepare's state and release, and the state for the campaign)
+    cases: list[(str, ?str, ?str, ?str, ?str, ?str, ?str)] = [
+        ("same", "paced", "17.18.03a", "17.18.03a", "done", "17.18.03a", "done"),
+        ("running", "paced", "17.18.03a", "17.18.03a", "running", "17.18.03a", "running"),
+        ("other campaign", "other", "17.18.03a", "17.18.03a", "done", "17.18.03a", None),
+        ("other tag target", "paced", "17.18.02", "17.18.03a", "done", "17.18.03a", None),
+        ("other release", "paced", "17.18.03a", "17.18.03a", "done", "17.18.02", None),
+        ("no prepare", "paced", "17.18.03a", "17.18.03a", None, None, None),
+        ("member without a target", "paced", None, None, "done", "17.18.03a", None),
+        ("member without a target, prepare without a release", "paced", None, None, "done",
+         None, None),
+    ]
+    for case in cases:
+        testing.assertEqual(cfs.prepare_for("paced", case.3, case.1, case.2, case.5, case.4),
+                            case.6, case.0)
 
 
 def _test_status_for():
@@ -972,17 +1076,20 @@ actor _test_recreated_campaign_keeps_its_subscription(t: testing.AsyncT):
 
 
 actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
-    """Each device's stage, reason and check verdicts reach the campaign next
-    to its status, as its flotilla reports them. A device not heard from has
-    none."""
+    """Each device's stage, reason, prepare and check verdicts reach the
+    campaign next to its status, as its flotilla reports them. A device not
+    heard from has none."""
     var done = False
 
     def row(o: y0_oper.software__software__upgrade_campaign_entry, name: str) -> str:
         r = o.state.device_status.get(name)
         if r is not None:
+            prep = r.prepare
             pre = r.precheck
             post = r.postcheck
-            return "{name} {r.status} {r.stage} ({r.reason}), pre {pre.verdict} {pre.detail} {pre.at}, post {post.verdict} {post.detail} {post.at}"
+            return ("{name} {r.status} {r.stage} ({r.reason}), "
+                    + "prepare {prep.state} {prep.release} {prep.started} {prep.ended} ({prep.message}), "
+                    + "pre {pre.verdict} {pre.detail} {pre.at}, post {post.verdict} {post.detail} {post.at}")
         return "{name} missing"
 
     def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
@@ -994,14 +1101,21 @@ actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
         if first is not None:
             if first.precheck.verdict is not None:
                 done = True
-                got = [row(o, "cpe-1"), row(o, "cpe-2"), row(o, "cpe-3")]
+                got = [row(o, "cpe-1"), row(o, "cpe-2"), row(o, "cpe-3"), row(o, "cpe-4")]
                 want = [
                     "cpe-1 rolled-back rollback (post-check failed: rfs-device-health: not back to the baseline), "
+                    + "prepare None None None None (None), "
                     + "pre pass rfs-device-health: 1/1 sessions established 2026-10-07T12:00:00Z, "
                     + "post fail rfs-device-health: not back to the baseline 2026-10-07T12:12:00Z",
                     "cpe-2 failed precheck (pre-check failed: did not answer: rfs-device-health), "
+                    + "prepare None None None None (None), "
                     + "pre fail did not answer: rfs-device-health 2026-10-07T12:01:00Z, post not-run None None",
-                    "cpe-3 pending None (None), pre None None None, post None None None",
+                    "cpe-3 pending None (None), prepare None None None None (None), "
+                    + "pre None None None, post None None None",
+                    "cpe-4 upgrade-needed None (None), "
+                    + "prepare failed 17.18.03a 2026-10-07T11:00:00Z 2026-10-07T11:02:10Z "
+                    + "(copy failed: no space left on bootflash:), "
+                    + "pre None None None, post None None None",
                 ]
                 if got != want:
                     t.failure(ValueError("device-status: {got}"))
@@ -1013,7 +1127,7 @@ actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
             done = True
             t.failure(ValueError(message))
 
-    names = ["cpe-1", "cpe-2", "cpe-3"]
+    names = ["cpe-1", "cpe-2", "cpe-3", "cpe-4"]
     conf = _paced_campaign(names)
     conf.admin_state = "plan"
     campaign = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
@@ -1040,6 +1154,12 @@ actor _test_campaign_device_status_verdicts(t: testing.AsyncT):
     refused.precheck.at = "2026-10-07T12:01:00Z"
     refused.postcheck.verdict = "not-run"
     campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-2"), device_name="cpe-2"), refused, None)
+
+    not_prepared = _tagged_prepare("upgrade-needed", "paced", "17.18.03a", "failed", "17.18.03a")
+    not_prepared.prepare.started = "2026-10-07T11:00:00Z"
+    not_prepared.prepare.ended = "2026-10-07T11:02:10Z"
+    not_prepared.prepare.message = "copy failed: no space left on bootflash:"
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-4"), device_name="cpe-4"), not_prepared, None)
 
     # The replay is in. A campaign in plan publishes once it is synced.
     campaign.on_subscriptions_synced()
@@ -1325,6 +1445,33 @@ actor _test_campaign_estimate_from_the_adapter(t: testing.AsyncT):
     t.success()
 
 
+def _test_device_prepare_estimate():
+    """A device's prepare estimate is the part of its upgrade estimate that
+    the copy takes on the IOS XE adapter. The upgrade estimate does not
+    change."""
+    linked = y_0.root()
+    # (name, mocked, upgrade-duration, prepare estimate, upgrade estimate)
+    cases: list[(str, bool, ?int, int, int)] = [
+        ("mock-395", True, 395, 130, 395),
+        ("mock-8", True, 8, 2, 8),
+        ("mock-3", True, 3, 1, 3),
+        ("mock-no-duration", True, None, 1, 4),
+        ("real", False, None, 130, 395),
+    ]
+    for c in cases:
+        dev = linked.fleet.device.create(
+            c.0, type="iosxe", credentials=InputCredentials(username="admin"))
+        if c.1:
+            dev.mock.enabled = True
+            dur = c.2
+            if dur is not None:
+                dev.mock.software.upgrade_duration = u64(dur)
+        testing.assertEqual(cfs.device_prepare_estimate(dev), c.3,
+                            c.0 + ": prepare estimate")
+        testing.assertEqual(cfs.device_estimate(dev), c.4,
+                            c.0 + ": upgrade estimate")
+
+
 def _test_window_open_since_yesterday_is_an_occurrence():
     """A window that opens at 23:00 for 4 h is still open at 01:00 the next
     day, so it is the first occurrence then."""
@@ -1430,6 +1577,27 @@ def _test_campaign_close_margin_reaches_the_controller():
         layout, alarms, conc = _plan(campaign, linked, 0)
         testing.assertEqual(_window_sizes(layout), case.1, str(margin))
         testing.assertEqual(alarms, [], str(margin))
+
+
+def _test_campaign_prepare_reaches_the_controller():
+    """The campaign's allow-staging sets whether the controller lets members
+    prepare, and each member's prepare estimate goes with it: 2 s for a
+    mock of 8 s, and 1 s for a mock with no duration. The same controller
+    is configured in turn, so turning allow-staging off reaches it too."""
+    names = ["cpe-1", "cpe-2"]
+    linked = _with_nightly(_flat_inventory(names, 8))
+    cpe3 = linked.fleet.device.create("cpe-3", type="iosxe",
+                                      credentials=InputCredentials(username="admin"))
+    cpe3.mock.enabled = True
+    campaign = _paced_campaign(names + ["cpe-3"])
+    ctl = fctl.Controller()
+    # (allow-staging, whether the controller lets members prepare)
+    cases: list[(bool, bool)] = [(True, True), (False, False), (True, True)]
+    for case in cases:
+        campaign.allow_staging = case.0
+        cfs.configure_campaign(ctl, campaign, linked, 0)
+        testing.assertEqual(ctl.prepare, case.1, str(case.0))
+        testing.assertEqual(ctl.prepare_est, {"cpe-1": 2, "cpe-2": 2, "cpe-3": 1}, str(case.0))
 
 
 def _test_campaign_stagger_reaches_the_controller():
@@ -1869,6 +2037,16 @@ def _tagged(status: str, campaign: ?str, target: ?str) -> y1_oper.stratoweave_rf
     with the target release target."""
     return y1_oper.stratoweave_rfs__rfs__device__state(
         status=status, upgrade_campaign=campaign, target_release=target)
+
+
+def _tagged_prepare(status: str, campaign: ?str, target: ?str, state: ?str,
+                    release: ?str) -> y1_oper.stratoweave_rfs__rfs__device__state:
+    """A device state with status, which answers the intent of campaign
+    with the target release target, and a prepare in state of release."""
+    s = _tagged(status, campaign, target)
+    s.prepare.state = state
+    s.prepare.release = release
+    return s
 
 
 def _with_version(linked: y_0.root, version: str) -> y_0.root:
@@ -2809,3 +2987,509 @@ actor _test_one_campaign_per_device(t: testing.AsyncT):
     for case in cases:
         _ClaimEdits(case.0, case.1, case.2, case.3, t.log_handler, on_case)
 
+
+def _soon(names: list[str], admin_state: str, allow_staging: bool,
+          now: int) -> (InputCampaign, y_0.root):
+    """A campaign called soon over names, and its inventory. Its default
+    schedule soon has one window of ten minutes that opens an hour after
+    now, in UTC. The members are mocks with no duration: each prepares in
+    1 s, and must start to prepare 1.5 s before the window opens. So the
+    first member goes at once, and the turns of three members are 30
+    minutes apart."""
+    campaign = InputCampaign(name="soon", admin_state=admin_state, default_schedule="soon",
+                             allow_staging=allow_staging)
+    for name in names:
+        campaign.device.create(name, image=IMAGE)
+    linked = _flat_inventory(names)
+    linked.schedules.schedule.create("soon").window.create(u64((now + 3600) % 86400),
+                                                           duration=u64(600))
+    return (campaign, linked)
+
+
+def _soon_state(event: str) -> str:
+    """The admin-state that _PrepareTurn starts the campaign in."""
+    return "plan" if event == "plan to run" else "run"
+
+
+actor _PrepareTurn(t: testing.AsyncT, event: str):
+    """Run the campaign soon over cpe-1 to cpe-3 with allow-staging, and let
+    the members answer upgrade-needed. The first output with allow-staging
+    must hold every member and let only the first member prepare. What
+    happens then depends on event:
+
+    - "first": nothing more.
+    - "down": cpe-1 is down when it answers: its read fails, so it reports
+      unknown. It gets no turn, and cpe-2 goes first.
+    - "plan to run": the campaign starts in plan, where no member prepares,
+      and runs once the members answered.
+    - "prepared": cpe-1 reports its prepare done.
+    - "failed": cpe-1 is down at its turn: its prepare fails.
+    - "run to plan": the campaign is set to plan.
+    - "image": the image gets a new version. The transform function on
+      the output written last lets no member prepare either.
+
+    After "prepared", "failed", "run to plan" and "image", the next output
+    must hold every member and let no member prepare."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var phase = 0
+    var ran = False
+    var turn: ?gdata.Node = None
+    var done = False
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    now = time.time().unix_s()
+    first = "cpe-2" if event == "down" else "cpe-1"
+    soon = _soon(names, _soon_state(event), True, now)
+    linked = soon.1.to_gdata()
+    newer = _with_version(_soon(names, "run", True, now).1, "17.18.04").to_gdata()
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def succeed() -> None:
+        if not done:
+            done = True
+            t.success()
+
+    def report(name: str, s: y1_oper.stratoweave_rfs__rfs__device__state) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name), s, None)
+
+    def act() -> None:
+        cc = controller
+        if event == "prepared" or event == "failed":
+            state = "done" if event == "prepared" else "failed"
+            report("cpe-1", _tagged_prepare("upgrade-needed", "soon", "17.18.03a", state,
+                                            "17.18.03a"))
+        elif cc is not None:
+            if event == "run to plan":
+                cc.on_conf(_soon(names, "plan", True, now).0, linked)
+            elif event == "image":
+                cc.on_conf(soon.0, newer)
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "soon")
+        staged = _staged(out)
+        if phase == 0:
+            if len(staged) == 0:
+                return
+            if event == "plan to run" and not ran:
+                fail("in plan, the campaign let {staged} prepare")
+            elif vetoed != names or staged != [first]:
+                fail("at the first turn: vetoed {vetoed}, let prepare {staged}")
+            elif event == "first" or event == "down" or event == "plan to run":
+                succeed()
+            else:
+                phase = 1
+                turn = out
+                act()
+        elif vetoed != names or staged != []:
+            fail("after {event}: vetoed {vetoed}, let prepare {staged}")
+        elif event == "image":
+            last = turn
+            if last is not None:
+                again = cfs.UpgradeCampaign().transform(soon.0, newer, last).to_gdata()
+                if _staged(again) != []:
+                    fail("after the image change the function lets {_staged(again)} prepare")
+                else:
+                    succeed()
+        else:
+            succeed()
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None or event != "plan to run" or ran:
+            return
+        answered = 0
+        for name in names:
+            r = oper!.state.device_status.get(name)
+            if r is not None and r.status == "upgrade-needed":
+                answered += 1
+        cc = controller
+        if answered == len(names) and cc is not None:
+            ran = True
+            cc.on_conf(_soon(names, "run", True, now).0, linked)
+
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), on_output, on_oper, None)
+    controller = ctl
+    ctl.on_conf(soon.0, linked)
+    for name in names:
+        report(name, _tagged("unknown" if event == "down" and name == "cpe-1" else "upgrade-needed",
+                             "soon", "17.18.03a"))
+    ctl.on_subscriptions_synced()
+    after 5.0: fail("at phase {phase} of {event}, no output came")
+
+
+actor _test_campaign_lets_one_member_prepare(t: testing.AsyncT):
+    """In run with allow-staging, the campaign lets the first member prepare
+    at once, and holds every member."""
+    _PrepareTurn(t, "first")
+
+
+actor _test_campaign_gives_no_turn_to_a_member_that_is_down(t: testing.AsyncT):
+    """A member that is down when it answers, and so reports unknown, gets
+    no turn: the next member goes first."""
+    _PrepareTurn(t, "down")
+
+
+actor _test_campaign_plan_to_run_lets_the_first_member_prepare(t: testing.AsyncT):
+    """In plan, no member prepares. Set to run, the campaign lets the first
+    member prepare at once."""
+    _PrepareTurn(t, "plan to run")
+
+
+actor _test_campaign_ends_a_turn_when_prepared(t: testing.AsyncT):
+    """The campaign stops letting a member prepare once its prepare is
+    done, and it keeps the veto."""
+    _PrepareTurn(t, "prepared")
+
+
+actor _test_campaign_ends_a_turn_when_the_prepare_fails(t: testing.AsyncT):
+    """A member down at its turn fails its prepare. The campaign stops
+    letting it prepare, and does not let it again."""
+    _PrepareTurn(t, "failed")
+
+
+actor _test_campaign_run_to_plan_ends_the_turns(t: testing.AsyncT):
+    """Set back to plan, the campaign lets no member prepare."""
+    _PrepareTurn(t, "run to plan")
+
+
+actor _test_campaign_image_change_ends_a_turn(t: testing.AsyncT):
+    """A new image version stops the prepare of the old target: the campaign
+    lets no member prepare until it answers the new target."""
+    _PrepareTurn(t, "image")
+
+
+actor _test_campaign_without_allow_staging_prepares_nothing(t: testing.AsyncT):
+    """The campaign soon without allow-staging: a decision after the
+    members answered lets no member prepare."""
+    var answered = False
+    var staged: list[str] = []
+    var outputs = 0
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    soon = _soon(names, "run", False, time.time().unix_s())
+
+    def on_output(out: gdata.Node) -> None:
+        outputs += 1
+        for name in _staged(out):
+            staged.append(name)
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if oper is None:
+            return
+        n = 0
+        for name in names:
+            r = oper!.state.device_status.get(name)
+            if r is not None and r.status == "upgrade-needed":
+                n += 1
+        if n == len(names):
+            answered = True
+
+    def finish() -> None:
+        if not answered:
+            t.failure(ValueError("no decision saw the members answer"))
+        elif outputs == 0 or len(staged) > 0:
+            t.failure(ValueError("{outputs} output(s), let prepare {staged}"))
+        else:
+            t.success()
+
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), on_output, on_oper, None)
+    ctl.on_conf(soon.0, soon.1.to_gdata())
+    for name in names:
+        ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                   _tagged("upgrade-needed", "soon", "17.18.03a"), None)
+    ctl.on_subscriptions_synced()
+    after 2.5: finish()
+
+
+actor _test_campaign_lets_a_member_added_late_prepare(t: testing.AsyncT):
+    """The campaign soon over cpe-1 alone lets cpe-1 prepare at once, and
+    has no turn left. cpe-2 is added: the campaign holds it, and cpe-1 stays
+    let. cpe-1's prepare is done, so it is no longer let. When cpe-2
+    answers, it goes at once."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var stage = 0
+    var done = False
+    now = time.time().unix_s()
+    one = _soon(["cpe-1"], "run", True, now)
+    both = _soon(["cpe-1", "cpe-2"], "run", True, now)
+    linked = both.1.to_gdata()
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "soon")
+        staged = _staged(out)
+        got = "vetoed {vetoed}, let prepare {staged}"
+        cc = controller
+        if stage == 0:
+            if len(staged) == 0:
+                return
+            if vetoed != ["cpe-1"] or staged != ["cpe-1"]:
+                fail("at the first turn: {got}")
+            elif cc is not None:
+                stage = 1
+                cc.on_conf(both.0, linked)
+        elif stage == 1:
+            if vetoed != ["cpe-1", "cpe-2"] or staged != ["cpe-1"]:
+                fail("once cpe-2 is added: {got}")
+            elif cc is not None:
+                stage = 2
+                cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+                          _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "done",
+                                          "17.18.03a"), None)
+        elif stage == 2:
+            if vetoed != ["cpe-1", "cpe-2"] or staged != []:
+                fail("once cpe-1 is prepared: {got}")
+            elif cc is not None:
+                stage = 3
+                cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-2"), device_name="cpe-2"),
+                          _tagged("upgrade-needed", "soon", "17.18.03a"), None)
+        elif vetoed == ["cpe-1", "cpe-2"] and staged == ["cpe-2"]:
+            done = True
+            t.success()
+        else:
+            fail("once cpe-2 answered: {got}")
+
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), on_output, lambda o: None, None)
+    controller = ctl
+    ctl.on_conf(one.0, linked)
+    ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+               _tagged("upgrade-needed", "soon", "17.18.03a"), None)
+    ctl.on_subscriptions_synced()
+    after 5.0: fail("at stage {stage}, no output came")
+
+
+def _prepare_starts(o: y0_oper.software__software__upgrade_campaign_entry) -> dict[str, int]:
+    """The prepare-start of each device in the plan of o that has one."""
+    starts: dict[str, int] = {}
+    for win in o.state.plan.window:
+        for dev in win.device:
+            s = dev.prepare_start
+            if s is not None:
+                starts[dev.name] = int(s)
+    return starts
+
+
+def _by_start(starts: dict[str, int]) -> list[str]:
+    """The names in starts, by their start."""
+    pairs: list[(int, str)] = []
+    for name, s in starts.items():
+        pairs.append((s, name))
+    return [e.1 for e in sorted(pairs)]
+
+
+def _with_image(campaign: InputCampaign, name: str, image: str) -> InputCampaign:
+    """campaign with image as the image of its member name."""
+    member = campaign.device.get(name)
+    if member is not None:
+        member.image = image
+    return campaign
+
+
+actor _test_campaign_in_plan_shows_prepares_and_writes_none(t: testing.AsyncT):
+    """The campaign soon in plan with allow-staging, once its members have
+    answered: the plan shows when each member would prepare in a run that
+    starts now, 30 minutes apart and one at a time. The campaign lets no
+    member prepare, and no member counts as preparing or prepared."""
+    var staged: list[str] = []
+    var outputs = 0
+    var done = False
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    now = time.time().unix_s()
+    soon = _soon(names, "plan", True, now)
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_output(out: gdata.Node) -> None:
+        outputs += 1
+        for name in _staged(out):
+            staged.append(name)
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        starts = _prepare_starts(o)
+        # The first publication comes before the answers, with no turns.
+        if len(starts) < len(names):
+            return
+        done = True
+        order = _by_start(starts)
+        first = starts.get_def("cpe-1", 0)
+        gaps = [starts.get_def("cpe-2", 0) - first, starts.get_def("cpe-3", 0) - first]
+        got = ("order {order}, first {first - now}, gaps {gaps}, "
+               + "concurrency {o.state.plan.prepare_concurrency}, "
+               + "preparing {o.state.preparing}, prepared {o.state.prepared}, "
+               + "{outputs} output(s), let prepare {staged}")
+        if order != names or first < now or first > now + 2 \
+           or gaps[0] < 1795 or gaps[0] > 1800 or gaps[1] < 3590 or gaps[1] > 3600 \
+           or o.state.plan.prepare_concurrency != u64(1) \
+           or o.state.preparing != u64(0) or o.state.prepared != u64(0) \
+           or outputs == 0 or len(staged) > 0:
+            t.failure(ValueError(got))
+        else:
+            t.success()
+
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), on_output, on_oper, None)
+    ctl.on_conf(soon.0, soon.1.to_gdata())
+    for name in names:
+        ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                   _tagged("upgrade-needed", "soon", "17.18.03a"), None)
+    ctl.on_subscriptions_synced()
+    after 5.0: fail("no plan showed a prepare-start for every member")
+
+
+actor _test_campaign_shows_the_prepares(t: testing.AsyncT):
+    """The campaign soon in run with allow-staging. cpe-1 has prepared,
+    cpe-2 failed to prepare, cpe-3 is in its upgrade and its run prepares,
+    cpe-4 waits to prepare, and the image of cpe-5 is not in the image
+    list. Only cpe-1 counts, as prepared: the run of cpe-3 is not a
+    prepare. The rows show each prepare as the device reports it. The
+    alarms are the plan's, then the failed prepare, then the image's. The
+    campaign lets cpe-4 prepare at once, and it alone prepares."""
+    var done = False
+    names = ["cpe-1", "cpe-2", "cpe-3", "cpe-4", "cpe-5"]
+    soon = _soon(names, "run", True, time.time().unix_s())
+    campaign = _with_image(soon.0, "cpe-5", "missing.bin")
+    reports = [
+        ("cpe-1", _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "done", "17.18.03a")),
+        ("cpe-2", _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "failed", "17.18.03a")),
+        ("cpe-3", _tagged_prepare("in-progress", "soon", "17.18.03a", "running", "17.18.03a")),
+        ("cpe-4", _tagged("upgrade-needed", "soon", "17.18.03a")),
+    ]
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def row(o: y0_oper.software__software__upgrade_campaign_entry, name: str) -> str:
+        r = o.state.device_status.get(name)
+        if r is not None:
+            return "{name} {r.status} prepare {r.prepare.state} {r.prepare.release}"
+        return "{name} missing"
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        rows = [row(o, name) for name in names]
+        # Wait for the publication that has every report.
+        if rows[:4] != ["cpe-1 upgrade-needed prepare done 17.18.03a",
+                        "cpe-2 upgrade-needed prepare failed 17.18.03a",
+                        "cpe-3 in-progress prepare running 17.18.03a",
+                        "cpe-4 upgrade-needed prepare None None"]:
+            return
+        done = True
+        got = ["preparing {o.state.preparing}, prepared {o.state.prepared}",
+               "starts " + ", ".join(_by_start(_prepare_starts(o))),
+               "concurrency {o.state.plan.prepare_concurrency}"] + list(o.state.plan.alarm)
+        want = ["preparing 0, prepared 1",
+                "starts cpe-4",
+                "concurrency 1",
+                "1 device(s) have not answered the campaign's target: cpe-5",
+                "1 device(s) failed to prepare and copy the image in their window: cpe-2",
+                "image missing.bin is not in the image list (1 device)"]
+        if got != want:
+            t.failure(ValueError("{got}"))
+        else:
+            t.success()
+
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), lambda o: None, on_oper, None)
+    ctl.on_conf(campaign, soon.1.to_gdata())
+    for r in reports:
+        ctl.on_rfs((rfs_name=cfs.flotilla_of(r.0), device_name=r.0), r.1, None)
+    ctl.on_subscriptions_synced()
+    after 5.0: fail("no publication had every report")
+
+
+actor _PrepareAlarm(t: testing.AsyncT, event: str):
+    """Run the campaign soon over cpe-1 and cpe-2 with allow-staging. cpe-1
+    failed to prepare, and cpe-2 has prepared. Once the campaign shows the
+    alarm for cpe-1 and counts cpe-2 as prepared, the event happens:
+
+    - "gone": cpe-1's state goes, as when its flotilla no longer has it.
+    - "image": the image gets a new version, so neither prepare is for the
+      campaign's intent any more.
+
+    The campaign must then drop the alarm. cpe-2 still counts as prepared
+    after "gone", and no longer after "image"."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var phase = 0
+    var done = False
+    names = ["cpe-1", "cpe-2"]
+    now = time.time().unix_s()
+    soon = _soon(names, "run", True, now)
+    newer = _with_version(_soon(names, "run", True, now).1, "17.18.04").to_gdata()
+    alarm = "1 device(s) failed to prepare and copy the image in their window: cpe-1"
+    after_event = u64(1) if event == "gone" else u64(0)
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        alarms = list(o.state.plan.alarm)
+        cc = controller
+        if phase == 0:
+            if alarm not in alarms:
+                return
+            if o.state.prepared != u64(1):
+                fail("before {event}: prepared {o.state.prepared}")
+            elif cc is not None:
+                phase = 1
+                if event == "gone":
+                    cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), None,
+                              None)
+                else:
+                    cc.on_conf(soon.0, newer)
+        elif alarm not in alarms:
+            if o.state.prepared != after_event:
+                fail("after {event}: prepared {o.state.prepared}")
+            else:
+                done = True
+                t.success()
+
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), lambda o: None, on_oper, None)
+    controller = ctl
+    ctl.on_conf(soon.0, soon.1.to_gdata())
+    ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+               _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "failed", "17.18.03a"), None)
+    ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-2"), device_name="cpe-2"),
+               _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "done", "17.18.03a"), None)
+    ctl.on_subscriptions_synced()
+    after 5.0: fail("at phase {phase} of {event}, the alarm stayed")
+
+
+actor _test_campaign_forgets_the_prepare_of_a_member_that_goes(t: testing.AsyncT):
+    """A member whose state goes takes its failed prepare, and the alarm
+    for it, with it."""
+    _PrepareAlarm(t, "gone")
+
+
+actor _test_campaign_image_change_ends_the_prepare_alarm(t: testing.AsyncT):
+    """A new image version makes the prepares of the old target stale: the
+    alarm for a failed prepare goes, and a done prepare no longer counts."""
+    _PrepareAlarm(t, "image")

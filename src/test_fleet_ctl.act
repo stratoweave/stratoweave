@@ -20,18 +20,31 @@ def daily(schedule: str, start: int, length: int, days: int) -> list[(str, int, 
     return [(schedule, d * DAY + start, d * DAY + start + length) for d in range(days)]
 
 
+def configured(windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
+               maxc: int, must_place: bool=False, debounce: int=0,
+               estimate: int=600, groups: dict[str, list[str]]={},
+               priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
+               close_margin: int=fleet_ctl.CLOSE_MARGIN, stagger: int=0,
+               prepare: bool=False, prepare_s: int=100) -> Controller:
+    """A controller before its first run, every device answered that it
+    needs the upgrade. Each device's prepare takes prepare_s seconds."""
+    c = Controller()
+    c.configure(windows, devs, target, maxc, must_place, debounce, estimate, groups, priority,
+                separation, close_margin, stagger, prepare, {d.0: prepare_s for d in devs})
+    sim.answer_all(c, 0)
+    return c
+
+
 def controller(windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
                maxc: int, must_place: bool=False, debounce: int=0,
                estimate: int=600, groups: dict[str, list[str]]={},
                priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
                rung: int=1, close_margin: int=fleet_ctl.CLOSE_MARGIN,
-               stagger: int=0) -> Controller:
+               stagger: int=0, prepare: bool=False, prepare_s: int=100) -> Controller:
     """A controller at the start of a run, every device answered that it
-    needs the upgrade."""
-    c = Controller()
-    c.configure(windows, devs, target, maxc, must_place, debounce, estimate, groups, priority,
-                separation, close_margin, stagger)
-    sim.answer_all(c, 0)
+    needs the upgrade. Each device's prepare takes prepare_s seconds."""
+    c = configured(windows, devs, target, maxc, must_place, debounce, estimate, groups, priority,
+                   separation, close_margin, stagger, prepare, prepare_s)
     c.start(rung)
     return c
 
@@ -319,7 +332,7 @@ def plan_is_run(windows: list[(str, int, int)], devs: list[(str, int, str)], tar
 
 def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
                        late: int=0, answers: list[(int, str)]=[],
-                       in_progress: bool=False) -> int:
+                       in_progress: bool=False, prepare: bool=False) -> int:
     """Run c the way the campaign actor does, each decision late seconds
     after its time, next to a copy of it that plans at every decision.
     Each decision of c starts the same devices, wakes at the same time and
@@ -327,11 +340,18 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
     the campaign's target later, as (time, name): each reports to both
     that it needs the upgrade at its time, and the next decision is one
     debounce later at the latest. With in_progress, each device that
-    starts reports in-progress to both at its start. Return how many
-    decisions of c took the last plan again."""
+    starts reports in-progress to both at its start. With prepare, each
+    decision of c also has the same prepares as the copy's and lets the
+    same members prepare, and each member let prepare reports to both its
+    prepare running when it is let and done one expected prepare time
+    later; the next decision is one debounce after that at the latest.
+    Return how many decisions of c took the last plan again."""
     d = c.copy()
     flying: list[(int, str)] = []
     pending = sorted(answers)
+    # The prepares that run, as (end, name), and the members let prepare.
+    prepping: list[(int, str)] = []
+    let: set[str] = set()
     again = 0
     t = 0
     while t <= until:
@@ -351,6 +371,14 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
             else:
                 later.append(a)
         pending = later
+        copying: list[(int, str)] = []
+        for p in prepping:
+            if p.0 <= t:
+                c.report_prepare(p.1, "done")
+                d.report_prepare(p.1, "done")
+            else:
+                copying.append(p)
+        prepping = copying
         if c.last_plan is not None and c.quiet_from <= t and t < c.quiet_until:
             again += 1
         d.quiet_until = 0
@@ -363,6 +391,19 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
         testing.assertEqual(s.plan.starts, n.plan.starts, "plan at {t}")
         testing.assertEqual(s.plan.held, n.plan.held, "held at {t}")
         testing.assertEqual(s.plan.alarms, n.plan.alarms, "alarms at {t}")
+        if prepare:
+            testing.assertEqual(s.prepares.starts, n.prepares.starts, "prepare starts at {t}")
+            testing.assertEqual(s.prepares.c, n.prepares.c, "prepares at once at {t}")
+            testing.assertEqual(s.prepares.alarms, n.prepares.alarms, "prepare alarms at {t}")
+            testing.assertEqual(sorted(list(c.allowed)), sorted(list(d.allowed)),
+                                "let prepare at {t}")
+            testing.assertEqual(c.prepare_at, d.prepare_at, "let prepare in this run at {t}")
+            for name in sorted(c.prepare_at.keys()):
+                if name not in let:
+                    let.add(name)
+                    c.report_prepare(name, "running")
+                    d.report_prepare(name, "running")
+                    prepping.append((t + c.prepare_est.get_def(name, 1), name))
         for name in s.started:
             flying.append((t + dur_of.get_def(name, c.est.get_def(name, 1)), name))
             if in_progress:
@@ -371,7 +412,7 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
         if s.finished:
             break
         nxt = s.wake
-        for f in flying:
+        for f in flying + prepping:
             if nxt < 0 or f.0 + c.debounce < nxt:
                 nxt = f.0 + c.debounce
         if len(pending) > 0 and (nxt < 0 or pending[0].0 + c.debounce < nxt):
@@ -2602,6 +2643,487 @@ def _test_the_plan_is_the_run_with_late_answers():
                                 "stagger {stagger}: the run after {last.t}")
         else:
             testing.assertTrue(False, "stagger {stagger}: no decision after the last answer")
+
+
+#############################################################################
+# Prepares before the window
+#############################################################################
+
+def one(debounce: int=0, prepare: bool=True) -> Controller:
+    """ONE: d0 to d4 of 600 s on a window that opens at 10150 and never
+    closes, two at a time and at most 10, at the start of a run. Each
+    prepare takes 100 s and the close margin is 150 percent, so each
+    member's deadline is 10000."""
+    return controller([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
+                      debounce=debounce, prepare=prepare)
+
+
+def configure_one(c: Controller, prepare: bool) -> None:
+    """Configure c again as ONE, with prepare on or off."""
+    devs = devices("d", 5, 600, "w")
+    c.configure([("w", 10150, fleet_ctl.OPEN_END)], devs, 2, 10, False, 0, 600, {}, {}, {},
+                fleet_ctl.CLOSE_MARGIN, 0, prepare, {d.0: 100 for d in devs})
+
+
+def _test_prepare_turns():
+    """The turns to prepare that the plan at 0 shows, and the alarms. ONE
+    spreads d0 to d4 evenly from 0 to their deadline at 10000. Nothing
+    prepares with prepare off, before the run, while the window is open,
+    or in a window that never closes and is open now. A window that opens
+    within the lead leaves no time to prepare. A member that has not
+    answered, is up to date, or reports a prepare does not wait, and the
+    others share the time. With a debounce of 30 s, each member starts at
+    the start of the debounce slot of its turn. A member that fits in no
+    window has no promise and does not prepare."""
+    one_w = [("w", 10150, fleet_ctl.OPEN_END)]
+    five = devices("d", 5, 600, "w")
+    # (case, windows, devices, debounce, prepare, whether the run started,
+    # status reports at 0, prepare reports, the starts, the alarms)
+    cases: list[(str, list[(str, int, int)], list[(str, int, str)], int, bool, bool,
+                 list[(str, ?str)], list[(str, str)], dict[str, int], list[str])] = [
+        ("ONE", one_w, five, 0, True, True, [], [],
+         {"d0": 0, "d1": 2500, "d2": 5000, "d3": 7500, "d4": 10000}, []),
+        ("prepare off", one_w, five, 0, False, True, [], [], {}, []),
+        ("not started", one_w, five, 0, True, False, [], [], {}, []),
+        ("open at 0", [("w", 0, 20000)], five, 0, True, True, [], [], {}, []),
+        ("opens at 100", [("w", 100, fleet_ctl.OPEN_END)], five, 0, True, True, [], [], {},
+         ["5 device(s) cannot prepare before their window opens: d0, d1, d2, d3, d4"]),
+        ("always open", [("w", 0, fleet_ctl.OPEN_END)], five, 0, True, True, [], [], {}, []),
+        ("d1 lost, d2 up to date", one_w, five, 0, True, True,
+         [("d1", None), ("d2", "up-to-date")], [], {"d0": 0, "d3": 5000, "d4": 10000}, []),
+        ("d3 prepared", one_w, five, 0, True, True, [], [("d3", "done")],
+         {"d0": 0, "d1": 3333, "d2": 6666, "d4": 10000}, []),
+        ("debounce 30", one_w, five, 30, True, True, [], [],
+         {"d0": 0, "d1": 2490, "d2": 4980, "d3": 7500, "d4": 9990}, []),
+        ("d4 fits in no window", [("w", 10150, 13750)],
+         devices("d", 4, 600, "w") + [("d4", 3000, "w")], 0, True, True, [], [],
+         {"d0": 0, "d1": 3333, "d2": 6666, "d3": 10000}, []),
+    ]
+    for case in cases:
+        c = configured(case.1, case.2, 2, 10, debounce=case.3, prepare=case.4)
+        if case.5:
+            c.start()
+        for r in case.6:
+            c.report(r.0, r.1, 0)
+        for r in case.7:
+            c.report_prepare(r.0, r.1)
+        c.plan(0)
+        p = c.prepares(0)
+        testing.assertEqual(p.starts, case.8, case.0)
+        testing.assertEqual(p.alarms, case.9, case.0)
+
+
+def _test_prepares_spread_over_the_whole_time():
+    """a0 and a1 wait for a window that opens at 10150, and b0 and b1 for
+    one that opens at 20150: their deadlines are 10000 and 20000. The
+    turns are as far apart as both deadlines allow, so they cover the
+    whole time to the last deadline: a1 goes a third of the way to 20000,
+    not at 10000."""
+    c = controller([("a", 10150, fleet_ctl.OPEN_END), ("b", 20150, fleet_ctl.OPEN_END)],
+                   devices("a", 2, 600, "a") + devices("b", 2, 600, "b"), 2, 10, prepare=True)
+    c.plan(0)
+    testing.assertEqual(c.prepares(0).starts, {"a0": 0, "a1": 6666, "b0": 13333, "b1": 20000})
+
+
+def _test_prepares_follow_the_promises():
+    """ONE, but d0 has not answered: the plan at 0 promises it no window,
+    and d1 goes first. d0 answers at 1000. The plan at 1000 promises it
+    the window after the others, and it takes the last turn."""
+    c = one()
+    c.report("d0", None, 0)
+    c.decide(0)
+    testing.assertEqual(sorted(list(c.allowed)), ["d1"])
+    c.report("d0", "upgrade-needed", 1000)
+    testing.assertEqual(c.decide(1000).prepares.starts,
+                        {"d1": 0, "d2": 2500, "d3": 5000, "d4": 7500, "d0": 10000})
+
+
+def _test_prepare_concurrency():
+    """The most members that prepare at once, each from its start for its
+    expected prepare time. ONE's turns are 2500 s apart and each prepare
+    takes 100 s: one at a time. 100 members whose prepare takes 250 s,
+    with a window that opens at 10275, have a turn every 100 s from 0 to
+    9900: three at once. Three more members that report their prepare
+    running, and were not let in this run, count from now: six at once.
+    31 members whose prepare takes 2 s and whose deadline is 30 have a
+    turn every second, but with a debounce of 5 s the five turns of each
+    slot start together at the slot's start: five at once."""
+    # (case, members that wait, members that report their prepare running,
+    # the window's opening, the prepare time, the debounce, the most at
+    # once)
+    cases: list[(str, int, int, int, int, int, int)] = [
+        ("ONE", 5, 0, 10150, 100, 0, 1),
+        ("a turn every 100 s", 100, 0, 10275, 250, 0, 3),
+        ("and three that run", 100, 3, 10275, 250, 0, 6),
+        ("five turns in each slot", 31, 0, 33, 2, 5, 5),
+    ]
+    for case in cases:
+        c = controller([("w", case.3, fleet_ctl.OPEN_END)],
+                       devices("d", case.1, 600, "w") + devices("r", case.2, 600, "w"), 2, 10,
+                       debounce=case.5, prepare=True, prepare_s=case.4)
+        for k in range(case.2):
+            c.report_prepare("r{k}", "running")
+        c.plan(0)
+        testing.assertEqual(c.prepares(0).c, case.6, case.0)
+
+
+def _test_decisions_let_members_at_their_turns():
+    """A decision lets each member whose turn is before the end of its
+    debounce slot, and wakes at the slot of the next turn. ONE: the
+    decision at 0 lets d0 and wakes at 2500, d1's turn; at 2499 it lets no
+    one, and at 2500 it lets d1. With a debounce of 30 s it wakes at 2490,
+    the start of the slot of d1's turn, and with prepare off at the
+    opening. 31 members whose deadline is 30 have a turn every second:
+    with a debounce of 5 s, each decision lets five of them."""
+    c = one()
+    s = c.decide(0)
+    testing.assertEqual((sorted(list(c.allowed)), s.wake), (["d0"], 2500))
+    c.decide(2499)
+    testing.assertEqual(c.prepare_at, {"d0": 0})
+    c.decide(2500)
+    testing.assertEqual(c.prepare_at, {"d0": 0, "d1": 2500})
+    testing.assertEqual(one(debounce=30).decide(0).wake, 2490)
+    testing.assertEqual(one(prepare=False).decide(0).wake, 10150)
+
+    b = controller([("w", 33, fleet_ctl.OPEN_END)], devices("d", 31, 600, "w"), 2, 10,
+                   debounce=5, prepare=True, prepare_s=2)
+    # (the decision, the members it lets, its wake)
+    batches: list[(int, list[str], int)] = [
+        (0, ["d0", "d1", "d2", "d3", "d4"], 5),
+        (5, ["d5", "d6", "d7", "d8", "d9"], 10),
+    ]
+    for batch in batches:
+        s = b.decide(batch.0)
+        let = sorted([name for name, at in b.prepare_at.items() if at == batch.0])
+        testing.assertEqual((let, s.wake), (batch.1, batch.2), str(batch.0))
+
+
+def _test_a_late_answer_joins_the_spread():
+    """ONE, but d4 has not answered: d0 to d3 share the time to 10000. d0
+    goes at 0 and d1 at 3333. d4 answers at 4000 and joins the turns: the
+    members left share the time from d1's turn."""
+    c = one()
+    c.report("d4", None, 0)
+    testing.assertEqual(c.decide(0).prepares.starts,
+                        {"d0": 0, "d1": 3333, "d2": 6666, "d3": 10000})
+    c.decide(3333)
+    c.report("d4", "upgrade-needed", 4000)
+    testing.assertEqual(c.decide(4000).prepares.starts,
+                        {"d0": 0, "d1": 3333, "d2": 5555, "d3": 7777, "d4": 10000})
+
+
+def _test_a_late_decision_spreads_the_rest_from_then():
+    """ONE: d0 goes at 0. The next decision comes at 3000, after the
+    debounce slot of d1's turn at 2500. It lets d1 now, and the members
+    left share the time from now: no two members go at once to catch up.
+    With a debounce of 30 s, a decision at 2519 is in the slot of d1's
+    turn, which starts at 2490: it lets d1, and the turns after it stay as
+    they were."""
+    # (the debounce, the late decision, the starts after it)
+    cases: list[(int, int, dict[str, int])] = [
+        (0, 3000, {"d0": 0, "d1": 3000, "d2": 5333, "d3": 7666, "d4": 10000}),
+        (30, 2519, {"d0": 0, "d1": 2519, "d2": 4980, "d3": 7500, "d4": 9990}),
+    ]
+    for case in cases:
+        c = one(debounce=case.0)
+        c.decide(0)
+        testing.assertEqual(c.decide(case.1).prepares.starts, case.2, str(case.0))
+
+
+def _test_a_member_that_comes_to_wait_after_the_turns_goes_at_once():
+    """a0 and a1 wait for a window that opens at 10150, and b0, which has
+    not answered, for one that opens at 20150. a0 goes at 0 and a1 at
+    10000, the last turn. b0 answers at 12000 and goes at once: the
+    spread before it ended."""
+    c = controller([("a", 10150, fleet_ctl.OPEN_END), ("b", 20150, fleet_ctl.OPEN_END)],
+                   devices("a", 2, 600, "a") + devices("b", 1, 600, "b"), 2, 10, prepare=True)
+    c.report("b0", None, 0)
+    c.decide(0)
+    c.decide(10000)
+    testing.assertEqual(c.prepare_at, {"a0": 0, "a1": 10000})
+    c.report("b0", "upgrade-needed", 12000)
+    c.decide(12000)
+    testing.assertEqual(c.prepare_at, {"a0": 0, "a1": 10000, "b0": 12000})
+
+
+def prepare_campaign(windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
+                     maxc: int, estimate: int, groups: dict[str, list[str]],
+                     priority: dict[str, int], stagger: int, answers: list[(int, str)],
+                     prepare: bool) -> Controller:
+    """A controller at the start of a run with a debounce of 1 s, prepare
+    on or off and each prepare 100 s. The devices in answers have not
+    answered yet."""
+    c = controller(windows, devs, target, maxc, False, 1, estimate, groups, priority,
+                   stagger=stagger, prepare=prepare)
+    for a in answers:
+        c.lost(a.1)
+    return c
+
+
+def _test_prepares_do_not_change_the_releases():
+    """Prepares change no release decision. Each campaign runs once with
+    prepare off, and once with prepare on and every member let prepare
+    reporting its prepare: the devices start in the same windows at the
+    same times. The members let prepare are the ones that start in a
+    window that opens after the run starts, and each is let by its
+    deadline. Next to a copy that plans at every decision, each decision
+    with prepare on starts and lets prepare as a new plan would, and some
+    decisions take the last plan again."""
+    groups, priority = pairs(40)
+    no_groups: dict[str, list[str]] = {}
+    no_priority: dict[str, int] = {}
+    # (case, windows, devices, target, max, estimate, groups, priorities,
+    # stagger, the devices that answer later, as (time, name))
+    cases: list[(str, list[(str, int, int)], list[(str, int, str)], int, int, int,
+                 dict[str, list[str]], dict[str, int], int, list[(int, str)])] = [
+        ("uniform", daily("day", 0, HOUR, 9), devices("d", 100, 600, "day"), 10, 10, 600,
+         no_groups, no_priority, 0, []),
+        ("two schedules", [("night", 0, HOUR), ("weekend", 2 * HOUR, 3 * HOUR)],
+         devices("n", 5, 8, "night") + devices("w", 5, 8, "weekend"), 8, 16, 8,
+         no_groups, no_priority, 0, []),
+        ("stagger", daily("day", 0, HOUR, 9), devices("d", 100, 600, "day"), 10, 10, 600,
+         no_groups, no_priority, 100, []),
+        ("late answers", daily("day", 0, HOUR, 9), devices("d", 20, 600, "day"), 2, 4, 600,
+         no_groups, no_priority, 0, late_answers()),
+        ("pairs", daily("day", 0, HOUR, 9), devices("d", 40, 600, "day"), 10, 10, 600,
+         groups, priority, 0, []),
+    ]
+    for case in cases:
+        runs: list[dict[str, ((str, int, int), int)]] = []
+        for prepare in [False, True]:
+            c = prepare_campaign(case.1, case.2, case.3, case.4, case.5, case.6, case.7, case.8,
+                                 case.9, prepare)
+            sim.drive(c, 0, {}, 30 * DAY, answers=case.9, prepare_reports=prepare)
+            runs.append(sim.started(c))
+            if prepare:
+                later = sorted([n for n, st in runs[0].items() if st.0.1 > 0])
+                testing.assertTrue(len(later) > 0, "{case.0}: no member starts later")
+                testing.assertEqual(sorted(c.prepare_at.keys()), later, case.0)
+                for name, at in c.prepare_at.items():
+                    d = c.prepare_deadline(name, at)
+                    if d is not None:
+                        testing.assertTrue(at * fleet_ctl.MICRO <= d,
+                                           "{case.0}: {name} let at {at}, after its deadline")
+                    else:
+                        testing.assertTrue(False, "{case.0}: {name} let at {at} without a deadline")
+        testing.assertEqual(runs[1], runs[0], case.0)
+        c = prepare_campaign(case.1, case.2, case.3, case.4, case.5, case.6, case.7, case.8,
+                             case.9, True)
+        again = same_as_a_new_plan(c, {}, 9 * DAY, answers=case.9, prepare=True)
+        testing.assertTrue(again > 0, "{case.0}: {again} decisions took the plan again")
+
+
+def _test_the_prepares_are_the_plan():
+    """A 1 h window at 06:00 every day for three days, and 20 devices of
+    600 s, two at a time, each prepare 100 s. The prepares that the
+    decision at 0 shows are the run: each member is let prepare at the
+    second shown, when every member reports its prepare."""
+    c = controller(daily("w", 6 * HOUR, HOUR, 3), devices("d", 20, 600, "w"), 2, 2, debounce=1,
+                   prepare=True)
+    ds = sim.drive(c, 0, {}, 3 * DAY, prepare_reports=True)
+    testing.assertEqual(len(c.prepare_at), 20)
+    testing.assertEqual(c.prepare_at, ds[0].prepares.starts)
+
+
+def _test_prepare_reports_keep_the_quiet_time():
+    """A prepare report changes no release decision, so the quiet time
+    stays."""
+    c = one()
+    c.decide(0)
+    quiet = c.quiet_until
+    testing.assertEqual(quiet, 10150)
+    states: list[?str] = ["running", "done", None]
+    for st in states:
+        c.report_prepare("d0", st)
+        testing.assertEqual(c.quiet_until, quiet, str(st))
+
+
+def _test_revokes():
+    """ONE: the decision at 0 lets d0 prepare. d0 stays let while its
+    prepare runs. It stops being let when its prepare is done or failed,
+    when it no longer answers that it needs the upgrade, when prepare goes
+    off, when the run stops, when it leaves the campaign, or when its
+    window opens. It is let once: it gets no later turn, and only leaving
+    the campaign forgets that it was let. When the window opens, d1, let
+    at 2500, stops being let too, though only d0 starts."""
+    # (the event, the next decision, or -1 for none, whether d0 is still
+    # let)
+    cases: list[(str, int, bool)] = [
+        ("prepare running", 5, True),
+        ("prepare done", 100, False),
+        ("prepare failed", 100, False),
+        ("lost answer", 100, False),
+        ("up to date", 100, False),
+        ("prepare off", -1, False),
+        ("stop", -1, False),
+        ("drop", 100, False),
+        ("window opens", 10150, False),
+    ]
+    for case in cases:
+        c = one()
+        c.decide(0)
+        testing.assertEqual(sorted(list(c.allowed)), ["d0"], case.0)
+        if case.0 == "prepare running":
+            c.report_prepare("d0", "running")
+        elif case.0 == "prepare done":
+            c.report_prepare("d0", "done")
+        elif case.0 == "prepare failed":
+            c.report_prepare("d0", "failed")
+        elif case.0 == "lost answer":
+            c.report("d0", None, 50)
+        elif case.0 == "up to date":
+            c.report("d0", "up-to-date", 50)
+        elif case.0 == "prepare off":
+            configure_one(c, False)
+        elif case.0 == "stop":
+            c.stop()
+        elif case.0 == "drop":
+            c.drop({"d0"})
+        elif case.0 == "window opens":
+            c.decide(2500)
+            testing.assertEqual(sorted(list(c.allowed)), ["d0", "d1"], case.0)
+        t = 0
+        if case.1 >= 0:
+            t = case.1
+            c.decide(t)
+        testing.assertEqual("d0" in c.allowed, case.2, case.0)
+        testing.assertEqual("d0" in [e.1 for e in c.turns(t).0], False, case.0)
+        testing.assertEqual(c.prepare_at.get_def("d0", -1), -1 if case.0 == "drop" else 0, case.0)
+        if case.0 == "window opens":
+            testing.assertEqual((sorted(list(c.released)), len(c.allowed)), (["d0"], 0), case.0)
+
+
+def _test_once_per_run():
+    """A member is let prepare once in a run. ONE: d0 is let at 0 and
+    reports its prepare done. When that report goes, as after a flotilla
+    restart, d0 gets no new turn in this run, and a new run lets it again
+    at once. A new run does not let it again while it reports its prepare
+    done. After the decision at 200, d0 has no turn left in any case."""
+    # (case, whether d0's report goes, whether a new run starts, whether d0
+    # is let again at 200)
+    cases: list[(str, bool, bool, bool)] = [
+        ("report gone", True, False, False),
+        ("report gone, new run", True, True, True),
+        ("new run", False, True, False),
+    ]
+    for case in cases:
+        c = one()
+        c.decide(0)
+        c.report_prepare("d0", "done")
+        c.decide(100)
+        if case.1:
+            c.report_prepare("d0", None)
+        if case.2:
+            c.stop()
+            c.start()
+        c.decide(200)
+        testing.assertEqual((c.prepare_at.get_def("d0", -1) == 200,
+                             "d0" in [e.1 for e in c.turns(200).0]), (case.3, False), case.0)
+
+
+def _test_prepares_between_the_windows_of_a_schedule():
+    """Two 1 h windows a day apart, and d0 to d9 of 600 s, one at a time,
+    each prepare 100 s. d0 to d4 start in the first window, and no member
+    prepares while it is open. When it closes, d5 to d9 wait for the
+    second window: their turns spread from the close to their deadline,
+    150 s before the second opening."""
+    c = controller([("w", 0, HOUR), ("w", DAY, DAY + HOUR)], devices("d", 10, 600, "w"), 1, 1,
+                   prepare=True)
+    sim.drive(c, 0, {}, HOUR - 1, prepare_reports=True)
+    testing.assertEqual(sorted(list(c.released)), ["d0", "d1", "d2", "d3", "d4"])
+    testing.assertEqual(c.prepare_at, {})
+    testing.assertEqual(c.decide(HOUR).prepares.starts,
+                        {"d5": 3600, "d6": 24262, "d7": 44925, "d8": 65587, "d9": 86250})
+
+
+def _test_prepare_alarms():
+    """The prepares name the members whose window opens too soon to
+    prepare before it, and then the members whose prepare failed while
+    they wait for their release. A failed prepare is forgotten when every
+    status is lost. A member whose prepare failed is not named when it no
+    longer waits: it is released, it has not answered, or its upgrade
+    failed and a new run starts, so it is no longer released. That holds
+    with prepare off too, where the run's own prepare is what failed."""
+    # (case, the window's opening, prepare on or off, the members whose
+    # prepare failed, the event, the alarms)
+    cases: list[(str, int, bool, list[str], str, list[str])] = [
+        ("failed", 10150, True, ["d0"], "",
+         ["1 device(s) failed to prepare and copy the image in their window: d0"]),
+        ("too soon", 100, True, [], "",
+         ["5 device(s) cannot prepare before their window opens: d0, d1, d2, d3, d4"]),
+        ("both", 100, True, ["d0"], "",
+         ["4 device(s) cannot prepare before their window opens: d1, d2, d3, d4",
+          "1 device(s) failed to prepare and copy the image in their window: d0"]),
+        ("failed, then all lost", 10150, True, ["d0"], "all lost", []),
+        ("released", 0, True, ["d0", "d4"], "released",
+         ["1 device(s) failed to prepare and copy the image in their window: d4"]),
+        ("answer lost", 10150, True, ["d0"], "answer lost", []),
+        ("upgrade failed, new run", 10150, True, ["d0"], "upgrade failed", []),
+        ("prepare off, upgrade failed, new run", 10150, False, ["d0"], "upgrade failed", []),
+    ]
+    for case in cases:
+        c = controller([("w", case.1, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
+                       prepare=case.2)
+        for name in case.3:
+            c.report_prepare(name, "failed")
+        if case.4 == "all lost":
+            c.lost_all()
+        elif case.4 == "answer lost":
+            c.report("d0", None, 0)
+        elif case.4 == "upgrade failed":
+            c.report("d0", "failed", 0)
+            c.stop()
+            c.start()
+        if case.4 == "released":
+            c.decide(0)
+            testing.assertEqual(sorted(list(c.released)), ["d0"], case.0)
+        else:
+            c.plan(0)
+        testing.assertEqual(c.prepares(0).alarms, case.5, case.0)
+
+
+def _test_the_plan_before_a_run_shows_a_run_started_now():
+    """Before a run, ONE prepares nothing. A copy that starts a run now
+    and plans shows the turns of that run. With a debounce of 30 s, a run
+    that starts at 15 shows d0 at 15, though the debounce slot of its turn
+    starts at 0."""
+    # (the debounce, when the run starts, the starts it shows)
+    cases: list[(int, int, dict[str, int])] = [
+        (0, 0, {"d0": 0, "d1": 2500, "d2": 5000, "d3": 7500, "d4": 10000}),
+        (30, 15, {"d0": 15, "d1": 2490, "d2": 4980, "d3": 7500, "d4": 9990}),
+    ]
+    for case in cases:
+        c = configured([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
+                       debounce=case.0, prepare=True)
+        c.plan(case.1)
+        testing.assertEqual(c.prepares(case.1).starts, {}, str(case.0))
+        r = c.copy()
+        r.start()
+        r.plan(case.1)
+        testing.assertEqual(r.prepares(case.1).starts, case.2, str(case.0))
+
+
+def _test_copy_keeps_the_prepares():
+    """ONE: d0 is let at 0 and reports its prepare done, and d2 reports
+    its prepare running, so no member is let at 1. A copy shows the same
+    prepares, and a decision on the copy does not change who the original
+    lets prepare."""
+    c = one()
+    c.decide(0)
+    c.report_prepare("d0", "done")
+    c.report_prepare("d2", "running")
+    c.decide(1)
+    testing.assertEqual(len(c.allowed), 0)
+    r = c.copy()
+    a = c.prepares(1)
+    b = r.prepares(1)
+    testing.assertEqual(b.starts, a.starts)
+    testing.assertEqual(b.c, a.c)
+    testing.assertEqual(b.alarms, a.alarms)
+    r.decide(3333)
+    testing.assertEqual(sorted(list(r.allowed)), ["d1"])
+    testing.assertEqual(len(c.allowed), 0)
+    testing.assertEqual(c.prepare_at, {"d0": 0})
 
 
 #############################################################################
