@@ -446,7 +446,7 @@
   flight finish, and the plan's alarm says "N device(s) failed, more than
   the failure budget of M: no more devices start". To go on, raise or
   remove the budget, or remove failed members. Without a budget, a
-  campaign releases as before.
+  campaign releases as before. [#791]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
