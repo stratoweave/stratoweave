@@ -1253,6 +1253,38 @@ def _test_staged_file_reads_both_listings():
         testing.assertEqual(swxe.staged_file(root, image), want, name)
 
 
+def _test_file_stamp():
+    cli = xecli_data.root()
+    fs = cli.file_systems.file_system.create("bootflash:")
+    fs.file.create(IMAGE_FILE, size=u64(734643332), modified="2026-11-11T09:04:08+00:00", index=u64(17))
+    fs.file.create("no-date.bin", size=u64(1), index=u64(18))
+    cases = [
+        ("index, size and date", cli.to_gdata(), IMAGE_FILE, "17 734643332 2026-11-11T09:04:08+00:00"),
+        ("no date", cli.to_gdata(), "no-date.bin", "-"),
+        ("not there", cli.to_gdata(), "other.bin", "-"),
+        ("NETCONF listing", _files_root([(name="bootflash:", paths=["/bootflash/" + IMAGE_FILE])]), IMAGE_FILE, "-"),
+    ]
+    for name, root, filename, want in cases:
+        got = swxe.file_stamp(root, filename)
+        testing.assertEqual(want, got if got is not None else "-", name)
+
+
+def _test_check_still_holds():
+    stamp = "17 734643332 2026-11-11T09:04:08+00:00"
+    passed = (file=IMAGE_FILE, stamp=stamp, check="sha512 aa")
+    cases = [
+        ("unchanged", passed, IMAGE_FILE, stamp, True),
+        ("written again", passed, IMAGE_FILE, "17 734643332 2026-11-12T10:00:00+00:00", False),
+        ("copied anew in the same second", passed, IMAGE_FILE, "23 734643332 2026-11-11T09:04:08+00:00", False),
+        ("another file", passed, "other.bin", stamp, False),
+        ("no stamp", passed, IMAGE_FILE, None, False),
+        ("never passed", None, IMAGE_FILE, stamp, False),
+    ]
+    for name, p, filename, st, want in cases:
+        testing.assertEqual(want, swxe.check_still_holds(p, filename, st, "sha512 aa"), name)
+    testing.assertEqual(False, swxe.check_still_holds(passed, IMAGE_FILE, stamp, "sha512 bb"), "another checksum")
+
+
 def _test_adapter_wait_left():
     cases = [
         ("nothing missing", {}, 0.0),
@@ -1287,18 +1319,20 @@ VERIFY_COMMAND = "verify /sha512 bootflash:" + IMAGE_FILE + " " + HASH
 CONFIG_CHANGE_COMMANDS = [clitest.RUNNING_CHANGE_COMMAND, clitest.STARTUP_CHANGE_COMMAND]
 
 
-def _dir(files: list[str], free: int=1458692096) -> str:
-    """dir bootflash: of a C1111, with these files and free bytes."""
+def _dir(files: list[str], free: int=1458692096, modified: str="Jun 18 2019 18:22:26") -> str:
+    """dir bootflash: of a C1111, with these files, modified at modified,
+    and free bytes."""
     lines = ["", "", "Directory of bootflash:/", ""]
     i = 15
     for f in files:
-        lines.append("   " + str(i) + "  -rw-        427968764  Jun 18 2019 18:22:26 +00:00  " + f)
+        lines.append("   " + str(i) + "  -rw-        427968764  " + modified + " +00:00  " + f)
         i += 1
     lines.extend(["", "2885718016 bytes total (" + str(free) + " bytes free)", ""])
     return "\r\n".join(lines)
 
 
 DIR_STAGED = _dir(["packages.conf", IMAGE_FILE])
+DIR_STAGED_LATER = _dir(["packages.conf", IMAGE_FILE], modified="Nov 11 2026 09:04:08")
 DIR_EMPTY = _dir(["packages.conf"])
 VERIFY_EQUAL = "\r\n\r\n.....Done!\r\nVerified (bootflash:" + IMAGE_FILE + ") = " + HASH + "\r\n"
 VERIFY_DIFFERS = "\r\n\r\n.....Done!\r\n%Error verifying bootflash:" + IMAGE_FILE + \
@@ -1340,7 +1374,7 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
                   settled: action(swxemock.IosXeSoftwareMock, xecli.CliMock, swdev.DeviceMgr, str) -> None,
                   timeout: float=2.5, preadded: ?str=None, checksum: bool=True, image_output: str="",
                   running: str=OLD_RELEASE, committed: ?str=None, files: bool=True,
-                  verify_delay: float=0.0):
+                  verify_delay: float=0.0, restamped: bool=False):
     """Drive one mock device with a sha512 image checksum from software intent
     to a settled status. The CliMock answers dir bootflash: with dir_output,
     and with a listing that has the image once the device took an xcopy, and
@@ -1349,7 +1383,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
     that the device has added from the start. Without checksum, the intent
     has no checksum, and the CliMock answers the check of the image's
     signature with image_output. The device runs running, and keeps
-    committed when it differs."""
+    committed when it differs. When restamped, the image has another date
+    after its first check, as when someone copies it again."""
     var dev_ref: ?swdev.DeviceMgr = None
     var mock: ?swxemock.IosXeSoftwareMock = None
     var cli: ?xecli.CliMock = None
@@ -1410,6 +1445,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         c.set_reply(VERIFY_COMMAND, verify_output)
         c.set_reply(VERIFY_IMAGE_COMMAND, image_output)
         c.set_delay(VERIFY_COMMAND, verify_delay)
+        if restamped:
+            c.set_reply_on(VERIFY_COMMAND, "dir bootflash:", DIR_STAGED_LATER)
         software = Software("camp-1", NEW_REQUESTED, IMAGE_URL)
         if checksum:
             software.image_checksum.create("sha512", HASH)
@@ -1531,8 +1568,9 @@ actor _test_iosxe_missing_image_is_copied_and_verified(t: testing.EnvT):
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
             testing.assertEqual(["xcopy", "install", "activate", "install-commit", "remove"], m.get_rpcs())
-            testing.assertEqual(c.get_commands(), [VERIFY_COMMAND, VERIFY_COMMAND] + CONFIG_CHANGE_COMMANDS,
-                                "NETCONF lists; the CLI verifies the copy in prepare and again in install")
+            testing.assertEqual(["dir bootflash:", VERIFY_COMMAND, "dir bootflash:"] + CONFIG_CHANGE_COMMANDS,
+                                c.get_commands(),
+                                "NETCONF lists; the CLI verifies the copy in prepare; install finds it unchanged")
             t.success()
         except Exception as e:
             t.failure(e)
@@ -1545,12 +1583,25 @@ actor _test_iosxe_slow_verify_runs_once(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual([VERIFY_COMMAND, VERIFY_COMMAND] + CONFIG_CHANGE_COMMANDS, c.get_commands(),
-                                "one check after the transfer in prepare, one in install")
+            testing.assertEqual(["dir bootflash:", VERIFY_COMMAND, "dir bootflash:"] + CONFIG_CHANGE_COMMANDS,
+                                c.get_commands(), "one check after the transfer in prepare, none in install")
             t.success()
         except Exception as e:
             t.failure(e)
     _StagingRun(t, "d-slow-verify", DIR_EMPTY, VERIFY_EQUAL, settled, verify_delay=0.2, timeout=5.0)
+
+
+actor _test_iosxe_changed_image_is_checked_again(t: testing.EnvT):
+    """An image whose date changed after its check is checked again."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["dir bootflash:", VERIFY_COMMAND, "dir bootflash:", VERIFY_COMMAND] + CONFIG_CHANGE_COMMANDS,
+                                c.get_commands(), "checked in prepare, and again in install")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-restamped", DIR_STAGED, VERIFY_EQUAL, settled, restamped=True)
 
 
 actor _test_iosxe_listing_falls_back_to_the_cli(t: testing.EnvT):
@@ -1560,7 +1611,8 @@ actor _test_iosxe_listing_falls_back_to_the_cli(t: testing.EnvT):
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
             testing.assertEqual(["install", "activate", "install-commit", "remove"], m.get_rpcs())
-            testing.assertEqual(c.get_commands()[:2], ["dir bootflash:", VERIFY_COMMAND], "list, then verify")
+            testing.assertEqual(["dir bootflash:", "dir bootflash:", VERIFY_COMMAND], c.get_commands()[:3],
+                                "list, read the stamp of the image, then verify")
             t.success()
         except Exception as e:
             t.failure(e)
@@ -1846,6 +1898,7 @@ actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
         elif staged_short:
             listing = _dir(["packages.conf", IMAGE_FILE], 100000000)
         c.set_reply("dir bootflash:", listing)
+        c.set_reply_on(COPY_COMMAND, "dir bootflash:", DIR_STAGED)
         c.set_question(COPY_COMMAND, COPY_QUESTION, "", COPY_DONE)
         c.set_reply(VERIFY_COMMAND, VERIFY_EQUAL)
         c.set_reply(ADD_COMMAND, ADD_DONE)
@@ -1882,7 +1935,6 @@ actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
         commands = c!.get_commands() if c is not None else []
         st = d!.get_swmgr().get_status() if d is not None else "?"
         reason = d!.get_swmgr().get_reason() if d is not None else None
-        c.set_reply_on(COPY_COMMAND, "dir bootflash:", DIR_STAGED)
         t.failure(ValueError("timed out: commands={commands} status={st} reason={reason}"))
 
     schema = yang.compile(swxe_yang.models)

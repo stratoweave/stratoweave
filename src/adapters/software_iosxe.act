@@ -455,6 +455,35 @@ def bootflash_filter(listing: str) -> ygdata.FNode:
         ygdata.FNode(q("file-system"), children=[ygdata.FNode(q("name"), value_match="bootflash:")])])])
 
 
+def check_still_holds(passed: ?(file: str, stamp: str, check: str), filename: str,
+                      stamp: ?str, check: str) -> bool:
+    """Return True if a check that the image passed still holds: the same
+    file, with the same stamp, passed the same check. Writing the file
+    again changes its stamp."""
+    if passed is None or stamp is None:
+        return False
+    p = passed!
+    return p.file == filename and p.stamp == stamp! and p.check == check
+
+
+def file_stamp(root: ?ygdata.Node, filename: str) -> ?str:
+    """Return the index, the size and the modification time of filename on
+    bootflash: in a listing over the CLI, as one string, or None when the
+    listing has no such file or lacks one of them. They are what stat gives
+    of a file: one that was written again, also deleted and copied anew,
+    has another stamp."""
+    fs = xecli_data.root.from_gdata(root).file_systems.file_system.get("bootflash:")
+    if fs is not None:
+        f = fs.file.get(filename)
+        if f is not None:
+            index = f.index
+            size = f.size
+            modified = f.modified
+            if index is not None and size is not None and modified is not None:
+                return "{index} {size} {modified}"
+    return None
+
+
 #############################################################################
 # Pure: filters and RPC bodies
 #############################################################################
@@ -840,6 +869,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     var _url = ""
     # The checksum that staging checks the image against, if any.
     var _check: ?(algorithm: str, digest: str) = None
+    # The file, its stamp and the check that it passed last, so that a later
+    # stage of the same upgrade does not check it again.
+    var _passed: ?(file: str, stamp: str, check: str) = None
     # Install stages the image first, then adds it.
     var _then_add = False
     # The conversion to install mode committed the release with its
@@ -1144,13 +1176,42 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         plan = upgrade_plan(_modules())
         size = _size_check(plan.verify, plan.listing)
         if c is not None:
-            _verify_against(gen, before_transfer, c)
+            checksum = c!
+            def against(stamp: ?str) -> None:
+                _verify_against(gen, before_transfer, checksum, stamp)
+            _unless_passed(gen, "{checksum.algorithm} {checksum.digest}", against)
         elif plan.verify == "cli":
-            _verify_image(gen, before_transfer)
+            def image(stamp: ?str) -> None:
+                _verify_image(gen, before_transfer, stamp)
+            _unless_passed(gen, "image", image)
         elif size is not None:
             _verify_size(gen, before_transfer, size, plan.listing)
         else:
             _staged()
+
+    def _unless_passed(gen: int, check: str, run: proc(?str) -> None) -> None:
+        """Check the staged image over the CLI with run, unless the image
+        passed the same check and has not changed since: then it is staged.
+        A check of a large image takes a minute or more on a C1111, and
+        each stage of an upgrade checks it. The driver keeps the checks
+        that passed in memory only: after a restart it checks again."""
+        def listed(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            stamp = file_stamp(root, _filename) if err is None else None
+            if check_still_holds(_passed, _filename, stamp, check):
+                _log.info("software: image unchanged since its check", {"file": _filename})
+                _staged()
+            else:
+                run(stamp)
+        dev.get(listed, bootflash_filter("cli"))
+
+    def _passes(check: str, stamp: ?str) -> None:
+        """Remember that the staged image passed check with stamp."""
+        if stamp is not None:
+            _passed = (file=_filename, stamp=stamp!, check=check)
+        else:
+            _passed = None
 
     def _verify_size(gen: int, before_transfer: bool, size: u64, listing: str) -> None:
         """Compare the size of the staged image with the image size of the
@@ -1173,7 +1234,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _fail("size mismatch: {_filename} is {got} bytes, not {size}")
         dev.get(listed, bootflash_filter(listing))
 
-    def _verify_image(gen: int, before_transfer: bool) -> None:
+    def _verify_image(gen: int, before_transfer: bool, stamp: ?str) -> None:
         """Check the hashes and the signature that the image holds."""
         def verified(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception) -> None:
             if gen != _gen:
@@ -1184,6 +1245,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             ok = out.verified if out is not None else None
             if ok is not None and ok:
                 _log.info("software: image signature verified", {"file": _filename})
+                _passes("image", stamp)
                 _staged()
             elif before_transfer:
                 _log.info("software: staged image fails its signature check, transferring it again", {"file": _filename})
@@ -1192,7 +1254,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _fail("{_filename} fails its signature check")
         _cli.verify(verified, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", _filename))
 
-    def _verify_against(gen: int, before_transfer: bool, c: (algorithm: str, digest: str)) -> None:
+    def _verify_against(gen: int, before_transfer: bool, c: (algorithm: str, digest: str), stamp: ?str) -> None:
         def verified(out: ?xecli_data.stratoweave_iosxe_cli__verify__output, err: ?Exception) -> None:
             if gen != _gen:
                 return
@@ -1202,6 +1264,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             ok = out.verified if out is not None else None
             if ok is not None and ok:
                 _log.info("software: image verified", {"file": _filename, "algorithm": c.algorithm})
+                _passes("{c.algorithm} {c.digest}", stamp)
                 _staged()
             elif before_transfer:
                 _log.info("software: staged image differs, transferring it again", {"file": _filename})

@@ -211,7 +211,12 @@ connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
   reboot the release is read every 20 seconds for up to 35 minutes. Nothing
   is retried.
 - Prepare keeps an image that is on bootflash and passes its check, and
-  transfers one that is missing or fails it. Install checks it again.
+  transfers one that is missing or fails it. Install checks it again,
+  unless the image passed the same check and `dir bootflash:` shows the
+  index, size and date that it had then, as stat would: a file written
+  again, also deleted and copied anew, gets another index. A check of a
+  735 MB image takes about a minute on a C1111. The driver keeps the
+  checks in memory: after a restart it checks again.
 - Before a transfer, bootflash needs 2.2 times the `image-size` of the
   intent: the image, and the packages that the add makes of it. Without the
   room, the adapter removes the inactive software once and looks again.
