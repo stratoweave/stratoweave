@@ -123,6 +123,11 @@ COMMAND_TIMEOUT = 60.0
 ## MD5 of an 838 MB image takes 23 s on a C8000V.
 RPC_TIMEOUT = 600.0
 
+## The bytes that a copy over http copies for each ! that it prints, on a
+## C1111: 3499 marks for 687933004 bytes and 3737 for 734643332 with 16.8.1,
+## 2177 for 427968764 with 17.15.06.
+COPY_MARK_BYTES = 196608
+
 ## Seconds that an install command can run. install add copies and expands
 ## an image, from a URL too.
 INSTALL_TIMEOUT = 3600.0
@@ -843,6 +848,25 @@ def _node_reads(top: gdata.FNode) -> list[Read]:
     return []
 
 
+def copy_progress(command: str, output: str) -> (file: str, bytes: u64):
+    """Return the destination and the bytes copied so far of a copy command
+    from what it printed so far. Another command gives no file."""
+    if not command.startswith("copy "):
+        return (file="", bytes=u64(0))
+    words = command.split()
+    return (file=words[-1], bytes=u64(output.count("!") * COPY_MARK_BYTES))
+
+
+def selects_copy_progress(filt: ?gdata.FNode) -> bool:
+    """Return True if a get with filt reads copy-progress, as a get without a
+    filter does."""
+    if filt is None:
+        return True
+    f = filt!
+    tops = f.children if f.name is None else [f]
+    return any([t.name == gdata.Id(xecli_yang.NS, "copy-progress") for t in tops])
+
+
 def reads(filt: ?gdata.FNode) -> list[Read]:
     """Return the reads that a get with filt needs.
 
@@ -1325,6 +1349,14 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
             _type([j.command + "\r"])
         _watch(j.timeout)
 
+    def running() -> (command: str, output: str):
+        """Return the command that runs now and what it printed so far, or
+        no command."""
+        j = job
+        if j is not None and dialog is None:
+            return (command=j.command, output=text)
+        return (command="", output="")
+
     def _watch(timeout: float):
         serial += 1
         at = serial
@@ -1452,13 +1484,19 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
     def _type(texts: list[str]):
         m = mock
         if m is not None:
+            first = ""
             replies = ""
             wait = 0.0
             for t in texts:
-                replies += m.type_text(t.rstrip())
+                reply = m.type_text(t.rstrip())
+                n = m.early_of(t.rstrip())
+                first += reply[:n]
+                replies += reply[n:]
                 d = m.delay_of(t.rstrip())
                 if d > wait:
                     wait = d
+            if first != "":
+                after 0: _on_text(first)
             after wait: _on_text(replies)
             return
         ch = channel
@@ -1548,6 +1586,8 @@ actor CliMock():
     var replies: dict[str, str] = {}
     # Seconds that a command takes, when set_delay gave it any.
     var delays: dict[str, float] = {}
+    # The characters of a command's output that come at once.
+    var early: dict[str, int] = {}
     # The answer to the question of a command, and what follows it.
     var answer_of: dict[str, str] = {}
     var after_answer: dict[str, str] = {}
@@ -1573,6 +1613,15 @@ actor CliMock():
     def set_delay(command: str, seconds: float) -> None:
         """Make command take seconds before its output comes."""
         delays[command] = seconds
+
+    def set_early(command: str, chars: int) -> None:
+        """Make the first chars of what command prints come at once, before
+        its delay, as the marks of a copy come while it runs."""
+        early[command] = chars
+
+    def early_of(text: str) -> int:
+        n = early.get(text)
+        return n if n is not None else 0
 
     def delay_of(text: str) -> float:
         d = delays.get(text)
@@ -1774,10 +1823,21 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
         except Exception as e:
             cb(None, e)
         else:
-            if len(rs) > 0:
-                _read(rs, 0, xecli_data.root(), filt, cb)
-            else:
-                cb(gdata.Container({}), None)
+            r = xecli_data.root()
+            if selects_copy_progress(filt):
+                _fill_copy_progress(r)
+            _read(rs, 0, r, filt, cb)
+
+    def _fill_copy_progress(r: xecli_data.root) -> None:
+        """Add the progress of the copy that runs now, from the session,
+        without a command."""
+        s = session
+        if s is not None:
+            running = s.running()
+            p = copy_progress(running.command, running.output)
+            if p.file != "":
+                r.copy_progress.file = p.file
+                r.copy_progress.bytes = p.bytes
 
     def _call(cb: action(?gdata.Node, ?Exception) -> None, c: Call):
         def received(output: ?str, err: ?Exception):

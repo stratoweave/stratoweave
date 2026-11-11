@@ -1374,7 +1374,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
                   settled: action(swxemock.IosXeSoftwareMock, xecli.CliMock, swdev.DeviceMgr, str) -> None,
                   timeout: float=2.5, preadded: ?str=None, checksum: bool=True, image_output: str="",
                   running: str=OLD_RELEASE, committed: ?str=None, files: bool=True,
-                  verify_delay: float=0.0, restamped: bool=False):
+                  verify_delay: float=0.0, restamped: bool=False, upgrade_duration: float=0.0,
+                  sized: bool=False):
     """Drive one mock device with a sha512 image checksum from software intent
     to a settled status. The CliMock answers dir bootflash: with dir_output,
     and with a listing that has the image once the device took an xcopy, and
@@ -1384,11 +1385,14 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
     has no checksum, and the CliMock answers the check of the image's
     signature with image_output. The device runs running, and keeps
     committed when it differs. When restamped, the image has another date
-    after its first check, as when someone copies it again."""
+    after its first check, as when someone copies it again. upgrade_duration
+    is the mock's; when sized, the intent has the image size of the mock.
+    The progress that the prepare job showed is in progress_seen."""
     var dev_ref: ?swdev.DeviceMgr = None
     var mock: ?swxemock.IosXeSoftwareMock = None
     var cli: ?xecli.CliMock = None
     var finished = False
+    var progress_seen: list[u64] = []
 
     def on_reconf(n: str) -> None:
         pass
@@ -1401,6 +1405,9 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
             return
         if "xcopy" in m!.get_rpcs():
             c!.set_reply("dir bootflash:", DIR_STAGED)
+        seen = d!.get_swmgr().get_job_progress("prepare")
+        if seen is not None and (len(progress_seen) == 0 or progress_seen[-1] != seen!):
+            progress_seen.append(seen!)
         st = d!.get_swmgr().get_status()
         if st == "unknown" or st == "in-progress":
             after 0.02: poll()
@@ -1433,7 +1440,7 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
 
     def _run(d: swdev.DeviceMgr, ms: swna.NetconfMockServer, c: xecli.CliMock) -> None:
         prestaged = IMAGE_FILE if dir_output == DIR_STAGED else None
-        m = swxemock.IosXeSoftwareMock(ms, t.log_handler, upgrade_duration=0.0,
+        m = swxemock.IosXeSoftwareMock(ms, t.log_handler, upgrade_duration=upgrade_duration,
                                        failure=swxemock.FAILURE_NONE, running=running,
                                        prestaged=prestaged, preadded=preadded, committed_release=committed)
         mock = m
@@ -1448,6 +1455,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         if restamped:
             c.set_reply_on(VERIFY_COMMAND, "dir bootflash:", DIR_STAGED_LATER)
         software = Software("camp-1", NEW_REQUESTED, IMAGE_URL)
+        if sized:
+            software.image_size = u64(swxemock.IMAGE_SIZE)
         if checksum:
             software.image_checksum.create("sha512", HASH)
         dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe", software=software)
@@ -1455,6 +1464,9 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         dmc.extra_adapter.create("iosxe-cli")
         d.set_dmc(dmc)
         after 0.02: poll()
+
+    def get_progress_seen() -> list[u64]:
+        return progress_seen
 
     def report_timeout() -> None:
         if finished:
@@ -1591,6 +1603,24 @@ actor _test_iosxe_slow_verify_runs_once(t: testing.EnvT):
     _StagingRun(t, "d-slow-verify", DIR_EMPTY, VERIFY_EQUAL, settled, verify_delay=0.2, timeout=5.0)
 
 
+actor _test_iosxe_transfer_progress(t: testing.EnvT):
+    """While xcopy writes the image, the prepare job shows how far it is,
+    from the size of the file on bootflash."""
+    var run: ?_StagingRun = None
+
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            r = run
+            seen = r!.get_progress_seen() if r is not None else []
+            testing.assertTrue(any([p > u64(0) and p < u64(100) for p in seen]), "a progress between 0 and 100: {seen}")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    run = _StagingRun(t, "d-progress", DIR_EMPTY, VERIFY_EQUAL, settled, upgrade_duration=2.0, sized=True,
+                      timeout=8.0)
+
+
 actor _test_iosxe_changed_image_is_checked_again(t: testing.EnvT):
     """An image whose date changed after its check is checked again."""
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
@@ -1690,10 +1720,11 @@ actor _test_live_software_upgrade(t: testing.EnvT):
         st = d!.get_swmgr().get_status()
         reason = d!.get_swmgr().get_reason()
         job = d!.get_swmgr().get_job_state("prepare")
-        now = "{st} {reason} {job}"
+        progress = d!.get_swmgr().get_job_progress("prepare")
+        now = "{st} {reason} {job} {progress}"
         if now != last:
             last = now
-            log.info("software status", {"status": st, "reason": reason, "prepare": job})
+            log.info("software status", {"status": st, "reason": reason, "prepare": job, "progress": progress})
         if staging:
             if job == "done" and st == "upgrade-needed":
                 staging = False

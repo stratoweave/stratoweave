@@ -127,7 +127,7 @@ Published under `stratoweave-rfs:device=<name>/software/state`:
 | `stage` | The step the run is in, or the step it ended in |
 | `reason` | Why the run failed or rolled back, why the release could not be read, or what held the install |
 | `precheck`, `postcheck` | `verdict` (`not-run`, `pass` or `fail`), `detail`, and `at`, the time of the verdict |
-| `job[prepare]` | The last prepare: `state` (`running`, `done` or `failed`), `release`, `started`, `ended` and, when it failed, `message` |
+| `job[prepare]` | The last prepare: `state` (`running`, `done` or `failed`), `release`, `started`, `ended` and, when it failed, `message`. While it runs, an adapter that transfers the image sets `progress` in percent of `image-size` and `message` with the bytes |
 
 The release the device runs is `state/platform/version` (see
 `device-platform.md`). The manager reads the platform again when an install
@@ -217,6 +217,12 @@ connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
   again, also deleted and copied anew, gets another index. A check of a
   735 MB image takes about a minute on a C1111. The driver keeps the
   checks in memory: after a restart it checks again.
+- While the image transfers, the adapter reports how far it is: over
+  NETCONF from the size of the file on bootflash at each poll of the
+  `xcopy`, over the CLI from the marks that `copy` prints, one `!` per
+  196608 bytes over http (measured on 16.8.1 and 17.15.06). The CLI adapter answers a
+  read of `copy-progress` from what the running copy printed, without a
+  command.
 - Before a transfer, bootflash needs 2.2 times the `image-size` of the
   intent: the image, and the packages that the add makes of it. Without the
   room, the adapter removes the inactive software once and looks again.

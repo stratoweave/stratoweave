@@ -442,6 +442,18 @@ def staged_size(root: ?ygdata.Node, filename: str) -> ?u64:
     return None
 
 
+def copy_progress_filter() -> ygdata.FNode:
+    """Select the progress of the copy that the CLI adapter runs."""
+    return ygdata.FNode(children=[ygdata.FNode(ygdata.Id(xecli_yang.NS, "copy-progress"))])
+
+
+def copied_bytes(root: ?ygdata.Node) -> ?u64:
+    """Return the bytes copied so far in a read of copy-progress, or None
+    while no copy runs."""
+    p = xecli_data.root.from_gdata(root).copy_progress
+    return p.bytes if p.file is not None else None
+
+
 def bootflash_filter(listing: str) -> ygdata.FNode:
     """Select the files of bootflash: over NETCONF, from
     Cisco-IOS-XE-platform-software-oper, or over the CLI."""
@@ -887,6 +899,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     # The device runs IOS XE 16 in install mode: one command adds,
     # activates and commits the image.
     var _one_shot = False
+    # A copy over the CLI runs, whose progress the driver reads.
+    var _copying = False
     # The conversion to install mode committed the release with its
     # activation, so commit has nothing left to do and abort cannot undo it.
     var _committed = False
@@ -1335,12 +1349,51 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         def copied(out: ?xecli_data.stratoweave_iosxe_cli__copy__output, err: ?Exception) -> None:
             if gen != _gen:
                 return
+            _copying = False
             if err is not None:
                 _fail(swdev.error_text(err!).replace(url, redact_url(url)))
                 return
             _log.info("software: image copied", {"file": _filename, "size": out.size if out is not None else None})
             _end_phase()
+        _copying = True
+        after now poll_period: _poll_copy(gen)
         _cli.copy(copied, xecli_data.stratoweave_iosxe_cli__copy__input(url, "bootflash:", _filename))
+
+    def _poll_copy(gen: int) -> None:
+        """Report how far the copy over the CLI is, every poll period while
+        it runs. The CLI adapter tells from the marks that the copy prints."""
+        if gen != _gen or not _copying:
+            return
+        def read(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen or not _copying or err is not None:
+                return
+            n = copied_bytes(root)
+            if n is not None:
+                _report_transfer(n!)
+        dev.get(read, copy_progress_filter())
+        after now poll_period: _poll_copy(gen)
+
+    def _report_transfer(transferred: u64) -> None:
+        """Pass on how many bytes of the image are on bootflash, up to the
+        image size of the intent."""
+        size = dev.get_dmc().software.image_size
+        n = transferred
+        if size is not None and n > size!:
+            n = size!
+        dev.get_swmgr().report_transfer(n, size)
+
+    def _read_transfer(gen: int) -> None:
+        """Report the size of the image file on bootflash while xcopy writes
+        it, from the NETCONF listing."""
+        if upgrade_plan(_modules()).listing != "netconf":
+            return
+        def listed(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen or err is not None:
+                return
+            n = staged_size(root, _filename)
+            if n is not None:
+                _report_transfer(n!)
+        dev.get(listed, bootflash_filter("netconf"))
 
     ####################################################################
     # install: add, then activate the added image; device reloads
@@ -1779,6 +1832,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         # Schedule the next poll before starting the read so a missing callback
         # does not stop polling.
         after now poll_period: _poll(gen)
+        if _expect_stage == STAGE_DOWNLOAD:
+            _read_transfer(gen)
         def on_oper(root: ?ygdata.Node, err: ?Exception) -> None:
             if gen != _gen:
                 return
