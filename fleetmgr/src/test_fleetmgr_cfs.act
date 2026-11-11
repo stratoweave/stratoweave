@@ -4,6 +4,7 @@ import time
 import std.xml as xml
 import yang.gdata as gdata
 import yang.xml as yxml
+from yang.type import Decimal
 
 import stratoweave
 import stratoweave.adapters.adapter as swadapt
@@ -1622,6 +1623,67 @@ def _test_campaign_stagger_reaches_the_controller():
         testing.assertEqual(alarms, [], str(stagger))
 
 
+def _test_failure_budget_devices():
+    """A failure budget in percent of a campaign's members gives the most
+    members that may fail, rounded down to whole devices. Without a
+    budget it gives -1."""
+    # (the budget in percent, or None for no budget, the members, and the
+    # devices)
+    cases: list[(?str, int, int)] = [
+        (None, 1000, -1),
+        ("0", 1000, 0),
+        ("0.5", 1000, 5),
+        ("0.50", 1000, 5),
+        ("1", 50, 0),
+        ("2", 50, 1),
+        ("10", 9, 0),
+        ("10", 10, 1),
+        ("10", 19, 1),
+        ("2", 100, 2),
+        ("2", 99, 1),
+        ("33.33", 3, 0),
+        ("33.34", 3, 1),
+        ("0.01", 9999, 0),
+        ("0.01", 10000, 1),
+        ("2.5", 100000, 2500),
+        ("100", 7, 7),
+        ("100.00", 7, 7),
+        ("50", 0, 0),
+    ]
+    for case in cases:
+        label = "{str(case.0)} percent of {case.1}"
+        p = case.0
+        percent: ?Decimal = None
+        if p is not None:
+            percent = Decimal.parse(p)
+        testing.assertEqual(cfs.failure_budget_devices(percent, case.1), case.2, label)
+
+
+def _test_campaign_failure_budget_reaches_the_controller():
+    """The campaign's failure-budget reaches the controller in devices of
+    the members the campaign has: 25 percent of 10 members is 2, and of 4
+    members 1. Without a budget the controller has none. The same
+    controller is configured in turn, so a change of the members or of
+    the budget reaches it too."""
+    # (the failure-budget in percent, or None for none, the members, and
+    # the controller's budget in devices)
+    cases: list[(?str, int, int)] = [
+        ("25", 10, 2),
+        ("25", 4, 1),
+        (None, 4, -1),
+        ("0", 10, 0),
+    ]
+    ctl = fctl.Controller()
+    for case in cases:
+        names = ["cpe-{i}" for i in range(case.1)]
+        campaign = _paced_campaign(names)
+        p = case.0
+        if p is not None:
+            campaign.failure_budget = Decimal.parse(p)
+        cfs.configure_campaign(ctl, campaign, _with_nightly(_flat_inventory(names)), 0)
+        testing.assertEqual(ctl.failure_budget, case.2, "{str(p)} percent of {case.1}")
+
+
 def _test_campaign_deadline_raises_the_planned_concurrency():
     """The same fleet with a deadline at the end of the second window. At
     11 at once the two windows take 38 and 55, seven short; at 12 they
@@ -2602,6 +2664,84 @@ actor _test_campaign_holds_a_member_that_left_in_flight_and_joins_again(t: testi
     """A member that left the campaign while in flight, and joins it again,
     gets the veto and is released only once it answers again."""
     _JoinsAgain(t, False)
+
+
+actor _test_campaign_stops_releasing_over_its_failure_budget(t: testing.AsyncT):
+    """A campaign of three members, one at a time, with a failure budget of
+    10 percent: none of its three members may fail. cpe-1 fails, so the
+    campaign releases no more members: the decision that counts the
+    failure releases nothing, counts cpe-1 failed, and its plan's alarm
+    says why. When the budget rises to 50 percent, one member may fail,
+    and the campaign releases cpe-2."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var stage = 0
+    var done = False
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    linked = _flat_inventory(names).to_gdata()
+    alarm = "1 device(s) failed, more than the failure budget of 0: no more devices start"
+
+    def budgeted(percent: str) -> InputCampaign:
+        campaign = _now_campaign("run", names)
+        campaign.failure_budget = Decimal.parse(percent)
+        return campaign
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def report(name: str, status: str) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                      _tagged(status, "now", "17.18.03a"), None)
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "now")
+        if stage == 0:
+            if free == ["cpe-1"]:
+                # cpe-1 is in flight, and fails.
+                stage = 1
+                report("cpe-1", "failed")
+        elif stage == 2 and free == ["cpe-2"]:
+            done = True
+            t.success()
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None or stage != 1:
+            return
+        o = oper!
+        if alarm in o.state.plan.alarm:
+            # The decision that published the alarm took its step: the
+            # plan shows each member it released as started.
+            started: list[str] = []
+            for win in o.state.plan.window:
+                for dev in win.device:
+                    if dev.started is not None:
+                        started.append(dev.name)
+            if "cpe-2" in started or "cpe-3" in started:
+                fail("over the budget, the campaign released {started}")
+            elif o.state.failed != u64(1):
+                fail("over the budget, failed is {o.state.failed}")
+            else:
+                stage = 2
+                cc = controller
+                if cc is not None:
+                    cc.on_conf(budgeted("50"), linked)
+
+    def timeout() -> None:
+        fail("at stage {stage}, cpe-2 was not released")
+
+    t.timeout(8.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, on_oper, None)
+    controller = ctl
+    ctl.on_conf(budgeted("10"), linked)
+    for name in names:
+        report(name, "upgrade-needed")
+    ctl.on_subscriptions_synced()
+    after 6.0: timeout()
 
 
 actor _test_campaign_holds_a_member_still_upgrading(t: testing.AsyncT):

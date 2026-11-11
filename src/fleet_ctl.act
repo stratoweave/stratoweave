@@ -299,9 +299,9 @@ class Plan(object):
     schedule that has not closed, and the earliest time it could start
     there. A device is held while it waits behind a failed or down
     redundancy group member, while it has not answered the campaign's
-    target, and while it waits behind a group member that has not
-    answered. alarms says which promises the run breaks and which devices
-    are held."""
+    target, while it waits behind a group member that has not answered,
+    and while more members have failed than the failure budget. alarms
+    says which promises the run breaks and which devices are held."""
     c: int
     starts: dict[str, (int, int)]
     held: dict[str, (int, int)]
@@ -471,6 +471,13 @@ class Controller(object):
     held: the plan shows it in the first window of its schedule that has
     not closed, and other devices can take that window.
 
+    A member has failed while its latest report is a failure. With a
+    failure budget, no device starts while more members have failed than
+    the budget. The devices in flight finish. The waiting devices are
+    held, the plan gives an alarm, and no member is let prepare. A member
+    that reports a success after its failure, or leaves the campaign, no
+    longer counts.
+
     The observed pace is kept at the scale of the campaign's estimate: an
     upgrade that took twice its device's estimate counts as twice the
     campaign's estimate, and each device's expected duration is its
@@ -553,7 +560,8 @@ class Controller(object):
     one member now and spreads the rest from now. A member stops being let
     when its prepare is done or failed, it is released, its latest report
     no longer says that it needs the upgrade, it leaves the campaign, a
-    window of its schedule opens, prepare goes off, or the run stops.
+    window of its schedule opens, prepare goes off, the run stops, or more
+    members have failed than the failure budget.
     Prepares change no release decision: step(), plan() and the quiet time
     read nothing of them."""
     # Configuration.
@@ -600,6 +608,8 @@ class Controller(object):
     # each member's expected prepare time, in seconds.
     prepare: bool
     prepare_est: dict[str, int]
+    # The most members that may fail, or -1 for no limit.
+    failure_budget: int
 
     # Each device that the controller has state for has a number: the
     # place of its state in the lists below. size is how many devices
@@ -666,6 +676,10 @@ class Controller(object):
     # Per device number: whether its latest report answers the campaign's
     # target.
     answered: list[bool]
+    # Per device number: whether its latest report is a failure. How many
+    # devices of the campaign have one.
+    failing: list[bool]
+    failures: int
     # The latest prepare state each member reports for the campaign's
     # target: running, done or failed. It outlives a run, as final_at does.
     prepare_state: dict[str, str]
@@ -776,6 +790,7 @@ class Controller(object):
         self.stagger = 0
         self.prepare = False
         self.prepare_est = {}
+        self.failure_budget = -1
         self.estimate_s = 1
         self.names = Names()
         self.size = 0
@@ -807,6 +822,8 @@ class Controller(object):
         self.final_at = []
         self.final_status = []
         self.answered = []
+        self.failing = []
+        self.failures = 0
         self.prepare_state = {}
         self.prepare_at = {}
         self.allowed = set()
@@ -855,6 +872,7 @@ class Controller(object):
             self.final_at.append(NO_TIME)
             self.final_status.append("")
             self.answered.append(False)
+            self.failing.append(False)
             self.progress.append(NO_TIME)
             self.resumed.append(False)
             self.failed.append(False)
@@ -948,7 +966,7 @@ class Controller(object):
                   estimate_s: int, groups: dict[str, list[str]]={},
                   priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
                   close_margin: int=CLOSE_MARGIN, stagger: int=0, prepare: bool=False,
-                  prepare_est: dict[str, int]={}) -> None:
+                  prepare_est: dict[str, int]={}, failure_budget: int=-1) -> None:
         """Take the windows the schedules give, the devices as (name,
         estimated duration, schedule) in the order they start, the target
         and the max concurrency, whether every device must start in a
@@ -957,8 +975,9 @@ class Controller(object):
         the priority of each device, per group whether it spreads and its
         min-separation in seconds, the close margin in percent of the slow
         time, the stagger in percent of the expected upgrade time, whether
-        the members may prepare, and each member's expected prepare time in
-        seconds. A group without a separation packs with none. New limits
+        the members may prepare, each member's expected prepare time in
+        seconds, and the most members that may fail, below 0 for no
+        limit. A group without a separation packs with none. New limits
         start the concurrency over at the target, and the ramp at most at
         the target. New limits keep the last upgrade times, and the pace
         and the slow time are taken from them again. Prepare and the
@@ -974,15 +993,18 @@ class Controller(object):
         e = imax(1, estimate_s)
         margin = imax(100, close_margin)
         st = imax(0, stagger)
+        budget = imax(-1, failure_budget)
         same_groups = False
         if groups == self.groups and priority == self.priority and separation == self.separation:
             same_groups = True
         if windows == self.current and devices == self.devices and target == self.target \
            and m == self.maxc and must_place == self.must_place \
            and debounce == self.debounce and e == self.estimate_s and same_groups \
-           and margin == self.close_margin and st == self.stagger:
+           and margin == self.close_margin and st == self.stagger \
+           and budget == self.failure_budget:
             return
         self.quiet_until = 0
+        self.failure_budget = budget
         retarget = target != self.target
         if retarget or m != self.maxc:
             self.c = target
@@ -1173,6 +1195,7 @@ class Controller(object):
             self.promised[k] = -1
             self.promise_seq[k] = 0
             self.answered[k] = False
+            self.failing[k] = False
             self.resumed[k] = False
             self.failed[k] = False
             self.reported[k] = False
@@ -1289,7 +1312,10 @@ class Controller(object):
         flights = 0
         in_flight = [0 for _s in scheds]
         devices_done = 0
+        failures = 0
         for k in range(n):
+            if member[k] and self.failing[k]:
+                failures += 1
             if self.released[k] and member[k]:
                 if self.done_at[k] != NO_TIME:
                     devices_done += 1
@@ -1337,6 +1363,7 @@ class Controller(object):
                             if flying[k] and not self.reported[k]])
         self.overdue = set()
         self.devices_done = devices_done
+        self.failures = failures
 
     def report(self, name: str, status: ?str, at: int) -> None:
         """Take the latest status of a device, which came at time at. A
@@ -1361,6 +1388,7 @@ class Controller(object):
     def report_n(self, k: int, status: ?str, at: int) -> None:
         """report() for the device with number k."""
         if status is not None and is_final(status):
+            self.take_failing(k, is_failure(status))
             if self.final_at[k] == NO_TIME:
                 self.final_at[k] = at
                 self.final_status[k] = status
@@ -1409,6 +1437,29 @@ class Controller(object):
         if self.is_member(k) and not self.released[k]:
             self.quiet_until = 0
 
+    def take_failing(self, k: int, failing: bool) -> None:
+        """Take whether the latest report of the device with number k is a
+        failure, and count the members whose latest report is one. A new
+        count ends the quiet time when more members have failed than the
+        failure budget before it or after it: the starts stop or go on, or
+        the plan's alarm gives the new count."""
+        if failing == self.failing[k]:
+            return
+        over = self.over_budget()
+        self.failing[k] = failing
+        if self.is_member(k):
+            if failing:
+                self.failures += 1
+            else:
+                self.failures -= 1
+            if over or self.over_budget():
+                self.quiet_until = 0
+
+    def over_budget(self) -> bool:
+        """True when more members have failed than the failure budget:
+        their latest report is a failure."""
+        return self.failure_budget >= 0 and self.failures > self.failure_budget
+
     def report_prepare(self, name: str, state: ?str) -> None:
         """Take the latest prepare state of a member for the campaign's
         target: running, done or failed, or None when it reports none. It
@@ -1427,6 +1478,7 @@ class Controller(object):
     def lost_n(self, k: int) -> None:
         """lost() for the device with number k."""
         self.take_answer(k, False)
+        self.take_failing(k, False)
         self.progress[k] = NO_TIME
         if self.final_at[k] != NO_TIME:
             self.final_at[k] = NO_TIME
@@ -1443,6 +1495,8 @@ class Controller(object):
         self.final_at = [NO_TIME for _k in range(n)]
         self.final_status = ["" for _k in range(n)]
         self.answered = [False for _k in range(n)]
+        self.failing = [False for _k in range(n)]
+        self.failures = 0
         self.prepare_state = {}
         self.progress = [NO_TIME for _k in range(n)]
         self.reported = [False for _k in range(n)]
@@ -1867,9 +1921,9 @@ class Controller(object):
 
     def step(self, t: int, c: int) -> (list[str], int, bool):
         """Decide at time t at concurrency c: take the reports that count,
-        grow the ramp, start what fits, and say when to decide next.
-        Returns the started devices, the wake and whether every device is
-        done."""
+        grow the ramp, start what fits, unless more members have failed
+        than the failure budget, and say when to decide next. Returns the
+        started devices, the wake and whether every device is done."""
         started, wake, finished = self.step_n(t, c)
         return ([self.name_of(k) for k in started], wake, finished)
 
@@ -1882,6 +1936,8 @@ class Controller(object):
         self.move_promises(t)
         started: list[int] = []
         n = imin(self.rung, c) - self.flights
+        if self.over_budget():
+            n = 0
         # True when the stagger holds back devices that wait in an open
         # window while slots are left.
         held_back = False
@@ -2113,6 +2169,7 @@ class Controller(object):
         c.stagger = self.stagger
         c.prepare = self.prepare
         c.prepare_est = self.prepare_est
+        c.failure_budget = self.failure_budget
         c.names = self.names
         c.size = self.size
         c.rank = self.rank
@@ -2144,6 +2201,8 @@ class Controller(object):
         c.final_status = self.final_status.copy()
         # The run ahead reports into its copy.
         c.answered = self.answered.copy()
+        c.failing = self.failing.copy()
+        c.failures = self.failures
         c.prepare_state = {k: v for k, v in self.prepare_state.items()}
         c.prepare_at = {k: v for k, v in self.prepare_at.items()}
         c.allowed = copy_set(self.allowed)
@@ -2481,8 +2540,17 @@ class Controller(object):
             self.parked.add(k)
         for name in stuck.2:
             skip.add(self.names.num[name])
+        held_names = stuck.0 + stuck.1 + stuck.2
+        over = self.over_budget()
+        if over:
+            # No device starts: every waiting device is held.
+            held_names = []
+            for k in self.order_n:
+                if not self.released[k]:
+                    skip.add(k)
+                    held_names.append(self.name_of(k))
         s = self.copy()
-        held = s.held_windows(stuck.0 + stuck.1 + stuck.2, t)
+        held = s.held_windows(held_names, t)
         c, run, b = s.choose(t, skip)
         settled = False
         for _round in range(PLAN_ROUNDS):
@@ -2505,6 +2573,9 @@ class Controller(object):
             self.c = c
 
         alarms: list[str] = []
+        if over:
+            alarms.append("{self.failures} device(s) failed, more than the failure budget of "
+                          + "{self.failure_budget}: no more devices start")
         if len(stuck.0) > 0:
             alarms.append("{len(stuck.0)} device(s) wait behind a failed redundancy group "
                           + "member: {names_text(stuck.0)}")
@@ -2638,7 +2709,8 @@ class Controller(object):
         """The turns to prepare of the members that wait to prepare at t,
         in order, as (time in microseconds, name), and the members whose
         deadline has passed, in the campaign's order. A member waits to
-        prepare while the run is on, prepare is on, it is not released,
+        prepare while the run is on, prepare is on, no more members have
+        failed than the failure budget, it is not released,
         its latest report says that it needs the upgrade, it has a promise,
         it was not let prepare in this run, it reports no prepare, and it
         has a deadline. The turns go by deadline, then by the order of the
@@ -2647,7 +2719,7 @@ class Controller(object):
         of t's debounce slot. Each next turn is one gap after the turn
         before it (prepare_gap)."""
         late: list[str] = []
-        if not self.running or not self.prepare:
+        if not self.running or not self.prepare or self.over_budget():
             return ([], late)
         waiting: list[(int, int, int, str)] = []
         for p in range(len(self.order_n)):
@@ -2749,13 +2821,14 @@ class Controller(object):
 
     def revoke_prepares(self, t: int) -> None:
         """Stop letting prepare each member that may no longer prepare at
-        t: all of them when the run is off or prepare is off, and each one
-        that is released, whose latest report no longer says that it needs
-        the upgrade, that left the campaign, whose prepare is done or
-        failed, or for which a window of its schedule is open."""
+        t: all of them when the run is off, prepare is off, or more members
+        have failed than the failure budget, and each one that is released,
+        whose latest report no longer says that it needs the upgrade, that
+        left the campaign, whose prepare is done or failed, or for which a
+        window of its schedule is open."""
         if len(self.allowed) == 0:
             return
-        if not self.running or not self.prepare:
+        if not self.running or not self.prepare or self.over_budget():
             self.allowed = set()
             return
         keep: set[str] = set()
