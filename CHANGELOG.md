@@ -43,6 +43,13 @@
 - Fixed NETCONF `<get-config>` returning the operational state published by
   transforms. [#683]
 - RESTCONF supports the `content` query parameter on GET. [#686]
+- RESTCONF supports the `fields` query parameter on GET, which narrows the
+  reply to the selected nodes, like
+  `GET /restconf/data/demo-fleet:device=cpe-16?fields=software(target;state)`.
+  The reply for a list entry keeps its keys. `/restconf-state/capabilities`
+  lists the `fields` capability. An invalid `fields` value, `fields` on any
+  method other than GET, and a query parameter given twice get 400 Bad
+  Request. [#805]
 - Fixed RESTCONF GET, NETCONF `<get>` and yang-push filters that could not
   reach an operational subtree under a config node, like
   `/software:software/upgrade-campaign=foo/state` in fleetmgr. [#677] [#681]
@@ -72,7 +79,7 @@
   Before, a device that never connected kept the transaction from ever
   completing, and since a Fleet Manager top sends one edit at a time to each
   flotilla, a single such device blocked all further configuration to its
-  flotilla.
+  flotilla. [#792]
 
 ### Devices & Adapters
 - SNMP device adapters are generated from MIBs. The system generator
@@ -107,30 +114,31 @@
   running configuration when one arrives. A change made outside StratoWeave
   is found without waiting for a reconnect. StratoWeave's own commits cause
   a resync too, because the `DeviceMgr` does not check `changed-by`. [#753]
-- `adapters.iosxe_cli.IosXeCliAdapter` runs IOS XE exec commands over SSH
-  and returns the results in the `stratoweave-iosxe-cli` YANG module: the
-  files on a file system from `dir`, the release, model, serial number and
-  boot image from `show version`, and a `checksum` RPC that runs
-  `verify /md5` or `verify /sha512`. Image staging needs the checksum on
-  releases without the verify YANG RPC, like IOS XE 17.18 on the C8000V.
-  The adapter does not configure the device and has no subscriptions. After
-  a failed login it reports the connection as lost and tries again later. A
-  device type that uses it adds `adapters.iosxe_cli_yang.models` to its
-  schema. [#755] [#765]
+- `adapters.iosxe_cli.IosXeCliAdapter` runs IOS XE commands over SSH, for
+  what NETCONF lacks on a device, or on older releases where NETCONF does
+  not start at all. It returns what it reads in the `stratoweave-iosxe-cli`
+  YANG module: the files on a file system from `dir`, the release, model,
+  serial number and boot image from `show version`, and the output of
+  `show install summary` and `show bootvar`. A device type that uses it adds
+  `adapters.iosxe_cli_yang.models` to its schema. [#755] [#777]
 - A device can run extra adapters beside the adapter of its device type, for
   what that adapter does not have, like a CLI adapter for an RPC that the
   device lacks over NETCONF. An extra adapter is a device type too, listed in
   the device's `extra-adapter` list with an optional `address`, `port` and
   `credentials`. Without a `port` it uses its own default port, not the port
-  of the address. A module belongs to the first adapter that has it, the
-  adapter of the device type first. Gets, subscriptions, RPCs and event
+  of the address. A module goes to the first connected adapter that has it,
+  the adapter of the device type first, and moves when an adapter connects
+  or loses its connection. Gets, subscriptions, RPCs and event
   notification subscriptions go to the adapters of the modules that their
   top-level nodes name, and configuration goes only to the adapter of the
   device type. `state/adapter` shows whether each adapter is connected. An
   adapter runs as an extra adapter when it passes its device type to the
   `DeviceMgr`'s `on_connect()` and `on_disconnect()`, as the NETCONF, SNMP
   and IOS XE CLI adapters do. See the device management reference. [#756]
-  [#765]
+  [#765] [#799]
+- `DeviceMgr.get_connected_modules()` gives the modules of a device's
+  connected adapters, and `get_unconnected_durations()` how long each adapter
+  that is not connected has been without a connection. [#799]
 - Fixed devices without yang-library or netconf-monitoring, like Junos 10.4,
   getting an empty module set, so transforms computed nothing for them.
   Their module set has the other capabilities of their `<hello>`, named by
@@ -173,16 +181,16 @@
   The IOS SSH server of a C1111 sends no server-sig-algs, so an RSA key needs
   `public-key-algorithm` `ssh-rsa` on its CLI port, while its NETCONF port
   takes the RSA SHA-2 signatures. [#776]
-- The `checksum` RPC of the IOS XE CLI adapter is now `verify`, with the
-  forms of the IOS XE command. Without an algorithm, the device checks the
-  hashes and the signature that an image holds. With `md5` or `sha512`, it
+- The `verify` RPC of the IOS XE CLI adapter runs the IOS XE `verify`
+  command in its forms. Without an algorithm, the device checks the hashes
+  and the signature that an image holds. With `md5` or `sha512`, it
   computes the digest, and with a `hash` too, it compares them and
-  `verified` says whether they match. [#777]
+  `verified` says whether they match. [#755] [#777]
 - The IOS XE CLI adapter runs install commands with its `install` RPC: add,
   activate with an abort timer, commit, abort, remove and rollback. It says
   whether the device reloads. A device in bundle mode refuses `install add`
   alone, and `install add file F activate commit` converts it to install
-  mode. The adapter reads `show install summary` and `show bootvar`. [#777]
+  mode. [#777]
 - The `configure` RPC of the IOS XE CLI adapter types configuration lines in
   `configure terminal` over an SSH shell, one at a time, and stops at the
   first line that the device rejects. `write-memory` saves the
@@ -190,16 +198,18 @@
   boot statement has to name, and a conversion sets it this way. [#777]
 - In mock mode, the IOS XE CLI adapter answers from a `CliMock`, which a test
   gets with `get_mock()` and gives the replies of the device. [#777]
-- The IOS XE CLI adapter logs in once and keeps an SSH shell open per
-  device, in which it types one command at a time; IOS XE closes the
+- The IOS XE CLI adapter logs in once per device and keeps an SSH shell
+  open, in which it types one command at a time. IOS XE closes the
   connection when an exec channel ends. The device is connected while the
-  shell is ready. When the connection closes, or a command gets no prompt
-  within its time, the adapter reports the device as disconnected and logs
-  in again. After a minute without a command, it types an empty line, so a
-  dead connection shows. [#780]
+  shell is ready. When a login fails, the connection closes, or a command
+  gets no prompt within its time, the adapter reports the device as
+  disconnected and logs in again. After a minute without a command, it
+  types an empty line, so a dead connection shows. [#765] [#780]
 - The `install` RPC of the IOS XE CLI adapter answers the question that
   `install remove` asks before it deletes files, which has no
-  `prompt-level none` on IOS XE 17.15. [#780]
+  `prompt-level none` on IOS XE 17.15 and comes twice on 16.8, and the
+  question of `install abort`. At debug level the adapter logs each command
+  that it types and each question that it answers. [#780] [#799]
 - The `ios-xe-cli` platform probe reads `show version` through the IOS XE CLI
   adapter, after the NETCONF probe, so an IOS XE device without NETCONF, like
   16.8 on a C1111, has a platform. Probes run over the modules of the
@@ -209,19 +219,17 @@
   device and tells how far it is from the `!` marks of the copy, and a
   `delete` RPC. It reads when the running and the startup configuration last
   changed, and the index of each file in `dir`. [#799]
-- The IOS XE CLI adapter answers the questions of `install remove`, which
-  16.8 asks twice, and of `install abort`. At debug level it logs each
-  command that it types and each question that it answers. [#799]
 - The IOS XE CLI adapter reads the BGP neighbors into `Cisco-IOS-XE-bgp-oper`
   from `show bgp ... neighbors`, in the shape that NETCONF gives them, and
   realizes subscriptions by polling, as the SNMP adapter does. The fleetmgr
-  BGP upgrade checks then work on a device without NETCONF. [#799]
-- A module that two adapters of a device serve goes to the first connected
-  adapter, the primary first, and moves when a connection comes or goes.
-  Before, it went to the first adapter that served it, also while that
-  adapter was down. `DeviceMgr.get_connected_modules` gives the modules of
-  the connected adapters, and `get_unconnected_durations` how long each
-  missing adapter has been without a connection. [#799]
+  BGP upgrade checks then work on a device without NETCONF. The polling
+  moved out of the SNMP adapter into the `adapters.polling.Poller` actor,
+  which both adapters use. [#799]
+- Fixed event notifications of the IOS XE `-events-oper` modules, like
+  `interface-admin-state-change` in `Cisco-IOS-XE-ios-events-oper`, never
+  arriving. The NETCONF adapter subscribed to them on the RFC 5277 `NETCONF`
+  stream, which the device accepts but sends nothing on. It now subscribes to
+  them on `yang-notif-native`, as it does for the `-events` modules. [#782]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
@@ -250,10 +258,11 @@
   `serial-number`. Without them a mock runs 17.18.02 on a C8000V.
   `mock/platform/version` replaces `mock/software/running-release`. The mock
   reports a release the way a device does, 17.18.02 as 17.18.2. [#718]
-- Each mock upgrade takes its own time: `mock/software/upgrade-duration-variance`
-  draws it within that percentage of `upgrade-duration`, either way, 20 by
-  default, so devices released together no longer all finish together. 0
-  keeps every upgrade at exactly `upgrade-duration`. [#770]
+- Mock upgrades vary in length. Each takes a time within
+  `mock/software/upgrade-duration-variance` percent of `upgrade-duration`,
+  either way, 20 by default, so devices released together no longer all
+  finish together. 0 keeps every upgrade at exactly `upgrade-duration`.
+  [#770]
 - A software veto holds only the install. The software manager still reads
   the release the device runs and reports `up-to-date`, or the new
   `upgrade-needed` when it differs. The vetoes are read again right before
@@ -273,40 +282,42 @@
 - With `allow-staging`, the software manager prepares the target while a
   veto holds the install: it copies the image to the device ahead of the
   window, once per intent. The result is in `state/job[prepare]`, which also
-  says which `release` it is for; a failed prepare leaves the status
+  says which `release` it is for. A failed prepare leaves the status
   `upgrade-needed`. The prepare of a run reports in the same entry. Before,
   `allow-staging` was stored and not used. [#775]
-- An image in `/images/image` can have the checksums that its vendor
-  publishes, `md5`, `sha256` and `sha512`, and its `size` in bytes. A
-  campaign copies them with the image URL into the software intent of each
-  device, as `software/image-checksum` and `software/image-size`, for the
-  device's adapter to check the staged image against. [#778]
+- An image in `/images/image` can have the `md5`, `sha256` and `sha512`
+  digests that its vendor publishes in its `checksum` list, and its `size`
+  in bytes. A campaign copies them with the image URL into the software
+  intent of each device, as `software/image-checksum` and
+  `software/image-size`, for the device's adapter to check the staged image
+  against. [#778]
 - The IOS XE software adapter picks how each step of an upgrade runs from the
-  modules that the device's adapters report: over NETCONF where the device
-  has the module for the step, else over the IOS XE CLI adapter. It lists
-  `bootflash:` over NETCONF (`Cisco-IOS-XE-platform-software-oper`) or the
-  CLI, and checks a staged image with the CLI adapter's `verify`: against
-  the image checksum of the intent, sha512 before md5, or else against the
-  signature that the image holds. A device that can compute no checksum
-  compares the size of the staged file with `software/image-size`. [#781]
+  modules of the device's connected adapters: over NETCONF where the device
+  has the module for the step, else over the IOS XE CLI adapter. That covers
+  reading the release and the versions, the transfer, the check, add,
+  activate, commit and abort. It lists `bootflash:` over NETCONF
+  (`Cisco-IOS-XE-platform-software-oper`) or the CLI, and checks a staged
+  image with the CLI adapter's `verify`: against the image checksum of the
+  intent, sha512 before md5, or else against the signature that the image
+  holds. A device that can compute no checksum compares the size of the
+  staged file with `software/image-size`. [#781] [#799]
 - IOS XE prepare and install can run again at any time and do only what is
   left. A release that the device has added needs no image file, and a
-  staged file that passes its check stays; a missing or failing file is
+  staged file that passes its check stays. A missing or failing file is
   transferred and checked again. Install activates a release that the
   device has added, and a release that the device runs activated and not
   committed is committed instead of reported up to date. When install add
   refuses an image as bad, the adapter deletes the file over NETCONF, so the
   next run transfers it again. [#781]
-- IOS XE staging waits up to 2 minutes for adapters of the device that are
-  not connected, such as a CLI adapter that connects after NETCONF, before it
-  picks how to run. [#781]
-- The IOS XE software adapter does each step over NETCONF when the device
-  has the module, and over the IOS XE CLI adapter otherwise: it reads the
-  release and the versions, transfers, checks, adds, activates, commits and
-  aborts. It converts a device in bundle mode, which it also tells over
-  NETCONF, to install mode, and on IOS XE 16 it installs with one command,
-  `install add file ... activate commit`. A C1111 went from 16.8.1 in
-  bundle mode to 17.15.06 over the CLI alone. [#799]
+- Before it stages an image, the IOS XE adapter waits until each adapter of
+  the device that is not connected, such as a CLI adapter that connects
+  after NETCONF, has been without a connection for 2 minutes. The wait
+  counts from when the adapter lost its connection or was set up, so the
+  later stages of an upgrade do not wait again. [#781] [#799]
+- The IOS XE software adapter converts a device in bundle mode, which it
+  also detects over NETCONF, to install mode, and on IOS XE 16 it installs
+  with one command, `install add file ... activate commit`. A C1111 went
+  from 16.8.1 in bundle mode to 17.15.06 over the CLI alone. [#799]
 - Before a transfer the IOS XE adapter looks for room for 2.2 times the
   image size, and before an add for 1.2 times. When short, it removes the
   software that the device does not run, once. The manager calls `cleanup`
@@ -321,23 +332,24 @@
   index, size and modification time in `dir` stay the same. [#799]
 - The prepare job tells how far a transfer is, in `progress` and in its
   message: over NETCONF from the size of the file on bootflash, over the
-  CLI from the output of the copy. An xcopy also ends when the file has the
-  image size, as IOS XE 17.9.5a records no xcopy. [#799]
-- No upgrade runs while the device is not connected: the manager waits as
-  under a veto and reads the release again when an adapter connects. The
-  IOS XE adapter waits for a missing adapter once, up to 2 minutes from
-  when it lost its connection. [#799]
+  CLI from the output of the copy. A software adapter reports it with the
+  new `SoftwareManager.report_transfer`. An xcopy also ends when the file
+  has the image size, as IOS XE 17.9.5a records no xcopy. [#799]
+- No upgrade runs while the device is not connected: the software manager
+  waits as under a veto and reads the release again when an adapter
+  connects. [#799]
 - The install is a job in the device software state, `job[install]`. While
   the prepare or the install runs, the message of its job says what the
   device does, as the adapter reports it with the new
   `SoftwareManager.report_step`. After the install, the install job says
-  when the commit window ends, until the run commits or rolls back. The IOS XE
-  adapter reports the transaction that the device runs, like `add: extract`
-  or `activate: reload`, the step lines of an install command over the CLI,
-  the check and the transfer of the image, and `waiting for the device to
-  boot`. The IOS XE CLI adapter has `install-progress`, the last step line
-  of the install command that runs. The IOS XE mock lists an operation that
-  runs in `install-oper` and goes through its stages. [#803]
+  when the commit window ends, until the run commits or rolls back. The
+  IOS XE adapter reports the transaction that the device runs, like
+  `add: extract` or `activate: reload`, the step lines of an install command
+  over the CLI, the check and the transfer of the image, and `waiting for
+  the device to boot`. The IOS XE CLI adapter has `install-progress`, the
+  last step line of the install command that runs. The IOS XE mock lists a
+  running operation in `Cisco-IOS-XE-install-oper` and takes it through its
+  stages. [#803]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -358,8 +370,7 @@
   were placed in both windows and counted twice. [#722]
 - The release decisions of a campaign moved from the campaign actor into the
   `stratoweave.fleet_ctl.Controller` class. The controller has no clock and
-  no I/O, so `test_fleet_ctl` runs it without an actor. The move doesn't
-  change the decisions. [#725]
+  no I/O, so `test_fleet_ctl` runs it without an actor. [#725]
 - Removed the `stratoweave.fleet_sched` module. Its helpers moved into
   `stratoweave.fleet_ctl`, and the campaign simulator
   `stratoweave.fleet_sched_sim` is now `stratoweave.fleet_ctl_sim`. [#740]
@@ -422,16 +433,22 @@
   takes seconds instead of minutes, and a decision that only starts devices
   reuses the last plan while no report came in, no device is due and no
   window opens or closes. [#748]
-- Campaign decisions are 6 to 8 times faster at 100,000 devices: a plan after
-  a report takes 0.7 s instead of 5.3 s in a debug build, 85 ms instead of
-  521 ms in a release build. The controller keeps the state of each device in
-  lists by device number, and the campaign takes its members from the
-  inventory once per configuration instead of at every decision. [#787]
-- A campaign device whose final report came before its release, such as a
-  device that is up to date when the campaign starts, ran no upgrade, also
-  when the report and the release fall in the same second. Before, it
-  counted as an upgrade of one second and dragged the campaign's pace down.
-  [#766]
+- Campaign decisions are about 6 times faster at 100,000 devices: a plan
+  after a report takes 85 ms instead of 521 ms in a release build. Most of
+  the gain is in the run ahead that computes a plan. The controller numbers
+  the devices and keeps their state in lists by number, so a run ahead
+  copies and indexes lists instead of hashing device names in tables of
+  100,000 entries. Each step of the controller takes the reports that it
+  has not counted yet from a heap ordered by time, instead of going through
+  all of them. The windows of a schedule share one count of their waiting
+  devices and one sort of the devices by estimate, instead of one per
+  window. The campaign reads its members' schedules, estimates and
+  redundancy groups from the inventory when the campaign or the inventory
+  changes, instead of at every decision. [#787]
+- Fixed a member whose final report came before its release, but in the
+  same second, counting as an upgrade of one second. It happened to members
+  that were already up to date when the campaign started, and dragged the
+  campaign's pace down. [#766]
 - Maintenance windows that are open at the same time share a campaign's
   free slots. Before, the window that opened first took every slot it
   could use, and a window that opened later waited until the first had
@@ -462,7 +479,7 @@
   values at /software/upgrade-campaign". To move a device, remove it from
   its campaign, or delete the campaign, in an earlier edit. A device that
   is not in the fleet gets nothing from a campaign, so two campaigns can
-  name it; the edit that adds it to the fleet then fails with the same
+  name it. The edit that adds it to the fleet then fails with the same
   error until only one campaign names it. [#783]
 - A campaign's `device-status` shows a member's status only when the status
   is for the campaign's intent, its name and the member's target release,
@@ -504,7 +521,7 @@
   now, so its plan shows what `run` would do. So a member added to a
   running campaign waits until it has read the release it runs, and is then
   planned and released. A campaign created directly in `run` promises its
-  windows in the order its members answer; create it in `plan` first to
+  windows in the order its members answer. Create it in `plan` first to
   keep the campaign's order. A decision that only starts devices still
   takes the last plan again when the plan's only alarms are for held
   devices. [#783]
@@ -527,7 +544,10 @@
   its members time to be told about their window: the campaign uses only
   the windows that open that long or more after it first went to `run`.
   That time is the campaign's `state/run-since`, and a pause and a restart
-  of fleetmgr keep it. 0, the default, gives no notice. [#795]
+  of fleetmgr keep it. For a campaign from an earlier version, `run-since`
+  is the time Fleet Manager first starts on this version, or, for a
+  campaign in `plan`, the time it next goes to `run`. 0, the default, gives
+  no notice. [#795]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -564,16 +584,16 @@
   members in upgrade order and its separation, and a page to create a group.
   A member's priority can be typed there, or the member dragged to another
   place, which sets the priorities that give that order. A change that
-  reorders another group of the device asks first.
-  The device page sets a device's groups and priority, and the devices page
-  shows and filters by group. The demo fleet pairs devices in groups. A
-  campaign's page shows the groups of its members, each member in upgrade
-  order with its status and time. Groups held behind a failed member come
-  first, with a button that takes that member out of the group.
+  reorders another group of the device asks first. The device page sets a
+  device's groups and priority, and the devices page shows and filters by
+  group. The demo fleet pairs devices in groups. A campaign's page shows the
+  groups of its members, each member in upgrade order with its status and
+  time. Groups held behind a failed member come first, with a button that
+  takes that member out of the group. [#789]
 - The campaign page has Schedule and pace under the plan, folded each time
   the page opens. The failed devices, the redundancy groups and the devices
-  fold too; only the failed devices start open. Folded, the redundancy
-  groups say how many of them are held.
+  fold too, and only the failed devices start open. Folded, the redundancy
+  groups say how many of them are held. [#789]
 - The device page is redesigned around the device's upgrade run. [#674]
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for
@@ -582,8 +602,10 @@
   accessibility. The campaign page leads with live progress and failures.
   [#679]
 - The web UI no longer redraws the timeline every second and reads less from
-  the server. The devices, schedules and new-campaign pages share one fleet
-  read for 30 s, and the Refresh button reloads it. [#671] [#687] [#689]
+  the server. Each page reads only the fields that it shows, with the
+  RESTCONF `fields` query parameter. The devices and new-campaign pages and
+  the search share one fleet read for 30 s, and the Refresh button reloads
+  it. [#671] [#687] [#689] [#805]
 - Web UI pages show at once and fill in as their reads arrive, and the
   sidebar marks the page that is loading. On large fleets the pages read
   less: the device page reads only the device's own `device-status` entry,
@@ -601,6 +623,8 @@
   [#690]
 - `just run` starts the top and its ten flotillas with no devices, images or
   campaigns. [#736]
+- `just build` builds fleetmgr and flotilla with `--release`, optimized for
+  speed and without debug symbols. [#805]
 - The web UI is built with SvelteKit 3, and `just gen-webui` needs Node 22.17
   or newer. [#739] [#745]
 - A fleet device can have extra adapters, as a StratoWeave device can: the
@@ -657,7 +681,13 @@
   name. The adata generator stores that name in the schema as the new
   `adata_name` of each node, and `yang.data.from_data()` reads it from there
   instead of computing it on every call. [acton-yang#552] [#762]
-- Removed `yang.schema.DNode.gname`. [acton-yang#557] [#762]
+- `yang.schema.DNode.gname` is the node's `gdata.Id` instead of the name of
+  its gdata class, like `Container`, and a `DList` has the `gdata.Id` of each
+  key in `key_gnames`. `yang.data.from_data()` uses them instead of creating
+  a `gdata.Id` for every node it reads, and the generated adata
+  `from_gdata()` methods use `gdata.Id` constants of their module. Fleet
+  Manager with 50,000 devices has all of them connected in 22 s instead of
+  33 s. [acton-yang#557] [acton-yang#558] [#762] [#790]
 - Fixed subscription data callbacks running in the provider's actor.
   `yang.gdata.Dst` and the data callback of `TreeProvider.declare_subscriptions`
   take an action again instead of a proc, so a consumer that passes its actor
@@ -677,6 +707,9 @@
   subscription got only the first neighbor and the fleetmgr BGP post-check
   failed. The occurrences are now read as one container. [acton-yang#560]
   [#802]
+- `yang.restconf.resolve_fields()` parses a RESTCONF `fields` value against
+  the schema below the target resource, and `select_fields()` narrows data
+  to the result. [acton-yang#561] [#805]
 
 #### acton-ssh
 - Fixed SSH events being delivered out of the order libssh raises them.
@@ -697,6 +730,16 @@
   an exception instead of a string. [acton-ssh#21] [#720]
 - Stores GC pointers with write barriers, so programs that link it can run
   in Acton's generational GC mode. [acton-ssh#23] [#764]
+- `ssh.Server` serves interactive shells when it gets an `on_shell` action,
+  which receives the client's terminal as a `PtyRequest`, or `None` when the
+  client asked for none. Without `on_shell` the server refuses shells, as
+  before. `Channel.change_pty_size()` sends a terminal size change, which a
+  `ServerChannel` receives with `on_window_change`. [acton-ssh#24] [#780]
+- Fixed writes that queue more than 8 MiB failing their channel, which kept
+  a NETCONF message over 8 MiB from going out over an `SshPipe`.
+  `max_write_buffer` of `Client` and `Server` defaults to 0, no limit.
+  Writes go to libssh in pieces of at most 256 KiB, which also bounds
+  libssh's send buffer per connection. [acton-ssh#25] [#788]
 
 #### acton-lmdb
 - Builds with Zig 0.17. [acton-lmdb#6] [#670]
@@ -709,9 +752,16 @@
   and a MIB compiler that emits YANG (RFC 6643). The SNMP device adapters use
   it. [#701]
 
+#### http-router
+- Query parameter names and values are percent-decoded.
+  `Context.query()` gives every value of each name as a list, in request
+  order, instead of one value, and `query_param()` gives the first. [#805]
+
 ### Documentation
 - The software upgrade reference is rewritten to match the code, and is part
   of the guide. [#697] [#699]
+- The guide has a Releases page, which includes this changelog, and a
+  Roadmap page. [#800]
 
 ### Testing & CI
 - Downstream upgrade PRs run `make gen`, so changes to generated code don't
@@ -772,11 +822,7 @@
   no longer reported as an `rpc-error`. The device side is visible per
   device instead: `state/adapter` shows whether it is connected, and the
   inspection API's `/device/<name>/info` and `/device/<name>/log` show its
-  queue and what was sent to it.
-- Fleet Manager has no `run-since` for a campaign from an earlier version.
-  A campaign in `run` gets the time Fleet Manager first starts on this
-  version, and a paused campaign the time it next goes to `run`. Its
-  `notification-period` counts from that time.
+  queue and what was sent to it. [#792]
 
 ## [26.10] - 2026-10-23
 
@@ -869,6 +915,31 @@ next. Give it a spin. We’d love to hear what you think.
 [#763]: https://github.com/stratoweave/stratoweave/pull/763
 [#764]: https://github.com/stratoweave/stratoweave/pull/764
 [#765]: https://github.com/stratoweave/stratoweave/pull/765
+[#766]: https://github.com/stratoweave/stratoweave/pull/766
+[#770]: https://github.com/stratoweave/stratoweave/pull/770
+[#775]: https://github.com/stratoweave/stratoweave/pull/775
+[#776]: https://github.com/stratoweave/stratoweave/pull/776
+[#777]: https://github.com/stratoweave/stratoweave/pull/777
+[#778]: https://github.com/stratoweave/stratoweave/pull/778
+[#779]: https://github.com/stratoweave/stratoweave/pull/779
+[#780]: https://github.com/stratoweave/stratoweave/pull/780
+[#781]: https://github.com/stratoweave/stratoweave/pull/781
+[#782]: https://github.com/stratoweave/stratoweave/pull/782
+[#783]: https://github.com/stratoweave/stratoweave/pull/783
+[#784]: https://github.com/stratoweave/stratoweave/pull/784
+[#787]: https://github.com/stratoweave/stratoweave/pull/787
+[#788]: https://github.com/stratoweave/stratoweave/pull/788
+[#789]: https://github.com/stratoweave/stratoweave/pull/789
+[#790]: https://github.com/stratoweave/stratoweave/pull/790
+[#791]: https://github.com/stratoweave/stratoweave/pull/791
+[#792]: https://github.com/stratoweave/stratoweave/pull/792
+[#794]: https://github.com/stratoweave/stratoweave/pull/794
+[#795]: https://github.com/stratoweave/stratoweave/pull/795
+[#799]: https://github.com/stratoweave/stratoweave/pull/799
+[#800]: https://github.com/stratoweave/stratoweave/pull/800
+[#802]: https://github.com/stratoweave/stratoweave/pull/802
+[#803]: https://github.com/stratoweave/stratoweave/pull/803
+[#805]: https://github.com/stratoweave/stratoweave/pull/805
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton#3390]: https://github.com/actonlang/acton/pull/3390
@@ -880,6 +951,8 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-ssh#20]: https://github.com/actonlang/acton-ssh/pull/20
 [acton-ssh#21]: https://github.com/actonlang/acton-ssh/pull/21
 [acton-ssh#23]: https://github.com/actonlang/acton-ssh/pull/23
+[acton-ssh#24]: https://github.com/actonlang/acton-ssh/pull/24
+[acton-ssh#25]: https://github.com/actonlang/acton-ssh/pull/25
 [acton-yang#541]: https://github.com/stratoweave/acton-yang/pull/541
 [acton-yang#544]: https://github.com/stratoweave/acton-yang/pull/544
 [acton-yang#545]: https://github.com/stratoweave/acton-yang/pull/545
@@ -893,4 +966,6 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-yang#555]: https://github.com/stratoweave/acton-yang/pull/555
 [acton-yang#556]: https://github.com/stratoweave/acton-yang/pull/556
 [acton-yang#557]: https://github.com/stratoweave/acton-yang/pull/557
+[acton-yang#558]: https://github.com/stratoweave/acton-yang/pull/558
 [acton-yang#560]: https://github.com/stratoweave/acton-yang/pull/560
+[acton-yang#561]: https://github.com/stratoweave/acton-yang/pull/561
