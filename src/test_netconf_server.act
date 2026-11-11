@@ -23,6 +23,9 @@ are released when it closes.
 The YANG library is covered over the pipe: <get> reads it and <get-config>
 does not, and a client's list_schemas finds the modules through the
 yang-library:1.1 capability.
+
+Over the pipe too, an edit-config to a device that never connects completes
+once it is committed to TTT.
 """
 
 import logging
@@ -39,6 +42,7 @@ import yang.schema as yschema
 import yang.xml as yxml
 import yang.ypatch as ypatch
 
+import device as swdev
 import netconf_server as swnetconf
 import yp
 
@@ -370,6 +374,106 @@ actor _test_edit_config_rejects_nonrunning_target(t: testing.AsyncT):
     client = netconf.Client(None, "mock", 0, "admin", "admin", None, _on_connect, None, True, lh, pipe=pipes.client)
 
     after 5.0: fail(ValueError("timed out waiting for edit-config rejection"))
+
+
+DEV_NS = "urn:demo-dev"
+DEV_YANG = r"""module demo-dev {
+  yang-version "1.1";
+  namespace "urn:demo-dev";
+  prefix dd;
+  list device {
+    key name;
+    leaf name { type string; }
+    container config {
+      leaf val { type string; }
+    }
+  }
+}"""
+
+
+def _dq(n: str) -> gdata.Id:
+    return gdata.Id(DEV_NS, n)
+
+
+def _val_from_reply(reply: ?xml.Node) -> ?str:
+    """Dig <rpc-reply><data><device><config><val> out of a get-config reply."""
+    if reply is not None:
+        for data in reply.children:
+            if data.tag == "data":
+                for device in data.children:
+                    if device.tag == "device":
+                        for config in device.children:
+                            if config.tag == "config":
+                                for leaf in config.children:
+                                    if leaf.tag == "val":
+                                        return leaf.text
+    return None
+
+
+actor _test_edit_config_ok_with_unconnected_device(t: testing.AsyncT):
+    """An edit-config to a device that never connects completes once it is
+    committed to TTT. The device "dead" has no device settings, so its
+    DeviceMgr has no adapter and no modules; its DeviceConfig node registers
+    the transaction to wait for the device, which never answers. The client
+    sends the second edit only after the first has completed, as the
+    DeviceMgr of a top does towards a flotilla, and both must complete."""
+    lh = logging.Handler("nctest")
+    schema = yang.compile([DEV_YANG])
+    dev_registry = swdev.DeviceRegistry(log_handler=lh)
+    layer = ttt.Layer("top", ttt.Container({
+        _dq("device"): ttt.List(ttt.DeviceConfig(dev_registry), [_dq("name")], ns=DEV_NS, module="demo-dev"),
+    }), None)
+    inventory = swnetconf.module_inventory(schema)
+
+    pipes = netconf.actor_pipe_pair()
+    server = swnetconf.NetconfSession(pipes.server, lh, schema, schema, layer, inventory)
+
+    var done = False
+    var replies = 0
+    def fail(e: Exception):
+        if not done:
+            done = True
+            t.failure(e)
+
+    def _edit(c: netconf.Client, val: str, cb: action(netconf.Client, ?netconf.NetconfError) -> None):
+        config = xml.decode('<device xmlns="urn:demo-dev"><name>dead</name><config><val>' + val + '</val></config></device>')
+        c.edit_config([config], cb)
+
+    def _on_get(c: netconf.Client, reply: ?xml.Node, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        val = _val_from_reply(reply)
+        if val != "two":
+            fail(ValueError("expected val two after both edits, got {val}"))
+            return
+        if not done:
+            done = True
+            t.success()
+
+    def _on_second(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        replies += 1
+        c.get_config(_on_get, "running")
+
+    def _on_first(c: netconf.Client, err: ?netconf.NetconfError):
+        if err is not None:
+            fail(err)
+            return
+        replies += 1
+        _edit(c, "two", _on_second)
+
+    def _on_connect(c: netconf.Client, e: ?Exception):
+        if e is not None:
+            fail(ValueError("client connect failed: {e}"))
+            return
+        _edit(c, "one", _on_first)
+
+    client = netconf.Client(None, "mock", 0, "admin", "admin", None, _on_connect, None, True, lh, pipe=pipes.client)
+
+    after 2.0: fail(ValueError("timed out waiting for edit-config replies: {replies} of 2"))
 
 
 actor _OnChangeOperUpdate(t: testing.AsyncT, layer: ttt.Layer):
