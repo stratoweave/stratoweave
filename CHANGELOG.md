@@ -462,7 +462,7 @@
   or flotilla that holds it in `held-by`, and `state/held` counts them. New
   plan alarms name the members that are down, the members in flight that
   are still down after their expected end, and the held members that lost
-  the window promised to them.
+  the window promised to them. [#794]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
