@@ -179,6 +179,9 @@ over NETCONF when the device has the module for it, and over the IOS XE CLI
 adapter when the device has that as an extra adapter and lacks the module,
 as IOS XE 16.8 on a C1111 lacks NETCONF. It plans from the adapters that are
 connected, so after a reload a step runs over whichever adapter is back.
+Before it stages, it waits for an adapter that is not connected until that
+adapter has been without a connection for 2 minutes. An adapter that never
+connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
 
 | Step | NETCONF | CLI |
 | --- | --- | --- |

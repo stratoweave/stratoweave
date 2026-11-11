@@ -67,10 +67,12 @@ STAGE_ADD_END = "install-txn-add-postchk"
 
 POLL_PERIOD = 10.0
 RELOAD_POLL_PERIOD = 20.0
-# Seconds that staging waits for adapters that are not connected, such as an
-# IOS XE CLI adapter that connects after NETCONF. Without them the plan
-# lacks their steps: without the CLI, the image cannot be checked, so it is
-# transferred again.
+# Seconds that an adapter can be without a connection before staging stops
+# waiting for it, such as an IOS XE CLI adapter that connects after NETCONF.
+# Without it the plan lacks its steps: without the CLI, the image cannot be
+# checked, so it is transferred again. The time counts from when the adapter
+# lost its connection, so later stages of the same upgrade do not wait for
+# an adapter that never connects, like NETCONF on IOS XE 16.8.
 ADAPTER_WAIT = 120.0
 ADAPTER_POLL = 5.0
 # Generous: the transfer and the add each take minutes.
@@ -339,6 +341,18 @@ def upgrade_plan(modules: set[str]) -> (check: str, transfer: str, listing: str,
     install = "netconf" if INSTALL_MODULE in modules else cli
     delete = "netconf" if CISCO_RPC_MODULE in modules else cli
     return (check=check, transfer=transfer, listing=listing, verify=cli, install=install, delete=delete)
+
+
+def adapter_wait_left(down: dict[str, float], wait: float) -> float:
+    """Return the seconds that staging still waits for the adapters that
+    are not connected, from the seconds that each has been without a
+    connection. 0 means stage now: no adapter is missing, or each missing
+    one has been without a connection for wait."""
+    left = 0.0
+    for d in down.values():
+        if wait - d > left:
+            left = wait - d
+    return left
 
 
 def usable_checksum(checksums: list[(algorithm: str, digest: str)]) -> ?(algorithm: str, digest: str):
@@ -995,25 +1009,28 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _url = url!
         _filename = image_filename(url!)
         _then_add = False
-        _stage_when_connected(_gen, adapter_wait)
+        _stage_when_connected(_gen, False)
 
-    def _stage_when_connected(gen: int, left: float) -> None:
+    def _stage_when_connected(gen: int, waited: bool) -> None:
         """Stage once every adapter of the device is connected, because the
-        plan follows the modules of the adapters that are connected. After
-        adapter_wait, stage with the adapters that are there."""
+        plan follows the modules of the adapters that are connected. Stage
+        with the adapters that are there once each missing one has been
+        without a connection for adapter_wait."""
         if gen != _gen:
             return
-        missing = dev.get_unconnected_adapters()
+        down = dev.get_unconnected_durations()
+        missing = list(down.keys())
+        left = adapter_wait_left(down, adapter_wait)
         if len(missing) == 0:
             _stage()
         elif left <= 0.0:
             _log.warning("software: staging without adapters that are not connected", {"adapters": missing})
             _stage()
         else:
-            if left == adapter_wait:
-                _log.info("software: waiting for adapters before staging", {"adapters": missing})
+            if not waited:
+                _log.info("software: waiting for adapters before staging", {"adapters": missing, "wait": left})
             step = ADAPTER_POLL if ADAPTER_POLL < left else left
-            after now step: _stage_when_connected(gen, left - step)
+            after now step: _stage_when_connected(gen, True)
 
     def _stage(removed: bool=False) -> None:
         """Make sure that the device has the image. A release that the
@@ -1262,7 +1279,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _abort_then_install = False
         _leaving = ""
         _room_removed = False
-        _stage_when_connected(_gen, adapter_wait)
+        _stage_when_connected(_gen, False)
 
     def _install_mode() -> None:
         """Refuse to install when the running configuration has changes
