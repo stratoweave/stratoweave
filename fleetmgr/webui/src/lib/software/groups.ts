@@ -9,10 +9,14 @@ import type { ValidationResult } from '#lib/core/validation/types.ts';
 import {
   DATA_ROOT,
   FLEET_DEVICE_LIST_ROOT,
+  type CampaignPlan,
   type Device,
   type DeviceJson,
+  type DeviceStatusRow,
   type FleetPatchJson,
   type GroupSeparation,
+  type KnownStatus,
+  type PlanDevice,
   type RedundancyGroupsPatchJson,
   type SeparationPolicy
 } from '#lib/software/model.ts';
@@ -74,6 +78,179 @@ export function groupRows(devices: Device[], separations: GroupSeparation[]): Gr
     separation: entries.get(name) ?? defaultSeparation(name),
     hasEntry: entries.has(name)
   }));
+}
+
+/** Where a member of a group is in a campaign. held: it has not run, and
+ * a failed member holds it, directly or through held members. */
+export type MemberState = 'done' | 'upgrading' | 'failed' | 'held' | 'waiting';
+
+export interface CampaignMember {
+  device: Device;
+  row: DeviceStatusRow;
+  state: MemberState;
+  /** When it finished, started or is planned to start, by its state; null
+   * when the plan does not say. */
+  time: number | null;
+  /** Whether the plan has it in a window. */
+  placed: boolean;
+  /** Whom it waits behind: a failed member of one of its groups, or the
+   * held member before it in one of its groups. */
+  heldBy: string[];
+}
+
+/** In the order they need someone: held first, then failed with nobody
+ * waiting behind. */
+export const GROUP_STATES = ['held', 'failed', 'upgrading', 'waiting', 'done'] as const;
+export type GroupState = (typeof GROUP_STATES)[number];
+
+export interface CampaignGroup {
+  name: string;
+  separation: GroupSeparation;
+  /** Its members in the campaign, in upgrade order. */
+  members: CampaignMember[];
+  /** Its members outside the campaign, which the campaign does not pace. */
+  outside: number;
+  state: GroupState;
+  /** Its failed members that others wait behind. */
+  holders: string[];
+}
+
+function isFailed(status: KnownStatus | undefined): boolean {
+  return status === 'failed' || status === 'rolled-back';
+}
+
+/** Statuses of a member the campaign has released. */
+const RELEASED: ReadonlySet<KnownStatus> = new Set(['in-progress', 'succeeded', 'failed', 'rolled-back']);
+
+/** Whom each held campaign member waits behind, as the controller's
+ * stuck() works it out: a failed member holds the unreleased members of
+ * its groups, and a held member holds the unreleased member after it in
+ * each of its groups, and so on. Only groups with two or more campaign
+ * members count. */
+function holds(
+  byGroup: Map<string, Device[]>,
+  rowOf: Map<string, DeviceStatusRow>,
+  planned: Map<string, PlanDevice>
+): Map<string, Set<string>> {
+  const unreleased = (name: string): boolean => {
+    const row = rowOf.get(name);
+    return row !== undefined && !RELEASED.has(row.status) && (planned.get(name)?.started ?? null) === null;
+  };
+  const heldBy = new Map<string, Set<string>>();
+  /** True when name was not held before. */
+  const hold = (name: string, by: string): boolean => {
+    const set = heldBy.get(name);
+    if (set) {
+      set.add(by);
+      return false;
+    }
+    heldBy.set(name, new Set([by]));
+    return true;
+  };
+  const next = new Map<string, string[]>();
+  for (const devices of byGroup.values()) {
+    const order = devices.filter((d) => rowOf.has(d.name)).map((d) => d.name);
+    if (order.length < 2) continue;
+    for (const f of order) {
+      if (!isFailed(rowOf.get(f)?.status)) continue;
+      for (const m of order) {
+        if (m !== f && unreleased(m)) hold(m, f);
+      }
+    }
+    for (let k = 1; k < order.length; k++) {
+      if (!unreleased(order[k])) continue;
+      const after = next.get(order[k - 1]);
+      if (after) after.push(order[k]);
+      else next.set(order[k - 1], [order[k]]);
+    }
+  }
+  const todo = [...heldBy.keys()];
+  for (let h = todo.pop(); h !== undefined; h = todo.pop()) {
+    for (const n of next.get(h) ?? []) {
+      if (hold(n, h)) todo.push(n);
+    }
+  }
+  return heldBy;
+}
+
+/** held comes first: only an unreleased member is held, up-to-date ones
+ * too, as the controller releases those in their turn as well. */
+function memberState(status: KnownStatus, held: boolean): MemberState {
+  if (held) return 'held';
+  if (status === 'succeeded' || status === 'up-to-date') return 'done';
+  if (status === 'in-progress') return 'upgrading';
+  if (isFailed(status)) return 'failed';
+  return 'waiting';
+}
+
+function memberTime(state: MemberState, planned: PlanDevice | undefined): number | null {
+  if (!planned) return null;
+  if (state === 'upgrading') return planned.started;
+  if (state === 'done' || state === 'failed') return planned.finished;
+  return planned.started ?? (planned.estimatedStart > 0 ? planned.estimatedStart : null);
+}
+
+/** The earliest planned start of a waiting member; Infinity when none. */
+function nextStart(group: CampaignGroup): number {
+  let next = Infinity;
+  for (const m of group.members) {
+    if (m.state === 'waiting' && m.time !== null && m.time < next) next = m.time;
+  }
+  return next;
+}
+
+/** The groups of a campaign's members: held and failed ones first, then
+ * upgrading, waiting by their next start, and done. A failed or rolled-back
+ * member holds others (see holds()) until it succeeds or leaves the group
+ * or the campaign. Only the campaign's members count, as it paces only
+ * them. `byGroup` is groupMembers() of the fleet. */
+export function campaignGroups(
+  byGroup: Map<string, Device[]>,
+  separations: GroupSeparation[],
+  members: string[],
+  rows: DeviceStatusRow[],
+  plan: CampaignPlan | null
+): CampaignGroup[] {
+  // Rows can still list devices that left the campaign.
+  const memberSet = new Set(members);
+  const rowOf = new Map(rows.filter((r) => memberSet.has(r.device)).map((r) => [r.device, r]));
+  const planned = new Map<string, PlanDevice>();
+  for (const w of plan?.windows ?? []) {
+    for (const d of w.devices) planned.set(d.name, d);
+  }
+  const entries = new Map(separations.map((s) => [s.name, s]));
+  const heldBy = holds(byGroup, rowOf, planned);
+  const out: CampaignGroup[] = [];
+  for (const [name, devices] of byGroup) {
+    const inCampaign: CampaignMember[] = [];
+    for (const device of devices) {
+      const row = rowOf.get(device.name);
+      if (!row) continue;
+      const by = [...(heldBy.get(device.name) ?? [])];
+      const state = memberState(row.status, by.length > 0);
+      const p = planned.get(device.name);
+      const time = memberTime(state, p);
+      inCampaign.push({ device, row, state, time, placed: p !== undefined, heldBy: by });
+    }
+    if (inCampaign.length === 0) continue;
+    const state = GROUP_STATES.find((s) => inCampaign.some((m) => m.state === s)) ?? 'done';
+    out.push({
+      name,
+      separation: entries.get(name) ?? defaultSeparation(name),
+      members: inCampaign,
+      outside: devices.length - inCampaign.length,
+      state,
+      holders: state === 'held' ? inCampaign.filter((m) => m.state === 'failed').map((m) => m.device.name) : []
+    });
+  }
+  const rank = (g: CampaignGroup) => GROUP_STATES.indexOf(g.state);
+  const starts = (a: CampaignGroup, b: CampaignGroup) => {
+    if (a.state !== 'waiting') return 0;
+    const x = nextStart(a);
+    const y = nextStart(b);
+    return x < y ? -1 : x > y ? 1 : 0;
+  };
+  return out.sort((a, b) => rank(a) - rank(b) || starts(a, b) || compareNames(a.name, b.name));
 }
 
 /** Up to SUGGEST_LIMIT names that match what is typed, an exact match

@@ -6,6 +6,7 @@
   import { onLoaded } from '#lib/core/loading.svelte.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
   import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
+  import CampaignGroups from '#lib/software/CampaignGroups.svelte';
   import CampaignProgress from '#lib/software/CampaignProgress.svelte';
   import DeviceStatusTable from '#lib/software/DeviceStatusTable.svelte';
   import PlanningFields from '#lib/software/PlanningFields.svelte';
@@ -168,6 +169,12 @@
     } finally {
       planningSaving = false;
     }
+  }
+
+  /** The groups card took a member out of a group: the campaign plans again. */
+  function groupsWrote(): void {
+    live.wrote();
+    void live.reload();
   }
 
   let failedRows = $derived(
@@ -440,6 +447,16 @@
       {/if}
     </section>
   {/if}
+
+  {#key data.name}
+    <CampaignGroups
+      members={campaign.devices}
+      rows={campaign.deviceStatus}
+      plan={campaign.plan}
+      version={data.seq}
+      onwrote={groupsWrote}
+    />
+  {/key}
 
   <section class="card">
     <h2 class="fold-heading">
