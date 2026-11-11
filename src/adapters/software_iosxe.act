@@ -400,6 +400,16 @@ def room_needed(image_size: ?u64) -> ?u64:
     return None
 
 
+def package_room(image_size: ?u64) -> ?u64:
+    """Return the free space that the add of a staged image needs for the
+    packages that it makes of the image, or None without an image size. On
+    a C1111 the packages of 17.15.06 take 807 MB, 1.1 times the 735 MB
+    image. So the room is 1.2 times the image."""
+    if image_size is not None:
+        return image_size * u64(6) // u64(5)
+    return None
+
+
 def staged_size(root: ?ygdata.Node, filename: str) -> ?u64:
     """Return the size of filename on bootflash: in root, from a listing
     over NETCONF or over the CLI, or None when the listing has no size for
@@ -827,6 +837,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     # on from, and the release that it leaves.
     var _abort_then_install = False
     var _leaving = ""
+    # Install removed the inactive software once to make room for the
+    # packages of the add.
+    var _room_removed = False
     var _after_remove = ""
 
     def _finish(err: ?Exception) -> None:
@@ -1248,6 +1261,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _committed = False
         _abort_then_install = False
         _leaving = ""
+        _room_removed = False
         _stage_when_connected(_gen, adapter_wait)
 
     def _install_mode() -> None:
@@ -1323,7 +1337,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 return
             image = bundle_image(root)
             if image is not None:
-                _convert(image)
+                _with_room(image)
             else:
                 _add_unless_added()
         dev.get(on_version, cli_filter("version"))
@@ -1394,8 +1408,43 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _log.info("software: image added already", {"file": _filename, "version": v.version})
                 _activate(v.version)
             else:
-                _add()
+                _with_room(None)
         dev.get(on_versions, _versions_filter())
+
+    def _with_room(image: ?str) -> None:
+        """Add the staged image, or convert the device in bundle mode that
+        booted image, when bootflash has room for the packages that the add
+        makes of it. Packages of a release that the device activated and
+        aborted stay on bootflash, and the device no longer lists the
+        release. Without the room, remove the software that the device does
+        not run, once: that removes the staged image too, so stage it again,
+        then add. Without an image size or a listing, just add."""
+        need = package_room(dev.get_dmc().software.image_size)
+        listing = upgrade_plan(_modules()).listing
+        if need is None or listing == "":
+            _add_or_convert(image)
+            return
+        gen = _gen
+        def listed(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            free = free_space(root) if err is None else None
+            if free is None or free! >= need!:
+                _add_or_convert(image)
+            elif _room_removed:
+                _finish(ValueError("add failed: bootflash: has {free} bytes free, the packages of the image need {need}"))
+            else:
+                _room_removed = True
+                _log.info("software: removing inactive software to make room for the packages",
+                          {"free": free, "need": need})
+                _remove_inactive("restage")
+        dev.get(listed, bootflash_filter(listing))
+
+    def _add_or_convert(image: ?str) -> None:
+        if image is not None:
+            _convert(image)
+        else:
+            _add()
 
     def _abort_pending(version: str) -> None:
         """Abort another release that the device runs activated and not
