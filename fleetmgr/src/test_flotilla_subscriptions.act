@@ -422,3 +422,83 @@ actor _test_device_status_verdicts(t: testing.EnvT):
 
     start()
     after 3: fail("device actor timed out")
+
+
+mut def adapters(connected: list[(str, bool)]) -> gdata.Node:
+    """Build the flotilla oper tree of device a, in progress, with one
+    adapter entry per (device type, connected)."""
+    tree = oper.root.from_gdata(software([("a", "in-progress", "install")]))
+    for kind, up in connected:
+        tree.device["a"].state.adapter.create(kind, connected=up)
+    return tree.to_gdata()
+
+
+actor _test_device_connection(t: testing.EnvT):
+    """The device actor publishes whether the flotilla is connected to the
+    device: its adapter entry of the device's type, iosxe. Until that entry
+    first says connected, and without that entry, connected is absent. An
+    extra adapter changes nothing."""
+    dev = new_device(t, "device-connection", True)
+    var server: ?netconf.NetconfMockServer = None
+    var device: ?ttt.TransformActor = None
+    var phase = 0
+    var done = False
+    steps = [
+        [("iosxe", True)],
+        [("iosxe", True), ("iosxe-cli", False)],
+        [("iosxe", False), ("iosxe-cli", False)],
+        [("iosxe-cli", True)],
+    ]
+    # What each step publishes; the extra adapter's step publishes nothing.
+    want = ["a None", "a True", "a False", "a None"]
+
+    def fail(message: str):
+        if not done:
+            done = True
+            d = device
+            if d is not None:
+                d.shutdown(None)
+            t.failure(ValueError(message))
+
+    def step(i: int):
+        if not done:
+            server!.set_oper_ds(adapters(steps[i]))
+
+    def on_oper(data: ?gdata.Node):
+        if done:
+            return
+        got = "cleared"
+        if data is not None:
+            entry = y1_oper.stratoweave_rfs__rfs__device_entry.from_gdata(data)
+            got = "{entry.name} {entry.state.connected}"
+        if got != want[phase]:
+            fail("publication {phase}: {got}")
+        elif phase == len(want) - 1:
+            done = True
+            device!.shutdown(None)
+            t.success()
+        else:
+            phase += 1
+            if phase == 1:
+                step(0)
+            elif phase == 2:
+                # The extra adapter first: the next publication must be
+                # the change of iosxe.
+                step(1)
+                after 0.1: step(2)
+            else:
+                step(3)
+
+    def start():
+        adapter = dev.get_adapter()
+        if isinstance(adapter, netconf.NetconfAdapter):
+            server = adapter.get_mock_server()
+            server!.set_oper_ds(adapters([("iosxe", False)]))
+            params = ttt.TransformActorParams(device_path("flotilla-1", "a"), lambda conf: None, lambda state: None, on_oper, dev)
+            device = t_1.DeviceTransformCtor(params)
+            device!.on_conf(device_conf("a"), gdata.Container(), None)
+        else:
+            fail("no NETCONF adapter")
+
+    start()
+    after 3: fail("device actor timed out in phase {phase}")

@@ -454,6 +454,15 @@
   the failure budget of M: no more devices start". To go on, raise or
   remove the budget, or remove failed members. Without a budget, a
   campaign releases as before. [#791]
+- A campaign holds a waiting member while the member is down: its flotilla
+  is not connected to it, or the top is not connected to its flotilla. The
+  member starts when it is back up, so a dead flotilla holds only its own
+  members. Before, a member that was down was released and failed. Each
+  held member's `device-status` gives the reason in `held` and the device
+  or flotilla that holds it in `held-by`, and `state/held` counts them. New
+  plan alarms name the members that are down, the members in flight that
+  are still down after their expected end, and the held members that lost
+  the window promised to them. [#794]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead

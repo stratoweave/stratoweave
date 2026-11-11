@@ -344,7 +344,8 @@ def reconfigure(c: Controller, devs: list[(str, int, str)], failure_budget: int)
 def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
                        late: int=0, answers: list[(int, str)]=[],
                        in_progress: bool=False, prepare: bool=False,
-                       failing: list[str]=[], budgets: list[(int, int)]=[]) -> int:
+                       failing: list[str]=[], budgets: list[(int, int)]=[],
+                       lives: list[(int, str, bool)]=[], reboots: bool=False) -> int:
     """Run c the way the campaign actor does, each decision late seconds
     after its time, next to a copy of it that plans at every decision.
     Each decision of c starts the same devices, wakes at the same time and
@@ -359,12 +360,19 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
     later; the next decision is one debounce after that at the latest.
     The devices in failing report failed instead of succeeded. budgets
     holds new failure budgets, as (time, budget): both take each at its
-    time, and a decision comes then. Return how many decisions of c took
-    the last plan again."""
+    time, and a decision comes then. lives holds devices that go down or
+    come back up, as (time, name, up), in the order of their times: both
+    take each at its time, and a decision comes then. With reboots, each
+    device that starts goes down a third of the way into its upgrade and
+    comes back up two thirds of the way in, and a decision comes at each;
+    both take the changes that are due at a decision in the order they
+    came. Return how many decisions of c took the last plan again."""
     d = c.copy()
     flying: list[(int, str)] = []
     pending = sorted(answers)
     budgets_left = sorted(budgets)
+    # The changes of up and down to come.
+    changes: list[(int, str, bool)] = lives
     # The prepares that run, as (end, name), and the members let prepare.
     prepping: list[(int, str)] = []
     let: set[str] = set()
@@ -384,6 +392,14 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
             b = budgets_left.pop(0)
             reconfigure(c, c.devices, b.1)
             reconfigure(d, d.devices, b.1)
+        to_come: list[(int, str, bool)] = []
+        for e in changes:
+            if e.0 <= t:
+                c.set_live(e.1, e.2)
+                d.set_live(e.1, e.2)
+            else:
+                to_come.append(e)
+        changes = to_come
         later: list[(int, str)] = []
         for a in pending:
             if a.0 <= t:
@@ -400,7 +416,9 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
             else:
                 copying.append(p)
         prepping = copying
-        if c.last_plan is not None and c.quiet_from <= t and t < c.quiet_until:
+        down = c.down_end()
+        if c.last_plan is not None and c.quiet_from <= t and t < c.quiet_until \
+           and (down < 0 or t < down):
             again += 1
         d.quiet_until = 0
         s = c.decide(t)
@@ -411,6 +429,7 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
         testing.assertEqual(s.plan.c, n.plan.c, "concurrency at {t}")
         testing.assertEqual(s.plan.starts, n.plan.starts, "plan at {t}")
         testing.assertEqual(s.plan.held, n.plan.held, "held at {t}")
+        testing.assertEqual(s.plan.why, n.plan.why, "why at {t}")
         testing.assertEqual(s.plan.alarms, n.plan.alarms, "alarms at {t}")
         if prepare:
             testing.assertEqual(s.prepares.starts, n.prepares.starts, "prepare starts at {t}")
@@ -426,16 +445,22 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
                     d.report_prepare(name, "running")
                     prepping.append((t + c.prepare_est.get_def(name, 1), name))
         for name in s.started:
-            flying.append((t + dur_of.get_def(name, c.est.get_def(name, 1)), name))
+            dur = dur_of.get_def(name, c.est.get_def(name, 1))
+            flying.append((t + dur, name))
             if in_progress:
                 c.report(name, "in-progress", t)
                 d.report(name, "in-progress", t)
+            if reboots:
+                changes = changes + [(t + dur // 3, name, False), (t + 2 * dur // 3, name, True)]
         if s.finished:
             break
         nxt = s.wake
         for f in flying + prepping:
             if nxt < 0 or f.0 + c.debounce < nxt:
                 nxt = f.0 + c.debounce
+        for e in changes:
+            if nxt < 0 or e.0 < nxt:
+                nxt = e.0
         if len(pending) > 0 and (nxt < 0 or pending[0].0 + c.debounce < nxt):
             nxt = pending[0].0 + c.debounce
         if len(budgets_left) > 0 and (nxt < 0 or budgets_left[0].0 < nxt):
@@ -2024,24 +2049,34 @@ def _test_a_success_within_the_debounce_frees_the_rest():
 
 def _test_members_wait_while_a_member_is_down():
     """z backs up r1 and r2 but is not in the campaign. While z, or r1
-    itself, is down, neither r1 nor r2 starts, and the plan says so; d0,
-    in no group, starts. When the device comes back up, r1 starts."""
+    itself, is down, neither r1 nor r2 starts, and the plan says so and
+    why; d0, in no group, starts. When the device comes back up, r1
+    starts."""
     devs = [("r1", 600, "w"), ("r2", 600, "w"), ("d0", 600, "w")]
-    for down in ["z", "r1"]:
+    # (the device that is down, the alarms, why each device is held)
+    cases: list[(str, list[str], dict[str, (str, str)])] = [
+        ("z", ["2 device(s) wait while a redundancy group member is down: r1, r2"],
+         {"r1": ("group-down", "z"), "r2": ("group-down", "z")}),
+        ("r1", ["1 device(s) are down: r1",
+                "1 device(s) wait while a redundancy group member is down: r2"],
+         {"r1": ("down", ""), "r2": ("group-down", "r1")}),
+    ]
+    for case in cases:
+        down = case.0
         c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 4, 4,
                        groups={"g": ["r1", "r2", "z"]}, priority={"r1": 1, "r2": 2, "z": 3},
                        rung=4)
         c.set_live(down, False)
         s = c.decide(0)
         testing.assertEqual(s.started, ["d0"], down)
-        testing.assertEqual(s.plan.alarms,
-                            ["2 device(s) wait while a redundancy group member is down: "
-                             + "r1, r2"], down)
+        testing.assertEqual(s.plan.alarms, case.1, down)
+        testing.assertEqual(s.plan.why, case.2, down)
         testing.assertEqual(s.plan.starts, {"d0": (0, 0)}, down)
         c.set_live(down, True)
         s = c.decide(10)
         testing.assertEqual(s.started, ["r1"], down)
         testing.assertEqual(s.plan.alarms, [], down)
+        testing.assertEqual(s.plan.why, {}, down)
 
 
 def _test_a_member_that_reports_while_down_holds_the_others():
@@ -2076,6 +2111,49 @@ def _test_a_member_down_while_it_upgrades_keeps_the_plan():
     c.set_live("a", True)
     c.report("a", "succeeded", 600)
     testing.assertEqual(c.decide(600).started, ["b"])
+
+
+def _test_set_live_says_when_the_quiet_time_ends():
+    """a starts at 0, b and c wait, with a debounce of 5 s. A change of a
+    member that waits, or of a device in a redundancy group that is not in
+    flight without a report, ends the quiet time, and set_live returns
+    True. So does a change of a member in flight without a report that was
+    past its expected end at the last step. A change of any other member in
+    flight or done in no group, of a member in flight without a report in a
+    group, a value that does not change, and an unknown device that is up
+    return False and keep the quiet time."""
+    devs = [("a", 600, "w"), ("b", 600, "w"), ("c", 600, "w")]
+    # (the redundancy groups, the device that goes down and comes back up,
+    # a's report at 600 or "", when the last step is, returned)
+    cases: list[(dict[str, list[str]], str, str, int, bool)] = [
+        ({}, "a", "", 0, False),
+        ({}, "a", "", 700, True),
+        ({}, "a", "succeeded", 601, False),
+        ({}, "a", "succeeded", 605, False),
+        ({"g": ["a", "c"]}, "a", "", 0, False),
+        ({"g": ["a", "c"]}, "a", "succeeded", 601, True),
+        ({"g": ["a", "c"]}, "a", "succeeded", 605, True),
+        ({}, "b", "", 0, True),
+        ({"g": ["b", "c"]}, "b", "", 0, True),
+    ]
+    for case in cases:
+        label = "{case.1} in groups {case.0}, a's report {case.2}, last step at {case.3}"
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, debounce=5, groups=case.0)
+        testing.assertEqual(c.decide(0).started, ["a"], label)
+        if case.2 != "":
+            c.report("a", case.2, 600)
+        if case.3 > 0:
+            c.decide(case.3)
+        testing.assertEqual(c.done_time("a") is not None, case.3 == 605, "done, " + label)
+        quiet = c.quiet_until
+        testing.assertTrue(quiet > 0, "quiet until {quiet}, " + label)
+        testing.assertEqual(c.set_live(case.1, False), case.4, "down, " + label)
+        testing.assertEqual(c.quiet_until == quiet, not case.4, "quiet, " + label)
+        testing.assertEqual(c.set_live(case.1, False), False, "down again, " + label)
+        c.quiet_until = quiet
+        testing.assertEqual(c.set_live(case.1, True), case.4, "up, " + label)
+        testing.assertEqual(c.quiet_until == quiet, not case.4, "quiet when up, " + label)
+        testing.assertEqual(c.set_live("x", True), False, "unknown, " + label)
 
 
 def _test_a_pack_group_keeps_its_min_separation():
@@ -3478,6 +3556,432 @@ def _test_a_failure_budget_with_redundancy_groups():
         testing.assertEqual(sorted(list(s.plan.held.keys())), case.3, label)
         c.report("r1", "succeeded", 700)
         testing.assertEqual(c.decide(700).started, case.4, label)
+
+
+#############################################################################
+# Devices that are down
+#############################################################################
+
+def are_down(names: str) -> str:
+    """The plan's alarm for the waiting devices names that are down."""
+    n = len(names.split(", "))
+    return "{n} device(s) are down: {names}"
+
+
+def lost_window(names: str) -> str:
+    """The plan's alarm for the devices names that lost their promised
+    window while held."""
+    n = len(names.split(", "))
+    return "{n} device(s) lost their promised window while held: {names}"
+
+
+def down_in_flight(names: str) -> str:
+    """The plan's alarm for the devices names in flight that are down past
+    their expected end."""
+    n = len(names.split(", "))
+    return "{n} device(s) in flight are down past their expected end: {names}"
+
+
+def _test_a_down_member_in_no_group_waits_until_it_is_back_up():
+    """d0 to d3 of 600 s, one at a time, in a 1 h window every day. The
+    plan at 0 promises the first window to all four. d1, in no group,
+    goes down at 100: it is held and keeps its promise, and d2 and d3 take
+    the slots. Back up at 1000, it starts when d2 is done, before d3, in
+    the window promised to it. Back up at 3000, it no longer fits that
+    window: the plan says that it will miss it, and it starts in the
+    next."""
+    wins = daily("w", 0, HOUR, 2)
+    down = are_down("d1")
+    miss = "1 device(s) will miss the window they were promised even at max-concurrency 1: d1"
+    # (when d1 comes back up, the steps after 100, each as (time, the
+    # device that reports a success then or "up", the devices that start,
+    # the alarms), the window d1 starts in)
+    cases: list[(int, list[(int, str, list[str], list[str])], (str, int, int))] = [
+        (1000, [(600, "d0", ["d2"], [down]),
+                (1000, "up", [], []),
+                (1200, "d2", ["d1"], [])], wins[0]),
+        (3000, [(600, "d0", ["d2"], [down]),
+                (1200, "d2", ["d3"], [down]),
+                (1800, "d3", [], [down]),
+                (3000, "up", [], [miss]),
+                (HOUR, "", [], []),
+                (DAY, "", ["d1"], [])], wins[1]),
+    ]
+    for case in cases:
+        label = "up at {case.0}"
+        c = controller(wins, devices("d", 4, 600, "w"), 1, 1)
+        testing.assertEqual(c.decide(0).started, ["d0"], label)
+        c.set_live("d1", False)
+        s = c.decide(100)
+        testing.assertEqual(s.started, [], label)
+        testing.assertEqual(s.plan.alarms, [down], label)
+        testing.assertEqual(s.plan.why, {"d1": ("down", "")}, label)
+        testing.assertEqual(s.plan.held, {"d1": (0, 100)}, label)
+        testing.assertEqual(c.promised_window("d1"), wins[0], label)
+        for st in case.1:
+            if st.1 == "up":
+                c.set_live("d1", True)
+            elif st.1 != "":
+                c.report(st.1, "succeeded", st.0)
+            s = c.decide(st.0)
+            testing.assertEqual((s.started, s.plan.alarms), (st.2, st.3), "{label}, at {st.0}")
+        testing.assertEqual(c.release_windows().get("d1"), case.2, label)
+
+
+def _test_the_plan_holds_down_devices_before_a_run():
+    """Before a run, d1 is down. The plan holds it, and says so."""
+    c = configured([("w", 0, fleet_ctl.OPEN_END)], devices("d", 3, 600, "w"), 1, 1)
+    c.set_live("d1", False)
+    p = c.plan(0)
+    testing.assertEqual(p.alarms, [are_down("d1")])
+    testing.assertEqual(p.why, {"d1": ("down", "")})
+    testing.assertEqual(sorted(list(p.starts.keys())), ["d0", "d2"])
+
+
+def _test_a_member_held_when_its_window_closes_loses_its_promise():
+    """The same campaign: d1 is held, for each reason below, from before
+    600 until 5000, after its promised window closed at 3600. Its promise
+    moves to the next window, and the plan says that it lost its window
+    while held, also once it is free, until it starts at the next opening.
+    The decision right after that start no longer says it."""
+    wins = daily("w", 0, HOUR, 2)
+    # (the reason, the alarm while it is held)
+    cases: list[(str, str)] = [
+        ("down", are_down("d1")),
+        ("not answered", "1 device(s) have not answered the campaign's target: d1"),
+        ("d0 failed", "1 device(s) wait behind a failed redundancy group member: d1"),
+    ]
+    for case in cases:
+        label = case.0
+        c = controller(wins, devices("d", 4, 600, "w"), 1, 1, groups={"g": ["d0", "d1"]},
+                       priority={"d0": 1, "d1": 2})
+        testing.assertEqual(c.decide(0).started, ["d0"], label)
+        if label == "down":
+            c.set_live("d1", False)
+        elif label == "not answered":
+            c.lost("d1")
+        c.report("d0", "failed" if label == "d0 failed" else "succeeded", 600)
+        # (the time, the device that reports a success then, the devices
+        # that start, the alarms)
+        steps: list[(int, str, list[str], list[str])] = [
+            (600, "", ["d2"], [case.1]),
+            (1200, "d2", ["d3"], [case.1]),
+            (1800, "d3", [], [case.1]),
+            (HOUR, "", [], [case.1, lost_window("d1")]),
+            (5000, "", [], [lost_window("d1")]),
+            (DAY, "", ["d1"], [lost_window("d1")]),
+            (DAY + 10, "", [], []),
+        ]
+        for st in steps:
+            if st.0 == 5000:
+                if label == "down":
+                    c.set_live("d1", True)
+                elif label == "not answered":
+                    c.report("d1", "upgrade-needed", 5000)
+                else:
+                    c.report("d0", "succeeded", 5000)
+            if st.1 != "":
+                c.report(st.1, "succeeded", st.0)
+            s = c.decide(st.0)
+            testing.assertEqual((s.started, s.plan.alarms), (st.2, st.3), "{label}, at {st.0}")
+            if st.0 == HOUR:
+                testing.assertEqual(c.promised_window("d1"), wins[1], label)
+        testing.assertEqual(c.release_windows().get("d1"), wins[1], label)
+
+
+def _test_a_pause_or_leaving_ends_the_alarm_for_a_lost_window():
+    """d0 and d1 of 600 s, one at a time, in a 1 h window on two days. d1
+    goes down after the plan at 0 promised it the first window, and loses
+    that window at its close. A plan after a pause, and a plan after d1
+    left the campaign and joined it again, no longer say that d1 lost its
+    window."""
+    wins = daily("w", 0, HOUR, 2)
+    devs = devices("d", 2, 600, "w")
+    for how in ["pause", "leave"]:
+        c = controller(wins, devs, 1, 1)
+        testing.assertEqual(c.decide(0).started, ["d0"], how)
+        c.set_live("d1", False)
+        c.report("d0", "succeeded", 600)
+        c.decide(600)
+        testing.assertEqual(c.decide(HOUR).plan.alarms, [are_down("d1"), lost_window("d1")],
+                            how)
+        if how == "pause":
+            c.stop()
+        else:
+            reconfigure(c, devs[:1], -1)
+            c.drop({"d1"})
+            reconfigure(c, devs, -1)
+        testing.assertEqual(c.plan(HOUR + 10).alarms, [are_down("d1")], how)
+
+
+def _test_a_held_member_without_a_window_left_is_held():
+    """d0 and d1 of 600 s, one at a time, in a 1 h window on two days. d1
+    goes down after the plan at 0 promised it the first window, and stays
+    down past the last window. The plan after that window shows d1 in no
+    window, but still holds it, for down."""
+    wins = daily("w", 0, HOUR, 2)
+    c = controller(wins, devices("d", 2, 600, "w"), 1, 1)
+    testing.assertEqual(c.decide(0).started, ["d0"])
+    c.set_live("d1", False)
+    c.report("d0", "succeeded", 600)
+    for t in [600, HOUR, DAY]:
+        c.decide(t)
+    p = c.decide(DAY + HOUR).plan
+    testing.assertEqual((p.why, p.held, p.alarms),
+                        ({"d1": ("down", "")}, {}, [are_down("d1"), lost_window("d1")]))
+
+
+def _test_a_member_that_goes_down_and_up_again_is_looked_at_once_in_each_window():
+    """d0, d1 and d2 of 600 s, one at a time, in a 1 h window every day
+    for 9 days. d0 starts at 0. Then d1, in no group, or z, in a group with
+    d1 and not in the campaign, goes down and comes back up three times,
+    with a decision after each change. Each window of d1's schedule looks
+    at d1 again once, not once for each time it came back up."""
+    wins = daily("w", 0, HOUR, 9)
+    # (the groups, the device that goes down and comes back up)
+    cases: list[(dict[str, list[str]], str)] = [
+        ({}, "d1"),
+        ({"g": ["d1", "z"]}, "z"),
+    ]
+    for case in cases:
+        c = controller(wins, devices("d", 3, 600, "w"), 1, 1, groups=case.0,
+                       priority={"d1": 1, "z": 2})
+        testing.assertEqual(c.decide(0).started, ["d0"], case.1)
+        t = 0
+        for _round in range(3):
+            for up in [False, True]:
+                t += 10
+                c.set_live(case.1, up)
+                c.decide(t)
+        k = c.names.num["d1"]
+        testing.assertEqual([len([d for d in r if d == k]) for r in c.retry],
+                            [1 for _w in wins], case.1)
+        c.report("d0", "succeeded", 600)
+        testing.assertEqual(c.decide(600).started, ["d1"], case.1)
+
+
+def _test_a_member_in_flight_that_is_down_holds_its_slot():
+    """d0 starts at 0, one at a time, in a window that never closes, and
+    goes down at 100, as a device does when it reboots. In a group or not,
+    that keeps the quiet time. d0 holds its slot and no one else, and the
+    plan expects it back up when its upgrade ends at 600. While it is down
+    after that, the plan says so. Back up at 700, it reports, and d1
+    starts."""
+    groups: list[dict[str, list[str]]] = [{}, {"g": ["d0", "x"]}]
+    for g in groups:
+        label = str(g)
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devices("d", 3, 600, "w"), 1, 1,
+                       groups=g, priority={"d0": 1, "x": 2})
+        testing.assertEqual(c.decide(0).started, ["d0"], label)
+        quiet = c.quiet_until
+        testing.assertEqual(c.set_live("d0", False), False, label)
+        testing.assertEqual(c.quiet_until, quiet, label)
+        s = c.decide(100)
+        testing.assertEqual((s.started, s.plan.alarms, s.plan.starts["d1"]), ([], [], (0, 600)),
+                            label)
+        s = c.decide(601)
+        testing.assertEqual((s.started, s.plan.alarms), ([], [down_in_flight("d0")]), label)
+        c.set_live("d0", True)
+        c.report("d0", "succeeded", 700)
+        s = c.decide(700)
+        testing.assertEqual((s.started, s.plan.alarms), (["d1"], []), label)
+
+
+def _test_the_alarm_for_a_member_in_flight_that_is_down_follows_the_pace():
+    """d0 and d1 start at 0, two at a time, in a window that never closes.
+    d0 succeeds at 150, so the pace falls to 375 s, and so does d1's
+    expected end; d2 starts, due at 525. While d1 is down after 375, the
+    plan says so, and a decision wakes at 376 for it. When d1 goes down
+    after the decision at 150, set_live says that the campaign must decide
+    before that decision's wake. When d1 comes back up after 375, set_live
+    says so too, and the plan no longer names d1."""
+    gone = down_in_flight("d1")
+    # (when d1 goes down and what set_live returns, when it comes back up
+    # or -1 and what set_live returns, the decisions after the one at 0 as
+    # (time, alarms, wake))
+    cases: list[(int, bool, int, bool, list[(int, list[str], int)])] = [
+        (100, False, -1, False, [(150, [], 376), (376, [gone], 525)]),
+        (300, True, -1, False, [(150, [], 525), (300, [], 376), (376, [gone], 525)]),
+        (380, True, -1, False, [(150, [], 525), (380, [gone], 525)]),
+        (100, False, 450, True, [(150, [], 376), (376, [gone], 525), (450, [], 525)]),
+    ]
+    for case in cases:
+        label = "down at {case.0}, up at {case.2}"
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devices("d", 4, 600, "w"), 2, 2, rung=2)
+        testing.assertEqual(c.decide(0).started, ["d0", "d1"], label)
+        c.report("d0", "succeeded", 150)
+        down_at = case.0
+        up_at = case.2
+        for st in case.4:
+            if down_at >= 0 and down_at <= st.0:
+                testing.assertEqual(c.set_live("d1", False), case.1, "{label}, down")
+                down_at = -1
+            if up_at >= 0 and up_at <= st.0:
+                testing.assertEqual(c.set_live("d1", True), case.3, "{label}, up")
+                up_at = -1
+            d = c.copy()
+            s = c.decide(st.0)
+            testing.assertEqual((s.plan.alarms, s.wake), (st.1, st.2), "{label}, at {st.0}")
+            testing.assertEqual(d.plan(st.0).alarms, st.1, "{label}, new plan at {st.0}")
+            if st.0 == 150:
+                testing.assertEqual((s.started, c.observed_s), (["d2"], 375), label)
+
+
+def _test_why_each_device_is_held():
+    """r1, r2 and r3 upgrade one at a time in the groups g1 and g2, r1
+    first; d1 is in g3 with z, which is not in the campaign; d0 is in no
+    group. r1 starts at 0 and reports at 600. Each held device has the
+    first reason that applies to it, its own first, and the device that
+    holds it when another one does."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w"), ("r3", 600, "w"), ("d0", 600, "w"),
+            ("d1", 600, "w")]
+    groups = {"g1": ["r1", "r2"], "g2": ["r2", "r3"], "g3": ["d1", "z"]}
+    priority = {"r1": 1, "r2": 2, "r3": 3, "d1": 1, "z": 2}
+    fb = ("failure-budget", "")
+    # (the case, the failure budget, r1's report, the devices that go down,
+    # the devices whose answer is lost, the waiting devices that report a
+    # failure, why each device is held)
+    cases: list[(str, int, str, list[str], list[str], list[str], dict[str, (str, str)])] = [
+        ("nothing", -1, "succeeded", [], [], [], {}),
+        ("r1 failed", -1, "failed", [], [], [],
+         {"r2": ("group-failed", "r1"), "r3": ("group-failed", "r1")}),
+        ("r2 down", -1, "succeeded", ["r2"], [], [],
+         {"r2": ("down", ""), "r3": ("group-down", "r2")}),
+        ("r2 not answered", -1, "succeeded", [], ["r2"], [],
+         {"r2": ("not-answered", ""), "r3": ("group-not-answered", "r2")}),
+        ("r3 not answered", -1, "succeeded", [], ["r3"], [], {"r3": ("not-answered", "")}),
+        ("r2 down and not answered", -1, "succeeded", ["r2"], ["r2"], [],
+         {"r2": ("down", ""), "r3": ("group-down", "r2")}),
+        ("r1 failed, r2 not answered", -1, "failed", [], ["r2"], [],
+         {"r2": ("not-answered", ""), "r3": ("group-failed", "r1")}),
+        ("r1 failed, r3 down", -1, "failed", ["r3"], [], [],
+         {"r2": ("group-failed", "r1"), "r3": ("down", "")}),
+        ("z down", -1, "succeeded", ["z"], [], [], {"d1": ("group-down", "z")}),
+        ("d0 down", -1, "succeeded", ["d0"], [], [], {"d0": ("down", "")}),
+        ("over the budget", 0, "failed", [], [], [],
+         {"r2": ("group-failed", "r1"), "r3": ("group-failed", "r1"), "d0": fb, "d1": fb}),
+        ("over the budget, d0 down", 0, "failed", ["d0"], [], [],
+         {"r2": ("group-failed", "r1"), "r3": ("group-failed", "r1"), "d0": ("down", ""),
+          "d1": fb}),
+        ("over the budget, z down", 0, "failed", ["z"], [], [],
+         {"r2": ("group-failed", "r1"), "r3": ("group-failed", "r1"), "d0": fb,
+          "d1": ("group-down", "z")}),
+        ("over the budget by d0, r2 not answered", 0, "succeeded", [], ["r2"], ["d0"],
+         {"r2": ("not-answered", ""), "r3": ("group-not-answered", "r2"), "d0": fb,
+          "d1": fb}),
+    ]
+    for case in cases:
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups=groups,
+                       priority=priority, failure_budget=case.1)
+        testing.assertEqual(c.decide(0).started, ["r1"], case.0)
+        c.report("r1", case.2, 600)
+        for name in case.3:
+            c.set_live(name, False)
+        for name in case.4:
+            c.lost(name)
+        for name in case.5:
+            c.report(name, "failed", 600)
+        p = c.plan(600)
+        testing.assertEqual(p.why, case.6, case.0)
+        testing.assertEqual(sorted(list(p.held.keys())), sorted(list(case.6.keys())), case.0)
+
+
+def _test_a_change_of_up_or_down_ends_the_quiet_time_of_a_waiting_member_or_a_group():
+    """d0 and r1 start at 0, two at a time; r1 and r2 are in a group with
+    z, which is not in the campaign, and x is in no group and not in the
+    campaign. A device that goes down, and comes back up, ends the quiet
+    time when it is a member that waits or it is in a group. d0 and r1, in
+    flight without a report, and x do not."""
+    devs = [("d0", 600, "w"), ("r1", 600, "w"), ("d1", 600, "w"), ("r2", 600, "w")]
+    # (the device, whether a change ends the quiet time)
+    cases: list[(str, bool)] = [
+        ("d0", False),
+        ("r1", False),
+        ("d1", True),
+        ("r2", True),
+        ("z", True),
+        ("x", False),
+    ]
+    for case in cases:
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 2, 2,
+                       groups={"g": ["r1", "r2", "z"]}, priority={"r1": 1, "r2": 2, "z": 3},
+                       rung=2)
+        testing.assertEqual(c.decide(0).started, ["d0", "r1"], case.0)
+        for up in [False, True]:
+            quiet = c.quiet_until
+            testing.assertTrue(quiet > 10, "quiet until {quiet}, " + case.0)
+            c.set_live(case.0, up)
+            testing.assertEqual(c.quiet_until == 0, case.1, "{case.0}, up {up}")
+            c.decide(10 if not up else 20)
+
+
+def _test_a_member_that_is_down_has_no_turn_to_prepare():
+    """ONE: each member's turn to prepare. d1 goes down after the plan at 0
+    promised it the window: it keeps its promise but has no turn, also in
+    the next plan, and the others share the time. Back up, it has its
+    turn again."""
+    c = one()
+    c.plan(0)
+    all_five = {"d0": 0, "d1": 2500, "d2": 5000, "d3": 7500, "d4": 10000}
+    testing.assertEqual(c.prepares(0).starts, all_five)
+    c.set_live("d1", False)
+    without = {"d0": 0, "d2": 3333, "d3": 6666, "d4": 10000}
+    testing.assertEqual(c.prepares(0).starts, without)
+    c.plan(0)
+    testing.assertEqual(c.prepares(0).starts, without)
+    c.set_live("d1", True)
+    testing.assertEqual(c.prepares(0).starts, all_five)
+
+
+def _test_decisions_with_devices_that_go_down_decide_as_a_new_plan():
+    """20 devices of 600 s in a 1 h window every day, two at a time and at
+    most four; d17 and d18 are in a group with z, which is not in the
+    campaign. Each device reboots during its upgrade. d5 is down from 0 to
+    2000, z from DAY + 100 to DAY + 900, and d12 from 1000 on: it loses its
+    window, and every later plan holds it. Staggered or not, each decision
+    decides as a new plan would, and the decisions in which only devices
+    start or reboot take the last plan again."""
+    lives: list[(int, str, bool)] = [
+        (0, "d5", False),
+        (1000, "d12", False),
+        (2000, "d5", True),
+        (DAY + 100, "z", False),
+        (DAY + 900, "z", True),
+    ]
+    for stagger in [0, 100]:
+        label = "stagger {stagger}"
+        c = controller(daily("day", 0, HOUR, 9), devices("d", 20, 600, "day"), 2, 4, False, 1,
+                       groups={"g": ["d17", "d18", "z"]}, priority={"d17": 1, "d18": 2, "z": 3},
+                       stagger=stagger)
+        again = same_as_a_new_plan(c, {}, 9 * DAY, lives=lives, reboots=True)
+        testing.assertTrue(again > 0, "{label}: {again} decisions took the plan again")
+        testing.assertEqual(sorted(list(c.released_devices())),
+                            sorted(["d{i}" for i in range(20) if i != 12]), label)
+
+
+def _test_the_plan_with_a_down_member_is_the_run_of_the_others():
+    """20 devices of 600 s in a 1 h window every day, two at a time and at
+    most four. d7 is down from the start and stays down, in no group or in
+    a group with d6. The first plan holds d7, and d6 too when d7 is in its
+    group, and only says so; the run starts every other device where
+    and when that plan said, and never starts the held ones."""
+    # (the groups, the held devices)
+    cases: list[(dict[str, list[str]], list[str])] = [
+        ({}, ["d7"]),
+        ({"g": ["d6", "d7"]}, ["d6", "d7"]),
+    ]
+    for case in cases:
+        label = str(case.0)
+        c = controller(daily("day", 0, HOUR, 9), devices("d", 20, 600, "day"), 2, 4, False, 1,
+                       groups=case.0, priority={"d6": 1, "d7": 2})
+        c.set_live("d7", False)
+        p = c.plan(0)
+        testing.assertEqual(sorted(list(p.why.keys())), case.1, label)
+        for a in p.alarms:
+            testing.assertTrue("are down" in a or "is down" in a, label + ": " + a)
+        sim.drive(c, 0, {}, 30 * DAY)
+        testing.assertEqual(sim.started(c), sim.planned(c, p), label)
+        testing.assertEqual(len(c.released_devices()), 20 - len(case.1), label)
 
 
 #############################################################################
