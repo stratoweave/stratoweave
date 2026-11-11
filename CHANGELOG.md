@@ -359,7 +359,7 @@
   a report takes 0.7 s instead of 5.3 s in a debug build, 85 ms instead of
   521 ms in a release build. The controller keeps the state of each device in
   lists by device number, and the campaign takes its members from the
-  inventory once per configuration instead of at every decision.
+  inventory once per configuration instead of at every decision. [#787]
 - A campaign device whose final report came before its release, such as a
   device that is up to date when the campaign starts, ran no upgrade, also
   when the report and the release fall in the same second. Before, it
