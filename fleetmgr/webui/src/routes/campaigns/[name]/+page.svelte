@@ -49,10 +49,11 @@
   let actionError = $state('');
   let confirmAction = $state<'run' | 'plan' | 'delete' | null>(null);
 
+  // Each load starts with the failed devices open and the pace and the
+  // devices folded.
+  let failedOpen = $state(true);
   let devicesOpen = $state(false);
-  // Changing the pace is occasional; while a campaign runs the section stays
-  // folded below the live status. null: follow the admin state.
-  let paceOpenChoice = $state<boolean | null>(null);
+  let paceOpen = $state(false);
   let unplacedOpen = $state(false);
   let filterStatus = $state<KnownStatus | ''>('');
   let searchText = $state('');
@@ -94,8 +95,9 @@
       shownName = data.name;
       actionError = '';
       confirmAction = null;
+      failedOpen = true;
       devicesOpen = false;
-      paceOpenChoice = null;
+      paceOpen = false;
       unplacedOpen = false;
       filterStatus = '';
       searchText = '';
@@ -126,7 +128,6 @@
   let eta = $derived(shown?.eta ?? null);
   // A failed load stops showing once a later read got through.
   let loadError = $derived((shown?.seq ?? 0) > applied.seq ? '' : applied.loadError);
-  let paceOpen = $derived(paceOpenChoice ?? campaign?.adminState === 'plan');
   let statuses = $derived(
     new Map<string, KnownStatus>((campaign?.deviceStatus ?? []).map((r) => [r.device, r.status]))
   );
@@ -438,12 +439,74 @@
     </section>
   {/if}
 
+  {#if planningForm}
+    <section class="card">
+      <h2 class="fold-heading">
+        <button class="fold" type="button" aria-expanded={paceOpen} onclick={() => (paceOpen = !paceOpen)}>
+          Schedule and pace
+        </button>
+        {#if !paceOpen}
+          <span class="hint">{planningDirty ? 'unsaved changes' : 'change the default schedule, a deadline or how many at once'}</span>
+        {/if}
+      </h2>
+      {#if paceOpen}
+        <div class="pace-body">
+          <PlanningFields
+            {schedules}
+            draft={planningForm}
+            errors={planningErrors}
+            disabled={planningSaving}
+            installSeconds={planInstallSeconds(campaign.plan)}
+            onchange={(next) => {
+              planningEdit = next;
+              planningMessage = null;
+            }}
+          />
+          <div class="planning-actions">
+            {#if planningMessage}
+              <span class={planningMessage.type === 'error' ? 'save-error' : 'save-ok'}>{planningMessage.text}</span>
+            {:else if alsoTargetConcurrency !== null}
+              <span class="save-ok">{alsoTargetConcurrency} at once also applies; saving sets it to 1.</span>
+            {/if}
+            <button
+              class="btn btn-secondary"
+              type="button"
+              disabled={planningSaving || planningEdit === null}
+              onclick={() => {
+                planningEdit = null;
+                planningMessage = null;
+              }}
+            >
+              Reset
+            </button>
+            <button
+              class="btn btn-primary"
+              type="button"
+              disabled={planningSaving || !planningDirty}
+              onclick={savePlanning}
+            >
+              {planningSaving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </div>
+      {/if}
+    </section>
+  {/if}
+
   {#if failedRows.length > 0}
     <section class="card failed-card">
-      <h2 class="panel-title">Failed or rolled back ({failedRows.length})</h2>
-      <DeviceStatusTable rows={failedRows.slice(0, FAILED_LIMIT)} />
-      {#if failedRows.length > FAILED_LIMIT}
-        <p class="rate">showing {FAILED_LIMIT} of {failedRows.length}</p>
+      <h2 class="fold-heading">
+        <button class="fold" type="button" aria-expanded={failedOpen} onclick={() => (failedOpen = !failedOpen)}>
+          Failed or rolled back ({failedRows.length})
+        </button>
+      </h2>
+      {#if failedOpen}
+        <div class="failed-body">
+          <DeviceStatusTable rows={failedRows.slice(0, FAILED_LIMIT)} />
+          {#if failedRows.length > FAILED_LIMIT}
+            <p class="rate">showing {FAILED_LIMIT} of {failedRows.length}</p>
+          {/if}
+        </div>
       {/if}
     </section>
   {/if}
@@ -512,59 +575,6 @@
     {/if}
   </section>
 
-  {#if planningForm}
-    <section class="card">
-      <h2 class="fold-heading">
-        <button class="fold" type="button" aria-expanded={paceOpen} onclick={() => (paceOpenChoice = !paceOpen)}>
-          Schedule and pace
-        </button>
-        {#if !paceOpen}
-          <span class="hint">{planningDirty ? 'unsaved changes' : 'change the default schedule, a deadline or how many at once'}</span>
-        {/if}
-      </h2>
-      {#if paceOpen}
-        <div class="pace-body">
-          <PlanningFields
-            {schedules}
-            draft={planningForm}
-            errors={planningErrors}
-            disabled={planningSaving}
-            installSeconds={planInstallSeconds(campaign.plan)}
-            onchange={(next) => {
-              planningEdit = next;
-              planningMessage = null;
-            }}
-          />
-          <div class="planning-actions">
-            {#if planningMessage}
-              <span class={planningMessage.type === 'error' ? 'save-error' : 'save-ok'}>{planningMessage.text}</span>
-            {:else if alsoTargetConcurrency !== null}
-              <span class="save-ok">{alsoTargetConcurrency} at once also applies; saving sets it to 1.</span>
-            {/if}
-            <button
-              class="btn btn-secondary"
-              type="button"
-              disabled={planningSaving || planningEdit === null}
-              onclick={() => {
-                planningEdit = null;
-                planningMessage = null;
-              }}
-            >
-              Reset
-            </button>
-            <button
-              class="btn btn-primary"
-              type="button"
-              disabled={planningSaving || !planningDirty}
-              onclick={savePlanning}
-            >
-              {planningSaving ? 'Saving…' : 'Save'}
-            </button>
-          </div>
-        </div>
-      {/if}
-    </section>
-  {/if}
 {/if}
 
 <ConfirmDialog
@@ -641,8 +651,16 @@
     border-color: rgb(var(--sw-danger-rgb) / 0.35);
   }
 
-  .failed-card .panel-title {
+  .failed-card .fold {
     color: var(--sw-danger-text);
+  }
+
+  .failed-card .fold:hover {
+    color: var(--sw-accent-bright);
+  }
+
+  .failed-body {
+    margin-top: 12px;
   }
 
   .fold-heading {

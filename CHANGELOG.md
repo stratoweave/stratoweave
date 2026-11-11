@@ -475,6 +475,10 @@
   campaign's page shows the groups of its members, each member in upgrade
   order with its status and time. Groups held behind a failed member come
   first, with a button that takes that member out of the group.
+- The campaign page has Schedule and pace under the plan, folded each time
+  the page opens. The failed devices, the redundancy groups and the devices
+  fold too; only the failed devices start open. Folded, the redundancy
+  groups say how many of them are held.
 - The device page is redesigned around the device's upgrade run. [#674]
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for

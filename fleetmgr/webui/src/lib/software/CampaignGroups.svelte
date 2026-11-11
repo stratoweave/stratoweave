@@ -87,6 +87,8 @@
     return out;
   });
 
+  // Folded when the page loads.
+  let open = $state(false);
   let filterState = $state<GroupState | ''>('');
   let searchText = $state('');
   let page = $state(1);
@@ -160,16 +162,23 @@
 
 {#if groups.length > 0 || readError}
   <section class="card">
-    <h2 class="panel-title">Redundancy groups ({groups.length.toLocaleString()})</h2>
+    <h2 class="fold-heading">
+      <button class="fold" type="button" aria-expanded={open} onclick={() => (open = !open)}>
+        Redundancy groups ({groups.length.toLocaleString()})
+      </button>
+      {#if !open && counts.get('held')}
+        <span class="pill warning"><span class="dot"></span>{counts.get('held')} held</span>
+      {/if}
+    </h2>
     {#if readError}
       <div class="error-state status">{readError}</div>
     {/if}
-    {#if message}
+    {#if open && message}
       <div class={message.type === 'error' ? 'error-state status' : 'success-banner status'} role="status">
         {message.text}
       </div>
     {/if}
-    {#if groups.length > 0}
+    {#if open && groups.length > 0}
       <div class="filter-row">
         <button
           class="chip"
@@ -277,6 +286,15 @@
 />
 
 <style>
+  .fold-heading {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    margin: 0;
+    font-size: inherit;
+  }
+
   .filter-row {
     display: flex;
     align-items: center;
