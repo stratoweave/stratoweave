@@ -66,6 +66,13 @@
   RFC 5277 subscription cannot also hold RFC 8639 subscriptions. [#752]
 - The `/device/<name>/modules` and `/device/<name>/info` inspection endpoints
   give the adapter of each module. [#756]
+- A NETCONF `<edit-config>` transaction is complete once it is committed to
+  TTT and persisted. Device interaction is left outside the transaction, so
+  the edit no longer waits for the devices to apply their configuration.
+  Before, a device that never connected kept the transaction from ever
+  completing, and since a Fleet Manager top sends one edit at a time to each
+  flotilla, a single such device blocked all further configuration to its
+  flotilla.
 
 ### Devices & Adapters
 - SNMP device adapters are generated from MIBs. The system generator
@@ -670,6 +677,12 @@
 - A device can be in one Fleet Manager campaign only. Before you upgrade,
   remove each device that two campaigns name from one of them. Otherwise
   Fleet Manager cannot load its configuration and does not start. [#783]
+- Since a NETCONF `<edit-config>` transaction completes before the devices
+  have applied their configuration, a device rejecting its configuration is
+  no longer reported as an `rpc-error`. The device side is visible per
+  device instead: `state/adapter` shows whether it is connected, and the
+  inspection API's `/device/<name>/info` and `/device/<name>/log` show its
+  queue and what was sent to it.
 
 ## [26.10] - 2026-10-23
 
