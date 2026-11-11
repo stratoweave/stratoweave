@@ -13,10 +13,10 @@ import yang.identityref
 
 
 def device_subscription(name: str) -> ygdata.SubscriptionSpec:
-    """Return the on-change subscription to the software state and the
-    platform that the flotilla reports for one device."""
+    """Return the on-change subscription to the software state, the platform
+    and the adapters that the flotilla reports for one device."""
     device = flotilla_oper.subs.device.entry(name)
-    return device.subscribe(select=[device.software.state, device.state.platform])
+    return device.subscribe(select=[device.software.state, device.state])
 
 
 actor DeviceTransform(
@@ -24,15 +24,22 @@ actor DeviceTransform(
     update_oper: proc(?y1_oper.stratoweave_rfs__rfs__device_entry) -> None,
     dev: swdev.DeviceMgr,
 ):
-    """Publish the software state and platform that the flotilla reports for
-    one device.
+    """Publish the software state, the platform and the connection that the
+    flotilla reports for one device.
 
     The actor subscribes to the flotilla for this device only. It publishes
     the status, the campaign and target release the status is for, the
     stage, reason, check verdicts, the device's prepare and platform in the
     state of its own entry, so a change on one device publishes one entry.
-    One subscription takes both."""
+    It publishes connected from the flotilla's adapter of the device's
+    type. It leaves it out while the flotilla has no entry for that
+    adapter, and until the entry first says connected: a device that has
+    not connected yet is not down. One subscription takes them all."""
     var subscriptions: ?ygdata.SubscriptionManager = None
+    # The device type, which names the adapter whose connection counts, and
+    # whether that adapter has said connected.
+    var primary = ""
+    var was_up = False
     var latest: ?(status: ?str, upgrade_campaign: ?str, target_release: ?str,
                   stage: ?str, reason: ?str,
                   prepare: (state: ?str, release: ?str, started: ?str, ended: ?str,
@@ -40,11 +47,12 @@ actor DeviceTransform(
                   precheck: (verdict: ?str, detail: ?str, at: ?str),
                   postcheck: (verdict: ?str, detail: ?str, at: ?str)) = None
     var platform: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+    var connected: ?bool = None
 
     def publish() -> None:
         value = latest
         p = platform
-        if value is None and p is None:
+        if value is None and p is None and connected is None:
             update_oper(None)
             return
         oper = base.Device.new_state(path)
@@ -72,6 +80,7 @@ actor DeviceTransform(
             o.version = p.version
             o.model = p.model
             o.serial_number = p.serial_number
+        oper.state.connected = connected
         update_oper(oper)
 
     def on_device(keys: ?(device_name: str),
@@ -87,6 +96,7 @@ actor DeviceTransform(
                  precheck: (verdict: ?str, detail: ?str, at: ?str),
                  postcheck: (verdict: ?str, detail: ?str, at: ?str)) = None
         p: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+        c: ?bool = None
         if error is not None:
             print("device state subscription failed at {path}: {error}", err=True)
         elif device is not None:
@@ -110,20 +120,33 @@ actor DeviceTransform(
             if (pl.os is not None or pl.version is not None or
                     pl.model is not None or pl.serial_number is not None):
                 p = (os=pl.os, version=pl.version, model=pl.model, serial_number=pl.serial_number)
-        if value != latest or p != platform:
+            adapter = device.state.adapter.get(primary)
+            if adapter is not None:
+                up = adapter.connected
+                if up is not None and up:
+                    was_up = True
+                if was_up:
+                    c = up
+        if value != latest or p != platform or c != connected:
             latest = value
             platform = p
+            connected = c
             publish()
 
     def shutdown() -> None:
         latest = None
         platform = None
+        connected = None
         if subscriptions is not None:
             subscriptions!.close()
             subscriptions = None
         update_oper(None)
 
     def on_conf(conf: y_1.stratoweave_rfs__rfs__device_entry) -> None:
+        # A new type counts from the flotilla's next delivery.
+        if conf.type != primary:
+            primary = conf.type
+            was_up = False
         if subscriptions is None:
             subscriptions = ygdata.SubscriptionManager(dev.tree_provider(), str(path))
             subscriptions!.declare({

@@ -8,6 +8,8 @@ from yang.type import Decimal
 
 import stratoweave
 import stratoweave.adapters.adapter as swadapt
+import stratoweave.adapters.netconf as netconf
+import stratoweave.device as swdev
 import stratoweave.ttt as ttt
 from stratoweave.device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig
@@ -16,6 +18,8 @@ import stratoweave.fleet_ctl as fctl
 import stratoweave.fleet_ctl_sim as sim
 import fleetmgr.cfs as cfs
 import fleetmgr.rfs as rfs
+import fleetmgr.devices.flotilla as flotilla_dev
+import fleetmgr.devices.flotilla_oper as flotilla_oper
 import fleetmgr.layers.y_0 as y_0
 import fleetmgr.layers.y_0_oper as y0_oper
 import fleetmgr.layers.y_1 as y_1_config
@@ -621,6 +625,7 @@ def _test_flotilla_placement():
     other flotillas; the pinned names catch that."""
     testing.assertEqual(cfs.flotilla_of("cpe-001"), "flotilla-8")
     testing.assertEqual(cfs.flotilla_of("cpe-002"), "flotilla-9")
+    testing.assertEqual(cfs.flotilla_of("cpe-007"), "flotilla-8")
     seen: set[str] = set()
     for i in range(1, 101):
         seen.add(cfs.flotilla_of("cpe-{i:03d}"))
@@ -1056,18 +1061,31 @@ actor _test_recreated_campaign_keeps_its_subscription(t: testing.AsyncT):
                                        _LoggingTreeProvider(log))
     new.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
 
+    def subscribers(owners: list[str]) -> set[str]:
+        """The campaigns that declared owners. A campaign declares one
+        owner per delivery: its own id, a colon and the delivery's number."""
+        out: set[str] = set()
+        for owner in owners:
+            out.add(owner[:owner.rfind(":")])
+        return out
+
     def check() -> None:
         declared, removed = log.owners()
-        kept = [d for d in declared if d not in removed]
-        if len(removed) == 0:
+        gone = subscribers(removed)
+        kept = subscribers([d for d in declared if d not in removed])
+        partly = False
+        for s in gone:
+            if s in kept:
+                partly = True
+        if len(removed) == 0 or partly:
             after 0.05: check()
-        elif len(set(declared)) == 2 and len(removed) == 1 and len(kept) == 1:
+        elif len(subscribers(declared)) == 2 and len(gone) == 1 and len(kept) == 1:
             t.success()
         else:
             t.failure(ValueError("declared {declared}, removed {removed}"))
 
     def delete_old() -> None:
-        if len(log.owners().0) < 2:
+        if len(subscribers(log.owners().0)) < 2:
             after 0.05: delete_old()
         else:
             old.shutdown()
@@ -2742,6 +2760,487 @@ actor _test_campaign_stops_releasing_over_its_failure_budget(t: testing.AsyncT):
         report(name, "upgrade-needed")
     ctl.on_subscriptions_synced()
     after 6.0: timeout()
+
+
+def _test_device_live():
+    """A device is down when the top is not connected to its flotilla, or
+    the flotilla is not connected to the device. A connection that is
+    unknown counts as up."""
+    # (the top to the flotilla, the flotilla to the device, up)
+    cases: list[(?bool, ?bool, bool)] = [
+        (None, None, True),
+        (True, None, True),
+        (None, True, True),
+        (True, True, True),
+        (None, False, False),
+        (True, False, False),
+        (False, None, False),
+        (False, True, False),
+        (False, False, False),
+    ]
+    for c in cases:
+        testing.assertEqual(cfs.device_live(c.0, c.1), c.2, "flotilla {c.0}, device {c.1}")
+
+
+def _test_held_status():
+    """A member that is down only because the top is not connected to its
+    flotilla is held for flotilla-down, by the flotilla. Its own connection
+    comes first, and the other reasons stay as the controller gives them."""
+    # (reason, holder, the top to the flotilla, the flotilla to the device,
+    # published reason and holder)
+    cases: list[(str, str, ?bool, ?bool, (str, str))] = [
+        ("down", "", None, False, ("down", "")),
+        ("down", "", True, False, ("down", "")),
+        ("down", "", False, None, ("flotilla-down", "flotilla-8")),
+        ("down", "", False, True, ("flotilla-down", "flotilla-8")),
+        ("down", "", False, False, ("down", "")),
+        ("group-down", "cpe-007", False, None, ("group-down", "cpe-007")),
+        ("not-answered", "", False, None, ("not-answered", "")),
+        ("failure-budget", "", None, None, ("failure-budget", "")),
+    ]
+    for c in cases:
+        testing.assertEqual(cfs.held_status(c.0, c.1, "flotilla-8", c.2, c.3), c.4,
+                            "{c.0} by {c.1}, flotilla {c.2}, device {c.3}")
+
+
+def _connected(status: str, campaign: str, connected: ?bool) -> y1_oper.stratoweave_rfs__rfs__device__state:
+    """A device state with status for the intent of campaign with the
+    target release 17.18.03a, and whether its flotilla is connected to it."""
+    s = _tagged(status, campaign, "17.18.03a")
+    s.connected = connected
+    return s
+
+
+def _flotilla_state(connected: bool) -> y1_oper.stratoweave_rfs__device__state__adapter_entry:
+    """The top's adapter entry for a flotilla."""
+    return y1_oper.stratoweave_rfs__device__state__adapter_entry(cfs.FLOTILLA_TYPE, connected)
+
+
+def _held_rows(o: y0_oper.software__software__upgrade_campaign_entry, names: list[str]) -> list[str]:
+    """Each member in names as "name held held-by", from the device-status
+    of o, and then the held counter."""
+    rows: list[str] = []
+    for name in names:
+        r = o.state.device_status.get(name)
+        if r is not None:
+            rows.append("{name} {r.held} {r.held_by}")
+        else:
+            rows.append("{name} missing")
+    rows.append("held {o.state.held}")
+    return rows
+
+
+# cpe-001 and cpe-007 are on flotilla-8, cpe-002 on flotilla-9.
+HELD_MEMBERS = ["cpe-001", "cpe-002", "cpe-007"]
+
+
+actor _HeldInPlan(t: testing.AsyncT, down: list[str], dead: list[str], unanswered: list[str],
+                  group: list[str], want: list[str]):
+    """Run the campaign paced in plan over HELD_MEMBERS. The members in
+    group are the redundancy group core, in that order. Before the sync,
+    as the replay does, each flotilla in dead says that the top is not
+    connected to it, and each member reports for the campaign: unknown when
+    it is in unanswered, upgrade-needed otherwise, and that its flotilla is
+    not connected to it when it is in down. Pass t when the publication
+    after the sync has the alarms, then each member as "name held
+    held-by", then the held counter, that want gives."""
+    var publications = 0
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if oper is None:
+            return
+        publications += 1
+        # The first publication comes from on_conf, before the reports.
+        if publications == 2:
+            o = oper!
+            got = list(o.state.plan.alarm) + _held_rows(o, HELD_MEMBERS)
+            if got == want:
+                t.success()
+            else:
+                t.failure(ValueError("after the sync: {got}"))
+
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper, None)
+
+    def replay() -> None:
+        conf = _paced_campaign(HELD_MEMBERS)
+        conf.admin_state = "plan"
+        linked = _with_nightly(_flat_inventory(HELD_MEMBERS))
+        for name in group:
+            dev = linked.fleet.device.get(name)
+            if dev is not None:
+                dev.redundancy_group = ["core"]
+        ctl.on_conf(conf, linked.to_gdata())
+        for f in dead:
+            ctl.on_flotilla((device_name=f, adapter_type=cfs.FLOTILLA_TYPE),
+                            _flotilla_state(False), None)
+        for name in HELD_MEMBERS:
+            status = "unknown" if name in unanswered else "upgrade-needed"
+            connected: ?bool = None
+            if name in down:
+                connected = False
+            ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                       _connected(status, "paced", connected), None)
+        ctl.on_subscriptions_synced()
+
+    replay()
+
+
+actor _test_campaign_holds_a_member_that_is_down(t: testing.AsyncT):
+    """cpe-002's flotilla is not connected to it, so the campaign holds it
+    for down."""
+    _HeldInPlan(t, ["cpe-002"], [], [], [],
+                ["1 device(s) are down: cpe-002",
+                 "cpe-001 None None", "cpe-002 down None", "cpe-007 None None", "held 1"])
+
+
+actor _test_campaign_holds_only_the_members_of_a_dead_flotilla(t: testing.AsyncT):
+    """The top is not connected to flotilla-8, so the campaign holds
+    cpe-001 and cpe-007 for flotilla-down, by flotilla-8, and not cpe-002."""
+    _HeldInPlan(t, [], ["flotilla-8"], [], [],
+                ["2 device(s) are down: cpe-001, cpe-007",
+                 "cpe-001 flotilla-down flotilla-8", "cpe-002 None None",
+                 "cpe-007 flotilla-down flotilla-8", "held 2"])
+
+
+actor _test_campaign_holds_a_member_for_its_own_connection_first(t: testing.AsyncT):
+    """cpe-001 was down before the top lost flotilla-8, so it is held for
+    down. cpe-007 is held for flotilla-down."""
+    _HeldInPlan(t, ["cpe-001"], ["flotilla-8"], [], [],
+                ["2 device(s) are down: cpe-001, cpe-007",
+                 "cpe-001 down None", "cpe-002 None None",
+                 "cpe-007 flotilla-down flotilla-8", "held 2"])
+
+
+actor _test_campaign_names_the_group_member_that_is_down(t: testing.AsyncT):
+    """cpe-001 is down, so cpe-002, after it in their redundancy group,
+    is held for group-down, by cpe-001."""
+    _HeldInPlan(t, ["cpe-001"], [], [], ["cpe-001", "cpe-002"],
+                ["1 device(s) are down: cpe-001",
+                 "1 device(s) wait while a redundancy group member is down: cpe-002",
+                 "cpe-001 down None", "cpe-002 group-down cpe-001", "cpe-007 None None",
+                 "held 2"])
+
+
+actor _test_campaign_names_the_group_member_that_has_not_answered(t: testing.AsyncT):
+    """cpe-002 has not answered, so cpe-007, after it in their redundancy
+    group, is held for group-not-answered, by cpe-002."""
+    _HeldInPlan(t, [], [], ["cpe-002"], ["cpe-002", "cpe-007"],
+                ["1 device(s) have not answered the campaign's target: cpe-002",
+                 "1 device(s) wait behind a redundancy group member that has not answered: cpe-007",
+                 "cpe-001 None None", "cpe-002 not-answered None",
+                 "cpe-007 group-not-answered cpe-002", "held 2"])
+
+
+actor _BackUp(t: testing.AsyncT, flotilla: bool, back: ?bool):
+    """Run the campaign now over HELD_MEMBERS, one at a time, every member
+    answered upgrade-needed. cpe-001 and cpe-007 are down: their flotilla
+    is not connected to them, or, when flotilla is True, the top is not
+    connected to their flotilla, flotilla-8. So the campaign releases
+    cpe-002 first, and holds the members that are down. When cpe-002 is
+    done, the campaign releases no one while they are down. When they are
+    back up, it releases cpe-001: the connection that was False is back,
+    as back gives it, True or no longer known."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var stage = 0
+    var done = False
+    var held: list[str] = []
+    linked = _flat_inventory(HELD_MEMBERS, 600).to_gdata()
+    want = ["cpe-001 flotilla-down flotilla-8", "cpe-002 None None",
+            "cpe-007 flotilla-down flotilla-8", "held 2"] if flotilla else \
+           ["cpe-001 down None", "cpe-002 None None", "cpe-007 down None", "held 2"]
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def report(name: str, status: str, connected: ?bool) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                      _connected(status, "now", connected), None)
+
+    def flotilla_8(connected: ?bool) -> None:
+        cc = controller
+        if cc is not None:
+            entry: ?y1_oper.stratoweave_rfs__device__state__adapter_entry = None
+            if connected is not None:
+                entry = _flotilla_state(connected)
+            cc.on_flotilla((device_name="flotilla-8", adapter_type=cfs.FLOTILLA_TYPE),
+                           entry, None)
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if oper is not None:
+            held = _held_rows(oper!, HELD_MEMBERS)
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "now")
+        if stage == 0:
+            if free == ["cpe-002"]:
+                stage = 1
+                report("cpe-002", "succeeded", True)
+            elif len(free) > 0:
+                fail("first released {free}")
+        elif stage == 1:
+            if free != []:
+                fail("cpe-002 done, released {free}")
+            elif held != want:
+                fail("held: {held}")
+            else:
+                stage = 2
+                if flotilla:
+                    flotilla_8(back)
+                else:
+                    report("cpe-001", "upgrade-needed", back)
+                    report("cpe-007", "upgrade-needed", back)
+        elif free == ["cpe-001"]:
+            done = True
+            t.success()
+        else:
+            fail("back up, released {free}")
+
+    def start() -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_conf(_now_campaign("run", HELD_MEMBERS), linked)
+            if flotilla:
+                flotilla_8(False)
+            for name in HELD_MEMBERS:
+                up = True
+                if not flotilla and name != "cpe-002":
+                    up = False
+                report(name, "upgrade-needed", up)
+            cc.on_subscriptions_synced()
+
+    def timeout() -> None:
+        fail("at stage {stage}, held {held}")
+
+    t.timeout(8.0)
+    controller = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, on_oper, None)
+    start()
+    after 6.0: timeout()
+
+
+actor _test_campaign_releases_a_member_when_it_is_back_up(t: testing.AsyncT):
+    _BackUp(t, False, True)
+
+
+actor _test_campaign_releases_a_member_whose_connection_is_no_longer_known(t: testing.AsyncT):
+    _BackUp(t, False, None)
+
+
+actor _test_campaign_releases_the_members_of_a_flotilla_that_is_back_up(t: testing.AsyncT):
+    _BackUp(t, True, True)
+
+
+actor _test_campaign_releases_the_members_of_a_flotilla_no_longer_known(t: testing.AsyncT):
+    _BackUp(t, True, None)
+
+
+actor _FlotillaLost(t: testing.AsyncT, status: str):
+    """Run the campaign now over HELD_MEMBERS, one at a time, with a failure
+    budget of 0 percent, every member answered upgrade-needed. cpe-001, on
+    flotilla-8, is released first and reports status. Then the top loses
+    flotilla-8. The campaign keeps cpe-001's status and the counter that
+    counts it, holds cpe-007 for flotilla-down, and releases no other
+    member: cpe-001 holds the only slot while it is in progress, and stops
+    the releases while it has failed."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var stage = 0
+    var done = False
+    linked = _flat_inventory(HELD_MEMBERS, 600).to_gdata()
+
+    def counted(o: y0_oper.software__software__upgrade_campaign_entry) -> ?u64:
+        """The counter that counts status."""
+        return o.state.failed if status == "failed" else o.state.in_progress
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def report(device: str, st: str) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_rfs((rfs_name=cfs.flotilla_of(device), device_name=device),
+                      _connected(st, "now", True), None)
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        free = _vetoed(out, "now").1
+        if stage == 0:
+            if free == ["cpe-001"]:
+                stage = 1
+                report("cpe-001", status)
+            elif len(free) > 0:
+                fail("first released {free}")
+        elif "cpe-002" in free or "cpe-007" in free:
+            fail("at stage {stage}, released {free}")
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        if stage == 1 and counted(o) == u64(1):
+            stage = 2
+            cc = controller
+            if cc is not None:
+                cc.on_flotilla((device_name="flotilla-8", adapter_type=cfs.FLOTILLA_TYPE),
+                               _flotilla_state(False), None)
+        elif stage == 2 and _held_rows(o, ["cpe-007"])[0] == "cpe-007 flotilla-down flotilla-8":
+            row = o.state.device_status.get("cpe-001")
+            got = row.status if row is not None else None
+            if counted(o) != u64(1) or got != status:
+                fail("after the loss: cpe-001 {got}, counted {counted(o)}")
+            else:
+                done = True
+                t.success()
+
+    def timeout() -> None:
+        fail("at stage {stage}")
+
+    t.timeout(8.0)
+    campaign = _now_campaign("run", HELD_MEMBERS)
+    campaign.failure_budget = Decimal.parse("0")
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, on_oper, None)
+    controller = ctl
+    ctl.on_conf(campaign, linked)
+    for name in HELD_MEMBERS:
+        report(name, "upgrade-needed")
+    ctl.on_subscriptions_synced()
+    after 6.0: timeout()
+
+
+actor _test_campaign_keeps_a_failed_member_of_a_lost_flotilla(t: testing.AsyncT):
+    _FlotillaLost(t, "failed")
+
+
+actor _test_campaign_keeps_a_member_in_flight_on_a_lost_flotilla(t: testing.AsyncT):
+    _FlotillaLost(t, "in-progress")
+
+
+actor _test_campaign_member_in_flight_that_reboots_publishes_nothing(t: testing.AsyncT):
+    """cpe-001 upgrades, and its flotilla loses and gets back its
+    connection to it, as in the reboot of the upgrade. The campaign does not
+    decide for that, so it publishes nothing."""
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var publications = 0
+    var released = False
+    names = ["cpe-001", "cpe-002"]
+
+    def report(connected: bool) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-001"), device_name="cpe-001"),
+                      _connected("in-progress", "now", connected), None)
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        publications += 1
+
+    def quiet(seen: int) -> None:
+        if publications == seen:
+            t.success()
+        else:
+            t.failure(ValueError("published {publications - seen} time(s) more"))
+
+    def reboot() -> None:
+        seen = publications
+        report(False)
+        report(True)
+        after float(cfs.campaign_debounce_s(len(names))) + 0.5: quiet(seen)
+
+    def on_output(out: gdata.Node) -> None:
+        if not released and _vetoed(out, "now").1 == ["cpe-001"]:
+            released = True
+            report(True)
+            # The decision for the in-progress status is in by then.
+            after float(cfs.campaign_debounce_s(len(names))) + 0.5: reboot()
+
+    t.timeout(6.0)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, on_oper, None)
+    controller = ctl
+    ctl.on_conf(_now_campaign("run", names), _flat_inventory(names, 600).to_gdata())
+    for name in names:
+        ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                   _connected("upgrade-needed", "now", True), None)
+    ctl.on_subscriptions_synced()
+
+
+actor _test_campaign_hears_whether_the_top_is_connected_to_a_flotilla(t: testing.EnvT):
+    """The campaign subscribes to the top's entries for the flotillas, in
+    the layer below it. When the top loses its connection to flotilla-8,
+    the campaign holds cpe-001, on flotilla-8, for flotilla-down. The
+    layer has no device states, so every member has not answered."""
+    registry = swdev.DeviceRegistry(
+        {cfs.FLOTILLA_TYPE: swdev.DeviceType(name=cfs.FLOTILLA_TYPE,
+                                             adapter_type=netconf.NetconfAdapter,
+                                             src_dnode=flotilla_dev.SRC_DNODE,
+                                             oper_src_dnode=flotilla_oper.SRC_DNODE)},
+        None, t.log_handler)
+    device = gdata.Id(y1_oper.NS_stratoweave_rfs, "device")
+    layer = ttt.Layer("1", ttt.Container({
+        device: ttt.List(ttt.Device(registry, t.log_handler),
+                         [gdata.Id(y1_oper.NS_stratoweave_rfs, "name")]),
+    }), None)
+    names = ["cpe-001", "cpe-002"]
+    want = ["cpe-001 flotilla-down flotilla-8", "cpe-002 not-answered None", "held 2"]
+    var last: list[str] = []
+    var campaign: ?cfs.UpgradeCampaignTransform = None
+    var done = False
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if oper is not None and not done:
+            last = _held_rows(oper!, names)
+            if last == want:
+                done = True
+                t.success()
+
+    def connected() -> bool:
+        """Whether the top's entry for flotilla-8 says that it is connected."""
+        tree = y1_oper.root.from_gdata(layer.get_data())
+        node = tree.device.get("flotilla-8")
+        if node is not None:
+            adapter = node.state.adapter.get(cfs.FLOTILLA_TYPE)
+            if adapter is not None:
+                up = adapter.connected
+                if up is not None and up:
+                    return True
+        return False
+
+    def disconnect() -> None:
+        if connected():
+            registry.get_or_create("flotilla-8").on_disconnect()
+        else:
+            after 0.05: disconnect()
+
+    def on_flotillas(result: value) -> None:
+        if isinstance(result, Exception):
+            fail("the flotillas were not added: {result}")
+            return
+        conf = _paced_campaign(names)
+        conf.admin_state = "plan"
+        made = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda c: None, on_oper,
+                                            layer.tree_provider())
+        campaign = made
+        made.on_conf(conf, _with_nightly(_flat_inventory(names)).to_gdata())
+        disconnect()
+
+    top = y_1.root()
+    for f in ["flotilla-8", "flotilla-9"]:
+        entry = top.device.create(f)
+        entry.type = cfs.FLOTILLA_TYPE
+        entry.credentials.username = "admin"
+        entry.mock.enabled = True
+    layer.edit_config(top.to_gdata(), on_flotillas)
+    after 2.5: fail("held: {last}")
 
 
 actor _test_campaign_holds_a_member_still_upgrading(t: testing.AsyncT):

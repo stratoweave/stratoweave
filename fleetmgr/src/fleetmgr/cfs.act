@@ -32,6 +32,35 @@ def flotilla_of(name: str) -> str:
     return "flotilla-{flotilla_index(name) + 1}"
 
 
+# The device type of the top's entry for a flotilla.
+FLOTILLA_TYPE = "flotilla"
+
+
+def device_live(flotilla: ?bool, device: ?bool) -> bool:
+    """Return whether a device is up: flotilla says whether the top is
+    connected to the device's flotilla, and device whether the flotilla is
+    connected to the device, each None while unknown. The device is down
+    when either is False."""
+    if flotilla is not None and not flotilla:
+        return False
+    if device is not None and not device:
+        return False
+    return True
+
+
+def held_status(reason: str, holder: str, flotilla: str, flotilla_up: ?bool,
+                device_up: ?bool) -> (str, str):
+    """Return the reason and the holder that a campaign publishes for a held
+    member, from the reason and the holder that its controller gives, ""
+    for no holder. flotilla is the member's flotilla, and flotilla_up and
+    device_up are as for device_live(). A member that is down only because
+    the top is not connected to its flotilla is held for flotilla-down, by
+    the flotilla."""
+    if reason == "down" and device_live(None, device_up) and not device_live(flotilla_up, None):
+        return ("flotilla-down", flotilla)
+    return (reason, holder)
+
+
 class Device(base.Device):
     def transform(self, i):
         o = base.o_root()
@@ -41,7 +70,7 @@ class Device(base.Device):
         # writes the same one, so the top connects to a flotilla once it has
         # a device.
         flotilla_dev = o.device.create(flotilla)
-        flotilla_dev.type = "flotilla"
+        flotilla_dev.type = FLOTILLA_TYPE
         flotilla_dev.sync_check = False
         port = supervisor.BASE_NETCONF_PORT + flotilla_index(i.name)
         flotilla_dev.address.create("primary", address="127.0.0.1", port=u64(port))
@@ -708,6 +737,11 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     and grow as devices finish without a failure. They stop while more
     members have failed than the campaign's failure budget.
 
+    The actor tells the controller which members are down: a member is
+    down while its flotilla is not connected to it, or while the top is not
+    connected to its flotilla. A connection that is not reported yet counts
+    as up. The actor publishes why the plan holds each held member.
+
     The actor writes the intent of every member directly, in plan and in
     run, with the campaign's veto. So each member reads the release it runs
     and answers, but installs nothing. In run, the actor removes the veto of
@@ -739,12 +773,19 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                                      ended: ?str, message: ?str),
                            precheck: (verdict: ?str, detail: ?str, at: ?str),
                            postcheck: (verdict: ?str, detail: ?str, at: ?str))] = {}
+    # Whether each device's flotilla is connected to it, and whether the top
+    # is connected to each flotilla, as they report it. A device or a
+    # flotilla that is not here has not reported.
+    var connected: dict[str, bool] = {}
+    var flotilla_up: dict[str, bool] = {}
     var subscriptions: ?ygdata.SubscriptionManager = None
     var subscriptions_synced = False
     # Set by shutdown, when the campaign is deleted.
     var closed = False
     var plan_layout: list[(str, int, int, list[(str, int, int)])] = []
     var plan_alarms: list[str] = []
+    # Why the plan holds each held member, and the holder.
+    var plan_why: dict[str, (str, str)] = {}
     # The prepares at the time of the plan, from the controller that made it.
     var plan_prepares = fctl.Prepares({}, 0, [])
     # What keeps members from their image, published after the plan alarms.
@@ -811,6 +852,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         p = shown.plan(now)
         plan_layout = shown.layout(p)
         plan_alarms = p.alarms
+        plan_why = p.why
         plan_prepares = shown.prepares(now)
 
     def publish() -> None:
@@ -821,6 +863,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         failed = 0
         preparing = 0
         prepared = 0
+        held = 0
 
         for d in members:
             status: ?str = None
@@ -873,12 +916,23 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 elif prepare == "done":
                     prepared += 1
 
+            why = plan_why.get(d)
+            if why is not None:
+                flotilla = flotilla_of(d)
+                h = held_status(why.0, why.1, flotilla, flotilla_up.get(flotilla),
+                                connected.get(d))
+                ds.held = h.0
+                if h.1 != "":
+                    ds.held_by = h.1
+                held += 1
+
         st.total = u64(len(members))
         st.in_progress = u64(in_progress)
         st.succeeded = u64(succeeded)
         st.failed = u64(failed)
         st.preparing = u64(preparing)
         st.prepared = u64(prepared)
+        st.held = u64(held)
 
         # The materialized plan: the same computation the transform actuates,
         # published so the layout is inspectable before and during the run.
@@ -909,8 +963,27 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     def forget(name: str) -> None:
         if name in latest:
             del latest[name]
+        if name in connected:
+            del connected[name]
         ctl.lost(name)
         ctl.report_prepare(name, None)
+
+    def live(name: str) -> bool:
+        """Return whether the device name is up."""
+        return device_live(flotilla_up.get(flotilla_of(name)), connected.get(name))
+
+    def take_live(name: str) -> bool:
+        """Tell the controller whether the member name is up, after a change.
+        Return True when the campaign must decide for the change. In plan,
+        any change can change the plan: the plan is that of a new run."""
+        if ctl.set_live(name, live(name)):
+            return True
+        return not running
+
+    def take_all_live() -> None:
+        """Tell the controller whether each member is up."""
+        for member in members:
+            ctl.set_live(member, live(member))
 
     def changed(relevant: bool) -> None:
         """Act on a change in what the members report, once per debounce: a
@@ -953,9 +1026,12 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         if error is not None:
             print("campaign status subscription failed at {path}: {error}", err=True)
             latest = {}
+            connected = {}
             ctl.lost_all()
+            take_all_live()
         elif keys is not None:
             name = keys.device_name
+            was = live(name)
             if state is not None:
                 pre = state.precheck
                 post = state.postcheck
@@ -980,9 +1056,43 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                                                          state.target_release, prep.release,
                                                          prep.state))
                     relevant = name in member_names
+                c = state.connected
+                if c is not None:
+                    connected[name] = c
+                elif name in connected:
+                    del connected[name]
             else:
                 forget(name)
                 relevant = name in member_names
+            if name in member_names and live(name) != was and take_live(name):
+                relevant = True
+        changed(relevant)
+
+    def on_flotilla(keys: ?(device_name: str, adapter_type: str),
+                    entry: ?y1_oper.stratoweave_rfs__device__state__adapter_entry,
+                    error: ?Exception) -> None:
+        """Take whether the top is connected to a flotilla, and tell the
+        controller about each member on it that goes down or comes up."""
+        relevant = error is not None
+        if error is not None:
+            print("campaign flotilla subscription failed at {path}: {error}", err=True)
+            flotilla_up = {}
+            take_all_live()
+        elif keys is not None:
+            f = keys.device_name
+            c: ?bool = None
+            if entry is not None:
+                c = entry.connected
+            if c != flotilla_up.get(f):
+                on_f = [m for m in members if flotilla_of(m) == f]
+                was = [live(m) for m in on_f]
+                if c is not None:
+                    flotilla_up[f] = c
+                else:
+                    del flotilla_up[f]
+                for i in range(len(on_f)):
+                    if live(on_f[i]) != was[i] and take_live(on_f[i]):
+                        relevant = True
         changed(relevant)
 
     def on_subscriptions_synced() -> None:
@@ -1028,6 +1138,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         shown = ctl
         plan_layout = ctl.layout(s.plan)
         plan_alarms = s.plan.alarms
+        plan_why = s.plan.why
         plan_prepares = s.prepares
         # Write only the members that went in flight or left it, and the
         # members let prepare or no longer let. A copy, so that the next
@@ -1085,6 +1196,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         # The controller forgets the members that left. Added again, a
         # member waits until it answers, and starts in a window.
         ctl.drop(left)
+        take_all_live()
         run_now = conf.admin_state == "run"
         if run_now and not running:
             ctl.start()
@@ -1140,10 +1252,16 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 want.add(statuses.dst(on_rfs).deliver({
                     statuses.subscribe(),
                 }))
+                adapters = y1_oper.subs.device.state.adapter
+                want.add(adapters.dst(on_flotilla).deliver({
+                    adapters.entry(FLOTILLA_TYPE).subscribe(),
+                }))
             else:
                 # A later subscription starts with a fresh rooted replay. Do
                 # not retain entries that may disappear while unsubscribed.
                 latest = {}
+                connected = {}
+                flotilla_up = {}
                 ctl.lost_all()
             subscriptions_synced = False
             subscriptions!.declare(want, synced=on_subscriptions_synced)

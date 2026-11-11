@@ -210,6 +210,23 @@ members from the campaign, which is also how a member is retried. Each
 member removed also makes the budget smaller: at 2 percent, 3 failed
 members of 100 stop the releases, and 2 of 99 still do.
 
+A member is down while its flotilla is not connected to it, or while the
+top is not connected to its flotilla. A member that has not connected
+since fleetmgr started is not down: the campaign holds it until it
+answers. The campaign holds a member that waits while it is down. It
+starts when it is back up, in its window if the window still fits, so a
+dead flotilla holds only its own members. When the top connects to a
+flotilla again, its members are up at once, with the states they had
+before, until the flotilla sends new ones. A member that the campaign
+releases then fails if its device is not connected yet. A member that
+goes down while it upgrades, as in the reboot of its upgrade, keeps its
+slot, and the plan's alarm names it when it is still down after its
+expected end. When the window of a held member closes, the member gets
+the next window of its schedule, and the plan's alarm names it until it
+starts. Each held member's `device-status` says why in `held`, and
+`held-by` names the device or the flotilla that holds it. The state's
+`held` counts them.
+
 With `allow-staging`, a campaign in `run` lets each member that needs the
 upgrade, and that the plan gives a window, prepare once before its window:
 the device copies its image, with no outage, while the campaign's veto
@@ -307,14 +324,17 @@ the whole list.
 
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription on the flotilla
-to the device's `/device/software/state` and `/device/state/platform`, and
+to the device's `/device/software/state` and `/device/state`, and
 publishes the status, the campaign and target release the status is for,
-the stage, reason and check verdicts in the entry's own `state` and the
-platform as its `state/platform`. A change on one device
+the stage, reason and check verdicts in the entry's own `state`, the
+platform as its `state/platform`, and whether the flotilla is connected to
+the device as `state/connected`. A change on one device
 publishes one entry. Removing the entry closes the subscription and clears
 the state. Each campaign transform subscribes to the `state` of every entry,
 one subscription, and aggregates its own members, each with the version and
-model its platform reports. Each `/fleet/device` actor subscribes to its RFS entry's
+model its platform reports. It also subscribes to the top's `/device`
+entries of the flotillas, to learn whether the top is connected to each
+flotilla. Each `/fleet/device` actor subscribes to its RFS entry's
 platform and publishes it as its own
 `state/platform`: OS, version, model and serial number.
 
