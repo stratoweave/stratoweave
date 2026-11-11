@@ -195,6 +195,21 @@ software state has no `upgrade-campaign`, and add the member again. The
 campaign then takes it as a new member: it holds it until it answers, and
 releases it in a window.
 
+With `failure-budget`, a campaign stops its releases when too many members
+fail. The budget is a percent of the members the campaign has, rounded
+down to whole devices: at 0.5, 5 of 1000 members may fail, and at 1, none
+of 50. A member has failed while its status for the campaign's intent is
+`failed` or `rolled-back`, as the `failed` counter counts it. A pause keeps
+the count. A restart of fleetmgr loses it, because the device status is not
+saved: a failed member answers again, and the campaign can release it. When
+more members have failed than the budget, no member starts or prepares: the
+members in flight finish, the others keep their windows, and the plan's
+alarm says "N device(s) failed, more than the failure budget of M: no more
+devices start". To go on, raise or remove the budget, or remove failed
+members from the campaign, which is also how a member is retried. Each
+member removed also makes the budget smaller: at 2 percent, 3 failed
+members of 100 stop the releases, and 2 of 99 still do.
+
 With `allow-staging`, a campaign in `run` lets each member that needs the
 upgrade, and that the plan gives a window, prepare once before its window:
 the device copies its image, with no outage, while the campaign's veto
