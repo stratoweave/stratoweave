@@ -2,15 +2,18 @@
 
 import type { KnownStatus } from './model';
 
+// A device that waits for its turn, whether it has answered or not.
+const WAITING = '#1d2c49';
+
 // Grey is kept free for devices that were unreachable from the start, a
 // status the model does not carry yet.
 export const CELL_COLOR: Record<KnownStatus, string> = {
-  pending: '#1d2c49',
-  unknown: '#1d2c49',
+  pending: WAITING,
+  unknown: WAITING,
   // Done like succeeded, which it counts into, but dimmer: the device was
   // on the target release already.
   'up-to-date': '#166534',
-  'upgrade-needed': '#3f3080',
+  'upgrade-needed': WAITING,
   'in-progress': '#22d3ee',
   succeeded: '#16a34a',
   failed: '#ef4444',
