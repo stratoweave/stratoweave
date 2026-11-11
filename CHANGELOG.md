@@ -463,6 +463,11 @@
   plan alarms name the members that are down, the members in flight that
   are still down after their expected end, and the held members that lost
   the window promised to them. [#794]
+- A campaign's new `notification-period`, in days, gives the customers of
+  its members time to be told about their window: the campaign uses only
+  the windows that open that long or more after it first went to `run`.
+  That time is the campaign's `state/run-since`, and a pause and a restart
+  of fleetmgr keep it. 0, the default, gives no notice.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -692,6 +697,10 @@
   device instead: `state/adapter` shows whether it is connected, and the
   inspection API's `/device/<name>/info` and `/device/<name>/log` show its
   queue and what was sent to it.
+- Fleet Manager has no `run-since` for a campaign from an earlier version.
+  A campaign in `run` gets the time Fleet Manager first starts on this
+  version, and a paused campaign the time it next goes to `run`. Its
+  `notification-period` counts from that time.
 
 ## [26.10] - 2026-10-23
 

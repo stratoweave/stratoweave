@@ -227,6 +227,20 @@ starts. Each held member's `device-status` says why in `held`, and
 `held-by` names the device or the flotilla that holds it. The state's
 `held` counts them.
 
+With `notification-period`, in days, a campaign uses only the windows that
+open that long or more after its `run-since`, so that the customers of its
+members can be told about their window in time. `run-since` is in the
+campaign's state: the time it first went to `run`. A pause and a restart of
+fleetmgr keep it, and deleting the campaign clears it. Before the first run,
+the plan counts from now. A window that opens earlier is left out, also when
+it closes later, and a campaign without a schedule opens its window at the
+end of the period. The prepares spread over the period, because the first
+window that the campaign uses is their deadline. A member added later, and a
+member that is up to date, gets no notice of its own: it gets the first
+window that the campaign uses. Raising `notification-period` during a run
+takes windows away: the members released in them keep them, and the others
+get the next window that is left.
+
 With `allow-staging`, a campaign in `run` lets each member that needs the
 upgrade, and that the plan gives a window, prepare once before its window:
 the device copies its image, with no outage, while the campaign's veto
@@ -234,10 +248,10 @@ holds the install. The first member prepares as soon as the campaign runs.
 The others follow, as far apart as their deadlines allow. In a campaign
 of thousands of members, the members whose turns fall in the same few
 seconds, up to 30, start together. A member's deadline is the opening of
-the next window of its schedule, less `close-margin` percent of its
-expected prepare time: 195 s at the IOS XE estimate of 130 s and the
-default 150. Members whose window opens first go first. No member prepares
-while a window of its schedule is open. In `plan` nothing is copied: the
+the next window of its schedule that the campaign uses, less `close-margin`
+percent of its expected prepare time: 195 s at the IOS XE estimate of 130 s
+and the default 150. Members whose window opens first go first. No member
+prepares while such a window is open. In `plan` nothing is copied: the
 plan shows each member's `prepare-start` in a run that starts now, and
 `prepare-concurrency`, the most copies at once. There is no cap on that
 number. `device-status` shows each member's `prepare`, and `preparing` and

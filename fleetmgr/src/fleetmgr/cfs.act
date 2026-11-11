@@ -15,6 +15,8 @@ import fleetmgr.layers.y_1_loose as y_1_loose
 import fleetmgr.layers.y_1_oper as y1_oper
 from fleetmgr.layers.y_1_oper import \
     stratoweave_rfs__rfs__device__state as FlotillaDeviceStatus
+from fleetmgr.layers.y_0 import \
+    software__software__upgrade_campaign__memory as CampaignMemory
 # TODO: required by the compiler, see acton issue #2390
 import yang.identityref
 import fleetmgr.layers.y_0_oper as y0_oper
@@ -268,8 +270,9 @@ def campaign_debounce_s(devices: int) -> int:
 
 _DAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6}
 
-# How far ahead the planner generates window occurrences. Nine days
-# covers a weekly rule with margin; longer recurrences come later.
+# How far ahead of now, or of a later notice cut, the planner generates
+# window occurrences. Nine days covers a weekly rule with margin; longer
+# recurrences come later.
 HORIZON_DAYS = 9
 
 # How long a running campaign waits at most before it decides again, so
@@ -277,15 +280,17 @@ HORIZON_DAYS = 9
 HORIZON_REFRESH = 86400
 
 
-def occurrences(sched: y_0.maintenance__schedules__schedule_entry, now: int) -> list[(int, int)]:
+def occurrences(sched: y_0.maintenance__schedules__schedule_entry, now: int,
+                cut: int=0) -> list[(int, int)]:
     """The schedule's absolute window occurrences over the horizon, as
     seconds since the Unix epoch: each rule opens at its local time of
     day on its listed weekdays, every day when none are listed. A window
     already open now is included, also one that opened on an earlier day
-    within the horizon; a closed one is not."""
+    within the horizon; a closed one is not, and neither is one that opens
+    before cut. The horizon starts at the later of now and cut."""
     out: list[(int, int)] = []
     off = int(sched.utc_offset) * 60
-    local_now = now + off
+    local_now = fctl.imax(now, cut) + off
     day0 = local_now - local_now % 86400
     for w in sched.window:
         at = int(w.at)
@@ -304,10 +309,21 @@ def occurrences(sched: y_0.maintenance__schedules__schedule_entry, now: int) -> 
                 if wd not in days:
                     continue
             start = local_day + at - off
-            if start + dur <= now:
+            if start + dur <= now or start < cut:
                 continue
             out.append((start, start + dur))
     return sorted(out)
+
+
+def notice_cut(period: int, run_since: ?int, now: int) -> int:
+    """Return the time from which a campaign with a notification period of
+    period days may use a window: run_since, the time the campaign first
+    went to run, or now before its first run, plus the period. Return 0
+    when the period is 0: every window counts."""
+    if period <= 0:
+        return 0
+    since = run_since if run_since is not None else now
+    return since + period * 86400
 
 
 class CampaignMembers(object):
@@ -407,33 +423,39 @@ def failure_budget_devices(percent: ?Decimal, members: int) -> int:
 
 def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_campaign_entry,
                        inventory: y_0.root, now: int,
-                       members: ?CampaignMembers=None) -> None:
+                       members: ?CampaignMembers=None, run_since: ?int=None) -> None:
     """Give the campaign's controller the windows, the devices and the
     limits that the campaign and the inventory give at time now. members
     is campaign_members() of the campaign and the inventory; without it,
-    configure_campaign() takes it again.
+    configure_campaign() takes it again. run_since is the time the
+    campaign first went to run, None before its first run.
 
-    A member device goes in the windows of its schedule. A campaign with
-    no default and no bound members gets one synthetic window that opens
-    at launch and never closes. The deadline cuts off the windows - the
-    synthetic one included - and every device must start before it when
-    the planner sees every window before it. So do the campaign's
-    allow-staging, each member's expected prepare time and the campaign's
-    failure budget, in devices of the members the campaign has now."""
+    A member device goes in the windows of its schedule that open at the
+    notice_cut() or later. A campaign with no default and no bound members
+    gets one synthetic window that opens at the cut, at launch without a
+    notification period, and never closes. The deadline cuts off the
+    windows - the synthetic one included - and every device must start
+    before it when the planner sees every window before it. So do the
+    campaign's allow-staging, each member's expected prepare time and the
+    campaign's failure budget, in devices of the members the campaign has
+    now."""
     m = members if members is not None else campaign_members(i, inventory)
     deadline = 0
     dl = i.deadline
     if dl is not None:
         deadline = int(dl)
+    cut = notice_cut(int(i.notification_period), run_since, now)
 
     windows: list[(str, int, int)] = []
     synthetic = len(m.referenced) == 0
     if synthetic:
-        windows.append(("default", 0, deadline if deadline > 0 else OPEN_END))
+        end = deadline if deadline > 0 else OPEN_END
+        if cut < end:
+            windows.append(("default", cut, end))
     for sname in m.referenced:
         sched = inventory.schedules.schedule.get(sname)
         if sched is not None:
-            for we in occurrences(sched, now):
+            for we in occurrences(sched, now, cut):
                 wstart = we.0
                 wend = we.1
                 if deadline > 0:
@@ -444,7 +466,8 @@ def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_
                         wend = deadline
                 windows.append((sname, wstart, wend))
 
-    must_place = deadline > 0 and (synthetic or deadline - now <= (HORIZON_DAYS - 1) * 86400)
+    must_place = deadline > 0 and (synthetic or
+                                   deadline - fctl.imax(now, cut) <= (HORIZON_DAYS - 1) * 86400)
     ctl.configure(windows, m.devices, int(i.target_concurrency), int(i.max_concurrency),
                   must_place, campaign_debounce_s(len(m.devices)), m.estimate, m.groups,
                   m.priority, m.separation, int(i.close_margin), int(i.stagger),
@@ -700,25 +723,54 @@ def prepare_for(campaign: str, target: ?str, tag_campaign: ?str, tag_target: ?st
     return None
 
 
+def kept_run_since(memory: ?CampaignMemory) -> ?int:
+    """Return the run-since in memory, the memory of a campaign, or None."""
+    if memory is not None:
+        r = memory.run_since
+        if r is not None:
+            return int(r)
+    return None
+
+
+def run_since_at(admin_state: str, kept: ?int, now: int) -> ?int:
+    """Return the run-since of a campaign in admin_state at time now, when
+    kept is the run-since it has: kept when it has one, now when the
+    campaign runs, and None otherwise."""
+    if kept is not None:
+        return kept
+    if admin_state == "run":
+        return now
+    return None
+
+
 class UpgradeCampaign(base.UpgradeCampaign):
-    def transform(self, i, linked, prev_output):
+    def transform(self, i, linked, memory, prev_output):
         """Return the software intent of campaign i for its members, as the
-        actor writes it. The members that prev_output, the output written
-        last, has in flight stay in flight, and the members it lets prepare
-        stay let. So an edit of the campaign, or of its linked input, keeps
-        what the actor wrote. An edit that turns allow-staging off, sets the
-        campaign to plan, or gives a member a new target release, stops
-        letting the member prepare.
+        actor writes it, and the campaign's memory. The members that
+        prev_output, the output written last, has in flight stay in flight,
+        and the members it lets prepare stay let. So an edit of the
+        campaign, or of its linked input, keeps what the actor wrote. An
+        edit that turns allow-staging off, sets the campaign to plan, or
+        gives a member a new target release, stops letting the member
+        prepare.
 
         The output gives each member in the fleet the campaign's name in the
         operator's transaction. So an edit that puts a device of the fleet
         in two campaigns fails: the two names do not merge. A member that is
         not in the fleet gets nothing, so two campaigns can name it. The
         edit that adds it to the fleet then fails, while both campaigns
-        name it."""
+        name it.
+
+        The memory that it returns keeps the run-since of memory, the
+        memory of the last commit. The edit that first sets the campaign to
+        run gives it the time of the edit."""
         inventory = y_0.root.from_gdata(linked)
         w = written_in(prev_output, i, inventory)
-        return campaign_config(i, inventory, w.0, w.1, None)
+        since = run_since_at(i.admin_state, kept_run_since(memory), time.time().unix_s())
+        out_memory: ?CampaignMemory = None
+        if since is not None:
+            out_memory = CampaignMemory(run_since=u64(since))
+        return (campaign_config(i, inventory, w.0, w.1, None), out_memory)
 
 
 actor UpgradeCampaignTransform(path: ttt.Path,
@@ -760,6 +812,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     or a window of its schedule opens, as the controller says. A prepare
     counts only when it is for the campaign's intent and copies the
     member's target release.
+
+    The actor takes run-since from the campaign's memory, gives the
+    controller the windows that the notification period lets the campaign
+    use from it, and publishes it.
     """
     var members: list[str] = []
     var member_names: set[str] = set()
@@ -791,6 +847,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     # What keeps members from their image, published after the plan alarms.
     var member_alarms: list[str] = []
     var running = False
+    # When the campaign first went to run, from the campaign's memory.
+    var run_since: ?int = None
     var active = False
     var generation = 0
     var debounce_armed = False
@@ -858,6 +916,9 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     def publish() -> None:
         oper = base.UpgradeCampaign.new_state(path)
         st = oper.state
+        since = run_since
+        if since is not None:
+            st.run_since = u64(since)
         in_progress = 0
         succeeded = 0
         failed = 0
@@ -1007,7 +1068,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         does not plan again."""
         current = campaign
         if not running and current is not None:
-            configure_campaign(ctl, current, inventory, now, member_info)
+            configure_campaign(ctl, current, inventory, now, member_info, run_since)
             plan_now(now)
 
     def publish_settled(gen: int) -> None:
@@ -1108,7 +1169,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             replan(time.time().unix_s())
             publish()
 
-    def shutdown() -> None:
+    def shutdown(memory: ?CampaignMemory=None) -> None:
         # The campaign is deleted: end its timers, stop hearing from its
         # members and clear its state.
         closed = True
@@ -1133,7 +1194,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         # The schedules give new windows as time passes.
         current = campaign
         if current is not None:
-            configure_campaign(ctl, current, inventory, t, member_info)
+            configure_campaign(ctl, current, inventory, t, member_info, run_since)
         s = ctl.decide(t)
         shown = ctl
         plan_layout = ctl.layout(s.plan)
@@ -1172,7 +1233,9 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             active = False
         publish()
 
-    def on_conf(conf: y_0.software__software__upgrade_campaign_entry, linked: ygdata.Node) -> None:
+    def on_conf(conf: y_0.software__software__upgrade_campaign_entry, linked: ygdata.Node,
+                memory: ?CampaignMemory=None) -> None:
+        run_since = kept_run_since(memory)
         ms = []
         names: set[str] = set()
         for member in conf.device:
@@ -1192,7 +1255,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         member_info = campaign_members(conf, inventory)
         # The released devices, the ramp and the promises stay: a replan
         # goes on from where the run is.
-        configure_campaign(ctl, conf, inventory, now, member_info)
+        configure_campaign(ctl, conf, inventory, now, member_info, run_since)
         # The controller forgets the members that left. Added again, a
         # member waits until it answers, and starts in a window.
         ctl.drop(left)
