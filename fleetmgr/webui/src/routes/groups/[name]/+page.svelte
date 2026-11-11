@@ -14,6 +14,7 @@
   <GroupEditor
     name={data.name}
     members={data.members}
+    otherGroups={data.otherGroups}
     campaignsOf={data.campaignsOf}
     separation={data.separation}
     hasEntry={data.hasEntry}

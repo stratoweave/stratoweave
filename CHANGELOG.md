@@ -470,6 +470,9 @@
   page, campaign, image, device or schedule by name. [#737]
 - The web UI has redundancy group pages: a list, one page per group with its
   members in upgrade order and its separation, and a page to create a group.
+  A member's priority can be typed there, or the member dragged to another
+  place, which sets the priorities that give that order. A change that
+  reorders another group of the device asks first.
   The device page sets a device's groups and priority, and the devices page
   shows and filters by group. The demo fleet pairs devices in groups. A
   campaign's page shows the groups of its members, each member in upgrade

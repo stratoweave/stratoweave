@@ -8,6 +8,7 @@ import { parseDuration } from '#lib/core/time.ts';
 import type { ValidationResult } from '#lib/core/validation/types.ts';
 import {
   DATA_ROOT,
+  DEFAULT_PRIORITY,
   FLEET_DEVICE_LIST_ROOT,
   type CampaignPlan,
   type Device,
@@ -353,6 +354,86 @@ export async function saveMembership(name: string, before: Membership, after: Me
     if (priorityChanged) rest['redundancy-priority'] = after.priority;
     return rest;
   });
+}
+
+/** Room left before or after a member moved to an end of the order. */
+const PRIORITY_STEP = 10;
+
+function keyBefore(pa: number, na: string, pb: number, nb: string): boolean {
+  return pa < pb || (pa === pb && na < nb);
+}
+
+/** The priorities to write so that the members upgrade in `order`, which
+ * is their order now with `moved` taken to another place. Only `moved`
+ * changes when a priority fits between its new neighbours; else the
+ * members from it on go up as far as needed, and only if that runs out of
+ * range is every member numbered again. */
+export function reorderPriorities(members: Device[], order: string[], moved: string): Map<string, number> {
+  const prio = new Map(members.map((d) => [d.name, d.priority]));
+  const at = (name: string) => prio.get(name) ?? DEFAULT_PRIORITY;
+  const i = order.indexOf(moved);
+  const prev = i > 0 ? order[i - 1] : null;
+  const next = i + 1 < order.length ? order[i + 1] : null;
+  const fits = (p: number): boolean =>
+    p >= 0 &&
+    p <= MAX_PRIORITY &&
+    (prev === null || keyBefore(at(prev), prev, p, moved)) &&
+    (next === null || keyBefore(p, moved, at(next), next));
+  const candidates =
+    prev !== null && next !== null
+      ? [Math.floor((at(prev) + at(next)) / 2), at(prev), at(next)]
+      : next !== null
+        ? [at(next) - PRIORITY_STEP, Math.floor(at(next) / 2), at(next) - 1, at(next)]
+        : prev !== null
+          ? [at(prev) + PRIORITY_STEP, at(prev) + 1, at(prev)]
+          : [];
+  const single = candidates.find(fits);
+  if (single !== undefined) return new Map([[moved, single]]);
+
+  const out = new Map<string, number>();
+  let last: [number, string] | null = prev === null ? null : [at(prev), prev];
+  for (let k = i; k < order.length; k++) {
+    const name = order[k];
+    if (k > i && last !== null && keyBefore(last[0], last[1], at(name), name)) break;
+    const p = last === null ? 0 : last[1] < name ? last[0] : last[0] + 1;
+    if (p > MAX_PRIORITY) return renumber(order, at);
+    if (p !== at(name)) out.set(name, p);
+    last = [p, name];
+  }
+  return out;
+}
+
+function renumber(order: string[], at: (name: string) => number): Map<string, number> {
+  const step = Math.max(1, Math.min(PRIORITY_STEP, Math.floor(MAX_PRIORITY / order.length)));
+  const out = new Map<string, number>();
+  order.forEach((name, k) => {
+    if ((k + 1) * step !== at(name)) out.set(name, (k + 1) * step);
+  });
+  return out;
+}
+
+/** The other groups of the changed members whose upgrade order the new
+ * priorities change: a device has one priority for all its groups. */
+export function reorderedGroups(
+  otherGroups: Map<string, Device[]>,
+  members: Device[],
+  changes: Map<string, number>
+): string[] {
+  const groups = new Set(members.filter((d) => changes.has(d.name)).flatMap((d) => d.groups));
+  const out: string[] = [];
+  for (const g of groups) {
+    const devices = otherGroups.get(g);
+    if (!devices) continue;
+    const after = devices.map((d) => ({ ...d, priority: changes.get(d.name) ?? d.priority })).sort(byUpgradeOrder);
+    if (after.some((d, k) => d.name !== devices[k].name)) out.push(g);
+  }
+  return out.sort(compareNames);
+}
+
+/** A PATCH merges, so it sets the priorities and keeps the rest. */
+export function priorityPatch(changes: Map<string, number>): FleetPatchJson {
+  const device = [...changes].map(([name, p]) => ({ name, 'redundancy-priority': p }));
+  return { 'fleetmgr:fleet': { device } };
 }
 
 export interface NewGroupInput {
