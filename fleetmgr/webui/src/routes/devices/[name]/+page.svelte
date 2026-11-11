@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import DeviceGroups from '#lib/software/DeviceGroups.svelte';
   import DevicePicture from '#lib/software/DevicePicture.svelte';
   import StageChain from '#lib/software/StageChain.svelte';
   import StatusPill from '#lib/software/StatusPill.svelte';
@@ -71,6 +72,12 @@
     } finally {
       savingSchedule = false;
     }
+  }
+
+  /** For the groups card: reads the device again and waits for it. */
+  async function reloadDevice(): Promise<void> {
+    await invalidate('data:device');
+    await data.device;
   }
 
   onMount(() => {
@@ -267,6 +274,10 @@
       {/if}
     </div>
   </section>
+
+  {#key device.name}
+    <DeviceGroups {device} reload={reloadDevice} />
+  {/key}
 {/if}
 
 <style>

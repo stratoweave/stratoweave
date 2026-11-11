@@ -21,12 +21,14 @@ async function loadFleet(
 }
 
 // ?schedule=NAME opens the list filtered to the devices bound to NAME,
-// ?name=TEXT with the name filter set to TEXT. The fleet is not awaited:
-// the page shows at once and fills in when it arrives.
+// ?group=NAME to the members of redundancy group NAME, ?name=TEXT with the
+// name filter set to TEXT. The fleet is not awaited: the page shows at once
+// and fills in when it arrives.
 export const load: PageLoad = ({ fetch, depends, url }) => {
   depends('data:software');
   return {
     scheduleFilter: url.searchParams.get('schedule') ?? '',
+    groupFilter: url.searchParams.get('group') ?? '',
     nameFilter: url.searchParams.get('name') ?? '',
     fleet: loadFleet(fetch)
   };

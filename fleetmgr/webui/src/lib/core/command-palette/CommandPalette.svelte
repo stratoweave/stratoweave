@@ -143,7 +143,7 @@
           onkeydown={handleKey}
           type="text"
           class="cmdk-input"
-          placeholder="Jump to a campaign, image, device or schedule…"
+          placeholder="Jump to a campaign, image, device, group or schedule…"
           autocomplete="off"
           spellcheck="false"
         />

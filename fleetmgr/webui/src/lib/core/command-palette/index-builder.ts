@@ -1,11 +1,14 @@
 import { restconfGetCachedOrNull } from '#lib/core/restconf/client.ts';
+import { devicesText, groupRows } from '#lib/software/groups.ts';
 import {
   FLEET_ROOT,
   IMAGES_ROOT,
+  REDUNDANCY_GROUPS_ROOT,
   SCHEDULES_ROOT,
   SOFTWARE_CONFIG,
   parseCampaigns,
   parseFleet,
+  parseGroupSeparations,
   parseImages,
   parseSchedules
 } from '#lib/software/model.ts';
@@ -23,6 +26,8 @@ export const NAVIGATION: PaletteEntry[] = [
   { id: 'nav:images', label: 'Images', href: '/images' },
   { id: 'nav:images:new', label: 'Add image', href: '/images/new' },
   { id: 'nav:devices', label: 'Devices', href: '/devices' },
+  { id: 'nav:groups', label: 'Redundancy groups', href: '/groups' },
+  { id: 'nav:groups:new', label: 'New group', href: '/groups/new' },
   { id: 'nav:schedules', label: 'Schedules', href: '/schedules' },
   { id: 'nav:schedules:new', label: 'New schedule', href: '/schedules/new' }
 ];
@@ -70,6 +75,18 @@ export const SOURCES: PaletteSource[] = [
     load: async () => {
       const { devices } = parseFleet(await restconfGetCachedOrNull<unknown>(FLEET_ROOT));
       return entries('devices', devices.map((d) => ({ name: d.name, description: d.address })));
+    }
+  },
+  {
+    category: 'Redundancy groups',
+    listHref: () => '/groups',
+    load: async () => {
+      const [fleet, groups] = await Promise.all([
+        restconfGetCachedOrNull<unknown>(FLEET_ROOT),
+        restconfGetCachedOrNull<unknown>(REDUNDANCY_GROUPS_ROOT)
+      ]);
+      const rows = groupRows(parseFleet(fleet).devices, parseGroupSeparations(groups));
+      return entries('groups', rows.map((r) => ({ name: r.name, description: devicesText(r.members.length) })));
     }
   },
   {

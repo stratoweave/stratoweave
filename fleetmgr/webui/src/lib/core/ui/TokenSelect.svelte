@@ -32,6 +32,9 @@
     id?: string;
     /** Sized like the compact inputs of a table row. */
     compact?: boolean;
+    /** Always the field with suggestions, also for a few options: for a
+     * caller that passes only the options that match what is typed. */
+    suggest?: boolean;
     onchange: (next: string[]) => void;
     /** More controls in the same row, after the field. They are sized like
      * the field. */
@@ -50,6 +53,7 @@
     describedby,
     id,
     compact = false,
+    suggest = false,
     onchange,
     children
   }: Props = $props();
@@ -61,7 +65,7 @@
   let root: HTMLElement | null = $state(null);
   let input: HTMLInputElement | null = $state(null);
   let counts = $derived(new Map(options.map((o) => [o.value, o.count])));
-  let toggles = $derived(options.length <= TOGGLE_MAX);
+  let toggles = $derived(!suggest && options.length <= TOGGLE_MAX);
   let shown = $derived(
     toggles
       ? [...options.map((o) => o.value), ...selected.filter((v) => !counts.has(v))]

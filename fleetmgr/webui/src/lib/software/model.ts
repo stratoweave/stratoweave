@@ -15,6 +15,8 @@ export const IMAGES_ROOT = 'data/stratoweave-images:images';
 export const IMAGE_LIST_ROOT = `${IMAGES_ROOT}/image`;
 export const FLEET_ROOT = 'data/fleetmgr:fleet';
 export const FLEET_DEVICE_LIST_ROOT = 'data/fleetmgr:fleet/device';
+export const REDUNDANCY_GROUPS_ROOT = 'data/fleetmgr:redundancy-groups';
+export const REDUNDANCY_GROUP_LIST_ROOT = `${REDUNDANCY_GROUPS_ROOT}/redundancy-group`;
 
 export type AdminState = 'plan' | 'run';
 
@@ -32,6 +34,8 @@ export interface DeviceJson {
   type?: string;
   description?: string;
   schedule?: string;
+  'redundancy-group'?: string[];
+  'redundancy-priority'?: number;
   'approval-required'?: boolean;
   address?: AddressJson[];
   credentials?: { username?: string; password?: string };
@@ -123,6 +127,16 @@ export interface CampaignJson {
   state?: CampaignStateJson;
 }
 
+export type SeparationPolicy = 'spread' | 'pack';
+
+/** /fleetmgr:redundancy-groups/redundancy-group entry: how far apart the
+ * members of a group upgrade. */
+export interface RedundancyGroupJson {
+  name: string;
+  'separation-policy'?: SeparationPolicy;
+  'min-separation'?: number;
+}
+
 /** /stratoweave-images:images/image entry. */
 export interface ImageJson {
   name: string;
@@ -163,6 +177,10 @@ export interface FleetPatchJson {
   'fleetmgr:fleet': {
     device?: DeviceJson[];
   };
+}
+
+export interface RedundancyGroupsPatchJson {
+  'fleetmgr:redundancy-groups': { 'redundancy-group': RedundancyGroupJson[] };
 }
 
 interface ImagesPatchJson {
@@ -224,6 +242,10 @@ export interface Device {
   model: string;
   version: string;
   serialNumber: string;
+  /** The redundancy groups it is a member of, as stored. */
+  groups: string[];
+  /** Where it comes in each of its groups: lower first. */
+  priority: number;
 }
 
 export type Verdict = 'not-run' | 'pass' | 'fail';
@@ -277,6 +299,16 @@ export interface CampaignCounters {
 /** YANG defaults; a GET omits leaves left at their default. */
 export const DEFAULT_TARGET_CONCURRENCY = 10;
 export const DEFAULT_MAX_CONCURRENCY = 50;
+export const DEFAULT_PRIORITY = 100;
+
+/** A group's entry under /redundancy-groups, or the defaults of a group
+ * that has none. */
+export interface GroupSeparation {
+  name: string;
+  policy: SeparationPolicy;
+  /** Seconds from when one member is done until the next may start. */
+  minSeparation: number;
+}
 
 export interface MaintenanceWindow {
   /** Local time of day the window opens, seconds after midnight. */
@@ -415,7 +447,9 @@ function parseDevice(entry: DeviceJson): Device {
     address: firstAddress(entry),
     model: entry.state?.platform?.model ?? '',
     version: entry.state?.platform?.version ?? '',
-    serialNumber: entry.state?.platform?.['serial-number'] ?? ''
+    serialNumber: entry.state?.platform?.['serial-number'] ?? '',
+    groups: entry['redundancy-group'] ?? [],
+    priority: entry['redundancy-priority'] === undefined ? DEFAULT_PRIORITY : num(entry['redundancy-priority'])
   };
 }
 
@@ -595,6 +629,18 @@ export function parseSchedules(json: unknown): Schedule[] {
   });
   schedules.sort((a, b) => a.name.localeCompare(b.name));
   return schedules;
+}
+
+/** Parse a GET of data/fleetmgr:redundancy-groups. */
+export function parseGroupSeparations(json: unknown): GroupSeparation[] {
+  const tree = (json as { 'fleetmgr:redundancy-groups'?: { 'redundancy-group'?: RedundancyGroupJson[] } })?.[
+    'fleetmgr:redundancy-groups'
+  ];
+  return (tree?.['redundancy-group'] ?? []).map((g) => ({
+    name: g.name,
+    policy: g['separation-policy'] === 'pack' ? 'pack' : 'spread',
+    minSeparation: num(g['min-separation'] ?? 0)
+  }));
 }
 
 /** Parse a GET of data/fleetmgr:fleet/device={name}. */

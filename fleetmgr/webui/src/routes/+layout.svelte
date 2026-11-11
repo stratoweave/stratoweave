@@ -41,16 +41,19 @@
     '/images/new': 'Add image',
     '/schedules': 'Schedules',
     '/schedules/new': 'New schedule',
+    '/groups': 'Redundancy groups',
+    '/groups/new': 'New group',
     '/config': 'Config',
     '/apply': 'Apply config'
   };
   // Detail pages sit under their list: /campaigns/<name>, /devices/<name>,
-  // /images/<name>, /schedules/<name>.
+  // /images/<name>, /schedules/<name>, /groups/<name>.
   const PARENTS: Record<string, string> = {
     '/campaigns/': 'Campaigns',
     '/images/': 'Images',
     '/devices/': 'Devices',
-    '/schedules/': 'Schedules'
+    '/schedules/': 'Schedules',
+    '/groups/': 'Redundancy groups'
   };
 
   let currentPathname = $derived(page.url.pathname);
@@ -117,6 +120,14 @@
         >
           <span class="nav-icon"><NavIcon name="devices" /></span>
           Devices
+        </a>
+        <a
+          class="nav-item"
+          class:active={activePathname.startsWith('/groups')}
+          href="/groups"
+        >
+          <span class="nav-icon"><NavIcon name="groups" /></span>
+          Redundancy groups
         </a>
       </div>
       <div class="nav-section">

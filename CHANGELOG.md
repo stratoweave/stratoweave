@@ -473,6 +473,20 @@
   RESTCONF PATCH, after a confirmation. [#736]
 - The web UI has a search, in the header or with Ctrl/⌘+K, that jumps to a
   page, campaign, image, device or schedule by name. [#737]
+- The web UI has redundancy group pages: a list, one page per group with its
+  members in upgrade order and its separation, and a page to create a group.
+  A member's priority can be typed there, or the member dragged to another
+  place, which sets the priorities that give that order. A change that
+  reorders another group of the device asks first.
+  The device page sets a device's groups and priority, and the devices page
+  shows and filters by group. The demo fleet pairs devices in groups. A
+  campaign's page shows the groups of its members, each member in upgrade
+  order with its status and time. Groups held behind a failed member come
+  first, with a button that takes that member out of the group.
+- The campaign page has Schedule and pace under the plan, folded each time
+  the page opens. The failed devices, the redundancy groups and the devices
+  fold too; only the failed devices start open. Folded, the redundancy
+  groups say how many of them are held.
 - The device page is redesigned around the device's upgrade run. [#674]
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for
