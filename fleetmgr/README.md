@@ -374,7 +374,9 @@ keeps waiting and refuses after 45 s; the device is then left on the old
 release. The post-check passes once the device is back at the baseline and
 refuses after 10 minutes, which aborts the activation. A fleet device's
 `upgrade-checks/precheck-wait` and `postcheck-wait` change those waits; the
-demo's `bgp-lost` devices wait a minute.
+demo's `bgp-lost` devices wait a minute. `upgrade-checks/enabled` false turns
+the checks off, for a device whose BGP state no adapter reads, such as IOS XE
+16.8 without NETCONF.
 
 Nothing is read from the device between checks and nothing is published
 but the verdicts, under `/device{cpe}/software/state/precheck` and
