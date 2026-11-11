@@ -467,7 +467,7 @@
   its members time to be told about their window: the campaign uses only
   the windows that open that long or more after it first went to `run`.
   That time is the campaign's `state/run-since`, and a pause and a restart
-  of fleetmgr keep it. 0, the default, gives no notice.
+  of fleetmgr keep it. 0, the default, gives no notice. [#795]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
