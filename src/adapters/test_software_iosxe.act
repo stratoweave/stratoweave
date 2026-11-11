@@ -1782,6 +1782,8 @@ COPY_DONE = "\r\nAccessing " + IMAGE_URL + "...\r\nLoading " + IMAGE_URL + " !!\
 ADD_COMMAND = "install add file bootflash:" + IMAGE_FILE
 ACTIVATE_COMMAND = "install activate auto-abort-timer 30 prompt-level none"
 ONE_SHOT_COMMAND = "install add file bootflash:" + IMAGE_FILE + " activate commit prompt-level none"
+OLD16_RELEASE = "16.08.01"
+OLD16_VERSION = "16.8.1.0.82"
 ADD_DONE = "\r\ninstall_add: START Tue Nov 10 09:43:02 UTC 2026\r\ninstall_add: Adding PACKAGE\r\nFinished Add\r\nSUCCESS: install_add  Tue Nov 10 09:45:02 UTC 2026\r\n"
 ACTIVATE_DONE = "\r\ninstall_activate: START Tue Nov 10 09:46:02 UTC 2026\r\nFinished Activate\r\nInstall will reload the system now!\r\nSUCCESS: install_activate  Tue Nov 10 09:48:02 UTC 2026\r\n"
 COMMIT_DONE = "\r\ninstall_commit: START Tue Nov 10 10:06:02 UTC 2026\r\nFinished Commit\r\nSUCCESS: install_commit  Tue Nov 10 10:06:12 UTC 2026\r\n"
@@ -1823,7 +1825,8 @@ def _test_cli_version_reads():
 actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
                   settled: action(xecli.CliMock, swdev.DeviceMgr, str) -> None,
                   short: bool=False, unsaved: bool=False, other_added: bool=False,
-                  boot_change: bool=False, staged_short: bool=False):
+                  boot_change: bool=False, staged_short: bool=False, old16: bool=False,
+                  added16: bool=False):
     """Drive a mock device whose NETCONF never connects, over the CLI only,
     from a software intent with a sha512 checksum to a settled status. The
     image is not on bootflash. The device runs OLD_RELEASE, in bundle mode
@@ -1836,7 +1839,9 @@ actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
     the device has added 17.15.04c until a remove. When boot_change, the
     device changed its configuration itself as it booted. When
     staged_short, the image is on bootflash from the start, with 100 MB
-    free, too little for its packages, until a remove."""
+    free, too little for its packages, until a remove. When old16, the
+    device runs 16.8.1 instead, in install mode. When added16 too, it has
+    added the target release until a remove."""
     var dev_ref: ?swdev.DeviceMgr = None
     var cli: ?xecli.CliMock = None
     var finished = False
@@ -1856,6 +1861,8 @@ actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
             c!.set_reply("dir bootflash:", DIR_EMPTY)
             if other_added and ADD_COMMAND not in commands:
                 c!.set_reply("show install summary", _summary(["IMG   C    " + OLD_VERSION]))
+            if added16 and ONE_SHOT_COMMAND not in commands:
+                c!.set_reply("show install summary", _summary(["IMG   C    " + OLD16_VERSION]))
         if ADD_COMMAND in commands:
             c!.set_reply("show install summary", _summary(["IMG   I    " + NEW_VERSION, "IMG   C    " + OLD_VERSION]))
         if ACTIVATE_COMMAND in commands or ONE_SHOT_COMMAND in commands:
@@ -1892,10 +1899,12 @@ actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
     def _run(d: swdev.DeviceMgr, c: xecli.CliMock) -> None:
         cli = c
         image = BUNDLE_IMAGE if bundle else "bootflash:packages.conf"
-        c.set_reply("show version", _show_version(OLD_RELEASE, image))
-        packages = [] if bundle else ["IMG   C    " + OLD_VERSION]
+        c.set_reply("show version", _show_version(OLD16_RELEASE if old16 else OLD_RELEASE, image))
+        packages = [] if bundle else ["IMG   C    " + (OLD16_VERSION if old16 else OLD_VERSION)]
         if other_added:
             packages = ["IMG   I    17.15.04c.0.107"] + packages
+        if added16:
+            packages = ["IMG   I    " + NEW_VERSION] + packages
         c.set_reply("show install summary", _summary(packages))
         listing = DIR_EMPTY
         if short:
@@ -1992,6 +2001,49 @@ actor _test_iosxe_cli_only_bundle_mode(t: testing.EnvT):
         except Exception as e:
             t.failure(e)
     _CliOnlyRun(t, "d-cli-bundle", True, settled)
+
+
+actor _test_iosxe_cli_only_from_16(t: testing.EnvT):
+    """A device that runs IOS XE 16 in install mode installs with one
+    command that adds, activates and commits, without boot statements."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands()
+                     if cmd.startswith("copy ") or cmd.startswith("install ") or cmd == "write memory"]
+            testing.assertEqual([COPY_COMMAND, ONE_SHOT_COMMAND, "install remove inactive"], steps)
+            testing.assertEqual([], c.get_configured())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-16", False, settled, old16=True)
+
+
+actor _test_iosxe_cli_only_from_16_removes_the_added_release(t: testing.EnvT):
+    """A device that runs IOS XE 16 and has added the target release removes
+    it first: the one command adds it again, from the image file."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands()
+                     if cmd.startswith("copy ") or cmd.startswith("install ") or cmd == "write memory"]
+            testing.assertEqual(["install remove inactive", COPY_COMMAND, ONE_SHOT_COMMAND, "install remove inactive"], steps)
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-16-added", False, settled, old16=True, added16=True)
+
+
+def _test_one_shot_install():
+    cases = [
+        ("16.8.1", "16.8.1", True),
+        ("16.12.4", "16.12.4", True),
+        ("17.9.5a", "17.9.5a", False),
+        ("17.15.06", "17.15.06", False),
+        ("unknown", None, False),
+    ]
+    for name, release, want in cases:
+        testing.assertEqual(want, swxe.one_shot_install(release), name)
 
 
 actor _test_iosxe_cli_only_makes_room(t: testing.EnvT):

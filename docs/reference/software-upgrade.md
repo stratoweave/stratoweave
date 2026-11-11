@@ -228,6 +228,12 @@ connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
   `packages.conf` and then the running image, `write memory` saves that,
   and `install add file ... activate commit` adds, activates and commits in
   one command. That release has no commit window and no abort.
+- A device that runs IOS XE 16 in install mode installs with the same one
+  command, over the CLI. On a C1111 with 16.8.1, `install activate` with
+  the auto-abort timer waited until its SSH session closed, and from
+  17.9.5a `install abort` back to 16.8.1 failed, so a commit window cannot
+  take the device back. A release that it has added is removed first: the
+  one command adds it again from the image file.
 
 The YANG for these RPCs and oper nodes is a trimmed copy in
 `src/adapters/software_iosxe_yang.act`. The bindings generated from it are in

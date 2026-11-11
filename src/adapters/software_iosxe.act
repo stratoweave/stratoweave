@@ -608,6 +608,16 @@ def other_added_version(root: ?ygdata.Node, release: str) -> ?str:
     return None
 
 
+def one_shot_install(release: ?str) -> bool:
+    """Return True if a device that runs release in install mode installs
+    with one command that adds, activates and commits, as a conversion
+    does. On a C1111 with IOS XE 16.8.1, install activate with an
+    auto-abort timer waited until its SSH session closed, and from the
+    activated 17.9.5a install abort back to 16.8.1 failed: a commit window
+    cannot take a device back to 16."""
+    return release is not None and release!.startswith("16.")
+
+
 def pending_other_version(root: ?ygdata.Node, release: str) -> ?str:
     """The version of another release than `release` that the device runs
     activated and not committed, as after a run that stopped before its
@@ -874,6 +884,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     var _passed: ?(file: str, stamp: str, check: str) = None
     # Install stages the image first, then adds it.
     var _then_add = False
+    # The device runs IOS XE 16 in install mode: one command adds,
+    # activates and commits the image.
+    var _one_shot = False
     # The conversion to install mode committed the release with its
     # activation, so commit has nothing left to do and abort cannot undo it.
     var _committed = False
@@ -1069,14 +1082,23 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         device has added needs no image file: activate uses the packages
         that the add made. Another release that a run added and did not
         activate is removed first, once: the device cannot add the target
-        next to it."""
+        next to it. A device that runs IOS XE 16 installs with one command
+        that adds too, so it needs the image file: a release that it has
+        added is removed first, once, like another one."""
         gen = _gen
         def on_versions(root: ?ygdata.Node, err: ?Exception) -> None:
             if gen != _gen:
                 return
             ver = added_version(root, _release) if err is None else None
             other = other_added_version(root, _release) if err is None else None
-            if ver is not None:
+            if ver is not None and one_shot_install(committed_release(root)):
+                if removed:
+                    _stage_file()
+                else:
+                    _log.info("software: removing the added release first, IOS XE 16 adds it again with one command",
+                              {"version": ver})
+                    _remove_inactive("restage")
+            elif ver is not None:
                 _log.info("software: release added already, no image needed", {"version": ver})
                 _staged()
             elif other is not None and not removed:
@@ -1338,6 +1360,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _filename = image_filename(url!)
         _activated_at = None
         _then_add = True
+        _one_shot = False
         _committed = False
         _abort_then_install = False
         _leaving = ""
@@ -1418,6 +1441,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             image = bundle_image(root)
             if image is not None:
                 _with_room(image)
+            elif one_shot_install(running_release(root)):
+                _one_shot = True
+                _with_room(None)
             else:
                 _add_unless_added()
         dev.get(on_version, cli_filter("version"))
@@ -1430,29 +1456,17 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         reloads, and the release is committed with the activation, so there
         is no commit window."""
         _enter("activate")
-        _want = _release
-        _committed = True
         gen = _gen
         lines = conversion_boot_lines(image)
         _log.info("software: converting to install mode, device will reload",
                   {"running": image, "file": _filename, "boot": lines})
-        def activated(err: ?Exception) -> None:
-            if gen != _gen:
-                return
-            if err is not None:
-                _fail(swdev.error_text(err!))
-                return
-            _activate_booting = True
-            after now reload_poll_period: _poll(gen)
         def saved(err: ?Exception) -> None:
             if gen != _gen:
                 return
             if err is not None:
                 _fail("write memory: " + swdev.error_text(err!))
                 return
-            _cli_install(activated, xecli_data.stratoweave_iosxe_cli__install__input(
-                add=xecli_data.stratoweave_iosxe_cli__install__input__add(
-                    "bootflash:" + _filename, activate=True, commit=True, prompt_level="none")))
+            _install_one_shot()
         def configured(err: ?Exception) -> None:
             if gen != _gen:
                 return
@@ -1461,6 +1475,28 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 return
             _cli.write_memory(saved)
         _cli.configure(configured, xecli_data.stratoweave_iosxe_cli__configure__input(lines))
+
+    def _install_one_shot() -> None:
+        """Add, activate and commit the image with one command, over the CLI.
+        The device reloads, and the release is committed with the
+        activation, so there is no commit window and no abort."""
+        _enter("activate")
+        _want = _release
+        _committed = True
+        gen = _gen
+        def activated(err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _fail(swdev.error_text(err!))
+                return
+            _activate_booting = True
+            after now reload_poll_period: _poll(gen)
+        if _one_shot:
+            _log.info("software: installing with one command, device will reload", {"file": _filename})
+        _cli_install(activated, xecli_data.stratoweave_iosxe_cli__install__input(
+            add=xecli_data.stratoweave_iosxe_cli__install__input__add(
+                "bootflash:" + _filename, activate=True, commit=True, prompt_level="none")))
 
     def _add_unless_added() -> None:
         """Activate the image when the device has added it already, as after
@@ -1523,6 +1559,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def _add_or_convert(image: ?str) -> None:
         if image is not None:
             _convert(image)
+        elif _one_shot:
+            _install_one_shot()
         else:
             _add()
 
