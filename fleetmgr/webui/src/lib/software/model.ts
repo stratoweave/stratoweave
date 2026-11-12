@@ -32,6 +32,8 @@ export const FLEET_SCHEDULES = `${FLEET_ROOT}?content=config&fields=device/sched
 export const CAMPAIGN_SETTINGS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign(name;admin-state;default-schedule)`;
 /** The campaigns that have devices, with the names of their devices only. */
 export const CAMPAIGN_MEMBERS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign/device/name`;
+/** The campaigns with their names and the images their devices use. */
+export const CAMPAIGN_IMAGES = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign(name;device/image)`;
 /** Every campaign with its admin state and the names of its devices, not
  * their images. */
 export const CAMPAIGN_LIST = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign(name;admin-state;device/name)`;

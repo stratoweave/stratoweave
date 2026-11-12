@@ -4,7 +4,7 @@ import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/c
 import { campaignsByImage } from '#lib/software/image-tree.ts';
 import {
   IMAGES_ROOT,
-  SOFTWARE_CONFIG,
+  CAMPAIGN_IMAGES,
   parseCampaignConfigs,
   parseImages,
   parseUrlBase
@@ -30,7 +30,7 @@ export const load: PageLoad = async ({ fetch, depends, url }) => {
       (listing) => ({ listing, error: '' }),
       (e: unknown) => ({ listing: null as ImageFolderListing | null, error: errorText(e, 'Failed to read the image folder.') })
     ),
-    restconfGetCachedOrNull<unknown>(SOFTWARE_CONFIG, fetch).then(
+    restconfGetCachedOrNull<unknown>(CAMPAIGN_IMAGES, fetch).then(
       (json) => campaignsByImage(parseCampaignConfigs(json)),
       () => null
     )
