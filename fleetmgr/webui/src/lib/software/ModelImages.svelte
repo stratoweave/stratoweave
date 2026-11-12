@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { imagesFor, type ModelGroup } from '#lib/software/campaign-images.ts';
+  import { imagesFor, targetSplit, type ModelGroup } from '#lib/software/campaign-images.ts';
   import type { CatalogImage } from '#lib/software/images.ts';
 
   interface Props {
@@ -23,7 +23,8 @@
       const choices = imagesFor(g.model, images);
       const pick = picks[g.model] ?? '';
       const chosen = choices.find((i) => i.name === pick) ?? null;
-      return { ...g, choices, chosen };
+      const split = chosen === null ? null : targetSplit(g.devices, chosen.version);
+      return { ...g, choices, chosen, split };
     })
   );
 
@@ -40,6 +41,7 @@
         <th class="col-devices right">Devices</th>
         <th>Image</th>
         <th class="col-version">Version</th>
+        <th class="col-split">Against the image</th>
       </tr>
     </thead>
     <tbody>
@@ -47,7 +49,7 @@
         {@const id = `${uid}-${index}`}
         <tr>
           <td class="mono model">{row.model}</td>
-          <td class="tn right" title={row.devices.join(', ')}>{row.devices.length.toLocaleString()}</td>
+          <td class="tn right" title={row.devices.map((d) => d.name).join(', ')}>{row.devices.length.toLocaleString()}</td>
           <td class="image-cell">
             {#if row.choices.length === 0}
               <span class="missing">No image lists this model.</span>
@@ -75,6 +77,22 @@
             {/if}
           </td>
           <td class="mono tn">{row.chosen?.version || '—'}</td>
+          <td class="split">
+            {#if row.split === null}
+              —
+            {:else}
+              {@const s = row.split}
+              {#if s.need.length > 0}
+                <span title={s.need.join(', ')}>{s.need.length.toLocaleString()} need it</span>
+              {/if}
+              {#if s.onTarget.length > 0}
+                <span class="on" title={s.onTarget.join(', ')}>{s.onTarget.length.toLocaleString()} already on it</span>
+              {/if}
+              {#if s.newer.length > 0}
+                <span class="newer" title={s.newer.join(', ')}>{s.newer.length.toLocaleString()} newer</span>
+              {/if}
+            {/if}
+          </td>
         </tr>
       {/each}
     </tbody>
@@ -91,7 +109,7 @@
 <style>
   .models {
     table-layout: fixed;
-    min-width: 640px;
+    min-width: 720px;
   }
 
   .col-model {
@@ -104,6 +122,28 @@
 
   .col-version {
     width: 14%;
+  }
+
+  .col-split {
+    width: 20%;
+  }
+
+  .split {
+    font-size: var(--sw-text-xs);
+    color: var(--sw-text-secondary);
+  }
+
+  .split span + span::before {
+    content: ' · ';
+    color: var(--sw-text-muted);
+  }
+
+  .split .on {
+    color: var(--sw-success);
+  }
+
+  .split .newer {
+    color: var(--sw-warning);
   }
 
   .right {

@@ -312,9 +312,17 @@ campaign page draws the plan as a timeline: each window is a band as wide
 as its duration, with one cell per device at its start on the wall
 clock, the real one once the controller has released the device; a marker
 shows now, and once the campaign runs the cells take the devices' live
-status; the same page changes the campaign's default schedule and its
-pace, set by a deadline or by how many devices upgrade at once, plus the
-most at once. The top serves the UI itself: the static build is embedded
+status, grey for a member held because it is down and amber for one held
+for another reason. Members that already run their target take no cell.
+The progress bar splits the members into upgraded, already up to date,
+in progress, failed, held, not answered and waiting, and names what holds
+the held ones. The same page changes the campaign's default schedule and
+its pace, set by a deadline or by how many devices upgrade at once, plus
+the most at once, its notification period and its failure budget. The new
+campaign page counts, for each model, the devices that already run the
+picked image or a newer release, and leaves out the ones that run it. The
+devices pages show whether each device can be reached. The top serves the
+UI itself: the static build is embedded
 in the `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so with
 `just demo` running the UI is at http://127.0.0.1:18200/. After a UI change,
 `just gen-webui` rebuilds the UI and regenerates that module (needs Node),

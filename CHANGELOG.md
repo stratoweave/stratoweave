@@ -691,6 +691,29 @@
   with them.
 - Fixed the campaign plan timeline drawing a crowded window past its end.
   Its columns grow taller instead. [#761]
+- The campaign page shows why members wait. Its progress bar splits the
+  members that it upgraded from those that were up to date already, and
+  the members that wait into held, not answered and waiting, and says what
+  holds the held ones: the device or its flotilla being down, a veto of
+  another holder, a member of its redundancy groups, or the failure budget.
+  Before, up-to-date members counted as succeeded, and every waiting member
+  as pending or unknown. The devices table says why each held member waits,
+  links the group member that holds it and filters by the reason. The plan
+  timeline draws members that are down grey and the other held members
+  amber, with a legend of the colours it shows, and leaves out the members
+  that already run their target, which are listed above it. The redundancy
+  groups take whom each member waits behind from the campaign, and offer to
+  take out only the failed members that others wait behind. A `pending`
+  member shows as not answered, and the device page names the attempt it
+  has not answered.
+- The campaign page sets the campaign's notification period and failure
+  budget, shows how many failures the budget allows and how many there
+  are, and when the campaign first ran.
+- The new campaign page shows, for each model, how many of the selected
+  devices already run the picked image and how many run a newer release.
+  It leaves out the devices that run their image, unless told not to, and
+  warns that the campaign would downgrade the newer ones.
+- The devices and device pages show whether each device can be reached.
 - fleetmgr and flotilla run Acton's generational garbage collector. Start
   them with `ACTON_GC_MODE=ordinary` for the ordinary collector. [#764]
 - Removed the unused `cpe-device` model. The IOS XE device type directory is

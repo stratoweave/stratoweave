@@ -20,9 +20,10 @@ export const REDUNDANCY_GROUP_LIST_ROOT = `${REDUNDANCY_GROUPS_ROOT}/redundancy-
 // nothing selected in it is left out, so a read that needs every entry
 // selects its key. Pages that share one of these share its cached read.
 /** A device entry as parseDevice reads it: no credentials or mock
- * settings, which are most of it, and of its state only the platform. */
+ * settings, which are most of it, and of its state only the platform and
+ * whether it can be reached. */
 export const DEVICE_FIELDS =
-  'name;type;description;schedule;address(address;port);redundancy-group;redundancy-priority;state/platform(model;version;serial-number)';
+  'name;type;description;schedule;address(address;port);redundancy-group;redundancy-priority;state(connected;platform(model;version;serial-number))';
 /** The fleet as parseFleet reads it. */
 export const FLEET_LIST = `${FLEET_ROOT}?fields=device(${DEVICE_FIELDS})`;
 /** The devices bound to a schedule, with the binding. Config only: the
@@ -60,7 +61,10 @@ export interface DeviceJson {
   address?: AddressJson[];
   credentials?: { username?: string; password?: string };
   mock?: { enabled?: boolean };
-  state?: { platform?: { version?: string; model?: string; 'serial-number'?: string } };
+  state?: {
+    platform?: { version?: string; model?: string; 'serial-number'?: string };
+    connected?: string;
+  };
 }
 
 interface CampaignMemberJson {
@@ -87,6 +91,12 @@ interface JobJson {
 interface DeviceStatusJson {
   device: string;
   status?: string;
+  /** The attempt the status is for. */
+  attempt?: number | string;
+  /** Why the member may not start now; absent when it may. */
+  held?: string;
+  /** The device or flotilla that holds it, when another one does. */
+  'held-by'?: string;
   /** What the device runs, from its platform. */
   version?: string;
   /** The chassis model, from its platform. */
@@ -135,12 +145,18 @@ interface PlanJson {
 }
 
 /** Counters are optional and do not sum to total: pending, unknown and
- * up-to-date devices fall into no counter. */
+ * upgrade-needed devices fall into no counter. succeeded includes
+ * up-to-date, which up-to-date counts again, and held overlaps the others:
+ * it counts the members that device-status gives a held reason. */
 interface CampaignStateJson {
+  /** Seconds since the Unix epoch: when the campaign first went to run. */
+  'run-since'?: number | string;
   total?: number;
   'in-progress'?: number;
   succeeded?: number;
+  'up-to-date'?: number;
   failed?: number;
+  held?: number;
   plan?: PlanJson;
   'device-status'?: DeviceStatusJson[];
 }
@@ -154,6 +170,10 @@ export interface CampaignJson {
   deadline?: number;
   'target-concurrency'?: number;
   'max-concurrency'?: number;
+  /** Days; a GET omits the default 0. */
+  'notification-period'?: number;
+  /** decimal64 percent, a string in RFC 7951 JSON; absent for none. */
+  'failure-budget'?: number | string;
   state?: CampaignStateJson;
 }
 
@@ -251,16 +271,56 @@ function normalizeStatus(raw: unknown): KnownStatus {
 export type StatusTone = 'accent' | 'success' | 'warning' | 'danger' | 'muted';
 
 export const STATUS_TONE: Record<KnownStatus, StatusTone> = {
-  pending: 'warning',
+  pending: 'muted',
   unknown: 'muted',
   'up-to-date': 'success',
-  'upgrade-needed': 'warning',
+  'upgrade-needed': 'muted',
   'in-progress': 'accent',
   succeeded: 'success',
   failed: 'danger',
   'rolled-back': 'danger',
   'not-started': 'danger'
 };
+
+/** How a status reads. pending is a member whose device has no status for
+ * the member's attempt: it has not answered the campaign's target. */
+export const STATUS_LABEL: Record<KnownStatus, string> = {
+  pending: 'not answered',
+  unknown: 'unknown',
+  'up-to-date': 'up-to-date',
+  'upgrade-needed': 'upgrade-needed',
+  'in-progress': 'in-progress',
+  succeeded: 'succeeded',
+  failed: 'failed',
+  'rolled-back': 'rolled-back',
+  'not-started': 'not-started'
+};
+
+/** Why a campaign holds a member, as device-status/held names it. */
+export const HELD_REASONS = [
+  'down',
+  'flotilla-down',
+  'not-answered',
+  'vetoed',
+  'group-failed',
+  'group-down',
+  'group-not-answered',
+  'group-vetoed',
+  'failure-budget'
+] as const;
+export type HeldReason = (typeof HELD_REASONS)[number];
+
+function parseHeld(raw: string | undefined): HeldReason | null {
+  return (HELD_REASONS as readonly (string | undefined)[]).includes(raw) ? (raw as HeldReason) : null;
+}
+
+/** Whether a fleet device can be reached, as /fleet/device/state/connected
+ * says; null while it has not connected since fleetmgr started. */
+export type Connection = 'connected' | 'device-down' | 'flotilla-down';
+
+function parseConnection(raw: string | undefined): Connection | null {
+  return raw === 'connected' || raw === 'device-down' || raw === 'flotilla-down' ? raw : null;
+}
 
 // ── Parsed view types ──
 
@@ -276,6 +336,8 @@ export interface Device {
   model: string;
   version: string;
   serialNumber: string;
+  /** Whether it can be reached; null until it first connects. */
+  connection: Connection | null;
   /** The redundancy groups it is a member of, as stored. */
   groups: string[];
   /** Where it comes in each of its groups: lower first. */
@@ -335,15 +397,27 @@ export interface DeviceStatusRow {
   install: Job;
   precheck: CheckResult;
   postcheck: CheckResult;
+  /** Why the campaign holds it; null when it may start, or has. */
+  held: HeldReason | null;
+  /** The device or flotilla that holds it; '' when none does. */
+  heldBy: string;
+  /** The attempt its status is for: the one in progress, or else the
+   * member's attempt. */
+  attempt: number;
 }
 
 export interface CampaignCounters {
   total: number;
   inProgress: number;
+  /** Includes upToDate. */
   succeeded: number;
+  /** Members that ran the target release already. */
+  upToDate: number;
   failed: number;
+  /** Members with a held reason, whatever their status. */
+  held: number;
   /** total - (inProgress + succeeded + failed), floored at 0: members that
-   * are pending or unknown (up-to-date counts into succeeded). Not an error. */
+   * wait, upgrade-needed, pending or unknown. Not an error. */
   remainder: number;
 }
 
@@ -412,22 +486,10 @@ export interface PlanWindow {
  * Members in no window are not actuated. */
 export interface CampaignPlan {
   windows: PlanWindow[];
-  /** The planner's alarms without its one alarm per device that fits no
-   * window: those devices are `unplaced`. */
+  /** The planner's alarms, which also name the members in no window. */
   alarms: string[];
+  /** The members in no window yet, by name. */
   unplaced: string[];
-}
-
-/** "3 devices do not fit their windows". */
-export function unplacedText(count: number): string {
-  return count === 1
-    ? '1 device does not fit its windows'
-    : `${count.toLocaleString()} devices do not fit their windows`;
-}
-
-/** The plan's alarms one per line, the unplaced devices as one line. */
-export function planAlarmLines(plan: CampaignPlan): string[] {
-  return plan.unplaced.length > 0 ? [...plan.alarms, unplacedText(plan.unplaced.length)] : plan.alarms;
 }
 
 export interface Campaign {
@@ -445,6 +507,12 @@ export interface Campaign {
   /** Devices upgrading at the same time. */
   targetConcurrency: number;
   maxConcurrency: number;
+  /** Days of notice before the first window the campaign uses. */
+  notificationPeriod: number;
+  /** Percent of the members that may fail; null for no budget. */
+  failureBudget: number | null;
+  /** Seconds since the Unix epoch: when it first went to run. */
+  runSince: number | null;
   counters: CampaignCounters | null;
   plan: CampaignPlan | null;
   deviceStatus: DeviceStatusRow[];
@@ -464,7 +532,7 @@ export interface DeviceCampaign {
 
 /** The published half of a campaign: counters, plan and one row per
  * member. */
-type CampaignState = Pick<Campaign, 'counters' | 'plan' | 'deviceStatus'>;
+type CampaignState = Pick<Campaign, 'counters' | 'plan' | 'deviceStatus' | 'runSince'>;
 
 /** A campaign without its published state. */
 export type CampaignConfig = Omit<Campaign, keyof CampaignState>;
@@ -473,6 +541,7 @@ export type CampaignConfig = Omit<Campaign, keyof CampaignState>;
  * member list: what the plan places, and one row per device it reports. */
 export interface StateParts {
   counters: CampaignCounters | null;
+  runSince: number | null;
   windows: PlanWindow[];
   alarms: string[];
   placed: Set<string>;
@@ -499,26 +568,28 @@ function parseDevice(entry: DeviceJson): Device {
     model: entry.state?.platform?.model ?? '',
     version: entry.state?.platform?.version ?? '',
     serialNumber: entry.state?.platform?.['serial-number'] ?? '',
+    connection: parseConnection(entry.state?.connected),
     groups: entry['redundancy-group'] ?? [],
     priority: entry['redundancy-priority'] === undefined ? DEFAULT_PRIORITY : num(entry['redundancy-priority'])
   };
 }
 
-function countersOf(total: number, inProgress: number, succeeded: number, failed: number): CampaignCounters {
-  return {
-    total,
-    inProgress,
-    succeeded,
-    failed,
-    remainder: Math.max(0, total - inProgress - succeeded - failed)
-  };
+function countersOf(c: Omit<CampaignCounters, 'remainder'>): CampaignCounters {
+  return { ...c, remainder: Math.max(0, c.total - c.inProgress - c.succeeded - c.failed) };
 }
 
 function parseCounters(state: CampaignStateJson | undefined): CampaignCounters | null {
   if (!state || typeof state.total !== 'number') {
     return null;
   }
-  return countersOf(state.total, state['in-progress'] ?? 0, state.succeeded ?? 0, state.failed ?? 0);
+  return countersOf({
+    total: state.total,
+    inProgress: state['in-progress'] ?? 0,
+    succeeded: state.succeeded ?? 0,
+    upToDate: state['up-to-date'] ?? 0,
+    failed: state.failed ?? 0,
+    held: state.held ?? 0
+  });
 }
 
 /** An absent check has not run. */
@@ -562,7 +633,10 @@ function parseRow(row: DeviceStatusJson): DeviceStatusRow {
     prepare: parseJob(row.prepare),
     install: parseJob(row.install),
     precheck: parseCheck(row.precheck),
-    postcheck: parseCheck(row.postcheck)
+    postcheck: parseCheck(row.postcheck),
+    held: parseHeld(row.held),
+    heldBy: row['held-by'] ?? '',
+    attempt: num(row.attempt)
   };
 }
 
@@ -586,8 +660,9 @@ function parseStateParts(state: CampaignStateJson): StateParts {
   }
   return {
     counters: parseCounters(state),
+    runSince: state['run-since'] == null ? null : num(state['run-since']),
     windows,
-    alarms: (state.plan?.alarm ?? []).filter((a) => !a.startsWith('unplannable: ')),
+    alarms: state.plan?.alarm ?? [],
     placed: new Set(windows.flatMap((w) => w.devices.map((d) => d.name))),
     rows
   };
@@ -601,6 +676,7 @@ export function joinState(parts: StateParts | null, members: string[]): Campaign
   const extra = parts === null ? [] : [...parts.rows.keys()].filter((device) => !memberSet.has(device));
   return {
     counters: parts?.counters ?? null,
+    runSince: parts?.runSince ?? null,
     plan:
       parts === null
         ? null
@@ -622,7 +698,9 @@ function parseCampaignConfig(entry: CampaignJson): CampaignConfig {
     defaultSchedule: entry['default-schedule'] ?? '',
     deadline: typeof entry.deadline === 'number' ? entry.deadline : null,
     targetConcurrency: entry['target-concurrency'] ?? DEFAULT_TARGET_CONCURRENCY,
-    maxConcurrency: entry['max-concurrency'] ?? DEFAULT_MAX_CONCURRENCY
+    maxConcurrency: entry['max-concurrency'] ?? DEFAULT_MAX_CONCURRENCY,
+    notificationPeriod: num(entry['notification-period'] ?? 0),
+    failureBudget: entry['failure-budget'] == null ? null : num(entry['failure-budget'])
   };
 }
 

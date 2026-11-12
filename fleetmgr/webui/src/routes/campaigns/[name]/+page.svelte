@@ -27,14 +27,18 @@
   import { formatEta } from '#lib/software/rate.ts';
   import { formatClock } from '#lib/core/time.ts';
   import { imageCounts } from '#lib/software/campaign-images.ts';
+  import { HELD_KINDS, HELD_KIND_LABEL, heldCounts, heldKind, type HeldKind } from '#lib/software/device-state.ts';
   import { nameMatcher } from '#lib/software/selection.ts';
+  import { alreadyOnTarget } from '#lib/software/stages.ts';
   import {
     CAMPAIGN_LIST_ROOT,
     DATA_ROOT,
     KNOWN_STATUSES,
+    STATUS_LABEL,
     adminStatePatch,
     joinState,
-    unplacedText,
+    type CampaignPlan,
+    type DeviceStatusRow,
     type KnownStatus,
     type Schedule
   } from '#lib/software/model.ts';
@@ -54,8 +58,11 @@
   let failedOpen = $state(true);
   let devicesOpen = $state(false);
   let paceOpen = $state(false);
-  let unplacedOpen = $state(false);
-  let filterStatus = $state<KnownStatus | ''>('');
+  let onTargetOpen = $state(false);
+  /** The devices table's filter: '' for all, one status or held kind, or
+   * the members in no window. */
+  type RowFilter = '' | `status:${KnownStatus}` | `held:${HeldKind}` | 'unplaced';
+  let filter = $state<RowFilter>('');
   let searchText = $state('');
   let page = $state(1);
 
@@ -98,8 +105,8 @@
       failedOpen = true;
       devicesOpen = false;
       paceOpen = false;
-      unplacedOpen = false;
-      filterStatus = '';
+      onTargetOpen = false;
+      filter = '';
       searchText = '';
       page = 1;
       planningEdit = null;
@@ -128,8 +135,44 @@
   let eta = $derived(shown?.eta ?? null);
   // A failed load stops showing once a later read got through.
   let loadError = $derived((shown?.seq ?? 0) > applied.seq ? '' : applied.loadError);
-  let statuses = $derived(
-    new Map<string, KnownStatus>((campaign?.deviceStatus ?? []).map((r) => [r.device, r.status]))
+  let rowsByName = $derived(
+    new Map<string, DeviceStatusRow>((campaign?.deviceStatus ?? []).map((r) => [r.device, r]))
+  );
+  let held = $derived(heldCounts(campaign?.deviceStatus ?? []));
+
+  // Members that ran the target already take no cell in the timeline: they
+  // have nothing to install, and are listed under the plan instead.
+  let onTarget = $derived(
+    (campaign?.deviceStatus ?? [])
+      .filter(alreadyOnTarget)
+      .map((r) => r.device)
+      .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+  );
+  let timelinePlan = $derived.by((): CampaignPlan | null => {
+    const plan = campaign?.plan ?? null;
+    if (plan === null || onTarget.length === 0) return plan;
+    const skip = new Set(onTarget);
+    const windows = plan.windows
+      .map((w) => ({ ...w, devices: w.devices.filter((d) => !skip.has(d.name)) }))
+      .filter((w) => w.devices.length > 0);
+    return { ...plan, windows };
+  });
+
+  // The failure budget in whole devices, rounded down as the campaign
+  // rounds it: 0.5 percent of 1000 members is 5.
+  let budget = $derived.by(() => {
+    const percent = campaign?.failureBudget ?? null;
+    if (percent === null || counters === null) return null;
+    const allowed = Math.floor((counters.total * Math.round(percent * 100)) / 10000);
+    return { percent, allowed, failed: counters.failed, over: counters.failed > allowed };
+  });
+
+  /** When the first window the campaign may use opens at the earliest:
+   * its notification period after it first ran, or after now before. */
+  let noticeFrom = $derived(
+    campaign && campaign.notificationPeriod > 0
+      ? (campaign.runSince ?? now) + campaign.notificationPeriod * 86400
+      : null
   );
 
   let savedPlanning = $derived(campaign ? planningOf(campaign) : null);
@@ -192,11 +235,18 @@
     return counts;
   });
 
+  let unplacedSet = $derived(new Set(campaign?.plan?.unplaced ?? []));
+
+  function passes(r: DeviceStatusRow, f: RowFilter): boolean {
+    if (f === '') return true;
+    if (f === 'unplaced') return unplacedSet.has(r.device);
+    if (f.startsWith('status:')) return `status:${r.status}` === f;
+    return r.held !== null && `held:${heldKind(r.held)}` === f;
+  }
+
   let filteredRows = $derived.by(() => {
     const matchName = nameMatcher(searchText.trim());
-    return (campaign?.deviceStatus ?? []).filter(
-      (r) => (!filterStatus || r.status === filterStatus) && matchName(r.device)
-    );
+    return (campaign?.deviceStatus ?? []).filter((r) => passes(r, filter) && matchName(r.device));
   });
   let paged = $derived(paginate(filteredRows, page, PAGE_SIZE));
 
@@ -210,7 +260,7 @@
       if (plan !== null && (plan.windows.length > 0 || plan.unplaced.length > 0)) {
         const placed = c.devices.length - plan.unplaced.length;
         const windows = `${plan.windows.length} window${plan.windows.length === 1 ? '' : 's'}`;
-        const missing = plan.unplaced.length > 0 ? `, ${plan.unplaced.length} not placed` : '';
+        const missing = plan.unplaced.length > 0 ? `, ${plan.unplaced.length} in no window yet` : '';
         return `Planned — ${placed} of ${c.devices.length} placed in ${windows}${missing}.`;
       }
       return 'Planned.';
@@ -218,8 +268,11 @@
     if (counters === null) return 'Running — no state reported yet.';
     if (counters.inProgress > 0)
       return `Running — ${counters.inProgress} of ${counters.total} installing.`;
-    if (counters.total > 0 && counters.remainder === 0)
-      return `No work outstanding — ${counters.succeeded} succeeded, ${counters.failed} failed.`;
+    if (counters.total > 0 && counters.remainder === 0) {
+      const upgraded = counters.succeeded - counters.upToDate;
+      const already = counters.upToDate > 0 ? `, ${counters.upToDate} already up to date` : '';
+      return `No work outstanding — ${upgraded} upgraded${already}, ${counters.failed} failed.`;
+    }
     return 'Running.';
   });
 
@@ -246,7 +299,8 @@
     if (!c || !confirmAction) return '';
     if (confirmAction === 'run') {
       const unplaced = c.plan?.unplaced.length ?? 0;
-      const placed = c.devices.length - unplaced;
+      const skip = new Set([...(c.plan?.unplaced ?? []), ...onTarget]);
+      const placed = c.devices.filter((d) => !skip.has(d)).length;
       const first = c.plan?.windows.find((w) => w.end === null || w.end > Date.now() / 1000);
       const opens =
         first && first.start > Date.now() / 1000
@@ -255,7 +309,8 @@
       return (
         `Start upgrading ${placed} device(s) to their images? Devices are released a few at a time as their windows open and completions come in. Real installs reload devices and take several minutes.` +
         opens +
-        (unplaced > 0 ? ` ${unplaced} device(s) do not fit the windows and are left alone.` : '')
+        (onTarget.length > 0 ? ` ${onTarget.length} device(s) already run their target and need nothing.` : '') +
+        (unplaced > 0 ? ` ${unplaced} device(s) are in no window yet and do not start.` : '')
       );
     }
     if (confirmAction === 'plan')
@@ -314,6 +369,17 @@
     <div>
       <h1>{campaign.name}</h1>
       <p class="summary">{summary}</p>
+      {#if campaign.runSince !== null || noticeFrom !== null}
+        <p class="since">
+          {#if campaign.runSince !== null}
+            First ran {formatClock(campaign.runSince)}.
+          {/if}
+          {#if noticeFrom !== null}
+            {campaign.notificationPeriod} day{campaign.notificationPeriod === 1 ? '' : 's'} of notice: it uses
+            windows from {formatClock(noticeFrom)}{campaign.runSince === null ? ', counted from now until it runs' : ''}.
+          {/if}
+        </p>
+      {/if}
     </div>
     <div class="page-actions">
       <button
@@ -360,7 +426,44 @@
 
   {#if counters !== null}
     <section class="card status-card" aria-label="Progress">
-      <CampaignProgress {counters} />
+      <CampaignProgress {counters} notAnswered={held.byKind.get('not-answered') ?? 0} />
+      {#if held.byKind.size > 0 || budget !== null}
+        <div class="held-foot">
+          {#if held.byKind.size > 0}
+            <p>
+              <span class="foot-label">Held</span>
+              {#each HELD_KINDS.filter((k) => held.byKind.has(k)) as kind, i (kind)}
+                {#if i > 0}<span class="sep">·</span>{/if}
+                <button
+                  class="link"
+                  type="button"
+                  onclick={() => {
+                    filter = `held:${kind}`;
+                    devicesOpen = true;
+                    page = 1;
+                  }}
+                >
+                  {held.byKind.get(kind)?.toLocaleString()} {HELD_KIND_LABEL[kind]}{kind === 'flotilla-down' &&
+                  held.flotillas.length > 0
+                    ? ` (${held.flotillas.join(', ')})`
+                    : ''}
+                </button>
+              {/each}
+            </p>
+          {/if}
+          {#if budget !== null}
+            <p class:over={budget.over}>
+              <span class="foot-label">Failure budget</span>
+              {#if budget.over}
+                {budget.failed} failed, more than the {budget.allowed} allowed ({budget.percent}%): no more devices
+                start.
+              {:else}
+                {budget.failed} of {budget.allowed} allowed failures ({budget.percent}%).
+              {/if}
+            </p>
+          {/if}
+        </div>
+      {/if}
       {#if campaign.adminState === 'run'}
         <div class="status-foot">
           <p class="rate">
@@ -392,36 +495,37 @@
         <h2 class="panel-title">Plan</h2>
         <span class="hint">estimates in your local time</span>
       </div>
-      {#if plan.alarms.length > 0 || plan.unplaced.length > 0}
+      {#if plan.alarms.length > 0}
         <ul class="alarms">
           {#each plan.alarms as alarm, i (i)}
             <li>{alarm}</li>
           {/each}
-          {#if plan.unplaced.length > 0}
-            <li class="unplaced-item">
-              <button
-                class="fold unplaced-fold"
-                type="button"
-                aria-expanded={unplacedOpen}
-                onclick={() => (unplacedOpen = !unplacedOpen)}
-              >
-                {unplacedText(plan.unplaced.length)}
-              </button>
-              {#if unplacedOpen}
-                <ul class="unplaced">
-                  {#each plan.unplaced as name (name)}
-                    <li><a class="mono" href={`/devices/${encodeURIComponent(name)}`}>{name}</a></li>
-                  {/each}
-                </ul>
-              {/if}
-            </li>
-          {/if}
         </ul>
       {/if}
-      {#if plan.windows.length > 0}
+      {#if onTarget.length > 0}
+        <div class="on-target">
+          <button
+            class="fold names-fold"
+            type="button"
+            aria-expanded={onTargetOpen}
+            onclick={() => (onTargetOpen = !onTargetOpen)}
+          >
+            {onTarget.length === 1 ? '1 device already runs' : `${onTarget.length.toLocaleString()} devices already run`} the
+            target: no upgrade
+          </button>
+          {#if onTargetOpen}
+            <ul class="names">
+              {#each onTarget as name (name)}
+                <li><a class="mono" href={`/devices/${encodeURIComponent(name)}`}>{name}</a></li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+      {/if}
+      {#if timelinePlan !== null && timelinePlan.windows.length > 0}
         <PlanTimeline
-          {plan}
-          {statuses}
+          plan={timelinePlan}
+          rows={rowsByName}
           {now}
           ondevice={(name) => goto(`/devices/${encodeURIComponent(name)}`)}
         />
@@ -443,10 +547,14 @@
     <section class="card">
       <h2 class="fold-heading">
         <button class="fold" type="button" aria-expanded={paceOpen} onclick={() => (paceOpen = !paceOpen)}>
-          Schedule and pace
+          Schedule, pace and limits
         </button>
         {#if !paceOpen}
-          <span class="hint">{planningDirty ? 'unsaved changes' : 'change the default schedule, a deadline or how many at once'}</span>
+          <span class="hint"
+            >{planningDirty
+              ? 'unsaved changes'
+              : 'change the default schedule, a deadline, how many at once, the notice or the failure budget'}</span
+          >
         {/if}
       </h2>
       {#if paceOpen}
@@ -534,11 +642,11 @@
         <div class="filter-row">
           <button
             class="chip"
-            class:active={filterStatus === ''}
+            class:active={filter === ''}
             type="button"
-            aria-pressed={filterStatus === ''}
+            aria-pressed={filter === ''}
             onclick={() => {
-              filterStatus = '';
+              filter = '';
               page = 1;
             }}
           >
@@ -548,18 +656,51 @@
             {#if statusCounts.get(status)}
               <button
                 class="chip"
-                class:active={filterStatus === status}
+                class:active={filter === `status:${status}`}
                 type="button"
-                aria-pressed={filterStatus === status}
+                aria-pressed={filter === `status:${status}`}
                 onclick={() => {
-                  filterStatus = status;
+                  filter = `status:${status}`;
                   page = 1;
                 }}
               >
-                {status} {statusCounts.get(status)}
+                {STATUS_LABEL[status]} {statusCounts.get(status)}
               </button>
             {/if}
           {/each}
+          {#if campaign.plan !== null && campaign.plan.unplaced.length > 0}
+            <button
+              class="chip"
+              class:active={filter === 'unplaced'}
+              type="button"
+              aria-pressed={filter === 'unplaced'}
+              onclick={() => {
+                filter = 'unplaced';
+                page = 1;
+              }}
+            >
+              in no window {campaign.plan.unplaced.length}
+            </button>
+          {/if}
+          {#if held.byKind.size > 0}
+            <span class="chip-sep" aria-hidden="true"></span>
+            {#each HELD_KINDS as kind (kind)}
+              {#if held.byKind.get(kind)}
+                <button
+                  class="chip held-chip"
+                  class:active={filter === `held:${kind}`}
+                  type="button"
+                  aria-pressed={filter === `held:${kind}`}
+                  onclick={() => {
+                    filter = `held:${kind}`;
+                    page = 1;
+                  }}
+                >
+                  held: {HELD_KIND_LABEL[kind]} {held.byKind.get(kind)}
+                </button>
+              {/if}
+            {/each}
+          {/if}
           <input
             class="input compact mono search"
             type="text"
@@ -628,6 +769,69 @@
 
   .status-foot .rate {
     margin: 0;
+  }
+
+  .since {
+    margin: 2px 0 0;
+    font-size: var(--sw-text-xs);
+    color: var(--sw-text-muted);
+  }
+
+  .held-foot {
+    display: grid;
+    gap: 4px;
+    margin-top: 12px;
+    font-size: var(--sw-text-xs);
+    color: var(--sw-text-secondary);
+  }
+
+  .held-foot p {
+    margin: 0;
+  }
+
+  .held-foot .over {
+    color: var(--sw-danger-text);
+  }
+
+  .foot-label {
+    margin-right: 8px;
+    font-weight: 600;
+    color: var(--sw-text-muted);
+  }
+
+  .sep {
+    margin: 0 6px;
+    color: var(--sw-text-muted);
+  }
+
+  .link {
+    padding: 0;
+    border: 0;
+    background: none;
+    font: inherit;
+    color: var(--sw-warning);
+    cursor: pointer;
+  }
+
+  .link:hover {
+    text-decoration: underline;
+  }
+
+  /* Like the alarms, but nothing is wrong. */
+  .on-target {
+    margin: 0 0 12px;
+    padding: 8px 14px;
+    border-radius: var(--sw-radius-md);
+    border: 1px solid rgb(var(--sw-success-rgb) / 0.25);
+    background: var(--sw-success-dim);
+    color: var(--sw-success);
+    font-size: var(--sw-text-sm);
+  }
+
+  .chip-sep {
+    width: 1px;
+    align-self: stretch;
+    background: var(--sw-border-default);
   }
 
   /* Same height as CampaignProgress's bar. */
@@ -728,13 +932,7 @@
     font-size: var(--sw-text-sm);
   }
 
-  /* The fold's chevron stands in for the bullet. */
-  .unplaced-item {
-    list-style: none;
-  }
-
-  .unplaced-fold {
-    margin-left: -18px;
+  .names-fold {
     min-height: 0;
     color: inherit;
     font-size: inherit;
@@ -742,12 +940,12 @@
     text-align: left;
   }
 
-  .unplaced-fold:hover {
+  .names-fold:hover {
     color: inherit;
     text-decoration: underline;
   }
 
-  .unplaced {
+  .names {
     display: flex;
     flex-wrap: wrap;
     gap: 4px 14px;
@@ -758,13 +956,13 @@
     list-style: none;
   }
 
-  .unplaced a {
+  .names a {
     color: var(--sw-text-secondary);
     font-size: var(--sw-text-xs);
     text-decoration: none;
   }
 
-  .unplaced a:hover {
+  .names a:hover {
     color: var(--sw-accent-bright);
     text-decoration: underline;
   }

@@ -1,9 +1,14 @@
 <script lang="ts">
+  import HeldText from '#lib/software/HeldText.svelte';
   import JobProgress from '#lib/software/JobProgress.svelte';
   import StageChain from '#lib/software/StageChain.svelte';
   import StatusPill from '#lib/software/StatusPill.svelte';
   import type { DeviceStatusRow } from '#lib/software/model.ts';
-  import { jobProgress, stageDetail } from '#lib/software/stages.ts';
+  import { jobDetail, jobProgress, stageDetail } from '#lib/software/stages.ts';
+
+  function deviceHref(name: string): string {
+    return `/devices/${encodeURIComponent(name)}`;
+  }
 
   interface Props {
     rows: DeviceStatusRow[];
@@ -28,7 +33,7 @@
       {#each rows as row (row.device)}
         {@const progress = jobProgress(row)}
         <tr>
-          <td><a class="device-name" href={`/devices/${encodeURIComponent(row.device)}`}>{row.device}</a></td>
+          <td><a class="device-name" href={deviceHref(row.device)}>{row.device}</a></td>
           <td><StatusPill status={row.status} raw={row.raw} /></td>
           <td><StageChain {row} /></td>
           <td>
@@ -46,7 +51,13 @@
                 <span class="mono percent">{progress}%</span>
               </span>
             {/if}
-            {stageDetail(row) || '—'}
+            {#if row.held !== null}
+              <!-- A member held before its window may prepare ahead of it. -->
+              {@const doing = jobDetail(row)}
+              <span class="held">held:</span> <HeldText {row} />{#if doing}{` · ${doing}`}{/if}
+            {:else}
+              {stageDetail(row) || '—'}
+            {/if}
           </td>
         </tr>
       {/each}
@@ -80,6 +91,10 @@
 
   /* Takes the spare width, but never so little that a long check result
      turns into a column of single words when the table scrolls. */
+  .held {
+    color: var(--sw-warning);
+  }
+
   .detail {
     width: 100%;
     min-width: 18rem;
