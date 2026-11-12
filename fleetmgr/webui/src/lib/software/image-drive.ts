@@ -29,14 +29,17 @@ function imagesOf(entry: DriveEntry, list: CatalogImage[]): CatalogImage[] {
 
 /** Move each entry to its path, one after the other: its file or folder in
  * the image folder, then, in one write, the file leaf of every image whose
- * file it takes along. `onmoved` hears how many entries are done. */
+ * file it takes along. When that write fails, the file or folder moves
+ * back, so the images keep a file at their path. `onmoved` hears how many
+ * entries are done. */
 export async function moveEntries(moves: Move[], onmoved: (done: number) => void = () => {}): Promise<void> {
   // The list as it is now, not as the page loaded it.
   const list = parseImages(await restconfGetOrNull<unknown>(IMAGES_ROOT));
   let done = 0;
   for (const { entry, to } of moves) {
     const from = entry.path;
-    if (entry.kind === 'folder' ? entry.onDisk : entry.file !== null) {
+    const onDisk = entry.kind === 'folder' ? entry.onDisk : entry.file !== null;
+    if (onDisk) {
       try {
         await moveImagePath(from, to);
       } catch (moveError) {
@@ -48,8 +51,15 @@ export async function moveEntries(moves: Move[], onmoved: (done: number) => void
       try {
         await restconfPatchJson(DATA_ROOT, imageFilesPatch(moved));
       } catch (listError) {
-        const names = moved.map((m) => m.name).join(', ');
-        throw new Error(`Moved ${from}, but the image list still has the old path for ${names}: ${errorText(listError, 'no reply')}`);
+        const why = errorText(listError, 'no reply');
+        if (!onDisk) throw new Error(`Could not give ${from} its new path in the image list: ${why}`);
+        try {
+          await moveImagePath(to, from);
+        } catch {
+          const names = moved.map((m) => m.name).join(', ');
+          throw new Error(`Moved ${from} to ${to}, but the image list still has the old path for ${names}: ${why}`);
+        }
+        throw new Error(`Did not move ${from}: the image list refused the new path: ${why}`);
       }
     }
     onmoved(++done);
