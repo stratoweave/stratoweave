@@ -1,3 +1,4 @@
+import file
 import logging
 import testing
 import time
@@ -9,6 +10,7 @@ from yang.type import Decimal
 import stratoweave
 import stratoweave.adapters.adapter as swadapt
 import stratoweave.adapters.netconf as netconf
+import stratoweave.db.lmdb as swlmdb
 import stratoweave.device as swdev
 import stratoweave.ttt as ttt
 from stratoweave.device_meta_config import \
@@ -32,6 +34,7 @@ from fleetmgr.layers.y_0 import \
     fleetmgr__fleet__device__credentials as InputCredentials, \
     fleetmgr__fleet__device__mock__module_entry as InputMockModule, \
     fleetmgr__fleet__device_entry as InputDevice, \
+    software__software__upgrade_campaign__memory as InputMemory, \
     software__software__upgrade_campaign_entry as InputCampaign
 from fleetmgr.layers.y_1_loose import \
     stratoweave_rfs__device_entry as OutputNode, \
@@ -376,7 +379,7 @@ def _test_campaign_function_renders_the_claim():
     for case in cases:
         campaign = _paced_campaign(names)
         campaign.admin_state = case.1
-        out = cfs.UpgradeCampaign().transform(campaign, linked, case.2).to_gdata()
+        out = cfs.UpgradeCampaign().transform(campaign, linked, None, case.2).0.to_gdata()
         vetoed, free, targeted, unnamed = _vetoed(out, "paced")
         testing.assertEqual(vetoed, case.3, case.0)
         testing.assertEqual(sorted(vetoed + free), names, case.0)
@@ -398,7 +401,7 @@ def _test_campaign_function_renders_the_claim():
         campaign.admin_state = case.1
         campaign.allow_staging = case.2
         lk = _with_version(_with_nightly(_flat_inventory(names)), case.3).to_gdata()
-        out = cfs.UpgradeCampaign().transform(campaign, lk, prev_staged).to_gdata()
+        out = cfs.UpgradeCampaign().transform(campaign, lk, None, prev_staged).0.to_gdata()
         vetoed, free, targeted, unnamed = _vetoed(out, "paced")
         testing.assertEqual(vetoed, names, case.0)
         testing.assertEqual(_staged(out), case.4, case.0)
@@ -1792,6 +1795,222 @@ def _test_campaign_deadline_beyond_the_horizon_keeps_the_concurrency():
     testing.assertEqual(conc, 10)
     testing.assertEqual(len(alarms), 1)
     testing.assertTrue(alarms[0].startswith("65 device(s) are in no window yet: "), alarms[0])
+
+
+def _test_notice_cut():
+    """The notice cut is run-since, or now before the first run, plus the
+    notification period in days. Without a notification period it is 0, so
+    every window counts."""
+    # (case, the notification period in days, run-since, now, the cut)
+    cases: list[(str, int, ?int, int, int)] = [
+        ("no notice", 0, None, 1000, 0),
+        ("no notice, in a run", 0, 500, 1000, 0),
+        ("a day, before the first run", 1, None, 1000, 1000 + 86400),
+        ("a day, in a run", 1, 500, 1000, 500 + 86400),
+        ("a week, in a run", 7, 500, 1000, 500 + 7 * 86400),
+        ("a day, passed", 1, 500, 500 + 3 * 86400, 500 + 86400),
+    ]
+    for case in cases:
+        testing.assertEqual(cfs.notice_cut(case.1, case.2, case.3), case.4, case.0)
+
+
+def _notice_windows(period: int, run_since: ?int, now: int) -> list[(str, int, int)]:
+    """The windows that the controller gets from a campaign with one member
+    and a notification period of period days, at time now: its schedule has
+    a 1 h window at 02:00 every day."""
+    linked = _flat_inventory(["d0"])
+    linked.schedules.schedule.create("day").window.create(u64(7200), duration=u64(3600))
+    campaign = InputCampaign(name="notice", admin_state="run", default_schedule="day",
+                             notification_period=u64(period))
+    campaign.device.create("d0", image=IMAGE)
+    ctl = fctl.Controller()
+    cfs.configure_campaign(ctl, campaign, linked, now, None, run_since)
+    return ctl.current
+
+
+def _test_campaign_uses_the_windows_from_the_notice_cut():
+    """A 1 h window at 02:00 every day, and now is midnight. The campaign
+    uses only the windows that open at the cut or later. It leaves out a
+    window that opens before the cut, also when the window closes after it.
+    The horizon starts at the cut, so a notice longer than the horizon
+    still gives windows."""
+    now = 10 * 86400
+    tonight = now + 7200
+    # (case, the notification period in days, run-since, the first and the
+    # last window's opening, and the number of windows)
+    cases: list[(str, int, ?int, int, int, int)] = [
+        ("no notice", 0, None, tonight, tonight + 8 * 86400, 9),
+        ("no notice, in a run", 0, now - 86400, tonight, tonight + 8 * 86400, 9),
+        ("a day, before the first run", 1, None, tonight + 86400, tonight + 9 * 86400, 9),
+        ("the cut at the opening", 1, tonight - 86400, tonight, tonight + 8 * 86400, 9),
+        ("the cut in the window", 1, tonight - 86400 + 1, tonight + 86400,
+         tonight + 8 * 86400, 8),
+        ("the cut at the close", 1, tonight - 86400 + 3600, tonight + 86400,
+         tonight + 8 * 86400, 8),
+        ("the cut passed", 1, now - 2 * 86400, tonight, tonight + 8 * 86400, 9),
+        ("a week", 7, None, tonight + 7 * 86400, tonight + 15 * 86400, 9),
+        ("past the horizon", 12, None, tonight + 12 * 86400, tonight + 20 * 86400, 9),
+    ]
+    for case in cases:
+        windows = _notice_windows(case.1, case.2, now)
+        testing.assertEqual(len(windows), case.5, case.0)
+        if len(windows) > 0:
+            testing.assertEqual((windows[0].1, windows[-1].1), (case.3, case.4), case.0)
+            testing.assertEqual([w.2 - w.1 for w in windows], [3600 for w in windows], case.0)
+
+
+def _test_campaign_without_a_schedule_opens_at_the_notice_cut():
+    """A campaign without a schedule gets one window that opens at the cut,
+    at 0 without a notice, and that closes at the deadline or never. A
+    deadline at the cut or before it leaves no window."""
+    now = 10 * 86400
+    # (case, the notification period in days, run-since, the deadline, and
+    # the windows)
+    cases: list[(str, int, ?int, ?int, list[(str, int, int)])] = [
+        ("no notice", 0, None, None, [("default", 0, cfs.OPEN_END)]),
+        ("no notice, a deadline", 0, None, now + 86400, [("default", 0, now + 86400)]),
+        ("a day, before the first run", 1, None, None, [("default", now + 86400, cfs.OPEN_END)]),
+        ("a day, in a run", 1, now - 100, None, [("default", now + 86300, cfs.OPEN_END)]),
+        ("a day, a deadline after the cut", 1, None, now + 2 * 86400,
+         [("default", now + 86400, now + 2 * 86400)]),
+        ("a day, a deadline at the cut", 1, None, now + 86400, []),
+        ("two days, a deadline before the cut", 2, None, now + 86400, []),
+    ]
+    for case in cases:
+        campaign = InputCampaign(name="anytime", admin_state="run",
+                                 notification_period=u64(case.1))
+        dl = case.3
+        if dl is not None:
+            campaign.deadline = u64(dl)
+        campaign.device.create("d0", image=IMAGE)
+        ctl = fctl.Controller()
+        cfs.configure_campaign(ctl, campaign, _flat_inventory(["d0"]), now, None, case.2)
+        testing.assertEqual(ctl.current, case.4, case.0)
+
+
+def _test_campaign_deadline_and_the_notice_cut():
+    """Two devices, a notification period of 5 days, and a deadline. A
+    deadline before the cut leaves the campaign no window, and the plan says
+    that the devices cannot start before the deadline. The planner sees
+    every window before the deadline when the deadline is at most 8 days
+    after the cut, so every device must start then."""
+    now = 10 * 86400
+    # (case, the schedule, or None for none, the deadline, whether every
+    # device must start, and the alarms)
+    cases: list[(str, ?str, int, bool, list[str])] = [
+        ("a schedule, the deadline before the cut", "day", now + 3 * 86400, True,
+         ["2 device(s) cannot start before the deadline even at max-concurrency 1: d0, d1"]),
+        ("no schedule, the deadline before the cut", None, now + 3 * 86400, True,
+         ["2 device(s) cannot start before the deadline even at max-concurrency 1: d0, d1"]),
+        ("a schedule, the deadline 7 days after the cut", "day", now + 12 * 86400, True, []),
+        ("a schedule, the deadline 10 days after the cut", "day", now + 15 * 86400, False, []),
+    ]
+    for case in cases:
+        campaign, linked = _daily_campaign("dl", 2, case.2, 1, 1)
+        campaign.default_schedule = case.1
+        campaign.notification_period = u64(5)
+        layout, alarms, conc = _plan(campaign, linked, now)
+        testing.assertEqual(alarms, case.4, case.0)
+        ctl = fctl.Controller()
+        cfs.configure_campaign(ctl, campaign, linked, now)
+        testing.assertEqual(ctl.must_place, case.3, case.0)
+
+
+def _test_campaign_notice_raised_in_a_run():
+    """20 devices of 10 min, a 1 h window at midnight every day, 10 at once,
+    in a run without a notice. The first decision releases d0 and promises
+    the others tonight's window. A notification period of 2 days, set 10 s
+    later, takes tonight's window and tomorrow's away. d0 keeps its window,
+    and the others get the first window that is left."""
+    campaign, linked = _daily_campaign("raise", 20, None, 10, 10)
+    campaign.admin_state = "run"
+    ctl = fctl.Controller()
+    cfs.configure_campaign(ctl, campaign, linked, 0, None, 0)
+    sim.answer_all(ctl, 0)
+    ctl.start()
+    s = ctl.decide(0)
+    testing.assertEqual(s.started, ["d0"])
+    testing.assertEqual([win.1 for win in ctl.layout(s.plan)], [0])
+    campaign.notification_period = u64(2)
+    cfs.configure_campaign(ctl, campaign, linked, 10, None, 0)
+    p = ctl.plan(10)
+    layout = ctl.layout(p)
+    testing.assertEqual([(win.1, len(win.3)) for win in layout], [(0, 1), (2 * 86400, 19)])
+    testing.assertEqual([entry.0 for entry in layout[0].3], ["d0"])
+    testing.assertEqual(p.alarms, [])
+
+
+def _test_campaign_prepares_spread_over_the_notice():
+    """Three members with allow-staging and a 1 h window at midnight every
+    day, planned at 02:00, after tonight's window closed. The first window
+    that the campaign uses is the deadline of the prepares. Without a
+    notice, that is the window a day from now, so the prepares start within
+    a day. With a notice of two days, it is the window three days from now,
+    so the prepares spread over the notice."""
+    now = 10 * 86400 + 7200
+    # (case, the notification period in days, and whether the last prepare
+    # starts more than a day from now)
+    cases: list[(str, int, bool)] = [
+        ("no notice", 0, False),
+        ("two days", 2, True),
+    ]
+    for case in cases:
+        campaign, linked = _daily_campaign("prep", 3, None, 1, 1)
+        campaign.allow_staging = True
+        campaign.notification_period = u64(case.1)
+        ctl = fctl.Controller()
+        cfs.configure_campaign(ctl, campaign, linked, now)
+        sim.answer_all(ctl, now)
+        ctl.start()
+        ctl.plan(now)
+        starts = ctl.prepares(now).starts
+        testing.assertEqual(sorted(list(starts.keys())), ["d0", "d1", "d2"], case.0)
+        last = now
+        for s in starts.values():
+            last = fctl.imax(last, s)
+        testing.assertEqual(last > now + 86400, case.2, "{case.0}: the last starts at {last - now}")
+
+
+def _test_campaign_function_keeps_run_since():
+    """The campaign's transform function keeps run-since in the campaign's
+    memory. The edit that first sets the campaign to run sets it to the time
+    of the edit. A later edit, a recompute, and a pause keep it. A campaign
+    from an earlier version has no memory, so its first recompute or edit
+    in run sets it."""
+    names = ["cpe-1"]
+    linked = _with_nightly(_flat_inventory(names)).to_gdata()
+    # (case, admin-state, the run-since in the memory, and the run-since
+    # that the function keeps, or -1 for the time of the edit)
+    cases: list[(str, str, ?int, ?int)] = [
+        ("plan, before the first run or from an earlier version", "plan", None, None),
+        ("the first run, or a run from an earlier version", "run", None, -1),
+        ("an edit or a recompute in run", "run", 50, 50),
+        ("a pause", "plan", 50, 50),
+        ("run after a pause", "run", 50, 50),
+    ]
+    for case in cases:
+        campaign = _paced_campaign(names)
+        campaign.admin_state = case.1
+        memory: ?gdata.Node = None
+        kept = case.2
+        if kept is not None:
+            memory = InputMemory(run_since=u64(kept)).to_gdata()
+        before = time.time().unix_s()
+        out = cfs.UpgradeCampaign().transform_wrapper(campaign.to_gdata(), linked, memory, None,
+                                                      None)
+        later = time.time().unix_s()
+        got: ?int = None
+        m = out.1
+        if m is not None:
+            r = InputMemory.from_gdata(m).run_since
+            if r is not None:
+                got = int(r)
+        want = case.3
+        if want is not None and want == -1:
+            testing.assertTrue(got is not None and got! >= before and got! <= later,
+                               "{case.0}: {got} in {before}..{later}")
+        else:
+            testing.assertEqual(got, want, case.0)
 
 
 def _bind(linked: y_0.root, name: str, schedule: str) -> None:
@@ -3731,7 +3950,7 @@ actor _PrepareTurn(t: testing.AsyncT, event: str):
         elif event == "image":
             last = turn
             if last is not None:
-                again = cfs.UpgradeCampaign().transform(soon.0, newer, last).to_gdata()
+                again = cfs.UpgradeCampaign().transform(soon.0, newer, None, last).0.to_gdata()
                 if _staged(again) != []:
                     fail("after the image change the function lets {_staged(again)} prepare")
                 else:
@@ -4132,3 +4351,231 @@ actor _test_campaign_image_change_ends_the_prepare_alarm(t: testing.AsyncT):
     """A new image version makes the prepares of the old target stale: the
     alarm for a failed prepare goes, and a done prepare no longer counts."""
     _PrepareAlarm(t, "image")
+
+
+actor _NoticePlan(t: testing.AsyncT, paused: bool):
+    """Plan a campaign called paced, in plan, with cpe-1 and a notification
+    period of a day. Its schedule has a window that opens an hour from now
+    every day. Paused, the campaign has a run-since of a day ago less one
+    second in its memory, so its notice cut is a second from now. Before
+    its first run it has no memory and plans a run that starts now, so its
+    cut is a day from now. cpe-1 answers before the sync, and the sync plans
+    again. Pass t when each plan up to the one with the answer starts with
+    the first window after the cut, and the campaign publishes the
+    run-since of its memory."""
+    start = time.time().unix_s()
+    since = start - 86400 + 1
+    first = start + 3600 if paused else start + 3600 + 86400
+    var done = False
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        want: ?int = None
+        if paused:
+            want = since
+        got: ?int = None
+        r = o.state.run_since
+        if r is not None:
+            got = int(r)
+        starts = sorted([int(w.start) for w in o.state.plan.window])
+        ds = o.state.device_status.get("cpe-1")
+        if got != want:
+            fail("run-since {got}, not {want}")
+        elif len(starts) == 0 or starts[0] != first:
+            fail("the windows open {[s - start for s in starts]} s from now, not {first - start}")
+        elif ds is not None and ds.status == "upgrade-needed":
+            done = True
+            t.success()
+
+    linked = _flat_inventory(["cpe-1"])
+    sched = linked.schedules.schedule.create("nightly")
+    sched.window.create(u64((start + 3600) % 86400), duration=u64(600))
+    conf = _paced_campaign(["cpe-1"])
+    conf.admin_state = "plan"
+    conf.notification_period = u64(1)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("paced"), lambda o: None, on_oper, None)
+    ctl.on_conf(conf, linked.to_gdata(), InputMemory(run_since=u64(since)) if paused else None)
+    ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+               _tagged("upgrade-needed", "paced", "17.18.03a"), None)
+    ctl.on_subscriptions_synced()
+    after 2.0: fail("the campaign published no plan with the answer of cpe-1")
+
+
+actor _test_campaign_in_plan_plans_from_now_and_the_notice(t: testing.AsyncT):
+    _NoticePlan(t, False)
+
+
+actor _test_campaign_in_a_pause_plans_from_its_run_since(t: testing.AsyncT):
+    _NoticePlan(t, True)
+
+
+actor _NoticeRelease(t: testing.AsyncT, period: int):
+    """Run a campaign called paced with cpe-1, one at a time, and a
+    notification period of period days. Its run began a day ago, less one
+    second. Its schedule has a window that opened a minute ago and is open
+    for 30 min, and a window that opens 3 s from now. cpe-1 needs the
+    upgrade. Pass t when the campaign releases cpe-1: with no notice before
+    the second window opens, and with a day of notice once it opens."""
+    start = time.time().unix_s()
+    var done = False
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "paced")
+        if free == ["cpe-1"]:
+            at = time.time().unix_s() - start
+            released_in_time = False
+            if period == 0 and at < 3:
+                released_in_time = True
+            elif period > 0 and at >= 3:
+                released_in_time = True
+            if released_in_time:
+                done = True
+                t.success()
+            else:
+                fail("with a notice of {period} day(s), cpe-1 was released after {at} s")
+
+    linked = _flat_inventory(["cpe-1"])
+    sched = linked.schedules.schedule.create("nightly")
+    sched.window.create(u64((start - 60) % 86400), duration=u64(1800))
+    sched.window.create(u64((start + 3) % 86400), duration=u64(1800))
+    conf = _paced_campaign(["cpe-1"])
+    conf.target_concurrency = u64(1)
+    conf.max_concurrency = u64(1)
+    conf.notification_period = u64(period)
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("paced"), on_output, lambda o: None, None)
+    ctl.on_conf(conf, linked.to_gdata(), InputMemory(run_since=u64(start - 86400 + 1)))
+    ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+               _tagged("upgrade-needed", "paced", "17.18.03a"), None)
+    ctl.on_subscriptions_synced()
+    after 6.0: fail("with a notice of {period} day(s), cpe-1 was not released")
+
+
+actor _test_campaign_without_notice_releases_in_the_open_window(t: testing.AsyncT):
+    _NoticeRelease(t, 0)
+
+
+actor _test_campaign_releases_in_the_first_window_after_the_notice(t: testing.AsyncT):
+    _NoticeRelease(t, 1)
+
+
+actor _test_campaign_keeps_run_since_through_a_pause_and_a_restart(t: testing.EnvT):
+    """A campaign keeps the time of the edit that first set it to run as
+    run-since. It is set to plan and to run again more than a second later.
+    Then fleetmgr restarts: a new layer stack restores the database of the
+    first, and recomputes. The campaign publishes the first run-since again,
+    so the pause did not set it again, and the database kept it."""
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    db_path = fs.mktmpdir("test_campaign_run_since_")
+    cap = file.WriteFileCap(fc)
+    var db = swlmdb.LmdbStore(cap, db_path)
+    var layer = sysspec.get_layers(
+        swdev.DeviceRegistry(sysspec.device_types, log_handler=t.log_handler), t.log_handler, db)
+    var first = -1
+    var done = False
+    root = y_0.root()
+    campaign = root.software.upgrade_campaign.create("kept", admin_state="run",
+                                                     notification_period=u64(2))
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def published() -> ?int:
+        """The run-since that the campaign publishes, or None."""
+        c = y0_oper.root.from_gdata(layer.get_data()).software.upgrade_campaign.get("kept")
+        if c is not None:
+            r = c.state.run_since
+            if r is not None:
+                return int(r)
+        return None
+
+    def cleanup() -> None:
+        await async db.db.close()
+        await async fs.rmtree(db_path)
+        await async fs.rmdir(db_path)
+
+    def restored_published(tries: int) -> None:
+        got = published()
+        if got is not None:
+            cleanup()
+            if got == first:
+                done = True
+                t.success()
+            else:
+                fail("after the restart, run-since is {got}, not {first}")
+        elif tries > 0:
+            after 0.05: restored_published(tries - 1)
+        else:
+            fail("after the restart, the campaign published no run-since")
+
+    def recomputed(r: value) -> None:
+        if isinstance(r, Exception):
+            fail("the recompute after the restart failed: {r}")
+            return
+        restored_published(60)
+
+    def restored(error: ?Exception) -> None:
+        if error is not None:
+            fail("the restore failed: {error}")
+            return
+        layer.newsession().recompute(recomputed)
+
+    def restart() -> None:
+        await async db.db.close()
+        db = swlmdb.LmdbStore(cap, db_path)
+        layer = sysspec.get_layers(
+            swdev.DeviceRegistry(sysspec.device_types, log_handler=t.log_handler),
+            t.log_handler, db)
+        layer.load_from_db(restored)
+
+    def resumed(r: value) -> None:
+        if isinstance(r, Exception):
+            fail("the edit to run again failed: {r}")
+            return
+        after 0.3: restart()
+
+    def paused(r: value) -> None:
+        if isinstance(r, Exception):
+            fail("the edit to plan failed: {r}")
+            return
+        campaign.admin_state = "run"
+        layer.edit_config(root.to_gdata(), None, resumed)
+
+    def pause() -> None:
+        campaign.admin_state = "plan"
+        layer.edit_config(root.to_gdata(), None, paused)
+
+    def first_published(tries: int) -> None:
+        got = published()
+        if got is not None:
+            first = got
+            after 1.1: pause()
+        elif tries > 0:
+            after 0.05: first_published(tries - 1)
+        else:
+            fail("the campaign published no run-since")
+
+    def ran(r: value) -> None:
+        if isinstance(r, Exception):
+            fail("the edit to run failed: {r}")
+            return
+        first_published(60)
+
+    t.timeout(10.0)
+    layer.edit_config(root.to_gdata(), None, ran)
