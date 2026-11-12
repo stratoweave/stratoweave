@@ -4,7 +4,8 @@ set -euo pipefail
 # Checks what the unit tests can't, against a running mini: a file sent
 # through the real HTTP server lands intact in its --software.image-dir
 # folder, also in a folder inside it, moves with /image-move, and /images
-# keeps the entry added for it, with the path of its file.
+# keeps the entry added for it, with the path of its file. The listing also
+# copes with a folder it can't read and with links.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ACTON_BIN="${ACTON:-acton}"
@@ -24,6 +25,7 @@ cleanup() {
         kill "$PID" 2>/dev/null || true
         wait "$PID" 2>/dev/null || true
     fi
+    chmod -R u+rwx "$WORK_DIR" 2>/dev/null || true
     rm -rf "$WORK_DIR"
 }
 
@@ -73,6 +75,17 @@ restconf() {
     BODY="$(cat "$WORK_DIR/reply")"
 }
 
+# Send a request to the image folder routes, with data as JSON
+call() {
+    local method="$1" path="$2" data="${3:-}"
+    local args=(-sS --connect-timeout 1 --max-time 10 -o "$WORK_DIR/reply" -w '%{http_code}' -X "$method")
+    if [[ -n "$data" ]]; then
+        args+=(-H 'Content-Type: application/json' --data-binary "$data")
+    fi
+    STATUS="$("$CURL_BIN" "${args[@]}" "http://127.0.0.1:${PORT}${path}")"
+    BODY="$(cat "$WORK_DIR/reply")"
+}
+
 expect() {
     [[ "$STATUS" == "$1" && "$BODY" == *"$2"* ]] || fail "expected $1 with '$2', got $STATUS: $BODY"
 }
@@ -110,12 +123,10 @@ restconf GET "/stratoweave-images:images"
 upload "/image-file/iosxe/17.18/$NAME" "$WORK_DIR/source.bin"
 expect 200 "iosxe/17.18/$NAME"
 cmp "$WORK_DIR/source.bin" "$IMAGE_DIR/iosxe/17.18/$NAME" || fail "the file uploaded into a folder differs from the source"
-STATUS="$("$CURL_BIN" -sS --connect-timeout 1 --max-time 10 -o "$WORK_DIR/reply" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "{\"from\": \"iosxe/17.18\", \"to\": \"archive/17.18\"}" "http://127.0.0.1:${PORT}/image-move")"
-BODY="$(cat "$WORK_DIR/reply")"
+call POST /image-move '{"from": "iosxe/17.18", "to": "archive/17.18"}'
 expect 200 '"kind":"folder"'
 cmp "$WORK_DIR/source.bin" "$IMAGE_DIR/archive/17.18/$NAME" || fail "the moved file differs from the source"
-STATUS="$("$CURL_BIN" -sS --connect-timeout 1 --max-time 10 -o "$WORK_DIR/reply" -w '%{http_code}' "http://127.0.0.1:${PORT}/image-file")"
-BODY="$(cat "$WORK_DIR/reply")"
+call GET /image-file
 expect 200 "\"archive/17.18/$NAME\""
 
 # The image list keeps the image's name and the path of its file
@@ -128,9 +139,24 @@ restconf PATCH "" "{\"stratoweave-images:images\":{\"image\":[{\"name\":\"$NAME\
 [[ "$STATUS" == 400 ]] || fail "a file path with an empty folder name was taken: $STATUS $BODY"
 restconf DELETE "/stratoweave-images:images/image=$NAME"
 expect 204 ""
-STATUS="$("$CURL_BIN" -sS --connect-timeout 1 --max-time 10 -o "$WORK_DIR/reply" -w '%{http_code}' -X DELETE "http://127.0.0.1:${PORT}/image-folder/archive")"
-BODY="$(cat "$WORK_DIR/reply")"
+call DELETE /image-folder/archive
 expect 204 ""
 [[ ! -e "$IMAGE_DIR/archive" ]] || fail "the folder is still there after DELETE"
+
+# What the unit tests can't make. A folder that can't be read, as a
+# root-owned lost+found, shows empty, and a loop of links is left out,
+# rather than failing the listing. A hard link is in the way of a move.
+mkdir "$IMAGE_DIR/locked"
+chmod 000 "$IMAGE_DIR/locked"
+ln -s loop "$IMAGE_DIR/loop"
+printf a > "$IMAGE_DIR/a.bin"
+ln "$IMAGE_DIR/a.bin" "$IMAGE_DIR/b.bin"
+call GET /image-file
+expect 200 '"name":"locked"'
+[[ "$BODY" != *'"loop"'* ]] || fail "the loop of links is listed: $BODY"
+chmod 700 "$IMAGE_DIR/locked"
+call POST /image-move '{"from": "a.bin", "to": "b.bin"}'
+expect 409 "b.bin already exists"
+[[ -e "$IMAGE_DIR/a.bin" ]] || fail "a.bin is gone after a refused move"
 
 echo "Image upload test passed on port ${PORT}"
