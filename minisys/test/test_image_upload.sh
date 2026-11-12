@@ -3,7 +3,8 @@ set -euo pipefail
 
 # Checks what the unit tests can't, against a running mini: a file sent
 # through the real HTTP server lands intact in its --software.image-dir
-# folder, and /images keeps the entry added for it.
+# folder, also in a folder inside it, moves with /image-move, and /images
+# keeps the entry added for it, with the path of its file.
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ACTON_BIN="${ACTON:-acton}"
@@ -104,5 +105,32 @@ restconf DELETE "/stratoweave-images:images/image=$NAME"
 expect 204 ""
 restconf GET "/stratoweave-images:images"
 [[ "$BODY" != *"$NAME"* ]] || fail "the image list entry is still there after DELETE: $BODY"
+
+# Into a folder that the upload makes, then moved to another
+upload "/image-file/iosxe/17.18/$NAME" "$WORK_DIR/source.bin"
+expect 200 "iosxe/17.18/$NAME"
+cmp "$WORK_DIR/source.bin" "$IMAGE_DIR/iosxe/17.18/$NAME" || fail "the file uploaded into a folder differs from the source"
+STATUS="$("$CURL_BIN" -sS --connect-timeout 1 --max-time 10 -o "$WORK_DIR/reply" -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary "{\"from\": \"iosxe/17.18\", \"to\": \"archive/17.18\"}" "http://127.0.0.1:${PORT}/image-move")"
+BODY="$(cat "$WORK_DIR/reply")"
+expect 200 '"kind":"folder"'
+cmp "$WORK_DIR/source.bin" "$IMAGE_DIR/archive/17.18/$NAME" || fail "the moved file differs from the source"
+STATUS="$("$CURL_BIN" -sS --connect-timeout 1 --max-time 10 -o "$WORK_DIR/reply" -w '%{http_code}' "http://127.0.0.1:${PORT}/image-file")"
+BODY="$(cat "$WORK_DIR/reply")"
+expect 200 "\"archive/17.18/$NAME\""
+
+# The image list keeps the image's name and the path of its file
+ENTRY="{\"name\":\"$NAME\",\"file\":\"archive/17.18/$NAME\",\"os\":\"IOS XE\",\"version\":\"17.18.03a\",\"model\":[\"C8000V\"]}"
+restconf PATCH "" "{\"stratoweave-images:images\":{\"image\":[$ENTRY]}}"
+expect 204 ""
+restconf GET "/stratoweave-images:images/image=$NAME"
+expect 200 "\"file\":\"archive/17.18/$NAME\""
+restconf PATCH "" "{\"stratoweave-images:images\":{\"image\":[{\"name\":\"$NAME\",\"file\":\"a//b\"}]}}"
+[[ "$STATUS" == 400 ]] || fail "a file path with an empty folder name was taken: $STATUS $BODY"
+restconf DELETE "/stratoweave-images:images/image=$NAME"
+expect 204 ""
+STATUS="$("$CURL_BIN" -sS --connect-timeout 1 --max-time 10 -o "$WORK_DIR/reply" -w '%{http_code}' -X DELETE "http://127.0.0.1:${PORT}/image-folder/archive")"
+BODY="$(cat "$WORK_DIR/reply")"
+expect 204 ""
+[[ ! -e "$IMAGE_DIR/archive" ]] || fail "the folder is still there after DELETE"
 
 echo "Image upload test passed on port ${PORT}"

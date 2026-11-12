@@ -30,6 +30,21 @@ def _files(method: str, reply: dict[str, ?value]) -> list[(str, int)]:
     return files
 
 
+def _folders(reply: dict[str, ?value]) -> list[str]:
+    """The name of each folder a GET reply lists."""
+    folders = []
+    listed = reply["folders"]
+    if isinstance(listed, list):
+        for entry in listed:
+            if isinstance(entry, dict):
+                name = entry.get("name")
+                if isinstance(name, str):
+                    folders.append(name)
+                    continue
+            raise ValueError("Not a folder: {entry}")
+    return folders
+
+
 actor _test_image_file_requests(t: testing.EnvT):
     """Each request, in order, gets its status and reply."""
     fc = file.FileCap(t.env.cap)
@@ -37,15 +52,33 @@ actor _test_image_file_requests(t: testing.EnvT):
     directory = fs.mktmpdir("test_image_file_api_")
     router = http_router.Router()
     swimgapi.install(router, swimgapi.ImageFileApi(swimg.ImageDir(fc, directory), logging.Logger(t.log_handler)))
-    # files: the name and size of each file a 200 reply lists. error: a part
-    # of the error in other replies.
-    steps: list[(method: str, path: str, body: bytes, status: int, files: list[(str, int)], error: str)] = [
-        (method="PUT", path="/image-file/.x", body=b"ab", status=400, files=[], error="Invalid image file name"),
-        (method="PUT", path="/image-file/a.bin", body=b"", status=400, files=[], error="no body"),
-        (method="PUT", path="/image-file/a.bin", body=b"\x00\xff\r\n", status=200, files=[("a.bin", 4)], error=""),
-        (method="GET", path="/image-file", body=b"", status=200, files=[("a.bin", 4)], error=""),
-        (method="DELETE", path="/image-file/a.bin", body=b"", status=204, files=[], error=""),
-        (method="DELETE", path="/image-file/a.bin", body=b"", status=404, files=[], error="No image file named a.bin"),
+    # files: the name and size of each file that a GET or a file PUT
+    # answers with. folders: the folders that a GET lists. text: a part of
+    # the error in a 4xx reply, or the kind a move answers with.
+    steps: list[(method: str, path: str, body: bytes, status: int, files: list[(str, int)], folders: list[str], text: str)] = [
+        (method="PUT", path="/image-file/.x", body=b"ab", status=400, files=[], folders=[], text="Invalid image path"),
+        (method="PUT", path="/image-file/a.bin", body=b"", status=400, files=[], folders=[], text="no body"),
+        (method="PUT", path="/image-file/a.bin", body=b"\x00\xff\r\n", status=200, files=[("a.bin", 4)], folders=[], text=""),
+        (method="PUT", path="/image-file/iosxe/17.18/c.bin", body=b"cc", status=200, files=[("iosxe/17.18/c.bin", 2)], folders=[], text=""),
+        (method="PUT", path="/image-folder/empty", body=b"", status=201, files=[], folders=[], text=""),
+        (method="PUT", path="/image-folder/empty", body=b"", status=200, files=[], folders=[], text=""),
+        (method="PUT", path="/image-folder/a.bin", body=b"", status=409, files=[], folders=[], text="a.bin is a file"),
+        (method="GET", path="/image-file", body=b"", status=200, files=[("a.bin", 4), ("iosxe/17.18/c.bin", 2)], folders=["empty", "iosxe", "iosxe/17.18"], text=""),
+        (method="POST", path="/image-move", body=b'{"from": "a.bin", "to": "iosxe/a.bin"}', status=200, files=[], folders=[], text="file"),
+        (method="POST", path="/image-move", body=b'{"from": "iosxe", "to": "empty/iosxe"}', status=200, files=[], folders=[], text="folder"),
+        (method="POST", path="/image-move", body=b'{"from": "missing", "to": "x"}', status=404, files=[], folders=[], text="No file or folder named missing"),
+        (method="POST", path="/image-move", body=b'{"from": "empty", "to": "empty/x"}', status=400, files=[], folders=[], text="into itself"),
+        (method="POST", path="/image-move", body=b"a.bin", status=400, files=[], folders=[], text="Send the move as JSON"),
+        (method="GET", path="/image-file", body=b"", status=200, files=[("empty/iosxe/17.18/c.bin", 2), ("empty/iosxe/a.bin", 4)], folders=["empty", "empty/iosxe", "empty/iosxe/17.18"], text=""),
+        (method="DELETE", path="/image-file/empty", body=b"", status=400, files=[], folders=[], text="is a folder"),
+        # Not the image folder itself
+        (method="DELETE", path="/image-folder", body=b"", status=400, files=[], folders=[], text="Invalid image path"),
+        (method="DELETE", path="/image-folder/empty", body=b"", status=204, files=[], folders=[], text=""),
+        (method="DELETE", path="/image-folder/empty", body=b"", status=404, files=[], folders=[], text="No image folder named empty"),
+        (method="GET", path="/image-file", body=b"", status=200, files=[], folders=[], text=""),
+        (method="PUT", path="/image-file/a.bin", body=b"a", status=200, files=[("a.bin", 1)], folders=[], text=""),
+        (method="DELETE", path="/image-file/a.bin", body=b"", status=204, files=[], folders=[], text=""),
+        (method="DELETE", path="/image-file/a.bin", body=b"", status=404, files=[], folders=[], text="No image file named a.bin"),
     ]
     var current = 0
 
@@ -66,10 +99,16 @@ actor _test_image_file_requests(t: testing.EnvT):
         step = steps[current]
         try:
             testing.assertEqual(status, step.status)
-            if status == 200:
+            if status >= 400:
+                testing.assertIn(step.text, str(json.decode(body)["error"]))
+            elif step.method == "GET":
+                reply = json.decode(body)
+                testing.assertEqual(_files(step.method, reply), step.files)
+                testing.assertEqual(_folders(reply), step.folders)
+            elif step.method == "PUT" and step.path.startswith("/image-file/"):
                 testing.assertEqual(_files(step.method, json.decode(body)), step.files)
-            elif status != 204:
-                testing.assertIn(step.error, str(json.decode(body)["error"]))
+            elif step.method == "POST":
+                testing.assertEqual(str(json.decode(body)["kind"]), step.text)
         except Exception as e:
             _done(ValueError("{step.method} {step.path} returned {status}: {body}: {e}"))
             return

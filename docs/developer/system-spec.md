@@ -66,14 +66,16 @@ modules that are shipped with StratoWeave:
 * `swyang.ssh` provides reusable SSH client types and the `ssh-client-config`
  grouping used by the RFS device model and application inventory models.
 * `swyang.ietf_yang_types` supplies the date and time types used by RFS.
-* `swyang.images` adds the image list, `/images`: software images by file
- name, with OS, version, family and hardware models. A family has at most
+* `swyang.images` adds the image list, `/images`: software images by name,
+ each with the path of its file in the image folder (`file`, such as
+ `iosxe/c8000v-universalk9.17.18.03a.SPA.bin`, the name when absent), OS,
+ version, family and hardware models. A family has at most
  one default image. The YANG says so with `must` statements, which are not
  checked yet, so clients keep to the rule. `url-base` says where devices
- fetch the images from: an image's URL is `url-base` followed by its name.
+ fetch the images from: an image's URL is `url-base` followed by its file.
  Add it to the top layer. The
  files themselves go into the image folder (`--software.image-dir`) over
- `/image-file`.
+ `/image-file`, where `/image-folder` and `/image-move` keep them in folders.
 * `tmf.yang.ietf_yang_tmf_map` includes the TMF mapping schema, which is used
  to annotate YANG with TMF Service/Resource mapping instructions.
 * `tmf.yang.swtmf` and `tmf.yang.swtmf640` include the TMF640 store transform

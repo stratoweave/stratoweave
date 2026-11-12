@@ -354,6 +354,19 @@
   retry its status answers. A new retry is a new intent: the manager reads
   the device again, and runs a failed upgrade again when no veto holds the
   install. A run under way finishes first. [#804]
+- Images can be kept in folders inside the image folder. An image in
+  `/images/image` has a new `file` leaf, the path of its file there, such as
+  `iosxe/17.18/c8000v-universalk9.17.18.03a.SPA.bin`; without it the file is
+  the image's name, as before. A device's URL is `url-base` followed by the
+  file. Campaigns keep naming the image, so moving its file changes only the
+  `file` leaf, and the campaigns give their members the new URL. Members
+  that answered or finished keep their status, since the target release
+  stays the same. `GET /image-file` lists the files in every folder, by
+  path, and the folders under `folders`; `PUT /image-file/<path>` makes the
+  folders on the way. `PUT` and `DELETE /image-folder/<path>` make a folder
+  and remove one with everything in it, and `POST /image-move` with
+  `{"from": ..., "to": ...}` moves or renames a file or folder without
+  replacing anything.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
