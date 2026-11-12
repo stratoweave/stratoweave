@@ -193,11 +193,13 @@ cli.port = u64(22)
 ```
 
 Each adapter reports the modules it serves. A module belongs to the first
-adapter that has it: the adapter of the device type, then the extra adapters
-in their order. Oper reads, subscriptions, RPCs and event notification
-subscriptions go to the adapters of the modules that their top-level nodes
-name. A module that no adapter has goes to the adapter of the device type, and
-so does all configuration.
+connected adapter that has it: the adapter of the device type, then the extra
+adapters in their order. While no adapter that has it is connected, it belongs
+to the first that has it. Oper reads, subscriptions, RPCs and event
+notification subscriptions go to the adapters of the modules that their
+top-level nodes name, and move when a connection comes or goes. A module that
+no adapter has goes to the adapter of the device type, and so does all
+configuration.
 
 An extra adapter connects to the address that its `address` leaf names, or to
 the first address. It uses its own `port`, or its default port when `port` is
