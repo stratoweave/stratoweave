@@ -294,11 +294,13 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
       manager still reads the release the device runs and reports up-to-date
       or upgrade-needed. The vetoes are read again right before the install
       starts; they never abort one in flight.
-    * Each status answers an intent: the upgrade campaign and target release
-      of the read or run that set it, published with the status. A final
-      status that answers the intent is kept while the intent and the device
-      type stay the same, so a reconnect or an unrelated config change does
-      not run a failed upgrade again. The install installs the release the
+    * Each status answers an intent: the upgrade campaign, target release
+      and retry of the read or run that set it, published with the status.
+      A final status that answers the intent is kept while the intent and
+      the device type stay the same, so a reconnect or an unrelated config
+      change does not run a failed upgrade again. A new retry is a new
+      intent: the device is read again, and a failed upgrade runs again. A
+      run under way finishes first. The install installs the release the
       run read the device for.
     * Under a hold, a read that fails says the release is unknown and is
       tried again when the device connects, or after a while. Without one
@@ -334,6 +336,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     var adapter: SoftwareAdapter = NoSoftwareAdapter(log_handler)
     var target_release: ?str = None
     var upgrade_campaign: ?str = None
+    # Any change of retry makes a new intent, so the device is read again.
+    var retry: u64 = 0
     var allow_staging: bool = False
     var vetoes: dict[str, str] = {}
 
@@ -345,6 +349,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     # The intent the read or run under way answers.
     var run_campaign: ?str = None
     var run_target: ?str = None
+    var run_retry: u64 = 0
     # Set when the intent or the connection changed while busy: the end of
     # the work reconciles once.
     var again: bool = False
@@ -386,21 +391,23 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         """Called by DeviceMgr when the device type is known or changes. A new
         adapter has answered nothing yet, so the status answers no intent."""
         adapter = a
-        _set_answers(None, None)
+        _set_answers(None, None, None)
         _reconcile()
 
-    def set_config(campaign: ?str, target: ?str, staging: bool, veto: dict[str, str]) -> None:
+    def set_config(campaign: ?str, target: ?str, staging: bool, veto: dict[str, str],
+                   new_retry: u64=0) -> None:
         """Software config from DeviceMetaConfig.software: the campaign whose
         intent this is, the target release name, whether staging may run ahead
-        of the window, and the current vetoes keyed by holder. Acts only when
-        one of them changed."""
+        of the window, the current vetoes keyed by holder, and the retry of
+        the intent. Acts only when one of them changed."""
         if campaign == upgrade_campaign and target == target_release \
-           and staging == allow_staging and veto == vetoes:
+           and staging == allow_staging and veto == vetoes and new_retry == retry:
             return
         upgrade_campaign = campaign
         target_release = target
         allow_staging = staging
         vetoes = veto
+        retry = new_retry
         _reconcile()
 
     def on_connect() -> None:
@@ -514,15 +521,17 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             # the DeviceMgr keeps what it receives in its oper tree.
             devmgr.on_software_state(state.copy())
 
-    def _set_answers(campaign: ?str, target: ?str) -> None:
-        """Make the status answer the intent of campaign and target. A status
-        that starts to answer another intent drops the stage, the reason and
-        the verdicts of the last one. Publishes with the next _record(), or
-        now when the intent goes."""
-        if campaign == state.upgrade_campaign and target == state.target_release:
+    def _set_answers(campaign: ?str, target: ?str, answered_retry: ?u64) -> None:
+        """Make the status answer the intent of campaign, target and retry. A
+        status that starts to answer another intent drops the stage, the
+        reason, the verdicts and the jobs of the last one. Publishes with the
+        next _record(), or now when the intent goes."""
+        if campaign == state.upgrade_campaign and target == state.target_release \
+           and answered_retry == state.retry:
             return
         state.upgrade_campaign = campaign
         state.target_release = target
+        state.retry = answered_retry
         if target is not None:
             state.stage = None
             state.reason = None
@@ -543,9 +552,11 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     def _answers() -> bool:
         """True when the status answers the intent of the configuration."""
+        answered = state.retry
         return state.status != ST_UNKNOWN and state.target_release is not None \
             and state.target_release == target_release \
-            and state.upgrade_campaign == upgrade_campaign
+            and state.upgrade_campaign == upgrade_campaign \
+            and answered is not None and answered == retry
 
     def _done() -> None:
         """End the read or run under way. If the intent or the connection
@@ -575,7 +586,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             return
         t = target_release
         if t is None:
-            _set_answers(None, None)
+            _set_answers(None, None, None)
             return
         s = state.status
         if s is not None and _answers():
@@ -586,11 +597,13 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
                     busy = True
                     run_campaign = upgrade_campaign
                     run_target = t
+                    run_retry = retry
                     _prepare_ahead()
                 return
         busy = True
         run_campaign = upgrade_campaign
         run_target = t
+        run_retry = retry
         adapter.check(_on_check_done)
 
     def _prepared(release: str) -> bool:
@@ -691,7 +704,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     def _on_check_done(running: ?str, err: ?Exception) -> None:
         """Decide whether there is anything to do, from what the device reports."""
-        if target_release != run_target or upgrade_campaign != run_campaign:
+        if target_release != run_target or upgrade_campaign != run_campaign \
+           or retry != run_retry:
             # The intent changed while we were reading: read for the new one.
             again = True
             _done()
@@ -703,7 +717,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             # is not connected cannot be upgraded: say the release is unknown,
             # and read again when the device connects, or after a while for
             # another error.
-            _set_answers(run_campaign, run_target)
+            _set_answers(run_campaign, run_target, run_retry)
             state.reason = "could not read the running release: " + error_text(err!)
             unpublished = True
             _record(ST_UNKNOWN)
@@ -729,7 +743,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         elif adapter.matches_release(running, t):
             _log.info("software: already on the target release, nothing to do",
                       {"device": name, "release": running, "target": t})
-            _set_answers(run_campaign, run_target)
+            _set_answers(run_campaign, run_target, run_retry)
             _clear_reason()
             _record(ST_UP_TO_DATE)
             _done()
@@ -737,7 +751,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         elif held:
             _log.info("software: upgrade needed, held by a veto",
                       {"device": name, "release": running, "target": t})
-            _set_answers(run_campaign, run_target)
+            _set_answers(run_campaign, run_target, run_retry)
             _clear_reason()
             _record(ST_UPGRADE_NEEDED)
             if allow_staging and not _prepared(t):
@@ -746,7 +760,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
                 _done()
             return
         previous_release = running
-        _set_answers(run_campaign, run_target)
+        _set_answers(run_campaign, run_target, run_retry)
         # A new run starts at prepare; the verdicts below are from the last one.
         state.stage = STAGE_PREPARE
         state.reason = None
@@ -859,6 +873,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             if target_release is None:
                 _fail("target release withdrawn before install")
                 return
+            # A new retry does not stop the run: it finishes, and then the
+            # device is read again for the new intent.
             if target_release != run_target or upgrade_campaign != run_campaign:
                 _log.info("software: the intent changed before install, not installing",
                           {"device": name, "target": run_target})
@@ -2292,7 +2308,8 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
                 sw_vetoes = {}
                 for v in sw.veto:
                     sw_vetoes[v.holder] = str(v.reason)
-                swmgr.set_config(sw.upgrade_campaign, sw.target_release, sw.allow_staging, sw_vetoes)
+                swmgr.set_config(sw.upgrade_campaign, sw.target_release, sw.allow_staging, sw_vetoes,
+                                 sw.retry)
 
                 if need_new_adapter:
                     new_adapter = _build_adapter(device_type, new_dmc, effective_mock, _log_handler,

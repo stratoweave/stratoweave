@@ -149,8 +149,8 @@ Set `FLEETMGR_API` to point these targets at a top node on another address.
 ## Campaigns
 
 A campaign acquires its members as soon as it exists, in `plan` and in
-`run`. Each member in the fleet gets the campaign's name, the target
-release and image URL of its image, and a veto with the holder
+`run`. Each member in the fleet gets the campaign's name, its `retry`, the
+target release and image URL of its image, and a veto with the holder
 `campaign:NAME`, which holds the install. The member reads the release it
 runs and answers `up-to-date` or `upgrade-needed`. Nothing is installed. A
 member added later, also while the campaign runs, is acquired the same way.
@@ -158,10 +158,12 @@ In `run`, the campaign removes the veto of a member when it releases the
 member in a window, and puts the veto back when the member is done.
 
 A member's `device-status` shows its status only when the status is for
-the campaign's intent: the device reports it for the campaign's name and
-the member's target release. Otherwise it shows `pending`, and the counters
-do not count it. Its `upgrade-campaign` and `target-release` say which
-intent the device's status is for.
+the campaign's intent: the device reports it for the campaign's name, the
+member's target release and the member's retry. A status without a retry
+is for retry 0. `in-progress` counts for any retry, because a run of an
+earlier retry is still under way. Otherwise it shows `pending`, and the
+counters do not count it. Its `upgrade-campaign`, `target-release` and
+`retry` say which intent the device's status is for.
 
 The campaign releases a member only once the member has answered its
 target: its status is `upgrade-needed`, or a final status. A member that
@@ -191,10 +193,14 @@ campaign's veto: it holds a slot and its redundancy groups until it is
 done, or until it stops before its install and waits again.
 
 Stopping and running a campaign again does not retry its failed members.
-To retry a member, remove it from the campaign, wait until the device's
-software state has no `upgrade-campaign`, and add the member again. The
-campaign then takes it as a new member: it holds it until it answers, and
-releases it in a window.
+To retry a member, change its `retry`, for example from 0 to 1. The
+campaign then takes it as a new member, as if it was removed and added
+again: the device reads its release again, and the campaign holds the
+member until it answers the new retry, and releases it in a window. A
+member that succeeded reads again and answers `up-to-date`. A member in
+flight gets the campaign's veto back: its run stops before the install,
+or, past the install, finishes and holds its slot until it ends. Removing
+the member and adding it again, in two edits, also retries it.
 
 With `failure-budget`, a campaign stops its releases when too many members
 fail. The budget is a percent of the members the campaign has, rounded
@@ -206,9 +212,9 @@ saved: a failed member answers again, and the campaign can release it. When
 more members have failed than the budget, no member starts or prepares: the
 members in flight finish, the others keep their windows, and the plan's
 alarm says "N device(s) failed, more than the failure budget of M: no more
-devices start". To go on, raise or remove the budget, or remove failed
-members from the campaign, which is also how a member is retried. Each
-member removed also makes the budget smaller: at 2 percent, 3 failed
+devices start". To go on, raise or remove the budget, or retry or remove
+failed members. A retried member no longer counts as failed. Each member
+removed also makes the budget smaller: at 2 percent, 3 failed
 members of 100 stop the releases, and 2 of 99 still do.
 
 A member is down while its flotilla is not connected to it, or while the
@@ -323,8 +329,8 @@ routing each member to its flotilla before merging all software intent into the
 same device entry that the inventory transform writes. Each member names its
 `image` from `/images`: the device's target release is the image's
 `version`, and its image URL is the list's `url-base` followed by the image
-name. A member whose image is not in the list, or has no version, gets
-only the campaign's name and veto, with no target release, and the
+name. A member whose image is not in the list, or has no version, gets only
+the campaign's name, its retry and the veto, with no target release, and the
 campaign's plan alarms say so.
 
 `/images` is the StratoWeave image list (`swyang.images`): software images
@@ -339,18 +345,17 @@ the whole list.
 
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription on the flotilla
-to the device's `/device/software/state` and `/device/state`, and
-publishes the status, the campaign and target release the status is for,
-the stage, reason and check verdicts in the entry's own `state`, the
-platform as its `state/platform`, and whether the flotilla is connected to
-the device as `state/connected`. A change on one device
-publishes one entry. Removing the entry closes the subscription and clears
-the state. Each campaign transform subscribes to the `state` of every entry,
-one subscription, and aggregates its own members, each with the version and
-model its platform reports. It also subscribes to the top's `/device`
-entries of the flotillas, to learn whether the top is connected to each
-flotilla. Each `/fleet/device` actor subscribes to its RFS entry's
-platform and publishes it as its own
+to the device's `/device/software/state` and `/device/state`, and publishes
+the status, the campaign, target release and retry the status is for, the
+stage, reason and check verdicts in the entry's own `state`, the platform as
+its `state/platform`, and whether the flotilla is connected to the device as
+`state/connected`. A change on one device publishes one entry. Removing the
+entry closes the subscription and clears the state. Each campaign transform
+subscribes to the `state` of every entry, one subscription, and aggregates
+its own members, each with the version and model its platform reports. It
+also subscribes to the top's `/device` entries of the flotillas, to learn
+whether the top is connected to each flotilla. Each `/fleet/device` actor
+subscribes to its RFS entry's platform and publishes it as its own
 `state/platform`: OS, version, model and serial number.
 
 `flotilla` supplies one modeled layer, the standard RFS plus the

@@ -350,6 +350,10 @@
   last step line of the install command that runs. The IOS XE mock lists a
   running operation in `Cisco-IOS-XE-install-oper` and takes it through its
   stages. [#803]
+- The software intent has a `retry`, 0 by default, and the state says which
+  retry its status answers. A new retry is a new intent: the manager reads
+  the device again, and runs a failed upgrade again when no veto holds the
+  install. A run under way finishes first.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -548,6 +552,14 @@
   is the time Fleet Manager first starts on this version, or, for a
   campaign in `plan`, the time it next goes to `run`. 0, the default, gives
   no notice. [#795]
+- A campaign member has a `retry`. Changing it retries the member in one
+  edit, as removing it and adding it again did in two: the campaign takes
+  it as a new member, its device reads its release again, and a member
+  that failed is released again in a window. A member in flight gets the
+  campaign's veto back; a run past its install finishes and holds its slot
+  until it ends. A status counts only for the member's retry, except
+  `in-progress`; `device-status` shows the retry that it answers. A retried
+  member no longer counts against the failure budget.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
