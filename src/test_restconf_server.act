@@ -97,23 +97,140 @@ actor _test_get_monitoring_data(t: testing.AsyncT):
     _send()
 
 
-actor _test_content_query_bad_request(t: testing.AsyncT):
-    """The content query parameter with an unknown value, or on any request
-    other than a GET of the datastore or a data resource, is answered with
-    400 Bad Request."""
+actor _test_get_fields(t: testing.AsyncT):
+    """A GET with the fields query parameter answers with the target resource
+    narrowed to the nodes that fields selects (RFC 8040 4.8.3). A selected
+    node that is missing leaves its siblings in place, list entries keep
+    their keys, and a target with nothing selected is answered empty. A
+    fields value that does not resolve below the target is answered with
+    400, unless the path does not resolve (404)."""
+    schema = yang.compile([fixture.FLEET_CONFIG_YANG])
+    oper_schema = yang.compile([fixture.FLEET_YANG])
+    http_root = http_router.Router()
+    swrestconf.RestconfServer(http_root, logging.Logger(t.log_handler), schema, oper_schema, fixture.fleet_layer())
+
+    xml = "application/yang-data+xml"
+    # The path and accept header of each GET, and its expected status and body
+    requests: list[(str, ?str, int, str)] = [
+        ("/restconf/data/demo-fleet:device=cpe-16?fields=software/target", None,
+            200, r'{"demo-fleet:device":[{"name":"cpe-16","software":{"target":"2.0"}}]}'),
+        ("/restconf/data/demo-fleet:device=cpe-16?fields=software/target", xml,
+            200, '<device xmlns="urn:demo-fleet"><name>cpe-16</name><software><target>2.0</target></software></device>'),
+        ("/restconf/data/demo-fleet:device=cpe-16?fields=software(target;state)", None,
+            200, r'{"demo-fleet:device":[{"name":"cpe-16","software":{"target":"2.0","state":{"status":"up-cpe-16"}}}]}'),
+        ("/restconf/data/demo-fleet:device=cpe-16?content=config&fields=software(target;state)", None,
+            200, r'{"demo-fleet:device":[{"name":"cpe-16","software":{"target":"2.0"}}]}'),
+        ("/restconf/data/demo-fleet:device=cpe-16?fields=software/target;software", None,
+            200, r'{"demo-fleet:device":[{"name":"cpe-16","software":{"target":"2.0","state":{"status":"up-cpe-16"}}}]}'),
+        ("/restconf/data/demo-fleet:device=cpe-16?fields=software%2Ftarget", None,
+            200, r'{"demo-fleet:device":[{"name":"cpe-16","software":{"target":"2.0"}}]}'),
+        ("/restconf/data/demo-fleet:device=cpe-17?fields=software/target", None,
+            200, r'{"demo-fleet:device":[{"name":"cpe-17"}]}'),
+        ("/restconf/data/demo-fleet:device=cpe-16/software?fields=target", None,
+            200, r'{"demo-fleet:software":{"target":"2.0"}}'),
+        ("/restconf/data/demo-fleet:device=cpe-17/software?fields=target", None,
+            200, r'{"demo-fleet:software":{}}'),
+        ("/restconf/data?fields=demo-fleet:device(name;software/state)", None,
+            200, r'{"demo-fleet:device":[{"name":"cpe-16","software":{"state":{"status":"up-cpe-16"}}},{"name":"cpe-17","software":{"state":{"status":"up-cpe-17"}}}]}'),
+        ("/restconf/data?fields=ietf-yang-library:modules-state/module(name;revision)", None,
+            200, r'{"ietf-yang-library:modules-state":{"module":[{"name":"demo-fleet","revision":""},{"name":"ietf-datastores","revision":"2018-02-14"},{"name":"ietf-inet-types","revision":"2013-07-15"},{"name":"ietf-restconf-monitoring","revision":"2017-01-26"},{"name":"ietf-yang-library","revision":"2019-01-04"},{"name":"ietf-yang-types","revision":"2025-12-22"}]}}'),
+        ("/restconf/data/demo-fleet:device=cpe-16?fields=nope", None,
+            400, "ValueError: Invalid fields at position 0: Child 'nope' not found"),
+        ("/restconf/data/demo-fleet:device=cpe-16?fields=software(target", None,
+            400, "ValueError: Invalid fields at position 15: expected ')' in software(target"),
+        ("/restconf/data?fields=device", None,
+            400, r"ValueError: Invalid fields at position 0: Child 'device' not found, requires qualifier, found in modules {'demo-fleet'}"),
+        ("/restconf/data/demo-fleet:device=cpe-16/name?fields=name", None,
+            400, "ValueError: Invalid fields at position 0: name has no child name"),
+        ("/restconf/data/demo-fleet:device=cpe-16?fields=%zz", None,
+            400, ""),
+        ("/restconf/data/demo-fleet:device=cpe-16?fields=", None,
+            400, "ValueError: Invalid fields at position 0: expected a node name in "),
+        ("/restconf/data/demo-fleet:nope?fields=nope", None,
+            404, "ValueError: Child 'nope' not found with qualifiers: module='demo-fleet'"),
+    ]
+    devices = ["cpe-16", "cpe-17"]
+    var ready = 0
+    var current = 0
+
+    def _put(name: str, body: str, on_response: proc(int, dict[str, str], str) -> None):
+        headers = {"content-type": "application/yang-data+xml"}
+        http_root.serve(http.Request("PUT", "/restconf/data/demo-fleet:device={name}", b"1.1", headers, body.encode()), on_response)
+
+    def _wait_state():
+        """Wait for the oper state of each device, so it is in the GETs."""
+        if ready < len(devices):
+            http_root.serve(http.Request("GET", "/restconf/data/demo-fleet:device={devices[ready]}/software/state", b"1.1", {}, b""), _on_state)
+        else:
+            _send()
+
+    def _on_state(status: int, headers: dict[str, str], body: str):
+        if status == 200:
+            ready += 1
+            _wait_state()
+        elif status == 404 and body == "No data at path":
+            after 0.01: _wait_state()
+        else:
+            t.failure(ValueError("GET state of {devices[ready]} returned {status}: {body}"))
+
+    def _send():
+        path, accept, expected_status, expected_body = requests[current]
+        headers = {"accept": accept} if accept is not None else {}
+        http_root.serve(http.Request("GET", path, b"1.1", headers, b""), _on_response)
+
+    def _on_response(status: int, headers: dict[str, str], body: str):
+        path, accept, expected_status, expected_body = requests[current]
+        if status != expected_status or body != expected_body:
+            suffix = " (XML)" if accept is not None else ""
+            t.failure(ValueError("GET {path}{suffix} returned {status} {body}, expected {expected_status} {expected_body}"))
+            return
+        current += 1
+        if current < len(requests):
+            _send()
+        else:
+            t.success()
+
+    def _on_put_cpe17(status: int, headers: dict[str, str], body: str):
+        if status != 201:
+            t.failure(ValueError("PUT cpe-17 returned {status}: {body}"))
+            return
+        _wait_state()
+
+    def _on_put_cpe16(status: int, headers: dict[str, str], body: str):
+        if status != 201:
+            t.failure(ValueError("PUT cpe-16 returned {status}: {body}"))
+            return
+        # cpe-17 has no software/target
+        _put("cpe-17", '<device xmlns="urn:demo-fleet"><name>cpe-17</name></device>', _on_put_cpe17)
+
+    _put("cpe-16", '<device xmlns="urn:demo-fleet"><name>cpe-16</name><software><target>2.0</target></software></device>', _on_put_cpe16)
+
+
+actor _test_query_bad_request(t: testing.AsyncT):
+    """Any query parameter given more than once, the content query parameter
+    with an unknown value, or the content or fields query parameter on any
+    request other than a GET of the datastore or a data resource, is
+    answered with 400 Bad Request."""
     schema = yang.compile([fixture.FLEET_CONFIG_YANG])
     oper_schema = yang.compile([fixture.FLEET_YANG])
     http_root = http_router.Router()
     swrestconf.RestconfServer(http_root, logging.Logger(t.log_handler), schema, oper_schema, fixture.fleet_layer())
 
     get_only = "The content query parameter is only allowed for GET of data resources"
+    fields_get_only = "The fields query parameter is only allowed for GET of data resources"
     requests = [
         ("GET", "/restconf/data?content=bogus", "Invalid value for the content query parameter: bogus"),
+        ("POST", "/restconf/data?insert=first&insert=last", "The insert query parameter is only allowed once"),
         ("POST", "/restconf/data/demo-fleet:device=cpe-16?content=config", get_only),
         ("PUT", "/restconf/data/demo-fleet:device=cpe-16?content=config", get_only),
         ("PATCH", "/restconf/data/demo-fleet:device=cpe-16?content=config", get_only),
         ("DELETE", "/restconf/data/demo-fleet:device=cpe-16?content=config", get_only),
         ("GET", "/restconf/yang-library-version?content=all", get_only),
+        ("POST", "/restconf/data/demo-fleet:device=cpe-16?fields=name", fields_get_only),
+        ("PUT", "/restconf/data/demo-fleet:device=cpe-16?fields=name", fields_get_only),
+        ("PATCH", "/restconf/data/demo-fleet:device=cpe-16?fields=name", fields_get_only),
+        ("DELETE", "/restconf/data/demo-fleet:device=cpe-16?fields=name", fields_get_only),
+        ("GET", "/restconf/yang-library-version?fields=name", fields_get_only),
     ]
     var current = 0
 
