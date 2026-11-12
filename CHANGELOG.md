@@ -660,6 +660,7 @@
   updates repeat `<neighbors>` for each BGP neighbor, so a NETCONF
   subscription got only the first neighbor and the fleetmgr BGP post-check
   failed. The occurrences are now read as one container. [acton-yang#560]
+  [#802]
 
 #### acton-ssh
 - Fixed SSH events being delivered out of the order libssh raises them.
