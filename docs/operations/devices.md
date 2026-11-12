@@ -201,6 +201,12 @@ top-level nodes name, and move when a connection comes or goes. A module that
 no adapter has goes to the adapter of the device type, and so does all
 configuration.
 
+The IOS XE CLI adapter also reads the BGP neighbors, into `bgp-state-data` of
+`Cisco-IOS-XE-bgp-oper`, as NETCONF gives them. A device whose NETCONF does not
+start, such as IOS XE 16.8 on a C1111, has them from the CLI; when NETCONF
+connects, NETCONF serves them. The CLI adapter realizes a subscription by
+reading again at each period, and has no on-change subscriptions.
+
 An extra adapter connects to the address that its `address` leaf names, or to
 the first address. It uses its own `port`, or its default port when `port` is
 not set: the port of the address is for the adapter of the device type. Its

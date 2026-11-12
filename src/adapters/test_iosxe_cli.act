@@ -333,6 +333,39 @@ DELETE_MISSING = _crlf("""Delete bootflash:/sw-copy-test.bin? [confirm]
 ## on a C1111 running 17.15.06 after write memory.
 RUNNING_CHANGE_COMMAND = "show running-config | include " + xecli.CONFIG_CHANGE_LINES
 STARTUP_CHANGE_COMMAND = "show startup-config | include " + xecli.CONFIG_CHANGE_LINES
+
+## The commands of a BGP read, as the adapter types them.
+BGP_IPV4 = "show bgp ipv4 unicast neighbors | include " + xecli.BGP_NEIGHBOR_LINES
+BGP_IPV6 = "show bgp ipv6 unicast neighbors | include " + xecli.BGP_NEIGHBOR_LINES
+BGP_VPNV4 = "show bgp vpnv4 unicast all neighbors | include " + xecli.BGP_NEIGHBOR_LINES
+BGP_VPNV6 = "show bgp vpnv6 unicast all neighbors | include " + xecli.BGP_NEIGHBOR_LINES
+
+## BGP_IPV4 on a C1111 with 17.15.06: a neighbor that is shut down, one that
+## is down and one that is up. NETCONF gives the same neighbors, states and
+## prefixes.
+BGP_IPV4_C1111 = _crlf("""
+
+BGP neighbor is 192.0.2.1,  remote AS 65002, external link
+  BGP state = Idle, down for never
+ For address family: IPv4 Unicast
+    Prefixes Current:               0          0
+BGP neighbor is 192.0.2.5,  remote AS 65004, external link
+  BGP state = Idle, down for never
+ For address family: IPv4 Unicast
+    Prefixes Current:               0          0
+BGP neighbor is 192.168.1.244,  remote AS 65001, external link
+  BGP state = Established, up for 00:08:25
+ For address family: IPv4 Unicast
+    Prefixes Current:               1          3 (Consumes 408 bytes)
+""")
+
+## BGP_VPNV4 on the same C1111: a neighbor in VRF RED.
+BGP_VPNV4_C1111 = _crlf("""
+BGP neighbor is 192.0.2.9,  vrf RED,  remote AS 65003, external link
+  BGP state = Idle, down for never
+ For address family: VPNv4 Unicast
+    Prefixes Current:               0          0
+""")
 CONFIG_CHANGE_SAVED = _crlf("\n! Last configuration change at 22:34:25 UTC Tue Nov 10 2026 by admin\n")
 ## Constructed: a change after the write memory.
 CONFIG_CHANGE_LATER = _crlf("\n! Last configuration change at 23:12:01 UTC Tue Nov 10 2026 by admin\n")
@@ -1314,8 +1347,10 @@ def _test_reads():
     version = gdata.FNode(_q("version"))
     other = gdata.FNode(gdata.Id("urn:other", "system"))
     cases = [
-        ("no filter", None, ["dir bootflash:", "show version", RUNNING_CHANGE_COMMAND, STARTUP_CHANGE_COMMAND,
-                             "show bootvar", "show install summary"]),
+        ("no filter", None, [BGP_IPV4, BGP_IPV6, BGP_VPNV4, BGP_VPNV6, "dir bootflash:", "show version",
+                             RUNNING_CHANGE_COMMAND, STARTUP_CHANGE_COMMAND, "show bootvar", "show install summary"]),
+        ("bgp-state-data", gdata.FNode(children=[gdata.FNode(gdata.Id(xecli_yang.BGP_NS, "bgp-state-data"))]),
+         [BGP_IPV4, BGP_IPV6, BGP_VPNV4, BGP_VPNV6]),
         ("file-systems", _top([_fs(["harddisk:"])]), ["dir harddisk:"]),
         ("install summary", _top([gdata.FNode(_q("install-summary"))]), ["show install summary"]),
         ("bootvar", _top([gdata.FNode(_q("bootvar"))]), ["show bootvar"]),
@@ -1331,6 +1366,133 @@ def _test_reads():
     for name, filt, want in cases:
         testing.assertEqual([r.command for r in xecli.reads(filt)], want, name)
     testing.assertTrue(_reads_error(_top([_fs(["boot flash:"])])).startswith("invalid file system name"), "bad name")
+
+
+def _bgp(output: str) -> list[str]:
+    try:
+        return [str(n) for n in xecli.parse_bgp_neighbors(output)]
+    except xecli.CommandError as e:
+        return ["error: " + e.error_message]
+
+
+def _test_parse_bgp_neighbors():
+    cases = [
+        ("BGP not active: the filter leaves no line", _crlf("\n\n"), []),
+        ("IPv4 on a C1111", BGP_IPV4_C1111, [
+            "ipv4-unicast default 192.0.2.1 fsm-idle 0 0",
+            "ipv4-unicast default 192.0.2.5 fsm-idle 0 0",
+            "ipv4-unicast default 192.168.1.244 fsm-established 1 3",
+        ]),
+        ("a neighbor in a VRF", BGP_VPNV4_C1111, ["vpnv4-unicast RED 192.0.2.9 fsm-idle 0 0"]),
+        ("two address families of one neighbor", _crlf("""
+BGP neighbor is 2001:db8::1,  remote AS 65010, external link
+  BGP state = Established, up for 1w2d
+ For address family: IPv4 Unicast
+    Prefixes Current:               4          2 (Consumes 272 bytes)
+ For address family: IPv6 Unicast
+    Prefixes Current:               5          7 (Consumes 952 bytes)
+"""), [
+            "ipv4-unicast default 2001:db8::1 fsm-established 4 2",
+            "ipv6-unicast default 2001:db8::1 fsm-established 5 7",
+        ]),
+        ("a command that the device does not have", _crlf("""
+                     ^
+% Invalid input detected at '^' marker.
+"""), ["error: % Invalid input detected at '^' marker."]),
+        ("a prefix line without numbers", _crlf("""
+BGP neighbor is 192.0.2.1,  remote AS 65002, external link
+  BGP state = Idle, down for never
+ For address family: IPv4 Unicast
+    Prefixes Current:               n/a        0
+"""), ["error: unexpected prefix line: Prefixes Current:               n/a        0"]),
+        ("an address family without a neighbor", _crlf("""
+ For address family: IPv4 Unicast
+    Prefixes Current:               0          0
+"""), ["error: address family before a BGP neighbor: For address family: IPv4 Unicast"]),
+    ]
+    for name, output, want in cases:
+        testing.assertEqual(_bgp(output), want, name)
+
+
+def _test_bgp_read_fills_the_tree():
+    """The neighbors of several commands make one list, keyed as NETCONF
+    keys it."""
+    r = xecli_data.root()
+    xecli.BgpRead("show bgp ipv4 unicast neighbors").parse(r, BGP_IPV4_C1111)
+    xecli.BgpRead("show bgp vpnv4 unicast all neighbors").parse(r, BGP_VPNV4_C1111)
+    back = xecli_data.root.from_gdata(r.to_gdata())
+    got: list[str] = []
+    for n in back.bgp_state_data.neighbors.neighbor:
+        got.append(" ".join([n.afi_safi, n.vrf_name, n.neighbor_id, _opt(n.session_state),
+                             _opt_u64(n.prefix_activity.sent.current_prefixes),
+                             _opt_u64(n.prefix_activity.received.current_prefixes)]))
+    testing.assertEqual(sorted(got), [
+        "ipv4-unicast default 192.0.2.1 fsm-idle 0 0",
+        "ipv4-unicast default 192.0.2.5 fsm-idle 0 0",
+        "ipv4-unicast default 192.168.1.244 fsm-established 1 3",
+        "vpnv4-unicast RED 192.0.2.9 fsm-idle 0 0",
+    ])
+
+
+def _opt_u64(value: ?u64) -> str:
+    return str(value) if value is not None else "-"
+
+
+actor _test_adapter_subscription_polls_bgp(t: testing.EnvT):
+    """A subscription to the BGP neighbors reads them again at each period:
+    a neighbor that comes up shows in a later delivery."""
+    t.timeout(10.0)
+    down = _crlf("""
+BGP neighbor is 192.168.1.244,  remote AS 65001, external link
+  BGP state = Active, down for 00:00:12
+ For address family: IPv4 Unicast
+    Prefixes Current:               0          0
+""")
+    m = _mock({BGP_IPV4: down, BGP_IPV6: "", BGP_VPNV4: BGP_VPNV4_C1111, BGP_VPNV6: ""})
+    var dev: ?swdev.DeviceMgr = None
+    var seen: list[str] = []
+    var changed = False
+
+    def states(tree: ?gdata.Node) -> str:
+        parts: list[str] = []
+        for n in xecli_data.root.from_gdata(tree).bgp_state_data.neighbors.neighbor:
+            parts.append(n.neighbor_id + "=" + _opt(n.session_state))
+        return " ".join(sorted(parts))
+
+    def delivered(tree: ?gdata.Node, err: ?Exception):
+        if err is not None:
+            t.failure(err)
+            return
+        s = states(tree)
+        if len(seen) == 0 or seen[-1] != s:
+            seen.append(s)
+        if not changed:
+            changed = True
+            m.set_reply(BGP_IPV4, BGP_IPV4_C1111)
+        elif "192.168.1.244=fsm-established" in s:
+            d = dev
+            if d is not None:
+                d.remove_subscriptions("bgp-test")
+            try:
+                testing.assertEqual(seen, [
+                    "192.0.2.9=fsm-idle 192.168.1.244=fsm-active",
+                    "192.0.2.1=fsm-idle 192.0.2.5=fsm-idle 192.0.2.9=fsm-idle 192.168.1.244=fsm-established",
+                ])
+            except Exception as e:
+                t.failure(e)
+                return
+            t.success()
+
+    def connected():
+        d = dev
+        if d is not None and xecli_yang.BGP_MODULE in d.get_modules().0:
+            filt = gdata.FNode(children=[gdata.FNode(gdata.Id(xecli_yang.BGP_NS, "bgp-state-data"))])
+            d.declare_subscriptions("bgp-test", delivered, {gdata.SubscriptionSpec(filt, period=u64(50000000))})
+            return
+        after 0.01: connected()
+
+    dev = _mock_device(t, m)
+    connected()
 
 
 def _test_parse_version():
@@ -2089,6 +2251,129 @@ actor _test_live_iosxe_beside_netconf(t: testing.EnvT):
         d.set_dmc(dmc)
         dev = d
         connected()
+
+
+def _neighbors(tree: ?gdata.Node) -> list[str]:
+    """The BGP neighbors of a tree, one line each, sorted."""
+    got: list[str] = []
+    for n in xecli_data.root.from_gdata(tree).bgp_state_data.neighbors.neighbor:
+        got.append(" ".join([n.afi_safi, n.vrf_name, n.neighbor_id, _opt(n.session_state),
+                             _opt_u64(n.prefix_activity.sent.current_prefixes),
+                             _opt_u64(n.prefix_activity.received.current_prefixes)]))
+    return sorted(got)
+
+
+actor _test_live_bgp(t: testing.EnvT):
+    """Read the BGP neighbors of a real device over the CLI. With
+    IOSXE_BGP_NETCONF set, the device has NETCONF too: NETCONF serves the
+    neighbors through DeviceMgr, and the CLI adapter must read the same
+    neighbors, states and prefixes. A subscription of the CLI adapter
+    delivers them too."""
+    t.require("iosxe-cli")
+    t.timeout(120.0)
+    netconf = live_setting(t, "IOSXE_BGP_NETCONF", "") != ""
+    filt = gdata.FNode(children=[gdata.FNode(gdata.Id(xecli_yang.BGP_NS, "bgp-state-data"))])
+    var dev: ?swdev.DeviceMgr = None
+    var finished = False
+    var expected: ?list[str] = None
+
+    def finish(err: ?Exception):
+        if finished:
+            return
+        finished = True
+        d = dev
+        if d is not None:
+            a = d.get_extra_adapter("iosxe-cli")
+            if a is not None:
+                a.remove_subscriptions("live-bgp")
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def delivered(tree: ?gdata.Node, err: ?Exception):
+        try:
+            if err is not None:
+                raise err
+            got = _neighbors(tree)
+            print("CLI subscription: " + "; ".join(got))
+            e = expected
+            if e is not None:
+                testing.assertEqual(got, e, "the subscription delivers what the CLI read")
+        except Exception as ex:
+            finish(ex)
+            return
+        finish(None)
+
+    def cli_read(tree: ?gdata.Node, err: ?Exception):
+        d = dev
+        try:
+            if err is not None:
+                raise err
+            got = _neighbors(tree)
+            print("CLI: " + "; ".join(got))
+            e = expected
+            if e is not None:
+                testing.assertEqual(got, e, "the CLI reads what NETCONF gives")
+            expected = got
+        except Exception as ex:
+            finish(ex)
+            return
+        if d is not None:
+            a = d.get_extra_adapter("iosxe-cli")
+            if a is not None:
+                a.declare_subscriptions("live-bgp", delivered, {gdata.SubscriptionSpec(filt, period=u64(1000000000))}, None)
+
+    def netconf_read(tree: ?gdata.Node, err: ?Exception):
+        d = dev
+        try:
+            if err is not None:
+                raise err
+            got = _neighbors(tree)
+            print("NETCONF: " + "; ".join(got))
+            expected = got
+        except Exception as ex:
+            finish(ex)
+            return
+        if d is not None:
+            a = d.get_extra_adapter("iosxe-cli")
+            if a is not None:
+                a.get(cli_read, filt)
+
+    def connected():
+        d = dev
+        if d is not None:
+            mods = d.get_modules().0
+            if xecli_yang.MODULE in mods and (not netconf or "Cisco-IOS-XE-native" in mods):
+                if netconf:
+                    try:
+                        testing.assertEqual("iosxe", d.get_module_adapters()[xecli_yang.BGP_MODULE],
+                                            "NETCONF serves BGP while it is connected")
+                    except Exception as ex:
+                        finish(ex)
+                        return
+                    d.get(netconf_read, filt)
+                else:
+                    d.get(cli_read, filt)
+                return
+        after 0.1: connected()
+
+    bgp = yang.compile([xecli_yang.bgp_oper])
+    types = {
+        "iosxe": swdev.DeviceType("iosxe", swna.NetconfAdapter, bgp, oper_src_dnode=bgp),
+        "iosxe-cli": swdev.DeviceType("iosxe-cli", xecli.IosXeCliAdapter, yang.compile(xecli_yang.models)),
+    }
+    d = swdev.DeviceMgr(types, t.env, "xe", t.log_handler, lambda name: None, swdev.SchemaRegistry())
+    dmc = Dmc("xe", live_credentials(t), type="iosxe")
+    dmc.address.create("primary", live_setting(t, "IOSXE_CLI_ADDRESS", "127.0.0.1"),
+                       port=u64(int(live_setting(t, "IOSXE_NETCONF_PORT", "830") if netconf else "1")))
+    extra = dmc.extra_adapter.create("iosxe-cli", port=u64(int(live_setting(t, "IOSXE_CLI_PORT", "22"))))
+    extra.ssh = ExtraSsh(key_exchange=_algorithms(t, "IOSXE_CLI_KEY_EXCHANGES"),
+                         host_key_algorithm=_algorithms(t, "IOSXE_CLI_HOST_KEY_ALGORITHMS"),
+                         public_key_algorithm=_algorithms(t, "IOSXE_CLI_PUBLIC_KEY_ALGORITHMS"))
+    d.set_dmc(dmc)
+    dev = d
+    connected()
 
 
 # The install test upgrades a real device and reloads it. Run it on a lab
