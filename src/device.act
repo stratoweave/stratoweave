@@ -227,6 +227,12 @@ def _now() -> str:
     return f"{d.year:04d}-{d.month:02d}-{d.day:02d}T{d.hour:02d}:{d.minute:02d}:{d.second:02d}Z"
 
 
+def _monotonic() -> float:
+    """Monotonic time in seconds."""
+    secs, nanos = time.get_monotonic()
+    return float(secs) + float(nanos) / 1000000000.0
+
+
 def error_text(err: Exception) -> str:
     """An error as one line for a published reason, without the class name
     str() puts first. An error without a message gives its class name."""
@@ -243,8 +249,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     to devmgr.on_software_state.
 
     Implemented so far: check, prepare, pre-checks, install, post-checks,
-    commit or rollback, then a check to read the release back, and a resync;
-    and a prepare under a veto. Cleanup is still a stub.
+    commit or rollback, then a check to read the release back, a resync and
+    the cleanup; and a prepare under a veto.
 
     Declarative like the rest of StratoWeave: the manager is told a target
     release and reconciles toward it, rather than being handed a command to
@@ -371,8 +377,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         _reconcile()
 
     def on_connect() -> None:
-        """Called by DeviceMgr when the device's primary adapter connects: a
-        read under a veto that could not reach the device runs again."""
+        """Called by DeviceMgr when an adapter of the device connects: a read
+        under a veto that could not reach the device runs again."""
         _reconcile()
 
     #### check registration #################################################
@@ -446,6 +452,13 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     def get_reason() -> ?str:
         return state.reason
+
+    def get_job_progress(job: str) -> ?u64:
+        """The progress of a job in percent, when its adapter reported any."""
+        j = state.job.get(job)
+        if j is not None:
+            return j.progress
+        return None
 
     def get_job_state(job: str) -> ?str:
         """The state of a job, one of the JOB_* values; None before it ran."""
@@ -559,6 +572,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             job.release = release
             job.started = _now()
             job.ended = None
+            job.progress = None
             job.message = None
         else:
             state.job.create(JOB_PREPARE, state=JOB_RUNNING, release=release, started=_now())
@@ -572,6 +586,25 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             job.ended = _now()
             job.message = error_text(err!) if err is not None else None
             devmgr.on_software_state(state.copy())
+
+    def report_transfer(transferred: u64, total: ?u64) -> None:
+        """Publish how far the adapter has transferred the image, in the
+        prepare job while it runs: progress is the percent of total, when
+        the adapter knows it, and message has the bytes."""
+        found = state.job.get(JOB_PREPARE)
+        if found is None:
+            return
+        job = found!
+        if job.state != JOB_RUNNING:
+            return
+        size = total if total is not None else u64(0)
+        if size > u64(0):
+            percent = transferred * u64(100) // size
+            job.progress = percent if percent < u64(100) else u64(100)
+            job.message = "transferred " + str(transferred) + " of " + str(size) + " bytes"
+        else:
+            job.message = "transferred " + str(transferred) + " bytes"
+        devmgr.on_software_state(state.copy())
 
     def _prepare_ahead() -> None:
         """Prepare the target while a veto holds the install: copy the image to
@@ -602,10 +635,11 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             return
         t = run_target!
         held = len(vetoes) > 0
-        if err is not None and held:
-            # Under a hold the read is all there is to do: say the release is
-            # unknown, and read again when the device connects, or after a
-            # while for another error.
+        if err is not None and (held or isinstance(err, NotConnectedError)):
+            # Under a hold the read is all there is to do, and a device that
+            # is not connected cannot be upgraded: say the release is unknown,
+            # and read again when the device connects, or after a while for
+            # another error.
             _set_answers(run_campaign, run_target)
             state.reason = "could not read the running release: " + error_text(err!)
             unpublished = True
@@ -848,6 +882,15 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         # can change without a reconnect, so read the platform again too.
         devmgr.resync()
         devmgr.read_platform()
+        adapter.cleanup(_on_cleanup_done)
+
+    def _on_cleanup_done(err: ?Exception) -> None:
+        """The device runs the target, committed, so the run succeeded also
+        when the cleanup failed. The reason says so."""
+        if err is not None:
+            _log.warning("software: installed, but the cleanup failed",
+                         {"device": name, "error": str(err)})
+            state.reason = "cleanup failed: " + error_text(err!)
         _record(ST_SUCCEEDED)
         _done()
 
@@ -1526,6 +1569,9 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
     # adapters' by device type.
     var primary_modules: dict[str, ModCap] = {}
     var extra_modules: dict[str, dict[str, ModCap]] = {}
+    # When each adapter last connected or lost its connection, or was set
+    # up, by device type, in monotonic seconds.
+    var adapter_changed: dict[str, float] = {}
     # The device types whose bundled schemas make up bundled_schema.
     var schema_types: list[str] = []
     # Which adapter serves each namespace.
@@ -1738,9 +1784,10 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         _update_routes()
         new_union = union_modules(_adapter_types(), _modules_by_type())
         resync()
-        _read_platform(new_union)
-        if is_primary:
-            swmgr.on_connect()
+        _read_platform(get_connected_modules())
+        # Any adapter: a device whose NETCONF does not start has its
+        # software read and installed over the CLI.
+        swmgr.on_connect()
         _ensure_config_change_subscription(new_union)
         if modset_eq(modset, new_union):
             _log.debug("Supported modules unchanged")
@@ -1758,6 +1805,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         reporter = _reporting_adapter(dev_type)
         if reporter is not None:
             _set_connected(reporter, False)
+            _update_routes()
 
     def _set_connected(dev_type: str, connected: bool) -> None:
         """Publish whether an adapter is connected, on a change only. The
@@ -1775,12 +1823,16 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         else:
             oper.state.adapter.create(dev_type, connected)
             changed = connected
+            adapter_changed[dev_type] = _monotonic()
         if changed:
+            adapter_changed[dev_type] = _monotonic()
             _log.info("DeviceMgr: adapter connected" if connected else "DeviceMgr: adapter disconnected",
                       {"device": name, "adapter": dev_type})
             update_oper()
 
     def _drop_adapter_entry(dev_type: str) -> None:
+        if dev_type in adapter_changed:
+            del adapter_changed[dev_type]
         if oper.state.adapter.get(dev_type) is not None:
             del oper.state.adapter[dev_type]
             update_oper()
@@ -1808,7 +1860,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         """Decide again which adapter serves each namespace, and send the
         declarations whose route changed to the adapters that serve them
         now."""
-        routes = Routes(_adapter_types(), _modules_by_type())
+        routes = Routes(_adapter_types(), _modules_by_type(), get_unconnected_adapters())
         for owner_id in list(declared.keys()):
             _route_subscriptions(owner_id, False)
         for owner_id in list(notif_declared.keys()):
@@ -1918,8 +1970,10 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
             s.close()
 
     def _read_platform(mods: dict[str, ModCap]) -> None:
-        """Start a new probe walk. An empty module set says nothing about the
-        device, so the last values stay."""
+        """Start a new probe walk over the modules of the adapters that are
+        connected: the probe of an adapter that is not connected cannot
+        read, as NETCONF after a reload into IOS XE 16.8. An empty module
+        set says nothing about the device, so the last values stay."""
         platform_gen += 1
         if len(mods) == 0:
             _log.debug("DeviceMgr: no modules, platform not read", {"device": name})
@@ -1930,7 +1984,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         """Read the platform again on the current connection. SoftwareManager
         calls this after an install, which can change the release without a
         reconnect."""
-        _read_platform(modset)
+        _read_platform(get_connected_modules())
 
     def _end_platform_read() -> None:
         platform_read += 1
@@ -2609,6 +2663,20 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         """The extra adapter of a device type."""
         return extra_adapters.get(dev_type)
 
+    def get_connected_modules() -> dict[str, ModCap]:
+        """The modules of the adapters that are connected now. get_modules
+        keeps the modules of an adapter that is not connected, for the
+        schema and the routes. A software driver that picks an adapter for
+        each step needs the ones that it can reach, as after a reload into a
+        release that has no NETCONF."""
+        unconnected = get_unconnected_adapters()
+        res: dict[str, ModCap] = {}
+        for t, mods in _modules_by_type().items():
+            if t not in unconnected:
+                for module, cap in mods.items():
+                    res[module] = cap
+        return res
+
     def get_unconnected_adapters() -> list[str]:
         """The device types of the adapters that are not connected, the
         adapter of the device type first, then the extra adapters."""
@@ -2623,6 +2691,22 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
                         connected = c
                 if not connected:
                     res.append(t)
+        return res
+
+    def get_unconnected_durations() -> dict[str, float]:
+        """The seconds that each adapter that is not connected has been
+        without a connection, by device type, in the order of
+        get_unconnected_adapters: since it lost its connection, or since it
+        was set up when it never had one."""
+        now = _monotonic()
+        res: dict[str, float] = {}
+        for t in get_unconnected_adapters():
+            since = adapter_changed.get(t)
+            if since is None:
+                adapter_changed[t] = now
+                res[t] = 0.0
+            else:
+                res[t] = now - since!
         return res
 
     def get_module_adapters() -> dict[str, str]:

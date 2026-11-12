@@ -47,7 +47,7 @@ check ──> already on target ──> up-to-date
   │
   ├─> a veto holds the install ──> upgrade-needed ──> with allow-staging: prepare once
   │
-  └─> prepare ─> pre-checks ─> install ─> post-checks ─> commit ─> succeeded
+  └─> prepare ─> pre-checks ─> install ─> post-checks ─> commit ─> cleanup ─> succeeded
          │           │            │            │            │
          └───────────┴────────────┴─> failed   └────────────┴─> rollback ─> rolled-back
 ```
@@ -60,6 +60,7 @@ check ──> already on target ──> up-to-date
 | install | Activate the new release. The device reboots. The step ends when the device runs the target. |
 | post-checks | Ask every post-check. A refusal, or no answer in time, starts a rollback. |
 | commit | Tell the device to keep the new release. Then read the release again and re-read the device config. |
+| cleanup | Remove the software that the device does not run, which makes room for the next upgrade. A failed cleanup leaves the run `succeeded`, with the error in `reason`. |
 | rollback | Go back to the release the device ran before. |
 
 Rules:
@@ -79,8 +80,9 @@ Rules:
 - Under a veto, a read that fails gives `unknown`, with the error in
   `reason`. If the device was not connected, the manager reads it again when
   it connects; after another error, after 5 seconds, then twice as long each
-  time, up to 5 minutes. Without a veto, a read that fails goes on to the
-  upgrade, which reports what fails.
+  time, up to 5 minutes. Without a veto, a device that is not connected
+  gives `unknown` too, and is read again when it connects; another read
+  error goes on to the upgrade, which reports what fails.
 - Right before the install, after the pre-checks, the manager looks at the
   config again. A veto now holds the install, with `upgrade-needed` and the
   holders in `reason`. A changed target or campaign ends the run with
@@ -125,7 +127,7 @@ Published under `stratoweave-rfs:device=<name>/software/state`:
 | `stage` | The step the run is in, or the step it ended in |
 | `reason` | Why the run failed or rolled back, why the release could not be read, or what held the install |
 | `precheck`, `postcheck` | `verdict` (`not-run`, `pass` or `fail`), `detail`, and `at`, the time of the verdict |
-| `job[prepare]` | The last prepare: `state` (`running`, `done` or `failed`), `release`, `started`, `ended` and, when it failed, `message` |
+| `job[prepare]` | The last prepare: `state` (`running`, `done` or `failed`), `release`, `started`, `ended` and, when it failed, `message`. While it runs, an adapter that transfers the image sets `progress` in percent of `image-size` and `message` with the bytes |
 
 The release the device runs is `state/platform/version` (see
 `device-platform.md`). The manager reads the platform again when an install
@@ -161,7 +163,7 @@ A platform adapter is a subclass of `SoftwareAdapter` in `src/device.act`.
 | `commit(done)` | Keep the activated release. |
 | `commit_window(done)` | Seconds left before the device goes back on its own, or `None`. |
 | `rollback(done, previous)` | Go back to `previous`. Call `done` only once the device runs it. |
-| `cleanup(done)` | Remove old images. The manager does not call it. |
+| `cleanup(done)` | Remove old images. The manager calls it after the commit, once the device runs the target. |
 | `plan_estimate()` | Seconds a whole upgrade takes, for planners. Static. |
 | `prepare_estimate()` | Seconds the copy of the image takes, for planners. Static. |
 | `supports_mocking()` | Whether the adapter works with the device mock. |
@@ -172,19 +174,31 @@ it should name the operation and the device's cause, for example
 
 ## IOS XE
 
-`IosXeSoftwareAdapter` in `src/adapters/software_iosxe.act` uses these
-NETCONF RPCs:
+`IosXeSoftwareAdapter` in `src/adapters/software_iosxe.act` runs each step
+over NETCONF when the device has the module for it, and over the IOS XE CLI
+adapter when the device has that as an extra adapter and lacks the module,
+as IOS XE 16.8 on a C1111 lacks NETCONF. It plans from the adapters that are
+connected, so after a reload a step runs over whichever adapter is back.
+Before it stages, it waits for an adapter that is not connected until that
+adapter has been without a connection for 2 minutes. An adapter that never
+connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
 
-| Step | RPC |
-| --- | --- |
-| prepare | `xcopy` from `image-url` to bootflash |
-| install | `install` (add only), then `activate` with a 30 minute auto-abort timer |
-| commit | `install-commit` |
-| rollback | `abort` |
+| Step | NETCONF | CLI |
+| --- | --- | --- |
+| read the release | `software-version` in `Cisco-IOS-XE-device-hardware-oper` | `show version` |
+| read the versions | `install-version-state-info` | `show install summary` |
+| list bootflash | `Cisco-IOS-XE-platform-software-oper` | `dir bootflash:` |
+| check the image | none | `verify /sha512`, `verify /md5`, or `verify` for the signature |
+| prepare | `xcopy` from `image-url` to bootflash | `copy` |
+| install | `install` (add only), then `activate` with a 30 minute auto-abort timer | `install add`, then `install activate auto-abort-timer 30` |
+| commit | `install-commit` | `install commit` |
+| rollback | `abort` | `install abort` |
+| cleanup | `remove` of the inactive software | `install remove inactive` |
 
 - An `<ok/>` reply only means the device accepted the RPC. The adapter then
   reads `install-oper-data` for the records with its UUID until the
-  operation ends.
+  operation ends. A CLI command returns when it ends, or when the session
+  ends as the device reloads.
 - `activate` names the image by the version the device gave it during the
   add, for example `17.18.03a.0.5540`.
 - The device reboots after `activate` and after `abort`. Read errors during
@@ -192,13 +206,40 @@ NETCONF RPCs:
   the one it waits for.
 - Without `install-commit` within 30 minutes of `activate`, the device goes
   back to the old release on its own. 30 is the lowest value IOS XE accepts.
-- The running release comes from the `software-version` banner in
-  `Cisco-IOS-XE-device-hardware-oper`. Releases are compared part by part,
-  so `17.18.03a` matches `17.18.3a`.
+- Releases are compared part by part, so `17.18.03a` matches `17.18.3a`.
 - Operation records are read every 10 seconds for up to 30 minutes. During a
   reboot the release is read every 20 seconds for up to 35 minutes. Nothing
   is retried.
-- Old images stay on bootflash. `cleanup` does nothing.
+- Prepare keeps an image that is on bootflash and passes its check, and
+  transfers one that is missing or fails it. Install checks it again,
+  unless the image passed the same check and `dir bootflash:` shows the
+  index, size and date that it had then, as stat would: a file written
+  again, also deleted and copied anew, gets another index. A check of a
+  735 MB image takes about a minute on a C1111. The driver keeps the
+  checks in memory: after a restart it checks again.
+- While the image transfers, the adapter reports how far it is: over
+  NETCONF from the size of the file on bootflash at each poll of the
+  `xcopy`, over the CLI from the marks that `copy` prints, one `!` per
+  196608 bytes over http (measured on 16.8.1 and 17.15.06). The CLI adapter answers a
+  read of `copy-progress` from what the running copy printed, without a
+  command.
+- Before a transfer, bootflash needs 2.2 times the `image-size` of the
+  intent: the image, and the packages that the add makes of it. Without the
+  room, the adapter removes the inactive software once and looks again.
+- With the CLI adapter, install refuses to start when the running
+  configuration has changes that `write memory` has not saved, because the
+  reboot would lose them.
+- A device in bundle mode, which booted a `.bin`, takes no `install add`
+  alone. Over the CLI the adapter converts it: `boot system` names
+  `packages.conf` and then the running image, `write memory` saves that,
+  and `install add file ... activate commit` adds, activates and commits in
+  one command. That release has no commit window and no abort.
+- A device that runs IOS XE 16 in install mode installs with the same one
+  command, over the CLI. On a C1111 with 16.8.1, `install activate` with
+  the auto-abort timer waited until its SSH session closed, and from
+  17.9.5a `install abort` back to 16.8.1 failed, so a commit window cannot
+  take the device back. A release that it has added is removed first: the
+  one command adds it again from the image file.
 
 The YANG for these RPCs and oper nodes is a trimmed copy in
 `src/adapters/software_iosxe_yang.act`. The bindings generated from it are in

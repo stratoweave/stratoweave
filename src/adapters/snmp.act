@@ -15,10 +15,11 @@ import device as swdev
 import snmp_schema
 import snmp_mock
 import subscriptions
+import adapters.polling as polling
 from device_meta_config import stratoweave_rfs__device_entry as DeviceMetaConfig
 from device_schema import DeviceSchema
-from adapters.adapter import DeviceAdapter, DeviceStream, Subscription, ModCap, ConfigError, \
-    NotConnectedError, SubscriptionStatus, SUBSCRIPTION_POLL, subscription_delay, merge_subscription_tree
+from adapters.adapter import DeviceAdapter, ModCap, ConfigError, NotConnectedError, SubscriptionStatus, \
+    SUBSCRIPTION_POLL
 
 
 # A table walk stops at this many values and reports an error.
@@ -102,75 +103,7 @@ actor SnmpDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, metadata: m
     var configured = False
     var generation = 0
     var closed = False
-    var streams: dict[gdata.SubscriptionSpec, DeviceStream] = {}
-    var subscribers: dict[str, Subscription] = {}
-
-    def _owner_synced(owner_id: str):
-        owner = subscribers.get(owner_id)
-        if owner is not None and owner.owed and len(owner.pending) == 0:
-            owner.owed = False
-            s = owner.synced
-            if s is not None:
-                s(owner_id)
-
-    def _owner_publish(owner_id: str, err: ?Exception=None):
-        owner = subscribers.get(owner_id)
-        if owner is not None:
-            owner.cb(merge_subscription_tree(owner.want, streams), err)
-
-    def _stream_error(st: DeviceStream, err: Exception):
-        st.done = True
-        st.error = err
-        for owner_id in list(st.owners):
-            owner = subscribers.get(owner_id)
-            if owner is not None:
-                if st.instances is not None:
-                    owner.cb(None, err)
-                else:
-                    _owner_publish(owner_id, err)
-                owner.pending.discard(st.spec)
-                _owner_synced(owner_id)
-
-    def _rooted_publish(owner: Subscription, st: DeviceStream, trees: list[gdata.Node]):
-        for tree in trees:
-            owner.cb(tree, None)
-        if len(owner.previous) > 0:
-            point = gdata.root_names(st.spec.root)
-            present = {i.0 for tree in trees for i in gdata.instances(tree, point)}
-            for tree in owner.previous:
-                for i in gdata.instances(tree, point):
-                    if i.0 not in present:
-                        owner.cb(gdata.gone(i.1, point), None)
-            owner.previous = []
-
-    def _snapshot(st: DeviceStream, tree: ?gdata.Node):
-        rooted = st.instances
-        deliveries: list[gdata.Node] = []
-        if rooted is not None:
-            before = rooted.spines()
-            rooted.replace(tree)
-            deliveries = rooted.spines()
-            point = rooted.point
-            was = {i.0: i.1 for n in before for i in gdata.instances(n, point)}
-            present = {i.0: i.1 for n in deliveries for i in gdata.instances(n, point)}
-            for key, n in was.items():
-                if key not in present:
-                    gone = gdata.gone(n, point)
-                    if gone is not None:
-                        deliveries.append(gone)
-        else:
-            st.latest = tree
-        st.done = True
-        st.error = None
-        for owner_id in list(st.owners):
-            owner = subscribers.get(owner_id)
-            if owner is not None:
-                if rooted is not None:
-                    _rooted_publish(owner, st, deliveries)
-                else:
-                    _owner_publish(owner_id)
-                owner.pending.discard(st.spec)
-                _owner_synced(owner_id)
+    poller = polling.Poller()
 
     def get(cb: action(?gdata.Node, ?Exception) -> None, filt: ?gdata.FNode=None):
         current = c
@@ -188,102 +121,25 @@ actor SnmpDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, metadata: m
         except Exception as err:
             cb(None, err)
 
-    def _tick(st: DeviceStream):
-        if not st.active or closed:
-            return
-        gen = generation
-        def received(tree: ?gdata.Node, error: ?Exception):
-            if not st.active or closed:
-                return
-            if gen == generation:
-                if error is not None:
-                    _stream_error(st, error)
-                else:
-                    _snapshot(st, tree)
-            after now subscription_delay(st.spec): _tick(st)
-        get(received, st.spec.filt)
-
-    def _remove_owner_spec(owner_id: str, spec: gdata.SubscriptionSpec):
-        st = streams.get(spec)
-        if st is not None:
-            st.owners.discard(owner_id)
-            if len(st.owners) == 0:
-                st.active = False
-                del streams[spec]
-
     def declare_subscriptions(owner_id: str, cb: action(?gdata.Node, ?Exception) -> None,
                               want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None):
-        root: ?gdata.FNode = None
-        point: list[gdata.Id] = []
-        folded: set[gdata.SubscriptionSpec] = set()
         try:
-            root, point = subscriptions.delivery_root(want)
-            if any([spec.period is None for spec in want]):
-                raise ValueError("SNMP subscriptions require a polling period")
-            folded = {gdata.SubscriptionSpec(f, period=p, root=root)
-                      for p, f in subscriptions.fold(want).items()}
-            for spec in folded:
-                schema.plan(spec.filt)
+            for f in subscriptions.fold(want).values():
+                schema.plan(f)
         except Exception as err:
             cb(None, err)
             if synced is not None:
                 synced(owner_id)
             return
-        old = subscribers.get(owner_id)
-        old_want = old.want if old is not None else set()
-        same_root = all([spec.root == root for spec in old_want])
-        owner = Subscription(cb, folded, synced)
-        if old is not None and same_root:
-            owner.previous = old.previous
-        if old is not None and same_root and folded != old_want and len(point) > 0:
-            for spec in old_want:
-                st = streams.get(spec)
-                if st is not None and st.instances is not None:
-                    owner.previous.extend(st.instances!.spines())
-        subscribers[owner_id] = owner
-        for spec in old_want:
-            if spec not in folded:
-                _remove_owner_spec(owner_id, spec)
-        for spec in folded:
-            st = streams.get(spec)
-            if st is None:
-                st = DeviceStream(spec)
-                streams[spec] = st!
-                st!.owners.add(owner_id)
-                after 0: _tick(st!)
-            elif spec in old_want and owner_id in st!.owners:
-                if st!.done:
-                    owner.pending.discard(spec)
-            else:
-                st!.owners.add(owner_id)
-                if st!.done:
-                    if st!.error is not None and st!.instances is not None:
-                        cb(None, st!.error)
-                    elif st!.error is not None:
-                        _owner_publish(owner_id, st!.error)
-                    elif st!.instances is not None:
-                        _rooted_publish(owner, st!, st!.instances!.spines())
-                    else:
-                        _owner_publish(owner_id)
-                    owner.pending.discard(spec)
-        if same_root and len(old_want - folded) > 0 and len(point) == 0:
-            _owner_publish(owner_id)
-        _owner_synced(owner_id)
+        poller.declare_subscriptions(owner_id, cb, want, synced)
 
     def remove_subscriptions(owner_id: str):
-        owner = subscribers.get(owner_id)
-        if owner is not None:
-            del subscribers[owner_id]
-            for spec in owner.want:
-                _remove_owner_spec(owner_id, spec)
+        poller.remove_subscriptions(owner_id)
 
     def close(on_close: ?action() -> None=None):
         closed = True
         generation += 1
-        for st in streams.values():
-            st.active = False
-        streams = {}
-        subscribers = {}
+        poller.close()
         if c is not None:
             c!.close()
             c = None
@@ -308,6 +164,7 @@ actor SnmpDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, metadata: m
         configured = True
         settings = new_settings
         generation += 1
+        poller.restart()
         gen = generation
         previous = c
         previous_mock = mock
@@ -352,6 +209,8 @@ actor SnmpDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, metadata: m
         mock = candidate_mock
         if c is not None:
             async dev.on_connect(modules, None, dmc.type)
+
+    poller.attach(get)
 
 
 class SnmpAdapter(DeviceAdapter):

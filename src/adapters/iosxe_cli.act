@@ -1,7 +1,10 @@
 """IOS XE exec commands over SSH, with the results as YANG data.
 
-The adapter implements the stratoweave-iosxe-cli module only. It reads and
-runs commands; it does not configure the device.
+The adapter implements the stratoweave-iosxe-cli module. It reads and runs
+commands, and its configure RPC types configuration lines. It also reads the
+BGP neighbors into bgp-state-data of Cisco-IOS-XE-bgp-oper, as NETCONF gives
+them, for a device without NETCONF. A subscription reads its data again at
+each period.
 
 The adapter logs in once and keeps an SSH shell open, in which it types
 one command at a time. A command is done when the prompt follows its
@@ -12,18 +15,21 @@ output text.
 What the IOS XE releases that we tried give for software management, over
 NETCONF and over the CLI:
 
-                       NETCONF                          CLI
-  Release   Platform   files verify xcopy install ev    dir sum hash image install bootvar config  Notes
-  16.8.1    C1111      -     -      -     -       -     yes yes -    yes   yes     yes     yes     1 2 3 4 5 9
-  17.9.5a   C1111      yes   no     has   yes     yes   yes yes yes  yes   has     yes     yes     6 7 9 11 14
-  17.15.04c C1111      has   no     has   yes     has   yes -   yes  -     has     -       -       9 10 12 15
-  17.15.06  C1111      has   no     yes   yes     has   yes -   yes  -     has     -       -       9 10 13 15
-  17.18.2   C8000V     -     no     yes   yes     yes   yes yes -    -     -       -       -       8
+                       NETCONF                                  CLI
+  Release   Platform   files verify xcopy install remove timer ev  dir sum hash image copy install bootvar change config  Notes
+  16.8.1    C1111      -     -      -     -       -      -     -   yes yes yes  yes   yes  yes     yes     yes    yes     1 2 3 4 5 9 18 19
+  17.9.5a   C1111      yes   no     yes   yes     has    yes   yes yes yes yes  yes   yes  yes     yes     yes    yes     6 7 9 11 14 20 21
+  17.15.04c C1111      yes   no     yes   yes     yes    yes   has yes -   yes  -     -    yes     -       yes    -       9 10 12 15 16 17
+  17.15.06  C1111      yes   no     yes   yes     yes    has   has yes -   yes  -     yes  yes     -       yes    -       9 10 13 15 17
+  17.18.2   C8000V     -     no     yes   yes     -      -     yes yes yes -    -     -    -       -       -      -       8
 
   files    Cisco-IOS-XE-platform-software-oper, the files of each partition
+           and its size and use
   verify   Cisco-IOS-XE-verify-rpc and Cisco-IOS-XE-verify-events
   xcopy    Cisco-IOS-XE-xcopy-rpc: the device fetches an image
   install  Cisco-IOS-XE-install-rpc: add, activate and commit
+  remove   Cisco-IOS-XE-install-rpc remove of the inactive software
+  timer    the auto-abort timer and the boot mode in install-oper-data
   ev       netconf-config-change on the NETCONF stream, also for CLI changes,
            and the -events-oper modules on yang-notif-native only
   dir      dir of a file system
@@ -31,8 +37,11 @@ NETCONF and over the CLI:
   hash     verify /md5 or /sha512 with a hash: Verified or %Error verifying
   image    verify without an algorithm: the hashes that an image holds and
            its digital signature
+  copy     copy from a URL to a file system
   install  install add, activate, commit, abort, remove and rollback
   bootvar  show bootvar: the files that ROMMON boots
+  change   the lines of show running-config and show startup-config that say
+           when the configuration changed last
   config   configure terminal in an SSH shell, and write memory
 
   yes      tried, and it works
@@ -67,6 +76,33 @@ Notes:
 13. xcopy fetches the image over http.
 14. scp to bootflash: copies about 0.45 MB/s.
 15. scp to bootflash: copies about 3.9 MB/s.
+16. A configuration change that the device makes as it boots, after an
+    upgrade, names no one in show running-config: "Last configuration
+    change at 23:13:38 UTC Tue Nov 10 2026".
+17. Over the CLI, 17.15.06 copied 17.15.04c over http (735 MB in 3 min),
+    added it and activated it with the abort timer; 17.15.04c committed it
+    and removed the inactive software. Abort and rollback are not tried.
+18. In bundle mode, 16.8.1 copied 17.15.06 over http (735 MB in 10.5 min)
+    and checked its sha512 in about 70 s. With the boot lines set and
+    saved, install add file F activate commit prompt-level none converted
+    the device to install mode with 17.15.06: 20 min to the reload, 4 min
+    to boot. install remove inactive keeps the image of a conversion: the
+    device lists it in bootflash:.installer/exclude_del_file.
+19. In install mode, 16.8.1 copied 17.9.5a over http at 2.7 MB/s and
+    checked its sha512 in 20 s. install remove inactive scans for 1.5 to
+    4.5 min, asks its question, and at once asks again with [y/n] alone.
+    install activate, and install add file F activate commit too, print
+    "Performing Activate on Active/Standby" and then wait until their SSH
+    session closes; then the device activates, commits with the one
+    command, and reloads.
+20. Over the CLI, 17.9.5a copied 16.8.1 at 2.9 MB/s, committed a release
+    activated over 16.8.1 and removed the inactive software. install abort
+    back to 16.8.1 asks "Do you want to proceed? [y/n]" and then fails:
+    "Abort: Passed on []. Failed on [R0]".
+21. Over NETCONF, 17.9.5a fetched 17.15.06 with xcopy in 2.5 min, and the
+    file on bootflash grew as it did, but the device recorded no operation
+    for the xcopy. It added 17.15.06 in 30 s and activated it with the
+    abort timer; after the reload, 17.15.06 gave a commit window of 1512 s.
 """
 
 import logging
@@ -78,10 +114,12 @@ import yang.gdata as gdata
 import device as swdev
 import adapters.iosxe_cli_data as xecli_data
 import adapters.iosxe_cli_yang as xecli_yang
+import adapters.polling as polling
+import subscriptions
 from device_meta_config import stratoweave_rfs__device_entry as DeviceMetaConfig
 from device_schema import DeviceSchema
 from adapters.adapter import DeviceAdapter, ModCap, ConfigError, NotConnectedError, \
-    PermanentError, TransientError, SubscriptionStatus, SUBSCRIPTION_UNKNOWN, ssh_transport_config
+    PermanentError, TransientError, SubscriptionStatus, SUBSCRIPTION_POLL, ssh_transport_config
 
 ## The file systems that a read gets when its filter does not name any.
 DEFAULT_FILE_SYSTEMS = ["bootflash:"]
@@ -94,6 +132,11 @@ COMMAND_TIMEOUT = 60.0
 ## MD5 of an 838 MB image takes 23 s on a C8000V.
 RPC_TIMEOUT = 600.0
 
+## The bytes that a copy over http copies for each ! that it prints, on a
+## C1111: 3499 marks for 687933004 bytes and 3737 for 734643332 with 16.8.1,
+## 2177 for 427968764 with 17.15.06.
+COPY_MARK_BYTES = 196608
+
 ## Seconds that an install command can run. install add copies and expands
 ## an image, from a URL too.
 INSTALL_TIMEOUT = 3600.0
@@ -104,6 +147,16 @@ CONFIG_LINE_TIMEOUT = 30.0
 ## The question that install remove asks before it deletes files, on a C1111
 ## with 17.15.04c. It has no prompt-level none.
 REMOVE_QUESTION = "Do you want to remove the above files? [y/n]"
+
+## How IOS XE 16.8 asks the question of install remove again, on a line of its
+## own. 16.8 prints the question and at once asks again, before anything is
+## typed, as if it read an empty line first.
+REMOVE_ASKED_AGAIN = "[y/n]"
+
+## The end of the question that install abort asks before it reverts, on a
+## C1111 with 17.9.5a: "This operation may require a reload of the system. Do
+## you want to proceed? [y/n]". install rollback is taken to ask the same.
+ABORT_QUESTION = "Do you want to proceed? [y/n]"
 
 ## Seconds without a command after which the shell gets an empty line, so a
 ## dead connection shows and the device does not end the session. IOS XE
@@ -144,7 +197,8 @@ class CommandError(PermanentError):
 
 def modules() -> dict[str, ModCap]:
     """Return the modules that the adapter implements."""
-    return {xecli_yang.MODULE: ModCap(xecli_yang.MODULE, xecli_yang.NS)}
+    return {xecli_yang.MODULE: ModCap(xecli_yang.MODULE, xecli_yang.NS),
+            xecli_yang.BGP_MODULE: ModCap(xecli_yang.BGP_MODULE, xecli_yang.BGP_NS)}
 
 
 def check_file_system(name: str) -> None:
@@ -197,8 +251,58 @@ def verify_command(file_system: str, file: str, algorithm: ?str=None, expected: 
     return "verify " + file_system + file
 
 
+def copy_command(source: str, file_system: str, file: str) -> str:
+    """Return the copy command that copies source to file on file_system."""
+    check_location(source)
+    check_file_system(file_system)
+    check_file(file)
+    return "copy " + source + " " + file_system + file
+
+
+def delete_command(file_system: str, file: str) -> str:
+    """Return the delete command of file on file_system."""
+    check_file_system(file_system)
+    check_file(file)
+    return "delete " + file_system + file
+
+
+def _copy_error(lines: list[str]) -> ?str:
+    """Return the first line where copy or delete reports an error. A
+    warning, such as the one about a file that copy overwrites, is not
+    one."""
+    for line in lines:
+        if line.startswith("%") and not line.startswith("%Warning"):
+            return line
+    return None
+
+
+def parse_copy(output: str) -> u64:
+    """Return the number of bytes that copy reports copied.
+
+    Raise CommandError when the device reports an error, or the output has
+    no count, as when the copy stopped.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _copy_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    for line in lines:
+        words = line.split()
+        if len(words) > 3 and words[1] == "bytes" and words[2] == "copied" and _digits(words[0]):
+            return u64(int(words[0]))
+    raise CommandError("copy output has no count of bytes copied")
+
+
+def check_delete_output(output: str) -> None:
+    """Raise CommandError when delete reports an error, as for a file that
+    is not there."""
+    err = _copy_error([line.strip() for line in output.splitlines()])
+    if err is not None:
+        raise CommandError(err)
+
+
 def check_location(location: str) -> None:
-    """Raise ValueError if location is not a file or a URL for an install command."""
+    """Raise ValueError if location is not a file or a URL for an install or a copy command."""
     if ":" not in location or any([c not in _LOCATION_CHARS for c in location]):
         raise ValueError("invalid file or URL: " + location + ". Use a file system or a scheme, and only letters, digits and ._~:/@%+=,-")
 
@@ -286,11 +390,13 @@ class DirEntry(object):
     name: str
     size: u64
     modified: str
+    index: u64
 
-    def __init__(self, name: str, size: u64, modified: str):
+    def __init__(self, name: str, size: u64, modified: str, index: u64=u64(0)):
         self.name = name
         self.size = size
         self.modified = modified
+        self.index = index
 
     def __str__(self) -> str:
         return self.name + " " + str(self.size) + " " + self.modified
@@ -330,13 +436,26 @@ def _dir_line(line: str) -> ?DirEntry:
         raise CommandError("unexpected dir line: " + line)
     if not fields[1].startswith("-"):
         return None
-    return DirEntry(" ".join(fields[8:]), u64(int(fields[2])), modified)
+    return DirEntry(" ".join(fields[8:]), u64(int(fields[2])), modified, u64(int(fields[0])))
 
 
 def _total_line(line: str) -> bool:
     """True for the last line of a listing, e.g. 11546681344 bytes total (9966010368 bytes free)."""
     fields = line.split()
     return len(fields) == 6 and _digits(fields[0]) and fields[1:3] == ["bytes", "total"] and fields[5] == "free)"
+
+
+def parse_dir_space(output: str) -> ?(total: u64, free: u64):
+    """Return the size and the free space of the file system from the total
+    line of a dir listing, or None when the listing has no total line."""
+    for line in output.splitlines():
+        text = line.strip()
+        if _total_line(text):
+            fields = text.split()
+            free = fields[3][1:]
+            if _digits(free):
+                return (total=u64(int(fields[0])), free=u64(int(free)))
+    return None
 
 
 def parse_dir(output: str, file_system: str) -> list[DirEntry]:
@@ -598,6 +717,107 @@ def parse_version(output: str) -> xecli_data.stratoweave_iosxe_cli__version:
     return v
 
 
+## The comment lines that say when the configuration changed last.
+CONFIG_CHANGE_LINES = "^! Last configuration change|^! No configuration change"
+
+
+def parse_config_change(output: str) -> ?str:
+    """Return the line of show running-config or show startup-config that
+    says when the configuration changed last, without its "! ", or None.
+
+    Raise CommandError when the device reports an error, as when there is no
+    startup configuration.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    for line in lines:
+        if line.startswith("! Last configuration change") or line.startswith("! No configuration change"):
+            return line[2:]
+    return None
+
+
+## The lines of show bgp ... neighbors that name each neighbor, its state, its
+## address families and their current prefixes. The device leaves out all
+## other lines, also "% BGP not active".
+BGP_NEIGHBOR_LINES = "BGP neighbor is|BGP state =|For address family:|Prefixes Current:"
+
+## The commands whose neighbors make up the BGP data: the global table over
+## IPv4 and IPv6, and the VRFs over each.
+BGP_COMMANDS = ["show bgp ipv4 unicast neighbors", "show bgp ipv6 unicast neighbors",
+                "show bgp vpnv4 unicast all neighbors", "show bgp vpnv6 unicast all neighbors"]
+
+
+class BgpNeighbor(object):
+    """One address family of a BGP neighbor, with the names that NETCONF
+    gives in Cisco-IOS-XE-bgp-oper."""
+    afi_safi: str
+    vrf: str
+    address: str
+    state: str
+    sent: u64
+    received: u64
+
+    def __init__(self, afi_safi: str, vrf: str, address: str, state: str, sent: u64=u64(0), received: u64=u64(0)):
+        self.afi_safi = afi_safi
+        self.vrf = vrf
+        self.address = address
+        self.state = state
+        self.sent = sent
+        self.received = received
+
+    def __str__(self) -> str:
+        return " ".join([self.afi_safi, self.vrf, self.address, self.state, str(self.sent), str(self.received)])
+
+
+def parse_bgp_neighbors(output: str) -> list[BgpNeighbor]:
+    """Return each address family of each neighbor in the output of show bgp
+    ... neighbors that BGP_NEIGHBOR_LINES filters.
+
+    The names are those of NETCONF: address family IPv4 Unicast becomes
+    ipv4-unicast, state Established becomes fsm-established, and a neighbor
+    outside a VRF is in VRF default. Raise CommandError when the device
+    reports an error or a line is not as expected.
+    """
+    lines = [line.strip() for line in output.splitlines()]
+    err = _device_error(lines)
+    if err is not None:
+        raise CommandError(err)
+    result: list[BgpNeighbor] = []
+    address = ""
+    vrf = "default"
+    state = ""
+    for line in lines:
+        if line.startswith("BGP neighbor is "):
+            parts = line[len("BGP neighbor is "):].split(",")
+            address = parts[0].strip()
+            vrf = "default"
+            state = ""
+            for part in parts[1:]:
+                p = part.strip()
+                if p.startswith("vrf "):
+                    vrf = p[4:].strip()
+        elif line.startswith("BGP state = "):
+            words = line[len("BGP state = "):].split(",")[0].split()
+            if len(words) == 0:
+                raise CommandError("BGP state line without a state: " + line)
+            state = "fsm-" + words[0].lower()
+        elif line.startswith("For address family: "):
+            if address == "":
+                raise CommandError("address family before a BGP neighbor: " + line)
+            family = "-".join(line[len("For address family: "):].lower().split())
+            result.append(BgpNeighbor(family, vrf, address, state))
+        elif line.startswith("Prefixes Current:"):
+            # Prefixes Current: <sent> <received> (Consumes <n> bytes)
+            words = line.split()
+            if len(result) == 0 or len(words) < 4 or not _digits(words[2]) or not _digits(words[3]):
+                raise CommandError("unexpected prefix line: " + line)
+            result[-1].sent = u64(int(words[2]))
+            result[-1].received = u64(int(words[3]))
+    return result
+
+
 def file_systems_selected(top: gdata.FNode) -> list[str]:
     """Return the file systems that a filter of file-systems selects.
 
@@ -650,7 +870,11 @@ class DirRead(Read):
     def parse(self, r: xecli_data.root, output: str) -> None:
         fs = r.file_systems.file_system.create(self.file_system)
         for e in parse_dir(output, self.file_system):
-            fs.file.create(e.name, size=e.size, modified=e.modified)
+            fs.file.create(e.name, size=e.size, modified=e.modified, index=e.index)
+        space = parse_dir_space(output)
+        if space is not None:
+            fs.total = space.total
+            fs.free = space.free
 
 
 class VersionRead(Read):
@@ -671,6 +895,24 @@ class BootvarRead(Read):
         r.bootvar = parse_bootvar(output)
 
 
+class RunningChangeRead(Read):
+    """Read when the running configuration changed last."""
+    def __init__(self):
+        self.command = "show running-config | include " + CONFIG_CHANGE_LINES
+
+    def parse(self, r: xecli_data.root, output: str) -> None:
+        r.config_change.running = parse_config_change(output)
+
+
+class StartupChangeRead(Read):
+    """Read when the startup configuration changed last."""
+    def __init__(self):
+        self.command = "show startup-config | include " + CONFIG_CHANGE_LINES
+
+    def parse(self, r: xecli_data.root, output: str) -> None:
+        r.config_change.startup = parse_config_change(output)
+
+
 class InstallRead(Read):
     """Read the installed packages with show install summary."""
     def __init__(self):
@@ -678,6 +920,19 @@ class InstallRead(Read):
 
     def parse(self, r: xecli_data.root, output: str) -> None:
         r.install_summary = parse_install_summary(output)
+
+
+class BgpRead(Read):
+    """Read the BGP neighbors that one show bgp ... neighbors command lists."""
+    def __init__(self, command: str):
+        self.command = command + " | include " + BGP_NEIGHBOR_LINES
+
+    def parse(self, r: xecli_data.root, output: str) -> None:
+        for n in parse_bgp_neighbors(output):
+            key = (afi_safi=n.afi_safi, vrf_name=n.vrf, neighbor_id=n.address)
+            e = r.bgp_state_data.neighbors.neighbor.create(key, session_state=n.state)
+            e.prefix_activity.sent.current_prefixes = n.sent
+            e.prefix_activity.received.current_prefixes = n.received
 
 
 def _node_reads(top: gdata.FNode) -> list[Read]:
@@ -691,7 +946,30 @@ def _node_reads(top: gdata.FNode) -> list[Read]:
         return [InstallRead()]
     if top.name == gdata.Id(xecli_yang.NS, "bootvar"):
         return [BootvarRead()]
+    if top.name == gdata.Id(xecli_yang.NS, "config-change"):
+        return [RunningChangeRead(), StartupChangeRead()]
+    if top.name == gdata.Id(xecli_yang.BGP_NS, "bgp-state-data"):
+        return [BgpRead(c) for c in BGP_COMMANDS]
     return []
+
+
+def copy_progress(command: str, output: str) -> (file: str, bytes: u64):
+    """Return the destination and the bytes copied so far of a copy command
+    from what it printed so far. Another command gives no file."""
+    if not command.startswith("copy "):
+        return (file="", bytes=u64(0))
+    words = command.split()
+    return (file=words[-1], bytes=u64(output.count("!") * COPY_MARK_BYTES))
+
+
+def selects_copy_progress(filt: ?gdata.FNode) -> bool:
+    """Return True if a get with filt reads copy-progress, as a get without a
+    filter does."""
+    if filt is None:
+        return True
+    f = filt!
+    tops = f.children if f.name is None else [f]
+    return any([t.name == gdata.Id(xecli_yang.NS, "copy-progress") for t in tops])
 
 
 def reads(filt: ?gdata.FNode) -> list[Read]:
@@ -945,10 +1223,52 @@ class InstallCall(Call):
         return INSTALL_TIMEOUT if INSTALL_TIMEOUT > default else default
 
     def answers(self) -> list[(question: str, answer: str)]:
-        """install remove asks before it deletes files; the RPC means yes."""
+        """install remove asks before it deletes files, install abort and
+        install rollback before they revert. The RPC means yes."""
         if self.command.startswith("install remove"):
-            return [(question=REMOVE_QUESTION, answer="y")]
+            return [(question=REMOVE_QUESTION, answer="y"), (question=REMOVE_ASKED_AGAIN, answer="y")]
+        if self.command.startswith("install abort") or self.command.startswith("install rollback"):
+            return [(question=ABORT_QUESTION, answer="y")]
         return []
+
+
+class CopyCall(Call):
+    """Run the copy RPC."""
+    file: str
+
+    def __init__(self, inp: xecli_data.stratoweave_iosxe_cli__copy__input):
+        self.command = copy_command(inp.source, inp.file_system, inp.file)
+        self.file = inp.file
+
+    def reply(self, output: str) -> gdata.Node:
+        return xecli_data.stratoweave_iosxe_cli__copy__output(size=parse_copy(output)).to_gdata()
+
+    def timeout(self, default: float) -> float:
+        return INSTALL_TIMEOUT if INSTALL_TIMEOUT > default else default
+
+    def answers(self) -> list[(question: str, answer: str)]:
+        """copy asks for the destination file name, and before it
+        overwrites a file."""
+        return [(question="Destination filename [" + self.file + "]?", answer=""),
+                (question="[confirm]", answer="")]
+
+
+class DeleteCall(Call):
+    """Run the delete RPC."""
+    file: str
+
+    def __init__(self, inp: xecli_data.stratoweave_iosxe_cli__delete__input):
+        self.command = delete_command(inp.file_system, inp.file)
+        self.file = inp.file
+
+    def reply(self, output: str) -> gdata.Node:
+        check_delete_output(output)
+        return gdata.Container({})
+
+    def answers(self) -> list[(question: str, answer: str)]:
+        """delete asks for the file name, then to confirm."""
+        return [(question="Delete filename [" + self.file + "]?", answer=""),
+                (question="[confirm]", answer="")]
 
 
 class WriteMemoryCall(Call):
@@ -1003,6 +1323,10 @@ def rpc_call(request: gdata.Node) -> Call:
         return InstallCall(xecli_data.stratoweave_iosxe_cli__install__input.from_gdata(body))
     if rpc_id == gdata.Id(xecli_yang.NS, "write-memory"):
         return WriteMemoryCall()
+    if rpc_id == gdata.Id(xecli_yang.NS, "copy"):
+        return CopyCall(xecli_data.stratoweave_iosxe_cli__copy__input.from_gdata(body))
+    if rpc_id == gdata.Id(xecli_yang.NS, "delete"):
+        return DeleteCall(xecli_data.stratoweave_iosxe_cli__delete__input.from_gdata(body))
     raise ValueError("RPC " + str(rpc_id) + " is not supported by the IOS XE CLI adapter")
 
 
@@ -1053,7 +1377,8 @@ def _after_echo(text: str) -> str:
 
 
 actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock, login_timeout: float,
-                 on_ready: action() -> None, on_end: action(Exception) -> None):
+                 on_ready: action() -> None, on_end: action(Exception) -> None,
+                 log_handler: ?logging.Handler=None):
     """One login to an IOS XE device with a shell that runs one command at a
     time.
 
@@ -1069,6 +1394,7 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
     when the connection closed, and the commands in the queue. Then it calls
     on_end. close ends the session without on_end.
     """
+    _log = logging.Logger(log_handler)
     var client: ?ssh.Client = None
     var channel: ?ssh.Channel = None
     # The exec prompt, such as Router#.
@@ -1123,8 +1449,18 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
             _type(d.start())
         else:
             dialog = None
+            if j.command != "":
+                _log.debug("IOS XE CLI: running", {"command": j.command})
             _type([j.command + "\r"])
         _watch(j.timeout)
+
+    def running() -> (command: str, output: str):
+        """Return the command that runs now and what it printed so far, or
+        no command."""
+        j = job
+        if j is not None and dialog is None:
+            return (command=j.command, output=text)
+        return (command="", output="")
 
     def _watch(timeout: float):
         serial += 1
@@ -1201,6 +1537,7 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
     def _on_text(chunk: str):
         if ended:
             return
+        _log.trace("IOS XE CLI: received", {"text": chunk})
         if not started:
             text += chunk
             p = last_line(text)
@@ -1244,6 +1581,7 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
         tail = last_line(text)
         for a in answers:
             if tail.endswith(a.question) and text.rfind(a.question) >= answered:
+                _log.debug("IOS XE CLI: answering", {"question": a.question, "answer": a.answer})
                 answered = len(text)
                 _type([a.answer + "\r"])
                 return
@@ -1251,13 +1589,19 @@ actor CliSession(cap: ?net.TCPConnectCap, dmc: DeviceMetaConfig, mock: ?CliMock,
     def _type(texts: list[str]):
         m = mock
         if m is not None:
+            first = ""
             replies = ""
             wait = 0.0
             for t in texts:
-                replies += m.type_text(t.rstrip())
+                reply = m.type_text(t.rstrip())
+                n = m.early_of(t.rstrip())
+                first += reply[:n]
+                replies += reply[n:]
                 d = m.delay_of(t.rstrip())
                 if d > wait:
                     wait = d
+            if first != "":
+                after 0: _on_text(first)
             after wait: _on_text(replies)
             return
         ch = channel
@@ -1347,11 +1691,15 @@ actor CliMock():
     var replies: dict[str, str] = {}
     # Seconds that a command takes, when set_delay gave it any.
     var delays: dict[str, float] = {}
+    # The characters of a command's output that come at once.
+    var early: dict[str, int] = {}
     # The answer to the question of a command, and what follows it.
     var answer_of: dict[str, str] = {}
     var after_answer: dict[str, str] = {}
     # The command whose question waits for a line.
     var asking: ?str = None
+    # The replies that a command sets when it runs, by command.
+    var sets: dict[str, list[(command: str, output: str)]] = {}
     var commands: list[str] = []
     var configured: list[str] = []
     var config_mode = False
@@ -1359,9 +1707,26 @@ actor CliMock():
     def set_reply(command: str, output: str) -> None:
         replies[command] = output
 
+    def set_reply_on(trigger: str, command: str, output: str) -> None:
+        """When trigger runs, give command the output, as a copy changes
+        what dir shows."""
+        if trigger in sets:
+            sets[trigger].append((command=command, output=output))
+        else:
+            sets[trigger] = [(command=command, output=output)]
+
     def set_delay(command: str, seconds: float) -> None:
         """Make command take seconds before its output comes."""
         delays[command] = seconds
+
+    def set_early(command: str, chars: int) -> None:
+        """Make the first chars of what command prints come at once, before
+        its delay, as the marks of a copy come while it runs."""
+        early[command] = chars
+
+    def early_of(text: str) -> int:
+        n = early.get(text)
+        return n if n is not None else 0
 
     def delay_of(text: str) -> float:
         d = delays.get(text)
@@ -1417,6 +1782,10 @@ actor CliMock():
             return text + "\r\nRouter#"
         commands.append(text)
         r = replies.get(text)
+        updates = sets.get(text)
+        if updates is not None:
+            for update in updates:
+                replies[update.command] = update.output
         if r is not None and text in answer_of:
             asking = text
             return text + "\r\n" + r
@@ -1454,6 +1823,7 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
     var mock: ?CliMock = None
     var session: ?CliSession = None
     var ready = False
+    poller = polling.Poller()
 
     def get_mock() -> ?CliMock:
         return mock
@@ -1472,7 +1842,7 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
         if d is not None:
             session = CliSession(tcp, d, mock, command_timeout,
                                  lambda: _session_ready(gen),
-                                 lambda err: _session_ended(gen, delay, err))
+                                 lambda err: _session_ended(gen, delay, err), log_handler)
 
     def _session_ready(gen: int):
         if closed or gen != generation:
@@ -1500,6 +1870,7 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
 
     def _restart():
         generation += 1
+        poller.restart()
         ready = False
         s = session
         session = None
@@ -1559,10 +1930,21 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
         except Exception as e:
             cb(None, e)
         else:
-            if len(rs) > 0:
-                _read(rs, 0, xecli_data.root(), filt, cb)
-            else:
-                cb(gdata.Container({}), None)
+            r = xecli_data.root()
+            if selects_copy_progress(filt):
+                _fill_copy_progress(r)
+            _read(rs, 0, r, filt, cb)
+
+    def _fill_copy_progress(r: xecli_data.root) -> None:
+        """Add the progress of the copy that runs now, from the session,
+        without a command."""
+        s = session
+        if s is not None:
+            running = s.running()
+            p = copy_progress(running.command, running.output)
+            if p.file != "":
+                r.copy_progress.file = p.file
+                r.copy_progress.bytes = p.bytes
 
     def _call(cb: action(?gdata.Node, ?Exception) -> None, c: Call):
         def received(output: ?str, err: ?Exception):
@@ -1611,15 +1993,33 @@ actor IosXeCliDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?E
             else:
                 _exec(cb, request)
 
+    def declare_subscriptions(owner_id: str, cb: action(?gdata.Node, ?Exception) -> None,
+                              want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None):
+        try:
+            for f in subscriptions.fold(want).values():
+                reads(f)
+        except Exception as err:
+            cb(None, err)
+            if synced is not None:
+                synced(owner_id)
+            return
+        poller.declare_subscriptions(owner_id, cb, want, synced)
+
+    def remove_subscriptions(owner_id: str):
+        poller.remove_subscriptions(owner_id)
+
     def close(on_close: ?action() -> None=None):
         closed = True
         generation += 1
+        poller.close()
         s = session
         session = None
         if s is not None:
             s.close()
         if on_close is not None:
             on_close()
+
+    poller.attach(get)
 
 
 class IosXeCliAdapter(DeviceAdapter):
@@ -1657,10 +2057,10 @@ class IosXeCliAdapter(DeviceAdapter):
         return self._modules
 
     def subscription_method(self) -> str:
-        return SUBSCRIPTION_UNKNOWN
+        return SUBSCRIPTION_POLL
 
     def subscription_status(self) -> SubscriptionStatus:
-        return SubscriptionStatus(SUBSCRIPTION_UNKNOWN)
+        return SubscriptionStatus(SUBSCRIPTION_POLL, emulated=True)
 
     def fetch_config(self, done: action(?gdata.Node, ?Exception) -> None):
         done(gdata.Container({}), None)
@@ -1679,12 +2079,10 @@ class IosXeCliAdapter(DeviceAdapter):
 
     def declare_subscriptions(self, owner_id: str, cb: action(?gdata.Node, ?Exception) -> None,
                               want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None):
-        cb(None, PermanentError("the IOS XE CLI adapter does not support subscriptions"))
-        if synced is not None:
-            synced(owner_id)
+        self._driver.declare_subscriptions(owner_id, cb, want, synced)
 
     def remove_subscriptions(self, owner_id: str):
-        pass
+        self._driver.remove_subscriptions(owner_id)
 
     def close(self, on_close: ?action() -> None=None):
         self._driver.close(on_close)

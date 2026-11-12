@@ -200,6 +200,28 @@
 - The `install` RPC of the IOS XE CLI adapter answers the question that
   `install remove` asks before it deletes files, which has no
   `prompt-level none` on IOS XE 17.15. [#780]
+- The `ios-xe-cli` platform probe reads `show version` through the IOS XE CLI
+  adapter, after the NETCONF probe, so an IOS XE device without NETCONF, like
+  16.8 on a C1111, has a platform. Probes run over the modules of the
+  connected adapters, so a device whose NETCONF went down reads its platform
+  over the CLI. [#799]
+- The IOS XE CLI adapter has a `copy` RPC, which fetches a file onto the
+  device and tells how far it is from the `!` marks of the copy, and a
+  `delete` RPC. It reads when the running and the startup configuration last
+  changed, and the index of each file in `dir`. [#799]
+- The IOS XE CLI adapter answers the questions of `install remove`, which
+  16.8 asks twice, and of `install abort`. At debug level it logs each
+  command that it types and each question that it answers. [#799]
+- The IOS XE CLI adapter reads the BGP neighbors into `Cisco-IOS-XE-bgp-oper`
+  from `show bgp ... neighbors`, in the shape that NETCONF gives them, and
+  realizes subscriptions by polling, as the SNMP adapter does. The fleetmgr
+  BGP upgrade checks then work on a device without NETCONF. [#799]
+- A module that two adapters of a device serve goes to the first connected
+  adapter, the primary first, and moves when a connection comes or goes.
+  Before, it went to the first adapter that served it, also while that
+  adapter was down. `DeviceMgr.get_connected_modules` gives the modules of
+  the connected adapters, and `get_unconnected_durations` how long each
+  missing adapter has been without a connection. [#799]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
@@ -278,6 +300,33 @@
 - IOS XE staging waits up to 2 minutes for adapters of the device that are
   not connected, such as a CLI adapter that connects after NETCONF, before it
   picks how to run. [#781]
+- The IOS XE software adapter does each step over NETCONF when the device
+  has the module, and over the IOS XE CLI adapter otherwise: it reads the
+  release and the versions, transfers, checks, adds, activates, commits and
+  aborts. It converts a device in bundle mode, which it also tells over
+  NETCONF, to install mode, and on IOS XE 16 it installs with one command,
+  `install add file ... activate commit`. A C1111 went from 16.8.1 in
+  bundle mode to 17.15.06 over the CLI alone. [#799]
+- Before a transfer the IOS XE adapter looks for room for 2.2 times the
+  image size, and before an add for 1.2 times. When short, it removes the
+  software that the device does not run, once. The manager calls `cleanup`
+  after the commit. A transfer that failed for lack of room says so. [#799]
+- The IOS XE adapter removes another added release before it stages the
+  target, and aborts another release pending commit before an install. It
+  refuses to install while a change that someone made to the running
+  configuration is not saved, and saves a change that the device made
+  itself as it booted. [#799]
+- The IOS XE commit window comes from the device's abort timer. [#799]
+- A staged IOS XE image that passed a check is not checked again while its
+  index, size and modification time in `dir` stay the same. [#799]
+- The prepare job tells how far a transfer is, in `progress` and in its
+  message: over NETCONF from the size of the file on bootflash, over the
+  CLI from the output of the copy. An xcopy also ends when the file has the
+  image size, as IOS XE 17.9.5a records no xcopy. [#799]
+- No upgrade runs while the device is not connected: the manager waits as
+  under a veto and reads the release again when an adapter connects. The
+  IOS XE adapter waits for a missing adapter once, up to 2 minutes from
+  when it lost its connection. [#799]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -548,6 +597,11 @@
   settings of each, which the transforms pass to the device on its
   flotilla. The flotillas register the device type `iosxe-cli`, the IOS XE
   CLI adapter, so an IOS XE device can have the CLI beside NETCONF. [#779]
+- A fleet device has `upgrade-checks/enabled`, true by default. With false,
+  its upgrades go without the BGP pre- and post-checks. [#799]
+- The prepare in the upgrade status of a fleet device, and in the
+  `device-status` of a campaign, has `progress`: how far the device's
+  transfer is. [#799]
 
 ### Dependencies
 

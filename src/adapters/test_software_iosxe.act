@@ -467,7 +467,7 @@ actor _test_iosxe_staging_waits_for_adapters(t: testing.EnvT):
         try:
             testing.assertEqual("succeeded", st, d!.get_swmgr().get_reason())
             testing.assertEqual(["never"], d!.get_unconnected_adapters())
-            testing.assertEqual(["xcopy", "install", "activate", "install-commit"], m!.get_rpcs())
+            testing.assertEqual(["xcopy", "install", "activate", "install-commit", "remove"], m!.get_rpcs())
             t.success()
         except Exception as e:
             t.failure(e)
@@ -536,7 +536,7 @@ actor _test_iosxe_upgrade_through_the_software_manager(t: testing.EnvT):
             # reports the new release; keep polling until it catches up.
             return
         finished = True
-        testing.assertEqual(["xcopy", "install", "activate", "install-commit"],
+        testing.assertEqual(["xcopy", "install", "activate", "install-commit", "remove"],
                             m!.get_rpcs(), "unexpected RPCs on the device")
         inp = m!.get_inputs()
         testing.assertEqual(IMAGE_URL, inp.source,
@@ -877,7 +877,7 @@ actor _test_iosxe_size_keeps_a_staged_image(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual(["install", "activate", "install-commit"], m.get_rpcs())
+            testing.assertEqual(["install", "activate", "install-commit", "remove"], m.get_rpcs())
             t.success()
         except Exception as e:
             t.failure(e)
@@ -890,7 +890,7 @@ actor _test_iosxe_size_mismatch_transfers_again(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual(["xcopy", "install", "activate", "install-commit"], m.get_rpcs())
+            testing.assertEqual(["xcopy", "install", "activate", "install-commit", "remove"], m.get_rpcs())
             t.success()
         except Exception as e:
             t.failure(e)
@@ -1045,7 +1045,7 @@ actor _UpgradeRun(t: testing.EnvT, name: str, upgrade_duration: float,
                   failure: str, running: str, target: str, image_url: str,
                   settled: action(swxemock.IosXeSoftwareMock, swdev.DeviceMgr,
                                   str) -> None,
-                  timeout: float=2.5):
+                  timeout: float=2.5, bundle: bool=False):
     """Drive one mock device from software intent to a settled status, then
     call `settled` with the mock, the device and the status. The timeout
     failure dumps what the device saw."""
@@ -1081,7 +1081,7 @@ actor _UpgradeRun(t: testing.EnvT, name: str, upgrade_duration: float,
             if ms is not None:
                 m = swxemock.IosXeSoftwareMock(ms!, t.log_handler,
                                                upgrade_duration=upgrade_duration,
-                                               failure=failure, running=running)
+                                               failure=failure, running=running, bundle=bundle)
                 mock = m
                 m.attach()
                 dmc = DeviceMetaConfig(name, Credentials("admin", "admin"),
@@ -1202,19 +1202,22 @@ actor _test_iosxe_release_follows_the_image(t: testing.EnvT):
 #############################################################################
 
 def _test_upgrade_plan_follows_the_modules():
-    netconf = {swxe.XCOPY_MODULE, swxe.INSTALL_MODULE, swxe.FILES_MODULE}
-    no_files = {swxe.XCOPY_MODULE, swxe.INSTALL_MODULE}
     cli = {xecli_yang.MODULE}
+    netconf = {swxe.HARDWARE_MODULE, swxe.XCOPY_MODULE, swxe.INSTALL_MODULE, swxe.FILES_MODULE, swxe.CISCO_RPC_MODULE}
+    no_files = {swxe.HARDWARE_MODULE, swxe.XCOPY_MODULE, swxe.INSTALL_MODULE}
+    # Columns: check, transfer, listing, verify, install, delete.
     cases = [
-        ("NETCONF and the CLI, as a C1111 with 17.15", netconf | cli, ("netconf", "netconf", "cli", "netconf")),
-        ("NETCONF without the files, and the CLI", no_files | cli, ("netconf", "cli", "cli", "netconf")),
-        ("only the CLI, as a C1111 with 16.8.1", cli, ("", "cli", "cli", "")),
-        ("only NETCONF, without the CLI adapter", netconf, ("netconf", "netconf", "", "netconf")),
-        ("nothing", set(), ("", "", "", "")),
+        ("NETCONF and the CLI, as a C1111 with 17.15", netconf | cli,
+         ("netconf", "netconf", "netconf", "cli", "netconf", "netconf")),
+        ("NETCONF without the files and delete, and the CLI", no_files | cli,
+         ("netconf", "netconf", "cli", "cli", "netconf", "cli")),
+        ("only the CLI, as a C1111 with 16.8.1", cli, ("cli", "cli", "cli", "cli", "cli", "cli")),
+        ("only NETCONF, without the CLI adapter", netconf, ("netconf", "netconf", "netconf", "", "netconf", "netconf")),
+        ("nothing", set(), ("", "", "", "", "", "")),
     ]
     for name, modules, want in cases:
         p = swxe.upgrade_plan(modules)
-        testing.assertEqual((p.transfer, p.listing, p.verify, p.install), want, name)
+        testing.assertEqual((p.check, p.transfer, p.listing, p.verify, p.install, p.delete), want, name)
 
 
 def _files_root(partitions: list[(name: str, paths: list[str])]) -> ygdata.Node:
@@ -1250,6 +1253,50 @@ def _test_staged_file_reads_both_listings():
         testing.assertEqual(swxe.staged_file(root, image), want, name)
 
 
+def _test_file_stamp():
+    cli = xecli_data.root()
+    fs = cli.file_systems.file_system.create("bootflash:")
+    fs.file.create(IMAGE_FILE, size=u64(734643332), modified="2026-11-11T09:04:08+00:00", index=u64(17))
+    fs.file.create("no-date.bin", size=u64(1), index=u64(18))
+    cases = [
+        ("index, size and date", cli.to_gdata(), IMAGE_FILE, "17 734643332 2026-11-11T09:04:08+00:00"),
+        ("no date", cli.to_gdata(), "no-date.bin", "-"),
+        ("not there", cli.to_gdata(), "other.bin", "-"),
+        ("NETCONF listing", _files_root([(name="bootflash:", paths=["/bootflash/" + IMAGE_FILE])]), IMAGE_FILE, "-"),
+    ]
+    for name, root, filename, want in cases:
+        got = swxe.file_stamp(root, filename)
+        testing.assertEqual(want, got if got is not None else "-", name)
+
+
+def _test_check_still_holds():
+    stamp = "17 734643332 2026-11-11T09:04:08+00:00"
+    passed = (file=IMAGE_FILE, stamp=stamp, check="sha512 aa")
+    cases = [
+        ("unchanged", passed, IMAGE_FILE, stamp, True),
+        ("written again", passed, IMAGE_FILE, "17 734643332 2026-11-12T10:00:00+00:00", False),
+        ("copied anew in the same second", passed, IMAGE_FILE, "23 734643332 2026-11-11T09:04:08+00:00", False),
+        ("another file", passed, "other.bin", stamp, False),
+        ("no stamp", passed, IMAGE_FILE, None, False),
+        ("never passed", None, IMAGE_FILE, stamp, False),
+    ]
+    for name, p, filename, st, want in cases:
+        testing.assertEqual(want, swxe.check_still_holds(p, filename, st, "sha512 aa"), name)
+    testing.assertEqual(False, swxe.check_still_holds(passed, IMAGE_FILE, stamp, "sha512 bb"), "another checksum")
+
+
+def _test_adapter_wait_left():
+    cases = [
+        ("nothing missing", {}, 0.0),
+        ("just lost", {"iosxe": 0.0}, 120.0),
+        ("lost a while ago", {"iosxe": 100.0}, 20.0),
+        ("lost before a whole wait", {"iosxe": 600.0}, 0.0),
+        ("the most recent loss counts", {"iosxe": 600.0, "iosxe-cli": 30.0}, 90.0),
+    ]
+    for name, down, want in cases:
+        testing.assertEqual(want, swxe.adapter_wait_left(down, 120.0), name)
+
+
 def _test_usable_checksum_prefers_sha512():
     md5 = (algorithm="md5", digest="aa")
     sha256 = (algorithm="sha256", digest="bb")
@@ -1268,20 +1315,24 @@ def _test_usable_checksum_prefers_sha512():
 HASH = "3ad02abe" * 16
 OTHER_HASH = "0" * 128
 VERIFY_COMMAND = "verify /sha512 bootflash:" + IMAGE_FILE + " " + HASH
+## What the CLI reads before an install, to tell whether the configuration is saved.
+CONFIG_CHANGE_COMMANDS = [clitest.RUNNING_CHANGE_COMMAND, clitest.STARTUP_CHANGE_COMMAND]
 
 
-def _dir(files: list[str]) -> str:
-    """dir bootflash: of a C1111, with these files."""
+def _dir(files: list[str], free: int=1458692096, modified: str="Jun 18 2019 18:22:26") -> str:
+    """dir bootflash: of a C1111, with these files, modified at modified,
+    and free bytes."""
     lines = ["", "", "Directory of bootflash:/", ""]
     i = 15
     for f in files:
-        lines.append("   " + str(i) + "  -rw-        427968764  Jun 18 2019 18:22:26 +00:00  " + f)
+        lines.append("   " + str(i) + "  -rw-        427968764  " + modified + " +00:00  " + f)
         i += 1
-    lines.extend(["", "2885718016 bytes total (1458692096 bytes free)", ""])
+    lines.extend(["", "2885718016 bytes total (" + str(free) + " bytes free)", ""])
     return "\r\n".join(lines)
 
 
 DIR_STAGED = _dir(["packages.conf", IMAGE_FILE])
+DIR_STAGED_LATER = _dir(["packages.conf", IMAGE_FILE], modified="Nov 11 2026 09:04:08")
 DIR_EMPTY = _dir(["packages.conf"])
 VERIFY_EQUAL = "\r\n\r\n.....Done!\r\nVerified (bootflash:" + IMAGE_FILE + ") = " + HASH + "\r\n"
 VERIFY_DIFFERS = "\r\n\r\n.....Done!\r\n%Error verifying bootflash:" + IMAGE_FILE + \
@@ -1323,7 +1374,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
                   settled: action(swxemock.IosXeSoftwareMock, xecli.CliMock, swdev.DeviceMgr, str) -> None,
                   timeout: float=2.5, preadded: ?str=None, checksum: bool=True, image_output: str="",
                   running: str=OLD_RELEASE, committed: ?str=None, files: bool=True,
-                  verify_delay: float=0.0):
+                  verify_delay: float=0.0, restamped: bool=False, upgrade_duration: float=0.0,
+                  sized: bool=False, xcopy_records: bool=True):
     """Drive one mock device with a sha512 image checksum from software intent
     to a settled status. The CliMock answers dir bootflash: with dir_output,
     and with a listing that has the image once the device took an xcopy, and
@@ -1332,11 +1384,15 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
     that the device has added from the start. Without checksum, the intent
     has no checksum, and the CliMock answers the check of the image's
     signature with image_output. The device runs running, and keeps
-    committed when it differs."""
+    committed when it differs. When restamped, the image has another date
+    after its first check, as when someone copies it again. upgrade_duration
+    is the mock's; when sized, the intent has the image size of the mock.
+    The progress that the prepare job showed is in progress_seen."""
     var dev_ref: ?swdev.DeviceMgr = None
     var mock: ?swxemock.IosXeSoftwareMock = None
     var cli: ?xecli.CliMock = None
     var finished = False
+    var progress_seen: list[u64] = []
 
     def on_reconf(n: str) -> None:
         pass
@@ -1349,6 +1405,9 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
             return
         if "xcopy" in m!.get_rpcs():
             c!.set_reply("dir bootflash:", DIR_STAGED)
+        seen = d!.get_swmgr().get_job_progress("prepare")
+        if seen is not None and (len(progress_seen) == 0 or progress_seen[-1] != seen!):
+            progress_seen.append(seen!)
         st = d!.get_swmgr().get_status()
         if st == "unknown" or st == "in-progress":
             after 0.02: poll()
@@ -1381,17 +1440,24 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
 
     def _run(d: swdev.DeviceMgr, ms: swna.NetconfMockServer, c: xecli.CliMock) -> None:
         prestaged = IMAGE_FILE if dir_output == DIR_STAGED else None
-        m = swxemock.IosXeSoftwareMock(ms, t.log_handler, upgrade_duration=0.0,
+        m = swxemock.IosXeSoftwareMock(ms, t.log_handler, upgrade_duration=upgrade_duration,
                                        failure=swxemock.FAILURE_NONE, running=running,
-                                       prestaged=prestaged, preadded=preadded, committed_release=committed)
+                                       prestaged=prestaged, preadded=preadded, committed_release=committed,
+                                       xcopy_records=xcopy_records)
         mock = m
         cli = c
         m.attach()
         c.set_reply("dir bootflash:", dir_output)
+        c.set_reply(clitest.RUNNING_CHANGE_COMMAND, clitest.CONFIG_CHANGE_SAVED)
+        c.set_reply(clitest.STARTUP_CHANGE_COMMAND, clitest.CONFIG_CHANGE_SAVED)
         c.set_reply(VERIFY_COMMAND, verify_output)
         c.set_reply(VERIFY_IMAGE_COMMAND, image_output)
         c.set_delay(VERIFY_COMMAND, verify_delay)
+        if restamped:
+            c.set_reply_on(VERIFY_COMMAND, "dir bootflash:", DIR_STAGED_LATER)
         software = Software("camp-1", NEW_REQUESTED, IMAGE_URL)
+        if sized:
+            software.image_size = u64(swxemock.IMAGE_SIZE)
         if checksum:
             software.image_checksum.create("sha512", HASH)
         dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe", software=software)
@@ -1399,6 +1465,9 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         dmc.extra_adapter.create("iosxe-cli")
         d.set_dmc(dmc)
         after 0.02: poll()
+
+    def get_progress_seen() -> list[u64]:
+        return progress_seen
 
     def report_timeout() -> None:
         if finished:
@@ -1423,7 +1492,7 @@ actor _test_iosxe_staged_image_is_not_copied_again(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual(["install", "activate", "install-commit"], m.get_rpcs())
+            testing.assertEqual(["install", "activate", "install-commit", "remove"], m.get_rpcs())
             testing.assertTrue(VERIFY_COMMAND in c.get_commands(), "the image is verified")
             t.success()
         except Exception as e:
@@ -1438,7 +1507,7 @@ actor _test_iosxe_added_image_is_activated(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual(["activate", "install-commit"], m.get_rpcs())
+            testing.assertEqual(["activate", "install-commit", "remove"], m.get_rpcs())
             t.success()
         except Exception as e:
             t.failure(e)
@@ -1452,8 +1521,9 @@ actor _test_iosxe_added_release_needs_no_image(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual(["activate", "install-commit"], m.get_rpcs())
-            testing.assertEqual([], c.get_commands(), "no listing and no check")
+            testing.assertEqual(["activate", "install-commit", "remove"], m.get_rpcs())
+            testing.assertEqual(CONFIG_CHANGE_COMMANDS, c.get_commands(),
+                                "no listing and no check of the image, only of the configuration")
             t.success()
         except Exception as e:
             t.failure(e)
@@ -1468,7 +1538,7 @@ actor _test_iosxe_uncommitted_release_is_committed(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual(["install-commit"], m.get_rpcs())
+            testing.assertEqual(["install-commit", "remove"], m.get_rpcs())
             t.success()
         except Exception as e:
             t.failure(e)
@@ -1482,7 +1552,7 @@ actor _test_iosxe_signed_image_stays_without_a_checksum(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual(["install", "activate", "install-commit"], m.get_rpcs())
+            testing.assertEqual(["install", "activate", "install-commit", "remove"], m.get_rpcs())
             testing.assertTrue(VERIFY_IMAGE_COMMAND in c.get_commands(), "the signature is checked")
             t.success()
         except Exception as e:
@@ -1510,9 +1580,10 @@ actor _test_iosxe_missing_image_is_copied_and_verified(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual(["xcopy", "install", "activate", "install-commit"], m.get_rpcs())
-            testing.assertEqual(c.get_commands(), [VERIFY_COMMAND, VERIFY_COMMAND],
-                                "NETCONF lists; the CLI verifies the copy in prepare and again in install")
+            testing.assertEqual(["xcopy", "install", "activate", "install-commit", "remove"], m.get_rpcs())
+            testing.assertEqual(["dir bootflash:", VERIFY_COMMAND, "dir bootflash:"] + CONFIG_CHANGE_COMMANDS,
+                                c.get_commands(),
+                                "NETCONF lists; the CLI verifies the copy in prepare; install finds it unchanged")
             t.success()
         except Exception as e:
             t.failure(e)
@@ -1525,12 +1596,58 @@ actor _test_iosxe_slow_verify_runs_once(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual([VERIFY_COMMAND, VERIFY_COMMAND], c.get_commands(),
-                                "one check after the transfer in prepare, one in install")
+            testing.assertEqual(["dir bootflash:", VERIFY_COMMAND, "dir bootflash:"] + CONFIG_CHANGE_COMMANDS,
+                                c.get_commands(), "one check after the transfer in prepare, none in install")
             t.success()
         except Exception as e:
             t.failure(e)
     _StagingRun(t, "d-slow-verify", DIR_EMPTY, VERIFY_EQUAL, settled, verify_delay=0.2, timeout=5.0)
+
+
+actor _test_iosxe_transfer_progress(t: testing.EnvT):
+    """While xcopy writes the image, the prepare job shows how far it is,
+    from the size of the file on bootflash."""
+    var run: ?_StagingRun = None
+
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            r = run
+            seen = r!.get_progress_seen() if r is not None else []
+            testing.assertTrue(any([p > u64(0) and p < u64(100) for p in seen]), "a progress between 0 and 100: {seen}")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    run = _StagingRun(t, "d-progress", DIR_EMPTY, VERIFY_EQUAL, settled, upgrade_duration=2.0, sized=True,
+                      timeout=8.0)
+
+
+actor _test_iosxe_xcopy_without_records_ends_at_the_image_size(t: testing.EnvT):
+    """A device that records no operation for an xcopy, as IOS XE 17.9.5a,
+    ends the transfer when the file on bootflash has the image size of the
+    intent."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["xcopy", "install", "activate", "install-commit", "remove"], m.get_rpcs())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-no-xcopy-record", DIR_EMPTY, VERIFY_EQUAL, settled, sized=True, xcopy_records=False,
+                timeout=6.0)
+
+
+actor _test_iosxe_changed_image_is_checked_again(t: testing.EnvT):
+    """An image whose date changed after its check is checked again."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["dir bootflash:", VERIFY_COMMAND, "dir bootflash:", VERIFY_COMMAND] + CONFIG_CHANGE_COMMANDS,
+                                c.get_commands(), "checked in prepare, and again in install")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-restamped", DIR_STAGED, VERIFY_EQUAL, settled, restamped=True)
 
 
 actor _test_iosxe_listing_falls_back_to_the_cli(t: testing.EnvT):
@@ -1539,8 +1656,9 @@ actor _test_iosxe_listing_falls_back_to_the_cli(t: testing.EnvT):
     def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
         try:
             testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
-            testing.assertEqual(["install", "activate", "install-commit"], m.get_rpcs())
-            testing.assertEqual(c.get_commands()[:2], ["dir bootflash:", VERIFY_COMMAND], "list, then verify")
+            testing.assertEqual(["install", "activate", "install-commit", "remove"], m.get_rpcs())
+            testing.assertEqual(["dir bootflash:", "dir bootflash:", VERIFY_COMMAND], c.get_commands()[:3],
+                                "list, read the stamp of the image, then verify")
             t.success()
         except Exception as e:
             t.failure(e)
@@ -1571,6 +1689,11 @@ actor _test_iosxe_checksum_mismatch_fails_in_prepare(t: testing.EnvT):
 #   IOSXE_SOFTWARE_RELEASE    the release to upgrade to, e.g. 17.15.04c
 #   IOSXE_SOFTWARE_IMAGE_URL  where the device fetches the image from
 #   IOSXE_SOFTWARE_SHA512     the sha512 of the image, optional
+#   IOSXE_SOFTWARE_SIZE       the size of the image in bytes, optional; without
+#                             it the driver does not check the room on bootflash
+#   IOSXE_SOFTWARE_CLI_ONLY   1 to start without NETCONF, as on IOS XE 16.8
+#   IOSXE_LOG_LEVEL           the log level of the device, e.g. trace for the
+#                             text that the CLI session receives
 #
 # NETCONF connects to IOSXE_NETCONF_PORT, default 830.
 
@@ -1590,6 +1713,8 @@ actor _test_live_software_upgrade(t: testing.EnvT):
     release = clitest.live_setting(t, "IOSXE_SOFTWARE_RELEASE", "")
     url = clitest.live_setting(t, "IOSXE_SOFTWARE_IMAGE_URL", "")
     sha512 = clitest.live_setting(t, "IOSXE_SOFTWARE_SHA512", "")
+    size = clitest.live_setting(t, "IOSXE_SOFTWARE_SIZE", "")
+    cli_only = clitest.live_setting(t, "IOSXE_SOFTWARE_CLI_ONLY", "") == "1"
     var dev: ?swdev.DeviceMgr = None
     var dmc: ?DeviceMetaConfig = None
     var last = ""
@@ -1611,10 +1736,11 @@ actor _test_live_software_upgrade(t: testing.EnvT):
         st = d!.get_swmgr().get_status()
         reason = d!.get_swmgr().get_reason()
         job = d!.get_swmgr().get_job_state("prepare")
-        now = "{st} {reason} {job}"
+        progress = d!.get_swmgr().get_job_progress("prepare")
+        now = "{st} {reason} {job} {progress}"
         if now != last:
             last = now
-            log.info("software status", {"status": st, "reason": reason, "prepare": job})
+            log.info("software status", {"status": st, "reason": reason, "prepare": job, "progress": progress})
         if staging:
             if job == "done" and st == "upgrade-needed":
                 staging = False
@@ -1642,10 +1768,10 @@ actor _test_live_software_upgrade(t: testing.EnvT):
         if finished or d is None or m is None:
             return
         mods = d!.get_modules().0
-        wanted = [swxe.INSTALL_MODULE, swxe.XCOPY_MODULE, xecli_yang.MODULE]
+        wanted = [xecli_yang.MODULE] if cli_only else [swxe.INSTALL_MODULE, swxe.XCOPY_MODULE, xecli_yang.MODULE]
         missing = [w for w in wanted if w not in mods]
         if len(missing) == 0:
-            log.info("both adapters are up, setting the software intent", {"release": release})
+            log.info("the adapters are up, setting the software intent", {"release": release})
             d!.set_dmc(m!)
             after 5.0: poll()
         elif tries == 0:
@@ -1669,7 +1795,12 @@ actor _test_live_software_upgrade(t: testing.EnvT):
         software.veto.create("live-test", reason="stage first")
         if sha512 != "":
             software.image_checksum.create("sha512", sha512)
+        if size != "":
+            software.image_size = u64(int(size))
         m = DeviceMetaConfig("xe", clitest.live_credentials(t), type="iosxe")
+        level = clitest.live_setting(t, "IOSXE_LOG_LEVEL", "")
+        if level != "":
+            m.debug.log_level = level
         m.address.create("primary", clitest.live_setting(t, "IOSXE_CLI_ADDRESS", "127.0.0.1"),
                            port=u64(int(clitest.live_setting(t, "IOSXE_NETCONF_PORT", "830"))))
         extra = m.extra_adapter.create("iosxe-cli", port=u64(int(clitest.live_setting(t, "IOSXE_CLI_PORT", "22"))))
@@ -1677,9 +1808,499 @@ actor _test_live_software_upgrade(t: testing.EnvT):
         extra.ssh = ExtraSsh(key_exchange=list(ssh.key_exchange), host_key_algorithm=list(ssh.host_key_algorithm),
                              public_key_algorithm=list(ssh.public_key_algorithm))
         # The driver picks its plan from the modules when prepare starts, so
-        # the intent waits until both adapters are up.
+        # the intent waits until the adapters are up: both of them, or the
+        # CLI alone with IOSXE_SOFTWARE_CLI_ONLY.
         d.set_dmc(DeviceMetaConfig.from_gdata(m.to_gdata()))
         m.software = software
         dmc = m
         dev = d
         after 1.0: connected(600)
+
+
+#############################################################################
+# Over the CLI only, as IOS XE 16.8 on a C1111, where NETCONF does not start
+#############################################################################
+
+## The old image that a device in bundle mode boots.
+BUNDLE_IMAGE = "bootflash:c8000v-universalk9.17.18.02.SPA.bin"
+COPY_COMMAND = "copy " + IMAGE_URL + " bootflash:" + IMAGE_FILE
+COPY_QUESTION = "Destination filename [" + IMAGE_FILE + "]? "
+COPY_DONE = "\r\nAccessing " + IMAGE_URL + "...\r\nLoading " + IMAGE_URL + " !!\r\n1000 bytes copied in 0.128 secs (7812 bytes/sec)"
+ADD_COMMAND = "install add file bootflash:" + IMAGE_FILE
+ACTIVATE_COMMAND = "install activate auto-abort-timer 30 prompt-level none"
+ONE_SHOT_COMMAND = "install add file bootflash:" + IMAGE_FILE + " activate commit prompt-level none"
+OLD16_RELEASE = "16.08.01"
+OLD16_VERSION = "16.8.1.0.82"
+ADD_DONE = "\r\ninstall_add: START Tue Nov 10 09:43:02 UTC 2026\r\ninstall_add: Adding PACKAGE\r\nFinished Add\r\nSUCCESS: install_add  Tue Nov 10 09:45:02 UTC 2026\r\n"
+ACTIVATE_DONE = "\r\ninstall_activate: START Tue Nov 10 09:46:02 UTC 2026\r\nFinished Activate\r\nInstall will reload the system now!\r\nSUCCESS: install_activate  Tue Nov 10 09:48:02 UTC 2026\r\n"
+COMMIT_DONE = "\r\ninstall_commit: START Tue Nov 10 10:06:02 UTC 2026\r\nFinished Commit\r\nSUCCESS: install_commit  Tue Nov 10 10:06:12 UTC 2026\r\n"
+
+
+def _show_version(release: str, image: str) -> str:
+    """show version of the C8000V capture, running release from image."""
+    return clitest.SHOW_VERSION.replace("Cisco IOS XE Software, Version 17.18.02",
+                                        "Cisco IOS XE Software, Version " + release) \
+        .replace("System image file is \"bootflash:packages.conf\"", "System image file is \"" + image + "\"")
+
+
+def _summary(packages: list[str]) -> str:
+    """show install summary with these package lines, as IMG   C    17.18.02.0.5540.
+    No lines is a device in bundle mode."""
+    return clitest.INSTALL_SUMMARY.replace("IMG   C    17.09.05a.0.6476\r\n", "".join([p + "\r\n" for p in packages]))
+
+
+def _test_cli_version_reads():
+    """The release, the versions and the mode, from what the CLI reads."""
+    r = xecli_data.root()
+    xecli.VersionRead().parse(r, _show_version(OLD_RELEASE, BUNDLE_IMAGE))
+    xecli.InstallRead().parse(r, _summary(["IMG   I    " + NEW_VERSION, "IMG   C    " + OLD_VERSION]))
+    root = r.to_gdata()
+    testing.assertEqual(swxe.running_release(root), OLD_REPORTED)
+    testing.assertEqual(swxe.device_versions(root), [(version=NEW_VERSION, state=swxe.VS_INSTALLED),
+                                                     (version=OLD_VERSION, state=swxe.VS_COMMITTED)])
+    testing.assertEqual(swxe.added_version(root, NEW_REQUESTED), NEW_VERSION)
+    testing.assertEqual(swxe.committed_release(root), OLD_RELEASE)
+    testing.assertEqual(swxe.bundle_image(root), BUNDLE_IMAGE)
+    r2 = xecli_data.root()
+    xecli.VersionRead().parse(r2, _show_version(OLD_RELEASE, "bootflash:packages.conf"))
+    testing.assertEqual(swxe.bundle_image(r2.to_gdata()), None, "install mode")
+    testing.assertEqual(swxe.conversion_boot_lines(BUNDLE_IMAGE),
+                        ["no boot system", "boot system flash bootflash:packages.conf",
+                         "boot system flash " + BUNDLE_IMAGE])
+
+
+actor _CliOnlyRun(t: testing.EnvT, name: str, bundle: bool,
+                  settled: action(xecli.CliMock, swdev.DeviceMgr, str) -> None,
+                  short: bool=False, unsaved: bool=False, other_added: bool=False,
+                  boot_change: bool=False, staged_short: bool=False, old16: bool=False,
+                  added16: bool=False):
+    """Drive a mock device whose NETCONF never connects, over the CLI only,
+    from a software intent with a sha512 checksum to a settled status. The
+    image is not on bootflash. The device runs OLD_RELEASE, in bundle mode
+    or in install mode. The CliMock answers as the device does: each install
+    command changes what show version and show install summary say. Each
+    such command takes 0.1 s, so the replies change before its output
+    comes. When short, the intent has an image size of 600 MB and bootflash
+    has 100 MB free until a remove makes room. When unsaved, the running
+    configuration changed after the last write memory. When other_added,
+    the device has added 17.15.04c until a remove. When boot_change, the
+    device changed its configuration itself as it booted. When
+    staged_short, the image is on bootflash from the start, with 100 MB
+    free, too little for its packages, until a remove. When old16, the
+    device runs 16.8.1 instead, in install mode. When added16 too, it has
+    added the target release until a remove."""
+    var dev_ref: ?swdev.DeviceMgr = None
+    var cli: ?xecli.CliMock = None
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def poll() -> None:
+        c = cli
+        d = dev_ref
+        if finished or c is None or d is None:
+            return
+        commands = c!.get_commands()
+        if COPY_COMMAND in commands:
+            c!.set_reply("dir bootflash:", DIR_STAGED)
+        elif "install remove inactive" in commands:
+            c!.set_reply("dir bootflash:", DIR_EMPTY)
+            if other_added and ADD_COMMAND not in commands:
+                c!.set_reply("show install summary", _summary(["IMG   C    " + OLD_VERSION]))
+            if added16 and ONE_SHOT_COMMAND not in commands:
+                c!.set_reply("show install summary", _summary(["IMG   C    " + OLD16_VERSION]))
+        if ADD_COMMAND in commands:
+            c!.set_reply("show install summary", _summary(["IMG   I    " + NEW_VERSION, "IMG   C    " + OLD_VERSION]))
+        if ACTIVATE_COMMAND in commands or ONE_SHOT_COMMAND in commands:
+            c!.set_reply("show version", _show_version(NEW_REQUESTED, "bootflash:packages.conf"))
+            if ONE_SHOT_COMMAND in commands:
+                c!.set_reply("show install summary", _summary(["IMG   C    " + NEW_VERSION]))
+            else:
+                c!.set_reply("show install summary", _summary(["IMG   U    " + NEW_VERSION, "IMG   I    " + OLD_VERSION]))
+        if "install commit" in commands:
+            c!.set_reply("show install summary", _summary(["IMG   C    " + NEW_VERSION]))
+        st = d!.get_swmgr().get_status()
+        if st == "unknown" or st == "in-progress":
+            after 0.02: poll()
+            return
+        finished = True
+        settled(c!, d!, st)
+
+    def start() -> None:
+        d = dev_ref
+        if d is None:
+            return
+        if xecli_yang.MODULE not in d!.get_modules().0:
+            after 0.01: start()
+            return
+        extra = d!.get_extra_adapter("iosxe-cli")
+        if isinstance(extra, xecli.IosXeCliAdapter):
+            c = extra.get_mock()
+            if c is not None:
+                _run(d!, c)
+                return
+        finished = True
+        t.failure(ValueError("no CliMock on the device"))
+
+    def _run(d: swdev.DeviceMgr, c: xecli.CliMock) -> None:
+        cli = c
+        image = BUNDLE_IMAGE if bundle else "bootflash:packages.conf"
+        c.set_reply("show version", _show_version(OLD16_RELEASE if old16 else OLD_RELEASE, image))
+        packages = [] if bundle else ["IMG   C    " + (OLD16_VERSION if old16 else OLD_VERSION)]
+        if other_added:
+            packages = ["IMG   I    17.15.04c.0.107"] + packages
+        if added16:
+            packages = ["IMG   I    " + NEW_VERSION] + packages
+        c.set_reply("show install summary", _summary(packages))
+        listing = DIR_EMPTY
+        if short:
+            listing = _dir(["packages.conf"], 100000000)
+        elif staged_short:
+            listing = _dir(["packages.conf", IMAGE_FILE], 100000000)
+        c.set_reply("dir bootflash:", listing)
+        c.set_reply_on(COPY_COMMAND, "dir bootflash:", DIR_STAGED)
+        c.set_question(COPY_COMMAND, COPY_QUESTION, "", COPY_DONE)
+        c.set_reply(VERIFY_COMMAND, VERIFY_EQUAL)
+        c.set_reply(ADD_COMMAND, ADD_DONE)
+        c.set_reply(ACTIVATE_COMMAND, ACTIVATE_DONE)
+        c.set_reply(ONE_SHOT_COMMAND, clitest.INSTALL_ONE_SHOT)
+        c.set_reply("install commit", COMMIT_DONE)
+        c.set_reply("write memory", clitest.WRITE_MEMORY)
+        c.set_question("install remove inactive", clitest.REMOVE_BEFORE, "y", clitest.REMOVE_AFTER)
+        running = clitest.CONFIG_CHANGE_SAVED
+        if unsaved:
+            running = clitest.CONFIG_CHANGE_LATER
+        elif boot_change:
+            running = clitest.CONFIG_CHANGED_AT_BOOT
+        c.set_reply(clitest.RUNNING_CHANGE_COMMAND, running)
+        c.set_reply(clitest.STARTUP_CHANGE_COMMAND, clitest.CONFIG_CHANGE_SAVED)
+        for command in [ADD_COMMAND, ACTIVATE_COMMAND, ONE_SHOT_COMMAND, "install commit", "install remove inactive"]:
+            c.set_delay(command, 0.1)
+        software = Software("camp-1", NEW_REQUESTED, IMAGE_URL)
+        software.image_checksum.create("sha512", HASH)
+        if short or staged_short:
+            software.image_size = u64(600000000)
+        dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe", software=software)
+        dmc.mock.enabled = True
+        dmc.extra_adapter.create("iosxe-cli")
+        d.set_dmc(dmc)
+        after 0.02: poll()
+
+    def report_timeout() -> None:
+        if finished:
+            return
+        finished = True
+        c = cli
+        d = dev_ref
+        commands = c!.get_commands() if c is not None else []
+        st = d!.get_swmgr().get_status() if d is not None else "?"
+        reason = d!.get_swmgr().get_reason() if d is not None else None
+        t.failure(ValueError("timed out: commands={commands} status={st} reason={reason}"))
+
+    schema = yang.compile(swxe_yang.models)
+    cli_schema = yang.compile(xecli_yang.models)
+    dev_types = {
+        "iosxe": swdev.DeviceType(name="iosxe", adapter_type=_never_connects, src_dnode=schema,
+                                  oper_src_dnode=schema, software_adapter_type=_fast_adapter),
+        "iosxe-cli": swdev.DeviceType(name="iosxe-cli", adapter_type=xecli.IosXeCliAdapter,
+                                      src_dnode=cli_schema, oper_src_dnode=cli_schema),
+    }
+    dev = swdev.DeviceMgr(dev_types, t.env, name, t.log_handler, on_reconf, swdev.SchemaRegistry())
+    dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe")
+    dmc.mock.enabled = True
+    dmc.extra_adapter.create("iosxe-cli")
+    dev.set_dmc(dmc)
+    dev_ref = dev
+    after 0.01: start()
+    after 5.0: report_timeout()
+
+
+actor _test_iosxe_cli_only_install_mode(t: testing.EnvT):
+    """Without NETCONF, a device in install mode is upgraded over the CLI:
+    copy, check, add, activate with the abort timer, commit."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            testing.assertEqual(None, d.get_swmgr().get_reason(), "the cleanup succeeded")
+            steps = [cmd for cmd in c.get_commands() if cmd.startswith("copy ") or cmd.startswith("install ")]
+            testing.assertEqual([COPY_COMMAND, ADD_COMMAND, ACTIVATE_COMMAND, "install commit",
+                                 "install remove inactive"], steps)
+            testing.assertEqual([], c.get_configured(), "install mode needs no boot statement")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-install", False, settled)
+
+
+actor _test_iosxe_cli_only_bundle_mode(t: testing.EnvT):
+    """Without NETCONF, a device in bundle mode is converted: the boot
+    statements name packages.conf and then the old image, the configuration
+    is saved, and one command adds, activates and commits."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands()
+                     if cmd.startswith("copy ") or cmd.startswith("install ") or cmd == "write memory"]
+            testing.assertEqual([COPY_COMMAND, "write memory", ONE_SHOT_COMMAND, "install remove inactive"], steps)
+            testing.assertEqual(swxe.conversion_boot_lines(BUNDLE_IMAGE), c.get_configured())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-bundle", True, settled)
+
+
+actor _test_iosxe_cli_only_from_16(t: testing.EnvT):
+    """A device that runs IOS XE 16 in install mode installs with one
+    command that adds, activates and commits, without boot statements."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands()
+                     if cmd.startswith("copy ") or cmd.startswith("install ") or cmd == "write memory"]
+            testing.assertEqual([COPY_COMMAND, ONE_SHOT_COMMAND, "install remove inactive"], steps)
+            testing.assertEqual([], c.get_configured())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-16", False, settled, old16=True)
+
+
+actor _test_iosxe_cli_only_from_16_removes_the_added_release(t: testing.EnvT):
+    """A device that runs IOS XE 16 and has added the target release removes
+    it first: the one command adds it again, from the image file."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands()
+                     if cmd.startswith("copy ") or cmd.startswith("install ") or cmd == "write memory"]
+            testing.assertEqual(["install remove inactive", COPY_COMMAND, ONE_SHOT_COMMAND, "install remove inactive"], steps)
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-16-added", False, settled, old16=True, added16=True)
+
+
+def _test_one_shot_install():
+    cases = [
+        ("16.8.1", "16.8.1", True),
+        ("16.12.4", "16.12.4", True),
+        ("17.9.5a", "17.9.5a", False),
+        ("17.15.06", "17.15.06", False),
+        ("unknown", None, False),
+    ]
+    for name, release, want in cases:
+        testing.assertEqual(want, swxe.one_shot_install(release), name)
+
+
+actor _test_iosxe_cli_only_makes_room(t: testing.EnvT):
+    """Without room for the image and its packages, the driver removes the
+    inactive software first, lists bootflash again, then copies."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands() if cmd.startswith("copy ") or cmd.startswith("install ")]
+            testing.assertEqual(["install remove inactive", COPY_COMMAND, ADD_COMMAND, ACTIVATE_COMMAND,
+                                 "install commit", "install remove inactive"], steps)
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-room", False, settled, True)
+
+
+def _test_free_space_and_room():
+    """Free space over NETCONF counts in KiB; over the CLI in bytes. The
+    room is 2.2 times the image."""
+    r = ixoper.root()
+    q = r.cisco_platform_software.q_filesystem.create()
+    q.partitions.create("bootflash:", total_size=u64(2818084), used_size=u64(1253100))
+    testing.assertEqual(swxe.free_space(r.to_gdata()), u64(1564984 * 1024), "NETCONF")
+    cli = xecli_data.root()
+    xecli.DirRead("bootflash:").parse(cli, DIR_EMPTY)
+    testing.assertEqual(swxe.free_space(cli.to_gdata()), u64(1458692096), "CLI")
+    testing.assertEqual(swxe.free_space(_files_root([(name="bootflash:", paths=["/bootflash/a.bin"])])), None,
+                        "a listing without sizes")
+    testing.assertEqual(swxe.room_needed(u64(734643332)), u64(1616215330))
+    testing.assertEqual(swxe.room_needed(None), None)
+
+
+actor _test_iosxe_unsaved_configuration_refuses_the_install(t: testing.EnvT):
+    """The running configuration changed after the last write memory: the
+    install stops before the add, since the reload would lose the change."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("failed", st)
+            reason = d.get_swmgr().get_reason()
+            testing.assertTrue(reason is not None and "not saved" in reason!, str(reason))
+            steps = [cmd for cmd in c.get_commands() if cmd.startswith("install ")]
+            testing.assertEqual([], steps, "nothing installed")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-unsaved", False, settled, False, True)
+
+
+def _test_unsaved_configuration():
+    def root(running: str, startup: ?str) -> ygdata.Node:
+        r = xecli_data.root()
+        xecli.RunningChangeRead().parse(r, running)
+        if startup is not None:
+            xecli.StartupChangeRead().parse(r, startup)
+        return r.to_gdata()
+    cases: list[(label: str, running: str, startup: ?str, unsaved: bool)] = [
+        (label="saved", running=clitest.CONFIG_CHANGE_SAVED, startup=clitest.CONFIG_CHANGE_SAVED, unsaved=False),
+        (label="changed later", running=clitest.CONFIG_CHANGE_LATER, startup=clitest.CONFIG_CHANGE_SAVED, unsaved=True),
+        (label="no change since the boot", running=clitest.CONFIG_NOT_CHANGED, startup=clitest.CONFIG_CHANGE_SAVED, unsaved=False),
+        (label="changed by the device as it booted", running=clitest.CONFIG_CHANGED_AT_BOOT,
+         startup=clitest.CONFIG_CHANGE_SAVED, unsaved=False),
+        (label="no startup line", running=clitest.CONFIG_CHANGE_SAVED, startup=None, unsaved=True),
+    ]
+    for c in cases:
+        testing.assertEqual(swxe.unsaved_configuration(root(c.running, c.startup)) is not None, c.unsaved, c.label)
+
+
+def _test_other_added_version():
+    """Another release that the device added and does not run is removed
+    before staging; the committed and the running ones are not."""
+    def root(packages: list[str]) -> ygdata.Node:
+        r = xecli_data.root()
+        xecli.InstallRead().parse(r, _summary(packages))
+        return r.to_gdata()
+    cases: list[(label: str, packages: list[str], want: ?str)] = [
+        (label="another added", packages=["IMG   I    17.15.04c.0.107", "IMG   C    " + OLD_VERSION], want="17.15.04c.0.107"),
+        (label="the target added", packages=["IMG   I    " + NEW_VERSION, "IMG   C    " + OLD_VERSION], want=None),
+        (label="only the committed", packages=["IMG   C    " + OLD_VERSION], want=None),
+        (label="another release activated, not committed",
+         packages=["IMG   U    17.15.04c.0.107", "IMG   I    " + OLD_VERSION], want=None),
+    ]
+    for c in cases:
+        testing.assertEqual(swxe.other_added_version(root(c.packages), NEW_REQUESTED), c.want, c.label)
+
+
+actor _test_iosxe_cli_only_removes_another_added_release(t: testing.EnvT):
+    """A run that stopped after the add left 17.15.04c added: the next run
+    removes it before staging its own release."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands() if cmd.startswith("copy ") or cmd.startswith("install ")]
+            testing.assertEqual(["install remove inactive", COPY_COMMAND, ADD_COMMAND, ACTIVATE_COMMAND,
+                                 "install commit", "install remove inactive"], steps)
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-other", False, settled, False, False, True)
+
+
+def _test_epoch_seconds():
+    cases: list[(text: str, want: ?int)] = [
+        (text="2026-11-10T23:41:31+00:00", want=1794354091),
+        (text="2026-11-10T23:41:31.123456+00:00", want=1794354091),
+        (text="2026-11-11T00:41:31+01:00", want=1794354091),
+        (text="1970-01-01T00:00:00Z", want=0),
+        (text="2000-02-29T12:00:00-05:30", want=951845400),
+        (text="2026-11-10 23:41:31", want=None),
+        (text="2026-11-10T23:41:31", want=None),
+        (text="", want=None),
+    ]
+    for c in cases:
+        testing.assertEqual(swxe.epoch_seconds(c.text), c.want, c.text)
+
+
+## show install summary on a C1111 activated to 17.15.04c and not committed.
+SUMMARY_UNCOMMITTED = "\r\n[ R0 ] Installed Package(s) Information:\r\nState (St): I - Inactive, U - Activated & Uncommitted,\r\n            C - Activated & Committed, D - Deactivated & Uncommitted\r\n--------------------------------------------------------------------------------\r\nType  St   Filename/Version\r\n--------------------------------------------------------------------------------\r\nIMG   U    17.15.04c.0.107\r\n\r\n--------------------------------------------------------------------------------\r\nAuto abort timer: active , time before rollback - 00:25:36\r\n--------------------------------------------------------------------------------\r\n"
+
+
+def _test_abort_timer_left():
+    cli = xecli_data.root()
+    xecli.InstallRead().parse(cli, SUMMARY_UNCOMMITTED)
+    testing.assertEqual(swxe.abort_timer_left(cli.to_gdata(), 0), 25 * 60 + 36, "CLI")
+    testing.assertEqual(swxe.device_versions(cli.to_gdata()),
+                        [(version="17.15.04c.0.107", state=swxe.VS_UNCOMMITTED)], "only the activated release")
+    committed = xecli_data.root()
+    xecli.InstallRead().parse(committed, _summary(["IMG   C    " + OLD_VERSION]))
+    testing.assertEqual(swxe.abort_timer_left(committed.to_gdata(), 0), None, "inactive")
+    r = ixoper.root()
+    loc = r.install_oper_data.install_location_information.create()
+    loc.oper_state.auto_abort_timer.state = "install-timer-state-active"
+    loc.oper_state.auto_abort_timer.end_time = "2026-11-10T23:41:31+00:00"
+    testing.assertEqual(swxe.abort_timer_left(r.to_gdata(), 1794354091 - 1536), 1536, "NETCONF")
+
+
+actor _test_iosxe_pending_release_is_aborted_first(t: testing.EnvT):
+    """The device runs 17.18.04 activated and not committed, as after a run
+    that stopped before its commit. An install of another release aborts it
+    first; the device reloads to the committed release. The aborted release
+    stays added, so staging removes it, which removes the staged image too,
+    and transfers again."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["xcopy", "abort", "remove", "xcopy", "install", "activate", "install-commit", "remove"],
+                                m.get_rpcs())
+            testing.assertEqual(NEW_REPORTED, m.get_running())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _StagingRun(t, "d-pending", DIR_EMPTY, VERIFY_EQUAL, settled, preadded="17.18.04",
+                running="17.18.04", committed=OLD_RELEASE)
+
+
+def _test_transfer_failure():
+    cause = swxemock.SUB_DOWNLOAD_FAIL
+    testing.assertEqual(swxe.transfer_failure(cause, u64(239529984), u64(734643332)),
+                        cause + ": bootflash: has 239529984 bytes free, the image is 734643332", "out of room")
+    testing.assertEqual(swxe.transfer_failure(cause, u64(1786126336), u64(734643332)), cause, "room enough")
+    testing.assertEqual(swxe.transfer_failure(cause, None, u64(734643332)), cause, "free space unknown")
+    testing.assertEqual(swxe.transfer_failure(cause, u64(1), None), cause, "size unknown")
+
+
+actor _test_iosxe_bundle_mode_without_the_cli_fails(t: testing.EnvT):
+    """A device that says over NETCONF that it booted in bundle mode would
+    refuse the add. Without the CLI adapter there is no way to convert it,
+    so the install fails before the add and says why."""
+    def settled(m: swxemock.IosXeSoftwareMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("failed", status)
+            testing.assertEqual(["xcopy"], m.get_rpcs(), "no add")
+            reason = d.get_swmgr().get_reason()
+            testing.assertTrue(reason is not None and "bundle mode" in reason!, str(reason))
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _UpgradeRun(t, "d-bundle-netconf", 0.0, swxemock.FAILURE_NONE, OLD_RELEASE,
+                NEW_REQUESTED, IMAGE_URL, settled, bundle=True)
+
+
+actor _test_iosxe_cli_saves_the_changes_of_the_device(t: testing.EnvT):
+    """The device changed its configuration as it booted. Over the CLI the
+    driver saves that before the add, since install with prompt-level none
+    refuses to run while the configuration is not saved."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands()
+                     if cmd.startswith("copy ") or cmd.startswith("install ") or cmd == "write memory"]
+            testing.assertEqual([COPY_COMMAND, "write memory", ADD_COMMAND, ACTIVATE_COMMAND,
+                                 "install commit", "install remove inactive"], steps)
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-boot-change", False, settled, boot_change=True)
+
+
+actor _test_iosxe_cli_makes_room_for_the_packages(t: testing.EnvT):
+    """The image is staged, and bootflash has too little room for the
+    packages that the add makes of it, as when an aborted release left its
+    packages behind. The driver removes the inactive software, which takes
+    the image too, stages it again and adds."""
+    def settled(c: xecli.CliMock, d: swdev.DeviceMgr, st: str) -> None:
+        try:
+            testing.assertEqual("succeeded", st, d.get_swmgr().get_reason())
+            steps = [cmd for cmd in c.get_commands() if cmd.startswith("copy ") or cmd.startswith("install ")]
+            testing.assertEqual(["install remove inactive", COPY_COMMAND, ADD_COMMAND, ACTIVATE_COMMAND,
+                                 "install commit", "install remove inactive"], steps)
+            t.success()
+        except Exception as e:
+            t.failure(e)
+    _CliOnlyRun(t, "d-cli-package-room", False, settled, staged_short=True)
