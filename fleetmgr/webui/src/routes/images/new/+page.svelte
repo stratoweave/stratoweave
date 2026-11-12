@@ -18,11 +18,13 @@
 {/if}
 
 {#if files.length > 0}
-  <AddImagesForm {files} {typed} images={data.images} />
+  <AddImagesForm {files} {typed} folder={data.folder} images={data.images} />
 {:else}
   <CatalogImageForm
     image={null}
     images={data.images}
+    folder={data.folder}
+    file={data.file}
     onfiles={(next, held) => {
       typed = held;
       files = next;

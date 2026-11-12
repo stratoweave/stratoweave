@@ -4,11 +4,11 @@ import { goto } from '$app/navigation';
 // page: a File cannot travel in a URL.
 let pending: File[] = [];
 
-/** Open the add page with one row per file. */
-export async function addImageFiles(files: File[]): Promise<void> {
+/** Open the add page with one row per file, to upload into folder. */
+export async function addImageFiles(files: File[], folder = ''): Promise<void> {
   pending = files;
   try {
-    await goto('/images/new');
+    await goto(folder ? `/images/new?${new URLSearchParams({ folder })}` : '/images/new');
   } finally {
     // Taken by the add page, unless the navigation was cut short.
     if (pending === files) pending = [];

@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { tick } from 'svelte';
+  import { tick, type Snippet } from 'svelte';
 
   interface Props {
     open?: boolean;
@@ -8,8 +8,14 @@
     confirmLabel?: string;
     cancelLabel?: string;
     confirmClass?: string;
+    /** Confirm does nothing, as when a field below needs a fix. */
+    confirmDisabled?: boolean;
     oncancel?: () => void;
     onconfirm?: () => void;
+    /** Fields under the message; Enter in one confirms. The element with
+     * data-autofocus gets focus, and a text field its text selected: all
+     * of it, or as many characters as its data-select says. */
+    children?: Snippet;
   }
 
   let {
@@ -19,8 +25,10 @@
     confirmLabel = 'Confirm',
     cancelLabel = 'Cancel',
     confirmClass = 'btn-danger',
+    confirmDisabled = false,
     oncancel,
-    onconfirm
+    onconfirm,
+    children
   }: Props = $props();
 
   let dialog: HTMLDialogElement | null = $state(null);
@@ -32,11 +40,29 @@
     if (!dialog) return;
     if (open && !dialog.open) {
       dialog.showModal();
-      void tick().then(() => cancelButton?.focus());
+      void tick().then(focusFirst);
     } else if (!open && dialog.open) {
       dialog.close();
     }
   });
+
+  function focusFirst(): void {
+    const field = dialog?.querySelector<HTMLElement>('[data-autofocus]');
+    if (!field) {
+      cancelButton?.focus();
+      return;
+    }
+    field.focus();
+    if (field instanceof HTMLInputElement && field.type === 'text') {
+      const end = Number(field.dataset.select ?? field.value.length);
+      field.setSelectionRange(0, Number.isFinite(end) ? end : field.value.length);
+    }
+  }
+
+  function submit(event: SubmitEvent): void {
+    event.preventDefault();
+    if (!confirmDisabled) onconfirm?.();
+  }
 
   function handleCancel(event: Event): void {
     // Escape: let the parent flip `open` instead of the browser closing us.
@@ -57,23 +83,24 @@
   oncancel={handleCancel}
   onclick={handleBackdropClick}
 >
-  <div class="confirm-dialog__panel card">
+  <form class="confirm-dialog__panel card" onsubmit={submit}>
     <div class="confirm-dialog__body">
       <h2 id="{id}-title">{title}</h2>
       {#if message}
         <p id="{id}-message">{message}</p>
       {/if}
+      {@render children?.()}
     </div>
 
     <div class="confirm-dialog__actions">
       <button class="btn" type="button" bind:this={cancelButton} onclick={() => oncancel?.()}>
         {cancelLabel}
       </button>
-      <button class={`btn ${confirmClass}`.trim()} type="button" onclick={() => onconfirm?.()}>
+      <button class={`btn ${confirmClass}`.trim()} type="submit" disabled={confirmDisabled}>
         {confirmLabel}
       </button>
     </div>
-  </div>
+  </form>
 </dialog>
 
 <style>

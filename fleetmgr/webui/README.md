@@ -22,7 +22,7 @@ after devices finish applying — a real install takes minutes.
 
     # UI development, from ../
     just webui
-    # -> http://localhost:3000, /restconf, /image-file and /layer proxied to FLEETMGR_API
+    # -> http://localhost:3000, /restconf, the image folder routes and /layer proxied to FLEETMGR_API
 
 Type check: `npm run check`. After UI changes: `just gen-webui`, then
 `just build` and commit the regenerated module.
@@ -135,13 +135,16 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   stops it. The leafref is not validated upstream, so the UI offers only
   existing schedules and flags bindings to a missing one.
 - Images are `stratoweave-images:images/image` entries keyed by `name`,
-  with `os`, `version` and a `model` leaf-list. Adding one PATCHes the
+  which campaign members name, with `file`, the path of the image's file in
+  the top's image folder (`--software.image-dir`), such as
+  `iosxe/17.18/c8000v-universalk9.17.18.03a.SPA.bin`, the name when absent;
+  each has `os`, `version` and a `model` leaf-list. Adding one PATCHes the
   datastore root, which merges into an image of the same name rather than
   fail, so the add reads the image names again first and refuses one that
   exists; saving one PUTs the whole entry, so a model removed in the form
   disappears (DELETE on a leaf returns 500); deleting one, from its row in
   the list or on its page, DELETEs the entry and then its file at
-  `/image-file/{name}`, where a 404 counts as removed. The form requires
+  `/image-file/{file}`, where a 404 counts as removed. The form requires
   `os`, `version` and a model, though the YANG does not. A model is added
   by Enter or by picking a suggestion; other text left in the model field
   blocks the save, so a half-typed model is neither lost nor saved.
@@ -168,6 +171,37 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   before it is lost.
   Without an image folder `/image-file` answers 404, and the page says so
   and uploads nothing.
+- The images page is a file manager over one tree: the folders and files of
+  `GET /image-file` (every file and folder, by path) and the images of the
+  list, each placed at its `file`, with the folders on those paths. The
+  folder shown is in the URL, `/images?folder=iosxe/17.18`; an image's page
+  stays at its name, `/images/{name}`. A trail of the folders above it opens
+  them. Folders come first, then the images by the column picked; a row
+  shows the file name, and the image's name under it when the two differ. A
+  list entry whose file is not in the folder says "no file", and a file the
+  list lacks shows with "not listed · add", which opens the add form for
+  that file (`/images/new?file={path}`). New folder PUTs
+  `/image-folder/{path}`; uploads, by drop or Upload images, go into the
+  folder shown: each image is named by its file name, with `file` the
+  folder and that name. An upload whose name is already an image's, or
+  whose path is another image's file, is refused in its row; the names are
+  read again before each file is sent and before its entry is added, so one
+  added meanwhile stops it too, and a PATCH never merges into another
+  image. Rows have a menu, also on a right-click: Edit (or Open, or Add),
+  Rename, Move to… with a folder picker, and Delete. Checked rows,
+  shift-click for a range, move and delete together, and rows dragged onto
+  a folder row or a folder in the trail move there. A move POSTs
+  `/image-move` for the file or folder, then one PATCH sets the `file` of
+  every image whose file it took along. The images keep their names, so
+  campaigns follow: their members get the new URL, and those that answered
+  or finished keep their status, since the target release is the same. The
+  move and rename dialogs say which campaigns install the images. Without an
+  image folder nothing moves, as the files would not follow. Delete takes
+  the list entries out, then DELETEs the file or `/image-folder/{path}` with
+  everything in it; it warns, and does not refuse, when a campaign uses an
+  image. The search field matches folders by name and images as the old
+  filter did, in the folder shown and every folder in it, each match with
+  the folder it is in.
 - Search (Search in the header, or Ctrl/⌘+K) jumps to a page, campaign,
   image, device or schedule by name, matched like the devices page
   filter. It reads the four lists through the 30 s read cache the devices

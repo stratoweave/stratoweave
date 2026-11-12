@@ -599,6 +599,14 @@
   OS, version and family filled in from IOS XE file names. An image can be
   made the default of its family, and the images page sets the image list's
   `url-base`. Deleting an image also deletes its file. [#709] [#742] [#743]
+- The web UI's images page browses the image folder like a file manager:
+  open folders, make them, upload into the one shown, and rename, move and
+  delete files and folders, from a row's menu, by dragging rows onto a
+  folder, or on several selected rows at once. A move changes the `file` of
+  the images it takes along and keeps their names, also for images that
+  campaigns install. An upload whose file name is already an image's name
+  fails before the file is sent. Search covers the folder shown and the
+  folders in it, and files that the image list lacks show, ready to add.
 - The web UI has a Config page that shows the top's configuration, the state
   its transforms publish, or both, as XML, JSON or AData. The Apply config
   page merges JSON or XML configuration into the running system with a

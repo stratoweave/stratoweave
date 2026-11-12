@@ -168,6 +168,8 @@ export interface RedundancyGroupJson {
 /** /stratoweave-images:images/image entry. */
 export interface ImageJson {
   name: string;
+  /** Path of the file in the image folder; without it, the name. */
+  file?: string;
   os?: string;
   version?: string;
   model?: string[];
@@ -720,6 +722,7 @@ export function parseDeviceEntry(json: unknown): Device | null {
 function parseImage(entry: ImageJson): CatalogImage {
   return {
     name: entry.name,
+    file: entry.file || entry.name,
     os: entry.os ?? '',
     models: entry.model ?? [],
     version: entry.version ?? '',
@@ -782,10 +785,12 @@ export function adminStatePatch(name: string, state: AdminState): SoftwarePatchJ
   return { 'software:software': { 'upgrade-campaign': [{ name, 'admin-state': state }] } };
 }
 
-/** Every leaf, since a PUT replaces the whole entry. */
+/** Every leaf, since a PUT replaces the whole entry. A file at the name
+ * needs no file leaf. */
 export function imageToJson(image: CatalogImage): ImageJson {
   const json: ImageJson = {
     name: image.name,
+    ...(image.file && image.file !== image.name ? { file: image.file } : {}),
     os: image.os,
     version: image.version,
     model: [...image.models],
@@ -805,6 +810,12 @@ export function imageCreatePatch(images: CatalogImage[], clear: string[] = []): 
 /** Clears the default of the images named. */
 export function defaultsClearPatch(names: string[]): ImagesPatchJson {
   return imageCreatePatch([], names);
+}
+
+/** Points each image named at its file's new path, in one write. The
+ * images keep their names, so the campaigns that name them follow. */
+export function imageFilesPatch(moved: { name: string; file: string }[]): ImagesPatchJson {
+  return { 'stratoweave-images:images': { image: moved.map(({ name, file }) => ({ name, file })) } };
 }
 
 // ── Validation ──
