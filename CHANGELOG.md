@@ -655,6 +655,12 @@
 - A `root_path` passed to `yang.data.from_data()` can lead to a notification,
   top-level or nested in a container, so a notification payload decodes like
   RPC output. [acton-yang#555] [#751]
+- Fixed XML decoding keeping only the first of a container element that
+  occurs more than once in the same parent. IOS XE 17.15 periodic yang-push
+  updates repeat `<neighbors>` for each BGP neighbor, so a NETCONF
+  subscription got only the first neighbor and the fleetmgr BGP post-check
+  failed. The occurrences are now read as one container. [acton-yang#560]
+  [#802]
 
 #### acton-ssh
 - Fixed SSH events being delivered out of the order libssh raises them.
@@ -871,3 +877,4 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-yang#555]: https://github.com/stratoweave/acton-yang/pull/555
 [acton-yang#556]: https://github.com/stratoweave/acton-yang/pull/556
 [acton-yang#557]: https://github.com/stratoweave/acton-yang/pull/557
+[acton-yang#560]: https://github.com/stratoweave/acton-yang/pull/560
