@@ -165,58 +165,140 @@ class Device(base.Device):
         return o
 
 
+def connection(flotilla: ?bool, device: ?bool) -> ?str:
+    """Return how a fleet device can be reached, as its state/connected
+    gives it: flotilla says whether the top is connected to the device's
+    flotilla, and device whether the flotilla is connected to the device,
+    each None while unknown. The device's own connection comes first, as in
+    held_status(): a device that was down before the top lost its flotilla
+    stays device-down. None while neither says anything, or while only the
+    flotilla is up."""
+    if device is not None and not device:
+        return "device-down"
+    if flotilla is not None and not flotilla:
+        return "flotilla-down"
+    if device is not None:
+        return "connected"
+    return None
+
+
+def platform_of(state: ?y1_oper.stratoweave_rfs__rfs__device__state__platform) \
+        -> ?(os: ?str, version: ?str, model: ?str, serial_number: ?str):
+    """Return the platform in state, or None when it has none of its parts."""
+    if state is not None and (state.os is not None or state.version is not None or
+                              state.model is not None or state.serial_number is not None):
+        return (os=state.os, version=state.version, model=state.model,
+                serial_number=state.serial_number)
+    return None
+
+
 actor DeviceTransform(path: ttt.Path,
                       update_oper: proc(?y0_oper.fleetmgr__fleet__device_entry) -> None,
                       lower_tree_provider: ?ygdata.TreeProvider):
-    """Publish the platform of one device, as its RFS entry relays it from
-    the device's flotilla."""
+    """Publish the state of one fleet device from three inputs, each from a
+    subscription of its own:
+
+    - platform: the device's RFS state/platform, which its flotilla reads
+      from the device. It is published as state/platform.
+    - device_up: the device's RFS state/connected, whether the flotilla is
+      connected to the device.
+    - flotilla_up: the top's /device entry of the flotilla, whether the top
+      is connected to the flotilla.
+
+    connection() makes state/connected of device_up and flotilla_up. With a
+    subscription of its own, an input that is absent, as the connection is
+    until the device first connects, does not hide the others. An input is
+    None while unknown, also after its subscription failed. A delivery sets
+    its input, and publish() publishes what the inputs give when that
+    changed."""
     var subscriptions: ?ygdata.SubscriptionManager = None
+    var closed = False
     var platform: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+    var device_up: ?bool = None
+    var flotilla_up: ?bool = None
+    # What publish() published last; both None while it published nothing.
+    var shown_platform: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
+    var shown_connected: ?str = None
+
+    def publish() -> None:
+        connected = connection(flotilla_up, device_up)
+        if platform == shown_platform and connected == shown_connected:
+            return
+        shown_platform = platform
+        shown_connected = connected
+        p = platform
+        if p is None and connected is None:
+            update_oper(None)
+            return
+        oper = base.Device.new_state(path)
+        if p is not None:
+            o = oper.state.platform
+            o.os = p.os
+            o.version = p.version
+            o.model = p.model
+            o.serial_number = p.serial_number
+        oper.state.connected = connected
+        update_oper(oper)
 
     def on_platform(keys: ?(rfs_name: str, device_name: str),
                     state: ?y1_oper.stratoweave_rfs__rfs__device__state__platform,
                     error: ?Exception) -> None:
-        # A call can still arrive after shutdown closed the subscription.
-        if subscriptions is None:
+        # A call can still arrive after shutdown closed the subscriptions.
+        if closed:
             return
-        value: ?(os: ?str, version: ?str, model: ?str, serial_number: ?str) = None
         if error is not None:
             print("device platform subscription failed at {path}: {error}", err=True)
-        elif state is not None and (state.os is not None or state.version is not None or
-                                    state.model is not None or state.serial_number is not None):
-            value = (os=state.os, version=state.version, model=state.model,
-                     serial_number=state.serial_number)
-        if value == platform:
+        platform = platform_of(state)
+        publish()
+
+    def on_connected(keys: ?(rfs_name: str, device_name: str),
+                     state: ?FlotillaDeviceStatus, error: ?Exception) -> None:
+        if closed:
             return
-        platform = value
-        if value is not None:
-            oper = base.Device.new_state(path)
-            o = oper.state.platform
-            o.os = value.os
-            o.version = value.version
-            o.model = value.model
-            o.serial_number = value.serial_number
-            update_oper(oper)
-        else:
-            update_oper(None)
+        if error is not None:
+            print("device connection subscription failed at {path}: {error}", err=True)
+        device_up = state.connected if state is not None else None
+        publish()
+
+    def on_flotilla(keys: ?(device_name: str, adapter_type: str),
+                    entry: ?y1_oper.stratoweave_rfs__device__state__adapter_entry,
+                    error: ?Exception) -> None:
+        if closed:
+            return
+        if error is not None:
+            print("device flotilla subscription failed at {path}: {error}", err=True)
+        flotilla_up = entry.connected if entry is not None else None
+        publish()
 
     def shutdown() -> None:
+        closed = True
         if subscriptions is not None:
             subscriptions!.close()
             subscriptions = None
-        if platform is not None:
-            platform = None
-            update_oper(None)
+        platform = None
+        device_up = None
+        flotilla_up = None
+        publish()
 
     def on_conf(conf: y_0.fleetmgr__fleet__device_entry) -> None:
         # The flotilla follows from the name, so it never changes.
         tp = lower_tree_provider
-        if subscriptions is None and tp is not None:
-            subscriptions = ygdata.SubscriptionManager(tp, "device-platform:{path}")
-            platform_state = y1_oper.subs.rfs.device.state.platform
-            subscriptions!.declare({platform_state.dst(on_platform).deliver({
-                y1_oper.subs.rfs.entry(flotilla_of(conf.name)).device.entry(conf.name).state.platform.subscribe(),
-            })})
+        if subscriptions is None and tp is not None and not closed:
+            subscriptions = ygdata.SubscriptionManager(tp, "device-state:{path}")
+            flotilla = flotilla_of(conf.name)
+            rfs_state = y1_oper.subs.rfs.entry(flotilla).device.entry(conf.name).state
+            top_flotilla = y1_oper.subs.device.entry(flotilla).state.adapter.entry(FLOTILLA_TYPE)
+            subscriptions!.declare({
+                y1_oper.subs.rfs.device.state.platform.dst(on_platform).deliver({
+                    rfs_state.platform.subscribe(),
+                }),
+                y1_oper.subs.rfs.device.state.dst(on_connected).deliver({
+                    rfs_state.connected.subscribe(),
+                }),
+                y1_oper.subs.device.state.adapter.dst(on_flotilla).deliver({
+                    top_flotilla.subscribe(),
+                }),
+            })
 
 
 def device_estimate(dev: ?y_0.fleetmgr__fleet__device_entry) -> int:
@@ -1004,6 +1086,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             st.run_since = u64(since)
         in_progress = 0
         succeeded = 0
+        up_to_date = 0
         failed = 0
         preparing = 0
         prepared = 0
@@ -1050,6 +1133,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 in_progress += 1
             elif status == "succeeded" or status == "up-to-date":
                 succeeded += 1
+                if status == "up-to-date":
+                    up_to_date += 1
             elif status == "failed" or status == "rolled-back" or status == "not-started":
                 failed += 1
             # Only a member that waits for its release counts: the run of a
@@ -1073,6 +1158,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         st.total = u64(len(members))
         st.in_progress = u64(in_progress)
         st.succeeded = u64(succeeded)
+        st.up_to_date = u64(up_to_date)
         st.failed = u64(failed)
         st.preparing = u64(preparing)
         st.prepared = u64(prepared)

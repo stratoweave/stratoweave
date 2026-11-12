@@ -600,6 +600,15 @@
   run starts, or that the veto stops before its install, waits again and
   frees its slot. Before, the campaign released it, and it held a slot
   while its device did not install. [#811]
+- Each `/fleet/device` says in `state/connected` whether it can be reached:
+  `connected`, `device-down` while its flotilla is not connected to it, or
+  `flotilla-down` while the top is not connected to its flotilla. A device
+  that was down before the top lost its flotilla stays `device-down`, as a
+  campaign holds it for `down`. `state/connected` is absent while the
+  device has not connected since fleetmgr started. A campaign's new
+  `state/up-to-date` counts the members that answered `up-to-date`, as they
+  already ran the target release when they read it; `succeeded` still
+  counts them too.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead

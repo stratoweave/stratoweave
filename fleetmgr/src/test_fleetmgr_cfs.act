@@ -2785,7 +2785,8 @@ actor _test_campaign_image_change_holds_a_member_again(t: testing.AsyncT):
 actor _test_campaign_image_change_makes_answers_stale(t: testing.AsyncT):
     """A member that answered the campaign's target shows pending, and
     counts nowhere, once its image in the campaign has another version.
-    The device sends no new status for that."""
+    The device sends no new status for that. An up-to-date member counts
+    in succeeded and in up-to-date."""
     var controller: ?cfs.UpgradeCampaignTransform = None
     var changed = False
     var done = False
@@ -2805,16 +2806,16 @@ actor _test_campaign_image_change_makes_answers_stale(t: testing.AsyncT):
         r = o.state.device_status.get("cpe-1")
         got = "missing"
         if r is not None:
-            got = "{r.status} {r.attempt}, succeeded {o.state.succeeded}"
+            got = "{r.status} {r.attempt}, succeeded {o.state.succeeded}, up-to-date {o.state.up_to_date}"
         if not changed:
             # The first publication comes before the device's state.
-            if got == "up-to-date 0, succeeded 1":
+            if got == "up-to-date 0, succeeded 1, up-to-date 1":
                 changed = True
                 cc = controller
                 if cc is not None:
                     newer = _with_version(_with_nightly(_flat_inventory(names)), "17.18.04")
                     cc.on_conf(conf, newer.to_gdata())
-        elif got == "pending None, succeeded 0":
+        elif got == "pending None, succeeded 0, up-to-date 0":
             done = True
             t.success()
         else:
@@ -3520,6 +3521,89 @@ def _test_held_status():
     for c in cases:
         testing.assertEqual(cfs.held_status(c.0, c.1, "flotilla-8", c.2, c.3), c.4,
                             "{c.0} by {c.1}, flotilla {c.2}, device {c.3}")
+
+
+def _test_connection():
+    """A fleet device is connected while its flotilla says so and the top
+    is not cut off from the flotilla. Its own connection comes first, as a
+    campaign's held gives it: a device that was down before the top lost
+    its flotilla stays device-down. Nothing is said while neither is known,
+    or while only the flotilla is up."""
+    # (the top to the flotilla, the flotilla to the device, published)
+    cases: list[(?bool, ?bool, ?str)] = [
+        (None, None, None),
+        (True, None, None),
+        (None, True, "connected"),
+        (True, True, "connected"),
+        (None, False, "device-down"),
+        (True, False, "device-down"),
+        (False, None, "flotilla-down"),
+        (False, True, "flotilla-down"),
+        (False, False, "device-down"),
+    ]
+    for c in cases:
+        testing.assertEqual(cfs.connection(c.0, c.1), c.2, "flotilla {c.0}, device {c.1}")
+        held = cfs.held_status("down", "", "flotilla-8", c.0, c.1).0
+        testing.assertEqual(held == "flotilla-down", c.2 == "flotilla-down",
+                            "held {held}, flotilla {c.0}, device {c.1}")
+
+
+def _fleet_device_path(name: str) -> ttt.Path:
+    """Return the path of one /fleet/device entry, as TTT builds it."""
+    fleet = ttt.PathElem(gdata.Id(y0_oper.NS_fleetmgr, "fleet"), ttt.PathRoot("root"))
+    devices = ttt.PathElem(gdata.Id(y0_oper.NS_fleetmgr, "device"), fleet)
+    return ttt.PathKey(name, devices, {gdata.Id(y0_oper.NS_fleetmgr, "name"): gdata.Leaf(name)})
+
+
+actor _test_fleet_device_publishes_how_it_is_connected(t: testing.AsyncT):
+    """A fleet device publishes whether it can be reached next to its
+    platform, as its flotilla and the top's entry for the flotilla report
+    it. Its flotilla going down shows while the device is connected. A
+    device that was down before stays device-down while its flotilla is
+    down and after it is back. Shutdown clears the state."""
+    want = ["connected None", "connected 17.18.2", "flotilla-down 17.18.2",
+            "connected 17.18.2", "device-down 17.18.2", "connected 17.18.2", "gone"]
+    var got: list[str] = []
+
+    def on_oper(oper: ?y0_oper.fleetmgr__fleet__device_entry) -> None:
+        if oper is not None:
+            got.append("{oper!.state.connected} {oper!.state.platform.version}")
+        else:
+            got.append("gone")
+
+    def check() -> None:
+        if got == want:
+            t.success()
+        else:
+            t.failure(ValueError("published {got}"))
+
+    name = "cpe-001"
+    f = cfs.flotilla_of(name)
+    dev = cfs.DeviceTransform(_fleet_device_path(name), on_oper, None)
+
+    def device(connected: bool) -> None:
+        dev.on_connected((rfs_name=f, device_name=name),
+                         y1_oper.stratoweave_rfs__rfs__device__state(connected=connected), None)
+
+    def flotilla(connected: bool) -> None:
+        dev.on_flotilla((device_name=f, adapter_type=cfs.FLOTILLA_TYPE),
+                        _flotilla_state(connected), None)
+
+    # The top is connected to the flotilla before the device first connects.
+    flotilla(True)
+    device(True)
+    platform = y1_oper.stratoweave_rfs__rfs__device__state__platform()
+    platform.version = "17.18.2"
+    dev.on_platform((rfs_name=f, device_name=name), platform, None)
+    flotilla(False)
+    flotilla(True)
+    device(False)
+    # Neither publishes: the device stays device-down.
+    flotilla(False)
+    flotilla(True)
+    device(True)
+    dev.shutdown()
+    after 0.5: check()
 
 
 def _connected(status: str, campaign: str, connected: ?bool) -> y1_oper.stratoweave_rfs__rfs__device__state:
