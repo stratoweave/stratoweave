@@ -129,23 +129,23 @@ def _test_ramp_grows_four_times_a_round():
 
 def _test_only_a_device_done_without_a_failure_grows_the_ramp():
     """The ramp grows by three for each device that is done without a
-    failure, also one that reported up-to-date before its release. 10 at
-    once in a window that never closes, the ramp at one device. d1
-    reports up-to-date before its release. d0 fails: the ramp stays at
-    one, and d1 starts. d1 is done at the next decision, up to date: the
-    ramp lets 4 be in flight, and d2 to d5 start. d2 rolls back: the ramp
-    stays at 4, and d6 takes the slot of d2. d3 succeeds: the ramp lets 7
-    be in flight, and with d4, d5 and d6 in flight, d7 to d10 start."""
+    failure, but not for one that is done without a release. 10 at once
+    in a window that never closes, the ramp at one device. d1 reports
+    up-to-date before its release: it is done at once, and the ramp stays
+    at one. d0 fails: the ramp stays at one, and d2 starts. d2 rolls back:
+    the ramp stays at one, and d3 starts. d3 succeeds: the ramp lets 4 be
+    in flight, and d4 to d7 start. d4 succeeds: the ramp lets 7 be in
+    flight, and with d5, d6 and d7 in flight, d8 to d11 start."""
     c = open_window(12, 10, 10)
     c.report("d1", "up-to-date", 0)
     testing.assertEqual(c.decide(0).started, ["d0"])
     # (the time of the decision, the reports that come then, the devices
     # that start, the ramp after)
     cases: list[(int, list[(str, str)], list[str], int)] = [
-        (600, [("d0", "failed")], ["d1"], 1),
-        (601, [], ["d2", "d3", "d4", "d5"], 4),
-        (1201, [("d2", "rolled-back")], ["d6"], 4),
-        (1250, [("d3", "succeeded")], ["d7", "d8", "d9", "d10"], 7),
+        (600, [("d0", "failed")], ["d2"], 1),
+        (1200, [("d2", "rolled-back")], ["d3"], 1),
+        (1800, [("d3", "succeeded")], ["d4", "d5", "d6", "d7"], 4),
+        (1850, [("d4", "succeeded")], ["d8", "d9", "d10", "d11"], 7),
     ]
     for case in cases:
         for r in case.1:
@@ -154,56 +154,87 @@ def _test_only_a_device_done_without_a_failure_grows_the_ramp():
         testing.assertEqual(c.rung, case.3, str(case.0))
 
 
-def _test_devices_up_to_date_before_their_release_grow_the_ramp():
-    """100 devices, u0 to u99, report up-to-date at 0, and 40 devices of
-    600 s, r0 to r39, come after them, 10 at once, in a window that never
-    closes, with a debounce of 30 s. The run starts at 0 too, and each
-    up-to-date device reported before its release, so it ran no upgrade
-    and is done at the decision after its release. It grows the ramp as a device that
-    succeeds does: the decisions start 1, 4 and then 10 devices. So the
-    first 11 decisions start 95 of the up-to-date devices, and the 12th
-    the last 5 and r0 to r4. If the ramp did not grow on them, it would
-    stay at one device, and r0 would start at the 101st decision. r0 must
-    start at the 12th decision at the latest, and every device must be
-    done."""
-    devs = devices("u", 100, 600, "w") + devices("r", 40, 600, "w")
-    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 10, 10, debounce=30)
-    for i in range(100):
-        c.report("u{i}", "up-to-date", 0)
-    ds = sim.drive(c, 0, {}, DAY)
-    first = -1
-    for k in range(len(ds)):
-        if first < 0 and "r0" in ds[k].started:
-            first = k + 1
-    testing.assertTrue(first > 0 and first <= 12,
-                       "r0 starts at decision {first}, at the latest the 12th")
-    testing.assertEqual(len(c.done_times()), 140)
+def without(devs: list[(str, int, str)], names: list[str]) -> list[(str, int, str)]:
+    """The devices devs without the devices names."""
+    return [d for d in devs if d.0 not in names]
+
+
+def _test_members_up_to_date_at_the_start_take_no_window_and_no_slot():
+    """Members that report up-to-date before the run are done at once,
+    without a release. They take no window, no slot and no turn of the
+    stagger, and add nothing to the ramp or the pace. So every decision
+    starts the same devices at the same time as in the campaign without
+    them, with the same devices in flight, ramp, pace and alarms, and the
+    run ends at the same decision. The first plan is the same too: it
+    places none of them. They count as done."""
+    open_w = [("w", 0, fleet_ctl.OPEN_END)]
+    # Every fourth device is up to date.
+    every_fourth = [("u{i}" if i % 4 == 1 else "d{i}", 600, "day") for i in range(24)]
+    # (case, the windows, the devices, the members up to date, the target,
+    # the max concurrency, whether every device must start in a window,
+    # the ramp, the stagger)
+    cases: list[(str, list[(str, int, int)], list[(str, int, str)], list[str], int, int, bool,
+                 int, int)] = [
+        ("100 first", open_w, devices("u", 100, 600, "w") + devices("r", 40, 600, "w"),
+         ["u{i}" for i in range(100)], 10, 10, False, 1, 0),
+        ("every fourth", daily("day", 0, HOUR, 9), every_fourth,
+         [d.0 for d in every_fourth if d.0.startswith("u")], 2, 4, False, 1, 0),
+        ("staggered", open_w, devices("u", 5, 600, "w") + devices("r", 3, 600, "w"),
+         ["u{i}" for i in range(5)], 3, 3, False, 3, 100),
+        ("deadline", [("w", 0, 2 * HOUR)],
+         [("u0", 600, "w")] + devices("d", 12, 600, "w") + [("u1", 600, "w")],
+         ["u0", "u1"], 1, 4, True, 1, 0),
+    ]
+    for case in cases:
+        c = controller(case.1, case.2, case.4, case.5, case.6, 30, rung=case.7,
+                       stagger=case.8)
+        for name in case.3:
+            c.report(name, "up-to-date", 0)
+        alone = controller(case.1, without(case.2, case.3), case.4, case.5, case.6, 30,
+                           rung=case.7, stagger=case.8)
+        p = c.plan(0)
+        q = alone.plan(0)
+        testing.assertEqual(c.layout(p), alone.layout(q), case.0)
+        testing.assertEqual(p.alarms, q.alarms, case.0)
+        ds = sim.drive(c, 0, {}, 30 * DAY)
+        es = sim.drive(alone, 0, {}, 30 * DAY)
+        up = len(case.3)
+        testing.assertEqual([(d.t, d.started, d.c, d.flying, d.rung, d.done - up, d.pace, d.slow,
+                              d.alarms) for d in ds],
+                            [(e.t, e.started, e.c, e.flying, e.rung, e.done, e.pace, e.slow,
+                              e.alarms) for e in es], case.0)
+        testing.assertEqual([n for n in case.3 if c.is_released(n) or not c.is_done(n)], [],
+                            case.0)
+        testing.assertEqual(c.done_count(), len(case.2), case.0)
 
 
 def _test_a_report_before_the_release_in_its_second_ran_no_upgrade():
-    """d0 has an upgrade of 600 s, one device at a time, released at 0. A
-    final report that came before the release ran no upgrade, also in the
-    same second: d0 is done at the step that takes the report, and the
-    pace stays at 600 s. A report that came after the release is an
-    upgrade, in the same second too: it counts as 1 s, and the pace, the
-    mean of one upgrade at a target of one, becomes 1 s."""
-    # (whether d0 reports before its release, when it reports, when it is
-    # done, the pace after)
-    cases: list[(bool, int, int, int)] = [
-        (True, 0, 1, 600),
-        (False, 0, 0, 1),
-        (False, 1, 1, 1),
+    """d0 has an upgrade of 600 s, one device at a time. A final report
+    that came before the decision at 0 ran no upgrade, also in the same
+    second: d0 is done at once, without a release, d1 starts instead, and
+    the pace stays at 600 s. A report that came after d0's release at 0 is
+    an upgrade, in the same second too: it counts as 1 s, and the pace,
+    the mean of one upgrade at a target of one, becomes 1 s."""
+    # (whether d0 reports before the decision at 0, when it reports, the
+    # device that starts at 0, when d0 is done after a release or -1, the
+    # pace after)
+    cases: list[(bool, int, str, int, int)] = [
+        (True, 0, "d1", -1, 600),
+        (False, 0, "d0", 0, 1),
+        (False, 1, "d0", 1, 1),
     ]
     for case in cases:
+        label = "report at {case.1}, before the release: {case.0}"
         c = open_window(2, 1, 1)
         if case.0:
             c.report("d0", "succeeded", case.1)
-        testing.assertEqual(c.decide(0).started, ["d0"])
+        testing.assertEqual(c.decide(0).started, [case.2], label)
         if not case.0:
             c.report("d0", "succeeded", case.1)
         c.decide(1)
-        testing.assertEqual((c.done_times()["d0"], c.observed_s), (case.2, case.3),
-                            "report at {case.1}, before the release: {case.0}")
+        testing.assertEqual(c.is_done("d0"), True, label)
+        testing.assertEqual((c.done_times().get_def("d0", -1), c.observed_s), (case.3, case.4),
+                            label)
 
 
 def _test_each_device_that_succeeds_lets_three_more_start():
@@ -268,13 +299,15 @@ def _test_done_at_its_report():
 
 def _test_final_report_from_before_the_release():
     """A device that reported a final status before it was released is
-    done at the decision that sees it after the release. It ran no
-    upgrade, so the pace stays."""
+    done at once, without a release, and the decision starts the next
+    device in its slot. It ran no upgrade, so the pace stays."""
     c = open_window(2, 1, 1)
     c.report("d0", "up-to-date", 0)
-    c.decide(10)
-    c.decide(40)
-    testing.assertEqual(c.done_times(), {"d0": 40})
+    testing.assertEqual(c.decide(10).started, ["d1"])
+    testing.assertEqual((c.is_done("d0"), c.is_released("d0")), (True, False))
+    c.report("d1", "succeeded", 610)
+    c.decide(610)
+    testing.assertEqual(c.done_times(), {"d1": 610})
     testing.assertEqual(c.observed_s, 600)
 
 
@@ -351,7 +384,8 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
                        late: int=0, answers: list[(int, str)]=[],
                        in_progress: bool=False, prepare: bool=False,
                        failing: list[str]=[], budgets: list[(int, int)]=[],
-                       lives: list[(int, str, bool)]=[], reboots: bool=False) -> int:
+                       lives: list[(int, str, bool)]=[], reboots: bool=False,
+                       statuses: list[(int, str, ?str)]=[]) -> int:
     """Run c the way the campaign actor does, each decision late seconds
     after its time, next to a copy of it that plans at every decision.
     Each decision of c starts the same devices, wakes at the same time and
@@ -372,11 +406,15 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
     device that starts goes down a third of the way into its upgrade and
     comes back up two thirds of the way in, and a decision comes at each;
     both take the changes that are due at a decision in the order they
-    came. Return how many decisions of c took the last plan again."""
+    came. statuses holds other reports, as (time, name, status), in the
+    order of their times: both take each at its time, and a decision
+    comes then. Return how many decisions of c took the last plan
+    again."""
     d = c.copy()
     flying: list[(int, str)] = []
     pending = sorted(answers)
     budgets_left = sorted(budgets)
+    reports_left: list[(int, str, ?str)] = list(statuses)
     # The changes of up and down to come.
     changes: list[(int, str, bool)] = lives
     # The prepares that run, as (end, name), and the members let prepare.
@@ -414,6 +452,10 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
             else:
                 later.append(a)
         pending = later
+        while len(reports_left) > 0 and reports_left[0].0 <= t:
+            r = reports_left.pop(0)
+            c.report(r.1, r.2, r.0)
+            d.report(r.1, r.2, r.0)
         copying: list[(int, str)] = []
         for p in prepping:
             if p.0 <= t:
@@ -471,6 +513,8 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
             nxt = pending[0].0 + c.debounce
         if len(budgets_left) > 0 and (nxt < 0 or budgets_left[0].0 < nxt):
             nxt = budgets_left[0].0
+        if len(reports_left) > 0 and (nxt < 0 or reports_left[0].0 < nxt):
+            nxt = reports_left[0].0
         if nxt < 0:
             break
         t = nxt + late
@@ -806,14 +850,15 @@ def _test_a_plan_keeps_the_window_a_promise_moves_to():
     testing.assertEqual(sim.started(c).get("x"), (wins[1], 1000))
 
 
-def _test_a_pending_report_wakes_the_controller():
-    """d0 reported up-to-date before its release, so it is done at the next
-    decision, which the controller asks for a second later."""
+def _test_a_member_done_before_its_release_asks_for_no_decision():
+    """d0 reported up-to-date before its release, so it is done at once,
+    and no decision waits for it: the decision at 10 starts d1, and wakes
+    when d1's report is expected to count."""
     c = open_window(2, 1, 1)
     c.report("d0", "up-to-date", 0)
     s = c.decide(10)
-    testing.assertEqual((s.started, s.wake), (["d0"], 11))
-    testing.assertEqual(sim.planned(c, s.plan).get("d1"), (("w", 0, fleet_ctl.OPEN_END), 11))
+    testing.assertEqual((s.started, s.wake), (["d1"], 610))
+    testing.assertEqual(sim.planned(c, s.plan), {"d1": (("w", 0, fleet_ctl.OPEN_END), 10)})
 
 
 def _test_reconfigure_keeps_the_order_of_a_moved_promise():
@@ -1031,19 +1076,17 @@ def _test_overlapping_windows_of_one_schedule_take_one_share():
 
 def _test_nothing_starts_before_the_turn_of_a_held_start():
     """a and b never close, three devices of 600 s each, four at once,
-    staggered over a whole upgrade: 150 s from one start to the next. b0
-    reports up to date at 0. At 0, a0 starts and a1 waits for its turn at
-    150. A decision at 50 starts nothing, not even b0, as the plan of 0
-    said: that plan starts b0 and b1 at 150."""
+    staggered over a whole upgrade: 150 s from one start to the next. At
+    0, a0 starts and a1 waits for its turn at 150. A decision at 50 starts
+    nothing, as the plan of 0 said: that plan starts b0 at 150."""
     wins = [("a", 0, fleet_ctl.OPEN_END), ("b", 0, fleet_ctl.OPEN_END)]
     devs = devices("a", 3, 600, "a") + devices("b", 3, 600, "b")
     c = controller(wins, devs, 4, 4, rung=4, stagger=100)
-    c.report("b0", "up-to-date", 0)
     s = c.decide(0)
     testing.assertEqual(s.started, ["a0"])
     testing.assertEqual(s.plan.starts["b0"].1, 150)
     testing.assertEqual(c.decide(50).started, [])
-    testing.assertEqual(c.decide(150).started, ["b0", "b1"])
+    testing.assertEqual(c.decide(150).started, ["b0"])
 
 
 def _test_a_short_window_next_to_a_long_one_starts_all_its_devices():
@@ -1368,24 +1411,21 @@ def _test_a_decision_after_the_stagger_wake_plans_anew_and_catches_up():
     testing.assertEqual((s.started, s.plan.alarms), (["d2"], []))
 
 
-def _test_the_stagger_does_not_hold_devices_that_reported_before_their_release():
+def _test_the_stagger_holds_only_the_members_that_upgrade():
     """Five devices that report up to date before their release, then
     three of 600 s, three at a time with the ramp at three, staggered over
     a whole upgrade: 200 s from one start to the next. They report at 0,
-    the second the run starts in. The five run no upgrade, so the stagger
-    does not hold them: they start as fast as the ramp allows, and r0
-    starts with the last two. Then r1 and r2 follow 200 s apart."""
+    the second the run starts in. The five are done at once, so they take
+    no turn: r0 starts at 0, and r1 and r2 follow 200 s apart."""
     wins = [("w", 0, fleet_ctl.OPEN_END)]
     c = controller(wins, devices("u", 5, 600, "w") + devices("r", 3, 600, "w"), 3, 3, rung=3,
                    stagger=100)
     for i in range(5):
         c.report("u{i}", "up-to-date", 0)
     cases = [
-        (0, ["u0", "u1", "u2"], 1),
-        (1, ["u3", "u4", "r0"], 2),
-        (2, [], 201),
-        (201, ["r1"], 401),
-        (401, ["r2"], 601),
+        (0, ["r0"], 200),
+        (200, ["r1"], 400),
+        (400, ["r2"], 600),
     ]
     for case in cases:
         s = c.decide(case.0)
@@ -2324,6 +2364,207 @@ def _test_a_pack_group_keeps_its_min_separation():
     testing.assertEqual(c.decide(900).started, ["r2"])
 
 
+def _test_a_member_up_to_date_in_a_redundancy_group_counts_from_its_answer():
+    """a, b and u pack in a group with a min-separation of 300 s, two at a
+    time with the ramp at two, in a window that never closes, and d is in
+    no group. Each device that starts succeeds 600 s later. u answers at 0,
+    before the first decision. Up to date, u is done at once, at its
+    answer, and the member after it waits 300 s from then. First in the
+    group: a waits 300 s from u's answer, and b starts 300 s after a is
+    done, at 1200. Between a and b: b waits 300 s from u's answer and 300 s
+    from the end of a, to 900. Last: no member waits for u. Needing the
+    upgrade, u goes between a and b, and b starts at 1800. Done in an
+    earlier run, u is done at its answer too. Failed, u holds a and b when
+    the group holds on a failure, and no one when it goes on. When u needs
+    the upgrade, but answers up-to-date at 700, after a is done, b waits
+    300 s from that answer, to 1000. Failed, u can answer up-to-date later,
+    at 700, for example after an operator repairs it. Then the member after
+    it waits 300 s from that answer: b starts at 1000 when the group goes
+    on, and a starts at 1000 when the group holds and u is first."""
+    group_failed = ["2 device(s) wait behind a failed redundancy group member: a, b"]
+    first = {"u": 1, "a": 2, "b": 3}
+    between = {"a": 1, "u": 2, "b": 3}
+    # (case, the priorities, u's answers, the first at 0 and each later one
+    # at a later decision, the devices that start at 0, the start of each
+    # group member in the plan at 0, the alarms at 0, the devices that start
+    # at each later decision); a case that ends in "hold" holds the group on
+    # a failure
+    cases: list[(str, dict[str, int], list[(int, str)], list[str], dict[str, int], list[str],
+                 list[(int, list[str])])] = [
+        ("u first", first, [(0, "up-to-date")], ["d"], {"a": 300, "b": 1200}, [],
+         [(300, ["a"]), (600, []), (900, []), (1200, ["b"])]),
+        ("u between", between, [(0, "up-to-date")], ["a", "d"], {"a": 0, "b": 900}, [],
+         [(600, []), (900, ["b"])]),
+        ("u last", {"a": 1, "b": 2, "u": 3}, [(0, "up-to-date")], ["a", "d"],
+         {"a": 0, "b": 900}, [], [(600, []), (900, ["b"])]),
+        ("u needs the upgrade", between, [(0, "upgrade-needed")], ["a", "d"],
+         {"a": 0, "u": 900, "b": 1800}, [], [(600, []), (900, ["u"]), (1500, []), (1800, ["b"])]),
+        ("u needs the upgrade, then up to date", between,
+         [(0, "upgrade-needed"), (700, "up-to-date")], ["a", "d"], {"a": 0, "u": 900, "b": 1800},
+         [], [(600, []), (700, []), (900, []), (1000, ["b"])]),
+        ("u succeeded before, first", first, [(0, "succeeded")], ["d"], {"a": 300, "b": 1200},
+         [], [(300, ["a"]), (600, []), (900, []), (1200, ["b"])]),
+        ("u succeeded before, between", between, [(0, "succeeded")], ["a", "d"],
+         {"a": 0, "b": 900}, [], [(600, []), (900, ["b"])]),
+        ("u failed, go on", between, [(0, "failed")], ["a", "d"], {"a": 0, "b": 900}, [],
+         [(600, []), (900, ["b"])]),
+        ("u failed, hold", between, [(0, "failed")], ["d"], {}, group_failed,
+         [(600, []), (900, [])]),
+        ("u failed, then up to date, go on", between, [(0, "failed"), (700, "up-to-date")],
+         ["a", "d"], {"a": 0, "b": 900}, [], [(600, []), (700, []), (900, []), (1000, ["b"])]),
+        ("u failed first, then up to date, hold", first, [(0, "failed"), (700, "up-to-date")],
+         ["d"], {}, group_failed,
+         [(600, []), (700, []), (1000, ["a"]), (1600, []), (1900, ["b"])]),
+    ]
+    devs = [("a", 600, "w"), ("b", 600, "w"), ("u", 600, "w"), ("d", 600, "w")]
+    for case in cases:
+        label = case.0
+        hold = hold_all() if label.endswith("hold") else set()
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 2, 2, groups={"g": ["a", "u", "b"]},
+                       priority=case.1, separation={"g": (False, 300)}, rung=2, hold_failed=hold)
+        c.report("u", case.2[0].1, 0)
+        s = c.decide(0)
+        testing.assertEqual(s.started, case.3, label)
+        testing.assertEqual({n: st.1 for n, st in s.plan.starts.items() if n != "d"}, case.4,
+                            label)
+        testing.assertEqual(s.plan.alarms, case.5, label)
+        ends: list[(int, str)] = [(600, n) for n in s.started]
+        for step in case.6:
+            for e in ends:
+                if e.0 == step.0:
+                    c.report(e.1, "succeeded", step.0)
+            for a in case.2[1:]:
+                if a.0 == step.0:
+                    c.report("u", a.1, step.0)
+            started = c.decide(step.0).started
+            testing.assertEqual(started, step.1, "{label} at {step.0}")
+            for n in started:
+                ends.append((step.0 + 600, n))
+
+
+def _test_a_member_that_ran_before_a_pause_keeps_its_min_separation():
+    """a and b pack in a group with a min-separation of 1 h, one at a time,
+    in a window that never closes. a succeeds at 600, and the run stops
+    and starts again, as a pause does. a is then done without a release,
+    at its report, and b waits the min-separation from then, in the run
+    and in the plan of a copy that starts a run."""
+    devs = [("a", 600, "w"), ("b", 600, "w")]
+    # (case, when the run starts again, the devices that start then, the
+    # plan's start of b then)
+    cases: list[(str, int, list[str], int)] = [
+        ("before the min-separation", 800, [], 4200),
+        ("after the min-separation", 5000, ["b"], 5000),
+    ]
+    for case in cases:
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["a", "b"]},
+                       priority={"a": 1, "b": 2}, separation={"g": (False, HOUR)})
+        testing.assertEqual(c.decide(0).started, ["a"], case.0)
+        c.report("a", "succeeded", 600)
+        c.stop()
+        shown = c.copy()
+        shown.start()
+        p = shown.plan(case.1)
+        c.start()
+        s = c.decide(case.1)
+        testing.assertEqual(s.started, case.2, case.0)
+        testing.assertEqual(p.starts.get_def("b", (-1, -1)).1, case.3, case.0)
+        if len(case.2) == 0:
+            testing.assertEqual(s.plan.starts.get_def("b", (-1, -1)).1, case.3, case.0)
+            testing.assertEqual(c.decide(case.3).started, ["b"], case.0)
+
+
+def _test_a_success_after_a_failure_keeps_its_time_through_a_pause():
+    """a and b pack in a group with a min-separation of 1 h, one at a time,
+    in a window that never closes. a fails at 600, and an operator repairs
+    it: it reports succeeded at 2000, so b may start an hour after that, at
+    5600. The run stops and starts again at 4300, as a pause does. a is
+    then done without a release, at its success, and b still waits until
+    5600, in the run and in the plan."""
+    devs = [("a", 600, "w"), ("b", 600, "w")]
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["a", "b"]},
+                   priority={"a": 1, "b": 2}, separation={"g": (False, HOUR)})
+    testing.assertEqual(c.decide(0).started, ["a"])
+    c.report("a", "failed", 600)
+    testing.assertEqual(c.decide(600).started, [])
+    c.report("a", "succeeded", 2000)
+    testing.assertEqual(c.gate(c.known("b")), 5600)
+    c.stop()
+    c.start()
+    testing.assertEqual((c.done_time_of("a"), c.gate(c.known("b"))), (2000, 5600))
+    s = c.decide(4300)
+    testing.assertEqual((s.started, s.plan.starts.get("b")), ([], (0, 5600)))
+    testing.assertEqual(c.decide(5600).started, ["b"])
+
+
+def _test_a_member_forgotten_after_its_upgrade_keeps_its_min_separation():
+    """r1 and r2 pack in group g with a min-separation of 1 h, one at a
+    time, in a window that never closes. r1 upgrades from 0 to 600 and
+    succeeds. Then drop() forgets r1. With a new attempt, its device reads
+    again and answers up-to-date: r1 is done at 600, the end of its
+    upgrade, and r2 may start an hour after that. Also when the drop comes
+    before a step counts the success. When r1 leaves the campaign and
+    joins it again, its device answers with the succeeded that it keeps
+    for the attempt: r1 is done at that answer, and r2 may start an hour
+    after it. When its device then answers up-to-date at 800, r1 is done
+    at that answer. When r1 starts again at 650 with its new attempt, and
+    drop() forgets it once more before it reports, the end of that upgrade
+    is not known: when its device answers up-to-date at 800, r1 is done at
+    that answer. So it is when r1 answers upgrade-needed at 650, or answers
+    succeeded, loses its status and then answers up-to-date: such an answer
+    says that the device was not done at 600."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    wins = [("w", 0, fleet_ctl.OPEN_END)]
+    # (case, whether a step counts r1's success before the drop, whether r1
+    # leaves and joins again, when r1 starts again after the drop and has
+    # one more new attempt then, or -1, r1's answers after the drops and
+    # when each comes, r1's done time and r2's gate after the last)
+    cases: list[(str, bool, bool, int, list[(?str, int)], (int, int))] = [
+        ("new attempt", True, False, -1, [("up-to-date", 650)], (600, 600 + HOUR)),
+        ("new attempt before the step", False, False, -1, [("up-to-date", 650)],
+         (600, 600 + HOUR)),
+        ("left and joined again", True, True, -1, [("succeeded", 700)], (700, 700 + HOUR)),
+        ("left and joined again, then up to date", True, True, -1,
+         [("succeeded", 700), ("up-to-date", 800)], (800, 800 + HOUR)),
+        ("new attempt in its next upgrade", True, False, 650, [("up-to-date", 800)],
+         (800, 800 + HOUR)),
+        ("new attempt, upgrade-needed, then up to date", True, False, -1,
+         [("upgrade-needed", 650), ("up-to-date", 800)], (800, 800 + HOUR)),
+        ("left and joined again, status lost, then up to date", True, True, -1,
+         [("succeeded", 700), (None, 750), ("up-to-date", 800)], (800, 800 + HOUR)),
+    ]
+    for case in cases:
+        label = case.0
+        c = controller(wins, devs, 1, 1, groups={"g": ["r1", "r2"]},
+                       priority={"r1": 1, "r2": 2}, separation={"g": (False, HOUR)})
+        testing.assertEqual(c.decide(0).started, ["r1"], label)
+        c.report("r1", "succeeded", 600)
+        if case.1:
+            testing.assertEqual(c.decide(600).started, [], label)
+        if case.2:
+            gone = without(devs, ["r1"])
+            c.configure(wins, gone, c.target, c.maxc, c.must_place, c.debounce, c.estimate_s,
+                        c.groups, c.priority, c.separation, c.close_margin, c.stagger,
+                        c.prepare, c.prepare_est, c.failure_budget, c.hold_failed)
+            c.drop({"r1"})
+            c.configure(wins, devs, c.target, c.maxc, c.must_place, c.debounce, c.estimate_s,
+                        c.groups, c.priority, c.separation, c.close_margin, c.stagger,
+                        c.prepare, c.prepare_est, c.failure_budget, c.hold_failed)
+        else:
+            c.drop({"r1"})
+        if case.3 >= 0:
+            c.report("r1", "upgrade-needed", case.3)
+            testing.assertEqual(c.decide(case.3).started, ["r1"], label)
+            c.drop({"r1"})
+        last = 0
+        for a in case.4:
+            c.report("r1", a.0, a.1)
+            last = a.1
+        testing.assertEqual((c.done_time_of("r1"), c.gate(c.known("r2"))), case.5, label)
+        s = c.decide(last)
+        testing.assertEqual((s.started, s.plan.starts.get("r2")), ([], (0, case.5.1)), label)
+        testing.assertEqual(c.decide(case.5.1).started, ["r2"], label)
+
+
 def _test_a_min_separation_past_the_deadline_alarms():
     """A min-separation of 1 h puts r2 after the window that the deadline
     ends: the plan says r2 cannot start before the deadline."""
@@ -2501,23 +2742,40 @@ def _test_a_spread_partner_keeps_the_place_of_the_member_in_a_new_configuration(
     testing.assertEqual(s.plan.starts, {"P": (0, 600), "Q": (0, 900), "m": (1, DAY)})
 
 
-def _test_a_spread_swap_that_breaks_a_promise_is_undone():
-    """r2 and s2 report that they are up to date before they start, so
-    each one is done as soon as it starts. Moved to the second window,
-    each would give its place in the first window to a device of 10 min,
-    and devices promised the first window would miss it. The plan keeps
-    r2 and s2 in the first window."""
-    devs = [("r1", 600, "day"), ("r2", 600, "day"), ("s1", 600, "day"), ("s2", 600, "day")] \
-           + devices("d", 9, 600, "day")
-    c = controller(daily("day", 0, HOUR, 3), devs, 1, 1,
-                   groups={"g": ["r1", "r2"], "h": ["s1", "s2"]},
-                   priority={"r1": 1, "r2": 2, "s1": 1, "s2": 2},
-                   separation={"g": (True, 0), "h": (True, 0)})
-    c.report("r2", "up-to-date", 0)
-    c.report("s2", "up-to-date", 0)
-    p = c.plan(0)
-    testing.assertEqual(p.alarms, [])
-    testing.assertEqual((p.starts["r2"].0, p.starts["s2"].0), (0, 0))
+def _test_a_spread_group_spreads_the_members_that_upgrade():
+    """r1, r2 and r3 spread, then 97 devices in no group, all of 10 min, in
+    a 1 h window every day, 10 at once. The run uses the first three
+    windows. The member up to date before the run is done at once, in no
+    window, and the two others spread as a pair: in the first and the
+    last window. The same occurs when r2 succeeded or failed before the
+    run, in an earlier run or before a pause: r3 goes in the last window,
+    after r1 and after the report of r2. With none up to date, the three
+    take the three windows."""
+    devs = [("r1", 600, "day"), ("r2", 600, "day"), ("r3", 600, "day")] \
+           + devices("d", 97, 600, "day")
+    # (the member done before the run, or "" for none, its final status,
+    # the window of each other member)
+    cases: list[(str, str, dict[str, int])] = [
+        ("", "", {"r1": 0, "r2": 1, "r3": 2}),
+        ("r1", "up-to-date", {"r2": 0, "r3": 2}),
+        ("r2", "up-to-date", {"r1": 0, "r3": 2}),
+        ("r3", "up-to-date", {"r1": 0, "r2": 2}),
+        ("r2", "succeeded", {"r1": 0, "r3": 2}),
+        ("r2", "failed", {"r1": 0, "r3": 2}),
+    ]
+    for case in cases:
+        label = "{case.0} {case.1}"
+        c = controller(daily("day", 0, HOUR, 9), devs, 10, 10, debounce=1,
+                       groups={"g": ["r1", "r2", "r3"]}, priority={"r1": 1, "r2": 2, "r3": 3},
+                       separation={"g": (True, 0)})
+        if case.0 != "":
+            c.report(case.0, case.1, 0)
+        p = c.plan(0)
+        testing.assertEqual({n: s.0 for n, s in p.starts.items() if n.startswith("r")}, case.2,
+                            label)
+        testing.assertEqual(p.alarms, [], label)
+        sim.drive(c, 0, {}, 30 * DAY)
+        testing.assertEqual(sim.started(c), sim.planned(c, p), label)
 
 
 def _test_a_spread_member_needs_a_device_in_no_group_to_swap_with():
@@ -2693,22 +2951,22 @@ def _test_answers_keep_the_campaign_order():
 def _test_answers_before_release():
     """x and y pack, x first, one at a time, in a window that opens at
     1000. x reports before the window opens. A final status answers: x is
-    released at the opening, and done at the next step with no upgrade,
-    so the pace stays. A failure then holds y. in-progress says that x
-    still upgrades from before the run: x is in flight from its report,
-    and y waits for it. unknown is no answer: x is held, and y behind
-    it."""
+    done at once, without a release and with no upgrade, so the pace
+    stays. Up to date, x lets y start at the opening; failed, x holds y.
+    in-progress says that x still upgrades from before the run: x is in
+    flight from its report, and y waits for it. unknown is no answer: x is
+    held, and y behind it."""
     not_answered = ["1 device(s) have not answered the campaign's target: x",
                     "1 device(s) wait behind a redundancy group member that has not answered: y"]
     # (x's report, the devices that start at 1000, the devices that start
     # at the next step, the alarms then, whether x is done, whether it
-    # failed)
-    cases: list[(str, list[str], list[str], list[str], bool, bool)] = [
-        ("failed", ["x"], [],
-         ["1 device(s) wait behind a failed redundancy group member: y"], True, True),
-        ("up-to-date", ["x"], ["y"], [], True, False),
-        ("in-progress", [], [], [], False, False),
-        ("unknown", [], [], not_answered, False, False),
+    # failed, whether it is released)
+    cases: list[(str, list[str], list[str], list[str], bool, bool, bool)] = [
+        ("failed", [], [],
+         ["1 device(s) wait behind a failed redundancy group member: y"], True, True, False),
+        ("up-to-date", ["y"], [], [], True, False, False),
+        ("in-progress", [], [], [], False, False, True),
+        ("unknown", [], [], not_answered, False, False, False),
     ]
     for case in cases:
         c = controller([("w", 1000, fleet_ctl.OPEN_END)], [("x", 600, "w"), ("y", 600, "w")], 1,
@@ -2718,10 +2976,10 @@ def _test_answers_before_release():
         s = c.decide(1001)
         testing.assertEqual(s.started, case.2, case.0)
         testing.assertEqual(s.plan.alarms, case.3, case.0)
-        testing.assertEqual("x" in c.done_times(), case.4, case.0)
+        testing.assertEqual(c.is_done("x"), case.4, case.0)
         testing.assertEqual("x" in c.failed_devices(), case.5, case.0)
         testing.assertEqual(c.observed_s, 600, case.0)
-        testing.assertEqual("x" in c.released_devices(), case.0 != "unknown", case.0)
+        testing.assertEqual(c.is_released("x"), case.6, case.0)
 
 
 def _test_a_device_still_upgrading_holds_its_slot():
@@ -2816,6 +3074,115 @@ def _test_a_lost_answer_holds_the_device_again():
     testing.assertEqual(list(p.held.keys()), ["d0"])
 
 
+def _test_a_final_status_that_goes_makes_the_member_wait_again():
+    """d0 reports up-to-date before the run, so it is done at once, and d1
+    starts, one at a time, in a window that never closes. At 100 d0
+    reports again. Another final status keeps it done. With no status, or
+    its status lost, it waits again, but has not answered, so the plan
+    holds it; a status that is not for the campaign's intent reaches the
+    controller as no status. Needing the upgrade, it waits again, and its
+    window comes after the promise that d2 got while d0 was done. In
+    progress, it still upgrades, and the run takes it in flight."""
+    # (case, d0's report at 100, or "lost" for lost(), whether d0 is done
+    # then, why the plan at 100 holds d0, or "" when it does not, where and
+    # when that plan starts d0, or (-1, -1), the devices that start when d1
+    # succeeds at 600)
+    cases: list[(str, ?str, bool, str, (int, int), list[str])] = [
+        ("succeeded", "succeeded", True, "", (-1, -1), ["d2"]),
+        ("no status", None, False, "not-answered", (-1, -1), ["d2"]),
+        ("lost", "lost", False, "not-answered", (-1, -1), ["d2"]),
+        ("needs the upgrade", "upgrade-needed", False, "", (0, 1200), ["d2"]),
+        ("in progress", "in-progress", False, "", (-1, -1), []),
+    ]
+    for case in cases:
+        c = open_window(3, 1, 1)
+        c.report("d0", "up-to-date", 0)
+        testing.assertEqual(c.decide(0).started, ["d1"], case.0)
+        if case.1 == "lost":
+            c.lost("d0")
+        else:
+            c.report("d0", case.1, 100)
+        s = c.decide(100)
+        testing.assertEqual(s.started, [], case.0)
+        testing.assertEqual(c.is_done("d0"), case.2, case.0)
+        testing.assertEqual(s.plan.why.get_def("d0", ("", "")).0, case.3, case.0)
+        testing.assertEqual(s.plan.starts.get_def("d0", (-1, -1)), case.4, case.0)
+        c.report("d1", "succeeded", 600)
+        testing.assertEqual(c.decide(600).started, case.5, case.0)
+
+
+def _test_members_done_in_an_earlier_run_are_not_placed_again():
+    """One at a time, in a window that never closes: d0 succeeds and d1
+    fails, and r waits behind d1 in their group. The run stops and starts
+    again, as a pause does. d0 and d1 are done at once, without a release,
+    and in no window. d1 still counts as failed: against the budget, and,
+    when the group holds on a failure, it holds r. Without a budget d2
+    starts, or r when the group goes on; over a budget of zero nothing
+    starts. A copy that starts a run, as a campaign in plan shows it,
+    plans the same as the run."""
+    devs = [("d0", 600, "w"), ("d1", 600, "w"), ("r", 600, "w"), ("d2", 600, "w")]
+    group = "1 device(s) wait behind a failed redundancy group member: r"
+    # (whether the group holds on a failure, the budget, or -1 for none,
+    # the devices that start when the run starts again, why each device is
+    # held, the alarms)
+    cases: list[(bool, int, list[str], dict[str, (str, str)], list[str])] = [
+        (True, -1, ["d2"], {"r": ("group-failed", "d1")}, [group]),
+        (True, 0, [], {"r": ("group-failed", "d1"), "d2": ("failure-budget", "")},
+         [budget_alarm(1, 0), group]),
+        (False, -1, ["r"], {}, []),
+        (False, 0, [], {"r": ("failure-budget", ""), "d2": ("failure-budget", "")},
+         [budget_alarm(1, 0)]),
+    ]
+    for full in cases:
+        case = (full.1, full.2, full.3, full.4)
+        label = "hold {full.0}, budget {case.0}"
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["d1", "r"]},
+                       priority={"d1": 1, "r": 2}, failure_budget=case.0,
+                       hold_failed=hold_all() if full.0 else set())
+        testing.assertEqual(c.decide(0).started, ["d0"], label)
+        c.report("d0", "succeeded", 600)
+        testing.assertEqual(c.decide(600).started, ["d1"], label)
+        c.report("d1", "failed", 1200)
+        c.stop()
+        shown = c.copy()
+        shown.start()
+        p = shown.plan(1300)
+        c.start()
+        s = c.decide(1300)
+        testing.assertEqual(s.started, case.1, label)
+        testing.assertEqual((s.plan.why, s.plan.alarms), (case.2, case.3), label)
+        testing.assertEqual((p.starts, p.why, p.alarms), (s.plan.starts, case.2, case.3), label)
+        testing.assertEqual(sorted([e.0 for w in c.layout(s.plan) for e in w.3]), ["d2", "r"],
+                            label)
+        testing.assertEqual([n for n in ["d0", "d1"] if c.is_released(n) or not c.is_done(n)],
+                            [], label)
+        testing.assertEqual((c.failures, c.failed_devices()), (1, {"d1"}), label)
+
+
+def _test_a_member_that_waits_again_keeps_the_order_of_the_promises():
+    """One at a time, in a window that closes late: the plan promises the
+    window to d0 to d3 in that order, and d0 starts. d1 reports up-to-date,
+    so it is done and gives up its promise, then needs the upgrade again.
+    Its new promise comes after the promises of d2 and d3, so they start
+    before it."""
+    devs = [("d0", 600, "w"), ("d1", 600, "w"), ("d2", 600, "w"), ("d3", 600, "w")]
+    c = controller([("w", 0, 10 * HOUR)], devs, 1, 1)
+    testing.assertEqual(c.decide(0).started, ["d0"])
+    c.report("d1", "up-to-date", 100)
+    testing.assertEqual(c.decide(100).started, [])
+    c.report("d1", "upgrade-needed", 200)
+    testing.assertEqual(c.decide(200).started, [])
+    # (who succeeds, and when, the device that starts then)
+    steps: list[(str, int, list[str])] = [
+        ("d0", 600, ["d2"]),
+        ("d2", 1200, ["d3"]),
+        ("d3", 1800, ["d1"]),
+    ]
+    for step in steps:
+        c.report(step.0, "succeeded", step.1)
+        testing.assertEqual(c.decide(step.1).started, step.2, "after {step.0}")
+
+
 def _test_lost_all_forgets_the_answers():
     """d0 is in flight when every status is lost. The plan holds the
     devices that wait, d1 and d2."""
@@ -2899,6 +3266,50 @@ def _test_the_plan_is_the_run_with_late_answers():
                                 "stagger {stagger}: the run after {last.t}")
         else:
             testing.assertTrue(False, "stagger {stagger}: no decision after the last answer")
+
+
+def chains() -> (dict[str, list[str]], dict[str, int], dict[str, (bool, int)]):
+    """Two spread chains of three: d0, d1, d2 and d3, d4, d5, in that
+    order, with a min-separation of 10 min. Returns the groups, the
+    priorities and the separations."""
+    groups = {"a": ["d0", "d1", "d2"], "b": ["d3", "d4", "d5"]}
+    priority = {"d0": 1, "d1": 2, "d2": 3, "d3": 1, "d4": 2, "d5": 3}
+    return (groups, priority, {"a": (True, 600), "b": (True, 600)})
+
+
+def _test_the_plan_is_the_run_with_members_up_to_date():
+    """24 devices of 600 s in a 1 h window every day, two at a time and at
+    most four, d0 to d5 in two spread chains. d1, d3, d10 and d17 report
+    up-to-date before the run. Run on the expected durations, the first
+    plan is the run, staggered or not, and places none of the four. Then
+    d20 reports up-to-date at 1000, while it waits with a promise, needs
+    the upgrade again at 100000, and d13 reports failed at 2000, from an
+    earlier run: each decision decides as a new plan would."""
+    up = ["d1", "d3", "d10", "d17"]
+    groups, priority, separation = chains()
+    for stagger in [0, 100]:
+        label = "stagger {stagger}"
+        c = controller(daily("day", 0, HOUR, 9), devices("d", 24, 600, "day"), 2, 4, False, 1,
+                       groups=groups, priority=priority, separation=separation,
+                       stagger=stagger)
+        for name in up:
+            c.report(name, "up-to-date", 0)
+        p = c.plan(0)
+        testing.assertEqual([n for n in up if n in p.starts or n in p.held], [], label)
+        sim.drive(c, 0, {}, 30 * DAY)
+        testing.assertEqual(sim.started(c), sim.planned(c, p), label)
+        testing.assertEqual(c.done_count(), 24, label)
+
+        r = controller(daily("day", 0, HOUR, 9), devices("d", 24, 600, "day"), 2, 4, False, 1,
+                       groups=groups, priority=priority, separation=separation,
+                       stagger=stagger)
+        for name in up:
+            r.report(name, "up-to-date", 0)
+        same_as_a_new_plan(r, {}, 9 * DAY, statuses=[(1000, "d20", "up-to-date"),
+                                                      (2000, "d13", "failed"),
+                                                      (100000, "d20", "upgrade-needed")])
+        testing.assertEqual((r.done_count(), r.is_released("d20"), r.failed_devices()),
+                            (24, True, {"d13"}), label)
 
 
 #############################################################################
@@ -3486,14 +3897,14 @@ def _test_a_member_that_leaves_no_longer_counts():
 
 
 def _test_the_quiet_time_ends_when_the_budget_holds_or_frees_the_starts():
-    """d1 answered up-to-date before the run, and d0 starts, one at a time:
-    the decision is quiet until d0 is due. A new count of failures ends
-    the quiet time when more members have failed than the budget before
-    it or after it: when d1 reports a failure over the budget, and when d1
-    reports up-to-date after that failure. A new budget ends the quiet
-    time too; the same budget again does not. The next decision then plans
-    as a new plan would: over the budget, it holds d1 and d2 and says
-    why."""
+    """d1 answered up-to-date before the run, so it is done, and d0 starts,
+    one at a time: the decision is quiet until d0 is due. A new count of
+    failures ends the quiet time when more members have failed than the
+    budget before it or after it: when d1 reports a failure over the
+    budget, and when d1 reports up-to-date after that failure. A new
+    budget ends the quiet time too; the same budget again does not. The
+    next decision then plans as a new plan would: over the budget, it
+    holds d2 and says why."""
     # (the budget, or -1 for none, the event, whether the quiet time ends,
     # the alarms of the next decision)
     cases: list[(int, str, bool, list[str])] = [
@@ -3529,7 +3940,7 @@ def _test_the_quiet_time_ends_when_the_budget_holds_or_frees_the_starts():
         s = c.decide(2)
         held = sorted(list(s.plan.held.keys()))
         testing.assertEqual((s.started, s.plan.alarms), ([], case.3), label)
-        testing.assertEqual(held, ["d1", "d2"] if len(case.3) > 0 else [], label)
+        testing.assertEqual(held, ["d2"] if len(case.3) > 0 else [], label)
 
 
 def _test_the_alarm_follows_the_failures_over_the_budget():
@@ -3550,15 +3961,16 @@ def _test_the_alarm_follows_the_failures_over_the_budget():
 
 
 def _test_the_plan_before_a_run_shows_that_a_run_starts_nothing():
-    """Before a run, d1 reports failed, from an earlier run. A copy that
-    starts a run now, as a campaign in plan shows it, starts nothing at a
-    budget of zero: the plan holds every device and says why. At a budget
-    of one it starts all three."""
+    """Before a run, d1 reports failed, from an earlier run: it is done
+    without a release, and its failure counts. A copy that starts a run
+    now, as a campaign in plan shows it, starts nothing at a budget of
+    zero: the plan holds d0 and d2 and says why. At a budget of one it
+    starts both."""
     # (the budget, how many devices the plan starts, the held devices, the
     # alarms)
     cases: list[(int, int, list[str], list[str])] = [
-        (0, 0, ["d0", "d1", "d2"], [budget_alarm(1, 0)]),
-        (1, 3, [], []),
+        (0, 0, ["d0", "d2"], [budget_alarm(1, 0)]),
+        (1, 2, [], []),
     ]
     for case in cases:
         label = "budget {case.0}"
@@ -3576,8 +3988,9 @@ def _test_the_plan_before_a_run_shows_that_a_run_starts_nothing():
 def _test_a_pause_keeps_the_failures():
     """d0 starts and fails, more than the budget of zero. The run stops,
     and the count stays: a copy that starts a run, as a campaign in plan
-    shows it, starts nothing and says why. When the run starts again, it
-    starts nothing either, and holds every device."""
+    shows it, starts nothing and says why. When the run starts again, d0
+    is done at once, and still failed. The run starts nothing either, and
+    holds the other devices."""
     c = controller([("w", 0, fleet_ctl.OPEN_END)], devices("d", 3, 600, "w"), 1, 1,
                    failure_budget=0)
     testing.assertEqual(c.decide(0).started, ["d0"])
@@ -3594,7 +4007,8 @@ def _test_a_pause_keeps_the_failures():
     testing.assertEqual(c.failures, 1, "run again")
     s = c.decide(800)
     testing.assertEqual((s.started, s.plan.alarms), ([], [budget_alarm(1, 0)]), "run again")
-    testing.assertEqual(sorted(list(s.plan.held.keys())), ["d0", "d1", "d2"], "run again")
+    testing.assertEqual(sorted(list(s.plan.held.keys())), ["d1", "d2"], "run again")
+    testing.assertEqual((c.is_done("d0"), c.failed_devices()), (True, {"d0"}), "run again")
 
 
 def _test_releases_go_on_when_the_failures_fit_the_budget_again():
@@ -3987,7 +4401,8 @@ def _test_why_each_device_is_held():
     first; d1 is in g3 with z, which is not in the campaign; d0 is in no
     group. r1 starts at 0 and reports at 600. Each held device has the
     first reason that applies to it, its own first, and the device that
-    holds it when another one does."""
+    holds it when another one does. A waiting device that reports a
+    failure is done, and not held."""
     devs = [("r1", 600, "w"), ("r2", 600, "w"), ("r3", 600, "w"), ("d0", 600, "w"),
             ("d1", 600, "w")]
     groups = {"g1": ["r1", "r2"], "g2": ["r2", "r3"], "g3": ["d1", "z"]}
@@ -4022,8 +4437,7 @@ def _test_why_each_device_is_held():
          {"r2": ("group-failed", "r1"), "r3": ("group-failed", "r1"), "d0": fb,
           "d1": ("group-down", "z")}),
         ("over the budget by d0, r2 not answered", 0, "succeeded", [], ["r2"], ["d0"],
-         {"r2": ("not-answered", ""), "r3": ("group-not-answered", "r2"), "d0": fb,
-          "d1": fb}),
+         {"r2": ("not-answered", ""), "r3": ("group-not-answered", "r2"), "d1": fb}),
     ]
     for case in cases:
         c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups=groups,

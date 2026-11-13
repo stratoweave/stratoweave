@@ -637,6 +637,19 @@
   `state/up-to-date` counts the members that answered `up-to-date`, as they
   already ran the target release when they read it; `succeeded` still
   counts them too. [#816]
+- A campaign member whose status is final while it waits is done at once,
+  without a release: a member that is up to date, or one that succeeded or
+  failed before a pause. It takes no window and no slot, and adds nothing to
+  the pace or the ramp. The next member of its redundancy groups waits the
+  group's `min-separation` from the answer of a member that is up to date,
+  or, when that member upgraded in the run before it got a new attempt or
+  joined again, from the end of that upgrade. After one that upgraded before
+  a pause it waits the `min-separation` from that member's report. A failed
+  one still counts against the failure budget and holds its groups as their
+  `failure-policy` says. The plan shows it in no window, and the
+  campaign page counts it as already done. It waits again when its final
+  status goes. Before, it waited for a window of its schedule and held a
+  slot there until the next decision. [#830]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -1148,6 +1161,7 @@ next. Give it a spin. We’d love to hear what you think.
 [#822]: https://github.com/stratoweave/stratoweave/pull/822
 [#823]: https://github.com/stratoweave/stratoweave/pull/823
 [#825]: https://github.com/stratoweave/stratoweave/pull/825
+[#830]: https://github.com/stratoweave/stratoweave/pull/830
 [#832]: https://github.com/stratoweave/stratoweave/pull/832
 [#833]: https://github.com/stratoweave/stratoweave/pull/833
 [actmf#76]: https://github.com/stratoweave/actmf/pull/76
