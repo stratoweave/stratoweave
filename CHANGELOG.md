@@ -353,7 +353,7 @@
 - The software intent has a `retry`, 0 by default, and the state says which
   retry its status answers. A new retry is a new intent: the manager reads
   the device again, and runs a failed upgrade again when no veto holds the
-  install. A run under way finishes first.
+  install. A run under way finishes first. [#804]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -559,7 +559,7 @@
   campaign's veto back; a run past its install finishes and holds its slot
   until it ends. A status counts only for the member's retry, except
   `in-progress`; `device-status` shows the retry that it answers. A retried
-  member no longer counts against the failure budget.
+  member no longer counts against the failure budget. [#804]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
