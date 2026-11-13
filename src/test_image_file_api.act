@@ -30,6 +30,29 @@ def _files(method: str, reply: dict[str, ?value]) -> list[(str, int)]:
     return files
 
 
+def _folders(reply: dict[str, ?value]) -> list[str]:
+    """The name of each folder a GET reply lists."""
+    folders = []
+    listed = reply["folders"]
+    if isinstance(listed, list):
+        for entry in listed:
+            if isinstance(entry, dict):
+                name = entry.get("name")
+                if isinstance(name, str):
+                    folders.append(name)
+                    continue
+            raise ValueError("Not a folder: {entry}")
+    return folders
+
+
+# files: the name and size of each file that a GET or a file PUT answers
+# with. folders: the folders that a GET lists. error: a part of the error in
+# a 4xx reply. kind: what a move moved.
+def _step(method: str, path: str, status: int, body: bytes=b"", files: list[(str, int)]=[],
+          folders: list[str]=[], error: str="", kind: str=""):
+    return (method=method, path=path, body=body, status=status, files=files, folders=folders, error=error, kind=kind)
+
+
 actor _test_image_file_requests(t: testing.EnvT):
     """Each request, in order, gets its status and reply."""
     fc = file.FileCap(t.env.cap)
@@ -37,15 +60,31 @@ actor _test_image_file_requests(t: testing.EnvT):
     directory = fs.mktmpdir("test_image_file_api_")
     router = http_router.Router()
     swimgapi.install(router, swimgapi.ImageFileApi(swimg.ImageDir(fc, directory), logging.Logger(t.log_handler)))
-    # files: the name and size of each file a 200 reply lists. error: a part
-    # of the error in other replies.
-    steps: list[(method: str, path: str, body: bytes, status: int, files: list[(str, int)], error: str)] = [
-        (method="PUT", path="/image-file/.x", body=b"ab", status=400, files=[], error="Invalid image file name"),
-        (method="PUT", path="/image-file/a.bin", body=b"", status=400, files=[], error="no body"),
-        (method="PUT", path="/image-file/a.bin", body=b"\x00\xff\r\n", status=200, files=[("a.bin", 4)], error=""),
-        (method="GET", path="/image-file", body=b"", status=200, files=[("a.bin", 4)], error=""),
-        (method="DELETE", path="/image-file/a.bin", body=b"", status=204, files=[], error=""),
-        (method="DELETE", path="/image-file/a.bin", body=b"", status=404, files=[], error="No image file named a.bin"),
+    steps = [
+        _step("PUT", "/image-file/.x", 400, body=b"ab", error="Invalid image path"),
+        _step("PUT", "/image-file/a.bin", 400, error="no body"),
+        _step("PUT", "/image-file/a.bin", 200, body=b"\x00\xff\r\n", files=[("a.bin", 4)]),
+        _step("PUT", "/image-file/iosxe/17.18/c.bin", 200, body=b"cc", files=[("iosxe/17.18/c.bin", 2)]),
+        _step("PUT", "/image-folder/empty", 201),
+        _step("PUT", "/image-folder/empty", 200),
+        _step("PUT", "/image-folder/a.bin", 409, error="a.bin is a file"),
+        _step("GET", "/image-file", 200, files=[("a.bin", 4), ("iosxe/17.18/c.bin", 2)], folders=["empty", "iosxe", "iosxe/17.18"]),
+        _step("POST", "/image-move", 200, body=b'{"from": "a.bin", "to": "iosxe/a.bin"}', kind="file"),
+        _step("POST", "/image-move", 200, body=b'{"from": "iosxe", "to": "empty/iosxe"}', kind="folder"),
+        _step("POST", "/image-move", 200, body=b'{"from": "empty", "to": "empty"}', kind="folder"),
+        _step("POST", "/image-move", 404, body=b'{"from": "missing", "to": "x"}', error="No file or folder named missing"),
+        _step("POST", "/image-move", 400, body=b'{"from": "empty", "to": "empty/x"}', error="into itself"),
+        _step("POST", "/image-move", 400, body=b"a.bin", error="Send the move as JSON"),
+        _step("GET", "/image-file", 200, files=[("empty/iosxe/17.18/c.bin", 2), ("empty/iosxe/a.bin", 4)], folders=["empty", "empty/iosxe", "empty/iosxe/17.18"]),
+        _step("DELETE", "/image-file/empty", 400, error="is a folder"),
+        # Not the image folder itself
+        _step("DELETE", "/image-folder", 400, error="Invalid image path"),
+        _step("DELETE", "/image-folder/empty", 204),
+        _step("DELETE", "/image-folder/empty", 404, error="No image folder named empty"),
+        _step("GET", "/image-file", 200),
+        _step("PUT", "/image-file/a.bin", 200, body=b"a", files=[("a.bin", 1)]),
+        _step("DELETE", "/image-file/a.bin", 204),
+        _step("DELETE", "/image-file/a.bin", 404, error="No image file named a.bin"),
     ]
     var current = 0
 
@@ -66,10 +105,16 @@ actor _test_image_file_requests(t: testing.EnvT):
         step = steps[current]
         try:
             testing.assertEqual(status, step.status)
-            if status == 200:
-                testing.assertEqual(_files(step.method, json.decode(body)), step.files)
-            elif status != 204:
+            if status >= 400:
                 testing.assertIn(step.error, str(json.decode(body)["error"]))
+            elif step.method == "GET":
+                reply = json.decode(body)
+                testing.assertEqual(_files(step.method, reply), step.files)
+                testing.assertEqual(_folders(reply), step.folders)
+            elif step.method == "PUT" and step.path.startswith("/image-file/"):
+                testing.assertEqual(_files(step.method, json.decode(body)), step.files)
+            elif step.method == "POST":
+                testing.assertEqual(str(json.decode(body)["kind"]), step.kind)
         except Exception as e:
             _done(ValueError("{step.method} {step.path} returned {status}: {body}: {e}"))
             return

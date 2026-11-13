@@ -11,6 +11,7 @@
   import FileDrop from '#lib/core/ui/FileDrop.svelte';
   import { focusFirstError } from '#lib/core/ui/focus.ts';
   import TokenSelect from '#lib/core/ui/TokenSelect.svelte';
+  import { folderHref, joinPath } from '#lib/software/image-tree.ts';
   import {
     IMAGE_FILE_TYPES,
     OS_NAMES,
@@ -36,9 +37,11 @@
     typed?: TypedImage | null;
     /** Every image, for the name check and the suggestions. */
     images: CatalogImage[];
+    /** The folder the files go into; '' for the top. */
+    folder?: string;
   }
 
-  let { files, typed = null, images }: Props = $props();
+  let { files, typed = null, images, folder = '' }: Props = $props();
 
   type Upload =
     | { state: 'waiting' }
@@ -46,8 +49,10 @@
     | { state: 'adding' }
     | { state: 'failed'; reason: string };
 
+  // name is the file's name, which the image is listed by; file is where
+  // it goes, the folder and the name.
   interface Row extends CatalogImage {
-    file: File;
+    source: File;
     /** A model typed but not added yet. */
     draft: string;
     /** Where the row is once Upload is pressed. */
@@ -73,6 +78,8 @@
   // Where the operator asked to go while an upload runs.
   let leaveTo = $state<URL | null>(null);
   let leaving = false;
+  // The folder's page, where Cancel and a finished upload go.
+  const back = untrack(() => folderHref(folder));
 
   addFiles(untrack(() => files), untrack(() => typed));
 
@@ -132,9 +139,13 @@
       if (row.isDefault && (defaults.get(row.family.trim()) ?? 0) > 1) {
         e = { ...e, family: 'Another row is the default of this family.' };
       }
+      // The upload would replace the file of another image.
+      const owner = images.find((i) => i.file === row.file)?.name;
       const name = taken.has(row.name)
-        ? 'Already in the image list. Remove this row, or delete that image first.'
-        : imageFileError(row.file);
+        ? 'An image of this name is already in the image list. Remove this row, or delete that image first.'
+        : owner
+          ? `This is the file of the image ${owner}. Remove this row, or move or delete that image first.`
+          : imageFileError(row.source, folder);
       return withDraftError(name ? { ...e, name } : e, row.draft);
     });
   });
@@ -169,8 +180,9 @@
       if (names.has(file.name)) continue;
       names.add(file.name);
       const row: Row = {
-        file,
+        source: file,
         name: file.name,
+        file: joinPath(folder, file.name),
         models: [],
         draft: '',
         family: familyFromName(file.name),
@@ -198,6 +210,11 @@
     const next = removes[index] ?? removes[index - 1];
     if (next) next.focus();
     else drop?.focus();
+  }
+
+  /** Whether the image list has an image named name now. */
+  async function listed(name: string): Promise<boolean> {
+    return parseImages(await restconfGetOrNull<unknown>(IMAGES_ROOT)).some((i) => i.name === name);
   }
 
   // One file at a time: upload it, then add its entry. A row that is done
@@ -234,10 +251,18 @@
         const onSent = (sent: number) => {
           row.upload = { state: 'sending', sent };
         };
-        await uploadImageFile(row.name, row.file, onSent, controller.signal);
+        // An image of this name may have been added since the check above,
+        // and a PATCH would merge into it: then nothing is uploaded.
+        if (await listed(row.name)) throw new Error(`An image named ${row.name} is already in the image list.`);
+        await uploadImageFile(row.file, row.source, onSent, controller.signal);
         row.upload = { state: 'adding' };
+        const now = parseImages(await restconfGetOrNull<unknown>(IMAGES_ROOT));
+        if (now.some((i) => i.name === row.name)) {
+          throw new Error(`Uploaded, but an image named ${row.name} was added to the list meanwhile, so this one was not.`);
+        }
         const image = {
           name: row.name,
+          file: row.file,
           os: row.os.trim(),
           version: row.version.trim(),
           models: row.models,
@@ -246,9 +271,7 @@
         };
         // A default clears the family's current one in the same PATCH, as
         // the list is now: the upload may have taken a while.
-        const clear = image.isDefault
-          ? otherDefaults(image, parseImages(await restconfGetOrNull<unknown>(IMAGES_ROOT))).map((i) => i.name)
-          : [];
+        const clear = image.isDefault ? otherDefaults(image, now).map((i) => i.name) : [];
         await restconfPatchJson(DATA_ROOT, imageCreatePatch([image], clear));
         added.push(row.name);
         rows.splice(
@@ -265,7 +288,7 @@
     if (rows.length === 0) {
       leaveNotice(added.length === 1 ? `Uploaded image ${added[0]}.` : `Uploaded ${added.length} images.`);
       // Not a preload made before the write (hovering Cancel makes one).
-      await goto('/images', { refreshAll: true });
+      await goto(back, { refreshAll: true });
     } else {
       statusMessage = total === 1 ? 'The image was not added.' : `${rows.length} of ${total} images were not added.`;
     }
@@ -275,6 +298,7 @@
 <div class="page-header">
   <div>
     <h1>Add images</h1>
+    {#if folder}<p>Into the folder <span class="mono">{folder}</span>.</p>{/if}
   </div>
   <div class="page-actions">
     <FileDrop
@@ -286,7 +310,7 @@
       accept={IMAGE_FILE_TYPES}
     />
     <!-- While an upload runs, leaving asks first. -->
-    <a class="btn btn-secondary" href="/images">Cancel</a>
+    <a class="btn btn-secondary" href={back}>Cancel</a>
     <button
       class="btn btn-primary"
       type="button"
@@ -350,7 +374,7 @@
                 {:else if row.upload}
                   {@const u = row.upload}
                   {#if u.state === 'sending'}
-                    {@const done = percent(u.sent, row.file.size)}
+                    {@const done = percent(u.sent, row.source.size)}
                     <div
                       class="upload-bar"
                       role="progressbar"

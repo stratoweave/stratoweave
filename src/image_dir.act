@@ -1,17 +1,28 @@
 """The folder of software image files, set with the software.image_dir
-setting. A file is first written as .{name}.part, which the listing skips,
-and gets its name once all of it is written."""
+setting. Images can be kept in folders inside it: an image is named by its
+path, its folders and its file name joined by '/', such as
+iosxe/17.18/c8000v-universalk9.17.18.03a.SPA.bin. A file is first written
+as .{name}.part next to where it goes, which the listing skips, and gets its
+name once all of it is written."""
 
 import file
 
 
-# The name leaf of swyang.images has the same rule.
+# The file leaf of swyang.images has the same rules: each folder and file
+# name at most MAX_NAME characters, the whole path at most MAX_PATH.
 MAX_NAME = 200
+MAX_PATH = 400
 
 _NAME_CHARS = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._-")
 
 
+class Conflict(Exception):
+    """A file or folder is in the way of a change."""
+    pass
+
+
 def _valid_name(name: str) -> bool:
+    """Whether name can name a file or folder, one part of a path."""
     if name == "" or len(name) > MAX_NAME or name.startswith("."):
         return False
     for c in name:
@@ -20,46 +31,140 @@ def _valid_name(name: str) -> bool:
     return True
 
 
+def _valid_path(path: str) -> bool:
+    if path == "" or len(path) > MAX_PATH:
+        return False
+    for name in path.split("/"):
+        if not _valid_name(name):
+            return False
+    return True
+
+
 def check_name(name: str):
-    """Raise ValueError unless name can name an image file."""
-    if not _valid_name(name):
-        raise ValueError("Invalid image file name '{name}': use letters, digits, '.', '_' and '-', at most {MAX_NAME} characters, not starting with '.'")
+    """Raise ValueError unless name can name an image file or folder: its
+    path in the image folder."""
+    if not _valid_path(name):
+        raise ValueError("Invalid image path '{name}': name each folder and file with letters, digits, '.', '_' and '-', at most {MAX_NAME} characters, not starting with '.', and join them with '/', at most {MAX_PATH} characters in all")
+
+
+def _parent(name: str) -> str:
+    """The folder that name is in, '' for the image folder itself."""
+    i = name.rfind("/")
+    return name[:i] if i >= 0 else ""
+
+
+def _join(folder: str, name: str) -> str:
+    """The path of name in folder."""
+    return folder + "/" + name if folder != "" else name
+
+
+def _part_name(name: str) -> str:
+    """Where the file name is written first: .{file name}.part next to it."""
+    i = name.rfind("/")
+    return name[:i + 1] + "." + name[i + 1:] + ".part"
 
 
 actor ImageDir(cap: file.FileCap, path: str):
-    """Software image files in one folder. Changes go through this actor one
-    at a time."""
+    """Software image files in one folder and the folders inside it. Changes
+    go through this actor one at a time."""
     _fs = file.FS(cap)
     _wcap = file.WriteFileCap(cap)
 
     def _file(name: str) -> str:
-        return file.join_path([path, name])
+        return file.join_path([path, name]) if name != "" else path
 
-    def list() -> list[(name: str, size: int, modified: float)]:
-        """The regular files directly in the folder, by name. Hidden files and
-        subfolders are skipped. Raises OSError when the folder cannot be read."""
-        names: list[str] = []
+    def _own_kind(name: str) -> str:
+        """What name is, without looking at its folders: "file", "folder",
+        "other" or "" for nothing. A link to a file counts as the file; a
+        link to a folder is "other", so that nothing here follows it."""
+        # stat, unlike lstat, raises FileNotFoundError without a log line.
         try:
-            names = sorted(_fs.listdir(path))
-        except OSError as e:
-            raise OSError("Cannot read image folder {path}: {e}")
-        files = []
-        for name in names:
-            if name.startswith("."):
+            st = _fs.stat(_file(name))
+            if st.is_dir():
+                return "other" if _fs.lstat(_file(name)).is_symlink() else "folder"
+            return "file" if st.is_file() else "other"
+        except FileNotFoundError:
+            return ""
+
+    def _kind(name: str) -> str:
+        """What name is, as _own_kind. A file on its path means there is
+        nothing of that name, rather than an error."""
+        parts = name.split("/")
+        for i in range(1, len(parts)):
+            if _own_kind("/".join(parts[:i])) != "folder":
+                return ""
+        return _own_kind(name)
+
+    def _existing(name: str) -> str:
+        """What name is, as _kind. Raises ValueError for a bad name and
+        FileNotFoundError when there is nothing of that name."""
+        check_name(name)
+        kind = _kind(name)
+        if kind == "":
+            raise FileNotFoundError(_file(name))
+        return kind
+
+    def _make_folders(folder: str) -> bool:
+        """Make folder and the folders on its path that are missing, and say
+        whether there were any. Raises Conflict when a file is in the way."""
+        if folder == "":
+            return False
+        made = False
+        parts = folder.split("/")
+        for i in range(1, len(parts) + 1):
+            prefix = "/".join(parts[:i])
+            kind = _own_kind(prefix)
+            if kind == "":
+                await async _fs.mkdir(_file(prefix))
+                made = True
+            elif kind != "folder":
+                raise Conflict("{prefix} is a file, not a folder")
+        return made
+
+    def _walk(folder: str, files: dict[str, (name: str, size: int, modified: float)], folders: list[str]):
+        """Add the files and folders in folder, at any depth, to files and
+        folders. Raises OSError when folder cannot be read."""
+        for entry in _fs.listdir(_file(folder)):
+            rel = _join(folder, entry)
+            # Hidden ones, as the .part files, and names that check_name
+            # refuses, which could not be moved or removed here.
+            if not _valid_name(entry) or len(rel) > MAX_PATH:
                 continue
             try:
-                st = _fs.stat(_file(name))
-                if st.is_file():
-                    files.append((name=name, size=int(st.size), modified=st.mtime))
-            except FileNotFoundError:
-                # Removed since the listing.
+                st = _fs.stat(_file(rel))
+                if st.is_dir():
+                    if not _fs.lstat(_file(rel)).is_symlink():
+                        folders.append(rel)
+                        _walk(rel, files, folders)
+                elif st.is_file():
+                    files[rel] = (name=rel, size=int(st.size), modified=st.mtime)
+            except OSError:
+                # Removed since the listing, a link to nothing or a loop of
+                # links, or a folder that cannot be read, such as a
+                # root-owned lost+found, which shows empty.
                 pass
-        return files
+
+    def list() -> (files: list[(name: str, size: int, modified: float)], folders: list[str]):
+        """The regular files in the folder and in the folders inside it, and
+        those folders, each by its path, sorted. Hidden files and folders,
+        names that check_name refuses and links to folders are skipped.
+        Raises OSError when the folder cannot be read."""
+        files: dict[str, (name: str, size: int, modified: float)] = {}
+        folders: list[str] = []
+        try:
+            _walk("", files, folders)
+        except OSError as e:
+            raise OSError("Cannot read image folder {path}: {e}")
+        return (files=[files[name] for name in sorted(files.keys())], folders=sorted(folders))
 
     def save(name: str, data: bytes) -> (size: int, modified: float):
-        """Write data as the file name, replacing a file of that name."""
+        """Write data as the file name, replacing a file of that name. The
+        folders on its path are made as needed."""
         check_name(name)
-        part = file.join_path([path, "." + name + ".part"])
+        _make_folders(_parent(name))
+        if _own_kind(name) not in {"", "file"}:
+            raise Conflict("{name} is a folder, not a file")
+        part = _file(_part_name(name))
         f = file.WriteFile(_wcap, part)
         try:
             await async f.write(data)
@@ -72,8 +177,55 @@ actor ImageDir(cap: file.FileCap, path: str):
 
     def remove(name: str) -> None:
         """Remove the file name. Raises FileNotFoundError when there is none."""
+        if _existing(name) != "file":
+            raise ValueError("{name} is a folder, not a file")
+        await async _fs.remove(_file(name))
+
+    def make_folder(name: str) -> bool:
+        """Make the folder name and the folders on its path. False when it
+        was there already."""
         check_name(name)
-        target = _file(name)
-        # stat, unlike remove, raises FileNotFoundError without a log line.
-        await async _fs.stat(target)
-        await async _fs.remove(target)
+        return _make_folders(name)
+
+    # Not _fs.rmtree: it ignores errors, so a folder it could not remove
+    # would look removed.
+    def _remove_tree(name: str):
+        for entry in _fs.listdir(_file(name)):
+            rel = _join(name, entry)
+            if _fs.lstat(_file(rel)).is_dir():
+                _remove_tree(rel)
+            else:
+                await async _fs.remove(_file(rel))
+        await async _fs.rmdir(_file(name))
+
+    def remove_folder(name: str) -> None:
+        """Remove the folder name with everything in it. Raises
+        FileNotFoundError when there is none."""
+        if _existing(name) != "folder":
+            raise ValueError("{name} is a file, not a folder")
+        _remove_tree(name)
+
+    def move(src: str, dst: str) -> str:
+        """Move or rename the file or folder src to dst, making the folders
+        on dst's path as needed, and say which it was: "file" or "folder".
+        Moving to its own path does nothing. Nothing is replaced: something
+        at dst is a Conflict, unless it is src itself under another case of
+        its name."""
+        check_name(dst)
+        kind = _existing(src)
+        if kind == "other":
+            raise ValueError("{src} is neither a file nor a folder")
+        if src == dst:
+            return kind
+        if kind == "folder" and (dst + "/").startswith(src + "/"):
+            raise ValueError("Cannot move the folder {src} into itself")
+        _make_folders(_parent(dst))
+        if _own_kind(dst) != "":
+            # On a file system that ignores case, dst can be src itself. A
+            # hard link to src is another name for its file, and is in the way.
+            a = _fs.lstat(_file(src))
+            b = _fs.lstat(_file(dst))
+            if src.lower() != dst.lower() or a.dev != b.dev or a.ino != b.ino:
+                raise Conflict("{dst} already exists")
+        await async _fs.rename(_file(src), _file(dst))
+        return kind

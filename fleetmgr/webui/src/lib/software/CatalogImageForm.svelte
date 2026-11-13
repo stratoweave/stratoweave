@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
 
   import { errorText } from '#lib/core/errors.ts';
+  import { nameError, pathError } from '#lib/core/image-file.ts';
   import { leaveNotice } from '#lib/core/notice.ts';
   import {
     getListEntryPath,
@@ -17,6 +18,7 @@
   import { focusFirstError } from '#lib/core/ui/focus.ts';
   import TokenSelect from '#lib/core/ui/TokenSelect.svelte';
   import { deleteImage } from '#lib/software/delete-image.ts';
+  import { baseName, folderHref, joinPath, parentOf } from '#lib/software/image-tree.ts';
   import {
     IMAGE_FILE_TYPES,
     OS_NAMES,
@@ -52,15 +54,24 @@
     /** Given, a new image can also come from dropped or chosen files.
      * `typed` is what this form held, for the file of the same name. */
     onfiles?: (files: File[], typed: TypedImage | null) => void;
+    /** The folder a new image's file goes into; '' for the top. */
+    folder?: string;
+    /** For a new image, a file already in the image folder: the image gets
+     * it, and starts with its file name as its name. */
+    file?: string;
   }
 
-  let { image, images, onfiles }: Props = $props();
+  let { image, images, onfiles, folder = '', file = '' }: Props = $props();
 
   const uid = $props.id();
   const isNew = untrack(() => image === null);
   const stored = untrack(() => image?.name ?? null);
+  // The file a new image already has; '' when its name places it.
+  const given = untrack(() => (image ? image.file : file));
+  // Where Cancel and a delete go back to: the folder of the image's file.
+  const back = untrack(() => folderHref(given ? parentOf(given) : folder));
 
-  let name = $state(untrack(() => image?.name ?? ''));
+  let name = $state(untrack(() => image?.name ?? baseName(file)));
   let os = $state(untrack(() => image?.os ?? ''));
   let version = $state(untrack(() => image?.version ?? ''));
   let models = $state<string[]>(untrack(() => [...(image?.models ?? [])]));
@@ -87,9 +98,11 @@
   let osOptions = $derived([...new Set([...OS_NAMES, ...images.map((i) => i.os)])]);
   let familyOptions = $derived([...new Set(images.map((i) => i.family).filter((f) => f))]);
 
-  // What is typed, as it would be saved.
+  // What is typed, as it would be saved. A new image's file is the one it
+  // was given, or else its name in the folder it is added in.
   let current = $derived<CatalogImage>({
     name: stored ?? name.trim(),
+    file: given || (name.trim() ? joinPath(folder, name.trim()) : ''),
     os: os.trim(),
     version: version.trim(),
     models,
@@ -97,7 +110,11 @@
     isDefault
   });
   let taken = $derived(new Set([...images.map((i) => i.name), ...lateNames]));
-  let errors = $derived(withDraftError(imageErrors(current, isNew ? taken : null), modelDraft));
+  let errors = $derived.by(() => {
+    const e = imageErrors(current, isNew ? taken : null);
+    const bad = isNew && !e.name && current.name ? nameError(current.name) || pathError(current.file) : '';
+    return withDraftError(bad ? { ...e, name: bad } : e, modelDraft);
+  });
   let shown = $derived(touched ? errors : ({} as ImageErrors));
   let modelsMeta = $derived(shown.models ?? (modelDraft.trim() ? 'Press Enter to add it.' : ''));
   let previous = $derived(previousImage(current, images));
@@ -121,6 +138,9 @@
     if (!versionTyped) version = versionFromName(next.trim());
     if (!familyTyped) family = familyFromName(next.trim());
   }
+
+  // A file handed over fills in what its name carries.
+  if (isNew && untrack(() => file)) setName(baseName(untrack(() => file)));
 
   // Files take this page over, one row each. What is typed here goes to the
   // row of the same name; with no such row it would be lost, so ask first.
@@ -171,8 +191,9 @@
         );
       }
       leaveNotice(stored === null ? `Added image ${saved.name}.` : `Saved image ${saved.name}.`);
-      // Not a preload made before the write (hovering Cancel makes one).
-      await goto('/images', { refreshAll: true });
+      // To the folder of its file. Not a preload made before the write
+      // (hovering Cancel makes one).
+      await goto(folderHref(parentOf(saved.file)), { refreshAll: true });
     } catch (saveError) {
       statusMessage = errorText(saveError, 'Failed to save the image.');
     } finally {
@@ -186,9 +207,9 @@
     try {
       deleting = true;
       statusMessage = '';
-      await deleteImage(stored);
+      await deleteImage({ name: stored, file: given });
       leaveNotice(`Deleted image ${stored}.`);
-      await goto('/images', { refreshAll: true });
+      await goto(back, { refreshAll: true });
     } catch (deleteError) {
       statusMessage = errorText(deleteError, 'Failed to delete the image.');
     } finally {
@@ -215,7 +236,7 @@
     {#if isNew && onfiles}
       <FileDrop onfiles={takeFiles} disabled={saving} accept={IMAGE_FILE_TYPES} />
     {/if}
-    <a class="btn btn-secondary" href="/images">Cancel</a>
+    <a class="btn btn-secondary" href={back}>Cancel</a>
     <button class="btn btn-primary" type="button" disabled={saving || deleting} onclick={save}>
       {saving ? 'Saving…' : isNew ? 'Add image' : 'Save'}
     </button>
@@ -234,6 +255,7 @@
     error={shown.name}
     mono={true}
     disabled={!isNew}
+    help={current.file && current.file !== current.name ? `Its file: ${current.file}` : ''}
     placeholder="e.g. c1100-universalk9.17.18.03a.SPA.bin"
     onchange={setName}
     ontouch={() => (touched = true)}

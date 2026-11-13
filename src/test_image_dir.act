@@ -18,12 +18,22 @@ def _check_list(fc: file.FileCap):
         _write(fc, directory + "/a.bin", b"a")
         _write(fc, directory + "/.a.bin.part", b"partial")
         await async fs.mkdir(directory + "/sub")
-        _write(fc, directory + "/sub/x.bin", b"x")
-        files = image_dir.ImageDir(fc, directory).list()
-        testing.assertEqual([f.name for f in files], ["a.bin", "b.bin"])
-        testing.assertEqual([f.size for f in files], [1, 2])
+        _write(fc, directory + "/sub/x.bin", b"xxx")
+        _write(fc, directory + "/sub/.x.bin.part", b"partial")
+        await async fs.mkdir(directory + "/sub/empty")
+        await async fs.mkdir(directory + "/.hidden")
+        _write(fc, directory + "/.hidden/h.bin", b"h")
+        # Names that check_name refuses, as copied in from the shell
+        _write(fc, directory + "/my image.bin", b"m")
+        await async fs.mkdir(directory + "/My Images")
+        _write(fc, directory + "/My Images/y.bin", b"y")
+        listing = image_dir.ImageDir(fc, directory).list()
+        files = listing.files
+        testing.assertEqual([f.name for f in files], ["a.bin", "b.bin", "sub/x.bin"])
+        testing.assertEqual([f.size for f in files], [1, 2, 3])
         for f in files:
             testing.assertTrue(f.modified > 0.0, "modified time of {f.name}")
+        testing.assertEqual(listing.folders, ["sub", "sub/empty"])
     finally:
         await async fs.rmtree(directory)
         await async fs.rmdir(directory)
@@ -33,7 +43,9 @@ def _check_empty_and_errors(fc: file.FileCap):
     fs = file.FS(fc)
     directory = fs.mktmpdir("test_image_dir_errors_")
     try:
-        testing.assertEqual(len(image_dir.ImageDir(fc, directory).list()), 0)
+        empty = image_dir.ImageDir(fc, directory).list()
+        testing.assertEqual(len(empty.files), 0)
+        testing.assertEqual(len(empty.folders), 0)
 
         # A missing folder, and a file where the folder should be
         _write(fc, directory + "/a.bin", b"a")
@@ -69,9 +81,11 @@ def _read(fc: file.FileCap, path: str) -> bytes:
 
 def _test_check_name():
     long_name = "x" * image_dir.MAX_NAME
-    for name in ["c8000v-universalk9.17.18.03a.SPA.bin", "a", "A_b-1.x", long_name]:
+    long_path = long_name + "/" + "y" * (image_dir.MAX_PATH - image_dir.MAX_NAME - 1)
+    for name in ["c8000v-universalk9.17.18.03a.SPA.bin", "a", "A_b-1.x", long_name, "a/b", "iosxe/17.18/c.bin", long_path]:
         image_dir.check_name(name)
-    for name in ["", ".x", "a/b", "..", "a b", "ä.bin", "a%2Fb", long_name + "x"]:
+    for name in ["", ".x", "..", "a b", "ä.bin", "a%2Fb", long_name + "x", "/a", "a/", "a//b", "a/../b",
+                 "a/.b", "a/" + long_name + "x", long_path + "z"]:
         try:
             image_dir.check_name(name)
         except ValueError:
@@ -105,6 +119,18 @@ def _check_save(fc: file.FileCap):
             testing.error("Saved under a bad name")
         except ValueError:
             pass
+
+        # Into folders, made as needed and kept free of temporary files
+        testing.assertEqual(d.save("iosxe/17.18/c.bin", b"cc").size, 2)
+        testing.assertEqual(_read(fc, directory + "/iosxe/17.18/c.bin"), b"cc")
+        testing.assertEqual(fs.listdir(directory + "/iosxe/17.18"), ["c.bin"])
+        for name in ["a.bin/x.bin", "iosxe"]:
+            try:
+                await async d.save(name, b"x")
+                testing.error("Saved {name} over what is in its way")
+            except image_dir.Conflict:
+                pass
+
         nowhere = image_dir.ImageDir(fc, directory + "/missing")
         try:
             await async nowhere.save("a.bin", b"a")
@@ -134,6 +160,21 @@ def _check_remove(fc: file.FileCap):
             testing.error("Removed under a bad name")
         except ValueError:
             pass
+
+        # A file in a folder; a folder is not a file
+        await async d.save("f/b.bin", b"b")
+        try:
+            await async d.remove("f")
+            testing.error("Removed a folder as a file")
+        except ValueError:
+            pass
+        try:
+            await async d.remove("f/b.bin/c")
+            testing.error("Removed a file under a file without an error")
+        except FileNotFoundError:
+            pass
+        await async d.remove("f/b.bin")
+        testing.assertEqual(fs.listdir(directory + "/f"), [])
     finally:
         await async fs.rmtree(directory)
         await async fs.rmdir(directory)
@@ -146,4 +187,106 @@ actor _test_image_dir_save(t: testing.EnvT):
 
 actor _test_image_dir_remove(t: testing.EnvT):
     _check_remove(file.FileCap(t.env.cap))
+    t.success()
+
+
+def _check_folders(fc: file.FileCap):
+    fs = file.FS(fc)
+    directory = fs.mktmpdir("test_image_dir_folders_")
+    try:
+        d = image_dir.ImageDir(fc, directory)
+        testing.assertTrue(d.make_folder("a/b"))
+        testing.assertFalse(d.make_folder("a/b"))
+        testing.assertFalse(d.make_folder("a"))
+        await async d.save("a/b/x.bin", b"x")
+        await async d.save("a/y.bin", b"y")
+        await async d.save("top.bin", b"t")
+        for name in ["top.bin", "top.bin/c"]:
+            try:
+                await async d.make_folder(name)
+                testing.error("Made the folder {name} over a file")
+            except image_dir.Conflict:
+                pass
+        try:
+            await async d.make_folder("a/.b")
+            testing.error("Made a hidden folder")
+        except ValueError:
+            pass
+
+        try:
+            await async d.remove_folder("top.bin")
+            testing.error("Removed a file as a folder")
+        except ValueError:
+            pass
+        try:
+            await async d.remove_folder("missing")
+            testing.error("Removed a missing folder without an error")
+        except FileNotFoundError:
+            pass
+        await async d.remove_folder("a")
+        testing.assertEqual(fs.listdir(directory), ["top.bin"])
+        listing = d.list()
+        testing.assertEqual([f.name for f in listing.files], ["top.bin"])
+        testing.assertEqual(listing.folders, [])
+    finally:
+        await async fs.rmtree(directory)
+        await async fs.rmdir(directory)
+
+
+def _check_move(fc: file.FileCap):
+    fs = file.FS(fc)
+    directory = fs.mktmpdir("test_image_dir_move_")
+    try:
+        d = image_dir.ImageDir(fc, directory)
+        await async d.save("a.bin", b"a")
+        await async d.save("f/b.bin", b"b")
+        await async d.save("f/g/c.bin", b"c")
+
+        # A file into a new folder, and renamed in its folder
+        testing.assertEqual(d.move("a.bin", "new/a.bin"), "file")
+        testing.assertEqual(_read(fc, directory + "/new/a.bin"), b"a")
+        testing.assertEqual(d.move("new/a.bin", "new/a2.bin"), "file")
+        # A folder with what is in it
+        testing.assertEqual(d.move("f", "new/f"), "folder")
+        listing = d.list()
+        testing.assertEqual([f.name for f in listing.files], ["new/a2.bin", "new/f/b.bin", "new/f/g/c.bin"])
+        testing.assertEqual(listing.folders, ["new", "new/f", "new/f/g"])
+        # To its own path, which does nothing
+        testing.assertEqual(d.move("new/f", "new/f"), "folder")
+        testing.assertEqual(d.move("new/a2.bin", "new/a2.bin"), "file")
+        testing.assertEqual([f.name for f in d.list().files], ["new/a2.bin", "new/f/b.bin", "new/f/g/c.bin"])
+
+        await async d.save("other.bin", b"o")
+        refusals: list[(src: str, dst: str, why: str)] = [
+            (src="missing.bin", dst="x.bin", why="missing"),
+            (src="other.bin", dst="new/a2.bin", why="conflict"),
+            (src="other.bin", dst="new", why="conflict"),
+            (src="other.bin", dst="new/a2.bin/x.bin", why="conflict"),
+            (src="new/f", dst="new/f/g/f", why="value"),
+            (src="other.bin", dst="../other.bin", why="value"),
+        ]
+        for r in refusals:
+            try:
+                await async d.move(r.src, r.dst)
+                testing.error("Moved {r.src} to {r.dst}")
+            except FileNotFoundError:
+                testing.assertEqual(r.why, "missing", "{r.src} to {r.dst}")
+            except image_dir.Conflict:
+                testing.assertEqual(r.why, "conflict", "{r.src} to {r.dst}")
+            except ValueError:
+                testing.assertEqual(r.why, "value", "{r.src} to {r.dst}")
+        testing.assertEqual(_read(fc, directory + "/new/a2.bin"), b"a")
+        testing.assertEqual(_read(fc, directory + "/other.bin"), b"o")
+    finally:
+        await async fs.rmtree(directory)
+        await async fs.rmdir(directory)
+
+
+actor _test_image_dir_folders(t: testing.EnvT):
+    _check_folders(file.FileCap(t.env.cap))
+    t.success()
+
+
+actor _test_image_dir_move(t: testing.EnvT):
+    _check_move(file.FileCap(t.env.cap))
     t.success()

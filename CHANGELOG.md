@@ -354,6 +354,19 @@
   retry its status answers. A new retry is a new intent: the manager reads
   the device again, and runs a failed upgrade again when no veto holds the
   install. A run under way finishes first. [#804]
+- Images can be kept in folders inside the image folder. An image in
+  `/images/image` has a new `file` leaf, the path of its file there, such as
+  `iosxe/17.18/c8000v-universalk9.17.18.03a.SPA.bin`; without it the file is
+  the image's name, as before. A device's URL is `url-base` followed by the
+  file. Campaigns keep naming the image, so moving its file changes only the
+  `file` leaf, and the campaigns give their members the new URL. Members
+  that answered or finished keep their status, since the target release
+  stays the same. `GET /image-file` lists the files in every folder, by
+  path, and the folders under `folders`; `PUT /image-file/<path>` makes the
+  folders on the way. `PUT` and `DELETE /image-folder/<path>` make a folder
+  and remove one with everything in it, and `POST /image-move` with
+  `{"from": ..., "to": ...}` moves or renames a file or folder without
+  replacing anything.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -586,6 +599,14 @@
   OS, version and family filled in from IOS XE file names. An image can be
   made the default of its family, and the images page sets the image list's
   `url-base`. Deleting an image also deletes its file. [#709] [#742] [#743]
+- The web UI's images page browses the image folder like a file manager:
+  open folders, make them, upload into the one shown, and rename, move and
+  delete files and folders, from a row's menu, by dragging rows onto a
+  folder, or on several selected rows at once. A move changes the `file` of
+  the images it takes along and keeps their names, also for images that
+  campaigns install. An upload whose file name is already an image's name
+  fails before the file is sent. Search covers the folder shown and the
+  folders in it, and files that the image list lacks show, ready to add.
 - The web UI has a Config page that shows the top's configuration, the state
   its transforms publish, or both, as XML, JSON or AData. The Apply config
   page merges JSON or XML configuration into the running system with a

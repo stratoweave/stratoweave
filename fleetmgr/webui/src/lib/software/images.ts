@@ -4,6 +4,9 @@
 
 export interface CatalogImage {
   name: string;
+  /** Path of its file in the image folder, e.g. iosxe/17.18/x.bin: the
+   * entry's file leaf, or its name when it has none. */
+  file: string;
   os: string;
   models: string[];
   version: string;
