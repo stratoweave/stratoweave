@@ -304,8 +304,8 @@ class Plan(object):
     held the window promised to it, or else the first window of its
     schedule that has not closed, and the earliest time it could start
     there. why gives each device that is held, also one without a
-    window, its reason and its holder as Controller gives them, "" when
-    no other device holds it. alarms says which promises the run breaks
+    window, its reason and its holder as Controller gives them: a device,
+    the holder of a veto, or "" for neither. alarms says which promises the run breaks
     and which devices are held."""
     c: int
     starts: dict[str, (int, int)]
@@ -441,17 +441,25 @@ class Controller(object):
     group upgrade one at a time, lower priority first and equal priorities
     by name. A member may start when the member before it in each of its
     groups is done and the group's min-separation after that has passed,
-    and no other member of its groups is in flight, down or failed. A
-    member that may not start yet is looked at again when another member
+    and no other member of its groups is in flight or down, or failed in
+    a group that the failure holds. A member that may not start yet is looked at again when another member
     of its groups is done, reports a success after a failure, or comes
     back up, and when its min-separation has passed. A member that reports
     a success after a failure is done again at that report. A member that
-    failed or is down holds the other waiting members of its groups, and a
-    held member holds the members after it in its other groups.
+    is down holds the other waiting members of its groups, and a held
+    member holds the members after it in its other groups. A member that
+    failed holds the other waiting members of the groups that hold on a
+    failure, until an operator acts. In the other groups it holds no one
+    once it is done and up again, so the next member starts after the
+    group's min-separation; but a member whose rollback failed is in an
+    unknown state, and holds all its groups.
 
     A device is up until set_live() says that it is down. A waiting device
     that is down is held, in a redundancy group or not, and is looked at
-    again when it comes back up. A member that is down while it upgrades
+    again when it comes back up. Likewise a waiting device with a veto of
+    another holder than the campaign, as set_vetoed() says, is held until
+    the veto goes. A released device that gets such a veto before its run
+    starts, or that stops before its install, waits again. A member that is down while it upgrades
     holds no one and keeps its slot: the plan expects it back up when its
     upgrade ends. The plan gives an alarm for it while it is down after
     its expected end: its release and its expected duration after that.
@@ -485,14 +493,18 @@ class Controller(object):
     schedule that has not closed, and other devices can take that window.
 
     A held device has one reason, the first of these that applies to it,
-    and a holder: the device that holds it, when another device does.
-    When several hold it, the holder is one of them.
+    and a holder: the device that holds it, when another device does, or
+    the holder of the veto that holds it. When several hold it, the holder
+    is one of them.
 
     - down: it is down.
     - not-answered: it has not answered the campaign's target.
-    - group-failed: it waits behind a member that failed.
+    - vetoed: it has a veto of another holder than the campaign.
+    - group-failed: it waits behind a member that failed, in a group that
+      the failure holds.
     - group-down: it waits behind a member that is down.
     - group-not-answered: it waits behind a member that has not answered.
+    - group-vetoed: it waits behind a member that has such a veto.
     - failure-budget: more members have failed than the failure budget.
 
     A member has failed while its latest report is a failure. With a
@@ -610,6 +622,9 @@ class Controller(object):
     groups: dict[str, list[str]]
     priority: dict[str, int]
     separation: dict[str, (bool, int)]
+    # The groups whose members wait for an operator while a member is
+    # failed.
+    hold_failed: set[str]
     # Per campaign device: the member right before it in each of its
     # groups, with the group. Per device: its groups of two or more
     # members. Whether any group of two or more campaign devices spreads.
@@ -724,10 +739,17 @@ class Controller(object):
     # flight because it still upgraded from before the run.
     resumed: list[bool]
     # Per device number: whether it is done and its upgrade failed or
-    # rolled back, and whether it is known down; downs counts those.
+    # rolled back; whether its latest final report is a failed rollback,
+    # which only a later final report, a retry or a removal clears, also
+    # when the report is lost or a run starts; and whether it is known
+    # down; downs counts those.
     failed: list[bool]
+    rollback_failed: list[bool]
     down: list[bool]
     downs: int
+    # Per device number: the holder of a veto of another holder than the
+    # campaign that holds its install, or "".
+    vetoed: list[str]
     # Per device number: whether it is a released device that is not done
     # and has a final status: a step marks it done once its report counts.
     reported: list[bool]
@@ -815,6 +837,7 @@ class Controller(object):
         self.groups = {}
         self.priority = {}
         self.separation = {}
+        self.hold_failed = set()
         self.before = {}
         self.groups_of = {}
         self.spreads = False
@@ -868,6 +891,8 @@ class Controller(object):
         self.progress = []
         self.resumed = []
         self.failed = []
+        self.rollback_failed = []
+        self.vetoed = []
         self.down = []
         self.downs = 0
         self.reported = []
@@ -916,6 +941,8 @@ class Controller(object):
             self.progress.append(NO_TIME)
             self.resumed.append(False)
             self.failed.append(False)
+            self.rollback_failed.append(False)
+            self.vetoed.append("")
             self.down.append(False)
             self.reported.append(False)
             self.no_upgrade.append(False)
@@ -1006,7 +1033,8 @@ class Controller(object):
                   estimate_s: int, groups: dict[str, list[str]]={},
                   priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
                   close_margin: int=CLOSE_MARGIN, stagger: int=0, prepare: bool=False,
-                  prepare_est: dict[str, int]={}, failure_budget: int=-1) -> None:
+                  prepare_est: dict[str, int]={}, failure_budget: int=-1,
+                  hold_failed: ?set[str]=None) -> None:
         """Take the windows the schedules give, the devices as (name,
         estimated duration, schedule) in the order they start, the target
         and the max concurrency, whether every device must start in a
@@ -1016,8 +1044,9 @@ class Controller(object):
         min-separation in seconds, the close margin in percent of the slow
         time, the stagger in percent of the expected upgrade time, whether
         the members may prepare, each member's expected prepare time in
-        seconds, and the most members that may fail, below 0 for no
-        limit. A group without a separation packs with none. New limits
+        seconds, the most members that may fail, below 0 for no limit, and
+        the groups that hold on a failure, none when None. A group without
+        a separation packs with none. New limits
         start the concurrency over at the target, and the ramp at most at
         the target. New limits keep the last upgrade times, and the pace
         and the slow time are taken from them again. Prepare and the
@@ -1034,8 +1063,10 @@ class Controller(object):
         margin = imax(100, close_margin)
         st = imax(0, stagger)
         budget = imax(-1, failure_budget)
+        hold: set[str] = hold_failed if hold_failed is not None else set()
         same_groups = False
-        if groups == self.groups and priority == self.priority and separation == self.separation:
+        if groups == self.groups and priority == self.priority and separation == self.separation \
+           and hold == self.hold_failed:
             same_groups = True
         if windows == self.current and devices == self.devices and target == self.target \
            and m == self.maxc and must_place == self.must_place \
@@ -1072,6 +1103,7 @@ class Controller(object):
         self.groups = groups
         self.priority = priority
         self.separation = separation
+        self.hold_failed = hold
         self.target = target
         self.maxc = m
         self.must_place = must_place
@@ -1198,9 +1230,9 @@ class Controller(object):
                 return
 
     def take_back(self, k: int) -> None:
-        """The device with number k, which the run took in flight because it
-        reported in-progress, stopped before its install: it waits again,
-        as if it had not been released."""
+        """The released device with number k stopped before its install, or
+        has a veto of another holder and has not started its run: it waits
+        again, as if it had not been released."""
         self.resumed[k] = False
         self.released[k] = False
         self.released_at[k] = 0
@@ -1244,6 +1276,7 @@ class Controller(object):
             self.failing[k] = False
             self.resumed[k] = False
             self.failed[k] = False
+            self.rollback_failed[k] = False
             self.reported[k] = False
             self.no_upgrade[k] = False
             self.overdue.discard(k)
@@ -1412,17 +1445,19 @@ class Controller(object):
         self.devices_done = devices_done
         self.failures = failures
 
-    def report(self, name: str, status: ?str, at: int) -> None:
-        """Take the latest status of a device, which came at time at. A
-        final report after another final report keeps the time of the
-        first. A failed device that reports a success is done again at that
-        time, and no longer holds the other members of its groups. The
+    def report(self, name: str, status: ?str, at: int, rollback_failed: bool=False) -> None:
+        """Take the latest status of a device, which came at time at, and
+        whether a failed status ended in a failed rollback. A final report
+        after another final report keeps the time of the first. A failed
+        device that reports a success is done again at that time, and no
+        longer holds the other members of its groups. The
         device has answered the campaign's target while its latest status
         is an answer. A waiting device that reports in-progress during a
         run still upgrades from before the run, and the run takes it in
         flight (take_running). If it reports upgrade-needed before it is
         done, it stopped before its install, and it waits again
-        (take_back)."""
+        (take_back). So does a released device with a veto of another
+        holder that reports upgrade-needed."""
         k = self.known(name)
         if k < 0:
             if status is None or not (is_final(status) or is_answer(status)
@@ -1430,12 +1465,18 @@ class Controller(object):
                 # No state to keep.
                 return
             k = self.number(name)
-        self.report_n(k, status, at)
+        self.report_n(k, status, at, rollback_failed)
 
-    def report_n(self, k: int, status: ?str, at: int) -> None:
+    def report_n(self, k: int, status: ?str, at: int, rollback_failed: bool=False) -> None:
         """report() for the device with number k."""
         if status is not None and is_final(status):
             self.take_failing(k, is_failure(status))
+            stuck = rollback_failed and status == "failed"
+            if stuck != self.rollback_failed[k]:
+                self.rollback_failed[k] = stuck
+                self.quiet_until = 0
+                if not stuck:
+                    self.wake_members(k)
             if self.final_at[k] == NO_TIME:
                 self.final_at[k] = at
                 self.final_status[k] = status
@@ -1459,7 +1500,8 @@ class Controller(object):
                 self.progress[k] = at
         elif self.progress[k] != NO_TIME:
             self.progress[k] = NO_TIME
-        if status == "upgrade-needed" and self.resumed[k] and self.done_at[k] == NO_TIME:
+        if status == "upgrade-needed" and self.released[k] and self.done_at[k] == NO_TIME \
+           and (self.resumed[k] or self.vetoed[k] != ""):
             self.take_back(k)
         self.take_answer(k, is_answer(status))
         if status == "in-progress" and self.running and self.is_member(k) \
@@ -1597,15 +1639,50 @@ class Controller(object):
             return True
         return False
 
+    def set_vetoed(self, name: str, holder: str) -> bool:
+        """Take the holder of a veto of another holder than the campaign
+        that the device name has, or "" for none. A waiting device with
+        such a veto is held, and is looked at again when the veto goes. A
+        released device that has not started its run waits again: its
+        device does not install while the veto holds. Return True when the
+        campaign must decide."""
+        k = self.known(name)
+        if k < 0:
+            if holder == "":
+                return False
+            k = self.number(name)
+        if holder == self.vetoed[k]:
+            return False
+        self.vetoed[k] = holder
+        if holder == "":
+            if k in self.parked and self.gate(k) >= 0:
+                self.parked.discard(k)
+                self.look_again(k)
+        elif self.released[k] and self.done_at[k] == NO_TIME \
+             and self.final_at[k] == NO_TIME and self.progress[k] == NO_TIME:
+            self.take_back(k)
+        if self.is_member(k):
+            self.quiet_until = 0
+            return True
+        return False
+
     def separation_of(self, g: str) -> int:
         """The min-separation of group g: the time from when one member is
         done until the next may start."""
         return self.separation.get_def(g, (False, 0)).1
 
-    def holds(self, name: str) -> bool:
-        """True when the device name is in flight, down or failed."""
+    def failure_holds(self, k: int, g: str) -> bool:
+        """True when a failure of the device with number k holds the other
+        members of group g: g holds on a failure, or the rollback of the
+        device failed, which leaves it in an unknown state."""
+        return g in self.hold_failed or self.rollback_failed[k]
+
+    def holds(self, name: str, g: str) -> bool:
+        """True when the device name holds the other members of group g: it
+        is in flight or down, or it failed and its failure holds g."""
         k = self.known(name)
-        return k >= 0 and (self.flying[k] or self.down[k] or self.failed[k])
+        return k >= 0 and (self.flying[k] or self.down[k]
+                           or (self.failed[k] and self.failure_holds(k, g)))
 
     def done_time_of(self, name: str) -> int:
         """When the device name was done, or -1 when it is not."""
@@ -1617,12 +1694,13 @@ class Controller(object):
     def gate(self, k: int) -> int:
         """The time from which the waiting device with number k may start,
         or -1 while it must wait: while it has not answered the campaign's
-        target, while it is down, or while its redundancy groups hold it. A
-        group holds it while the member before it in the group is not
-        done, or another member of its groups is in flight, down or failed.
+        target, while it is down or vetoed, or while its redundancy groups
+        hold it. A group holds it while the member before it in the group is not
+        done, or another member of the group is in flight or down, or
+        failed and its failure holds the group.
         The time is when the member before it was done, and the group's
         min-separation after that."""
-        if not self.answered[k] or self.down[k]:
+        if not self.answered[k] or self.down[k] or self.vetoed[k] != "":
             return -1
         if not self.in_group(k):
             return 0
@@ -1636,7 +1714,7 @@ class Controller(object):
             at = imax(at, done + self.separation_of(b.1))
         for g in gs:
             for q in self.groups[g]:
-                if self.holds(q):
+                if self.holds(q, g):
                     return -1
         return at
 
@@ -1677,16 +1755,19 @@ class Controller(object):
         k = self.known(name)
         return name in self.est and not (k >= 0 and self.released[k])
 
-    def waiting_members(self, devs: list[str]) -> list[(str, str)]:
+    def waiting_members(self, devs: list[str], failures: bool=False) -> list[(str, str)]:
         """The waiting campaign devices that the devices devs hold, each
         as (device, holder), in the order of devs: each device of devs that
         waits itself, then the other waiting campaign devices of its
-        groups."""
+        groups. When failures is true, the devices devs failed, and a
+        device holds only the groups that its failure holds."""
         out: list[(str, str)] = []
         for x in devs:
             if self.is_waiting(x):
                 out.append((x, x))
             for g in self.groups_of.get_def(x, []):
+                if failures and not self.failure_holds(self.names.num[x], g):
+                    continue
                 for d in self.groups[g]:
                     if d != x and self.is_waiting(d):
                         out.append((d, x))
@@ -1694,14 +1775,15 @@ class Controller(object):
 
     def stuck(self) -> (list[(int, str, str)], set[int]):
         """The held devices, in the campaign's order, each as (number,
-        reason, holder), with "" as the holder when no other device holds
-        it; and the ones among them that wait for a device that failed or
+        reason, holder): the device that holds it, the holder of its veto,
+        or "" for neither; and the ones among them that wait for a device that failed or
         is down. A device held in its groups holds the members after it in
         its other groups, for the same reason and holder. A device that has
-        not answered holds only the members after it in its groups. A
-        failure report holds the other members at once, before a step marks
-        the device done. A member that is down while it upgrades holds no
-        one until it reports."""
+        not answered, or that has a veto of another holder, holds only the
+        members after it in its groups. A failure report holds the other
+        members of the groups that the failure holds at once, before a step
+        marks the device done. A member that is down while it upgrades holds
+        no one until it reports."""
         later: dict[str, list[str]] = {}
         for name, bs in self.before.items():
             if not self.released[self.names.num[name]]:
@@ -1717,12 +1799,16 @@ class Controller(object):
             if self.down[k] and (not self.flying[k] or self.reported[k]):
                 down.append(self.name_of(k))
         unanswered: list[(str, str)] = []
+        vetoed: list[(str, str)] = []
         for k in self.order_n:
             if not self.released[k] and not self.answered[k]:
                 unanswered.append((self.name_of(k), self.name_of(k)))
-        behind_failed = follow(self.waiting_members(failed), later)
+            elif not self.released[k] and self.vetoed[k] != "":
+                vetoed.append((self.name_of(k), self.name_of(k)))
+        behind_failed = follow(self.waiting_members(failed, True), later)
         behind_down = follow(self.waiting_members(down), later)
         behind_unanswered = follow(unanswered, later)
+        behind_vetoed = follow(vetoed, later)
         over = self.over_budget()
         out: list[(int, str, str)] = []
         park: set[int] = set()
@@ -1736,6 +1822,9 @@ class Controller(object):
                 reason = "down"
             elif not self.answered[k]:
                 reason = "not-answered"
+            elif self.vetoed[k] != "":
+                reason = "vetoed"
+                holder = self.vetoed[k]
             elif name in behind_failed:
                 reason = "group-failed"
                 holder = behind_failed[name]
@@ -1745,6 +1834,9 @@ class Controller(object):
             elif name in behind_unanswered:
                 reason = "group-not-answered"
                 holder = behind_unanswered[name]
+            elif name in behind_vetoed:
+                reason = "group-vetoed"
+                holder = behind_vetoed[name]
             elif over:
                 reason = "failure-budget"
             if reason != "":
@@ -2282,6 +2374,7 @@ class Controller(object):
         c.groups = self.groups
         c.priority = self.priority
         c.separation = self.separation
+        c.hold_failed = self.hold_failed
         c.before = self.before
         c.groups_of = self.groups_of
         c.spreads = self.spreads
@@ -2336,6 +2429,8 @@ class Controller(object):
         c.progress = self.progress.copy()
         c.resumed = self.resumed.copy()
         c.failed = self.failed.copy()
+        c.rollback_failed = self.rollback_failed.copy()
+        c.vetoed = self.vetoed.copy()
         c.down = self.down.copy()
         c.downs = self.downs
         c.reported = self.reported.copy()
@@ -2725,6 +2820,8 @@ class Controller(object):
             ("down", "are down"),
             ("group-down", "wait while a redundancy group member is down"),
             ("not-answered", "have not answered the campaign's target"),
+            ("vetoed", "are held by a veto of another holder"),
+            ("group-vetoed", "wait behind a redundancy group member that is held by a veto"),
             ("group-not-answered", "wait behind a redundancy group member that has not answered"),
         ]
         for r in texts:

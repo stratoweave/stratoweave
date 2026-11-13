@@ -129,6 +129,7 @@ Published under `stratoweave-rfs:device=<name>/software/state`:
 | `stage` | The step the run is in, or the step it ended in |
 | `reason` | Why the run failed or rolled back, why the release could not be read, or what held the install |
 | `precheck`, `postcheck` | `verdict` (`not-run`, `pass` or `fail`), `detail`, and `at`, the time of the verdict |
+| `veto[holder]` | The vetoes of the configuration, with their `reason`, so that a campaign sees the vetoes of other holders |
 | `job[prepare]` | The last prepare: `state` (`running`, `done` or `failed`), `release`, `started`, `ended` and, when it failed, `message`. While it runs, `message` says what the device does, as the adapter reports it, and an adapter that transfers the image sets `progress` in percent of `image-size` and `message` with the bytes |
 | `job[install]` | The install of the run, with the same leaves. While it runs, `message` says what the device does, for example `add: extract` or `waiting for the device to boot`. After the install, until the run commits or rolls back, it says when the commit window ends, for example `commit window ends 23:07 UTC` |
 

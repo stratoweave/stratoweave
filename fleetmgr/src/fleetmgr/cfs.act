@@ -331,26 +331,29 @@ class CampaignMembers(object):
     """The members of a campaign as its controller takes them: the
     devices as (name, estimated duration, schedule) by name, the schedules
     they are bound to, their redundancy groups, priorities and the groups'
-    separation, the campaign's estimated duration, and each member's
-    expected prepare time. When no member is bound to a schedule, every
-    member is in the synthetic schedule "default"."""
+    separation, the groups that hold on a failure, the campaign's
+    estimated duration, and each member's expected prepare time. When no
+    member is bound to a schedule, every member is in the synthetic
+    schedule "default"."""
     devices: list[(str, int, str)]
     referenced: list[str]
     groups: dict[str, list[str]]
     priority: dict[str, int]
     separation: dict[str, (bool, int)]
+    hold_failed: set[str]
     estimate: int
     prepare_est: dict[str, int]
 
     def __init__(self, devices: list[(str, int, str)], referenced: list[str],
                  groups: dict[str, list[str]], priority: dict[str, int],
-                 separation: dict[str, (bool, int)], estimate: int,
+                 separation: dict[str, (bool, int)], hold_failed: set[str], estimate: int,
                  prepare_est: dict[str, int]):
         self.devices = devices
         self.referenced = referenced
         self.groups = groups
         self.priority = priority
         self.separation = separation
+        self.hold_failed = hold_failed
         self.estimate = estimate
         self.prepare_est = prepare_est
 
@@ -400,13 +403,16 @@ def campaign_members(i: y_0.software__software__upgrade_campaign_entry,
         prepare_est[name] = device_prepare_estimate(dev)
 
     separation: dict[str, (bool, int)] = {}
+    hold_failed: set[str] = set()
     for g in groups.keys():
         policy = inventory.redundancy_groups.redundancy_group.get(g)
         if policy is not None:
             separation[g] = (policy.separation_policy == "spread", int(policy.min_separation))
+            if policy.failure_policy == "hold":
+                hold_failed.add(g)
         else:
             separation[g] = (True, 0)
-    return CampaignMembers(devices, referenced, groups, priority, separation,
+    return CampaignMembers(devices, referenced, groups, priority, separation, hold_failed,
                            estimated_duration(i, inventory), prepare_est)
 
 
@@ -437,9 +443,9 @@ def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_
     notification period, and never closes. The deadline cuts off the
     windows - the synthetic one included - and every device must start
     before it when the planner sees every window before it. So do the
-    campaign's allow-staging, each member's expected prepare time and the
+    campaign's allow-staging, each member's expected prepare time, the
     campaign's failure budget, in devices of the members the campaign has
-    now."""
+    now, and the redundancy groups that hold on a failure."""
     m = members if members is not None else campaign_members(i, inventory)
     deadline = 0
     dl = i.deadline
@@ -473,7 +479,7 @@ def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_
                   must_place, campaign_debounce_s(len(m.devices)), m.estimate, m.groups,
                   m.priority, m.separation, int(i.close_margin), int(i.stagger),
                   i.allow_staging, m.prepare_est,
-                  failure_budget_devices(i.failure_budget, len(m.devices)))
+                  failure_budget_devices(i.failure_budget, len(m.devices)), m.hold_failed)
 
 
 class RedundancyGroups(base.RedundancyGroups):
@@ -819,7 +825,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     The actor tells the controller which members are down: a member is
     down while its flotilla is not connected to it, or while the top is not
     connected to its flotilla. A connection that is not reported yet counts
-    as up. The actor publishes why the plan holds each held member.
+    as up. The actor also tells the controller which members have a veto
+    of another holder than the campaign, which holds their install, as
+    their devices report it. The actor publishes why the plan holds each
+    held member.
 
     The actor writes the intent of every member directly, in plan and in
     run, with the campaign's veto. So each member reads the release it runs
@@ -849,11 +858,12 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var members: list[str] = []
     var member_names: set[str] = set()
     # What each device reports: its software state, the campaign, the
-    # target release and the retry that its status is for, its prepare and
-    # install, and the version and model its platform has.
+    # target release and the retry that its status is for, the vetoes of its
+    # configuration, its prepare and install, and the version and model its
+    # platform has.
     var latest: dict[str, (status: ?str, upgrade_campaign: ?str, target_release: ?str,
                            retry: ?u64, version: ?str, model: ?str, stage: ?str,
-                           reason: ?str,
+                           reason: ?str, vetoes: list[(str, ?str)],
                            prepare: (state: ?str, release: ?str, started: ?str,
                                      ended: ?str, message: ?str, progress: ?u64),
                            install: (state: ?str, release: ?str, started: ?str,
@@ -987,6 +997,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 ds.retry = observed.retry
                 ds.stage = observed.stage
                 ds.reason = observed.reason
+                for v in observed.vetoes:
+                    ds.veto.create(v.0, reason=v.1)
                 ds.prepare.state = observed.prepare.state
                 ds.prepare.release = observed.prepare.release
                 ds.prepare.started = observed.prepare.started
@@ -1070,6 +1082,20 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             del connected[name]
         ctl.lost(name)
         ctl.report_prepare(name, None)
+        ctl.set_vetoed(name, "")
+
+    def foreign_veto(name: str) -> str:
+        """Return the holder of a veto of another holder than the campaign
+        that the device name reports, the first by name, or "" for
+        none."""
+        observed = latest.get(name)
+        current = campaign
+        if observed is not None and current is not None:
+            own = veto_holder(current.name)
+            for v in observed.vetoes:
+                if v.0 != own:
+                    return v.0
+        return ""
 
     def live(name: str) -> bool:
         """Return whether the device name is up."""
@@ -1144,6 +1170,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                          target_release=state.target_release, retry=state.retry,
                          version=state.platform.version,
                          model=state.platform.model, stage=state.stage, reason=state.reason,
+                         vetoes=[(v.holder, v.reason) for v in state.veto],
                          prepare=(state=prep.state, release=prep.release, started=prep.started,
                                   ended=prep.ended, message=prep.message,
                                   progress=prep.progress),
@@ -1160,11 +1187,13 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                     ctl.report(name, own_status(name, state.upgrade_campaign,
                                                 state.target_release, state.retry,
                                                 state.status),
-                               time.time().unix_s())
+                               time.time().unix_s(), state.stage == "rollback")
                     ctl.report_prepare(name, own_prepare(name, state.upgrade_campaign,
                                                          state.target_release, state.retry,
                                                          prep.release, prep.state))
                     relevant = name in member_names
+                    if relevant:
+                        ctl.set_vetoed(name, foreign_veto(name))
                 c = state.connected
                 if c is not None:
                     connected[name] = c
@@ -1332,11 +1361,12 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 ctl.report(name, own_status(name, observed.upgrade_campaign,
                                             observed.target_release, observed.retry,
                                             observed.status),
-                           now)
+                           now, observed.stage == "rollback")
                 ctl.report_prepare(name, own_prepare(name, observed.upgrade_campaign,
                                                      observed.target_release, observed.retry,
                                                      observed.prepare.release,
                                                      observed.prepare.state))
+            ctl.set_vetoed(name, foreign_veto(name))
         # Stop letting prepare the members that may no longer prepare, such
         # as a member whose answer the new image made stale.
         ctl.revoke_prepares(now)

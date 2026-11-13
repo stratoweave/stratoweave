@@ -367,6 +367,8 @@
   and remove one with everything in it, and `POST /image-move` with
   `{"from": ..., "to": ...}` moves or renames a file or folder without
   replacing anything.
+- The software state shows the vetoes of the configuration under
+  `state/veto`, with their reasons. [#811]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -410,9 +412,8 @@
   can trade windows with them, and `pack` starts each member as soon as
   the one before it is done; both keep an optional `min-separation`. When
   the upgrade of a member fails or rolls back, the other members keep their
-  windows but wait until it reports a success, or an operator takes it out
-  of the group or the campaign. The plan's alarms name the devices that
-  wait. [#740]
+  windows and wait as the group's `failure-policy` says. The plan's alarms
+  name the devices that wait. [#740]
 - Fixed upgrade duration estimates being reduced by devices that already
   run the target release. These devices could cause the campaign to
   underestimate upgrade times and schedule too many devices in the first
@@ -573,6 +574,22 @@
   until it ends. A status counts only for the member's retry, except
   `in-progress`; `device-status` shows the retry that it answers. A retried
   member no longer counts against the failure budget. [#804]
+- A redundancy group's new `failure-policy` says what a failed member does
+  to the other members. With `continue`, the default, a member that failed
+  or rolled back holds them only until it is done and up again, and the
+  next member starts after the group's `min-separation`. A member whose
+  rollback failed is in an unknown state, and holds them until an operator
+  acts. With `hold`, the other members wait for an operator after any
+  failure, as before. [#811]
+- A campaign holds a member whose device has a veto of another holder,
+  such as a service health check, until the veto goes. `device-status`
+  shows the device's vetoes, and the held reason `vetoed` with the veto's
+  holder in `held-by`; the members after it in its redundancy groups are
+  held as `group-vetoed`. The plan's alarm says "N device(s) are held by a
+  veto of another holder". A released member that gets such a veto before its
+  run starts, or that the veto stops before its install, waits again and
+  frees its slot. Before, the campaign released it, and it held a slot
+  while its device did not install. [#811]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -980,6 +997,7 @@ next. Give it a spin. We’d love to hear what you think.
 [#802]: https://github.com/stratoweave/stratoweave/pull/802
 [#803]: https://github.com/stratoweave/stratoweave/pull/803
 [#805]: https://github.com/stratoweave/stratoweave/pull/805
+[#811]: https://github.com/stratoweave/stratoweave/pull/811
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton#3390]: https://github.com/actonlang/acton/pull/3390
