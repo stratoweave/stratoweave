@@ -2,9 +2,9 @@ import { errorText } from '#lib/core/errors.ts';
 import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import { byUpgradeOrder, defaultSeparation, groupMembers } from '#lib/software/groups.ts';
 import {
-  FLEET_ROOT,
+  CAMPAIGN_MEMBERS,
+  FLEET_LIST,
   REDUNDANCY_GROUPS_ROOT,
-  SOFTWARE_CONFIG,
   parseCampaigns,
   parseFleet,
   parseGroupSeparations,
@@ -21,9 +21,9 @@ export const load: PageLoad = async ({ fetch, depends, params }) => {
 
   try {
     const [fleet, groups, software] = await Promise.all([
-      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch),
+      restconfGetCachedOrNull<unknown>(FLEET_LIST, fetch),
       restconfGetOrNull<unknown>(REDUNDANCY_GROUPS_ROOT, fetch),
-      restconfGetCachedOrNull<unknown>(SOFTWARE_CONFIG, fetch)
+      restconfGetCachedOrNull<unknown>(CAMPAIGN_MEMBERS, fetch)
     ]);
     const devices = parseFleet(fleet).devices;
     const members = devices.filter((d) => d.groups.includes(params.name)).sort(byUpgradeOrder);

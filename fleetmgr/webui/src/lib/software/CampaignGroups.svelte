@@ -14,7 +14,7 @@
     type GroupState
   } from '#lib/software/groups.ts';
   import {
-    FLEET_ROOT,
+    FLEET_LIST,
     REDUNDANCY_GROUPS_ROOT,
     STEP_LABEL,
     parseFleet,
@@ -50,7 +50,8 @@
   };
 
   // Who is in which group: read on open, on Refresh and after a write here,
-  // not on every poll of the page, as the fleet is 34 MB at 100k devices.
+  // not on every poll of the page, as the fleet list is 14 MB at 100k
+  // devices.
   let byGroup = $state.raw<Map<string, Device[]> | null>(null);
   let separations = $state.raw<GroupSeparation[]>([]);
   let readError = $state('');
@@ -60,7 +61,7 @@
     const mine = ++reads;
     try {
       const [fleetJson, groupsJson] = await Promise.all([
-        restconfGetCachedOrNull<unknown>(FLEET_ROOT),
+        restconfGetCachedOrNull<unknown>(FLEET_LIST),
         restconfGetOrNull<unknown>(REDUNDANCY_GROUPS_ROOT)
       ]);
       if (mine !== reads) return;

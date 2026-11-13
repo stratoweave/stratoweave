@@ -14,7 +14,7 @@
     suggestNames
   } from '#lib/software/groups.ts';
   import {
-    FLEET_ROOT,
+    FLEET_LIST,
     REDUNDANCY_GROUPS_ROOT,
     parseFleet,
     parseGroupSeparations,
@@ -36,7 +36,7 @@
 
   // The other devices and the group entries, for the suggestions and the
   // order. Read on mount and after a save, not on every poll of the page:
-  // at 30k devices the fleet is 14 MB.
+  // at 100k devices the fleet list is 14 MB.
   let fleet = $state.raw<Device[]>([]);
   let entryNames = $state.raw<string[]>([]);
   let readError = $state('');
@@ -84,7 +84,7 @@
   async function readContext(): Promise<void> {
     try {
       const [fleetJson, groupsJson] = await Promise.all([
-        restconfGetCachedOrNull<unknown>(FLEET_ROOT),
+        restconfGetCachedOrNull<unknown>(FLEET_LIST),
         restconfGetOrNull<unknown>(REDUNDANCY_GROUPS_ROOT)
       ]);
       fleet = parseFleet(fleetJson).devices;

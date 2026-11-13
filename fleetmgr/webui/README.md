@@ -79,19 +79,24 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   Members in no plan window are not actuated; the UI shows them as one
   count that expands to the device list. The plan timeline draws these
   times on the wall clock with a marker for now.
-- The whole-fleet read (`data/fleetmgr:fleet`, 14 MB at 30k devices) is
-  cached in the browser for 30 s and shared by the devices, schedules and
-  new-campaign pages. A write through the RESTCONF client drops the cache
-  and Refresh bypasses it; changes made elsewhere show when it expires.
-- The campaigns, schedules and new-campaign pages read the campaigns
-  with `content=config` (RFC 8040), which leaves out the published state:
-  the device rows and the plan, most of the subtree once a campaign has
-  members. The campaigns list adds each campaign's counters and alarm
-  lines from small GETs of its state leaves.
+- Reads of the fleet and of the campaigns ask with the RFC 8040 `fields`
+  parameter for only what the page shows; `src/lib/software/model.ts` has
+  one constant per selection. The fleet list (`data/fleetmgr:fleet`
+  without credentials, mock settings or any device state but the
+  platform, 14 MB at 100k devices) is cached in the browser for 30 s and
+  shared by the devices, groups and new-campaign pages and the search. A
+  write through the RESTCONF client drops the cache and Refresh bypasses
+  it; changes made elsewhere show when it expires.
+- The campaigns, schedules, groups and new-campaign pages read the
+  campaigns with `content=config` (RFC 8040), which leaves out the
+  published state: the device rows and the plan, most of the subtree once
+  a campaign has members. The campaigns list adds each campaign's counters
+  and alarm lines from one GET of its `state` with `fields`, which costs
+  the server the same as a leaf GET at any campaign size.
 - Polling. The campaign page ticks every 1.5 s, one tick at a time and
   none while the tab is hidden. A campaign with up to 600 members gets its
   `state` node (plan and per-device rows, ~150 B per member) every tick; a
-  larger one its four counter leaves (`.../state/total` and friends) every
+  larger one its counters (`.../state?fields=total;in-progress;...`) every
   tick, and its `state` every 12 s, or 6 s after the last one when
   `failed` moved. Every 12 s the page reads the campaign's config with
   `content=config`, which is how a change made elsewhere or a deletion
@@ -99,7 +104,7 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   the page reads the whole entry instead, which is small then. Each read
   is numbered when it starts, and an answer older than what is shown,
   than the page's last write, or for another campaign is dropped. The list
-  page GETs the counter leaves of up to six running campaigns every 2 s,
+  page GETs the counters of up to six running campaigns every 2 s,
   busy ones first, and reloads the list every 30 s; a polled counter shows
   only while it is newer than the reload. Nothing ever polls
   `GET /restconf/data` — it also hauls the full yang-library.
