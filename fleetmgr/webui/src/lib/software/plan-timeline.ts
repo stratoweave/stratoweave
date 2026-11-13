@@ -532,7 +532,7 @@ export function axisTicks(axis: Axis, step: number): number[] {
   return out;
 }
 
-const DONE = new Set<KnownStatus>(['succeeded', 'failed', 'rolled-back', 'up-to-date']);
+const DONE = new Set<KnownStatus>(['succeeded', 'failed', 'rolled-back', 'not-started', 'up-to-date']);
 
 /** Share of a window's devices that have settled, 0..1. */
 export function windowDone(w: PlanWindow, statuses: Map<string, KnownStatus>): number {

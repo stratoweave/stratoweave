@@ -252,7 +252,11 @@ the other members. With `continue`, the default, a member that failed or
 rolled back holds them only until it is done and up again; the next
 member starts after the group's `min-separation`. A member whose rollback
 failed holds them until an operator acts, as all failures do with
-`hold`.
+`hold`. So does a member with a new attempt that was set while a run of
+an earlier one failed its rollback: the device may run the release that
+run installed, uncommitted, so the new attempt does not start. The member
+shows `not-started`, with the failed attempt in its `reason`, and counts
+as failed until it has another attempt.
 
 With `notification-period`, in days, a campaign uses only the windows that
 open that long or more after its `run-since`, so that the customers of its

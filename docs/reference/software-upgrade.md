@@ -36,10 +36,11 @@ Set under `stratoweave-rfs:device=<name>/software`:
 The manager acts when `target-release`, `upgrade-campaign`, `attempt`,
 `allow-staging` or a veto changes, when the device type changes, and when
 the device connects. A new `image-url` alone does not make it act. A status
-that ends a read or a run (`up-to-date`, `succeeded`, `failed` or
-`rolled-back`) stands for its attempt. A reconnect, another config change,
-a new device type, or `target-release` removed and set again does not run
-the attempt again. To run a failed upgrade again, change `attempt`.
+that ends a read or a run (`up-to-date`, `succeeded`, `failed`,
+`rolled-back` or `not-started`) stands for its attempt. A reconnect,
+another config change, a new device type, or `target-release` removed and
+set again does not run the attempt again. To run a failed upgrade again,
+change `attempt`.
 
 ## Upgrade steps
 
@@ -69,6 +70,11 @@ Rules:
 - An error in prepare or install ends with `failed`. A failed install does
   not roll back.
 - A failed commit starts a rollback. A failed rollback ends with `failed`.
+  It can leave the device on the release that the run installed,
+  uncommitted, and a read would take that for the target. So the attempt
+  that the configuration names then, when it is another attempt, does not
+  start: it answers `not-started`, and its `reason` names the attempt that
+  failed.
 - If the device does not run the target after the commit, the run ends with
   `failed`. This happens when the device went back on its own before the
   commit arrived.
@@ -126,7 +132,7 @@ Published under `stratoweave-rfs:device=<name>/software/state`:
 | --- | --- |
 | `upgrade-campaign`, `target-release` | The campaign and the target of the attempts: those of the read or run that answered them, not the configuration of the moment |
 | `attempt[number]` | One entry for each attempt that the manager has answered at that target in that campaign, with the leaves below. The first answer for another campaign or target starts the list over |
-| `attempt/status` | `unknown`, `up-to-date`, `upgrade-needed`, `in-progress`, `succeeded`, `failed` or `rolled-back` |
+| `attempt/status` | `unknown`, `up-to-date`, `upgrade-needed`, `in-progress`, `succeeded`, `failed`, `rolled-back` or `not-started` |
 | `attempt/stage` | The step the attempt's run is in, or the step it ended in |
 | `attempt/reason` | Why the run failed or rolled back, why the release could not be read, or what held the install |
 | `attempt/precheck`, `attempt/postcheck` | `verdict` (`not-run`, `pass` or `fail`), `detail`, and `at`, the time of the verdict |

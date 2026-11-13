@@ -191,10 +191,11 @@ ST_IN_PROGRESS = "in-progress"
 ST_SUCCEEDED = "succeeded"
 ST_FAILED = "failed"
 ST_ROLLED_BACK = "rolled-back"
+ST_NOT_STARTED = "not-started"
 
 # The statuses that end a read or a run. A final status stands for its
 # attempt: nothing runs for that attempt again.
-ST_FINAL = {ST_UP_TO_DATE, ST_SUCCEEDED, ST_FAILED, ST_ROLLED_BACK}
+ST_FINAL = {ST_UP_TO_DATE, ST_SUCCEEDED, ST_FAILED, ST_ROLLED_BACK, ST_NOT_STARTED}
 
 # check-result/verdict
 VERDICT_NOT_RUN = "not-run"
@@ -315,6 +316,11 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
       with nothing activated, which is the whole point of the gate.
     * Any failing post-check triggers a rollback. So does a post-check that
       does not answer within POSTCHECK_TIMEOUT.
+    * A failed rollback can leave the device on the release that the run
+      installed, uncommitted, and a read would take that for the target. So
+      the attempt that the configuration names then, when it is not the
+      run's, does not start: it answers not-started, and its reason names
+      the attempt that failed.
     * **Cleanup is the point of no return**: it removes the superseded image,
       which on platforms without native rollback is the way home, so it must
       not run until the post-checks have passed.
@@ -969,10 +975,49 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             r = _answer().reason
             if r is not None:
                 why = r! + "; " + why
-            _fail(why)
+            _set_reason(why)
+            e = _answer()
+            e.status = ST_FAILED
+            # One publication, with the configured attempt when it does not
+            # start.
+            _hold_configured()
+            _publish()
+            _done()
             return
         _record(ST_ROLLED_BACK)
         _done()
+
+    def _hold_configured() -> None:
+        """After a failed rollback, answer the configured attempt not-started
+        when it is not the run's and has no final status. The reason names
+        the attempt that failed, with its target and campaign when the
+        configuration has others. Publishes with the next _publish()."""
+        if target_release is None or (attempt == run_attempt
+                                      and target_release == run_target
+                                      and upgrade_campaign == run_campaign):
+            return
+        found = _configured()
+        if found is not None:
+            s = found.status
+            if s is not None and s in ST_FINAL:
+                return
+        failed = "attempt {run_attempt}"
+        if target_release != run_target or upgrade_campaign != run_campaign:
+            t = run_target
+            c = run_campaign
+            if t is not None:
+                failed += " at " + t
+            if c is not None:
+                failed += " in " + c
+        _log.error("software: not starting the attempt after a failed rollback",
+                   {"device": name, "attempt": attempt, "failed": failed})
+        run_campaign = upgrade_campaign
+        run_target = target_release
+        run_attempt = attempt
+        e = _answer()
+        e.status = ST_NOT_STARTED
+        e.stage = None
+        e.reason = failed + " failed its rollback"
 
     def _on_final_check(running: ?str, err: ?Exception) -> None:
         if err is not None:

@@ -356,7 +356,10 @@
   attempt: a reconnect, a new device type, or the target removed and set
   again runs nothing. A new attempt reads the device again, and runs a
   failed upgrade again when no veto holds the install. A run of another
-  attempt that is under way finishes first. A run that a new target or
+  attempt that is under way finishes first. When that run fails its
+  rollback, the device may run the release it installed, uncommitted, so
+  the new attempt does not start: it answers the new status `not-started`,
+  with the failed attempt in its `reason`. A run that a new target or
   campaign, or a removed target, stops before its install ends at
   `upgrade-needed`. [#804]
 - Images can be kept in folders inside the image folder. An image in
@@ -577,7 +580,9 @@
   progress or else the member's attempt, in its new `attempt`, and no
   longer the `upgrade-campaign` and `target-release` of the device. A
   member with a new attempt no longer counts against the failure budget.
-  [#804]
+  A new attempt set while a run fails its rollback does not start: the
+  member shows `not-started`, counts as failed, and holds its redundancy
+  groups as a failed rollback does, until it has another attempt. [#804]
 - A redundancy group's new `failure-policy` says what a failed member does
   to the other members. With `continue`, the default, a member that failed
   or rolled back holds them only until it is done and up again, and the

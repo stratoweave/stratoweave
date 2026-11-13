@@ -237,7 +237,8 @@ export const KNOWN_STATUSES = [
   'in-progress',
   'succeeded',
   'failed',
-  'rolled-back'
+  'rolled-back',
+  'not-started'
 ] as const;
 export type KnownStatus = (typeof KNOWN_STATUSES)[number];
 
@@ -257,7 +258,8 @@ export const STATUS_TONE: Record<KnownStatus, StatusTone> = {
   'in-progress': 'accent',
   succeeded: 'success',
   failed: 'danger',
-  'rolled-back': 'danger'
+  'rolled-back': 'danger',
+  'not-started': 'danger'
 };
 
 // ── Parsed view types ──
@@ -282,7 +284,7 @@ export interface Device {
 
 export type Verdict = 'not-run' | 'pass' | 'fail';
 
-/** The steps of an upgrade run in order, as software/state/stage names
+/** The steps of an upgrade run in order, as software/state/attempt/stage names
  * them. A rollback is not one of them: it follows a failed post-check or
  * commit. */
 export const STEPS = ['prepare', 'precheck', 'install', 'postcheck', 'commit'] as const;
