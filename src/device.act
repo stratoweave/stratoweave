@@ -26,7 +26,8 @@ from device_oper import \
     stratoweave_rfs__device_entry as DeviceOper, \
     stratoweave_rfs__device__software__state as SoftwareState, \
     stratoweave_rfs__device__software__state__precheck as PrecheckResult, \
-    stratoweave_rfs__device__software__state__postcheck as PostcheckResult
+    stratoweave_rfs__device__software__state__postcheck as PostcheckResult, \
+    stratoweave_rfs__device__software__state__job_entry as SoftwareJob
 
 from device_schema import DeviceSchema, SchemaKey, SchemaTreeTransform
 from device_routing import Routes, union_modules, merge_schemas
@@ -69,6 +70,11 @@ class SoftwareAdapter(object):
     A job's error message is published as the run's reason, so it should name
     the platform operation and the platform's cause, like
     "add failed: install-verify-pkg-fail".
+
+    While prepare or install runs, the adapter can say what the device does
+    with the SoftwareManager of the device: `report_step` gives the step,
+    like "add: extract", and `report_transfer` how much of the image the
+    device has. The manager publishes them in the job.
     """
     _log_handler: logging.Handler
 
@@ -194,8 +200,9 @@ VERDICT_NOT_RUN = "not-run"
 VERDICT_PASS = "pass"
 VERDICT_FAIL = "fail"
 
-# state/job: the one job the manager reports, and its states.
+# state/job: the jobs the manager reports, and their states.
 JOB_PREPARE = "prepare"
+JOB_INSTALL = "install"
 JOB_RUNNING = "running"
 JOB_DONE = "done"
 JOB_FAILED = "failed"
@@ -225,6 +232,26 @@ def _now() -> str:
     """The current UTC time as a yang:date-and-time."""
     d = time.utcnow()
     return f"{d.year:04d}-{d.month:02d}-{d.day:02d}T{d.hour:02d}:{d.minute:02d}:{d.second:02d}Z"
+
+
+def clock_of_day(seconds: int) -> str:
+    """A time of day as HH:MM, from seconds after midnight. The seconds
+    are cut off. A time past the end of the day goes on into the next day,
+    and one before midnight into the day before."""
+    s = seconds // 60 * 60
+    while s >= 86400:
+        s -= 86400
+    while s < 0:
+        s += 86400
+    h = s // 3600
+    m = (s - h * 3600) // 60
+    return f"{h:02d}:{m:02d}"
+
+
+def _utc_clock_in(seconds: int) -> str:
+    """The UTC time of day, as HH:MM, seconds from now."""
+    d = time.utcnow()
+    return clock_of_day(d.hour * 3600 + d.minute * 60 + d.second + seconds)
 
 
 def _monotonic() -> float:
@@ -467,6 +494,13 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             return j.state
         return None
 
+    def get_job_message(job: str) -> ?str:
+        """The message of a job: the step it is in, or why it failed."""
+        j = state.job.get(job)
+        if j is not None:
+            return j.message
+        return None
+
     #### install ############################################################
 
     def _record(status: str) -> None:
@@ -564,9 +598,9 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         job = state.job.get(JOB_PREPARE)
         return job is not None and job.release == release
 
-    def _job_start(release: str) -> None:
-        """Publish the prepare job as running for release."""
-        job = state.job.get(JOB_PREPARE)
+    def _job_start(name: str, release: str) -> None:
+        """Publish the job name as running for release."""
+        job = state.job.get(name)
         if job is not None:
             job.state = JOB_RUNNING
             job.release = release
@@ -575,28 +609,57 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             job.progress = None
             job.message = None
         else:
-            state.job.create(JOB_PREPARE, state=JOB_RUNNING, release=release, started=_now())
+            state.job.create(name, state=JOB_RUNNING, release=release, started=_now())
         devmgr.on_software_state(state.copy())
 
-    def _job_end(err: ?Exception) -> None:
-        """Publish the end of the prepare job: done, or failed with the error."""
-        job = state.job.get(JOB_PREPARE)
+    def _job_end(name: str, err: ?Exception) -> None:
+        """Publish the end of the job name: done, or failed with the error."""
+        job = state.job.get(name)
         if job is not None:
             job.state = JOB_FAILED if err is not None else JOB_DONE
             job.ended = _now()
             job.message = error_text(err!) if err is not None else None
             devmgr.on_software_state(state.copy())
 
-    def report_transfer(transferred: u64, total: ?u64) -> None:
-        """Publish how far the adapter has transferred the image, in the
-        prepare job while it runs: progress is the percent of total, when
-        the adapter knows it, and message has the bytes."""
-        found = state.job.get(JOB_PREPARE)
+    def _job_note(name: str, message: ?str) -> None:
+        """Publish message as the message of the job name, also after the
+        job ended."""
+        job = state.job.get(name)
+        if job is not None and job.message != message:
+            job.message = message
+            devmgr.on_software_state(state.copy())
+
+    def _running_job() -> ?SoftwareJob:
+        """The prepare or install job while it runs. Only one runs at a
+        time."""
+        for name in [JOB_PREPARE, JOB_INSTALL]:
+            job = state.job.get(name)
+            if job is not None and job.state == JOB_RUNNING:
+                return job
+        return None
+
+    def report_step(message: str) -> None:
+        """Publish what the adapter does now, like "add: extract", in the
+        prepare or install job while it runs. The progress of the step
+        before goes."""
+        found = _running_job()
         if found is None:
             return
         job = found!
-        if job.state != JOB_RUNNING:
+        if job.message == message and job.progress is None:
             return
+        job.message = message
+        job.progress = None
+        devmgr.on_software_state(state.copy())
+
+    def report_transfer(transferred: u64, total: ?u64) -> None:
+        """Publish how far the adapter has transferred the image, in the
+        prepare or install job while it runs: progress is the percent of
+        total, when the adapter knows it, and message has the bytes."""
+        found = _running_job()
+        if found is None:
+            return
+        job = found!
         size = total if total is not None else u64(0)
         if size > u64(0):
             percent = transferred * u64(100) // size
@@ -612,14 +675,14 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         t = run_target!
         _log.info("software: preparing ahead of the install",
                   {"device": name, "target": t})
-        _job_start(t)
+        _job_start(JOB_PREPARE, t)
         adapter.prepare(_on_ahead_done, t)
 
     def _on_ahead_done(err: ?Exception) -> None:
         if err is not None:
             _log.warning("software: prepare ahead of the install failed",
                          {"device": name, "error": str(err)})
-        _job_end(err)
+        _job_end(JOB_PREPARE, err)
         _done()
 
     def _retry_read(gen: int) -> None:
@@ -690,11 +753,11 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         state.precheck = PrecheckResult(VERDICT_NOT_RUN, None, None)
         state.postcheck = PostcheckResult(VERDICT_NOT_RUN, None, None)
         _record(ST_IN_PROGRESS)
-        _job_start(t)
+        _job_start(JOB_PREPARE, t)
         adapter.prepare(_on_prepare_done, t)
 
     def _on_prepare_done(err: ?Exception) -> None:
-        _job_end(err)
+        _job_end(JOB_PREPARE, err)
         if err is not None:
             _log.error("software staging failed", {"device": name, "error": str(err)})
             _fail(error_text(err!))
@@ -702,6 +765,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         _run_checks("precheck", prechecks, precheck_timeout)
 
     def _on_install_done(err: ?Exception) -> None:
+        _job_end(JOB_INSTALL, err)
         if err is not None:
             _log.error("software install failed", {"device": name, "error": str(err)})
             _fail(error_text(err!))
@@ -711,6 +775,9 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     def _on_commit_window(w: ?int) -> None:
         limit = postcheck_timeout
         if w is not None:
+            # Until the commit or the rollback, the install job says when
+            # the device goes back on its own.
+            _job_note(JOB_INSTALL, "commit window ends " + _utc_clock_in(w!) + " UTC")
             left = float(w!) - COMMIT_MARGIN
             if left <= 0.0:
                 _start_rollback("no time left to commit before the device reverts")
@@ -809,7 +876,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
                 _record(ST_UPGRADE_NEEDED)
                 _done()
                 return
-            _set_stage(STAGE_INSTALL)
+            state.stage = STAGE_INSTALL
+            _job_start(JOB_INSTALL, run_target!)
             adapter.install(_on_install_done, run_target!)
         else:
             _set_stage(STAGE_COMMIT)
@@ -836,6 +904,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             # Abort now so the outcome is known.
             _start_rollback(error_text(err!))
             return
+        _job_note(JOB_INSTALL, None)
         # Check the device is on the target: it may have reverted on its own.
         adapter.check(_on_final_check)
 
@@ -843,6 +912,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         _log.error("software: rolling back", {"device": name, "reason": why})
         attempt += 1
         state.reason = why
+        _job_note(JOB_INSTALL, None)
         _set_stage(STAGE_ROLLBACK)
         adapter.rollback(_on_rollback_done, previous_release)
 
