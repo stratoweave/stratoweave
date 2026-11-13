@@ -43,6 +43,16 @@
   read of the fleet configuration takes 37 ms instead of 45 ms. [#815]
 - Acton library modules such as `json`, `http` and `argparse` are imported
   from `std`, as Acton moves them out of base [acton#3410]. [#833]
+- Fixed a filtered read of a list entry that two filters with different
+  predicates both match, like a NETCONF subtree filter with `<service>` by
+  name next to `<service>` by a leaf value. The entry had only what the first
+  filter selects, and now has what each of them selects, as a subscription
+  to the same filters does.
+- Reading a big list is faster. The list asks all its entries at once, so
+  they are read on all worker threads instead of one after the other. In
+  Fleet Manager with 10,000 devices, a read of the whole fleet takes 61 ms
+  instead of 75 ms, and of the whole datastore 88 ms instead of 103 ms, for
+  about 13% more CPU time.
 
 ### Northbound APIs
 - Fixed NETCONF `<get-config>` returning the operational state published by
