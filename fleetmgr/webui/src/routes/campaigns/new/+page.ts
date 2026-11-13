@@ -1,10 +1,10 @@
 import { errorText } from '#lib/core/errors.ts';
 import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import {
-  FLEET_ROOT,
+  CAMPAIGN_MEMBERS,
+  FLEET_LIST,
   IMAGES_ROOT,
   SCHEDULES_ROOT,
-  SOFTWARE_CONFIG,
   parseCampaigns,
   parseFleet,
   parseImages,
@@ -16,12 +16,12 @@ import type { PageLoad } from './$types';
 async function loadInventory(fetch: typeof globalThis.fetch) {
   try {
     // Small reads first: the top answers GETs one at a time, and the fleet
-    // takes 4 s at 100k devices.
+    // list takes over 3 s at 100k devices.
     const [images, schedules, software, fleet] = await Promise.all([
       restconfGetOrNull<unknown>(IMAGES_ROOT, fetch),
       restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch),
-      restconfGetOrNull<unknown>(SOFTWARE_CONFIG, fetch),
-      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch)
+      restconfGetOrNull<unknown>(CAMPAIGN_MEMBERS, fetch),
+      restconfGetCachedOrNull<unknown>(FLEET_LIST, fetch)
     ]);
     return {
       devices: parseFleet(fleet).devices,

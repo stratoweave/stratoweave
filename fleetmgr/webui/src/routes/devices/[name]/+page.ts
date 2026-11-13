@@ -2,14 +2,16 @@ import { errorText } from '#lib/core/errors.ts';
 import { getListEntryPath, restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import {
   CAMPAIGN_LIST_ROOT,
+  CAMPAIGN_SETTINGS,
   FLEET_DEVICE_LIST_ROOT,
   SCHEDULES_ROOT,
-  SOFTWARE_CONFIG,
   parseCampaignConfigs,
   parseDeviceEntry,
   parseDeviceStatusEntry,
+  parseMemberImage,
   parseSchedules,
   planStartOf,
+  planStartsPath,
   type CampaignConfig,
   type DeviceCampaign
 } from '#lib/software/model.ts';
@@ -17,19 +19,25 @@ import {
 import type { PageLoad } from './$types';
 
 // The page polls every 5 s. Each poll reads this device's own status row
-// in each of its campaigns. The campaigns' config and plans are big (7 MB
-// each at 100k members), so they come through the 30 s read cache.
-async function inCampaign(config: CampaignConfig, device: string, fetch: typeof globalThis.fetch): Promise<DeviceCampaign> {
+// in each of its campaigns. The rest comes through the 30 s read cache:
+// the campaigns, this device's entry in each, and the start times of
+// each plan.
+async function inCampaign(
+  config: CampaignConfig,
+  image: string,
+  device: string,
+  fetch: typeof globalThis.fetch
+): Promise<DeviceCampaign> {
   const entry = getListEntryPath(CAMPAIGN_LIST_ROOT, config.name);
   const [status, plan] = await Promise.all([
     restconfGetOrNull<unknown>(getListEntryPath(`${entry}/state/device-status`, device), fetch),
-    restconfGetCachedOrNull<unknown>(`${entry}/state/plan`, fetch)
+    restconfGetCachedOrNull<unknown>(planStartsPath(entry), fetch)
   ]);
   return {
     name: config.name,
     adminState: config.adminState,
     defaultSchedule: config.defaultSchedule,
-    image: config.images[config.devices.indexOf(device)] ?? '',
+    image,
     row: parseDeviceStatusEntry(status, device),
     start: planStartOf(plan, device)
   };
@@ -47,11 +55,25 @@ async function loadDevice(name: string, fetch: typeof globalThis.fetch) {
   }
 }
 
+// A campaign's device list is 7 MB at 100k members, so each campaign is
+// asked for this device's entry alone; a 404 means it is not a member.
 async function loadCampaigns(name: string, fetch: typeof globalThis.fetch) {
   try {
-    const configs = parseCampaignConfigs(await restconfGetCachedOrNull<unknown>(SOFTWARE_CONFIG, fetch));
-    const member = configs.filter((c) => c.devices.includes(name));
-    return { campaigns: await Promise.all(member.map((c) => inCampaign(c, name, fetch))), loadError: '' };
+    const configs = parseCampaignConfigs(await restconfGetCachedOrNull<unknown>(CAMPAIGN_SETTINGS, fetch));
+    const images = await Promise.all(
+      configs.map(async (c) => {
+        const entry = getListEntryPath(CAMPAIGN_LIST_ROOT, c.name);
+        const path = `${getListEntryPath(`${entry}/device`, name)}?content=config`;
+        return parseMemberImage(await restconfGetCachedOrNull<unknown>(path, fetch));
+      })
+    );
+    const memberOf: { config: CampaignConfig; image: string }[] = [];
+    configs.forEach((config, i) => {
+      const image = images[i];
+      if (image !== null) memberOf.push({ config, image });
+    });
+    const campaigns = await Promise.all(memberOf.map((m) => inCampaign(m.config, m.image, name, fetch)));
+    return { campaigns, loadError: '' };
   } catch (loadError) {
     return { campaigns: [] as DeviceCampaign[], loadError: errorText(loadError, 'Failed to load the campaigns.') };
   }

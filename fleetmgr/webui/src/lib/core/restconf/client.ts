@@ -112,10 +112,11 @@ export async function restconfGetOrNull<T>(path: string, fetchFn: Fetch = fetch)
   }
 }
 
-// The devices, schedules and new-campaign pages all read the whole fleet,
-// which at 30k devices is 14 MB and 2 s, so one read serves every page
-// opened within READ_CACHE_MS. The device page reads campaign config and
-// plans through it too. A write through this client drops the cache
+// The devices and new-campaign pages and the search read the same fleet
+// list, which at 100k devices is 14 MB, so one read serves every page
+// opened within READ_CACHE_MS. The schedules and device pages read their
+// smaller parts of the fleet and campaigns through it too. A write through
+// this client drops the cache
 // and the Refresh button bypasses it; what others change shows up when the
 // entry expires.
 const READ_CACHE_MS = 30_000;

@@ -32,11 +32,13 @@ def _split_restconf_path(text: str) -> list[str]:
 def _build_restconf_monitoring_gdata() -> ygdata.Node:
     """Build an ietf-restconf-monitoring datastore view (as gdata).
     """
-    # TODO: add "query" and other capabilities here once implemented
     root = rcmon.root(
         restconf_state=rcmon.ietf_restconf_monitoring__restconf_state(
             capabilities=rcmon.ietf_restconf_monitoring__restconf_state__capabilities(
-                capability=["urn:ietf:params:restconf:capability:defaults:1.0?basic-mode=explicit"],
+                capability=[
+                    "urn:ietf:params:restconf:capability:defaults:1.0?basic-mode=explicit",
+                    "urn:ietf:params:restconf:capability:fields:1.0",
+                ],
             ),
         ),
     )
@@ -50,17 +52,27 @@ CONTENT_BY_PARAM: dict[str, ttt.Content] = {
 }
 
 
-def _reject_content_query(next_handler: proc(http_router.Context, proc(int, dict[str, str], str) -> None) -> None):
-    """Answer 400 to a request that carries the content query parameter.
+_GET_ONLY_QUERY_PARAMS = ["content", "fields"]
 
-    RFC 8040 4.8.1 allows content only on a GET of the datastore or a data
-    resource, and answers its use on any other method or resource with
-    400 Bad Request.
-    """
+
+def _reject_get_only_query(next_handler: proc(http_router.Context, proc(int, dict[str, str], str) -> None) -> None):
+    """Reject query params only valid for GET on other methods"""
     def wrapped(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
-        if "content" in ctx.query():
-            respond(400, {}, "The content query parameter is only allowed for GET of data resources")
-            return
+        for name in _GET_ONLY_QUERY_PARAMS:
+            if name in ctx.query():
+                respond(400, {}, "The {name} query parameter is only allowed for GET of data resources")
+                return
+        next_handler(ctx, respond)
+    return wrapped
+
+
+proc def _reject_query_repeats(next_handler: proc(http_router.Context, proc(int, dict[str, str], str) -> None) -> None):
+    """Reject repeated query params"""
+    def wrapped(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
+        for name, values in ctx.query().items():
+            if len(values) > 1:
+                respond(400, {}, "The {name} query parameter is only allowed once")
+                return
         next_handler(ctx, respond)
     return wrapped
 
@@ -139,16 +151,9 @@ def _node_with_ns(node: ygdata.Node, snode: yschema.DNode) -> ygdata.Node:
     raise ValueError("Unexpected node type for RESTCONF GET serialization: {type(node)}")
 
 
-def _respond_restconf_subtree(path_elements: list[ydata.PathElement], data: ?ygdata.Node, accept: ?str, respond: proc(int, dict[str, str], str) -> None,
+def _respond_restconf_subtree(path_elements: list[ydata.PathElement], data: ?ygdata.Node, fields: ?list[ygdata.FNode], accept: ?str, respond: proc(int, dict[str, str], str) -> None,
 ) -> None:
     if data is not None:
-        if len(path_elements) <= 1:
-            if accept == "application/yang-data+xml":
-                respond(200, {"Content-Type": "application/yang-data+xml"}, data.to_xmlstr())
-            else:
-                respond(200, {"Content-Type": "application/yang-data+json"}, data.to_yang_jsonstr())
-            return
-
         # Walk the (already filtered) tree to the target node so we only return its subtree.
         node = data
         for elem in path_elements[1:]:
@@ -167,9 +172,21 @@ def _respond_restconf_subtree(path_elements: list[ydata.PathElement], data: ?ygd
                 respond(404, {}, "No data at path")
                 return
 
-        # Ensure top-level node gdata node in the filtered subtree always has namespace qualifiers
-        target_snode = path_elements[-1].node
-        result = ygdata.Container({target_snode.gname: _node_with_ns(node, target_snode)})
+        if fields is not None:
+            # A list entry target is in the response whatever fields selects
+            # in it, so its keys are selected too
+            key_fields: list[ygdata.FNode] = []
+            if isinstance(node, ygdata.List):
+                key_fields = [ygdata.FNode(k) for k in node.keys]
+            sel = yang.restconf.select_fields(node, key_fields + fields)
+            # The target is there, so if fields selects nothing in it, it is empty
+            node = sel if sel is not None else ygdata.Container()
+
+        result = node
+        if len(path_elements) > 1:
+            # Ensure top-level node gdata node in the filtered subtree always has namespace qualifiers
+            target_snode = path_elements[-1].node
+            result = ygdata.Container({target_snode.gname: _node_with_ns(node, target_snode)})
         if accept == "application/yang-data+xml":
             respond(200, {"Content-Type": "application/yang-data+xml"}, result.to_xmlstr())
         else:
@@ -247,21 +264,27 @@ actor RestconfServer(
         content = CONTENT_BY_PARAM[content_param]
 
         path_segments = _split_restconf_path(ctx.param("rest_path"))
-        if len(path_segments) == 0:
-            data = northbound.read_data(cfs, _monitoring_gdata, None, content)
-            _respond_restconf_subtree([], data if data is not None else ygdata.Container(), accept, respond)
-            return
-
         try:
-            if ':' not in path_segments[0]:
+            if len(path_segments) > 0 and ':' not in path_segments[0]:
                 raise ValueError("RESTCONF path must start with a module-qualified top-level name")
             path_elements = yang.restconf.resolve_path(_inventory.schema, path_segments)
-            filter = _path_elements_to_fnode(path_elements)
         except ValueError as e:
             respond(404, {}, str(e))
             return
         else:
-            _respond_restconf_subtree(path_elements, northbound.read_data(cfs, _monitoring_gdata, filter, content), accept, respond)
+            fields: ?list[ygdata.FNode] = None
+            if "fields" in ctx.query():
+                try:
+                    fields = yang.restconf.resolve_fields(path_elements[-1].node, ctx.query_param("fields"))
+                except ValueError as e:
+                    respond(400, {}, str(e))
+                    return
+
+            if len(path_elements) == 1:
+                data = northbound.read_data(cfs, _monitoring_gdata, None, content)
+                _respond_restconf_subtree(path_elements, data if data is not None else ygdata.Container(), fields, accept, respond)
+            else:
+                _respond_restconf_subtree(path_elements, northbound.read_data(cfs, _monitoring_gdata, _path_elements_to_fnode(path_elements), content), fields, accept, respond)
 
     def _router_handle_restconf_delete(ctx: http_router.Context, respond: proc(int, dict[str, str], str) -> None):
         input_config = yang.restconf.from_json_path(top_schema, None, _split_restconf_path(ctx.param("rest_path")), ydata.OP_REMOVE, loose=True)
@@ -352,11 +375,15 @@ actor RestconfServer(
 
     def _router_build_restconf_routes(g: http_router.RouteGroup):
         g.get("/*rest_path", _router_handle_restconf_get)
-        g.post("/*rest_path", _reject_content_query(_router_handle_restconf_post))
-        g.put("/*rest_path", _reject_content_query(_router_handle_restconf_put))
-        g.patch("/*rest_path", _reject_content_query(_router_handle_restconf_patch))
-        g.delete("/*rest_path", _reject_content_query(_router_handle_restconf_delete))
+        g.post("/*rest_path", _reject_get_only_query(_router_handle_restconf_post))
+        g.put("/*rest_path", _reject_get_only_query(_router_handle_restconf_put))
+        g.patch("/*rest_path", _reject_get_only_query(_router_handle_restconf_patch))
+        g.delete("/*rest_path", _reject_get_only_query(_router_handle_restconf_delete))
+
+    def _router_build_restconf_root(g: http_router.RouteGroup):
+        g.use(_reject_query_repeats)
+        g.get("/yang-library-version", _reject_get_only_query(_router_handle_yang_library_version))
+        g.route("/data", _router_build_restconf_routes)
 
     root.get("/.well-known/host-meta", _router_handle_host_meta)
-    root.get("{restconf_root}/yang-library-version", _reject_content_query(_router_handle_yang_library_version))
-    root.route("{restconf_root}/data", _router_build_restconf_routes)
+    root.route(restconf_root, _router_build_restconf_root)
