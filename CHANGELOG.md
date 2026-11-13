@@ -367,6 +367,8 @@
   and remove one with everything in it, and `POST /image-move` with
   `{"from": ..., "to": ...}` moves or renames a file or folder without
   replacing anything.
+- The software state shows the vetoes of the configuration under
+  `state/veto`, with their reasons.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -579,6 +581,15 @@
   rollback failed is in an unknown state, and holds them until an operator
   acts. With `hold`, the other members wait for an operator after any
   failure, as before.
+- A campaign holds a member whose device has a veto of another holder,
+  such as a service health check, until the veto goes. `device-status`
+  shows the device's vetoes, and the held reason `vetoed` with the veto's
+  holder in `held-by`; the members after it in its redundancy groups are
+  held as `group-vetoed`. The plan's alarm says "N device(s) are held by a
+  veto of another holder". A released member that gets such a veto before its
+  run starts, or that the veto stops before its install, waits again and
+  frees its slot. Before, the campaign released it, and it held a slot
+  while its device did not install.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead

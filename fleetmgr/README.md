@@ -234,6 +234,17 @@ starts. Each held member's `device-status` says why in `held`, and
 `held-by` names the device or the flotilla that holds it. The state's
 `held` counts them.
 
+The campaign also holds a member whose device has a veto of another
+holder than the campaign, for example a service health check that holds
+the device while its redundant peer has not converged. `device-status`
+shows the device's vetoes, and the member is held as `vetoed`, with the
+veto's holder in `held-by`. The members after it in its redundancy groups
+are held behind it as `group-vetoed`, and the plan's alarms name both. It
+starts when the veto goes. A member that
+gets such a veto after its release waits again, unless its run is past
+its install: a veto never stops an install. A member that a veto stops
+before its install waits again too.
+
 A redundancy group's `failure-policy` says what a failed member does to
 the other members. With `continue`, the default, a member that failed or
 rolled back holds them only until it is done and up again; the next
