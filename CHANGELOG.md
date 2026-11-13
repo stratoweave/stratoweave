@@ -368,7 +368,7 @@
   `{"from": ..., "to": ...}` moves or renames a file or folder without
   replacing anything.
 - The software state shows the vetoes of the configuration under
-  `state/veto`, with their reasons.
+  `state/veto`, with their reasons. [#811]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -580,7 +580,7 @@
   next member starts after the group's `min-separation`. A member whose
   rollback failed is in an unknown state, and holds them until an operator
   acts. With `hold`, the other members wait for an operator after any
-  failure, as before.
+  failure, as before. [#811]
 - A campaign holds a member whose device has a veto of another holder,
   such as a service health check, until the veto goes. `device-status`
   shows the device's vetoes, and the held reason `vetoed` with the veto's
@@ -589,7 +589,7 @@
   veto of another holder". A released member that gets such a veto before its
   run starts, or that the veto stops before its install, waits again and
   frees its slot. Before, the campaign released it, and it held a slot
-  while its device did not install.
+  while its device did not install. [#811]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -997,6 +997,7 @@ next. Give it a spin. We’d love to hear what you think.
 [#802]: https://github.com/stratoweave/stratoweave/pull/802
 [#803]: https://github.com/stratoweave/stratoweave/pull/803
 [#805]: https://github.com/stratoweave/stratoweave/pull/805
+[#811]: https://github.com/stratoweave/stratoweave/pull/811
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton#3390]: https://github.com/actonlang/acton/pull/3390
