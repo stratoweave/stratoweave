@@ -36,7 +36,8 @@ mock and debug settings, feature flags, and software intent.
 
 Set `ACTON=/path/to/acton` when the compiler is not on `PATH`. Regeneration
 produces both generated system-spec packages from `spec/`; the build produces
-both binaries.
+both binaries. `just build` builds them with `--release`, optimized for
+execution speed and without debug symbols.
 
 ## Ten-flotilla subprocess demo
 
