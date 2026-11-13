@@ -38,6 +38,13 @@
 - A software adapter has a static `prepare_estimate()`: the seconds the copy
   of the image takes, for planners. The IOS XE adapter gives 130. The unused
   `estimate(staged)` is removed. [#784]
+- Fixed a filtered read of a list entry that two filters with different
+  predicates both match, like a NETCONF subtree filter with `<service>` by
+  name next to `<service>` by a leaf value. The entry had only what the first
+  filter selects, and now has what each of them selects, as a subscription
+  to the same filters does.
+- Reading a big list is faster. The list asks all its entries at once, so
+  they are read on all worker threads instead of one after the other.
 
 ### Northbound APIs
 - Fixed NETCONF `<get-config>` returning the operational state published by
