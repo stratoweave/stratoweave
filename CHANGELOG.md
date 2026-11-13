@@ -268,13 +268,12 @@
   `upgrade-needed` when it differs. The vetoes are read again right before
   the install, so a veto added during the pre-checks holds it too. Before, a
   veto stopped even the read. [#775]
-- The software state says which intent its status answers, in
-  `state/upgrade-campaign` and `state/target-release`. A final status is
-  kept while that intent and the device type stay the same, so a reconnect
-  or an unrelated config change no longer runs a failed upgrade again.
-  Remove the target and set it again to retry. The install installs the
-  release the run read the device for, and a target changed during the
-  pre-checks is read again before anything is installed. [#775]
+- The software state says which campaign and target release its status
+  answers, in `state/upgrade-campaign` and `state/target-release`. A final
+  status stands, so a reconnect or an unrelated config change no longer
+  runs a failed upgrade again. The install installs the release the run
+  read the device for, and a target changed during the pre-checks is read
+  again before anything is installed. [#775]
 - Under a veto, a read of the release that fails gives `unknown` with the
   error, and is read again when the device connects, or after a while.
   With `runtime-schema-fetch`, a NETCONF get or RPC on a device that has not
@@ -350,10 +349,19 @@
   last step line of the install command that runs. The IOS XE mock lists a
   running operation in `Cisco-IOS-XE-install-oper` and takes it through its
   stages. [#803]
-- The software intent has a `retry`, 0 by default, and the state says which
-  retry its status answers. A new retry is a new intent: the manager reads
-  the device again, and runs a failed upgrade again when no veto holds the
-  install. A run under way finishes first. [#804]
+- The software intent has an `attempt`, 0 by default. The state has an
+  entry for each attempt at the target in the campaign,
+  `state/attempt[number]`, with its status, stage, reason, checks and
+  jobs; the entries of earlier attempts stay. A final status stands for its
+  attempt: a reconnect, a new device type, or the target removed and set
+  again runs nothing. A new attempt reads the device again, and runs a
+  failed upgrade again when no veto holds the install. A run of another
+  attempt that is under way finishes first. When that run fails its
+  rollback, the device may run the release it installed, uncommitted, so
+  the new attempt does not start: it answers the new status `not-started`,
+  with the failed attempt in its `reason`. A run that a new target or
+  campaign, or a removed target, stops before its install ends at
+  `upgrade-needed`. [#804] [#814]
 - Images can be kept in folders inside the image folder. An image in
   `/images/image` has a new `file` leaf, the path of its file there, such as
   `iosxe/17.18/c8000v-universalk9.17.18.03a.SPA.bin`; without it the file is
@@ -501,9 +509,7 @@
   error until only one campaign names it. [#783]
 - A campaign's `device-status` shows a member's status only when the status
   is for the campaign's intent, its name and the member's target release,
-  and `pending` otherwise. Its new `upgrade-campaign` and `target-release`
-  say which intent the device's status is for. The counters count only
-  those statuses. Before, a `succeeded` left from an earlier campaign made
+  and `pending` otherwise. The counters count only those statuses. Before, a `succeeded` left from an earlier campaign made
   a member done at its release, with no upgrade. [#783]
 - Setting a running campaign back to `plan` pauses it: members in flight
   stop before their install, and are released again when the campaign runs
@@ -511,9 +517,7 @@
   runs again, or after a restart of fleetmgr, counts in flight and keeps
   the campaign's veto until it is done, or until it stops before its
   install. Stopping a campaign and running it again no longer retries its
-  failed members. To retry a member, remove it from the campaign, wait
-  until the device's software state has no `upgrade-campaign`, and add it
-  again: the campaign takes it as a new member. [#783]
+  failed members. [#783]
 - With `allow-staging`, a campaign in `run` lets each member that needs the
   upgrade, and that the plan gives a window, prepare its image once before
   its window, under the campaign's veto. The first member prepares at once.
@@ -566,14 +570,20 @@
   is the time Fleet Manager first starts on this version, or, for a
   campaign in `plan`, the time it next goes to `run`. 0, the default, gives
   no notice. [#795]
-- A campaign member has a `retry`. Changing it retries the member in one
-  edit, as removing it and adding it again did in two: the campaign takes
-  it as a new member, its device reads its release again, and a member
-  that failed is released again in a window. A member in flight gets the
-  campaign's veto back; a run past its install finishes and holds its slot
-  until it ends. A status counts only for the member's retry, except
-  `in-progress`; `device-status` shows the retry that it answers. A retried
-  member no longer counts against the failure budget. [#804]
+- A campaign member has an `attempt`. Changing it tries the member again:
+  the campaign takes it as a new member, its device reads its release
+  again, and a member that failed is released again in a window. A member
+  in flight gets the campaign's veto back; a run past its install finishes
+  and holds its slot until it ends. Removing a member and adding it again
+  no longer tries it again: its device keeps the final status of its
+  attempt. `device-status` shows the attempt that counts, the one in
+  progress or else the member's attempt, in its new `attempt`, and no
+  longer the `upgrade-campaign` and `target-release` of the device. A
+  member with a new attempt no longer counts against the failure budget.
+  A new attempt set while a run fails its rollback does not start: the
+  member shows `not-started`, counts as failed, and holds its redundancy
+  groups as a failed rollback does, until it has another attempt. [#804]
+  [#814]
 - A redundancy group's new `failure-policy` says what a failed member does
   to the other members. With `continue`, the default, a member that failed
   or rolled back holds them only until it is done and up again, and the
@@ -996,8 +1006,10 @@ next. Give it a spin. We’d love to hear what you think.
 [#800]: https://github.com/stratoweave/stratoweave/pull/800
 [#802]: https://github.com/stratoweave/stratoweave/pull/802
 [#803]: https://github.com/stratoweave/stratoweave/pull/803
+[#804]: https://github.com/stratoweave/stratoweave/pull/804
 [#805]: https://github.com/stratoweave/stratoweave/pull/805
 [#811]: https://github.com/stratoweave/stratoweave/pull/811
+[#814]: https://github.com/stratoweave/stratoweave/pull/814
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton#3390]: https://github.com/actonlang/acton/pull/3390

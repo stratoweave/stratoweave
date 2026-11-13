@@ -180,7 +180,7 @@
 
   let failedRows = $derived(
     (campaign?.deviceStatus ?? []).filter(
-      (r) => r.status === 'failed' || r.status === 'rolled-back'
+      (r) => r.status === 'failed' || r.status === 'rolled-back' || r.status === 'not-started'
     )
   );
 

@@ -517,13 +517,13 @@ def veto_holder(campaign: str) -> str:
 
 def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_entry,
                    i: y_0.software__software__upgrade_campaign_entry,
-                   image: ?y_0.stratoweave_images__images__image_entry, retry: u64,
+                   image: ?y_0.stratoweave_images__images__image_entry, attempt: u64,
                    url_base: ?str, held: bool, prepare: bool) -> None:
     """Write the software intent of campaign i for one device to its
     flotilla. The intent is the campaign's name, the release of the
-    device's image, the member's retry, the URL to fetch the image from,
+    device's image, the member's attempt, the URL to fetch the image from,
     url_base followed by the image's file, and the image's checksums and
-    size. Without an image, only the name and the retry are written.
+    size. Without an image, only the name and the attempt are written.
     When held is true, the campaign's veto is written
     too: the device reads the release it runs, but does not install the
     target. When held and prepare are true, allow-staging is written as
@@ -531,7 +531,7 @@ def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_
     install. Otherwise allow-staging is left out, which means false."""
     software = o.rfs.create(flotilla_of(fleet_device.name)).device.create(fleet_device.name).software
     software.upgrade_campaign = i.name
-    software.retry = retry
+    software.attempt = attempt
     if image is not None:
         software.target_release = image.version
         if url_base is not None and url_base != "":
@@ -582,9 +582,9 @@ def member_targets(i: y_0.software__software__upgrade_campaign_entry,
     return targets
 
 
-def member_retries(i: y_0.software__software__upgrade_campaign_entry) -> dict[str, u64]:
-    """Return the retry that campaign i writes for each member."""
-    return {member.name: member.retry for member in i.device}
+def member_attempts(i: y_0.software__software__upgrade_campaign_entry) -> dict[str, u64]:
+    """Return the attempt that campaign i writes for each member."""
+    return {member.name: member.attempt for member in i.device}
 
 
 def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory: y_0.root,
@@ -624,7 +624,7 @@ def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory
             if staging and member.name in allowed:
                 prepare = True
             route_software(o, fleet_device, i, member_image(inventory, member.image),
-                           member.retry, url_base, held, prepare)
+                           member.attempt, url_base, held, prepare)
     return o
 
 
@@ -666,8 +666,8 @@ def written_in(prev: ?ygdata.Node, i: y_0.software__software__upgrade_campaign_e
     the campaign's name without the campaign's veto. A member is let
     prepare when prev gives it the campaign's name and allow-staging, with
     the target release that the campaign gives it now. Either needs the
-    retry that the campaign gives the member now: a member with a new retry
-    is a new member. A campaign that does not run has neither, and one
+    attempt that the campaign gives the member now: a member with a new
+    attempt is a new member. A campaign that does not run has neither, and one
     without allow-staging has no member let prepare."""
     unheld: set[str] = set()
     allowed: set[str] = set()
@@ -676,14 +676,14 @@ def written_in(prev: ?ygdata.Node, i: y_0.software__software__upgrade_campaign_e
         targets: dict[str, str] = {}
         if i.allow_staging:
             targets = member_targets(i, inventory)
-        retries = member_retries(i)
+        attempts = member_attempts(i)
         o = y_1_loose.root.from_gdata(prev)
         for flotilla in o.rfs:
             for dev in flotilla.device:
                 sw = dev.software
-                written = sw.retry
+                written = sw.attempt
                 if sw.upgrade_campaign == i.name \
-                   and (written if written is not None else u64(0)) == retries.get_def(dev.name, 0):
+                   and (written if written is not None else u64(0)) == attempts.get_def(dev.name, 0):
                     if sw.veto.get(holder) is None:
                         unheld.add(dev.name)
                     staged = sw.allow_staging
@@ -725,35 +725,52 @@ def intent_patch(output: ygdata.Node, i: y_0.software__software__upgrade_campaig
     return base.o_root().to_gdata()
 
 
-def status_for(campaign: str, target: ?str, retry: u64, tag_campaign: ?str,
-               tag_target: ?str, tag_retry: ?u64, status: ?str) -> ?str:
-    """Return status when it is for the intent of the campaign for a member
-    with the target release target and the retry retry: the device says
-    that its status is for this campaign, this target and this retry. A
-    status without a retry is for retry 0, the default. in-progress counts
-    for any retry: a run of an earlier retry is still under way, and holds
-    its slot until it ends. Return None otherwise. Such a status answers
-    the target only when it is upgrade-needed or final; the controller
-    decides that."""
-    if target is not None and tag_campaign == campaign and tag_target == target \
-       and ((tag_retry if tag_retry is not None else u64(0)) == retry
-            or status == "in-progress"):
-        return status
+def counted_attempt(campaign: str, target: ?str, attempt: u64, tag_campaign: ?str,
+                    tag_target: ?str, statuses: list[(u64, ?str)]) -> ?u64:
+    """Return the attempt that counts for a member of the campaign with the
+    target release target and the attempt attempt. statuses has the number
+    and the status of each attempt that the device reports for tag_campaign
+    and tag_target. An attempt in-progress counts: a run of an earlier
+    attempt is still under way, and holds its slot until it ends. Else the
+    member's attempt counts, once the device has answered it. Return None
+    for a device that reports another campaign or target, or has not
+    answered. The status of the attempt answers the target only when it is
+    upgrade-needed or final; the controller decides that."""
+    if target is None or tag_campaign != campaign or tag_target != target:
+        return None
+    for a in statuses:
+        if a.1 == "in-progress":
+            return a.0
+    for a in statuses:
+        if a.0 == attempt:
+            return attempt
     return None
 
 
-def prepare_for(campaign: str, target: ?str, retry: u64, tag_campaign: ?str,
-                tag_target: ?str, tag_retry: ?u64, release: ?str, state: ?str) -> ?str:
-    """Return state, the state of a member's prepare, when the prepare is
-    for the intent of the campaign for a member with the target release
-    target and the retry retry: the device says that its status is for
-    this campaign, this target and this retry, and its prepare copies or
-    copied the target. A status without a retry is for retry 0. Return None
-    otherwise."""
-    if target is not None and tag_campaign == campaign and tag_target == target \
-       and (tag_retry if tag_retry is not None else u64(0)) == retry and release == target:
-        return state
+def prepare_for(campaign: str, target: ?str, attempt: u64, tag_campaign: ?str,
+                tag_target: ?str, prepares: list[(u64, ?str, ?str)]) -> ?str:
+    """Return the state of the prepare of the attempt attempt of a member of
+    the campaign with the target release target, when the prepare copies or
+    copied the target. prepares has the number, and the release and state
+    of the prepare, of each attempt that the device reports for tag_campaign
+    and tag_target. Return None otherwise."""
+    if target is None or tag_campaign != campaign or tag_target != target:
+        return None
+    for a in prepares:
+        if a.0 == attempt and a.1 == target:
+            return a.2
     return None
+
+
+def controller_status(status: ?str, stage: ?str) -> (?str, bool):
+    """Return the status that the controller takes for the counted attempt
+    of a member, which has status and stage, and whether a failed rollback
+    left the device as it is. A not-started attempt is such a failure: the
+    run of an earlier attempt failed its rollback, and this one did not
+    start."""
+    if status == "not-started":
+        return ("failed", True)
+    return (status, status == "failed" and stage == "rollback")
 
 
 def kept_run_since(memory: ?CampaignMemory) -> ?int:
@@ -833,23 +850,24 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     The actor writes the intent of every member directly, in plan and in
     run, with the campaign's veto. So each member reads the release it runs
     and answers, but installs nothing. In run, the actor removes the veto of
-    the members in flight, and puts it back when they are done. A status
-    counts only when it is for the campaign's intent: the device reports
-    the campaign, the member's target release and its retry with it. The
-    controller releases only the members whose status answers the target,
+    the members in flight, and puts it back when they are done. Of the
+    attempts that a device reports for the campaign and the member's target
+    release, the one in-progress counts, else the member's attempt. A
+    not-started attempt counts as a failed rollback. The controller
+    releases only the members whose status answers the target,
     upgrade-needed or a final status, and its plan holds the others with
     an alarm. A member that still upgrades from before a pause or a restart
     counts in flight, and keeps the veto. In plan, the actor plans what a
     new run would do, again when what the members report changes. A member
     that leaves the campaign is forgotten: added again, it is a new member.
-    So is a member with a new retry. A run of an earlier retry that is
+    So is a member with a new attempt. A run of an earlier attempt that is
     still under way counts in flight until it ends.
 
     With allow-staging, in run, the actor writes allow-staging for each
     member from its turn to prepare until its prepare ends, it is released,
     or a window of its schedule opens, as the controller says. A prepare
-    counts only when it is for the campaign's intent and copies the
-    member's target release.
+    counts only when it is the prepare of the member's attempt and copies
+    the member's target release.
 
     The actor takes run-since from the campaign's memory, gives the
     controller the windows that the notification period lets the campaign
@@ -857,19 +875,21 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     """
     var members: list[str] = []
     var member_names: set[str] = set()
-    # What each device reports: its software state, the campaign, the
-    # target release and the retry that its status is for, the vetoes of its
-    # configuration, its prepare and install, and the version and model its
-    # platform has.
-    var latest: dict[str, (status: ?str, upgrade_campaign: ?str, target_release: ?str,
-                           retry: ?u64, version: ?str, model: ?str, stage: ?str,
-                           reason: ?str, vetoes: list[(str, ?str)],
-                           prepare: (state: ?str, release: ?str, started: ?str,
-                                     ended: ?str, message: ?str, progress: ?u64),
-                           install: (state: ?str, release: ?str, started: ?str,
-                                     ended: ?str, message: ?str),
-                           precheck: (verdict: ?str, detail: ?str, at: ?str),
-                           postcheck: (verdict: ?str, detail: ?str, at: ?str))] = {}
+    # What each device reports: the campaign and the target release of its
+    # attempts, the attempts, the vetoes of its configuration, and the
+    # version and model its platform has.
+    var latest: dict[str, (upgrade_campaign: ?str, target_release: ?str,
+                           attempts: list[(number: u64, status: ?str, stage: ?str,
+                                           reason: ?str,
+                                           prepare: (state: ?str, release: ?str,
+                                                     started: ?str, ended: ?str,
+                                                     message: ?str, progress: ?u64),
+                                           install: (state: ?str, release: ?str,
+                                                     started: ?str, ended: ?str,
+                                                     message: ?str),
+                                           precheck: (verdict: ?str, detail: ?str, at: ?str),
+                                           postcheck: (verdict: ?str, detail: ?str, at: ?str))],
+                           vetoes: list[(str, ?str)], version: ?str, model: ?str)] = {}
     # Whether each device's flotilla is connected to it, and whether the top
     # is connected to each flotilla, as they report it. A device or a
     # flotilla that is not here has not reported.
@@ -899,15 +919,15 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     # a copy of it that starts a new run.
     var shown = fctl.Controller()
     # The campaign and the inventory from the last on_conf, the target
-    # release and the retry of each member, the output written last, and the members in
-    # flight and the members let prepare that it was written with.
+    # release and the attempt of each member, the output written last, and the
+    # members in flight and the members let prepare that it was written with.
     var campaign: ?y_0.software__software__upgrade_campaign_entry = None
     var inventory = y_0.root()
     # The members of the campaign as the controller takes them, from the
     # campaign and the inventory of the last on_conf.
     var member_info: ?CampaignMembers = None
     var targets: dict[str, str] = {}
-    var retries: dict[str, u64] = {}
+    var attempts: dict[str, u64] = {}
     var output: ygdata.Node = base.o_root().to_gdata()
     var unheld: set[str] = set()
     var allowed: set[str] = set()
@@ -919,26 +939,45 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         stops if it has not reached its install."""
         return ctl.upgrading()
 
-    def own_status(name: str, tag_campaign: ?str, tag_target: ?str, tag_retry: ?u64,
-                   status: ?str) -> ?str:
-        """Return the status of the device name when it is for the
-        campaign's intent for the device, and None otherwise."""
+    def counted(name: str):
+        """Return the attempt of the device name that counts for the
+        campaign, as the device reports it, or None."""
+        observed = latest.get(name)
         current = campaign
-        if current is not None:
-            return status_for(current.name, targets.get(name), retries.get_def(name, 0),
-                              tag_campaign, tag_target, tag_retry, status)
+        if observed is not None and current is not None:
+            n = counted_attempt(current.name, targets.get(name), attempts.get_def(name, 0),
+                                observed.upgrade_campaign, observed.target_release,
+                                [(a.number, a.status) for a in observed.attempts])
+            if n is not None:
+                for a in observed.attempts:
+                    if a.number == n:
+                        return a
         return None
 
-    def own_prepare(name: str, tag_campaign: ?str, tag_target: ?str, tag_retry: ?u64,
-                    release: ?str, state: ?str) -> ?str:
-        """Return the state of the prepare of the device name when the
-        prepare is for the campaign's intent for the device, and None
-        otherwise."""
+    def own_prepare(name: str) -> ?str:
+        """Return the state of the prepare of the device name when it is the
+        prepare of the member's attempt and copies the member's target, and
+        None otherwise."""
+        observed = latest.get(name)
         current = campaign
-        if current is not None:
-            return prepare_for(current.name, targets.get(name), retries.get_def(name, 0),
-                               tag_campaign, tag_target, tag_retry, release, state)
+        if observed is not None and current is not None:
+            return prepare_for(current.name, targets.get(name), attempts.get_def(name, 0),
+                               observed.upgrade_campaign, observed.target_release,
+                               [(a.number, a.prepare.release, a.prepare.state)
+                                for a in observed.attempts])
         return None
+
+    def report(name: str, at: int) -> None:
+        """Tell the controller the status and the prepare of the device name
+        that count for the campaign. The controller gets None for a device
+        that has not answered the campaign."""
+        a = counted(name)
+        if a is not None:
+            s = controller_status(a.status, a.stage)
+            ctl.report(name, s.0, at, s.1)
+        else:
+            ctl.report(name, None, at)
+        ctl.report_prepare(name, own_prepare(name))
 
     def plan_now(now: int) -> None:
         """Plan at time now. A campaign that does not run plans on a copy of
@@ -972,56 +1011,46 @@ actor UpgradeCampaignTransform(path: ttt.Path,
 
         for d in members:
             status: ?str = None
-            prepare: ?str = None
-            version: ?str = None
-            model: ?str = None
+            prepare = own_prepare(d)
+            # A device that has not answered the campaign shows as pending,
+            # and counts nowhere.
+            ds = st.device_status.create(d)
+            a = counted(d)
+            if a is not None:
+                status = a.status
+                ds.attempt = a.number
+                ds.stage = a.stage
+                ds.reason = a.reason
+                ds.prepare.state = a.prepare.state
+                ds.prepare.release = a.prepare.release
+                ds.prepare.started = a.prepare.started
+                ds.prepare.ended = a.prepare.ended
+                ds.prepare.message = a.prepare.message
+                ds.prepare.progress = a.prepare.progress
+                ds.install.state = a.install.state
+                ds.install.release = a.install.release
+                ds.install.started = a.install.started
+                ds.install.ended = a.install.ended
+                ds.install.message = a.install.message
+                ds.precheck.verdict = a.precheck.verdict
+                ds.precheck.detail = a.precheck.detail
+                ds.precheck.at = a.precheck.at
+                ds.postcheck.verdict = a.postcheck.verdict
+                ds.postcheck.detail = a.postcheck.detail
+                ds.postcheck.at = a.postcheck.at
+            ds.status = status if status is not None else "pending"
             observed = latest.get(d)
             if observed is not None:
-                status = own_status(d, observed.upgrade_campaign, observed.target_release,
-                                    observed.retry, observed.status)
-                prepare = own_prepare(d, observed.upgrade_campaign, observed.target_release,
-                                      observed.retry, observed.prepare.release,
-                                      observed.prepare.state)
-                version = observed.version
-                model = observed.model
-
-            # A status that is not for this campaign's intent shows as
-            # pending, and counts nowhere.
-            ds = st.device_status.create(d)
-            ds.status = status if status is not None else "pending"
-            ds.version = version
-            ds.model = model
-            if observed is not None:
-                ds.upgrade_campaign = observed.upgrade_campaign
-                ds.target_release = observed.target_release
-                ds.retry = observed.retry
-                ds.stage = observed.stage
-                ds.reason = observed.reason
+                ds.version = observed.version
+                ds.model = observed.model
                 for v in observed.vetoes:
                     ds.veto.create(v.0, reason=v.1)
-                ds.prepare.state = observed.prepare.state
-                ds.prepare.release = observed.prepare.release
-                ds.prepare.started = observed.prepare.started
-                ds.prepare.ended = observed.prepare.ended
-                ds.prepare.message = observed.prepare.message
-                ds.prepare.progress = observed.prepare.progress
-                ds.install.state = observed.install.state
-                ds.install.release = observed.install.release
-                ds.install.started = observed.install.started
-                ds.install.ended = observed.install.ended
-                ds.install.message = observed.install.message
-                ds.precheck.verdict = observed.precheck.verdict
-                ds.precheck.detail = observed.precheck.detail
-                ds.precheck.at = observed.precheck.at
-                ds.postcheck.verdict = observed.postcheck.verdict
-                ds.postcheck.detail = observed.postcheck.detail
-                ds.postcheck.at = observed.postcheck.at
 
             if status == "in-progress":
                 in_progress += 1
             elif status == "succeeded" or status == "up-to-date":
                 succeeded += 1
-            elif status == "failed" or status == "rolled-back":
+            elif status == "failed" or status == "rolled-back" or status == "not-started":
                 failed += 1
             # Only a member that waits for its release counts: the run of a
             # released member fills the same job.
@@ -1162,35 +1191,30 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             name = keys.device_name
             was = live(name)
             if state is not None:
-                pre = state.precheck
-                post = state.postcheck
-                prep = state.prepare
-                inst = state.install
-                value = (status=state.status, upgrade_campaign=state.upgrade_campaign,
-                         target_release=state.target_release, retry=state.retry,
-                         version=state.platform.version,
-                         model=state.platform.model, stage=state.stage, reason=state.reason,
-                         vetoes=[(v.holder, v.reason) for v in state.veto],
+                attempts_seen = []
+                for a in state.attempt:
+                    prep = a.prepare
+                    inst = a.install
+                    pre = a.precheck
+                    post = a.postcheck
+                    attempts_seen.append(
+                        (number=a.number, status=a.status, stage=a.stage, reason=a.reason,
                          prepare=(state=prep.state, release=prep.release, started=prep.started,
                                   ended=prep.ended, message=prep.message,
                                   progress=prep.progress),
                          install=(state=inst.state, release=inst.release, started=inst.started,
                                   ended=inst.ended, message=inst.message),
                          precheck=(verdict=pre.verdict, detail=pre.detail, at=pre.at),
-                         postcheck=(verdict=post.verdict, detail=post.detail, at=post.at))
+                         postcheck=(verdict=post.verdict, detail=post.detail, at=post.at)))
+                value = (upgrade_campaign=state.upgrade_campaign,
+                         target_release=state.target_release, attempts=attempts_seen,
+                         vetoes=[(v.holder, v.reason) for v in state.veto],
+                         version=state.platform.version, model=state.platform.model)
                 # Of the platform the campaign keeps only the version and the
                 # model, so a delivery can change nothing it keeps.
                 if value != latest.get(name):
                     latest[name] = value
-                    # The controller gets only a status that is for this
-                    # campaign's intent, and None for any other.
-                    ctl.report(name, own_status(name, state.upgrade_campaign,
-                                                state.target_release, state.retry,
-                                                state.status),
-                               time.time().unix_s(), state.stage == "rollback")
-                    ctl.report_prepare(name, own_prepare(name, state.upgrade_campaign,
-                                                         state.target_release, state.retry,
-                                                         prep.release, prep.state))
+                    report(name, time.time().unix_s())
                     relevant = name in member_names
                     if relevant:
                         ctl.set_vetoed(name, foreign_veto(name))
@@ -1322,13 +1346,13 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         for name in member_names:
             if name not in names:
                 left.add(name)
-        # A member with a new retry is a new member, like one removed and
+        # A member with a new attempt is a new member, like one removed and
         # added again.
-        new_retries = member_retries(conf)
-        retried: set[str] = set()
-        for name, r in new_retries.items():
-            if name in member_names and r != retries.get_def(name, 0):
-                retried.add(name)
+        new_attempts = member_attempts(conf)
+        tried_again: set[str] = set()
+        for name, r in new_attempts.items():
+            if name in member_names and r != attempts.get_def(name, 0):
+                tried_again.add(name)
         members = ms
         member_names = names
         debounce_s = float(campaign_debounce_s(len(members)))
@@ -1340,10 +1364,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         # The released devices, the ramp and the promises stay: a replan
         # goes on from where the run is.
         configure_campaign(ctl, conf, inventory, now, member_info, run_since)
-        # The controller forgets the members that left and the members
-        # retried. Added again, a member waits until it answers, and starts
-        # in a window.
-        ctl.drop(left | retried)
+        # The controller forgets the members that left and the members with
+        # a new attempt. Added again, a member waits until it answers, and
+        # starts in a window.
+        ctl.drop(left | tried_again)
         take_all_live()
         run_now = conf.admin_state == "run"
         if run_now and not running:
@@ -1352,20 +1376,12 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             ctl.stop()
         running = run_now
         targets = member_targets(conf, inventory)
-        retries = new_retries
+        attempts = new_attempts
         # A new image makes the answers and the prepares for the old target
         # stale, and no device reports that. So report every member again.
         for name in members:
-            observed = latest.get(name)
-            if observed is not None:
-                ctl.report(name, own_status(name, observed.upgrade_campaign,
-                                            observed.target_release, observed.retry,
-                                            observed.status),
-                           now, observed.stage == "rollback")
-                ctl.report_prepare(name, own_prepare(name, observed.upgrade_campaign,
-                                                     observed.target_release, observed.retry,
-                                                     observed.prepare.release,
-                                                     observed.prepare.state))
+            if name in latest:
+                report(name, now)
             ctl.set_vetoed(name, foreign_veto(name))
         # Stop letting prepare the members that may no longer prepare, such
         # as a member whose answer the new image made stale.
