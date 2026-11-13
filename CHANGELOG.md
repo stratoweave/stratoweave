@@ -613,6 +613,13 @@
   takes, and adding, importing, removing or scheduling devices updates the
   devices list without reading the whole fleet again. Newly added devices
   show no model or version until the page is loaded again. [#754]
+- The redundancy group pages, the campaigns list and the device page read
+  only what they show, with the RESTCONF `fields` query parameter. At 20k
+  devices the group pages read 2.8 MB of the fleet instead of 6.6 MB and
+  the campaigns list 0.4 MB of the campaigns instead of 1.4 MB. The device
+  page no longer reads the device's credentials. A campaign's counters are
+  one read instead of four, and on the campaigns list the plan alarms come
+  with them.
 - Fixed the campaign plan timeline drawing a crowded window past its end.
   Its columns grow taller instead. [#761]
 - fleetmgr and flotilla run Acton's generational garbage collector. Start

@@ -3,6 +3,7 @@ import { getListEntryPath, restconfGetCachedOrNull, restconfGetOrNull } from '#l
 import {
   CAMPAIGN_LIST_ROOT,
   CAMPAIGN_SETTINGS,
+  DEVICE_FIELDS,
   FLEET_DEVICE_LIST_ROOT,
   SCHEDULES_ROOT,
   parseCampaignConfigs,
@@ -46,7 +47,7 @@ async function inCampaign(
 async function loadDevice(name: string, fetch: typeof globalThis.fetch) {
   try {
     const [entry, schedules] = await Promise.all([
-      restconfGetOrNull<unknown>(getListEntryPath(FLEET_DEVICE_LIST_ROOT, name), fetch),
+      restconfGetOrNull<unknown>(`${getListEntryPath(FLEET_DEVICE_LIST_ROOT, name)}?fields=${DEVICE_FIELDS}`, fetch),
       restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch)
     ]);
     return { device: parseDeviceEntry(entry), schedules: parseSchedules(schedules), loadError: '' };

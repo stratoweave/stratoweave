@@ -6,8 +6,6 @@ import type { CatalogImage } from '#lib/software/images.ts';
 // so creation merges into `data` under the module-qualified wrappers.
 export const DATA_ROOT = 'data';
 export const SOFTWARE_ROOT = 'data/software:software';
-/** The campaigns without their published state: RFC 8040 content=config. */
-export const SOFTWARE_CONFIG = `${SOFTWARE_ROOT}?content=config`;
 export const SCHEDULES_ROOT = 'data/maintenance:schedules';
 export const SCHEDULE_LIST_ROOT = 'data/maintenance:schedules/schedule';
 export const CAMPAIGN_LIST_ROOT = 'data/software:software/upgrade-campaign';
@@ -21,9 +19,12 @@ export const REDUNDANCY_GROUP_LIST_ROOT = `${REDUNDANCY_GROUPS_ROOT}/redundancy-
 // Smaller reads with the RFC 8040 fields parameter. A list entry with
 // nothing selected in it is left out, so a read that needs every entry
 // selects its key. Pages that share one of these share its cached read.
-/** The fleet as parseFleet reads it: no credentials or mock settings,
- * which are most of a device entry. */
-export const FLEET_LIST = `${FLEET_ROOT}?fields=device(name;type;description;schedule;address(address;port);redundancy-group;redundancy-priority;state/platform(model;version;serial-number))`;
+/** A device entry as parseDevice reads it: no credentials or mock
+ * settings, which are most of it, and of its state only the platform. */
+export const DEVICE_FIELDS =
+  'name;type;description;schedule;address(address;port);redundancy-group;redundancy-priority;state/platform(model;version;serial-number)';
+/** The fleet as parseFleet reads it. */
+export const FLEET_LIST = `${FLEET_ROOT}?fields=device(${DEVICE_FIELDS})`;
 /** The devices bound to a schedule, with the binding. Config only: the
  * state of 100k devices doubles the time of the read. */
 export const FLEET_SCHEDULES = `${FLEET_ROOT}?content=config&fields=device/schedule`;
@@ -31,6 +32,9 @@ export const FLEET_SCHEDULES = `${FLEET_ROOT}?content=config&fields=device/sched
 export const CAMPAIGN_SETTINGS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign(name;admin-state;default-schedule)`;
 /** The campaigns that have devices, with the names of their devices only. */
 export const CAMPAIGN_MEMBERS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign/device/name`;
+/** Every campaign with its admin state and the names of its devices, not
+ * their images. */
+export const CAMPAIGN_LIST = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign(name;admin-state;device/name)`;
 
 export type AdminState = 'plan' | 'run';
 
@@ -494,7 +498,7 @@ function parseDevice(entry: DeviceJson): Device {
   };
 }
 
-export function countersOf(total: number, inProgress: number, succeeded: number, failed: number): CampaignCounters {
+function countersOf(total: number, inProgress: number, succeeded: number, failed: number): CampaignCounters {
   return {
     total,
     inProgress,

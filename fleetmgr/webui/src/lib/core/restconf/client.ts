@@ -112,13 +112,12 @@ export async function restconfGetOrNull<T>(path: string, fetchFn: Fetch = fetch)
   }
 }
 
-// The devices and new-campaign pages and the search read the same fleet
-// list, which at 100k devices is 14 MB, so one read serves every page
-// opened within READ_CACHE_MS. The schedules and device pages read their
-// smaller parts of the fleet and campaigns through it too. A write through
-// this client drops the cache
-// and the Refresh button bypasses it; what others change shows up when the
-// entry expires.
+// The devices, groups and new-campaign pages and the search read the same
+// fleet list, which at 100k devices is 14 MB, so one read serves every page
+// opened within READ_CACHE_MS. The schedules, group and device pages read
+// their smaller parts of the fleet and campaigns through it too. A write
+// through this client drops the cache and the Refresh button bypasses it;
+// what others change shows up when the entry expires.
 const READ_CACHE_MS = 30_000;
 const readCache = new Map<string, { at: number; value: Promise<unknown> }>();
 

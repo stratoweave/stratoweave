@@ -1,15 +1,15 @@
 // The campaign page's live data: the loader's snapshot, kept fresh by one
 // tick every FAST_MS that decides what to read. A campaign of up to
 // FAST_ENTRY_LIMIT members gets its state node every tick; a larger one
-// its four counter leaves every tick, and its state every slow gap, or
-// half a gap after the last one when `failed` moved. The config comes
-// every slow gap with content=config, which is also how an outside change
-// or a deletion shows. The slow gap is SLOW_MS, or SLOW_COST times the
-// last state read when that is longer: at 100k members the state is 22 MB
-// and takes the server over a second, during which it answers no other
-// read. Without published state a small campaign's tick reads the whole
-// entry, which tells a campaign that has not reported yet from one that
-// was deleted; a large one reads its counter leaves until they appear.
+// its counters every tick, and its state every slow gap, or half a gap
+// after the last one when `failed` moved. The config comes every slow gap
+// with content=config, which is also how an outside change or a deletion
+// shows. The slow gap is SLOW_MS, or SLOW_COST times the last state read
+// when that is longer: at 100k members the state is 22 MB and takes the
+// server over a second, during which it answers no other read. Without
+// published state a small campaign's tick reads the whole entry, which
+// tells a campaign that has not reported yet from one that was deleted; a
+// large one reads its counters until they appear.
 //
 // Every read takes a sequence number when it starts. What it brings back
 // is used only if it is newer than what is shown of its kind, started

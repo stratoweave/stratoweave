@@ -1,7 +1,7 @@
 import { errorText } from '#lib/core/errors.ts';
 import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import { groupRows } from '#lib/software/groups.ts';
-import { FLEET_ROOT, REDUNDANCY_GROUPS_ROOT, parseFleet, parseGroupSeparations } from '#lib/software/model.ts';
+import { FLEET_LIST, REDUNDANCY_GROUPS_ROOT, parseFleet, parseGroupSeparations } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 
@@ -12,7 +12,7 @@ export const load: PageLoad = async ({ fetch, depends }) => {
 
   try {
     const [fleet, groups] = await Promise.all([
-      restconfGetCachedOrNull<unknown>(FLEET_ROOT, fetch),
+      restconfGetCachedOrNull<unknown>(FLEET_LIST, fetch),
       restconfGetOrNull<unknown>(REDUNDANCY_GROUPS_ROOT, fetch)
     ]);
     return { rows: groupRows(parseFleet(fleet).devices, parseGroupSeparations(groups)), loadError: '' };

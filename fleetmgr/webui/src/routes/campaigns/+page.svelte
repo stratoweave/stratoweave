@@ -13,8 +13,7 @@
   let { data }: PageProps = $props();
 
   // Discovery (config plus counters and alarms) reloads every 30 s; up to
-  // six running campaigns, busy ones first, get fresh counters from the
-  // leaf GETs every tick. A live value shows only while it is newer than
+  // six running campaigns, busy ones first, get fresh counters every tick. A live value shows only while it is newer than
   // the last load, so one that stopped being polled gives way to the reload.
   let live = $state.raw<Record<string, { seq: number; counters: CampaignCounters }>>({});
 
