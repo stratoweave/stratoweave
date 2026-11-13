@@ -157,13 +157,12 @@ member added later, also while the campaign runs, is acquired the same way.
 In `run`, the campaign removes the veto of a member when it releases the
 member in a window, and puts the veto back when the member is done.
 
-A member's `device-status` shows its status only when the status is for
-the campaign's intent: the device reports it for the campaign's name, the
-member's target release and the member's attempt. A status without an
-attempt is for attempt 0. `in-progress` counts for any attempt, because a
-run of an earlier attempt is still under way. Otherwise it shows `pending`, and the
-counters do not count it. Its `upgrade-campaign`, `target-release` and
-`attempt` say which intent the device's status is for.
+A member's `device-status` shows the attempt that counts for the member.
+Of the attempts that its device reports for the campaign's name and the
+member's target release, that is the one `in-progress`, because a run of
+an earlier attempt is still under way, and else the member's `attempt`.
+Its `attempt` says which one. A member whose device has not answered that
+attempt shows `pending`, and the counters do not count it.
 
 The campaign releases a member only once the member has answered its
 target: its status is `upgrade-needed`, or a final status. A member that
@@ -193,15 +192,16 @@ campaign's veto: it holds a slot and its redundancy groups until it is
 done, or until it stops before its install and waits again.
 
 Stopping and running a campaign again does not try its failed members
-again. To try a member again, change its `attempt`, for example from 0 to
-1. The
-campaign then takes it as a new member, as if it was removed and added
-again: the device reads its release again, and the campaign holds the
-member until it answers the new attempt, and releases it in a window. A
-member that succeeded reads again and answers `up-to-date`. A member in
-flight gets the campaign's veto back: its run stops before the install,
-or, past the install, finishes and holds its slot until it ends. Removing
-the member and adding it again, in two edits, also tries it again.
+again, and neither does removing a member and adding it again: its device
+keeps the final status of its attempt. A member removed while in flight
+stops before its install and answers `upgrade-needed`, so added again it
+waits for a window. To try a member again, change its `attempt`, for
+example from 0 to 1. The campaign then takes it as a new member: the
+device reads its release again, and the campaign holds the member until
+it answers the new attempt, and releases it in a window. A member that
+succeeded reads again and answers `up-to-date`. A member in flight gets
+the campaign's veto back: its run stops before the install, or, past the
+install, finishes and holds its slot until it ends.
 
 With `failure-budget`, a campaign stops its releases when too many members
 fail. The budget is a percent of the members the campaign has, rounded
@@ -366,8 +366,9 @@ the whole list.
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription on the flotilla
 to the device's `/device/software/state` and `/device/state`, and publishes
-the status, the campaign, target release and attempt the status is for, the
-stage, reason and check verdicts in the entry's own `state`, the platform as
+the campaign and target release of the device's attempts, each attempt with
+its status, stage, reason, prepare, install and check verdicts, and the
+vetoes in the entry's own `state`, the platform as
 its `state/platform`, and whether the flotilla is connected to the device as
 `state/connected`. A change on one device publishes one entry. Removing the
 entry closes the subscription and clears the state. Each campaign transform
@@ -406,7 +407,7 @@ without NETCONF, such as 16.8 on a C1111, has its BGP state from the
 `iosxe-cli` adapter.
 
 Nothing is read from the device between checks and nothing is published
-but the verdicts, under `/device{cpe}/software/state/precheck` and
+but the verdicts, under `/device{cpe}/software/state/attempt/precheck` and
 `postcheck`. The top carries both up to the campaign's `device-status`, next
 to the device's status, the step its upgrade is at and why it stopped. The mock IOS XE
 device serves one established BGP neighbor, so in the demo both checks pass

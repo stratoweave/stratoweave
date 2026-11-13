@@ -24,9 +24,16 @@ mut def telemetry(states: list[(str, str)]) -> gdata.Node:
     root = oper.root()
     for name, status in states:
         device = root.device.create(name, description="not selected")
-        device.software.state.status = status
-        device.software.state.stage = "prepare"
+        device.software.state.attempt.create(0, status=status, stage="prepare")
     return root.to_gdata()
+
+
+def first_attempt(state: oper.stratoweave_rfs__device__software__state) -> (?str, ?str):
+    """The status and the stage of attempt 0 in state."""
+    a = state.attempt.get(u64(0))
+    if a is not None:
+        return (a.status, a.stage)
+    return (None, None)
 
 
 def new_device(t: testing.EnvT, name: str, on_change: bool) -> swdev.DeviceMgr:
@@ -105,8 +112,8 @@ actor GeneratedOperDelivery(t: testing.EnvT, on_change: bool):
             if device.name != keys!.device_name or device.description is not None:
                 fail("typed device keys or selected fields are wrong")
             else:
-                received("device", keys!.device_name, device.software.state.status,
-                         device.software.state.stage)
+                got = first_attempt(device.software.state)
+                received("device", keys!.device_name, got.0, got.1)
         else:
             received("device", keys!.device_name, None, None)
 
@@ -114,7 +121,8 @@ actor GeneratedOperDelivery(t: testing.EnvT, on_change: bool):
         if err is not None or keys is None:
             fail("typed state callback failed: {err}")
         elif state is not None:
-            received("state", keys!.device_name, state.status, state.stage)
+            got = first_attempt(state)
+            received("state", keys!.device_name, got.0, got.1)
         else:
             received("state", keys!.device_name, None, None)
 
@@ -134,8 +142,8 @@ actor GeneratedOperDelivery(t: testing.EnvT, on_change: bool):
             server!.set_oper_ds(telemetry([("a", "in-progress"), ("b", "in-progress")]))
             state = oper.subs.device.software.state
             period = None if on_change else 0.05
-            want = {state.status.subscribe(period=period),
-                    state.stage.subscribe(period=period)}
+            want = {state.attempt.status.subscribe(period=period),
+                    state.attempt.stage.subscribe(period=period)}
             manager.declare({oper.subs.device.dst(on_device).deliver(want),
                              state.dst(on_state).deliver(want)}, synced=synced)
         else:
@@ -170,27 +178,34 @@ mut def device_conf(name: str) -> gdata.Node:
 
 
 mut def software(states: list[(str, ?str, ?str)]) -> gdata.Node:
-    """Build the flotilla oper tree: one (name, status, stage) per device.
-    Each device also has a platform: until acton-yang's gdata.filter is
-    fixed, the subscription leaves out a device without one."""
+    """Build the flotilla oper tree: one (name, status, stage) of attempt 0
+    per device. Each device also has a platform: until acton-yang's
+    gdata.filter is fixed, the subscription leaves out a device without
+    one."""
     root = oper.root()
     for name, status, stage in states:
         device = root.device.create(name, description="not selected")
-        device.software.state.status = status
-        device.software.state.stage = stage
+        device.software.state.attempt.create(0, status=status, stage=stage)
         device.state.platform.version = "17.18.2"
     return root.to_gdata()
 
 
+mut def attempt0(data: gdata.Node) -> ?y1_oper.stratoweave_rfs__rfs__device__state__attempt_entry:
+    """Attempt 0 in one publication of the device actor."""
+    return y1_oper.stratoweave_rfs__rfs__device_entry.from_gdata(data).state.attempt.get(u64(0))
+
+
 mut def published(data: ?gdata.Node) -> str:
-    """Describe one publication of the device actor: the device name, status
-    and stage, or "cleared"."""
+    """Describe one publication of the device actor: the device name, and
+    the status and stage of attempt 0, or "cleared"."""
     if data is not None:
         entry = y1_oper.stratoweave_rfs__rfs__device_entry.from_gdata(data)
         if entry.type is not None or entry.description is not None:
             return "config of {entry.name}"
-        state = entry.state
-        return "{entry.name} {state.status} {state.stage}"
+        a = entry.state.attempt.get(u64(0))
+        if a is not None:
+            return "{entry.name} {a.status} {a.stage}"
+        return "{entry.name} without attempt 0"
     return "cleared"
 
 
@@ -216,7 +231,7 @@ actor _test_device_status_instance(t: testing.EnvT):
         if not done and phase == 1:
             phase = 2
             tree = oper.root.from_gdata(software([("a", "succeeded", None), ("b", "succeeded", "prepare")]))
-            tree.device["a"].software.state.job.create("install", state="done")
+            tree.device["a"].software.state.attempt[u64(0)].job.create("install", state="done")
             server!.set_oper_ds(tree.to_gdata())
 
     def restart():
@@ -243,7 +258,7 @@ actor _test_device_status_instance(t: testing.EnvT):
             # Change the other device, and a job of this one that the actor
             # does not show: no publication.
             tree = oper.root.from_gdata(software([("a", "in-progress", "prepare"), ("b", "succeeded", "prepare")]))
-            tree.device["a"].software.state.job.create("commit", state="running")
+            tree.device["a"].software.state.attempt[u64(0)].job.create("commit", state="running")
             server!.set_oper_ds(tree.to_gdata())
             after 0.1: change_a()
         elif phase == 2:
@@ -302,7 +317,7 @@ mut def preparing(progress: ?int, job_state: str) -> gdata.Node:
     """The flotilla oper tree of device a, in progress in prepare, whose
     prepare job is in job_state with progress."""
     tree = oper.root.from_gdata(software([("a", "in-progress", "prepare")]))
-    job = tree.device["a"].software.state.job.create("prepare", state=job_state)
+    job = tree.device["a"].software.state.attempt[u64(0)].job.create("prepare", state=job_state)
     if progress is not None:
         job.progress = u64(progress)
     return tree.to_gdata()
@@ -311,7 +326,8 @@ mut def preparing(progress: ?int, job_state: str) -> gdata.Node:
 mut def published_progress(data: ?gdata.Node) -> str:
     """The progress in one publication of the device actor."""
     if data is not None:
-        p = y1_oper.stratoweave_rfs__rfs__device_entry.from_gdata(data).state.prepare.progress
+        a = attempt0(data)
+        p = a.prepare.progress if a is not None else None
         return str(p) if p is not None else "None"
     return "cleared"
 
@@ -373,7 +389,8 @@ mut def installing(job_state: str, message: ?str) -> gdata.Node:
     """The flotilla oper tree of device a, in progress in install, whose
     install job is in job_state with message."""
     tree = oper.root.from_gdata(software([("a", "in-progress", "install")]))
-    job = tree.device["a"].software.state.job.create("install", state=job_state, release="17.18.03a")
+    job = tree.device["a"].software.state.attempt[u64(0)].job.create(
+        "install", state=job_state, release="17.18.03a")
     job.message = message
     return tree.to_gdata()
 
@@ -381,8 +398,11 @@ mut def installing(job_state: str, message: ?str) -> gdata.Node:
 mut def published_install(data: ?gdata.Node) -> str:
     """The install job in one publication of the device actor."""
     if data is not None:
-        i = y1_oper.stratoweave_rfs__rfs__device_entry.from_gdata(data).state.install
-        return "{i.state} {i.release} {i.message}"
+        a = attempt0(data)
+        if a is not None:
+            i = a.install
+            return "{i.state} {i.release} {i.message}"
+        return "without attempt 0"
     return "cleared"
 
 
@@ -492,10 +512,11 @@ actor _test_device_status_absent(t: testing.EnvT):
 
 
 actor _test_device_status_verdicts(t: testing.EnvT):
-    """A stage, a reason, the campaign and target release the status
-    answers, a prepare, a check verdict and a platform that change while the
-    status stays the same are published, the prepare with its release, times
-    and message, the verdict with its detail and time."""
+    """The campaign and target release of the attempts, and a stage, a
+    reason, a prepare, a check verdict and a platform that change while the
+    status of the attempt stays the same, are published: the prepare with
+    its release, times and message, the verdict with its detail and
+    time."""
     dev = new_device(t, "device-verdicts", True)
     var server: ?netconf.NetconfMockServer = None
     var device: ?ttt.TransformActor = None
@@ -515,40 +536,48 @@ actor _test_device_status_verdicts(t: testing.EnvT):
         if data is not None:
             entry = y1_oper.stratoweave_rfs__rfs__device_entry.from_gdata(data)
             state = entry.state
-            pre = state.precheck
-            prep = state.prepare
             model = entry.state.platform.model
-            if pre.verdict is None and model is None:
-                tree = oper.root.from_gdata(software([("a", "in-progress", "prepare")]))
-                tree.device["a"].software.state.upgrade_campaign = "paced"
-                tree.device["a"].software.state.target_release = "17.18.03a"
-                tree.device["a"].software.state.stage = "rollback"
-                tree.device["a"].software.state.reason = "commit failed: install-img-commit-fail"
-                tree.device["a"].software.state.job.create(
-                    "prepare", state="failed", release="17.18.03a",
-                    started="2026-10-07T11:00:00Z", ended="2026-10-07T11:02:10Z",
-                    message="copy failed: no space left on bootflash:")
-                check = tree.device["a"].software.state.precheck
-                check.verdict = "pass"
-                check.detail = "rfs-device-health: no BGP neighbors"
-                check.at = "2026-10-07T12:00:00Z"
-                tree.device["a"].state.platform.model = "C8000V"
-                server!.set_oper_ds(tree.to_gdata())
-            elif state.status != "in-progress" or state.upgrade_campaign != "paced" or \
-                 state.target_release != "17.18.03a" or state.stage != "rollback" or \
-                 state.reason != "commit failed: install-img-commit-fail" or \
-                 prep.state != "failed" or prep.release != "17.18.03a" or \
-                 prep.started != "2026-10-07T11:00:00Z" or prep.ended != "2026-10-07T11:02:10Z" or \
-                 prep.message != "copy failed: no space left on bootflash:" or pre.verdict != "pass" or \
-                 pre.detail != "rfs-device-health: no BGP neighbors" or pre.at != "2026-10-07T12:00:00Z" or \
-                 model != "C8000V":
-                fail("unexpected state: {state.status} {state.upgrade_campaign} {state.target_release} "
-                     + "{state.stage} {state.reason} {prep.state} {prep.release} {prep.started} "
-                     + "{prep.ended} {prep.message} {pre.verdict} {pre.detail} {pre.at} {model}")
+            a = state.attempt.get(u64(0))
+            if a is not None:
+                if a.precheck.verdict is None and model is None:
+                    tree = oper.root.from_gdata(software([("a", "in-progress", "prepare")]))
+                    st = tree.device["a"].software.state
+                    st.upgrade_campaign = "paced"
+                    st.target_release = "17.18.03a"
+                    ta = st.attempt[u64(0)]
+                    ta.stage = "rollback"
+                    ta.reason = "commit failed: install-img-commit-fail"
+                    ta.job.create(
+                        "prepare", state="failed", release="17.18.03a",
+                        started="2026-10-07T11:00:00Z", ended="2026-10-07T11:02:10Z",
+                        message="copy failed: no space left on bootflash:")
+                    check = ta.precheck
+                    check.verdict = "pass"
+                    check.detail = "rfs-device-health: no BGP neighbors"
+                    check.at = "2026-10-07T12:00:00Z"
+                    tree.device["a"].state.platform.model = "C8000V"
+                    server!.set_oper_ds(tree.to_gdata())
+                elif a.status != "in-progress" or state.upgrade_campaign != "paced" or \
+                     state.target_release != "17.18.03a" or a.stage != "rollback" or \
+                     a.reason != "commit failed: install-img-commit-fail" or \
+                     a.prepare.state != "failed" or a.prepare.release != "17.18.03a" or \
+                     a.prepare.started != "2026-10-07T11:00:00Z" or \
+                     a.prepare.ended != "2026-10-07T11:02:10Z" or \
+                     a.prepare.message != "copy failed: no space left on bootflash:" or \
+                     a.precheck.verdict != "pass" or \
+                     a.precheck.detail != "rfs-device-health: no BGP neighbors" or \
+                     a.precheck.at != "2026-10-07T12:00:00Z" or model != "C8000V":
+                    prep = a.prepare
+                    pre = a.precheck
+                    fail("unexpected state: {a.status} {state.upgrade_campaign} {state.target_release} "
+                         + "{a.stage} {a.reason} {prep.state} {prep.release} {prep.started} "
+                         + "{prep.ended} {prep.message} {pre.verdict} {pre.detail} {pre.at} {model}")
+                else:
+                    done = True
+                    device!.shutdown(None)
+                    t.success()
             else:
-                done = True
-                device!.shutdown(None)
-                t.success()
+                fail("no attempt 0")
         else:
             fail("state was cleared")
 
