@@ -361,7 +361,7 @@
   the new attempt does not start: it answers the new status `not-started`,
   with the failed attempt in its `reason`. A run that a new target or
   campaign, or a removed target, stops before its install ends at
-  `upgrade-needed`. [#804]
+  `upgrade-needed`. [#804] [#814]
 - Images can be kept in folders inside the image folder. An image in
   `/images/image` has a new `file` leaf, the path of its file there, such as
   `iosxe/17.18/c8000v-universalk9.17.18.03a.SPA.bin`; without it the file is
@@ -583,6 +583,7 @@
   A new attempt set while a run fails its rollback does not start: the
   member shows `not-started`, counts as failed, and holds its redundancy
   groups as a failed rollback does, until it has another attempt. [#804]
+  [#814]
 - A redundancy group's new `failure-policy` says what a failed member does
   to the other members. With `continue`, the default, a member that failed
   or rolled back holds them only until it is done and up again, and the
@@ -1008,6 +1009,7 @@ next. Give it a spin. We’d love to hear what you think.
 [#804]: https://github.com/stratoweave/stratoweave/pull/804
 [#805]: https://github.com/stratoweave/stratoweave/pull/805
 [#811]: https://github.com/stratoweave/stratoweave/pull/811
+[#814]: https://github.com/stratoweave/stratoweave/pull/814
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton#3390]: https://github.com/actonlang/acton/pull/3390
