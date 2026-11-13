@@ -1,8 +1,9 @@
 <script lang="ts">
+  import JobProgress from '#lib/software/JobProgress.svelte';
   import StageChain from '#lib/software/StageChain.svelte';
   import StatusPill from '#lib/software/StatusPill.svelte';
   import type { DeviceStatusRow } from '#lib/software/model.ts';
-  import { stageDetail } from '#lib/software/stages.ts';
+  import { jobProgress, stageDetail } from '#lib/software/stages.ts';
 
   interface Props {
     rows: DeviceStatusRow[];
@@ -25,6 +26,7 @@
     </thead>
     <tbody>
       {#each rows as row (row.device)}
+        {@const progress = jobProgress(row)}
         <tr>
           <td><a class="device-name" href={`/devices/${encodeURIComponent(row.device)}`}>{row.device}</a></td>
           <td><StatusPill status={row.status} raw={row.raw} /></td>
@@ -37,7 +39,15 @@
             {/if}
           </td>
           <td class="mono">{row.version || '—'}</td>
-          <td class="detail">{stageDetail(row) || '—'}</td>
+          <td class="detail">
+            {#if progress !== null}
+              <span class="transfer">
+                <JobProgress value={progress} label={`Image transfer to ${row.device}`} />
+                <span class="mono percent">{progress}%</span>
+              </span>
+            {/if}
+            {stageDetail(row) || '—'}
+          </td>
         </tr>
       {/each}
     </tbody>
@@ -75,5 +85,23 @@
     min-width: 18rem;
     color: var(--sw-text-secondary);
     white-space: normal;
+  }
+
+  /* The bar above the line that says what the device does. */
+  .transfer {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    max-width: 18rem;
+    margin-bottom: 4px;
+  }
+
+  .transfer > :global(.bar) {
+    flex: 1;
+  }
+
+  .percent {
+    font-size: var(--sw-text-2xs);
+    color: var(--sw-text-muted);
   }
 </style>

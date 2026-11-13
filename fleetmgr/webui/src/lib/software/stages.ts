@@ -50,12 +50,40 @@ export function stageView(row: DeviceStatusRow): StageView {
   }
 }
 
+/** What the device does in the step that runs, as its job says: the
+ * transfer of the prepare, the step of the install, or after the install
+ * when the commit window ends. A device that waits for its window may
+ * prepare ahead of it. Empty when its job says nothing. */
+export function jobDetail(row: DeviceStatusRow): string {
+  const { status, stage, prepare, install } = row;
+  if (status === 'upgrade-needed') {
+    if (prepare.state === 'running') return prepare.message ? `preparing · ${prepare.message}` : 'preparing';
+    if (prepare.state === 'failed') return `prepare failed: ${prepare.message}`;
+    return prepare.state === 'done' ? 'prepared' : '';
+  }
+  if (status !== 'in-progress') return '';
+  if (stage === 'prepare' && prepare.state === 'running') return prepare.message;
+  if (stage === 'install' && install.state === 'running') return install.message;
+  if ((stage === 'postcheck' || stage === 'commit') && install.state === 'done') return install.message;
+  return '';
+}
+
+/** The percent of the image that the device has while its prepare
+ * transfers it; null otherwise. */
+export function jobProgress(row: DeviceStatusRow): number | null {
+  const { status, stage, prepare } = row;
+  const preparing = status === 'upgrade-needed' || (status === 'in-progress' && stage === 'prepare');
+  return preparing && prepare.state === 'running' ? prepare.progress : null;
+}
+
 /** One line on what the device is doing or what stopped it; empty when
  * the status says it all. */
 export function stageDetail(row: DeviceStatusRow): string {
   const view = stageView(row);
+  const doing = jobDetail(row);
   const running = view.steps.find((s) => s.state === 'running');
-  if (running) return `${STEP_LABEL[running.step]} running`;
+  if (running) return `${STEP_LABEL[running.step]} running${doing ? ` · ${doing}` : ''}`;
+  if (doing) return doing;
   if (view.steps[0].state === 'skipped') return 'already on the target release';
   const failed = view.steps.find((s) => s.state === 'failed');
   if (!failed) return '';

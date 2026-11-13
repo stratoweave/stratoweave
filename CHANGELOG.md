@@ -613,6 +613,10 @@
 - The prepare in the upgrade status of a fleet device, and in the
   `device-status` of a campaign, has `progress`: how far the device's
   transfer is. [#799]
+- The upgrade status of a fleet device, and the `device-status` of a
+  campaign, have `install`: the device's install job, whose message says
+  what the device does. The web UI shows it for each device of a campaign
+  and on the device page, with a bar for the transfer of the prepare.
 
 ### Dependencies
 
