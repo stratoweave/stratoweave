@@ -29,18 +29,18 @@ Set under `stratoweave-rfs:device=<name>/software`:
 | `target-release` | Release the device should run. Setting it makes the manager read the device, and upgrade it if no veto holds the install. |
 | `image-url` | URL the device downloads the image from. The last part of the path is the file name on the device. |
 | `veto[holder]` | While any entry exists, no install starts. The manager still reads the device. An install already running goes on. |
-| `upgrade-campaign` | Campaign whose intent this is. With `target-release` and `retry` it is the intent that the status answers. |
-| `retry` | A number, 0 by default. A new value is a new intent: the manager reads the device again, and runs a failed upgrade again. A run under way finishes first. |
+| `upgrade-campaign` | Campaign whose intent this is. With `target-release` and `attempt` it is the intent that the status answers. |
+| `attempt` | A number, 0 by default. A new value is a new intent: the manager reads the device again, and runs a failed upgrade again. A run under way finishes first. |
 | `allow-staging` | While a veto holds the install, prepare the target once per intent: copy its image to the device ahead of the window. |
 
-The manager acts when `target-release`, `upgrade-campaign`, `retry`,
+The manager acts when `target-release`, `upgrade-campaign`, `attempt`,
 `allow-staging` or a veto changes, when the device type changes, and when
 the device connects. A new `image-url` alone does not make it act. A status
 that ends a read or a run (`up-to-date`, `succeeded`, `failed` or
 `rolled-back`) is kept while the intent, the campaign, the target and the
-retry, and the device type stay the same. So a reconnect or another config
+attempt, and the device type stay the same. So a reconnect or another config
 change does not run a failed upgrade again. To run it again, change
-`retry`. Removing `target-release` and setting it again does the same.
+`attempt`. Removing `target-release` and setting it again does the same.
 
 ## Upgrade steps
 
@@ -125,7 +125,7 @@ Published under `stratoweave-rfs:device=<name>/software/state`:
 | Leaf | Value |
 | --- | --- |
 | `status` | `unknown`, `up-to-date`, `upgrade-needed`, `in-progress`, `succeeded`, `failed` or `rolled-back` |
-| `upgrade-campaign`, `target-release`, `retry` | The intent the status answers: the campaign, target and retry of the read or run that set it |
+| `upgrade-campaign`, `target-release`, `attempt` | The intent the status answers: the campaign, target and attempt of the read or run that set it |
 | `stage` | The step the run is in, or the step it ended in |
 | `reason` | Why the run failed or rolled back, why the release could not be read, or what held the install |
 | `precheck`, `postcheck` | `verdict` (`not-run`, `pass` or `fail`), `detail`, and `at`, the time of the verdict |
@@ -142,11 +142,11 @@ subscriptions see it right away. A new run removes `reason` and sets both
 verdicts back to `not-run`. So does a status that answers a new intent; it
 also removes `stage`. Removing `target-release` removes the intent from the
 state and keeps the status. A status from another campaign, target or
-retry does not answer the current intent, however final it is. State is not saved;
+attempt does not answer the current intent, however final it is. State is not saved;
 after a restart it is `unknown`.
 
 A prepare under a veto runs once per intent, the campaign, the target and
-the retry, and again after a device type change or a restart. Its result is only in
+the attempt, and again after a device type change or a restart. Its result is only in
 `job[prepare]`: a failed prepare leaves the status `upgrade-needed`, and is
 not run again, also not when `allow-staging` goes off and on. Turning
 `allow-staging` off does not stop a prepare that runs. When the veto goes,
