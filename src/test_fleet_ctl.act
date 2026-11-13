@@ -26,15 +26,20 @@ def configured(windows: list[(str, int, int)], devs: list[(str, int, str)], targ
                priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
                close_margin: int=fleet_ctl.CLOSE_MARGIN, stagger: int=0,
                prepare: bool=False, prepare_s: int=100,
-               failure_budget: int=-1) -> Controller:
+               failure_budget: int=-1, hold_failed: ?set[str]=None) -> Controller:
     """A controller before its first run, every device answered that it
     needs the upgrade. Each device's prepare takes prepare_s seconds."""
     c = Controller()
     c.configure(windows, devs, target, maxc, must_place, debounce, estimate, groups, priority,
                 separation, close_margin, stagger, prepare, {d.0: prepare_s for d in devs},
-                failure_budget)
+                failure_budget, hold_failed)
     sim.answer_all(c, 0)
     return c
+
+
+def hold_all() -> set[str]:
+    """The groups of the tests in this module that hold on a failure."""
+    return {"g", "g1", "g2", "h"}
 
 
 def controller(windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
@@ -43,11 +48,12 @@ def controller(windows: list[(str, int, int)], devs: list[(str, int, str)], targ
                priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
                rung: int=1, close_margin: int=fleet_ctl.CLOSE_MARGIN,
                stagger: int=0, prepare: bool=False, prepare_s: int=100,
-               failure_budget: int=-1) -> Controller:
+               failure_budget: int=-1, hold_failed: ?set[str]=None) -> Controller:
     """A controller at the start of a run, every device answered that it
     needs the upgrade. Each device's prepare takes prepare_s seconds."""
     c = configured(windows, devs, target, maxc, must_place, debounce, estimate, groups, priority,
-                   separation, close_margin, stagger, prepare, prepare_s, failure_budget)
+                   separation, close_margin, stagger, prepare, prepare_s, failure_budget,
+                   hold_failed)
     c.start(rung)
     return c
 
@@ -1773,7 +1779,7 @@ def _test_a_failed_member_holds_the_other_members():
     in no group, still starts."""
     devs = [("r1", 600, "w"), ("r2", 600, "w"), ("r3", 600, "w"), ("d0", 600, "w")]
     c = controller([("w", 0, DAY)], devs, 1, 10, True, groups={"g": ["r1", "r2", "r3"]},
-                   priority={"r1": 1, "r2": 2, "r3": 3})
+                   priority={"r1": 1, "r2": 2, "r3": 3}, hold_failed=hold_all())
     testing.assertEqual(c.decide(0).started, ["r1"])
     c.report("r1", "failed", 600)
     s = c.decide(600)
@@ -1787,13 +1793,100 @@ def _test_a_failed_member_holds_the_other_members():
     testing.assertEqual([e.0 for e in c.layout(c.plan(700))[0].3], ["r1", "d0", "r2", "r3"])
 
 
+def _test_a_failure_holds_its_group_by_the_group_failure_policy():
+    """r1 fails in a group with r2. A group that continues frees r2 once r1
+    is done, after the group's min-separation. A failed rollback leaves r1
+    in an unknown state, so it holds r2 also in a group that continues. A
+    group that holds keeps r2 waiting."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    # (case, r1's status, whether its rollback failed, min-separation,
+    #  whether the group holds, started at 600, the wake at 600, and the
+    #  plan alarms at 600)
+    cases: list[(str, str, bool, int, bool, list[str], int, list[str])] = [
+        ("rolled back", "rolled-back", False, 0, False, ["r2"], 1200, []),
+        ("failed install", "failed", False, 0, False, ["r2"], 1200, []),
+        ("failed, separation", "failed", False, 300, False, [], 900, []),
+        ("failed rollback", "failed", True, 0, False, [], -1,
+         ["1 device(s) wait behind a failed redundancy group member: r2"]),
+        ("group holds", "rolled-back", False, 0, True, [], -1,
+         ["1 device(s) wait behind a failed redundancy group member: r2"]),
+    ]
+    for case in cases:
+        hold: set[str] = {"g"} if case.4 else set()
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["r1", "r2"]},
+                       priority={"r1": 1, "r2": 2}, separation={"g": (False, case.3)},
+                       hold_failed=hold)
+        testing.assertEqual(c.decide(0).started, ["r1"], case.0)
+        c.report("r1", case.1, 600, case.2)
+        s = c.decide(600)
+        testing.assertEqual((s.started, s.wake), (case.5, case.6), case.0)
+        testing.assertEqual(s.plan.alarms, case.7, case.0)
+
+
+def _test_a_failed_member_that_is_down_holds_its_group_until_it_is_up():
+    """r1 rolls back in a group that continues, and is down, rebooting. r2
+    waits until r1 is up again."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["r1", "r2"]},
+                   priority={"r1": 1, "r2": 2})
+    testing.assertEqual(c.decide(0).started, ["r1"])
+    c.report("r1", "rolled-back", 600)
+    c.set_live("r1", False)
+    testing.assertEqual(c.decide(600).started, [])
+    c.set_live("r1", True)
+    testing.assertEqual(c.decide(700).started, ["r2"])
+
+
+def _test_a_failed_rollback_holds_its_group_until_an_operator_acts():
+    """r1's rollback fails in a group that continues. It holds r2 also when
+    its status is lost, as after a restart of its flotilla, and in a new
+    run, as after a pause."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    # (case, whether the status is lost, whether a new run starts)
+    cases: list[(str, bool, bool)] = [
+        ("counted", False, False),
+        ("status lost", True, False),
+        ("new run", False, True),
+    ]
+    for case in cases:
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["r1", "r2"]},
+                       priority={"r1": 1, "r2": 2})
+        testing.assertEqual(c.decide(0).started, ["r1"], case.0)
+        c.report("r1", "failed", 600, True)
+        testing.assertEqual(c.decide(600).started, [], case.0)
+        if case.1:
+            c.lost("r1")
+        if case.2:
+            # The new run takes r1's failure again: it releases r1, which
+            # runs no upgrade.
+            c.stop()
+            c.start()
+        testing.assertTrue("r2" not in c.decide(700).started, case.0)
+        s = c.decide(800)
+        testing.assertEqual(s.started, [], case.0)
+        testing.assertEqual(s.plan.why.get("r2"), ("group-failed", "r1"), case.0)
+
+
+def _test_a_success_after_a_failed_rollback_frees_the_group():
+    """r1's rollback fails, so it holds r2. When r1 later reports a
+    success, r2 starts."""
+    devs = [("r1", 600, "w"), ("r2", 600, "w")]
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["r1", "r2"]},
+                   priority={"r1": 1, "r2": 2})
+    testing.assertEqual(c.decide(0).started, ["r1"])
+    c.report("r1", "failed", 600, True)
+    testing.assertEqual(c.decide(600).started, [])
+    c.report("r1", "succeeded", 700)
+    testing.assertEqual(c.decide(700).started, ["r2"])
+
+
 def _test_a_failed_member_holds_the_members_after_the_held_ones():
     """r1 fails. r2 waits behind r1 in one group, and r3 waits behind r2 in
     another: the plan holds both."""
     devs = [("r1", 600, "w"), ("r2", 600, "w"), ("r3", 600, "w"), ("d0", 600, "w")]
     c = controller([("w", 0, DAY)], devs, 1, 10, True,
                    groups={"g1": ["r1", "r2"], "g2": ["r2", "r3"]},
-                   priority={"r1": 1, "r2": 2, "r3": 3})
+                   priority={"r1": 1, "r2": 2, "r3": 3}, hold_failed=hold_all())
     c.decide(0)
     c.report("r1", "failed", 600)
     testing.assertEqual(c.decide(600).plan.alarms,
@@ -1808,7 +1901,7 @@ def _test_a_failure_that_has_not_counted_yet_holds_the_members():
     wins = [("w", 0, 1600), ("w", DAY, DAY + 1600)]
     devs = [("a", 600, "w"), ("b", 600, "w"), ("d", 600, "w")]
     c = controller(wins, devs, 1, 1, debounce=5, groups={"g": ["a", "b"]},
-                   priority={"a": 1, "b": 2})
+                   priority={"a": 1, "b": 2}, hold_failed=hold_all())
     c.resume("a", 0, wins[0])
     c.report("a", "failed", 600)
     p = c.decide(601).plan
@@ -1822,12 +1915,12 @@ def _test_a_failed_member_holds_a_member_added_before_it():
     """b fails. An operator adds a to the campaign and to b's group, with a
     lower priority than b's. a waits too, in the window of its schedule."""
     wins = [("w", 0, fleet_ctl.OPEN_END)]
-    c = controller(wins, [("b", 600, "w")], 1, 1, groups={"g": ["b"]}, priority={"b": 2})
+    c = controller(wins, [("b", 600, "w")], 1, 1, groups={"g": ["b"]}, priority={"b": 2}, hold_failed=hold_all())
     testing.assertEqual(c.decide(0).started, ["b"])
     c.report("b", "failed", 600)
     c.decide(600)
     c.configure(wins, [("a", 600, "w"), ("b", 600, "w")], 1, 1, False, 0, 600,
-                {"g": ["a", "b"]}, {"a": 1, "b": 2})
+                {"g": ["a", "b"]}, {"a": 1, "b": 2}, hold_failed=hold_all())
     sim.answer_all(c, 700)
     s = c.decide(700)
     testing.assertEqual(s.started, [])
@@ -1842,7 +1935,7 @@ def _test_a_held_member_keeps_the_later_window_promised_to_it():
     though the first is still open."""
     wins = [("w", 0, 1600), ("w", DAY, DAY + 1600)]
     devs = [("r1", 600, "w"), ("d", 600, "w"), ("r2", 900, "w")]
-    c = controller(wins, devs, 1, 1, groups={"g": ["r1", "r2"]}, priority={"r1": 1, "r2": 2})
+    c = controller(wins, devs, 1, 1, groups={"g": ["r1", "r2"]}, priority={"r1": 1, "r2": 2}, hold_failed=hold_all())
     testing.assertEqual(c.decide(0).plan.starts["r2"], (1, DAY))
     c.report("r1", "failed", 600)
     p = c.decide(600).plan
@@ -1900,7 +1993,7 @@ def _test_members_looked_at_again_start_in_the_order_of_their_promises():
     devs = [("f1", 600, "w"), ("f2", 600, "w"), ("h1", 600, "w"), ("h2", 600, "w"),
             ("d1", 1200, "w"), ("d2", 1800, "w")]
     c = controller(wins, devs, 2, 2, groups={"g1": ["f1", "h1"], "g2": ["f2", "h2"]},
-                   priority={"f1": 1, "h1": 2, "f2": 1, "h2": 2}, rung=2)
+                   priority={"f1": 1, "h1": 2, "f2": 1, "h2": 2}, rung=2, hold_failed=hold_all())
     testing.assertEqual(c.decide(0).started, ["f1", "f2"])
     c.report("f1", "failed", 600)
     c.report("f2", "failed", 600)
@@ -1921,7 +2014,7 @@ def _test_a_member_looked_at_again_starts_before_later_promises():
     done, h starts before d."""
     wins = [("w", 0, fleet_ctl.OPEN_END)]
     devs = [("f", 600, "w"), ("h", 600, "w"), ("x", 600, "w"), ("d", 600, "w")]
-    c = controller(wins, devs, 1, 1, groups={"g": ["f", "h"]}, priority={"f": 1, "h": 2})
+    c = controller(wins, devs, 1, 1, groups={"g": ["f", "h"]}, priority={"f": 1, "h": 2}, hold_failed=hold_all())
     testing.assertEqual(c.decide(0).plan.starts,
                         {"f": (0, 0), "h": (0, 600), "x": (0, 1200), "d": (0, 1800)})
     c.report("f", "failed", 600)
@@ -1964,11 +2057,11 @@ def _test_an_operator_frees_the_members_of_a_failed_one():
         ("out of the campaign", [("r2", 600, "w")], {"g": ["r2"]}),
     ]
     for case in cases:
-        c = controller(wins, devs, 1, 1, groups={"g": ["r1", "r2"]}, priority=priority)
+        c = controller(wins, devs, 1, 1, groups={"g": ["r1", "r2"]}, priority=priority, hold_failed=hold_all())
         testing.assertEqual(c.decide(0).started, ["r1"], case.0)
         c.report("r1", "rolled-back", 600)
         testing.assertEqual(c.decide(600).started, [], case.0)
-        c.configure(wins, case.1, 1, 1, False, 0, 600, case.2, priority)
+        c.configure(wins, case.1, 1, 1, False, 0, 600, case.2, priority, hold_failed=hold_all())
         testing.assertEqual(c.decide(700).started, ["r2"], case.0)
 
 
@@ -1985,7 +2078,7 @@ def _test_a_later_success_frees_the_rest():
     devs = [("r1", 600, "w"), ("r2", 600, "w")]
     for case in cases:
         c = controller([("w", 0, DAY)], devs, 1, 1, groups={"g": ["r1", "r2"]},
-                       priority={"r1": 1, "r2": 2})
+                       priority={"r1": 1, "r2": 2}, hold_failed=hold_all())
         testing.assertEqual(c.decide(0).started, ["r1"])
         c.report("r1", "failed", 600)
         testing.assertEqual(c.decide(600).started, [])
@@ -2021,7 +2114,7 @@ def _test_a_member_held_past_its_window_starts_when_freed():
     wins = [("s", 0, 230), ("s", 0, fleet_ctl.OPEN_END)]
     devs = [("q", 100, "s"), ("z", 100, "s"), ("r", 100, "s")]
     c = controller(wins, devs, 2, 2, estimate=100, groups={"g1": ["q", "r"], "g2": ["z", "r"]},
-                   priority={"q": 1, "z": 1, "r": 2}, rung=2)
+                   priority={"q": 1, "z": 1, "r": 2}, rung=2, hold_failed=hold_all())
     testing.assertEqual(c.decide(0).started, ["q", "z"])
     c.decide(100)
     c.decide(101)
@@ -2557,7 +2650,7 @@ def _test_answers_before_release():
     ]
     for case in cases:
         c = controller([("w", 1000, fleet_ctl.OPEN_END)], [("x", 600, "w"), ("y", 600, "w")], 1,
-                       1, groups={"g": ["x", "y"]}, priority={"x": 1, "y": 2})
+                       1, groups={"g": ["x", "y"]}, priority={"x": 1, "y": 2}, hold_failed=hold_all())
         c.report("x", case.0, 500)
         testing.assertEqual(c.decide(1000).started, case.1, case.0)
         s = c.decide(1001)
@@ -3547,7 +3640,7 @@ def _test_a_failure_budget_with_redundancy_groups():
     for case in cases:
         label = "budget {case.0}"
         c = controller([("w", 0, DAY)], devs, 1, 10, True, groups={"g": ["r1", "r2", "r3"]},
-                       priority={"r1": 1, "r2": 2, "r3": 3}, failure_budget=case.0)
+                       priority={"r1": 1, "r2": 2, "r3": 3}, failure_budget=case.0, hold_failed=hold_all())
         testing.assertEqual(c.decide(0).started, ["r1"], label)
         c.report("r1", "failed", 600)
         s = c.decide(600)
@@ -3654,7 +3747,7 @@ def _test_a_member_held_when_its_window_closes_loses_its_promise():
     for case in cases:
         label = case.0
         c = controller(wins, devices("d", 4, 600, "w"), 1, 1, groups={"g": ["d0", "d1"]},
-                       priority={"d0": 1, "d1": 2})
+                       priority={"d0": 1, "d1": 2}, hold_failed=hold_all())
         testing.assertEqual(c.decide(0).started, ["d0"], label)
         if label == "down":
             c.set_live("d1", False)
@@ -3872,7 +3965,7 @@ def _test_why_each_device_is_held():
     ]
     for case in cases:
         c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups=groups,
-                       priority=priority, failure_budget=case.1)
+                       priority=priority, failure_budget=case.1, hold_failed=hold_all())
         testing.assertEqual(c.decide(0).started, ["r1"], case.0)
         c.report("r1", case.2, 600)
         for name in case.3:

@@ -234,6 +234,13 @@ starts. Each held member's `device-status` says why in `held`, and
 `held-by` names the device or the flotilla that holds it. The state's
 `held` counts them.
 
+A redundancy group's `failure-policy` says what a failed member does to
+the other members. With `continue`, the default, a member that failed or
+rolled back holds them only until it is done and up again; the next
+member starts after the group's `min-separation`. A member whose rollback
+failed holds them until an operator acts, as all failures do with
+`hold`.
+
 With `notification-period`, in days, a campaign uses only the windows that
 open that long or more after its `run-since`, so that the customers of its
 members can be told about their window in time. `run-since` is in the
