@@ -337,7 +337,7 @@
   the check and the transfer of the image, and `waiting for the device to
   boot`. The IOS XE CLI adapter has `install-progress`, the last step line
   of the install command that runs. The IOS XE mock lists an operation that
-  runs in `install-oper` and goes through its stages.
+  runs in `install-oper` and goes through its stages. [#803]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -617,6 +617,7 @@
   campaign, have `install`: the device's install job, whose message says
   what the device does. The web UI shows it for each device of a campaign
   and on the device page, with a bar for the transfer of the prepare.
+  [#803]
 
 ### Dependencies
 
