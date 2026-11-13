@@ -4,6 +4,7 @@
 
   import DeviceGroups from '#lib/software/DeviceGroups.svelte';
   import DevicePicture from '#lib/software/DevicePicture.svelte';
+  import JobProgress from '#lib/software/JobProgress.svelte';
   import StageChain from '#lib/software/StageChain.svelte';
   import StatusPill from '#lib/software/StatusPill.svelte';
   import { errorText } from '#lib/core/errors.ts';
@@ -17,7 +18,7 @@
     type DeviceStatusRow,
     type Step
   } from '#lib/software/model.ts';
-  import { stageDetail, stageView } from '#lib/software/stages.ts';
+  import { jobDetail, jobProgress, stageDetail, stageView } from '#lib/software/stages.ts';
   import { formatClock } from '#lib/core/time.ts';
   import type { PageProps } from './$types';
 
@@ -120,8 +121,11 @@
     });
   }
 
-  /** What neither the chain nor the check rows show. */
+  /** What neither the chain nor the check rows show: what the device does
+   * now, or what stopped it. */
   function note(row: DeviceStatusRow): string {
+    const doing = jobDetail(row);
+    if (doing) return doing;
     const view = stageView(row);
     if (view.steps[0].state === 'skipped') return 'already on the target release';
     if (!view.steps.some((s) => s.state === 'failed')) return '';
@@ -193,6 +197,7 @@
     {#each campaigns as campaign (campaign.name)}
       {@const row = campaign.row}
       {@const text = note(row)}
+      {@const progress = jobProgress(row)}
       <div class="run">
         <div class="run-head">
           <div class="facts">
@@ -218,6 +223,12 @@
           {/if}
         </div>
         <div class="track"><StageChain {row} large /></div>
+        {#if progress !== null}
+          <div class="transfer">
+            <JobProgress value={progress} label={`Image transfer to ${device.name}`} />
+            <span class="mono percent">{progress}%</span>
+          </div>
+        {/if}
         {#if text}
           <p class="note">{text}</p>
         {/if}
@@ -376,6 +387,28 @@
     text-align: center;
     font-size: 13px;
     color: var(--sw-text-secondary);
+  }
+
+  /* Under the chain, above the note that says what the device does. */
+  .transfer {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: min(100%, 420px);
+    margin: -12px auto 20px;
+  }
+
+  .transfer > :global(.bar) {
+    flex: 1;
+  }
+
+  .transfer + .note {
+    margin-top: -12px;
+  }
+
+  .percent {
+    font-size: 13px;
+    color: var(--sw-text-muted);
   }
 
   .check {

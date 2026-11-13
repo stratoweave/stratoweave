@@ -200,7 +200,10 @@ the campaign page draws them on a timeline, one cell per device, that takes
 the live status as the run passes them. Below it, each device's run is a
 chain of its steps, prepare, pre-check, install, post-check and commit: the
 step running now pulses, a failed step is red with a cross, and a rollback
-shows as ↺ after it; the device's `reason` says why the run stopped. The UI
+shows as ↺ after it; the device's `reason` says why the run stopped. Next to
+the chain, the message of the device's `prepare` or `install` says what the
+device does now, as `add: extract`, with a bar while the prepare transfers
+the image, and after the install when the commit window ends. The UI
 adds no semantics the model does not carry —
 anything done here can be done identically over NETCONF or plain RESTCONF.
 Two rules go beyond the model, in the wizard and on the campaign page: a

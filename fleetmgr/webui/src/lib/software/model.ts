@@ -56,6 +56,14 @@ interface CheckResultJson {
   at?: string;
 }
 
+/** A job of the device's upgrade run, relayed as strings. */
+interface JobJson {
+  state?: string;
+  release?: string;
+  message?: string;
+  progress?: number | string;
+}
+
 interface DeviceStatusJson {
   device: string;
   status?: string;
@@ -65,6 +73,8 @@ interface DeviceStatusJson {
   model?: string;
   stage?: string;
   reason?: string;
+  prepare?: JobJson;
+  install?: JobJson;
   precheck?: CheckResultJson;
   postcheck?: CheckResultJson;
 }
@@ -272,6 +282,21 @@ export interface CheckResult {
   at: number | null;
 }
 
+/** null: the device has not run the job for its target. */
+export type JobState = 'running' | 'done' | 'failed' | null;
+
+/** The prepare or the install of a device, as its software manager
+ * reports it. */
+export interface Job {
+  state: JobState;
+  /** While it runs, what the device does: "add: extract". When it failed,
+   * why. After the install, when the commit window ends. '' for none. */
+  message: string;
+  /** Percent of the image transferred, while the prepare runs; null
+   * otherwise. */
+  progress: number | null;
+}
+
 export interface DeviceStatusRow {
   device: string;
   status: KnownStatus;
@@ -282,6 +307,8 @@ export interface DeviceStatusRow {
   stage: Stage | null;
   /** Why the run failed or rolled back; '' otherwise. */
   reason: string;
+  prepare: Job;
+  install: Job;
   precheck: CheckResult;
   postcheck: CheckResult;
 }
@@ -477,6 +504,15 @@ function parseCheck(json: CheckResultJson | undefined): CheckResult {
   return { verdict, detail: json?.detail ?? '', at: Number.isFinite(at) ? at / 1000 : null };
 }
 
+function parseJob(json: JobJson | undefined): Job {
+  const state = json?.state === 'running' || json?.state === 'done' || json?.state === 'failed' ? json.state : null;
+  return {
+    state,
+    message: json?.message ?? '',
+    progress: json?.progress == null ? null : num(json.progress)
+  };
+}
+
 function parseStage(raw: string | undefined): Stage | null {
   return raw === 'rollback' || (STEPS as readonly (string | undefined)[]).includes(raw)
     ? (raw as Stage)
@@ -499,6 +535,8 @@ function parseRow(row: DeviceStatusJson): DeviceStatusRow {
     model: row.model ?? '',
     stage: parseStage(row.stage),
     reason: row.reason ?? '',
+    prepare: parseJob(row.prepare),
+    install: parseJob(row.install),
     precheck: parseCheck(row.precheck),
     postcheck: parseCheck(row.postcheck)
   };

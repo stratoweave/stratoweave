@@ -26,6 +26,11 @@
 # Install RPCs are asynchronous. An <ok/> reply means accepted, not complete.
 # The adapter polls operational state for completion.
 #
+# While a job runs, the driver reports its step to the SoftwareManager: the
+# transaction of the operation that runs, as "add: extract", from the
+# records, or the step line of an install command over the CLI; the bytes
+# of a transfer; and "waiting for the device to boot" while it reloads.
+#
 # See src/adapters/test_software_iosxe.act for the device side, mocked.
 #
 
@@ -59,6 +64,8 @@ TXN_FAILED = [TXN_FAIL, "install-txn-sts-dep-fail", "install-txn-sts-timeout",
               "install-txn-sts-disconnect"]
 # txn-sub-state when the device says nothing more.
 SUB_STATE_NONE = "none"
+# What a txn-cmd begins with: install-txn-extract.
+TXN_CMD_PREFIX = "install-txn-"
 
 # The stage that ends each records-polled job. A pure file copy really does
 # report through the install records.
@@ -275,6 +282,25 @@ def records_for(root: ?ygdata.Node, uuid: str) -> list[(status: str,
     return out
 
 
+def current_step(root: ?ygdata.Node, uuid: str) -> ?str:
+    """Return the step that the operation uuid is in: the txn-cmd of the
+    transaction that it began last, without install-txn-, e.g. extract.
+    None while install-oper lists no transaction of the operation, as
+    before it begins and after it ends."""
+    step: ?str = None
+    iod = ixoper.root.from_gdata(root).install_oper_data
+    for e in iod.install_oper:
+        if e.op_uuid == uuid:
+            for t in e.install_txn_summary_op:
+                c = t.txn_cmd
+                if c is not None:
+                    if c != "":
+                        step = c
+    if step is not None:
+        return step[len(TXN_CMD_PREFIX):] if step.startswith(TXN_CMD_PREFIX) else step
+    return None
+
+
 def aggregate(root: ?ygdata.Node, uuid: str, expect_stage: str,
               allow_noop: bool=True) -> (done: bool, failed: bool, detail: str):
     """Return completion and failure state for an operation UUID.
@@ -452,6 +478,12 @@ def copied_bytes(root: ?ygdata.Node) -> ?u64:
     while no copy runs."""
     p = xecli_data.root.from_gdata(root).copy_progress
     return p.bytes if p.file is not None else None
+
+
+def install_step(root: ?ygdata.Node) -> ?str:
+    """Return the step line in a read of install-progress, or None while no
+    install command runs or before its first step."""
+    return xecli_data.root.from_gdata(root).install_progress.step
 
 
 def bootflash_filter(listing: str) -> ygdata.FNode:
@@ -901,6 +933,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     var _one_shot = False
     # A copy over the CLI runs, whose progress the driver reads.
     var _copying = False
+    # An install command over the CLI runs, whose step the driver reads.
+    var _installing = False
     # The conversion to install mode committed the release with its
     # activation, so commit has nothing left to do and abort cannot undo it.
     var _committed = False
@@ -933,6 +967,16 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def _busy() -> bool:
         return _phase != ""
 
+    def _step(message: str) -> None:
+        """Say what the device does now. The manager publishes it in the job
+        that runs."""
+        dev.get_swmgr().report_step(message)
+
+    def _booting() -> None:
+        """The device reloads: wait for the release, not the records."""
+        _activate_booting = True
+        _step("waiting for the device to boot")
+
     def _new_token() -> str:
         """A timestamp token with microsecond resolution."""
         secs, nanos = time.get_realtime()
@@ -955,10 +999,30 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def _cli_install(done: action(?Exception) -> None,
                      inp: xecli_data.stratoweave_iosxe_cli__install__input) -> None:
         """Run an install command over the CLI. The RPC returns when the
-        command ends, or when the session ends as the device reloads."""
+        command ends, or when the session ends as the device reloads. While
+        it runs, report its steps."""
+        gen = _gen
         def ran(out: ?xecli_data.stratoweave_iosxe_cli__install__output, err: ?Exception) -> None:
+            if gen == _gen:
+                _installing = False
             done(err)
+        _installing = True
+        after now poll_period: _poll_install(gen)
         _cli.install(ran, inp)
+
+    def _poll_install(gen: int) -> None:
+        """Report the step line that the install command over the CLI
+        printed last, every poll period while it runs."""
+        if gen != _gen or not _installing:
+            return
+        def read(root: ?ygdata.Node, err: ?Exception) -> None:
+            if gen != _gen or not _installing or err is not None:
+                return
+            step = install_step(root)
+            if step is not None:
+                _step(step)
+        dev.get(read, cli_filter("install-progress"))
+        after now poll_period: _poll_install(gen)
 
     def _staging_check() -> ?(algorithm: str, digest: str):
         """The checksum that the device can check the staged image against,
@@ -1185,6 +1249,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         files that it does not use, with the NETCONF remove RPC or else over
         the CLI. Then go on as after_remove says."""
         _enter("remove")
+        _step("remove inactive")
         _after_remove = after_remove
         how = upgrade_plan(_modules()).install
         if how == "cli":
@@ -1288,6 +1353,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _transfer()
             else:
                 _fail("{_filename} fails its signature check")
+        _step("verifying the image")
         _cli.verify(verified, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", _filename))
 
     def _verify_against(gen: int, before_transfer: bool, c: (algorithm: str, digest: str), stamp: ?str) -> None:
@@ -1308,6 +1374,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             else:
                 computed = out.digest if out is not None else None
                 _fail("checksum mismatch: {c.algorithm} of {_filename} is {computed}, not {c.digest}")
+        _step("verifying the image")
         _cli.verify(verified, xecli_data.stratoweave_iosxe_cli__verify__input("bootflash:", _filename, c.algorithm, c.digest))
 
     def _staged() -> None:
@@ -1317,6 +1384,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             _finish(None)
 
     def _transfer() -> None:
+        _step("transferring the image")
         how = upgrade_plan(_modules()).transfer
         if how == "cli":
             _transfer_cli()
@@ -1516,6 +1584,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         reloads, and the release is committed with the activation, so there
         is no commit window."""
         _enter("activate")
+        _step("converting to install mode")
         gen = _gen
         lines = conversion_boot_lines(image)
         _log.info("software: converting to install mode, device will reload",
@@ -1541,6 +1610,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         The device reloads, and the release is committed with the
         activation, so there is no commit window and no abort."""
         _enter("activate")
+        _step("add, activate and commit")
         _want = _release
         _committed = True
         gen = _gen
@@ -1550,7 +1620,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if err is not None:
                 _fail(swdev.error_text(err!))
                 return
-            _activate_booting = True
+            _booting()
             after now reload_poll_period: _poll(gen)
         if _one_shot:
             _log.info("software: installing with one command, device will reload", {"file": _filename})
@@ -1632,6 +1702,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _enter("abort")
         _abort_then_install = True
         _leaving = _release_of_version(version)
+        _step("abort of " + _leaving)
         _log.info("software: aborting another release pending commit, device will reload",
                   {"version": version})
         if upgrade_plan(_modules()).install == "cli":
@@ -1649,6 +1720,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
 
     def _add() -> None:
         _enter("add")
+        _step("add")
         if upgrade_plan(_modules()).install == "cli":
             gen = _gen
             _log.info("software: adding image over the CLI", {"file": _filename})
@@ -1686,6 +1758,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
 
     def _activate(version: str) -> None:
         _enter("activate")
+        _step("activate")
         _want = _release
         secs, nanos = time.get_monotonic()
         _activated_at = secs
@@ -1698,7 +1771,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 if err is not None:
                     _fail(swdev.error_text(err!))
                     return
-                _activate_booting = True
+                _booting()
                 after now reload_poll_period: _poll(gen)
             _cli_install(activated, xecli_data.stratoweave_iosxe_cli__install__input(
                 activate=xecli_data.stratoweave_iosxe_cli__install__input__activate(
@@ -1824,15 +1897,16 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _activate_booting = True
+                _booting()
                 return
+            _report_record_step(root)
             v = aggregate(root, _uuid, "", True)
             if not v.done:
                 return
             if v.failed:
                 _fail(v.detail)
                 return
-            _activate_booting = True
+            _booting()
         dev.get(on_oper, records_filter())
 
     def _poll_records(gen: int) -> None:
@@ -1846,6 +1920,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 return
             if err is not None:
                 return
+            # A transfer reports its bytes instead.
+            if _phase != "stage":
+                _report_record_step(root)
             v = aggregate(root, _uuid, _expect_stage, _allow_noop)
             if not v.done:
                 return
@@ -1860,6 +1937,13 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             _log.info("software: {_phase} done", {"uuid": _uuid})
             _end_phase()
         dev.get(on_oper, records_filter())
+
+    def _report_record_step(root: ?ygdata.Node) -> None:
+        """Report the step of the operation that the records say, as
+        "add: extract"."""
+        step = current_step(root, _uuid)
+        if step is not None:
+            _step(operation_name(_phase) + ": " + step)
 
     def _fail_transfer(cause: str) -> None:
         """Fail a transfer with the device's cause, and say when bootflash
@@ -1934,6 +2018,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 return
             if err is not None:
                 # The device is reloading. Not a failure.
+                _step("waiting for the device to boot")
                 return
             got = running_release(root)
             if got is None:

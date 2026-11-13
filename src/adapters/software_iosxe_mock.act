@@ -84,6 +84,10 @@ BGP_RECEIVED = 4
 # Device vocabulary for a failed operation (Cisco-IOS-XE-install-oper-types).
 OP_FAIL = "install-op-fail"
 TXN_SUCC = "install-txn-sts-succ"
+# And for one that runs.
+OP_IN_PROGRESS = "install-op-in-progress"
+OP_NOT_COMPLETE = "op-not-complete"
+TXN_IN_PROGRESS = "install-txn-sts-in-progress"
 # txn-sub-state of the transaction each failure stops at. A c8000v 17.18.02
 # reports the first two for a missing file and a truncated image; the commit
 # one is from Cisco-IOS-XE-install-event-types.
@@ -104,6 +108,9 @@ _ACT_STAGES = ["install-txn-act-prechk", "install-txn-img-act", "install-txn-rel
 _COMMIT_STAGES = ["install-txn-commit-prechk", "install-txn-commit",
                   "install-txn-commit-postchk"]
 _ABORT_STAGES = ["install-txn-rbk-prechk", "install-txn-reload"]
+## The second record of install one-shot.
+_ONE_SHOT_ACT_STAGES = ["install-txn-act-prechk", "install-txn-img-act", "install-txn-commit",
+                        "install-txn-reload"]
 ## As a C1111 with 17.15.04c recorded a remove of the inactive software.
 _REMOVE_STAGES = ["install-txn-remove-prechk", "install-txn-remove", "install-txn-remove-postchk",
                   "install-txn-notify"]
@@ -229,6 +236,29 @@ def operation_record(uuid: str, op_id: str, status: str, done: str,
         q("op-status"): ygdata.Leaf(status, ns=ns, module=mod),
         q("op-done"): ygdata.Leaf(done, ns=ns, module=mod),
         q("install-txn-sum-op-hist"): ygdata.KeylessList(txns),
+    }, ns=ns, module=mod)
+
+
+def running_record(uuid: str, op_id: str, stages: list[str]) -> ygdata.Node:
+    """Return the record of an IOS XE install operation that runs: the
+    stages that it began, the last one in progress and the others done."""
+    def q(n: str) -> ygdata.Id:
+        return ygdata.Id(ixoper.NS_Cisco_IOS_XE_install_oper, n)
+    ns = ixoper.NS_Cisco_IOS_XE_install_oper
+    mod = "Cisco-IOS-XE-install-oper"
+    txns: list[ygdata.Node] = []
+    for i, stage in enumerate(stages):
+        status = TXN_IN_PROGRESS if i == len(stages) - 1 else TXN_SUCC
+        txns.append(ygdata.Container({
+            q("txn-cmd"): ygdata.Leaf(stage, ns=ns, module=mod),
+            q("txn-status"): ygdata.Leaf(status, ns=ns, module=mod),
+        }, ns=ns, module=mod))
+    return ygdata.Container({
+        q("op-uuid"): ygdata.Leaf(uuid, ns=ns, module=mod),
+        q("op-id"): ygdata.Leaf(op_id, ns=ns, module=mod),
+        q("op-status"): ygdata.Leaf(OP_IN_PROGRESS, ns=ns, module=mod),
+        q("op-done"): ygdata.Leaf(OP_NOT_COMPLETE, ns=ns, module=mod),
+        q("install-txn-summary-op"): ygdata.KeylessList(txns),
     }, ns=ns, module=mod)
 
 
@@ -395,6 +425,8 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
     `upgrade_duration` is the seconds a whole upgrade takes, shared out in the
     C8000V_SECONDS proportions; 0 completes each operation after FAST, or after
     `complete_after` when a caller gives a fixed delay per operation instead.
+    An operation that takes longer than FAST is listed in install-oper while
+    it runs, and goes through its stages in even shares of its time.
     `upgrade_duration_variance` is a fraction: each upgrade draws its own
     duration evenly within that fraction of upgrade_duration, either way,
     when its xcopy starts, and all of its operations share that duration.
@@ -435,6 +467,8 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
     var last_timer: ?str = None
     # The duration of the upgrade in progress, drawn at its xcopy.
     var duration: float = upgrade_duration
+    # The records of the operations that run, by uuid.
+    var running_ops: dict[str, ygdata.Node] = {}
 
     if failure not in FAILURES:
         _log.error("IOS XE software mock: unknown failure, behaving as none",
@@ -462,8 +496,28 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
             files.append((name=st, size=staged_size))
         mock_server.set_oper_ds(operational_datastore(
             cur, history, vstates, bgp_up(failure, cur, committed),
+            active=list(running_ops.values()),
             inventory=[inventory_entry(swxeplat.HW_TYPE_CHASSIS, 0, model, serial)], files=files,
             bundle=bundle))
+
+    def _run(uuid: str, stages: list[str], delay: float) -> None:
+        """List the operation uuid in install-oper while it runs, when it
+        takes longer than FAST, and go through its stages in even shares
+        of delay."""
+        if delay > FAST and len(stages) > 0:
+            _stage(uuid, stages, delay, 1)
+
+    def _stage(uuid: str, stages: list[str], delay: float, begun: int) -> None:
+        if begun > len(stages) or (begun > 1 and uuid not in running_ops):
+            return
+        running_ops[uuid] = running_record(uuid, "1", stages[:begun])
+        _publish()
+        after now delay / float(len(stages)): _stage(uuid, stages, delay, begun + 1)
+
+    def _ended(uuid: str) -> None:
+        """The operation uuid no longer runs; the caller publishes."""
+        if uuid in running_ops:
+            del running_ops[uuid]
 
     def _remember(record: ygdata.Node) -> None:
         # Copy on write: the published datastore still holds the old list.
@@ -499,6 +553,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         after now delay / float(DOWNLOAD_STEPS): _grow(uuid, step + 1, delay)
 
     def _finish_xcopy(uuid: str) -> None:
+        _ended(uuid)
         if downloading == uuid:
             downloading = None
         if failure == FAILURE_DOWNLOAD:
@@ -513,6 +568,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         _publish()
 
     def _finish_add(uuid: str, release: str) -> None:
+        _ended(uuid)
         a = added
         if failure == FAILURE_ADD:
             _fail(uuid, "1", _ADD_STAGES, STAGE_ADD_PRECHK, SUB_VERIFY_FAIL)
@@ -525,19 +581,21 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
 
     def _finish_install(uuid: str, release: str) -> None:
         """one-shot: add, activate, commit, reload as one operation."""
+        _ended(uuid)
         if failure == FAILURE_ADD:
             _fail(uuid, "1", _ADD_STAGES, STAGE_ADD_PRECHK, SUB_VERIFY_FAIL)
         else:
             _record(uuid, "1", _ADD_STAGES)
-            _record(uuid, "2", ["install-txn-act-prechk", "install-txn-img-act",
-                                "install-txn-commit", "install-txn-reload"])
+            _record(uuid, "2", _ONE_SHOT_ACT_STAGES)
             cur = swxe.reported_release(release)
             committed = cur
         _publish()
 
     def _finish_activate(uuid: str) -> None:
+        _ended(uuid)
         a = added
         if a is None:
+            _publish()
             return
         act_uuid = uuid
         _record(uuid, "1", _ACT_STAGES)
@@ -553,6 +611,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         cur = committed
 
     def _finish_commit(uuid: str) -> None:
+        _ended(uuid)
         if failure == FAILURE_REVERTS and cur != committed:
             # The timer beat the commit; a commit with nothing to do is marked
             # successful.
@@ -568,11 +627,13 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         _publish()
 
     def _finish_abort(uuid: str) -> None:
+        _ended(uuid)
         _record(uuid, "1", _ABORT_STAGES)
         cur = committed
         _publish()
 
     def _finish_remove(uuid: str) -> None:
+        _ended(uuid)
         _record(uuid, "1", _REMOVE_STAGES)
         staged = None
         a = added
@@ -612,6 +673,8 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
                 text=uuid!,
             )], None, None)
             delay = _delay("xcopy")
+            if xcopy_records:
+                _run(uuid!, _DOWNLOAD_STAGES, delay)
             if delay > 0.0:
                 downloading = uuid!
                 after now delay / float(DOWNLOAD_STEPS): _grow(uuid!, 1, delay)
@@ -634,9 +697,11 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
             respond([], None, None)
             if last_one_shot == "true":
                 delay = _one_shot_delay()
+                _run(uuid!, _ADD_STAGES + _ONE_SHOT_ACT_STAGES, delay)
                 after now delay: _finish_install(uuid!, release!)
             else:
                 delay = _delay("install")
+                _run(uuid!, _ADD_STAGES, delay)
                 after now delay: _finish_add(uuid!, release!)
             return
 
@@ -654,12 +719,14 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
                 return
             respond([], None, None)
             delay = _delay("activate")
+            _run(uuid!, _ACT_STAGES, delay)
             after now delay: _finish_activate(uuid!)
             return
 
         if request.tag == "install-commit":
             respond([], None, None)
             delay = _delay("install-commit")
+            _run(uuid!, _COMMIT_STAGES, delay)
             after now delay: _finish_commit(uuid!)
             return
 
@@ -668,6 +735,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
             # the device does not run go.
             respond([], None, None)
             delay = _delay("install-commit")
+            _run(uuid!, _REMOVE_STAGES, delay)
             after now delay: _finish_remove(uuid!)
             return
 
@@ -677,6 +745,7 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
                 return
             respond([], None, None)
             delay = _delay("abort")
+            _run(uuid!, _ABORT_STAGES, delay)
             after now delay: _finish_abort(uuid!)
             return
 

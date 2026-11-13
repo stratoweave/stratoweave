@@ -127,7 +127,8 @@ Published under `stratoweave-rfs:device=<name>/software/state`:
 | `stage` | The step the run is in, or the step it ended in |
 | `reason` | Why the run failed or rolled back, why the release could not be read, or what held the install |
 | `precheck`, `postcheck` | `verdict` (`not-run`, `pass` or `fail`), `detail`, and `at`, the time of the verdict |
-| `job[prepare]` | The last prepare: `state` (`running`, `done` or `failed`), `release`, `started`, `ended` and, when it failed, `message`. While it runs, an adapter that transfers the image sets `progress` in percent of `image-size` and `message` with the bytes |
+| `job[prepare]` | The last prepare: `state` (`running`, `done` or `failed`), `release`, `started`, `ended` and, when it failed, `message`. While it runs, `message` says what the device does, as the adapter reports it, and an adapter that transfers the image sets `progress` in percent of `image-size` and `message` with the bytes |
+| `job[install]` | The install of the run, with the same leaves. While it runs, `message` says what the device does, for example `add: extract` or `waiting for the device to boot`. After the install, until the run commits or rolls back, it says when the commit window ends, for example `commit window ends 23:07 UTC` |
 
 The release the device runs is `state/platform/version` (see
 `device-platform.md`). The manager reads the platform again when an install
@@ -171,6 +172,11 @@ A platform adapter is a subclass of `SoftwareAdapter` in `src/device.act`.
 Jobs report through `done`. The error message becomes the run's `reason`, so
 it should name the operation and the device's cause, for example
 `add failed: install-verify-pkg-fail`.
+
+While prepare or install runs, the adapter can tell the device's
+`SoftwareManager` (`dev.get_swmgr()`) what the device does:
+`report_step(message)` sets the job's `message`, and
+`report_transfer(transferred, total)` its `progress` and the bytes.
 
 ## IOS XE
 
@@ -223,6 +229,13 @@ connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
   196608 bytes over http (measured on 16.8.1 and 17.15.06). The CLI adapter answers a
   read of `copy-progress` from what the running copy printed, without a
   command.
+- While the install runs, the adapter reports its step: over NETCONF the
+  `txn-cmd` of the last transaction that the operation began, without
+  `install-txn-`, as `add: extract` or `activate: reload`; over the CLI
+  the last step line that the install command printed, as `Performing Add
+  on Active/Standby`, from a read of `install-progress`. During a reboot
+  the step is `waiting for the device to boot`. The check and the
+  transfer of the image are steps too.
 - Before a transfer, bootflash needs 2.2 times the `image-size` of the
   intent: the image, and the packages that the add makes of it. Without the
   room, the adapter removes the inactive software once and looks again.

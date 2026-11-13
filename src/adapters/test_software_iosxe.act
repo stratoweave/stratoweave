@@ -22,6 +22,7 @@ import yang
 import yang.gdata as ygdata
 
 import device as swdev
+import device_oper as swdevoper
 import adapters.iosxe_cli as xecli
 import adapters.iosxe_cli_data as xecli_data
 import adapters.test_iosxe_cli as clitest
@@ -289,6 +290,27 @@ def _test_aggregate_fails_on_a_reverted_record():
     v2 = swxe.aggregate(reverting, "job-1", "install-txn-img-act")
     testing.assertTrue(v2.done and v2.failed,
                        "fail-revert must not wait for op-complete")
+
+
+def _test_current_step_is_the_last_transaction_begun():
+    """The step of an operation that runs is the txn-cmd of its last
+    transaction, without install-txn-. A finished operation, or one that
+    install-oper does not list, has none."""
+    add = ["install-txn-add-prechk", "install-txn-copy", "install-txn-verify"]
+    running = swxemock.running_record("job-1", "1", add)
+    finished = _record("job-1", "1", swxe.OP_SUCC, swxe.OP_COMPLETE, add)
+    cases = [
+        ("three stages begun", swxemock.operational_datastore(OLD_RELEASE, [], active=[running]),
+         "job-1", "verify"),
+        ("another uuid", swxemock.operational_datastore(OLD_RELEASE, [], active=[running]), "job-2", None),
+        ("finished", _oper_ds(OLD_RELEASE, [finished]), "job-1", None),
+        ("no records", _oper_ds(OLD_RELEASE, []), "job-1", None),
+        ("a txn-cmd without the prefix",
+         swxemock.operational_datastore(OLD_RELEASE, [], active=[swxemock.running_record("job-1", "1", ["notify"])]),
+         "job-1", "notify"),
+    ]
+    for name, ds, uuid, want in cases:
+        testing.assertEqual(want, swxe.current_step(ds, uuid), name)
 
 
 def _test_added_version_picks_the_target_by_prefix():
@@ -600,6 +622,95 @@ actor _test_iosxe_upgrade_through_the_software_manager(t: testing.EnvT):
         fail(ValueError("timed out: rpcs={rpcs} running={run} status={st}"))
 
     after 2.5: report_timeout()
+
+
+actor _test_iosxe_install_reports_its_steps(t: testing.EnvT):
+    """While the install runs, its job says what the device does: the
+    stages of the add and of the activate that the device lists, then the
+    wait for the reload. After the install, the job says when the commit
+    window ends."""
+    t.timeout(10.0)
+    expected = ["add", "add: add-prechk", "add: copy", "add: verify", "add: extract", "add: add-postchk",
+                "activate", "activate: act-prechk", "activate: img-act", "activate: reload",
+                "waiting for the device to boot"]
+    var dev_ref: ?swdev.DeviceMgr = None
+    var seen: list[str] = []
+    var window = ""
+    var finished = False
+
+    def fail(e: Exception) -> None:
+        if not finished:
+            finished = True
+            t.failure(e)
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def assess() -> None:
+        # Each step must be one that the device or the driver gives, in
+        # order. A poll can miss a stage; it cannot miss the steps that the
+        # driver reports itself.
+        i = 0
+        for step in seen:
+            while i < len(expected) and expected[i] != step:
+                i += 1
+            if i == len(expected):
+                raise ValueError("unexpected step {step} in {seen}")
+        for step in ["add", "activate", "waiting for the device to boot"]:
+            if step not in seen:
+                raise ValueError("no {step} in {seen}")
+        if not any([s.startswith("add: ") for s in seen]) or not any([s.startswith("activate: ") for s in seen]):
+            raise ValueError("no stage of the device in {seen}")
+        if not window.startswith("commit window ends "):
+            raise ValueError("no commit window: {window}")
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if oper is not None and not finished:
+            on_software(swdevoper.stratoweave_rfs__device_entry.from_gdata(oper).software.state)
+
+    def on_software(st: swdevoper.stratoweave_rfs__device__software__state) -> None:
+        job = st.job.get("install")
+        if job is not None:
+            m = job.message
+            if m is not None:
+                if job.state == "running" and (len(seen) == 0 or seen[-1] != m):
+                    seen.append(m)
+                elif job.state == "done" and m.startswith("commit window "):
+                    window = m
+        if st.status == "succeeded":
+            finished = True
+            try:
+                assess()
+            except Exception as e:
+                t.failure(e)
+                return
+            t.success()
+        elif st.status == "failed":
+            fail(ValueError("the run failed: {st.reason}"))
+
+    def start() -> None:
+        d = dev_ref
+        if d is not None:
+            if "Cisco-IOS-XE-install-oper" not in d.get_modules().0:
+                after 0.01: start()
+                return
+            dev_adapter = d.get_adapter()
+            if isinstance(dev_adapter, swna.NetconfAdapter):
+                ms = dev_adapter.get_mock_server()
+                if ms is not None:
+                    # Each operation takes 0.4 s, many polls per stage.
+                    m = swxemock.IosXeSoftwareMock(ms, t.log_handler, complete_after=0.4)
+                    m.attach()
+                    d.set_update_oper(on_state)
+                    dmc = DeviceMetaConfig("d-steps", Credentials("admin", "admin"), type="iosxe",
+                                           software=Software("camp-1", NEW_REQUESTED, IMAGE_URL))
+                    dmc.mock.enabled = True
+                    d.set_dmc(dmc)
+                    return
+        fail(ValueError("no mock server on the device adapter"))
+
+    dev_ref = new_iosxe_mock_device_mgr(t, "d-steps", on_reconf)
+    after 0.01: start()
 
 
 actor _test_iosxe_device_already_on_target_sends_nothing(t: testing.EnvT):
