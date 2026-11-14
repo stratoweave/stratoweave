@@ -17,7 +17,9 @@ export const CELL_COLOR: Record<KnownStatus, string> = {
   'in-progress': '#22d3ee',
   succeeded: '#16a34a',
   failed: '#ef4444',
-  'rolled-back': '#991b1b'
+  'rolled-back': '#991b1b',
+  // Counted as failed: an earlier attempt failed its rollback.
+  'not-started': '#ef4444'
 };
 
 /** The gutter between cells; also the grid background. */

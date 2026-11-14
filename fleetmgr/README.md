@@ -149,7 +149,7 @@ Set `FLEETMGR_API` to point these targets at a top node on another address.
 ## Campaigns
 
 A campaign acquires its members as soon as it exists, in `plan` and in
-`run`. Each member in the fleet gets the campaign's name, its `retry`, the
+`run`. Each member in the fleet gets the campaign's name, its `attempt`, the
 target release and image URL of its image, and a veto with the holder
 `campaign:NAME`, which holds the install. The member reads the release it
 runs and answers `up-to-date` or `upgrade-needed`. Nothing is installed. A
@@ -157,13 +157,12 @@ member added later, also while the campaign runs, is acquired the same way.
 In `run`, the campaign removes the veto of a member when it releases the
 member in a window, and puts the veto back when the member is done.
 
-A member's `device-status` shows its status only when the status is for
-the campaign's intent: the device reports it for the campaign's name, the
-member's target release and the member's retry. A status without a retry
-is for retry 0. `in-progress` counts for any retry, because a run of an
-earlier retry is still under way. Otherwise it shows `pending`, and the
-counters do not count it. Its `upgrade-campaign`, `target-release` and
-`retry` say which intent the device's status is for.
+A member's `device-status` shows the attempt that counts for the member.
+Of the attempts that its device reports for the campaign's name and the
+member's target release, that is the one `in-progress`, because a run of
+an earlier attempt is still under way, and else the member's `attempt`.
+Its `attempt` says which one. A member whose device has not answered that
+attempt shows `pending`, and the counters do not count it.
 
 The campaign releases a member only once the member has answered its
 target: its status is `upgrade-needed`, or a final status. A member that
@@ -192,15 +191,17 @@ then, or after a restart of fleetmgr, counts in flight and keeps the
 campaign's veto: it holds a slot and its redundancy groups until it is
 done, or until it stops before its install and waits again.
 
-Stopping and running a campaign again does not retry its failed members.
-To retry a member, change its `retry`, for example from 0 to 1. The
-campaign then takes it as a new member, as if it was removed and added
-again: the device reads its release again, and the campaign holds the
-member until it answers the new retry, and releases it in a window. A
-member that succeeded reads again and answers `up-to-date`. A member in
-flight gets the campaign's veto back: its run stops before the install,
-or, past the install, finishes and holds its slot until it ends. Removing
-the member and adding it again, in two edits, also retries it.
+Stopping and running a campaign again does not try its failed members
+again, and neither does removing a member and adding it again: its device
+keeps the final status of its attempt. A member removed while in flight
+stops before its install and answers `upgrade-needed`, so added again it
+waits for a window. To try a member again, change its `attempt`, for
+example from 0 to 1. The campaign then takes it as a new member: the
+device reads its release again, and the campaign holds the member until
+it answers the new attempt, and releases it in a window. A member that
+succeeded reads again and answers `up-to-date`. A member in flight gets
+the campaign's veto back: its run stops before the install, or, past the
+install, finishes and holds its slot until it ends.
 
 With `failure-budget`, a campaign stops its releases when too many members
 fail. The budget is a percent of the members the campaign has, rounded
@@ -212,8 +213,9 @@ saved: a failed member answers again, and the campaign can release it. When
 more members have failed than the budget, no member starts or prepares: the
 members in flight finish, the others keep their windows, and the plan's
 alarm says "N device(s) failed, more than the failure budget of M: no more
-devices start". To go on, raise or remove the budget, or retry or remove
-failed members. A retried member no longer counts as failed. Each member
+devices start". To go on, raise or remove the budget, or give failed
+members a new attempt or remove them. A member with a new attempt no
+longer counts as failed. Each member
 removed also makes the budget smaller: at 2 percent, 3 failed
 members of 100 stop the releases, and 2 of 99 still do.
 
@@ -250,7 +252,11 @@ the other members. With `continue`, the default, a member that failed or
 rolled back holds them only until it is done and up again; the next
 member starts after the group's `min-separation`. A member whose rollback
 failed holds them until an operator acts, as all failures do with
-`hold`.
+`hold`. So does a member with a new attempt that was set while a run of
+an earlier one failed its rollback: the device may run the release that
+run installed, uncommitted, so the new attempt does not start. The member
+shows `not-started`, with the failed attempt in its `reason`, and counts
+as failed until it has another attempt.
 
 With `notification-period`, in days, a campaign uses only the windows that
 open that long or more after its `run-since`, so that the customers of its
@@ -348,7 +354,7 @@ same device entry that the inventory transform writes. Each member names its
 `image` from `/images`: the device's target release is the image's
 `version`, and its image URL is the list's `url-base` followed by the image
 name. A member whose image is not in the list, or has no version, gets only
-the campaign's name, its retry and the veto, with no target release, and the
+the campaign's name, its attempt and the veto, with no target release, and the
 campaign's plan alarms say so.
 
 `/images` is the StratoWeave image list (`swyang.images`): software images
@@ -364,8 +370,9 @@ the whole list.
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription on the flotilla
 to the device's `/device/software/state` and `/device/state`, and publishes
-the status, the campaign, target release and retry the status is for, the
-stage, reason and check verdicts in the entry's own `state`, the platform as
+the campaign and target release of the device's attempts, each attempt with
+its status, stage, reason, prepare, install and check verdicts, and the
+vetoes in the entry's own `state`, the platform as
 its `state/platform`, and whether the flotilla is connected to the device as
 `state/connected`. A change on one device publishes one entry. Removing the
 entry closes the subscription and clears the state. Each campaign transform
@@ -404,7 +411,7 @@ without NETCONF, such as 16.8 on a C1111, has its BGP state from the
 `iosxe-cli` adapter.
 
 Nothing is read from the device between checks and nothing is published
-but the verdicts, under `/device{cpe}/software/state/precheck` and
+but the verdicts, under `/device{cpe}/software/state/attempt/precheck` and
 `postcheck`. The top carries both up to the campaign's `device-status`, next
 to the device's status, the step its upgrade is at and why it stopped. The mock IOS XE
 device serves one established BGP neighbor, so in the demo both checks pass

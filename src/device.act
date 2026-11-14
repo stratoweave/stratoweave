@@ -25,9 +25,10 @@ from device_meta_config import \
 from device_oper import \
     stratoweave_rfs__device_entry as DeviceOper, \
     stratoweave_rfs__device__software__state as SoftwareState, \
-    stratoweave_rfs__device__software__state__precheck as PrecheckResult, \
-    stratoweave_rfs__device__software__state__postcheck as PostcheckResult, \
-    stratoweave_rfs__device__software__state__job_entry as SoftwareJob
+    stratoweave_rfs__device__software__state__attempt_entry as SoftwareAttempt, \
+    stratoweave_rfs__device__software__state__attempt__precheck as PrecheckResult, \
+    stratoweave_rfs__device__software__state__attempt__postcheck as PostcheckResult, \
+    stratoweave_rfs__device__software__state__attempt__job_entry as SoftwareJob
 
 from device_schema import DeviceSchema, SchemaKey, SchemaTreeTransform
 from device_routing import Routes, union_modules, merge_schemas
@@ -190,10 +191,11 @@ ST_IN_PROGRESS = "in-progress"
 ST_SUCCEEDED = "succeeded"
 ST_FAILED = "failed"
 ST_ROLLED_BACK = "rolled-back"
+ST_NOT_STARTED = "not-started"
 
-# The statuses that end a read or a run: one that answers the intent is kept
-# until the intent changes.
-ST_FINAL = {ST_UP_TO_DATE, ST_SUCCEEDED, ST_FAILED, ST_ROLLED_BACK}
+# The statuses that end a read or a run. A final status stands for its
+# attempt: nothing runs for that attempt again.
+ST_FINAL = {ST_UP_TO_DATE, ST_SUCCEEDED, ST_FAILED, ST_ROLLED_BACK, ST_NOT_STARTED}
 
 # check-result/verdict
 VERDICT_NOT_RUN = "not-run"
@@ -294,19 +296,19 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
       manager still reads the release the device runs and reports up-to-date
       or upgrade-needed. The vetoes are read again right before the install
       starts; they never abort one in flight.
-    * Each status answers an intent: the upgrade campaign, target release
-      and retry of the read or run that set it, published with the status.
-      A final status that answers the intent is kept while the intent and
-      the device type stay the same, so a reconnect or an unrelated config
-      change does not run a failed upgrade again. A new retry is a new
-      intent: the device is read again, and a failed upgrade runs again. A
-      run under way finishes first. The install installs the release the
-      run read the device for.
+    * The state has an entry for each attempt at one target release in one
+      upgrade campaign, with the status, stage, reason, checks and jobs of
+      the attempt's read or run. The first answer for another campaign or
+      target starts the list over. A final status stands for its attempt,
+      so a reconnect, a config change or a new device type does not run a
+      failed upgrade again. A new attempt is read again, and a failed
+      upgrade runs again. A run under way finishes first. The install
+      installs the release the run read the device for.
     * Under a hold, a read that fails says the release is unknown and is
       tried again when the device connects, or after a while. Without one
       the run goes on, as a failed read is no proof of being up to date.
     * A prepare is never a precondition; a run prepares again. Under a veto,
-      `allow_staging` lets the manager prepare the target once per intent,
+      `allow_staging` lets the manager prepare the target once per attempt,
       ahead of the install. The result goes in job[prepare], never in the
       status: a failed prepare leaves the status upgrade-needed.
     * Every pre-check must pass for install to proceed. A failing pre-check,
@@ -314,6 +316,11 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
       with nothing activated, which is the whole point of the gate.
     * Any failing post-check triggers a rollback. So does a post-check that
       does not answer within POSTCHECK_TIMEOUT.
+    * A failed rollback can leave the device on the release that the run
+      installed, uncommitted, and a read would take that for the target. So
+      the attempt that the configuration names then, when it is not the
+      run's, does not start: it answers not-started, and its reason names
+      the attempt that failed.
     * **Cleanup is the point of no return**: it removes the superseded image,
       which on platforms without native rollback is the way home, so it must
       not run until the post-checks have passed.
@@ -327,7 +334,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     has decided, so it may go away and do work first without blocking anything.
 
     The implementation has to tolerate a late reply: a check that answers after
-    the attempt it belonged to was abandoned must be ignored rather than allowed
+    the step it belonged to was abandoned must be ignored rather than allowed
     to gate a later one.
     """
 
@@ -336,8 +343,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     var adapter: SoftwareAdapter = NoSoftwareAdapter(log_handler)
     var target_release: ?str = None
     var upgrade_campaign: ?str = None
-    # Any change of retry makes a new intent, so the device is read again.
-    var retry: u64 = 0
+    # Any change of attempt makes a new intent, so the device is read again.
+    var attempt: u64 = 0
     var allow_staging: bool = False
     var vetoes: dict[str, str] = {}
 
@@ -346,10 +353,12 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     # sequences on top of each other. Wider than `status == in-progress`,
     # because the comparison happens before there is any work to report.
     var busy: bool = False
-    # The intent the read or run under way answers.
+    # The attempt that the read or run under way answers, with its campaign
+    # and target. They stay after the end of the run: they name the attempt
+    # that answered last.
     var run_campaign: ?str = None
     var run_target: ?str = None
-    var run_retry: u64 = 0
+    var run_attempt: u64 = 0
     # Set when the intent or the connection changed while busy: the end of
     # the work reconciles once.
     var again: bool = False
@@ -372,7 +381,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     var passed: dict[str, str] = {}
     # Bumped at every decision, so a late check reply or timer from an earlier
     # step is ignored.
-    var attempt: int = 0
+    var decision: int = 0
     # What the device ran before install; rollback returns to it.
     var previous_release: ?str = None
     var precheck_timeout: float = PRECHECK_TIMEOUT
@@ -380,33 +389,29 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     # The device/software/state oper tree this manager owns. Every change is
     # pushed to the DeviceMgr, which fuses it into the device entry's oper.
-    var state: SoftwareState = SoftwareState(
-        status=ST_UNKNOWN,
-        precheck=PrecheckResult(VERDICT_NOT_RUN, None, None),
-        postcheck=PostcheckResult(VERDICT_NOT_RUN, None, None))
+    var state: SoftwareState = SoftwareState()
 
     #### configuration ######################################################
 
     def set_adapter(a: SoftwareAdapter) -> None:
-        """Called by DeviceMgr when the device type is known or changes. A new
-        adapter has answered nothing yet, so the status answers no intent."""
+        """Called by DeviceMgr when the device type is known or changes. A
+        final status stands: the new adapter runs nothing for its attempt."""
         adapter = a
-        _set_answers(None, None, None)
         _reconcile()
 
     def set_config(campaign: ?str, target: ?str, staging: bool, veto: dict[str, str],
-                   new_retry: u64=0) -> None:
+                   new_attempt: u64=0) -> None:
         """Software config from DeviceMetaConfig.software: the campaign whose
         intent this is, the target release name, whether staging may run ahead
-        of the window, the current vetoes keyed by holder, and the retry of
+        of the window, the current vetoes keyed by holder, and the attempt of
         the intent. Acts only when one of them changed."""
         if campaign == upgrade_campaign and target == target_release \
-           and staging == allow_staging and veto == vetoes and new_retry == retry:
+           and staging == allow_staging and veto == vetoes and new_attempt == attempt:
             return
         upgrade_campaign = campaign
         target_release = target
         allow_staging = staging
-        retry = new_retry
+        attempt = new_attempt
         if veto != vetoes:
             vetoes = veto
             _show_vetoes()
@@ -420,7 +425,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         for h in sorted(vetoes.keys()):
             r = vetoes[h]
             state.veto.create(h, reason=r if r != "" else None)
-        devmgr.on_software_state(state.copy())
+        _publish()
 
     def on_connect() -> None:
         """Called by DeviceMgr when an adapter of the device connects: a read
@@ -491,84 +496,102 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     #### introspection ######################################################
 
+    # The test hooks below read the attempt that answered last.
+
     def get_status() -> str:
         """One of the ST_* values above."""
-        s = state.status
-        return s if s is not None else ST_UNKNOWN
+        e = _attempt()
+        if e is not None:
+            s = e.status
+            if s is not None:
+                return s
+        return ST_UNKNOWN
 
     def get_reason() -> ?str:
-        return state.reason
+        e = _attempt()
+        return e.reason if e is not None else None
+
+    def _job(job: str) -> ?SoftwareJob:
+        e = _attempt()
+        return e.job.get(job) if e is not None else None
 
     def get_job_progress(job: str) -> ?u64:
         """The progress of a job in percent, when its adapter reported any."""
-        j = state.job.get(job)
+        j = _job(job)
         if j is not None:
             return j.progress
         return None
 
     def get_job_state(job: str) -> ?str:
         """The state of a job, one of the JOB_* values; None before it ran."""
-        j = state.job.get(job)
+        j = _job(job)
         if j is not None:
             return j.state
         return None
 
     def get_job_message(job: str) -> ?str:
         """The message of a job: the step it is in, or why it failed."""
-        j = state.job.get(job)
+        j = _job(job)
         if j is not None:
             return j.message
         return None
 
     #### install ############################################################
 
+    def _publish() -> None:
+        """Push the state to the DeviceMgr. The release the device runs is
+        published as its platform version, not here."""
+        unpublished = False
+        # Push a copy: Acton does not copy local message arguments, and the
+        # DeviceMgr keeps what it receives in its oper tree.
+        devmgr.on_software_state(state.copy())
+
     def _record(status: str) -> None:
-        """Update the status and publish it if it or the rest of the state
-        changed. The release the device runs is published as its platform
-        version, not here."""
-        if status != state.status or unpublished:
-            state.status = status
-            unpublished = False
-            # Push a copy: Acton does not copy local message arguments, and
-            # the DeviceMgr keeps what it receives in its oper tree.
-            devmgr.on_software_state(state.copy())
+        """Set the status of the run's attempt, and publish the state if it
+        or the rest of the state changed."""
+        e = _answer()
+        if status != e.status or unpublished:
+            e.status = status
+            _publish()
 
-    def _set_answers(campaign: ?str, target: ?str, answered_retry: ?u64) -> None:
-        """Make the status answer the intent of campaign, target and retry. A
-        status that starts to answer another intent drops the stage, the
-        reason, the verdicts and the jobs of the last one. Publishes with the
-        next _record(), or now when the intent goes."""
-        if campaign == state.upgrade_campaign and target == state.target_release \
-           and answered_retry == state.retry:
-            return
-        state.upgrade_campaign = campaign
-        state.target_release = target
-        state.retry = answered_retry
-        if target is not None:
-            state.stage = None
-            state.reason = None
-            state.precheck = PrecheckResult(VERDICT_NOT_RUN, None, None)
-            state.postcheck = PostcheckResult(VERDICT_NOT_RUN, None, None)
-            for job in [e.name for e in state.job]:
-                del state.job[job]
+    def _configured() -> ?SoftwareAttempt:
+        """The entry of the configured attempt, once it has answered."""
+        if state.upgrade_campaign == upgrade_campaign and state.target_release == target_release:
+            return state.attempt.get(attempt)
+        return None
+
+    def _attempt() -> ?SoftwareAttempt:
+        """The entry of the attempt of the read or run under way, or of the
+        last one, once it has answered."""
+        if state.upgrade_campaign == run_campaign and state.target_release == run_target:
+            return state.attempt.get(run_attempt)
+        return None
+
+    def _answer() -> SoftwareAttempt:
+        """The entry of the attempt of the read or run under way. Its first
+        answer makes it, and the first answer for another campaign or target
+        starts the list over. Publishes with the next _record()."""
+        if state.upgrade_campaign != run_campaign or state.target_release != run_target:
+            state.upgrade_campaign = run_campaign
+            state.target_release = run_target
+            for n in [e.number for e in state.attempt]:
+                del state.attempt[n]
+        found = state.attempt.get(run_attempt)
+        if found is not None:
+            return found
+        unpublished = True
+        e = state.attempt.create(run_attempt, status=ST_UNKNOWN)
+        e.precheck = PrecheckResult(VERDICT_NOT_RUN, None, None)
+        e.postcheck = PostcheckResult(VERDICT_NOT_RUN, None, None)
+        return e
+
+    def _set_reason(why: ?str) -> None:
+        """Set the reason of the run's attempt; it goes out with the next
+        _record()."""
+        e = _answer()
+        if e.reason != why:
+            e.reason = why
             unpublished = True
-        else:
-            unpublished = False
-            devmgr.on_software_state(state.copy())
-
-    def _clear_reason() -> None:
-        """Remove the reason; it goes out with the next _record()."""
-        if state.reason is not None:
-            state.reason = None
-            unpublished = True
-
-    def _answers() -> bool:
-        """True when the status answers the intent of the configuration."""
-        answered = state.retry
-        return state.status != ST_UNKNOWN and state.target_release is not None \
-            and state.target_release == target_release \
-            and state.upgrade_campaign == upgrade_campaign \
-            and answered is not None and answered == retry
 
     def _done() -> None:
         """End the read or run under way. If the intent or the connection
@@ -580,52 +603,53 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     def _fail(why: str) -> None:
         """End the run failed; the reason goes out with the status."""
-        state.reason = why
+        _set_reason(why)
         _record(ST_FAILED)
         _done()
 
     def _set_stage(s: str) -> None:
-        state.stage = s
-        devmgr.on_software_state(state.copy())
+        e = _answer()
+        e.stage = s
+        _publish()
 
     def _reconcile() -> None:
-        """Read the running release for the intent, unless the status already
-        answers it: a final status, or upgrade-needed while a veto holds the
-        install. Without a veto, prepare and install the target if the device
-        runs another release."""
+        """Answer the configured attempt: read the release the device runs,
+        and without a veto prepare and install the target if the device runs
+        another release. Nothing runs for an attempt with a final status, and
+        for one that a veto holds at upgrade-needed only a prepare ahead."""
         if busy:
             again = True
             return
-        t = target_release
-        if t is None:
-            _set_answers(None, None, None)
+        if target_release is None:
             return
-        s = state.status
-        if s is not None and _answers():
-            if s in ST_FINAL:
+        found = _configured()
+        if found is not None:
+            s = found.status
+            if s is not None and s in ST_FINAL:
                 return
             if s == ST_UPGRADE_NEEDED and len(vetoes) > 0:
-                if allow_staging and not _prepared(t!):
-                    busy = True
-                    run_campaign = upgrade_campaign
-                    run_target = t
-                    run_retry = retry
+                if allow_staging and not _prepared(found):
+                    _start()
                     _prepare_ahead()
                 return
-        busy = True
-        run_campaign = upgrade_campaign
-        run_target = t
-        run_retry = retry
+        _start()
         adapter.check(_on_check_done)
 
-    def _prepared(release: str) -> bool:
-        """True when the prepare job runs or has a result for release."""
-        job = state.job.get(JOB_PREPARE)
-        return job is not None and job.release == release
+    def _start() -> None:
+        """Start a read or run for the configured attempt."""
+        busy = True
+        run_campaign = upgrade_campaign
+        run_target = target_release
+        run_attempt = attempt
+
+    def _prepared(e: SoftwareAttempt) -> bool:
+        """True when the prepare job of the attempt runs or has a result."""
+        return e.job.get(JOB_PREPARE) is not None
 
     def _job_start(name: str, release: str) -> None:
         """Publish the job name as running for release."""
-        job = state.job.get(name)
+        jobs = _answer().job
+        job = jobs.get(name)
         if job is not None:
             job.state = JOB_RUNNING
             job.release = release
@@ -634,33 +658,35 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             job.progress = None
             job.message = None
         else:
-            state.job.create(name, state=JOB_RUNNING, release=release, started=_now())
-        devmgr.on_software_state(state.copy())
+            jobs.create(name, state=JOB_RUNNING, release=release, started=_now())
+        _publish()
 
     def _job_end(name: str, err: ?Exception) -> None:
         """Publish the end of the job name: done, or failed with the error."""
-        job = state.job.get(name)
+        job = _answer().job.get(name)
         if job is not None:
             job.state = JOB_FAILED if err is not None else JOB_DONE
             job.ended = _now()
             job.message = error_text(err!) if err is not None else None
-            devmgr.on_software_state(state.copy())
+            _publish()
 
     def _job_note(name: str, message: ?str) -> None:
         """Publish message as the message of the job name, also after the
         job ended."""
-        job = state.job.get(name)
+        job = _answer().job.get(name)
         if job is not None and job.message != message:
             job.message = message
-            devmgr.on_software_state(state.copy())
+            _publish()
 
     def _running_job() -> ?SoftwareJob:
         """The prepare or install job while it runs. Only one runs at a
         time."""
-        for name in [JOB_PREPARE, JOB_INSTALL]:
-            job = state.job.get(name)
-            if job is not None and job.state == JOB_RUNNING:
-                return job
+        e = _attempt()
+        if e is not None:
+            for name in [JOB_PREPARE, JOB_INSTALL]:
+                job = e.job.get(name)
+                if job is not None and job.state == JOB_RUNNING:
+                    return job
         return None
 
     def report_step(message: str) -> None:
@@ -675,7 +701,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             return
         job.message = message
         job.progress = None
-        devmgr.on_software_state(state.copy())
+        _publish()
 
     def report_transfer(transferred: u64, total: ?u64) -> None:
         """Publish how far the adapter has transferred the image, in the
@@ -692,7 +718,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             job.message = "transferred " + str(transferred) + " of " + str(size) + " bytes"
         else:
             job.message = "transferred " + str(transferred) + " bytes"
-        devmgr.on_software_state(state.copy())
+        _publish()
 
     def _prepare_ahead() -> None:
         """Prepare the target while a veto holds the install: copy the image to
@@ -717,7 +743,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     def _on_check_done(running: ?str, err: ?Exception) -> None:
         """Decide whether there is anything to do, from what the device reports."""
         if target_release != run_target or upgrade_campaign != run_campaign \
-           or retry != run_retry:
+           or attempt != run_attempt:
             # The intent changed while we were reading: read for the new one.
             again = True
             _done()
@@ -729,9 +755,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             # is not connected cannot be upgraded: say the release is unknown,
             # and read again when the device connects, or after a while for
             # another error.
-            _set_answers(run_campaign, run_target, run_retry)
-            state.reason = "could not read the running release: " + error_text(err!)
-            unpublished = True
+            _set_reason("could not read the running release: " + error_text(err!))
             _record(ST_UNKNOWN)
             if not isinstance(err, NotConnectedError):
                 read_gen += 1
@@ -755,29 +779,28 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         elif adapter.matches_release(running, t):
             _log.info("software: already on the target release, nothing to do",
                       {"device": name, "release": running, "target": t})
-            _set_answers(run_campaign, run_target, run_retry)
-            _clear_reason()
+            _set_reason(None)
             _record(ST_UP_TO_DATE)
             _done()
             return
         elif held:
             _log.info("software: upgrade needed, held by a veto",
                       {"device": name, "release": running, "target": t})
-            _set_answers(run_campaign, run_target, run_retry)
-            _clear_reason()
+            _set_reason(None)
             _record(ST_UPGRADE_NEEDED)
-            if allow_staging and not _prepared(t):
+            if allow_staging and not _prepared(_answer()):
                 _prepare_ahead()
             else:
                 _done()
             return
         previous_release = running
-        _set_answers(run_campaign, run_target, run_retry)
-        # A new run starts at prepare; the verdicts below are from the last one.
-        state.stage = STAGE_PREPARE
-        state.reason = None
-        state.precheck = PrecheckResult(VERDICT_NOT_RUN, None, None)
-        state.postcheck = PostcheckResult(VERDICT_NOT_RUN, None, None)
+        # A run starts at prepare. The attempt may have run before, held by a
+        # veto: the verdicts below are from that run.
+        e = _answer()
+        e.stage = STAGE_PREPARE
+        e.reason = None
+        e.precheck = PrecheckResult(VERDICT_NOT_RUN, None, None)
+        e.postcheck = PostcheckResult(VERDICT_NOT_RUN, None, None)
         _record(ST_IN_PROGRESS)
         _job_start(JOB_PREPARE, t)
         adapter.prepare(_on_prepare_done, t)
@@ -820,8 +843,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         with the first refusal, the deadline, or the last pass; none
         registered passes at once."""
         names = list(reg.keys())
-        attempt += 1
-        gen = attempt
+        decision += 1
+        gen = decision
         checking = kind
         pending = {}
         passed = {}
@@ -843,7 +866,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         return done
 
     def _on_check_result(gen: int, registrant: str, ok: bool, reason: str) -> None:
-        if gen != attempt or registrant not in pending:
+        if gen != decision or registrant not in pending:
             _log.debug("software: late check reply ignored",
                        {"device": name, "check": registrant})
             return
@@ -856,22 +879,23 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             _checks_passed()
 
     def _on_check_timeout(gen: int) -> None:
-        if gen != attempt:
+        if gen != decision:
             return
         silent = ", ".join(sorted(pending.keys()))
         _checks_failed("did not answer: {silent}")
 
     def _record_check(kind: str, verdict: str, detail: str) -> None:
+        e = _answer()
         if kind == "precheck":
-            state.precheck = PrecheckResult(verdict, detail, _now())
+            e.precheck = PrecheckResult(verdict, detail, _now())
         else:
-            state.postcheck = PostcheckResult(verdict, detail, _now())
-        devmgr.on_software_state(state.copy())
+            e.postcheck = PostcheckResult(verdict, detail, _now())
+        _publish()
 
     def _checks_passed() -> None:
         kind = checking
         checking = ""
-        attempt += 1
+        decision += 1
         if len(passed) > 0:
             # What each check saw, so the verdict tells the story on its own.
             parts: list[str] = []
@@ -882,29 +906,26 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         else:
             _record_check(kind, VERDICT_PASS, "no {kind}s registered")
         if kind == "precheck":
+            # A new attempt does not stop the run: it finishes, and then the
+            # device is read again for the new attempt. A new target or
+            # campaign holds the install, and so does a veto.
+            why: ?str = None
             if target_release is None:
-                _fail("target release withdrawn before install")
-                return
-            # A new retry does not stop the run: it finishes, and then the
-            # device is read again for the new intent.
-            if target_release != run_target or upgrade_campaign != run_campaign:
-                _log.info("software: the intent changed before install, not installing",
-                          {"device": name, "target": run_target})
-                state.reason = "the intent changed before install"
-                unpublished = True
-                _record(ST_UPGRADE_NEEDED)
-                _done()
-                return
-            if len(vetoes) > 0:
+                why = "target release withdrawn before install"
+            elif target_release != run_target or upgrade_campaign != run_campaign:
+                why = "the intent changed before install"
+            elif len(vetoes) > 0:
                 holders = ", ".join(sorted(vetoes.keys()))
-                _log.info("software: a veto holds the install",
-                          {"device": name, "holders": holders})
-                state.reason = "held by {holders} before install"
-                unpublished = True
+                why = "held by {holders} before install"
+            if why is not None:
+                _log.info("software: not installing",
+                          {"device": name, "target": run_target, "reason": why})
+                _set_reason(why)
                 _record(ST_UPGRADE_NEEDED)
                 _done()
                 return
-            state.stage = STAGE_INSTALL
+            e = _answer()
+            e.stage = STAGE_INSTALL
             _job_start(JOB_INSTALL, run_target!)
             adapter.install(_on_install_done, run_target!)
         else:
@@ -914,7 +935,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     def _checks_failed(detail: str) -> None:
         kind = checking
         checking = ""
-        attempt += 1
+        decision += 1
         _record_check(kind, VERDICT_FAIL, detail)
         if kind == "precheck":
             # Nothing has been activated, so there is nothing to roll back.
@@ -938,8 +959,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     def _start_rollback(why: str) -> None:
         _log.error("software: rolling back", {"device": name, "reason": why})
-        attempt += 1
-        state.reason = why
+        decision += 1
+        _set_reason(why)
         _job_note(JOB_INSTALL, None)
         _set_stage(STAGE_ROLLBACK)
         adapter.rollback(_on_rollback_done, previous_release)
@@ -951,13 +972,52 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         if err is not None:
             _log.error("software rollback failed", {"device": name, "error": str(err)})
             why = error_text(err!)
-            r = state.reason
+            r = _answer().reason
             if r is not None:
                 why = r! + "; " + why
-            _fail(why)
+            _set_reason(why)
+            e = _answer()
+            e.status = ST_FAILED
+            # One publication, with the configured attempt when it does not
+            # start.
+            _hold_configured()
+            _publish()
+            _done()
             return
         _record(ST_ROLLED_BACK)
         _done()
+
+    def _hold_configured() -> None:
+        """After a failed rollback, answer the configured attempt not-started
+        when it is not the run's and has no final status. The reason names
+        the attempt that failed, with its target and campaign when the
+        configuration has others. Publishes with the next _publish()."""
+        if target_release is None or (attempt == run_attempt
+                                      and target_release == run_target
+                                      and upgrade_campaign == run_campaign):
+            return
+        found = _configured()
+        if found is not None:
+            s = found.status
+            if s is not None and s in ST_FINAL:
+                return
+        failed = "attempt {run_attempt}"
+        if target_release != run_target or upgrade_campaign != run_campaign:
+            t = run_target
+            c = run_campaign
+            if t is not None:
+                failed += " at " + t
+            if c is not None:
+                failed += " in " + c
+        _log.error("software: not starting the attempt after a failed rollback",
+                   {"device": name, "attempt": attempt, "failed": failed})
+        run_campaign = upgrade_campaign
+        run_target = target_release
+        run_attempt = attempt
+        e = _answer()
+        e.status = ST_NOT_STARTED
+        e.stage = None
+        e.reason = failed + " failed its rollback"
 
     def _on_final_check(running: ?str, err: ?Exception) -> None:
         if err is not None:
@@ -988,7 +1048,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         if err is not None:
             _log.warning("software: installed, but the cleanup failed",
                          {"device": name, "error": str(err)})
-            state.reason = "cleanup failed: " + error_text(err!)
+            _set_reason("cleanup failed: " + error_text(err!))
         _record(ST_SUCCEEDED)
         _done()
 
@@ -1626,8 +1686,9 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
 
     def on_software_state(state: SoftwareState) -> None:
         """SoftwareManager pushes its oper state: fuse and publish."""
+        attempts = ["{e.number}: " + str(e.status) + " at " + str(e.stage) for e in state.attempt]
         _log.info("DeviceMgr: software status",
-                  {"device": name, "status": str(state.status), "stage": str(state.stage)})
+                  {"device": name, "attempts": ", ".join(attempts)})
         oper.software.state = state
         update_oper()
 
@@ -2322,7 +2383,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
                     r = v.reason
                     sw_vetoes[v.holder] = r if r is not None else ""
                 swmgr.set_config(sw.upgrade_campaign, sw.target_release, sw.allow_staging, sw_vetoes,
-                                 sw.retry)
+                                 sw.attempt)
 
                 if need_new_adapter:
                     new_adapter = _build_adapter(device_type, new_dmc, effective_mock, _log_handler,

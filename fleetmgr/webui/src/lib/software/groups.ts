@@ -117,11 +117,17 @@ export interface CampaignGroup {
 }
 
 function isFailed(status: KnownStatus | undefined): boolean {
-  return status === 'failed' || status === 'rolled-back';
+  return status === 'failed' || status === 'rolled-back' || status === 'not-started';
 }
 
 /** Statuses of a member the campaign has released. */
-const RELEASED: ReadonlySet<KnownStatus> = new Set(['in-progress', 'succeeded', 'failed', 'rolled-back']);
+const RELEASED: ReadonlySet<KnownStatus> = new Set([
+  'in-progress',
+  'succeeded',
+  'failed',
+  'rolled-back',
+  'not-started'
+]);
 
 /** Whom each held campaign member waits behind, as the controller's
  * stuck() works it out: a failed member holds the unreleased members of
