@@ -1,7 +1,7 @@
 import { errorText } from '#lib/core/errors.ts';
 import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import { groupRows } from '#lib/software/groups.ts';
-import { FLEET_LIST, REDUNDANCY_GROUPS_ROOT, parseFleet, parseGroupSeparations } from '#lib/software/model.ts';
+import { FLEET_LIST, REDUNDANCY_GROUPS_ROOT, parseFleet, parseGroupPolicies } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 
@@ -15,7 +15,7 @@ export const load: PageLoad = async ({ fetch, depends }) => {
       restconfGetCachedOrNull<unknown>(FLEET_LIST, fetch),
       restconfGetOrNull<unknown>(REDUNDANCY_GROUPS_ROOT, fetch)
     ]);
-    return { rows: groupRows(parseFleet(fleet).devices, parseGroupSeparations(groups)), loadError: '' };
+    return { rows: groupRows(parseFleet(fleet).devices, parseGroupPolicies(groups)), loadError: '' };
   } catch (loadError) {
     return { rows: [], loadError: errorText(loadError, 'Failed to load the redundancy groups.') };
   }

@@ -17,7 +17,7 @@
     FLEET_LIST,
     REDUNDANCY_GROUPS_ROOT,
     parseFleet,
-    parseGroupSeparations,
+    parseGroupPolicies,
     type Device
   } from '#lib/software/model.ts';
 
@@ -88,7 +88,7 @@
         restconfGetOrNull<unknown>(REDUNDANCY_GROUPS_ROOT)
       ]);
       fleet = parseFleet(fleetJson).devices;
-      entryNames = parseGroupSeparations(groupsJson).map((s) => s.name);
+      entryNames = parseGroupPolicies(groupsJson).map((p) => p.name);
       readError = '';
     } catch (error) {
       readError = errorText(error, 'Failed to read the other groups.');

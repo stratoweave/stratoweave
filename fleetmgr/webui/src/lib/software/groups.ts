@@ -1,10 +1,11 @@
 // Redundancy groups. A device names the groups it is a member of on its
 // fleet entry, with one priority for all of them, and a group's entry under
-// /redundancy-groups says how far apart its members upgrade. A group exists
-// while a device names it or it has an entry.
+// /redundancy-groups says how far apart its members upgrade and what a
+// failed member does to the others. A group exists while a device names it
+// or it has an entry.
 
 import { restconfPatchJson, rewriteListEntry } from '#lib/core/restconf/client.ts';
-import { parseDuration } from '#lib/core/time.ts';
+import { formatDuration, parseDuration } from '#lib/core/time.ts';
 import type { ValidationResult } from '#lib/core/validation/types.ts';
 import {
   DATA_ROOT,
@@ -14,8 +15,9 @@ import {
   type Device,
   type DeviceJson,
   type DeviceStatusRow,
+  type FailurePolicy,
   type FleetPatchJson,
-  type GroupSeparation,
+  type GroupPolicy,
   type KnownStatus,
   type PlanDevice,
   type RedundancyGroupsPatchJson,
@@ -56,28 +58,35 @@ export function groupMembers(devices: Device[]): Map<string, Device[]> {
 }
 
 /** What a group with no entry does. */
-export function defaultSeparation(name: string): GroupSeparation {
-  return { name, policy: 'spread', minSeparation: 0 };
+export function defaultPolicy(name: string): GroupPolicy {
+  return { name, separationPolicy: 'spread', minSeparation: 0, failurePolicy: 'continue' };
+}
+
+/** "pack, 1m · holds on failure". */
+export function policyText(p: GroupPolicy): string {
+  const separation =
+    p.minSeparation > 0 ? `${p.separationPolicy}, ${formatDuration(p.minSeparation)}` : p.separationPolicy;
+  return `${separation} · ${p.failurePolicy === 'hold' ? 'holds' : 'continues'} on failure`;
 }
 
 export interface GroupRow {
   name: string;
   /** In upgrade order. */
   members: Device[];
-  separation: GroupSeparation;
+  policy: GroupPolicy;
   /** Whether it has an entry under /redundancy-groups. */
   hasEntry: boolean;
 }
 
 /** Every group that a device names or that has an entry, by name. */
-export function groupRows(devices: Device[], separations: GroupSeparation[]): GroupRow[] {
+export function groupRows(devices: Device[], policies: GroupPolicy[]): GroupRow[] {
   const members = groupMembers(devices);
-  const entries = new Map(separations.map((s) => [s.name, s]));
+  const entries = new Map(policies.map((p) => [p.name, p]));
   const names = [...new Set([...members.keys(), ...entries.keys()])].sort(compareNames);
   return names.map((name) => ({
     name,
     members: members.get(name) ?? [],
-    separation: entries.get(name) ?? defaultSeparation(name),
+    policy: entries.get(name) ?? defaultPolicy(name),
     hasEntry: entries.has(name)
   }));
 }
@@ -108,7 +117,7 @@ export type GroupState = (typeof GROUP_STATES)[number];
 
 export interface CampaignGroup {
   name: string;
-  separation: GroupSeparation;
+  policy: GroupPolicy;
   /** Its members in the campaign, in upgrade order. */
   members: CampaignMember[];
   /** Its members outside the campaign, which the campaign does not pace. */
@@ -121,6 +130,14 @@ export interface CampaignGroup {
 
 function isFailed(status: KnownStatus | undefined): boolean {
   return status === 'failed' || status === 'rolled-back' || status === 'not-started';
+}
+
+/** Whether the member's device is in an unknown state: its run failed its
+ * rollback, or its attempt did not start because the run of an earlier one
+ * did. Such a member holds its groups until an operator acts, whatever
+ * their failure policy. */
+export function rollbackFailed(row: DeviceStatusRow): boolean {
+  return (row.status === 'failed' && row.stage === 'rollback') || row.status === 'not-started';
 }
 
 /** held comes first: only an unreleased member is held, up-to-date ones
@@ -149,8 +166,9 @@ function nextStart(group: CampaignGroup): number {
   return next;
 }
 
-/** Whether member waits behind failed, which with the group's failure
- * policy continue it does only until failed is done and up again. */
+/** Whether member waits behind failed for its failure: under the group's
+ * failure policy hold until an operator acts, and under continue only when
+ * the rollback of failed failed. */
 function holdsBack(member: CampaignMember, failed: string): boolean {
   return member.row.held === 'group-failed' && member.heldBy.includes(failed);
 }
@@ -162,7 +180,7 @@ function holdsBack(member: CampaignMember, failed: string): boolean {
  * count, as it paces only them. `byGroup` is groupMembers() of the fleet. */
 export function campaignGroups(
   byGroup: Map<string, Device[]>,
-  separations: GroupSeparation[],
+  policies: GroupPolicy[],
   members: string[],
   rows: DeviceStatusRow[],
   plan: CampaignPlan | null
@@ -174,7 +192,7 @@ export function campaignGroups(
   for (const w of plan?.windows ?? []) {
     for (const d of w.devices) planned.set(d.name, d);
   }
-  const entries = new Map(separations.map((s) => [s.name, s]));
+  const entries = new Map(policies.map((p) => [p.name, p]));
   const out: CampaignGroup[] = [];
   for (const [name, devices] of byGroup) {
     const inCampaign: CampaignMember[] = [];
@@ -192,7 +210,7 @@ export function campaignGroups(
     const state = GROUP_STATES.find((s) => inCampaign.some((m) => m.state === s)) ?? 'done';
     out.push({
       name,
-      separation: entries.get(name) ?? defaultSeparation(name),
+      policy: entries.get(name) ?? defaultPolicy(name),
       members: inCampaign,
       outside: devices.length - inCampaign.length,
       state,
@@ -259,14 +277,19 @@ export function addMembersPatch(group: string, names: string[]): FleetPatchJson 
   return { 'fleetmgr:fleet': { device: names.map((name) => ({ name, 'redundancy-group': [group] })) } };
 }
 
-export function separationPatch(s: GroupSeparation): RedundancyGroupsPatchJson {
-  const entry = { name: s.name, 'separation-policy': s.policy, 'min-separation': s.minSeparation };
+export function policyPatch(p: GroupPolicy): RedundancyGroupsPatchJson {
+  const entry = {
+    name: p.name,
+    'separation-policy': p.separationPolicy,
+    'min-separation': p.minSeparation,
+    'failure-policy': p.failurePolicy
+  };
   return { 'fleetmgr:redundancy-groups': { 'redundancy-group': [entry] } };
 }
 
 /** A new group in one write: its members and its entry. */
-export function groupCreatePatch(s: GroupSeparation, members: string[]): FleetPatchJson & RedundancyGroupsPatchJson {
-  return { ...addMembersPatch(s.name, members), ...separationPatch(s) };
+export function groupCreatePatch(p: GroupPolicy, members: string[]): FleetPatchJson & RedundancyGroupsPatchJson {
+  return { ...addMembersPatch(p.name, members), ...policyPatch(p) };
 }
 
 /** Takes device `name` out of `group`. A PATCH cannot remove a leaf-list
@@ -396,9 +419,10 @@ export function priorityPatch(changes: Map<string, number>): FleetPatchJson {
 export interface NewGroupInput {
   name: string;
   members: string[];
-  policy: SeparationPolicy;
+  separationPolicy: SeparationPolicy;
   /** As typed. */
   minSeparation: string;
+  failurePolicy: FailurePolicy;
 }
 
 export function validateNewGroup(

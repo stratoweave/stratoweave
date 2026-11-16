@@ -8,7 +8,7 @@ import {
   SCHEDULES_ROOT,
   parseCampaigns,
   parseFleet,
-  parseGroupSeparations,
+  parseGroupPolicies,
   parseImages,
   parseSchedules
 } from '#lib/software/model.ts';
@@ -85,7 +85,7 @@ export const SOURCES: PaletteSource[] = [
         restconfGetCachedOrNull<unknown>(FLEET_LIST),
         restconfGetCachedOrNull<unknown>(REDUNDANCY_GROUPS_ROOT)
       ]);
-      const rows = groupRows(parseFleet(fleet).devices, parseGroupSeparations(groups));
+      const rows = groupRows(parseFleet(fleet).devices, parseGroupPolicies(groups));
       return entries('groups', rows.map((r) => ({ name: r.name, description: devicesText(r.members.length) })));
     }
   },

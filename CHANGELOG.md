@@ -714,6 +714,11 @@
   It leaves out the devices that run their image, unless told not to, and
   warns that the campaign would downgrade the newer ones.
 - The devices and device pages show whether each device can be reached.
+- The redundancy group pages set a group's `failure-policy` next to its
+  separation, and the groups list shows it. On a campaign's page, each
+  group gives its policies under its name, a member whose rollback failed
+  says so, as it holds its groups whatever their policy, and the
+  confirmation to take a member out says why the group waits for it.
 - fleetmgr and flotilla run Acton's generational garbage collector. Start
   them with `ACTON_GC_MODE=ordinary` for the ordinary collector. [#764]
 - Removed the unused `cpe-device` model. The IOS XE device type directory is

@@ -178,13 +178,16 @@ export interface CampaignJson {
 }
 
 export type SeparationPolicy = 'spread' | 'pack';
+export type FailurePolicy = 'continue' | 'hold';
 
 /** /fleetmgr:redundancy-groups/redundancy-group entry: how far apart the
- * members of a group upgrade. */
+ * members of a group upgrade, and what a failed member does to the
+ * others. */
 export interface RedundancyGroupJson {
   name: string;
   'separation-policy'?: SeparationPolicy;
   'min-separation'?: number;
+  'failure-policy'?: FailurePolicy;
 }
 
 /** /stratoweave-images:images/image entry. */
@@ -428,11 +431,14 @@ export const DEFAULT_PRIORITY = 100;
 
 /** A group's entry under /redundancy-groups, or the defaults of a group
  * that has none. */
-export interface GroupSeparation {
+export interface GroupPolicy {
   name: string;
-  policy: SeparationPolicy;
+  separationPolicy: SeparationPolicy;
   /** Seconds from when one member is done until the next may start. */
   minSeparation: number;
+  /** continue: a failed member holds the others until it is done and up
+   * again, unless its rollback failed. hold: until an operator acts. */
+  failurePolicy: FailurePolicy;
 }
 
 export interface MaintenanceWindow {
@@ -783,15 +789,17 @@ export function parseSchedules(json: unknown): Schedule[] {
   return schedules;
 }
 
-/** Parse a GET of data/fleetmgr:redundancy-groups. */
-export function parseGroupSeparations(json: unknown): GroupSeparation[] {
+/** Parse a GET of data/fleetmgr:redundancy-groups. A GET omits the leaves
+ * left at their defaults. */
+export function parseGroupPolicies(json: unknown): GroupPolicy[] {
   const tree = (json as { 'fleetmgr:redundancy-groups'?: { 'redundancy-group'?: RedundancyGroupJson[] } })?.[
     'fleetmgr:redundancy-groups'
   ];
   return (tree?.['redundancy-group'] ?? []).map((g) => ({
     name: g.name,
-    policy: g['separation-policy'] === 'pack' ? 'pack' : 'spread',
-    minSeparation: num(g['min-separation'] ?? 0)
+    separationPolicy: g['separation-policy'] === 'pack' ? 'pack' : 'spread',
+    minSeparation: num(g['min-separation'] ?? 0),
+    failurePolicy: g['failure-policy'] === 'hold' ? 'hold' : 'continue'
   }));
 }
 
