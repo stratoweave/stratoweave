@@ -250,6 +250,12 @@
   mock failures use it: with `bgp-down` the pre-check refuses the install, and
   with `bgp-lost` the post-check fails and the device rolls back. [#667]
   [#678]
+- The IOS XE mock serves seven interfaces in `Cisco-IOS-XE-interfaces-oper`
+  and two full OSPF neighbors in `Cisco-IOS-XE-ospf-oper` for the upgrade
+  checks. Two new mock failures change them while the activated release
+  runs, until a commit or an abort: `interface-lost` takes the line protocol
+  of GigabitEthernet0/0/1 and Virtual-Access2 down, and `ospf-lost` keeps the
+  OSPF neighbor 10.255.0.3 in init.
 - Removed `running-release` from the device software state. The release a
   device runs is in `state/platform/version`, which is read again when a
   software install ends, also after a rollback. [#718]
