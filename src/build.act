@@ -61,17 +61,18 @@ class SysSpec(object):
             lname = l.name if l.name is not None else str(idx)
             print("Compiling layer {lname} ({idx+1}/{num_layers})...", end='', flush=True)
             sw = time.Stopwatch()
-            r = CompiledLayer(yang.compile(l.models, allow_failure=allow_failure), l.models, l.name)
+            c = yang.compile_with_sources(l.models, allow_failure=allow_failure)
+            r = CompiledLayer(c.root, c.sources, l.name)
             print(" {sw.elapsed().to_float():.3f}s")
             return r
         num_dev_types = len(self.device_types)
         def _compile_dev_type(dev_type: DeviceType, idx: int) -> CompiledDeviceType:
             print("Compiling device type {dev_type.name} ({idx+1}/{num_dev_types})...", end='', flush=True)
             sw = time.Stopwatch()
-            root = yang.compile(dev_type.models, strict_quoting=False, allow_failure=allow_failure)
+            c = yang.compile_with_sources(dev_type.models, strict_quoting=False, allow_failure=allow_failure)
             for t in dev_type.transforms:
-                t.apply(root)
-            r = CompiledDeviceType(root, dev_type.models, dev_type.name, dev_type.transforms, dev_type.snmp_metadata)
+                t.apply(c.root)
+            r = CompiledDeviceType(c.root, c.sources, dev_type.name, dev_type.transforms, dev_type.snmp_metadata)
             print(" {sw.elapsed().to_float():.3f}s")
             return r
         compiled_layers = [_compile_layer(l, idx) for (idx, l) in enumerate(self.layers)]
@@ -87,7 +88,8 @@ class CompiledSysSpec(object):
     layers: list[CompiledLayer]
     def __init__(self, name: str, layers: list[CompiledLayer], device_types: list[CompiledDeviceType]):
         self.name = name
-        self.layers = layers + [CompiledLayer(yang.compile([swyang.stratoweave, swyang.device]), [swyang.stratoweave, swyang.device])]
+        device_layer = yang.compile_with_sources([swyang.stratoweave, swyang.device])
+        self.layers = layers + [CompiledLayer(device_layer.root, device_layer.sources)]
         self.dev_types = {dev_type.name: dev_type for dev_type in device_types}
 
     def gen_app(self, fc: file.FileCap, output_dir: str):
@@ -112,6 +114,7 @@ class CompiledSysSpec(object):
         syssrc_getlayers = "def get_layers(dev_registry: swdev.DeviceRegistry, log_handler: ?logging.Handler=None, db: ?swdb.Store=None):\n"
         syssrc_schema_for_layer = "def schema_for_layer(layer):\n"
         syssrc_oper_schema_for_layer = "def oper_schema_for_layer(layer):\n"
+        syssrc_src_yang_for_layer = "def src_yang_for_layer(layer):\n"
         for (idx, layer) in reversed(list(enumerate(self.layers))):
             print("Generating layer {idx}")
             layer_name = layer.name
@@ -175,6 +178,8 @@ class CompiledSysSpec(object):
             syssrc_schema_for_layer += "        return y_{idx}.SRC_DNODE\n"
             syssrc_oper_schema_for_layer += "    if layer == {idx}:\n"
             syssrc_oper_schema_for_layer += "        return y_{idx}_oper.SRC_DNODE\n"
+            syssrc_src_yang_for_layer += "    if layer == {idx}:\n"
+            syssrc_src_yang_for_layer += "        return y_{idx}.src_yang()\n"
 
             loose_name = "{output_dir}/{self.name}/layers/y_{idx}_loose.act"
             if _maybe_write_file(fc, loose_name, layer.print(loose=True, exclude_ext=_SW_EXCLUDE_EXT)):
@@ -185,6 +190,7 @@ class CompiledSysSpec(object):
         syssrc_getlayers += "    return layer0\n"
         syssrc_schema_for_layer += "    raise ValueError('Invalid layer: {{layer}}')"
         syssrc_oper_schema_for_layer += "    raise ValueError('Invalid layer: {{layer}}')"
+        syssrc_src_yang_for_layer += "    raise ValueError('Invalid layer: {{layer}}')"
 
         syssrc_devtypes = ""
         device_typesrc = "# This file is generated only when missing.\n"
@@ -254,13 +260,14 @@ class CompiledSysSpec(object):
         syssrc += "\n{syssrc_getlayers}\n"
         syssrc += "\n{syssrc_schema_for_layer}\n"
         syssrc += "\n\n{syssrc_oper_schema_for_layer}\n"
+        syssrc += "\n\n{syssrc_src_yang_for_layer}\n"
         syssrc += "\n\ngenerated_device_types: dict[str, swdev.DeviceType] = {{\n"
         syssrc += syssrc_devtypes
         syssrc += "}}\n"
         syssrc += "\ndevice_types: dict[str, swdev.DeviceType] = dict(\n"
         syssrc += "    list(generated_device_types.items()) + list(sw_device_types.device_types.items())\n"
         syssrc += ")"
-        syssrc += "\n\nSYSSPEC = swapp.SysSpec(device_types, get_layers, schema_for_layer, oper_schema_for_layer,\n"
+        syssrc += "\n\nSYSSPEC = swapp.SysSpec(device_types, get_layers, schema_for_layer, oper_schema_for_layer, src_yang_for_layer,\n"
         syssrc += "                        sw_device_types.platform_probes)\n"
         if _write_file_if_missing(fc, "{output_dir}/{self.name}/device_types.act", device_typesrc):
             print("+ App device_types.act created")
@@ -352,7 +359,7 @@ class Layer(object):
 
 class CompiledLayerBase(object):
     root: yschema.DRoot
-    src: list[str]
+    src: list[yschema.YangSource]
 
     def print(self, loose=False, gen_json=True, include_state=False, exclude_ext: list[(name: str, namespace: str)]=[], include_subs=False, schema_module: ?str=None):
         """Print the Acton (adata) classes for the layer
@@ -373,13 +380,13 @@ class CompiledLayerBase(object):
         return self.root.prschema(schema_yang=self.src)
 
 class CompiledLayer(CompiledLayerBase):
-    def __init__(self, root: yschema.DRoot, src: list[str], name: ?str=None):
+    def __init__(self, root: yschema.DRoot, src: list[yschema.YangSource], name: ?str=None):
         self.root = root
         self.src = src
         self.name = name
 
 class CompiledDeviceType(CompiledLayerBase):
-    def __init__(self, root: yschema.DRoot, src: list[str], name: str, transforms: list[SchemaTreeTransform]=[], snmp_metadata: ?str=None):
+    def __init__(self, root: yschema.DRoot, src: list[yschema.YangSource], name: str, transforms: list[SchemaTreeTransform]=[], snmp_metadata: ?str=None):
         self.root = root
         self.src = src
         self.name = name

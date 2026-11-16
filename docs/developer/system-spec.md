@@ -240,8 +240,6 @@ YANG modules in the CFS layer is that it allows you to keep the original YANG
 module clean of any StratoWeave-specific annotations. This can be desirable when
 a northbound NETCONF client downloads the YANG schemas from the system.
 
-!!! info "The StratoWeave northbound NETCONF interface is not yet available."
-
 ## Defining TMF Service/Resource mappings
 StratoWeave implements the YANG to TM Forum mapping defined in
 [draft-lambrechts-onsen-yang-tmf-mapping-00](https://datatracker.ietf.org/doc/html/draft-lambrechts-onsen-yang-tmf-mapping-00).

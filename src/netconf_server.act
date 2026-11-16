@@ -15,6 +15,7 @@ import yang.xml as yxml
 import ietf_yang_library as yl
 import monitoring
 import northbound
+import server_yang
 import yp
 import yp.events as ypevents
 import yp_ttt
@@ -24,20 +25,15 @@ import yp_ttt
 NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
 CAP_WRITABLE_RUNNING = "urn:ietf:params:netconf:capability:writable-running:1.0"
 
-# The modules that the server implements in its own code, for dynamic
-# subscriptions (RFC 8639 / 8641), and the modules that they import beyond
-# those of ietf-yang-library, for its YANG library
-SERVER_MODULES: list[(name: str, namespace: str, revision: ?str, implemented: bool, features: list[str])] = [
-    (name="ietf-subscribed-notifications", namespace=yp.NS_SN, revision="2019-09-09", implemented=True, features=["subtree", "xpath"]),
-    (name="ietf-yang-push", namespace=yp.NS_YP, revision="2019-09-09", implemented=True, features=["on-change"]),
-    (name="ietf-restconf", namespace="urn:ietf:params:xml:ns:yang:ietf-restconf", revision="2017-01-26", implemented=False, features=[]),
-    (name="ietf-yang-patch", namespace="urn:ietf:params:xml:ns:yang:ietf-yang-patch", revision="2017-02-22", implemented=False, features=[]),
-    (name="ietf-interfaces", namespace="urn:ietf:params:xml:ns:yang:ietf-interfaces", revision="2018-02-20", implemented=False, features=[]),
-    (name="ietf-ip", namespace="urn:ietf:params:xml:ns:yang:ietf-ip", revision="2018-02-22", implemented=False, features=[]),
-    (name="ietf-netconf-acm", namespace="urn:ietf:params:xml:ns:yang:ietf-netconf-acm", revision="2018-02-14", implemented=False, features=[]),
-    (name="ietf-network-instance", namespace="urn:ietf:params:xml:ns:yang:ietf-network-instance", revision="2019-01-21", implemented=False, features=[]),
-    (name="ietf-yang-schema-mount", namespace="urn:ietf:params:xml:ns:yang:ietf-yang-schema-mount", revision="2019-01-14", implemented=False, features=[]),
-]
+# The modules that the server implements in its own code, for <get-schema>
+# (RFC 6022) and dynamic subscriptions (RFC 8639 / 8641), by name, with the
+# features it supports. server_yang holds their schema and sources,
+# and those of the modules that they import, for its YANG library.
+SERVER_MODULES: dict[str, list[str]] = {
+    "ietf-netconf-monitoring": [],
+    "ietf-subscribed-notifications": ["subtree", "xpath"],
+    "ietf-yang-push": ["on-change"],
+}
 
 # Classic event notifications (RFC 5277): create-subscription plus interleave —
 # this server keeps accepting RPCs on a subscribed session.
@@ -45,10 +41,12 @@ CAP_NOTIFICATION_1_0 = "urn:ietf:params:netconf:capability:notification:1.0"
 CAP_INTERLEAVE_1_0 = "urn:ietf:params:netconf:capability:interleave:1.0"
 
 
-def module_inventory(top_oper_schema: yschema.DRoot) -> monitoring.ModuleInventory:
+def module_inventory(top_oper_schema: yschema.DRoot, yang_sources: list[yschema.YangSource]) -> monitoring.ModuleInventory:
     """The modules of a NETCONF server for top_oper_schema: those of
-    top_oper_schema and ietf-yang-library, and SERVER_MODULES."""
-    return monitoring.ModuleInventory(yschema.DRoot.merge([yl.SRC_DNODE, top_oper_schema]), SERVER_MODULES)
+    top_oper_schema and ietf-yang-library, and those of server_yang, of which
+    it implements SERVER_MODULES, with their sources. `yang_sources` are the
+    sources of the modules of top_oper_schema."""
+    return monitoring.ModuleInventory(yschema.DRoot.merge([yl.SRC_DNODE, top_oper_schema]), server_yang.SRC_DNODE.module_metadata, SERVER_MODULES, server_yang.src_yang() + yl.src_yang() + yang_sources)
 
 
 def build_capabilities(inventory: monitoring.ModuleInventory) -> list[str]:
@@ -114,7 +112,8 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
     the per-session subscription owner ids unique on the shared cfs.
 
     `inventory` holds the schema and the YANG library that the server serves,
-    see module_inventory.
+    and the sources that <get-schema> (RFC 6022) serves, see module_inventory
+    and monitoring.get_schema_reply.
 
     `on_close`, if given, is called with this session when its transport drops,
     so the owner can release its reference and let the session be reclaimed.
@@ -217,6 +216,11 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
                 s.send_error(message_id, "invalid-value", "Failed to read datastore: {e}")
                 return
             s.send_reply(message_id, [xml.Node("data", [(None, NS_NC_1_0)], children=data_children)])
+        elif op.tag == "get-schema":
+            try:
+                s.send_reply(message_id, [monitoring.get_schema_reply(op, inventory.sources)])
+            except monitoring.GetSchemaError as e:
+                s.send_error(message_id, e.error_tag, e.error_message, error_app_tag=e.error_app_tag)
         elif op.tag == "edit-config":
             if _datastore(op, "target") != "running":
                 s.send_error(message_id, "operation-not-supported", "Only the running datastore is writable")
@@ -244,11 +248,12 @@ actor NetconfSession(pipe, log_handler: logging.Handler, top_schema: yschema.DRo
                 s.send_error(message_id, "invalid-value", "Failed to apply edit-config: {e}")
                 return
         else:
-            # Everything beyond get/get-config/edit-config (close-session is
-            # handled inside netconf.Server). This includes candidate's commit/
-            # discard-changes and lock/unlock, which we deliberately do not fake:
-            # writable-running auto-commits every edit, and a no-op lock would
-            # hand out an exclusion guarantee we cannot keep.
+            # Everything beyond get/get-config/get-schema/edit-config
+            # (close-session is handled inside netconf.Server). This includes
+            # candidate's commit/discard-changes and lock/unlock, which we
+            # deliberately do not fake: writable-running auto-commits every
+            # edit, and a no-op lock would hand out an exclusion guarantee we
+            # cannot keep.
             s.send_error(message_id, "operation-not-supported", "Unsupported RPC operation: {op.tag}")
 
     def _on_conn(s: netconf.Server, err: ?Exception):
@@ -282,6 +287,7 @@ actor NetconfServer(
     top_schema: yschema.DRoot,
     top_oper_schema: yschema.DRoot,
     cfs: ttt.Layer,
+    yang_sources: list[yschema.YangSource],
     address: str = "::",
     port: int = 830,
     username: str = "admin",
@@ -295,9 +301,11 @@ actor NetconfServer(
 
     Listens for SSH connections on `port` and serves the `netconf` subsystem;
     each accepted channel becomes an independent NetconfSession sharing the `cfs`
-    configuration tree. `host_key` is the SSH host private key material (PEM /
-    OpenSSH text); when None the SSH library generates an ephemeral in-memory
-    host key per run. Reading a key from disk is the caller's job.
+    configuration tree. `yang_sources` are the sources of the modules of
+    top_schema, which the sessions serve with <get-schema>.
+    `host_key` is the SSH host private key material (PEM / OpenSSH text); when
+    None the SSH library generates an ephemeral in-memory host key per run.
+    Reading a key from disk is the caller's job.
 
     Authentication defaults to a static username/password check
     (StaticAuthChecker). Pass `auth_check` to plug in any checker with the same
@@ -305,7 +313,7 @@ actor NetconfServer(
     service over the network before responding.
     """
     _log = logging.Logger(log_handler)
-    _inventory = module_inventory(top_oper_schema)
+    _inventory = module_inventory(top_oper_schema, yang_sources)
     _auth = auth_check if auth_check is not None else StaticAuthChecker(username, password, log_handler).check
     # One hub for the whole server: app code publishes events here and every
     # session with an active create-subscription receives the matching ones.
