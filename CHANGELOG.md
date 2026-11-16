@@ -38,6 +38,11 @@
 - A software adapter has a static `prepare_estimate()`: the seconds the copy
   of the image takes, for planners. The IOS XE adapter gives 130. The unused
   `estimate(staged)` is removed. [#784]
+- Reads of a transform's data no longer copy each list entry to add its keys
+  when the entry already has them. In Fleet Manager with 10,000 devices, a
+  read of the fleet configuration takes 37 ms instead of 45 ms. [#815]
+- Acton library modules such as `json`, `http` and `argparse` are imported
+  from `std`, as Acton moves them out of base [acton#3410]. [#833]
 
 ### Northbound APIs
 - Fixed NETCONF `<get-config>` returning the operational state published by
@@ -66,6 +71,10 @@
   features `subtree`, `xpath` and `on-change`. The `<hello>` has one
   `yang-library:1.1` capability instead of a capability per module.
   RESTCONF serves `/modules-state` too. [#716]
+- The NETCONF server serves `<get-schema>` (RFC 6022) for each module and
+  submodule of the CFS schema, of ietf-yang-library, and of the modules that
+  the server implements itself and their imports. The YANG library lists
+  ietf-netconf-monitoring as implemented. [#820]
 - The NETCONF server serves RFC 5277 `create-subscription` and advertises the
   `:notification` and `:interleave` capabilities. Application code sends a
   notification to the subscribed sessions with `publish()` on
@@ -80,6 +89,14 @@
   completing, and since a Fleet Manager top sends one edit at a time to each
   flotilla, a single such device blocked all further configuration to its
   flotilla. [#792]
+- The HTTP server sends embedded static assets unchanged as bytes, so an
+  application's web UI can include images, fonts and other binary files,
+  which are served with their content type. `stratoweave.main()` takes
+  `static_assets` as `dict[str, bytes]` instead of `dict[str, str]`.
+- The HTTP server compresses text responses, such as RESTCONF and HTTP API
+  replies and the web UI's files, with gzip or deflate when the client
+  accepts it in `Accept-Encoding`. In Fleet Manager with 100,000 devices,
+  the 14 MB fleet list goes out as about 1.3 MB. [#832]
 
 ### Devices & Adapters
 - SNMP device adapters are generated from MIBs. The system generator
@@ -240,8 +257,7 @@
   kept in sync yet. [#703]
 - An image in `/images/image` has a `family`, like `c8000v-universalk9`, and
   a `default` flag. A family has at most one default image.
-  `/images/url-base` says where devices fetch the images from: an image's URL
-  is `url-base` followed by the image name. [#742] [#743]
+  `/images/url-base` says where devices fetch the images from. [#742] [#743]
 - The device software state has two new leaves: `stage`, the step the
   run is in or ended in, and `reason`, set when a run fails or rolls back.
   The IOS XE adapter takes `reason` from the `txn-sub-state` of the failed
@@ -255,7 +271,7 @@
   checks. Two new mock failures change them while the activated release
   runs, until a commit or an abort: `interface-lost` takes the line protocol
   of GigabitEthernet0/0/1 and Virtual-Access2 down, and `ospf-lost` keeps the
-  OSPF neighbor 10.255.0.3 in init.
+  OSPF neighbor 10.255.0.3 in init. [#821]
 - Removed `running-release` from the device software state. The release a
   device runs is in `state/platform/version`, which is read again when a
   software install ends, also after a rollback. [#718]
@@ -369,18 +385,18 @@
   campaign, or a removed target, stops before its install ends at
   `upgrade-needed`. [#804] [#814]
 - Images can be kept in folders inside the image folder. An image in
-  `/images/image` has a new `file` leaf, the path of its file there, such as
-  `iosxe/17.18/c8000v-universalk9.17.18.03a.SPA.bin`; without it the file is
-  the image's name, as before. A device's URL is `url-base` followed by the
-  file. Campaigns keep naming the image, so moving its file changes only the
+  `/images/image` has a `file` leaf, the path of its file there, such as
+  `iosxe/17.18/c8000v-universalk9.17.18.03a.SPA.bin`. Without it, the file is
+  the image's name. A device's URL is `url-base` followed by the file.
+  Campaigns keep naming the image, so moving its file changes only the
   `file` leaf, and the campaigns give their members the new URL. Members
   that answered or finished keep their status, since the target release
   stays the same. `GET /image-file` lists the files in every folder, by
-  path, and the folders under `folders`; `PUT /image-file/<path>` makes the
+  path, and the folders under `folders`. `PUT /image-file/<path>` makes the
   folders on the way. `PUT` and `DELETE /image-folder/<path>` make a folder
   and remove one with everything in it, and `POST /image-move` with
   `{"from": ..., "to": ...}` moves or renames a file or folder without
-  replacing anything.
+  replacing anything. [#806]
 - The software state shows the vetoes of the configuration under
   `state/veto`, with their reasons. [#811]
 
@@ -515,8 +531,9 @@
   error until only one campaign names it. [#783]
 - A campaign's `device-status` shows a member's status only when the status
   is for the campaign's intent, its name and the member's target release,
-  and `pending` otherwise. The counters count only those statuses. Before, a `succeeded` left from an earlier campaign made
-  a member done at its release, with no upgrade. [#783]
+  and `pending` otherwise. The counters count only those statuses. Before, a
+  `succeeded` left from an earlier campaign made a member done at its
+  release, with no upgrade. [#783]
 - Setting a running campaign back to `plan` pauses it: members in flight
   stop before their install, and are released again when the campaign runs
   again. A member that still reports `in-progress` for the campaign when it
@@ -614,7 +631,7 @@
   device has not connected since fleetmgr started. A campaign's new
   `state/up-to-date` counts the members that answered `up-to-date`, as they
   already ran the target release when they read it; `succeeded` still
-  counts them too.
+  counts them too. [#816]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -649,10 +666,10 @@
   campaigns install. An upload whose file name is already an image's name
   fails before the file is sent. Search covers the folder shown and the
   folders in it, and files that the image list lacks show, ready to add.
+  [#806]
 - The web UI's image pages have a Checksum field for the checksums that the
   vendor publishes: MD5, SHA-256 or SHA-512, told apart by their length. An
-  upload sets the image's `size` from the file. Saving an image no longer
-  drops its checksums and size.
+  upload sets the image's `size` from the file. [#823]
 - The web UI has a Config page that shows the top's configuration, the state
   its transforms publish, or both, as XML, JSON or AData. The Apply config
   page merges JSON or XML configuration into the running system with a
@@ -673,12 +690,11 @@
   the page opens. The failed devices, the redundancy groups and the devices
   fold too, and only the failed devices start open. Folded, the redundancy
   groups say how many of them are held. [#789]
-- The campaign page's Schedule, pace and limits set a campaign's
-  `close-margin` and `stagger`.
 - The campaign page's Revert to plan is now Pause, and its confirmation says
   what a pause does: members that upgrade stop before their install and go
   on when the campaign runs again. A campaign in plan that has run shows as
-  paused.
+  paused. Schedule, pace and limits set the campaign's `close-margin` and
+  `stagger`. [#823]
 - The device page is redesigned around the device's upgrade run. [#674]
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for
@@ -686,15 +702,16 @@
 - The web UI's add and import device forms take a private key file, and a
   CLI over SSH box that gives the device the `iosxe-cli` extra adapter, on
   port 22 or the port typed. A device with an address needs a password or a
-  key. Import gives the CLI only to the devices with an address.
+  key. Import gives the CLI only to the devices with an address. [#823]
 - The web UI works on narrow screens and has better contrast and
   accessibility. The campaign page leads with live progress and failures.
   [#679]
-- The web UI no longer redraws the timeline every second and reads less from
-  the server. Each page reads only the fields that it shows, with the
-  RESTCONF `fields` query parameter. The devices and new-campaign pages and
-  the search share one fleet read for 30 s, and the Refresh button reloads
-  it. [#671] [#687] [#689] [#805]
+- The web UI reads less from the server. Each page reads only the fields
+  that it shows, with the RESTCONF `fields` query parameter, and the device
+  page no longer reads the device's credentials. The pages that read the
+  whole fleet, like the devices page, share one read for 30 s, so a change
+  that another client makes can take that long to show.
+  [#671] [#687] [#689] [#805] [#807]
 - Web UI pages show at once and fill in as their reads arrive, and the
   sidebar marks the page that is loading. On large fleets the pages read
   less: the device page reads only the device's own `device-status` entry,
@@ -702,13 +719,6 @@
   takes, and adding, importing, removing or scheduling devices updates the
   devices list without reading the whole fleet again. Newly added devices
   show no model or version until the page is loaded again. [#754]
-- The redundancy group pages, the campaigns list and the device page read
-  only what they show, with the RESTCONF `fields` query parameter. At 20k
-  devices the group pages read 2.8 MB of the fleet instead of 6.6 MB and
-  the campaigns list 0.4 MB of the campaigns instead of 1.4 MB. The device
-  page no longer reads the device's credentials. A campaign's counters are
-  one read instead of four, and on the campaigns list the plan alarms come
-  with them.
 - Fixed the campaign plan timeline drawing a crowded window past its end.
   Its columns grow taller instead. [#761]
 - The campaign page shows why members wait. Its progress bar splits the
@@ -725,20 +735,22 @@
   groups take whom each member waits behind from the campaign, and offer to
   take out only the failed members that others wait behind. A `pending`
   member shows as not answered, and the device page names the attempt it
-  has not answered.
+  has not answered. [#816]
 - The campaign page sets the campaign's notification period and failure
   budget, shows how many failures the budget allows and how many there
-  are, and when the campaign first ran.
+  are, and when the campaign first ran. [#816]
 - The new campaign page shows, for each model, how many of the selected
   devices already run the picked image and how many run a newer release.
   It leaves out the devices that run their image, unless told not to, and
-  warns that the campaign would downgrade the newer ones.
+  warns that the campaign would downgrade the newer ones. [#816]
 - The devices and device pages show whether each device can be reached.
+  [#816]
 - The redundancy group pages set a group's `failure-policy` next to its
   separation, and the groups list shows it. On a campaign's page, each
   group gives its policies under its name, a member whose rollback failed
   says so, as it holds its groups whatever their policy, and the
   confirmation to take a member out says why the group waits for it.
+  [#819]
 - fleetmgr and flotilla run Acton's generational garbage collector. Start
   them with `ACTON_GC_MODE=ordinary` for the ordinary collector. [#764]
 - Removed the unused `cpe-device` model. The IOS XE device type directory is
@@ -757,7 +769,7 @@
   flotilla. The flotillas register the device type `iosxe-cli`, the IOS XE
   CLI adapter, so an IOS XE device can have the CLI beside NETCONF. [#779]
 - A fleet device has `upgrade-checks/enabled`, true by default. With false,
-  its upgrades go without the BGP pre- and post-checks. [#799]
+  its upgrades go without the pre- and post-checks. [#799]
 - The flotilla checks a device's interfaces and OSPF neighbors before and
   after an upgrade, as it checks BGP. The `interfaces` post-check wants every
   interface that was up, line protocol up, before the upgrade to be up
@@ -769,7 +781,7 @@
   device is read only while a check runs, and `upgrade-checks` sets the
   waits of all three or turns them off. No adapter reads the interfaces or
   the OSPF neighbors of an IOS XE device without NETCONF, such as 16.8 on a
-  C1111, so its pre-checks refuse unless the checks are off.
+  C1111, so its pre-checks refuse unless the checks are off. [#821]
 - The prepare in the upgrade status of a fleet device, and in the
   `device-status` of a campaign, has `progress`: how far the device's
   transfer is. [#799]
@@ -785,14 +797,15 @@
   images are four families in three releases, each family in its own
   folder, with an empty sparse file for each in `out/images`. `demo.xml`,
   `demo-campaign.xml`, `upgrade.xml`, `just upgrade` and `just
-  upgrade-and-watch` are gone.
+  upgrade-and-watch` are gone. [#825]
 
 ### Dependencies
 
 #### Acton
 - Requires Acton newer than 0.31.0, for explicit parameter defaults
-  [acton#3211], the `Env` services [acton#2768] and the write barriers of
-  the generational garbage collector [acton#3390].
+  [acton#3211], the `Env` services [acton#2768], the write barriers of the
+  generational garbage collector [acton#3390], HTTP server bodies as bytes
+  [acton#3403] and compressed HTTP responses [acton#3404].
 
 #### acton-yang
 - gdata is encoded as compact XML and JSON by default, as in the Acton
@@ -854,11 +867,19 @@
 - `yang.restconf.resolve_fields()` parses a RESTCONF `fields` value against
   the schema below the target resource, and `select_fields()` narrows data
   to the result. [acton-yang#561] [#805]
+- `yang.compile_with_sources()` compiles like `yang.compile()` and also gives
+  each source with the name and revision of its module or submodule, as a
+  `yang.schema.YangSource`. `DRoot.prschema()` and `DRoot.prdaclass()` take
+  their `schema_yang` sources in that form, and the generated `src_yang()`
+  functions return them. [acton-yang#562] [#820]
 - Fixed subtree filters dropping a list entry when one of its selection
   nodes selected nothing. A fleet device in no campaign has no software
   state on its flotilla, so the top's subscription got nothing and the
   device showed no platform or connection. A content match node that
   matches is now in the output too. [acton-yang#563] [#822]
+- Imports Acton library modules from `std`, and the schema code generator
+  writes `import std.base64` and `import std.json` into the modules it
+  generates. [acton-yang#565] [#833]
 
 #### acton-ssh
 - Fixed SSH events being delivered out of the order libssh raises them.
@@ -872,6 +893,7 @@
 - `SshPipe` can request an interactive shell with `shell=True`, instead of a
   subsystem or a command. [acton-ssh#20] [#714]
 - Builds with Zig 0.17. [acton-ssh#17] [#670]
+- Imports Acton library modules from `std`. [#833]
 - Connect failures are reported as `ssh.SshError`, or its subclasses
   `KeyExchangeError`, `HostKeyError` and `AuthenticationError`, instead of
   an `OSError` for everything. An `OSError` is left for failures before the
@@ -889,12 +911,23 @@
   `max_write_buffer` of `Client` and `Server` defaults to 0, no limit.
   Writes go to libssh in pieces of at most 256 KiB, which also bounds
   libssh's send buffer per connection. [acton-ssh#25] [#788]
+- `ssh.ScpPut` and `ssh.ScpGet` copy one file to or from the server over SCP
+  on an existing `Client`, without blocking. They run the server's `scp` on
+  an exec channel and hold the whole file in memory. [acton-ssh#22] [#818]
+- Fixed a busy loop while a channel has writes queued and the peer's window
+  is shut. [acton-ssh#22] [#818]
+- A failed connect or a dropped connection reports the socket's error, such
+  as "connection refused" or "no route to host", instead of "bad file
+  descriptor". [acton-ssh#22] [#818]
 
 #### acton-lmdb
 - Builds with Zig 0.17. [acton-lmdb#6] [#670]
 
 #### actmf
-- Updated for explicit defaults.
+- Updated for explicit defaults, for Acton library modules imported from
+  `std`, and for the changes to the `yang.data.YangData` protocol and
+  `yang.schema.DNode.gname` in acton-yang. [actmf#76] [actmf#77] [actmf#78]
+  [actmf#79] [actmf#80] [#741] [#762] [#790] [#833]
 
 #### actsnmp
 - New dependency: an SNMP implementation in Acton, with SNMPv1, v2c and v3
@@ -905,6 +938,9 @@
 - Query parameter names and values are percent-decoded.
   `Context.query()` gives every value of each name as a list, in request
   order, instead of one value, and `query_param()` gives the first. [#805]
+- Imports Acton library modules from `std`. [#833]
+- The `respond` callback of handlers and middleware takes the body as
+  `bytes` instead of `str`, as `http.Server` in Acton does. [acton#3403]
 
 ### Documentation
 - The software upgrade reference is rewritten to match the code, and is part
@@ -972,6 +1008,10 @@
   device instead: `state/adapter` shows whether it is connected, and the
   inspection API's `/device/<name>/info` and `/device/<name>/log` show its
   queue and what was sent to it. [#792]
+- `stratoweave.main()` takes `static_assets` as `dict[str, bytes]`. Have the
+  web UI build embed each file as a `bytes` literal, as fleetmgr's
+  `gen-embedded-assets.mjs` does. http-router handlers and middleware call
+  `respond` with a `bytes` body: call `.encode()` on a `str` body.
 
 ## [26.10] - 2026-10-23
 
@@ -1090,12 +1130,32 @@ next. Give it a spin. We’d love to hear what you think.
 [#803]: https://github.com/stratoweave/stratoweave/pull/803
 [#804]: https://github.com/stratoweave/stratoweave/pull/804
 [#805]: https://github.com/stratoweave/stratoweave/pull/805
+[#806]: https://github.com/stratoweave/stratoweave/pull/806
+[#807]: https://github.com/stratoweave/stratoweave/pull/807
 [#811]: https://github.com/stratoweave/stratoweave/pull/811
 [#814]: https://github.com/stratoweave/stratoweave/pull/814
+[#815]: https://github.com/stratoweave/stratoweave/pull/815
+[#816]: https://github.com/stratoweave/stratoweave/pull/816
+[#818]: https://github.com/stratoweave/stratoweave/pull/818
+[#819]: https://github.com/stratoweave/stratoweave/pull/819
+[#820]: https://github.com/stratoweave/stratoweave/pull/820
+[#821]: https://github.com/stratoweave/stratoweave/pull/821
 [#822]: https://github.com/stratoweave/stratoweave/pull/822
+[#823]: https://github.com/stratoweave/stratoweave/pull/823
+[#825]: https://github.com/stratoweave/stratoweave/pull/825
+[#832]: https://github.com/stratoweave/stratoweave/pull/832
+[#833]: https://github.com/stratoweave/stratoweave/pull/833
+[actmf#76]: https://github.com/stratoweave/actmf/pull/76
+[actmf#77]: https://github.com/stratoweave/actmf/pull/77
+[actmf#78]: https://github.com/stratoweave/actmf/pull/78
+[actmf#79]: https://github.com/stratoweave/actmf/pull/79
+[actmf#80]: https://github.com/stratoweave/actmf/pull/80
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton#3390]: https://github.com/actonlang/acton/pull/3390
+[acton#3403]: https://github.com/actonlang/acton/pull/3403
+[acton#3404]: https://github.com/actonlang/acton/pull/3404
+[acton#3410]: https://github.com/actonlang/acton/pull/3410
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
 [acton-ssh#6]: https://github.com/actonlang/acton-ssh/pull/6
 [acton-ssh#15]: https://github.com/actonlang/acton-ssh/pull/15
@@ -1103,6 +1163,7 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-ssh#18]: https://github.com/actonlang/acton-ssh/pull/18
 [acton-ssh#20]: https://github.com/actonlang/acton-ssh/pull/20
 [acton-ssh#21]: https://github.com/actonlang/acton-ssh/pull/21
+[acton-ssh#22]: https://github.com/actonlang/acton-ssh/pull/22
 [acton-ssh#23]: https://github.com/actonlang/acton-ssh/pull/23
 [acton-ssh#24]: https://github.com/actonlang/acton-ssh/pull/24
 [acton-ssh#25]: https://github.com/actonlang/acton-ssh/pull/25
@@ -1122,4 +1183,6 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-yang#558]: https://github.com/stratoweave/acton-yang/pull/558
 [acton-yang#560]: https://github.com/stratoweave/acton-yang/pull/560
 [acton-yang#561]: https://github.com/stratoweave/acton-yang/pull/561
+[acton-yang#562]: https://github.com/stratoweave/acton-yang/pull/562
 [acton-yang#563]: https://github.com/stratoweave/acton-yang/pull/563
+[acton-yang#565]: https://github.com/stratoweave/acton-yang/pull/565
