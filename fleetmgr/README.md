@@ -48,10 +48,10 @@ Start the top:
 The top starts ten `flotilla` subprocesses and waits for every NETCONF listener
 before starting its own runtime. The demo has 102 complete mock IOS XE
 entries, `cpe-001` to `cpe-102`, six to fourteen on each flotilla. Every
-device takes 120 to 150 s to upgrade, fourteen of them, picked at random
+device takes 120 to 150 s to upgrade, eighteen of them, picked at random
 when the file was generated so the grids show no pattern, fail in one of
-the mock's seven install and BGP ways, two per kind, and `cpe-003` already
-runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
+the mock's nine ways, two per kind, and `cpe-003` already runs the
+target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
 campaign over the 99 devices `upgrade.xml` does not use, bound to a
 `nightly` schedule with a one-hour window at midnight UTC, so the web UI
 has a plan to show. When the demo starts, each of its members reads the
@@ -79,7 +79,7 @@ duration in seconds or a range, the window length in seconds, and which
 schedules open soon rather than at their local midnight. `just demo-big`
 is `just demo-fleet 1000 10 20 10 120-150 14400 europe`: a thousand
 devices with `demo.xml`'s knobs, 120 to 150 s installs and a tenth failing
-one of the seven ways, picked by a fixed shuffle so the grids show no
+one of the mock's nine ways, picked by a fixed shuffle so the grids show no
 pattern, in four-hour windows with ten devices at once, where only europe
 opens right away and americas and asia wait for their midnight, as a real
 fleet's windows would. The files land in `out/`; a thousand devices come up
@@ -116,10 +116,12 @@ GigabitEthernet0/0/0, 10.255.0.2 and 10.255.0.3. `mock/platform` takes
 absent, and `model` and `serial-number`, the chassis the device reports,
 C8000V and 9ABCDEFGHIJ when absent; the demo devices report ten IOS XE
 models in a rough field mix, each with its own serial number. In the demo
-fourteen devices each reproduce one of the seven install and BGP failures:
-`cpe-034` fails its commit, so the campaign aborts it and it ends
-`rolled-back`, while `cpe-007` fails its download and ends `failed`. `cpe-039` refuses on its pre-check and `cpe-016` rolls back
-on its post-check. `cpe-003` already runs the target and ends `up-to-date`.
+eighteen devices each reproduce one of the nine failures: `cpe-034` fails
+its commit, so the campaign aborts it and it ends `rolled-back`, while
+`cpe-007` fails its download and ends `failed`. `cpe-039` refuses on its
+pre-check, and `cpe-016`, `cpe-061` and `cpe-068` roll back on their
+post-checks, which miss a BGP session, an interface and an OSPF neighbor.
+`cpe-003` already runs the target and ends `up-to-date`.
 The leaves are read when the device is created; change them by deleting and
 re-creating the device.
 
