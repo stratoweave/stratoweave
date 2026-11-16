@@ -22,8 +22,8 @@ an IOS XE device.
            and /fleet/device{cpe}/state/platform and state/connected
 
     flotilla RFS /rfs{cpe}/device-health
-        -> a periodic BGP state subscription while a check runs
-        -> the device's software upgrade pre-check and post-check
+        -> periodic BGP, interface and OSPF subscriptions while a check runs
+        -> the device's software upgrade pre-checks and post-checks
 
 There is no range expansion. A flotilla assigned 500 devices receives 500
 complete `/device` entries, including addresses, credentials, SSH options, policy,
@@ -50,7 +50,8 @@ before starting its own runtime. The demo has 102 complete mock IOS XE
 entries, `cpe-001` to `cpe-102`, six to fourteen on each flotilla. Every
 device takes 120 to 150 s to upgrade, fourteen of them, picked at random
 when the file was generated so the grids show no pattern, fail in one of
-the mock's seven ways, two per kind, and `cpe-003` already runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
+the mock's seven install and BGP ways, two per kind, and `cpe-003` already
+runs the target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
 campaign over the 99 devices `upgrade.xml` does not use, bound to a
 `nightly` schedule with a one-hour window at midnight UTC, so the web UI
 has a plan to show. When the demo starts, each of its members reads the
@@ -101,17 +102,23 @@ operation at once. `upgrade-duration-variance` lets each upgrade take up to
 that percentage longer or shorter, 20 by default, drawn at random per
 upgrade, so devices released together do not all finish together. `failure`
 names one IOS XE failure to reproduce: `download-failed`, `add-failed`,
-`activate-refused`, `commit-failed` or `reverts`, or one that fails a BGP
-check: `bgp-down` keeps the session idle from the start, so the pre-check
-refuses, and `bgp-lost` keeps it idle on the new release, so the post-check
-fails and the activation is aborted. `mock/platform` takes `version`, the
-release the device runs before any upgrade, 17.18.02 when absent, and `model`
-and `serial-number`, the chassis the device reports, C8000V and 9ABCDEFGHIJ
-when absent; the demo devices report ten IOS XE models in a rough field mix,
-each with its own serial number. In the demo fourteen devices each reproduce
-one of the seven failures: `cpe-034` fails its commit, so the campaign
-aborts it and it ends `rolled-back`, while `cpe-007` fails its download and
-ends `failed`. `cpe-039` refuses on its pre-check and `cpe-016` rolls back
+`activate-refused`, `commit-failed` or `reverts`, or one that fails an
+upgrade check: `bgp-down` keeps the BGP session idle from the start, so the
+pre-check refuses, while `bgp-lost` keeps it idle on the new release,
+`interface-lost` takes the line protocol of GigabitEthernet0/0/1 and
+Virtual-Access2 down on the new release, and `ospf-lost` keeps the OSPF
+neighbor 10.255.0.3 in init on the new release, so the post-check fails and
+the activation is aborted. The mock serves seven interfaces,
+GigabitEthernet0/0/0 to 0/0/2 (0/0/2 shut), Loopback0, NVI0,
+Virtual-Access1 and Virtual-Access2, and two full OSPF neighbors on
+GigabitEthernet0/0/0, 10.255.0.2 and 10.255.0.3. `mock/platform` takes
+`version`, the release the device runs before any upgrade, 17.18.02 when
+absent, and `model` and `serial-number`, the chassis the device reports,
+C8000V and 9ABCDEFGHIJ when absent; the demo devices report ten IOS XE
+models in a rough field mix, each with its own serial number. In the demo
+fourteen devices each reproduce one of the seven install and BGP failures:
+`cpe-034` fails its commit, so the campaign aborts it and it ends
+`rolled-back`, while `cpe-007` fails its download and ends `failed`. `cpe-039` refuses on its pre-check and `cpe-016` rolls back
 on its post-check. `cpe-003` already runs the target and ends `up-to-date`.
 The leaves are read when the device is created; change them by deleting and
 re-creating the device.
@@ -406,32 +413,53 @@ beneath it.
 ## Upgrade checks
 
 Every device the top places on a flotilla also gets `/rfs{cpe}/device-health`
-there. Its transform registers the software upgrade pre-check and post-check
-with the device's software manager and subscribes to the device's BGP state
-(`Cisco-IOS-XE-bgp-oper`) only while a check runs, every `poll-period`
-seconds, default 2.
+there. Its transform registers three checks with the device's software
+manager, each as a pre-check and a post-check under its name, and reads the
+device for a check only while it runs, every `poll-period` seconds, default
+2. A pre-check records a baseline, and its post-check compares against it.
 
-A check judges the readings delivered after it started, so a post-check
-cannot pass on numbers read before the reload; a periodic subscription
-delivers every successful read, so the first one is at most a poll period
-away. The pre-check passes once a reading shows an established neighbor, or
-no BGP neighbors at all, and records the established-session and
-advertised-prefix counts as the baseline. While every neighbor is down it
-keeps waiting and refuses after 45 s; the device is then left on the old
-release. The post-check passes once the device is back at the baseline and
-refuses after 10 minutes, which aborts the activation. A fleet device's
-`upgrade-checks/precheck-wait` and `postcheck-wait` change those waits; the
-demo's `bgp-lost` devices wait a minute. `upgrade-checks/enabled` false turns
-the checks off, for a device whose BGP state no adapter reads. An IOS XE device
-without NETCONF, such as 16.8 on a C1111, has its BGP state from the
-`iosxe-cli` adapter.
+- `bgp` reads the BGP neighbors (`Cisco-IOS-XE-bgp-oper`). The pre-check
+  passes once a read shows an established neighbor, or no BGP neighbors at
+  all, and records the established-session and advertised-prefix counts.
+  The post-check wants as many established sessions and advertised prefixes
+  again.
+- `interfaces` reads which interfaces are up with their line protocol up
+  (`Cisco-IOS-XE-interfaces-oper`: admin-status `if-state-up` and
+  oper-status `if-oper-state-ready`), what `show interfaces | inc up, line
+  protocol is up` lists. The pre-check passes on the first read and records
+  them. The post-check fails while an interface that was up is not, NVI and
+  Virtual-Access interfaces aside, or while fewer Virtual-Access interfaces
+  are up.
+- `ospf` reads the OSPF neighbors on each interface and their adjacency
+  state (`Cisco-IOS-XE-ospf-oper`, `ospf-state`), what `show ip ospf
+  neighbor detail` lists. The pre-check passes on the first read and
+  records them. The post-check wants the same neighbors, each in the same
+  state: none missing, none new.
+
+A check judges the reads delivered after it started, so a post-check cannot
+pass on numbers read before the reload; a periodic subscription delivers
+every successful read, so the first one is at most a poll period away. While
+every BGP neighbor is down the `bgp` pre-check keeps waiting and refuses
+after 45 s; the device is then left on the old release. A post-check passes
+once the device is back at its baseline and refuses after 10 minutes, which
+aborts the activation. A fleet device's `upgrade-checks/precheck-wait` and
+`postcheck-wait` change those waits; the demo's `bgp-lost`, `interface-lost`
+and `ospf-lost` devices wait a minute. `upgrade-checks/enabled` false turns
+the checks off, for a device whose BGP state, interfaces or OSPF neighbors
+no adapter reads. An IOS XE device without NETCONF, such as 16.8 on a
+C1111, has its BGP state from the `iosxe-cli` adapter, but no adapter reads
+its interfaces or OSPF neighbors yet, so its pre-checks refuse unless the
+checks are off.
 
 Nothing is read from the device between checks and nothing is published
 but the verdicts, under `/device{cpe}/software/state/attempt/precheck` and
-`postcheck`. The top carries both up to the campaign's `device-status`, next
-to the device's status, the step its upgrade is at and why it stopped. The mock IOS XE
-device serves one established BGP neighbor, so in the demo both checks pass
-with its numbers, except on the `bgp-down` and `bgp-lost` devices.
+`postcheck`, one part per check: `bgp: ...; interfaces: ...; ospf: ...`.
+The top carries both up to the campaign's `device-status`, next to the
+device's status, the step its upgrade is at and why it stopped. The mock IOS
+XE device serves one established BGP neighbor, its interfaces up and two
+full OSPF neighbors, so in the demo every check passes with its numbers,
+except on the `bgp-down`, `bgp-lost`, `interface-lost` and `ospf-lost`
+devices.
 
 ## Tests
 
@@ -441,7 +469,9 @@ The focused tests cover device placement by name, the top's flotilla
 entries, precise campaign links, campaign aggregation, the stage, reason and
 check verdicts reaching the campaign, the platform reaching the top, the parent RFS-to-flotilla render, direct `/device` configuration at
 the RFS-only bottom, the mock leaves reaching the flotilla, reading the BGP
-neighbors, and a complete mock IOS XE software upgrade gated by the
-device-health checks, which the mock's BGP failures refuse or roll back. The
+neighbors, the interfaces and the OSPF neighbors, the pre-check and
+post-check rules of the three checks, and a complete mock IOS XE software
+upgrade gated by them, which the mock's BGP, interface and OSPF failures
+refuse or roll back. The
 root tests also cover IOS XE adapter behavior and ensure that a software-intent
 change preserves the existing NETCONF adapter and session.

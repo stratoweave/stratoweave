@@ -744,6 +744,18 @@
   CLI adapter, so an IOS XE device can have the CLI beside NETCONF. [#779]
 - A fleet device has `upgrade-checks/enabled`, true by default. With false,
   its upgrades go without the BGP pre- and post-checks. [#799]
+- The flotilla checks a device's interfaces and OSPF neighbors before and
+  after an upgrade, as it checks BGP. The `interfaces` post-check wants every
+  interface that was up, line protocol up, before the upgrade to be up
+  again, NVI and Virtual-Access interfaces aside, and as many Virtual-Access
+  interfaces up. The `ospf` post-check wants the same OSPF neighbors, each in
+  the same state. Their pre-checks only record what they read. The checks
+  are registered as `bgp`, `interfaces` and `ospf` instead of
+  `rfs-device-health`, so a verdict says what each check saw. As before, the
+  device is read only while a check runs, and `upgrade-checks` sets the
+  waits of all three or turns them off. No adapter reads the interfaces or
+  the OSPF neighbors of an IOS XE device without NETCONF, such as 16.8 on a
+  C1111, so its pre-checks refuse unless the checks are off.
 - The prepare in the upgrade status of a fleet device, and in the
   `device-status` of a campaign, has `progress`: how far the device's
   transfer is. [#799]
