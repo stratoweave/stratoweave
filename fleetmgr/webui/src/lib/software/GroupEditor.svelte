@@ -17,25 +17,30 @@
     devicesText,
     parsePriority,
     parseSeparation,
+    policyPatch,
     priorityPatch,
     removeFromGroup,
     reorderPriorities,
     reorderedGroups,
-    separationPatch,
     suggestNames
   } from '#lib/software/groups.ts';
   import {
     DATA_ROOT,
     REDUNDANCY_GROUP_LIST_ROOT,
     type Device,
-    type GroupSeparation,
+    type FailurePolicy,
+    type GroupPolicy,
     type SeparationPolicy
   } from '#lib/software/model.ts';
 
   const PAGE_SIZE = 100;
-  const POLICIES: { value: SeparationPolicy; label: string }[] = [
+  const SEPARATIONS: { value: SeparationPolicy; label: string }[] = [
     { value: 'spread', label: 'spread' },
     { value: 'pack', label: 'pack' }
+  ];
+  const FAILURES: { value: FailurePolicy; label: string }[] = [
+    { value: 'continue', label: 'continue' },
+    { value: 'hold', label: 'hold' }
   ];
 
   interface Props {
@@ -47,13 +52,13 @@
     /** The campaigns each member is in. */
     campaignsOf: Map<string, string[]>;
     /** The group's entry, or the defaults. */
-    separation: GroupSeparation;
+    policy: GroupPolicy;
     hasEntry: boolean;
     /** Every device of the fleet, sorted: what a member is picked from. */
     deviceNames: string[];
   }
 
-  let { name, members, otherGroups, campaignsOf, separation, hasEntry, deviceNames }: Props = $props();
+  let { name, members, otherGroups, campaignsOf, policy, hasEntry, deviceNames }: Props = $props();
 
   const uid = $props.id();
   // What the new group page that sent us here did.
@@ -311,31 +316,46 @@
   }
 
   // null follows the group as loaded; an edit holds until it is saved.
-  let policyPick = $state<SeparationPolicy | null>(null);
+  let separationPick = $state<SeparationPolicy | null>(null);
   let separationText = $state<string | null>(null);
-  let separationMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
-  let policy = $derived(policyPick ?? separation.policy);
+  let failurePick = $state<FailurePolicy | null>(null);
+  let policyMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
+  let separationPolicy = $derived(separationPick ?? policy.separationPolicy);
+  let failurePolicy = $derived(failurePick ?? policy.failurePolicy);
   let typedSeparation = $derived(
-    separationText ?? (separation.minSeparation > 0 ? formatDuration(separation.minSeparation) : '')
+    separationText ?? (policy.minSeparation > 0 ? formatDuration(policy.minSeparation) : '')
   );
   let minSeparation = $derived(parseSeparation(typedSeparation));
-  let separationChanged = $derived(
-    policy !== separation.policy ||
-      (minSeparation !== null && minSeparation !== separation.minSeparation)
+  let policyChanged = $derived(
+    separationPolicy !== policy.separationPolicy ||
+      failurePolicy !== policy.failurePolicy ||
+      (minSeparation !== null && minSeparation !== policy.minSeparation)
   );
 
-  async function saveSeparation(): Promise<void> {
+  // An edit replaces what the last save said.
+  function pickSeparation(next: SeparationPolicy): void {
+    separationPick = next;
+    policyMessage = null;
+  }
+
+  function pickFailure(next: FailurePolicy): void {
+    failurePick = next;
+    policyMessage = null;
+  }
+
+  async function savePolicy(): Promise<void> {
     if (minSeparation === null) return;
     try {
       busy = true;
-      separationMessage = null;
-      await restconfPatchJson(DATA_ROOT, separationPatch({ name, policy, minSeparation }));
+      policyMessage = null;
+      await restconfPatchJson(DATA_ROOT, policyPatch({ name, separationPolicy, minSeparation, failurePolicy }));
       await invalidate('data:group');
-      policyPick = null;
+      separationPick = null;
       separationText = null;
-      separationMessage = { type: 'success', text: 'Saved.' };
+      failurePick = null;
+      policyMessage = { type: 'success', text: 'Saved.' };
     } catch (error) {
-      separationMessage = { type: 'error', text: errorText(error, 'Failed to save the separation.') };
+      policyMessage = { type: 'error', text: errorText(error, 'Failed to save the policy.') };
     } finally {
       busy = false;
     }
@@ -550,37 +570,53 @@
 </section>
 
 <section class="card">
-  <h2 class="panel-title" title="YANG: separation-policy, min-separation">Separation</h2>
-  <div class="separation">
-    <SegmentedControl
-      options={POLICIES}
-      value={policy}
-      ariaLabel="Separation policy"
-      onchange={(next) => (policyPick = next)}
-    />
-    <label class="dim" for={`${uid}-min`}>Min separation</label>
-    <input
-      id={`${uid}-min`}
-      class="input compact mono min"
-      class:has-error={minSeparation === null}
-      aria-invalid={minSeparation === null ? 'true' : undefined}
-      placeholder="e.g. 30m"
-      value={typedSeparation}
-      disabled={busy}
-      oninput={(e) => (separationText = e.currentTarget.value)}
-    />
+  <h2 class="panel-title" title="YANG: separation-policy, min-separation, failure-policy">Policy</h2>
+  <div class="policy">
+    <span class="policy-label">Separation</span>
+    <div>
+      <div class="policy-row">
+        <SegmentedControl
+          options={SEPARATIONS}
+          value={separationPolicy}
+          ariaLabel="Separation policy"
+          onchange={pickSeparation}
+        />
+        <label class="dim" for={`${uid}-min`}>Min separation</label>
+        <input
+          id={`${uid}-min`}
+          class="input compact mono min"
+          class:has-error={minSeparation === null}
+          aria-invalid={minSeparation === null ? 'true' : undefined}
+          aria-describedby={minSeparation === null ? `${uid}-min-error` : undefined}
+          placeholder="e.g. 30m"
+          value={typedSeparation}
+          disabled={busy}
+          oninput={(e) => {
+            separationText = e.currentTarget.value;
+            policyMessage = null;
+          }}
+        />
+      </div>
+      {#if minSeparation === null}
+        <p id={`${uid}-min-error`} class="min-error">A duration such as 30m or 2h.</p>
+      {/if}
+    </div>
+    <span class="policy-label">On failure</span>
+    <div class="policy-row">
+      <SegmentedControl options={FAILURES} value={failurePolicy} ariaLabel="Failure policy" onchange={pickFailure} />
+    </div>
+  </div>
+  <div class="policy-actions">
     <button
       class="btn btn-primary"
       type="button"
-      disabled={busy || !separationChanged || minSeparation === null}
-      onclick={saveSeparation}
+      disabled={busy || !policyChanged || minSeparation === null}
+      onclick={savePolicy}
     >
       Save
     </button>
-    {#if minSeparation === null}
-      <span class="save-error">A duration such as 30m or 2h.</span>
-    {:else if separationMessage}
-      <span class={separationMessage.type === 'error' ? 'save-error' : 'save-ok'}>{separationMessage.text}</span>
+    {#if policyMessage}
+      <span class={policyMessage.type === 'error' ? 'save-error' : 'save-ok'}>{policyMessage.text}</span>
     {/if}
   </div>
 </section>
@@ -729,7 +765,23 @@
     margin-top: 14px;
   }
 
-  .separation {
+  /* Each policy's label beside its control. */
+  .policy {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 16px 20px;
+    align-items: start;
+  }
+
+  .policy-label {
+    /* Level with the text of the control beside it. */
+    padding-top: 9px;
+    font-size: var(--sw-text-sm);
+    font-weight: 500;
+    color: var(--sw-text-label);
+  }
+
+  .policy-row {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
@@ -738,6 +790,20 @@
 
   .min {
     width: 8rem;
+  }
+
+  .min-error {
+    margin: 6px 0 0;
+    font-size: var(--sw-text-xs);
+    color: var(--sw-danger-text);
+  }
+
+  .policy-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 16px;
   }
 
   .save-ok {
@@ -753,6 +819,15 @@
   @media (max-width: 720px) {
     .col-platform {
       display: none;
+    }
+
+    .policy {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 6px;
+    }
+
+    .policy-label {
+      padding-top: 10px;
     }
 
     .device-name,

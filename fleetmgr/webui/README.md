@@ -60,6 +60,10 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `state/connected` is `connected`, `device-down` or `flotilla-down`, absent
   until the device first connects; the devices and device pages show it as
   a dot.
+- A redundancy group's entry under `fleetmgr:redundancy-groups` has
+  `separation-policy`, `min-separation` and `failure-policy`. A GET omits
+  them at their defaults (`spread`, 0 and `continue`), and a group with no
+  entry has the defaults. The group pages PATCH all three with each save.
 - Pacing is campaign config: `default-schedule` naming a shared
   `maintenance:schedules` entry, `deadline` (seconds since the Unix epoch),
   `target-concurrency` and `max-concurrency` (devices upgrading at the same

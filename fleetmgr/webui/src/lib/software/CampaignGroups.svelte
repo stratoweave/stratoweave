@@ -3,12 +3,14 @@
   import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
   import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
-  import { formatClock, formatDuration } from '#lib/core/time.ts';
+  import { formatClock } from '#lib/core/time.ts';
   import {
     GROUP_STATES,
     campaignGroups,
     groupMembers,
+    policyText,
     removeFromGroup,
+    rollbackFailed,
     type CampaignGroup,
     type CampaignMember,
     type GroupState
@@ -20,11 +22,11 @@
     STATUS_LABEL,
     STEP_LABEL,
     parseFleet,
-    parseGroupSeparations,
+    parseGroupPolicies,
     type CampaignPlan,
     type Device,
     type DeviceStatusRow,
-    type GroupSeparation
+    type GroupPolicy
   } from '#lib/software/model.ts';
   import { nameMatcher } from '#lib/software/selection.ts';
   import { stageDetail } from '#lib/software/stages.ts';
@@ -55,7 +57,7 @@
   // not on every poll of the page, as the fleet list is 14 MB at 100k
   // devices.
   let byGroup = $state.raw<Map<string, Device[]> | null>(null);
-  let separations = $state.raw<GroupSeparation[]>([]);
+  let policies = $state.raw<GroupPolicy[]>([]);
   let readError = $state('');
   let reads = 0;
 
@@ -68,7 +70,7 @@
       ]);
       if (mine !== reads) return;
       byGroup = groupMembers(parseFleet(fleetJson).devices);
-      separations = parseGroupSeparations(groupsJson);
+      policies = parseGroupPolicies(groupsJson);
       readError = '';
     } catch (error) {
       if (mine === reads) readError = errorText(error, 'Failed to read the redundancy groups.');
@@ -83,7 +85,7 @@
     }
   });
 
-  let groups = $derived(byGroup === null ? [] : campaignGroups(byGroup, separations, members, rows, plan));
+  let groups = $derived(byGroup === null ? [] : campaignGroups(byGroup, policies, members, rows, plan));
   let counts = $derived.by(() => {
     const out = new Map<GroupState, number>();
     for (const g of groups) out.set(g.state, (out.get(g.state) ?? 0) + 1);
@@ -101,11 +103,6 @@
   });
   let paged = $derived(paginate(filtered, page, PAGE_SIZE));
 
-  function separationText(group: CampaignGroup): string {
-    const s = group.separation;
-    return s.minSeparation > 0 ? `${s.policy}, ${formatDuration(s.minSeparation)}` : s.policy;
-  }
-
   /** What a member's chip says after its name. */
   function memberText(m: CampaignMember): string {
     const { status, stage } = m.row;
@@ -117,7 +114,7 @@
         if (stage === null) return 'upgrading';
         return stage === 'rollback' ? 'rolling back' : STEP_LABEL[stage];
       case 'failed':
-        return STATUS_LABEL[status];
+        return status === 'failed' && stage === 'rollback' ? 'rollback failed' : STATUS_LABEL[status];
       case 'held':
         return 'held';
       case 'waiting':
@@ -126,9 +123,25 @@
     }
   }
 
-  function memberTitle(m: CampaignMember): string {
-    if (m.state === 'held') return `held: ${heldText(m.row)}`;
-    return stageDetail(m.row) || STATUS_LABEL[m.row.status];
+  /** The member of group named name, if it is in the campaign. */
+  function memberOf(group: CampaignGroup, name: string): CampaignMember | undefined {
+    return group.members.find((m) => m.device.name === name);
+  }
+
+  function memberTitle(m: CampaignMember, group: CampaignGroup): string {
+    if (m.state === 'held') {
+      // The campaign says the holder failed; whether its rollback did tells
+      // why a group that continues on failure waits.
+      const holder = m.row.held === 'group-failed' ? memberOf(group, m.heldBy[0] ?? '') : undefined;
+      if (holder && rollbackFailed(holder.row)) return `held: behind ${holder.device.name} (rollback failed)`;
+      return `held: ${heldText(m.row)}`;
+    }
+    const detail = stageDetail(m.row) || m.row.reason || STATUS_LABEL[m.row.status];
+    if (m.state === 'failed' && rollbackFailed(m.row)) {
+      const why = 'Its device is in an unknown state, so it holds its groups until an operator acts.';
+      return `${detail.replace(/\.$/, '')}. ${why}`;
+    }
+    return detail;
   }
 
   let takeOut = $state<{ device: string; group: CampaignGroup } | null>(null);
@@ -140,7 +153,14 @@
     const { device, group } = takeOut;
     const behind = group.members.filter((m) => m.heldBy.includes(device)).map((m) => m.device.name);
     const stop = behind.length === 1 ? 'stops' : 'stop';
-    return `Take ${device} out of ${group.name}? ${behind.join(', ')} ${stop} waiting for it.`;
+    const holder = memberOf(group, device);
+    const why =
+      holder && rollbackFailed(holder.row)
+        ? `${device} failed its rollback, so its device is in an unknown state. `
+        : group.policy.failurePolicy === 'hold'
+          ? `${group.name} holds on failure, so its members wait for an operator. `
+          : '';
+    return `${why}Take ${device} out of ${group.name}? ${behind.join(', ')} ${stop} waiting for it.`;
   });
 
   async function confirmTakeOut(): Promise<void> {
@@ -235,14 +255,14 @@
               <tr>
                 <td class="group">
                   <a class="name" href={`/groups/${encodeURIComponent(group.name)}`}>{group.name}</a>
-                  <span class="separation">{separationText(group)}</span>
+                  <span class="policy">{policyText(group.policy)}</span>
                 </td>
                 <td><span class={`pill ${TONE[group.state]}`}><span class="dot"></span>{group.state}</span></td>
                 <td>
                   <div class="chain">
                     {#each group.members as m, i (m.device.name)}
                       {#if i > 0}<span class="arrow" aria-hidden="true">→</span>{/if}
-                      <span class={`member ${m.state}`} title={memberTitle(m)}>
+                      <span class={`member ${m.state}`} title={memberTitle(m, group)}>
                         <span class="dot"></span>
                         <a class="name" href={`/devices/${encodeURIComponent(m.device.name)}`}>{m.device.name}</a>
                         <span class="detail">{memberText(m)}</span>
@@ -315,7 +335,7 @@
     white-space: nowrap;
   }
 
-  .separation {
+  .policy {
     display: block;
     color: var(--sw-text-muted);
     font-size: var(--sw-text-2xs);

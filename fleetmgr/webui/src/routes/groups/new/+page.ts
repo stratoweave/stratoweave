@@ -1,7 +1,7 @@
 import { errorText } from '#lib/core/errors.ts';
 import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import { groupRows } from '#lib/software/groups.ts';
-import { FLEET_LIST, REDUNDANCY_GROUPS_ROOT, parseFleet, parseGroupSeparations } from '#lib/software/model.ts';
+import { FLEET_LIST, REDUNDANCY_GROUPS_ROOT, parseFleet, parseGroupPolicies } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 
@@ -15,7 +15,7 @@ export const load: PageLoad = async ({ fetch }) => {
     const devices = parseFleet(fleet).devices;
     return {
       deviceNames: devices.map((d) => d.name).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
-      groupNames: groupRows(devices, parseGroupSeparations(groups)).map((r) => r.name),
+      groupNames: groupRows(devices, parseGroupPolicies(groups)).map((r) => r.name),
       loadError: ''
     };
   } catch (loadError) {

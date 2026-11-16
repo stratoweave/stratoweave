@@ -16,7 +16,7 @@
     members={data.members}
     otherGroups={data.otherGroups}
     campaignsOf={data.campaignsOf}
-    separation={data.separation}
+    policy={data.policy}
     hasEntry={data.hasEntry}
     deviceNames={data.deviceNames}
   />

@@ -9,12 +9,16 @@
   import SegmentedControl from '#lib/core/ui/SegmentedControl.svelte';
   import TokenSelect from '#lib/core/ui/TokenSelect.svelte';
   import { groupCreatePatch, parseSeparation, suggestNames, validateNewGroup } from '#lib/software/groups.ts';
-  import { DATA_ROOT, type SeparationPolicy } from '#lib/software/model.ts';
+  import { DATA_ROOT, type FailurePolicy, type SeparationPolicy } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
 
-  const POLICIES: { value: SeparationPolicy; label: string }[] = [
+  const SEPARATIONS: { value: SeparationPolicy; label: string }[] = [
     { value: 'spread', label: 'spread' },
     { value: 'pack', label: 'pack' }
+  ];
+  const FAILURES: { value: FailurePolicy; label: string }[] = [
+    { value: 'continue', label: 'continue' },
+    { value: 'hold', label: 'hold' }
   ];
 
   let { data }: PageProps = $props();
@@ -23,8 +27,9 @@
   let name = $state('');
   let members = $state<string[]>([]);
   let memberDraft = $state('');
-  let policy = $state<SeparationPolicy>('spread');
+  let separationPolicy = $state<SeparationPolicy>('spread');
   let minSeparation = $state('');
+  let failurePolicy = $state<FailurePolicy>('continue');
   let touched = $state(false);
   let saving = $state(false);
   let statusMessage = $state('');
@@ -41,7 +46,11 @@
     return typed && !members.includes(typed) ? [...members, typed] : members;
   });
   let validation = $derived(
-    validateNewGroup({ name, members: allMembers, policy, minSeparation }, groupSet, deviceSet)
+    validateNewGroup(
+      { name, members: allMembers, separationPolicy, minSeparation, failurePolicy },
+      groupSet,
+      deviceSet
+    )
   );
   let errors = $derived(touched ? validation.errors : ({} as Record<string, string>));
 
@@ -51,7 +60,12 @@
       await focusFirstError(form);
       return;
     }
-    const group = { name: name.trim(), policy, minSeparation: parseSeparation(minSeparation) ?? 0 };
+    const group = {
+      name: name.trim(),
+      separationPolicy,
+      minSeparation: parseSeparation(minSeparation) ?? 0,
+      failurePolicy
+    };
     try {
       saving = true;
       statusMessage = '';
@@ -124,10 +138,10 @@
       <span class="field__label">Separation</span>
       <div class="policy">
         <SegmentedControl
-          options={POLICIES}
-          value={policy}
+          options={SEPARATIONS}
+          value={separationPolicy}
           ariaLabel="Separation policy"
-          onchange={(next) => (policy = next)}
+          onchange={(next) => (separationPolicy = next)}
         />
       </div>
       <small class="field__meta"> </small>
@@ -141,6 +155,18 @@
       onchange={(v) => (minSeparation = v)}
       ontouch={() => (touched = true)}
     />
+    <div class="field">
+      <span class="field__label">On failure</span>
+      <div class="policy">
+        <SegmentedControl
+          options={FAILURES}
+          value={failurePolicy}
+          ariaLabel="Failure policy"
+          onchange={(next) => (failurePolicy = next)}
+        />
+      </div>
+      <small class="field__meta"> </small>
+    </div>
   </div>
 </section>
 

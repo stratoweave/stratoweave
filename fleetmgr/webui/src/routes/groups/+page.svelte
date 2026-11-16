@@ -72,6 +72,7 @@
             <th>Order</th>
             <th>Separation</th>
             <th class="right">Min separation</th>
+            <th>On failure</th>
           </tr>
         </thead>
         <tbody>
@@ -100,10 +101,11 @@
                   <span class="more">and {(row.members.length - ORDER_SHOWN).toLocaleString()} more</span>
                 {/if}
               </td>
-              <td>{row.separation.policy}</td>
+              <td>{row.policy.separationPolicy}</td>
               <td class="tn right mono">
-                {row.separation.minSeparation > 0 ? formatDuration(row.separation.minSeparation) : '—'}
+                {row.policy.minSeparation > 0 ? formatDuration(row.policy.minSeparation) : '—'}
               </td>
+              <td>{row.policy.failurePolicy}</td>
             </tr>
           {/each}
         </tbody>

@@ -1,13 +1,13 @@
 import { errorText } from '#lib/core/errors.ts';
 import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
-import { byUpgradeOrder, defaultSeparation, groupMembers } from '#lib/software/groups.ts';
+import { byUpgradeOrder, defaultPolicy, groupMembers } from '#lib/software/groups.ts';
 import {
   CAMPAIGN_MEMBERS,
   FLEET_LIST,
   REDUNDANCY_GROUPS_ROOT,
   parseCampaigns,
   parseFleet,
-  parseGroupSeparations,
+  parseGroupPolicies,
   type Device
 } from '#lib/software/model.ts';
 
@@ -38,13 +38,13 @@ export const load: PageLoad = async ({ fetch, depends, params }) => {
         if (memberNames.has(name)) campaignsOf.set(name, [...(campaignsOf.get(name) ?? []), c.name]);
       }
     }
-    const entry = parseGroupSeparations(groups).find((s) => s.name === params.name) ?? null;
+    const entry = parseGroupPolicies(groups).find((p) => p.name === params.name) ?? null;
     return {
       name: params.name,
       members,
       otherGroups,
       campaignsOf,
-      separation: entry ?? defaultSeparation(params.name),
+      policy: entry ?? defaultPolicy(params.name),
       hasEntry: entry !== null,
       deviceNames: devices.map((d) => d.name).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
       loadError: ''
@@ -55,7 +55,7 @@ export const load: PageLoad = async ({ fetch, depends, params }) => {
       members: [],
       otherGroups: new Map<string, Device[]>(),
       campaignsOf: new Map<string, string[]>(),
-      separation: defaultSeparation(params.name),
+      policy: defaultPolicy(params.name),
       hasEntry: false,
       deviceNames: [],
       loadError: errorText(loadError, 'Failed to load the redundancy group.')
