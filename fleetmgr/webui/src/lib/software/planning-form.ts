@@ -1,6 +1,7 @@
-// A campaign's schedule and pace: the default schedule, the deadline and
-// how many devices upgrade at the same time, as the campaign page edits
-// them.
+// A campaign's schedule, pace and limits: the default schedule, the
+// deadline, how many devices upgrade at the same time, the days of notice
+// its members get before their window and its failure budget, as the
+// campaign page edits them.
 //
 // The pace comes from a deadline or from a number of devices at once, not
 // both. The model takes both, with target-concurrency as a floor under the
@@ -32,6 +33,10 @@ export interface PlanningDraft {
   /** Devices at once as typed; '' for the model default. */
   targetConcurrency: string;
   maxConcurrency: string;
+  /** Days as typed; '' for none. */
+  notificationPeriod: string;
+  /** Percent as typed; '' for no budget. */
+  failureBudget: string;
 }
 
 export interface Planning {
@@ -40,16 +45,23 @@ export interface Planning {
   deadline: number | null;
   targetConcurrency: number;
   maxConcurrency: number;
+  /** Days; 0 for none. */
+  notificationPeriod: number;
+  /** Percent; null for no budget. */
+  failureBudget: number | null;
 }
 
 const UINT32_MAX = 4294967295;
+const UINT16_MAX = 65535;
 
 export function planningOf(c: Campaign): Planning {
   return {
     defaultSchedule: c.defaultSchedule,
     deadline: c.deadline,
     targetConcurrency: c.targetConcurrency,
-    maxConcurrency: c.maxConcurrency
+    maxConcurrency: c.maxConcurrency,
+    notificationPeriod: c.notificationPeriod,
+    failureBudget: c.failureBudget
   };
 }
 
@@ -63,12 +75,15 @@ export function planningDraft(p: Planning): PlanningDraft {
     // pacing by the deadline stores.
     targetConcurrency:
       paceBy === 'deadline' || p.targetConcurrency === DEFAULT_TARGET_CONCURRENCY ? '' : String(p.targetConcurrency),
-    maxConcurrency: p.maxConcurrency === DEFAULT_MAX_CONCURRENCY ? '' : String(p.maxConcurrency)
+    maxConcurrency: p.maxConcurrency === DEFAULT_MAX_CONCURRENCY ? '' : String(p.maxConcurrency),
+    notificationPeriod: p.notificationPeriod === 0 ? '' : String(p.notificationPeriod),
+    failureBudget: p.failureBudget === null ? '' : String(p.failureBudget)
   };
 }
 
-/** Errors by field: deadline, target-concurrency, max-concurrency; only
- * the pace field in use is checked. A deadline must lie ahead of `now`,
+/** Errors by field: deadline, target-concurrency, max-concurrency,
+ * notification-period, failure-budget; only the pace field in use is
+ * checked. A deadline must lie ahead of `now`,
  * unless it is the one `saved` already holds. */
 export function validatePlanningDraft(
   draft: PlanningDraft,
@@ -95,6 +110,14 @@ export function validatePlanningDraft(
       errors[key] = 'A whole number of devices, 1 or more.';
     }
   }
+  const days = draft.notificationPeriod.trim();
+  if (days && (!/^\d+$/.test(days) || Number(days) > UINT16_MAX)) {
+    errors['notification-period'] = `A whole number of days, 0 to ${UINT16_MAX}.`;
+  }
+  const budget = draft.failureBudget.trim();
+  if (budget && (!/^\d+(\.\d{1,2})?$/.test(budget) || Number(budget) > 100)) {
+    errors['failure-budget'] = 'A percent from 0 to 100, with at most two decimals.';
+  }
   return errors;
 }
 
@@ -106,7 +129,9 @@ export function planningFromDraft(draft: PlanningDraft): Planning {
     defaultSchedule: draft.defaultSchedule,
     deadline: byDeadline && draft.deadline ? Math.floor(Date.parse(draft.deadline) / 1000) : null,
     targetConcurrency: byDeadline ? 1 : draft.targetConcurrency.trim() ? Number(draft.targetConcurrency) : DEFAULT_TARGET_CONCURRENCY,
-    maxConcurrency: draft.maxConcurrency.trim() ? Number(draft.maxConcurrency) : DEFAULT_MAX_CONCURRENCY
+    maxConcurrency: draft.maxConcurrency.trim() ? Number(draft.maxConcurrency) : DEFAULT_MAX_CONCURRENCY,
+    notificationPeriod: draft.notificationPeriod.trim() ? Number(draft.notificationPeriod) : 0,
+    failureBudget: draft.failureBudget.trim() ? Number(draft.failureBudget) : null
   };
 }
 
@@ -142,7 +167,7 @@ export function perHourText(draft: PlanningDraft, installSeconds: number): strin
   return `${head}, up to ${hourly(max).toLocaleString()} per hour at ${max.toLocaleString()} when a window falls behind.`;
 }
 
-type RemovableLeaf = 'default-schedule' | 'deadline';
+type RemovableLeaf = 'default-schedule' | 'deadline' | 'failure-budget';
 
 /** The leaves a save sets and the ones it removes. */
 export function planningChanges(saved: Planning, next: Planning): { set: Partial<CampaignJson>; remove: RemovableLeaf[] } {
@@ -160,6 +185,12 @@ export function planningChanges(saved: Planning, next: Planning): { set: Partial
   }
   if (next.targetConcurrency !== saved.targetConcurrency) set['target-concurrency'] = next.targetConcurrency;
   if (next.maxConcurrency !== saved.maxConcurrency) set['max-concurrency'] = next.maxConcurrency;
+  if (next.notificationPeriod !== saved.notificationPeriod) set['notification-period'] = next.notificationPeriod;
+  if (next.failureBudget !== saved.failureBudget) {
+    // decimal64 is a string in RFC 7951 JSON.
+    if (next.failureBudget !== null) set['failure-budget'] = String(next.failureBudget);
+    else remove.push('failure-budget');
+  }
   return { set, remove };
 }
 

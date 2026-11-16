@@ -9,8 +9,15 @@
 // change, colours when statuses change, and the clock only moves the
 // marker.
 
-import { CELL_COLOR, gutter } from './cells';
-import { deviceDuration, deviceStart, type KnownStatus, type PlanDevice, type PlanWindow } from './model';
+import { CELL_COLOR, cellKind, gutter } from './cells';
+import {
+  deviceDuration,
+  deviceStart,
+  type DeviceStatusRow,
+  type KnownStatus,
+  type PlanDevice,
+  type PlanWindow
+} from './model';
 
 const HOUR = 3600;
 
@@ -459,7 +466,7 @@ export interface Rect {
  * the row gutter pattern re-cuts them into cells. */
 export function cellRects(
   layout: WindowCells,
-  statuses: Map<string, KnownStatus>,
+  rows: Map<string, DeviceStatusRow>,
   oy: number,
   size: number,
   pitch: number
@@ -468,7 +475,7 @@ export function cellRects(
   for (const col of layout.cols) {
     let run: Rect | null = null;
     for (let row = 0; row < col.count; row++) {
-      const fill = CELL_COLOR[statuses.get(layout.devices[col.first + row].name) ?? 'pending'];
+      const fill = CELL_COLOR[cellKind(rows.get(layout.devices[col.first + row].name))];
       if (run !== null && run.fill === fill) {
         run.h += pitch;
         continue;
@@ -535,11 +542,11 @@ export function axisTicks(axis: Axis, step: number): number[] {
 const DONE = new Set<KnownStatus>(['succeeded', 'failed', 'rolled-back', 'not-started', 'up-to-date']);
 
 /** Share of a window's devices that have settled, 0..1. */
-export function windowDone(w: PlanWindow, statuses: Map<string, KnownStatus>): number {
+export function windowDone(w: PlanWindow, rows: Map<string, DeviceStatusRow>): number {
   if (w.devices.length === 0) return 0;
   let done = 0;
   for (const d of w.devices) {
-    if (DONE.has(statuses.get(d.name) ?? 'pending')) done++;
+    if (DONE.has(rows.get(d.name)?.status ?? 'pending')) done++;
   }
   return done / w.devices.length;
 }

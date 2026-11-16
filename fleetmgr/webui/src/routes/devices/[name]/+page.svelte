@@ -2,10 +2,12 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import ConnectionDot from '#lib/software/ConnectionDot.svelte';
   import DeviceGroups from '#lib/software/DeviceGroups.svelte';
   import DevicePicture from '#lib/software/DevicePicture.svelte';
   import JobProgress from '#lib/software/JobProgress.svelte';
   import StageChain from '#lib/software/StageChain.svelte';
+  import HeldText from '#lib/software/HeldText.svelte';
   import StatusPill from '#lib/software/StatusPill.svelte';
   import { errorText } from '#lib/core/errors.ts';
   import { onLoaded } from '#lib/core/loading.svelte.ts';
@@ -18,6 +20,7 @@
     type DeviceStatusRow,
     type Step
   } from '#lib/software/model.ts';
+  import { pendingText } from '#lib/software/device-state.ts';
   import { jobDetail, jobProgress, stageDetail, stageView } from '#lib/software/stages.ts';
   import { formatClock } from '#lib/core/time.ts';
   import type { PageProps } from './$types';
@@ -97,11 +100,11 @@
   }
 
   /** This device's start in the plan, real once released, else the
-   * planner's estimate; "not placed" when the plan has the campaign but
+   * planner's estimate; "no window yet" when the plan has the campaign but
    * no window for it. */
   function plannedStart(campaign: DeviceCampaign): string {
     if (campaign.start === null) return '—';
-    return campaign.start === 'unplaced' ? 'not placed' : formatClock(campaign.start);
+    return campaign.start === 'unplaced' ? 'no window yet' : formatClock(campaign.start);
   }
 
   /** The checks of the last run that have a verdict. */
@@ -162,7 +165,8 @@
       <div class="ident">
         <h1 title={`YANG: /fleet/device=${device.name}`}>{device.name}</h1>
         <p class="meta">
-          type <span class="mono">{device.type}</span>
+          <ConnectionDot connection={device.connection} text />
+          · type <span class="mono">{device.type}</span>
           {#if device.model}
             · model <span class="mono">{device.model}</span>
           {/if}
@@ -229,7 +233,17 @@
             <span class="mono percent">{progress}%</span>
           </div>
         {/if}
-        {#if text}
+        {#if row.held !== null}
+          <!-- Not having answered names the attempt. A member held before
+               its window may prepare ahead of it. -->
+          {@const pending = row.status === 'pending' ? pendingText(row) : ''}
+          <p class="note held">
+            <span class="held-label">held:</span>
+            {#if row.held === 'not-answered' && pending}{pending}{:else}<HeldText {row} />{/if}{#if text}{` · ${text}`}{/if}
+          </p>
+        {:else if row.status === 'pending'}
+          <p class="note">{pendingText(row)}</p>
+        {:else if text}
           <p class="note">{text}</p>
         {/if}
         {#each checks(row) as check (check.step)}
@@ -409,6 +423,10 @@
   .percent {
     font-size: 13px;
     color: var(--sw-text-muted);
+  }
+
+  .held-label {
+    color: var(--sw-warning);
   }
 
   .check {

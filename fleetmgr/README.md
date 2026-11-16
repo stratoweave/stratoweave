@@ -19,7 +19,7 @@ an IOS XE device.
         -> one on-change subscription per device
         -> fleetmgr RFS /rfs{flotilla-1}/device{cpe}/state
         -> fleetmgr CFS /software/upgrade-campaign/state
-           and /fleet/device{cpe}/state/platform
+           and /fleet/device{cpe}/state/platform and state/connected
 
     flotilla RFS /rfs{cpe}/device-health
         -> a periodic BGP state subscription while a check runs
@@ -162,7 +162,10 @@ Of the attempts that its device reports for the campaign's name and the
 member's target release, that is the one `in-progress`, because a run of
 an earlier attempt is still under way, and else the member's `attempt`.
 Its `attempt` says which one. A member whose device has not answered that
-attempt shows `pending`, and the counters do not count it.
+attempt shows `pending`, and the counters do not count it. A member that
+runs its target release already answers `up-to-date`: `succeeded` counts
+it, and `up-to-date` counts it again. It still waits for a window and is
+released in it, but it installs nothing and is done at once.
 
 The campaign releases a member only once the member has answered its
 target: its status is `upgrade-needed`, or a final status. A member that
@@ -309,9 +312,17 @@ campaign page draws the plan as a timeline: each window is a band as wide
 as its duration, with one cell per device at its start on the wall
 clock, the real one once the controller has released the device; a marker
 shows now, and once the campaign runs the cells take the devices' live
-status; the same page changes the campaign's default schedule and its
-pace, set by a deadline or by how many devices upgrade at once, plus the
-most at once. The top serves the UI itself: the static build is embedded
+status, grey for a member held because it is down and amber for one held
+for another reason. Members that already run their target take no cell.
+The progress bar splits the members into upgraded, already up to date,
+in progress, failed, held, not answered and waiting, and names what holds
+the held ones. The same page changes the campaign's default schedule and
+its pace, set by a deadline or by how many devices upgrade at once, plus
+the most at once, its notification period and its failure budget. The new
+campaign page counts, for each model, the devices that already run the
+picked image or a newer release, and leaves out the ones that run it. The
+devices pages show whether each device can be reached. The top serves the
+UI itself: the static build is embedded
 in the `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so with
 `just demo` running the UI is at http://127.0.0.1:18200/. After a UI change,
 `just gen-webui` rebuilds the UI and regenerates that module (needs Node),
@@ -381,7 +392,12 @@ its own members, each with the version and model its platform reports. It
 also subscribes to the top's `/device` entries of the flotillas, to learn
 whether the top is connected to each flotilla. Each `/fleet/device` actor
 subscribes to its RFS entry's platform and publishes it as its own
-`state/platform`: OS, version, model and serial number.
+`state/platform`: OS, version, model and serial number. It also subscribes
+to the entry's `state/connected` and to the top's `/device` entry of its
+flotilla, and publishes whether the device can be reached as
+`state/connected`: `connected`, `device-down`, or `flotilla-down` while the
+top is not connected to the flotilla and the device was not down before.
+The connection is absent until the device first connects.
 
 `flotilla` supplies one modeled layer, the standard RFS plus the
 `flotilla-rfs` augment below. StratoWeave adds the implicit device layer

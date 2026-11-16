@@ -10,6 +10,7 @@
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '#lib/core/restconf/client.ts';
   import { bindPatch, unbindDevice } from '#lib/maintenance/binding.ts';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
+  import ConnectionDot from '#lib/software/ConnectionDot.svelte';
   import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, parseFleet, type Device, type Schedule } from '#lib/software/model.ts';
   import { groupMatches, nameMatcher, scheduleMatches } from '#lib/software/selection.ts';
   import {
@@ -614,7 +615,10 @@
                 />
               </td>
               <td>
-                <a class="device-name" href={`/devices/${encodeURIComponent(device.name)}`}>{device.name}</a>
+                <span class="name-cell">
+                  <ConnectionDot connection={device.connection} />
+                  <a class="device-name" href={`/devices/${encodeURIComponent(device.name)}`}>{device.name}</a>
+                </span>
               </td>
               <td class="col-type">{device.type}</td>
               <td class="col-platform">
@@ -766,6 +770,12 @@
   .filter-count {
     font-size: 12px;
     color: var(--sw-text-muted);
+  }
+
+  .name-cell {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
   }
 
   .device-name {

@@ -10,7 +10,8 @@
   interface Props {
     schedules: Schedule[];
     draft: PlanningDraft;
-    /** By field: deadline, target-concurrency, max-concurrency. */
+    /** By field: deadline, target-concurrency, max-concurrency,
+     * notification-period, failure-budget. */
     errors: Record<string, string>;
     disabled?: boolean;
     /** Mean install time in seconds, from the plan; without it the devices
@@ -121,6 +122,28 @@
   {#if perHour}
     <p class="per-hour">{perHour}</p>
   {/if}
+  <div class="row limits">
+    <FieldText
+      label="Notice (days)"
+      value={draft.notificationPeriod}
+      error={errors['notification-period']}
+      mono={true}
+      {disabled}
+      placeholder="0"
+      help="Uses only windows that open this long after the campaign first runs."
+      onchange={(v) => patch({ notificationPeriod: v })}
+    />
+    <FieldText
+      label="Failure budget (%)"
+      value={draft.failureBudget}
+      error={errors['failure-budget']}
+      mono={true}
+      {disabled}
+      placeholder="none"
+      help="No more devices start once more than this share of the members have failed."
+      onchange={(v) => patch({ failureBudget: v })}
+    />
+  </div>
 </div>
 
 <style>
@@ -133,6 +156,10 @@
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 12px;
+  }
+
+  .limits {
+    margin-top: 8px;
   }
 
   .per-hour {

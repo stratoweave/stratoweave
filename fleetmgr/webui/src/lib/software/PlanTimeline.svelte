@@ -1,10 +1,12 @@
 <script lang="ts">
-  import { CELL_BG } from '#lib/software/cells.ts';
+  import { CELL_BG, CELL_COLOR, CELL_KINDS, CELL_LABEL, cellKind, type CellKind } from '#lib/software/cells.ts';
+  import { heldText } from '#lib/software/device-state.ts';
   import {
+    STATUS_LABEL,
     deviceDuration,
     deviceStart,
     type CampaignPlan,
-    type KnownStatus,
+    type DeviceStatusRow,
     type PlanDevice,
     type PlanWindow
   } from '#lib/software/model.ts';
@@ -40,13 +42,14 @@
 
   interface Props {
     plan: CampaignPlan;
-    statuses: Map<string, KnownStatus>;
+    /** Each member's row, by device name. */
+    rows: Map<string, DeviceStatusRow>;
     /** Unix seconds, ticking. */
     now: number;
     ondevice?: (name: string) => void;
   }
 
-  let { plan, statuses, now, ondevice }: Props = $props();
+  let { plan, rows, now, ondevice }: Props = $props();
 
   // The plan on a wall-clock axis. Each window is a band as wide as its
   // duration with one cell per device below it, in a column at its
@@ -143,11 +146,17 @@
 
   let ticks = $derived(axisTicks(axis, tickStep(axis.pxPerHour)));
 
-  // Statuses: the colours and each window's done share.
+  // Statuses: the colours, each window's done share and the legend of the
+  // colours that show.
   let rects = $derived(
-    blocks.map((b): Rect[] => cellRects(b.cells, statuses, b.gy, cells.size, cells.pitch))
+    blocks.map((b): Rect[] => cellRects(b.cells, rows, b.gy, cells.size, cells.pitch))
   );
-  let done = $derived(placed.map((p) => windowDone(p.w, statuses)));
+  let done = $derived(placed.map((p) => windowDone(p.w, rows)));
+  let legend = $derived.by((): CellKind[] => {
+    const shown = new Set<CellKind>();
+    for (const w of windows) for (const d of w.devices) shown.add(cellKind(rows.get(d.name)));
+    return CELL_KINDS.filter((k) => shown.has(k));
+  });
 
   // The clock: the marker and which windows are open.
   let markerX = $derived(Math.min(axis.width - PAD_R, Math.max(PAD_L, axis.xOf(now))));
@@ -225,10 +234,12 @@
       return `${w.schedule || 'window'}: ${opens}, ${closes}, ${w.devices.length} device(s)`;
     }
     const d = hit.d;
-    const status = statuses.get(d.name) ?? 'pending';
+    const row = rows.get(d.name);
+    const status = STATUS_LABEL[row?.status ?? 'pending'];
+    const held = row === undefined ? '' : heldText(row);
     const start = `${d.started === null ? 'starts' : 'started'} ${formatClock(deviceStart(d))}`;
     const took = `${d.finished === null ? '~' : 'took '}${formatDuration(deviceDuration(d))}`;
-    return `${d.name} — ${status} · ${start} · ${took}`;
+    return `${d.name} — ${status}${held ? ` (held: ${held})` : ''} · ${start} · ${took}`;
   }
 
   function onClick(event: MouseEvent): void {
@@ -245,7 +256,14 @@
 </script>
 
 <div class="bar">
-  <span class="hint">one cell per device at its start</span>
+  <div class="key">
+    <span class="hint">one cell per device at its start</span>
+    <ul class="legend" aria-label="Cell colours">
+      {#each legend as kind (kind)}
+        <li><span class="swatch" style:background={CELL_COLOR[kind]}></span>{CELL_LABEL[kind]}</li>
+      {/each}
+    </ul>
+  </div>
   <div class="chips">
     {#if zoom > 1}
       <button class="chip" class:active={follow} type="button" onclick={() => (follow = !follow)}>
@@ -363,6 +381,36 @@
   .hint {
     font-size: 13px;
     color: var(--sw-text-muted);
+  }
+
+  .key {
+    display: flex;
+    align-items: center;
+    gap: 6px 14px;
+    flex-wrap: wrap;
+  }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-size: var(--sw-text-xs);
+    color: var(--sw-text-secondary);
+  }
+
+  .legend li {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .swatch {
+    width: 9px;
+    height: 9px;
+    border-radius: 2px;
   }
 
   .chips {

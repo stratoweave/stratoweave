@@ -165,7 +165,15 @@
                   <span class="dim">—</span>
                 {/if}
               </td>
-              <td class="tn" data-label="Succeeded">{campaign.counters?.succeeded.toLocaleString() ?? '—'}</td>
+              <td
+                class="tn"
+                data-label="Succeeded"
+                title={campaign.counters && campaign.counters.upToDate > 0
+                  ? `${campaign.counters.succeeded - campaign.counters.upToDate} upgraded, ${campaign.counters.upToDate} already up to date`
+                  : undefined}
+              >
+                {campaign.counters?.succeeded.toLocaleString() ?? '—'}
+              </td>
               <td class="tn" class:failed-cell={(campaign.counters?.failed ?? 0) > 0} data-label="Failed">
                 {campaign.counters?.failed.toLocaleString() ?? '—'}
               </td>

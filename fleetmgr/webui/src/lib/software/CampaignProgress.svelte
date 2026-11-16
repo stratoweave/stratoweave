@@ -1,36 +1,66 @@
 <script lang="ts">
+  import { CELL_COLOR } from '#lib/software/cells.ts';
   import type { CampaignCounters } from '#lib/software/model.ts';
+  import { progressOf } from '#lib/software/progress.ts';
 
   interface Props {
     counters: CampaignCounters | null;
+    /** The members held because they have not answered, from the last
+     * rows read; without rows they count as held. */
+    notAnswered?: number;
     /** hero renders the 30px bar with the full legend; compact a 7px bar */
     compact?: boolean;
   }
 
-  let { counters, compact = false }: Props = $props();
-
-  const REMAINDER_HINT = 'pending or unknown';
+  let { counters, notAnswered = 0, compact = false }: Props = $props();
 
   interface Segment {
     name: string;
     n: number;
     color: string;
-    hint?: string;
+    hint: string;
     pulse?: boolean;
+    /** Listed in the legend only while it counts any member. */
+    situational?: boolean;
   }
 
-  // The legend lists every entry, zero or not, so it does not shift as a
-  // count crosses zero; the bar only draws the non-empty ones.
+  // The legend lists the usual entries, zero or not, so they do not shift
+  // as a count crosses zero, and the situational ones while they count any
+  // member; the bar only draws the non-empty ones.
   let segments = $derived.by((): Segment[] => {
     if (counters === null) return [];
+    const p = progressOf(counters, notAnswered);
     return [
-      { name: 'succeeded', n: counters.succeeded, color: 'var(--sw-success)' },
-      { name: 'in progress', n: counters.inProgress, color: 'var(--sw-accent)', pulse: true },
-      { name: 'failed', n: counters.failed, color: 'var(--sw-danger)' },
-      { name: 'waiting', n: counters.remainder, color: 'var(--sw-bar-rest)', hint: REMAINDER_HINT }
+      { name: 'upgraded', n: p.upgraded, color: 'var(--sw-success)', hint: 'upgraded by this campaign' },
+      {
+        name: 'already up to date',
+        n: p.upToDate,
+        color: CELL_COLOR['up-to-date'],
+        hint: 'ran the target release already: nothing to install',
+        situational: true
+      },
+      { name: 'in progress', n: p.inProgress, color: 'var(--sw-accent)', hint: 'upgrading now', pulse: true },
+      { name: 'failed', n: p.failed, color: 'var(--sw-danger)', hint: 'failed or rolled back' },
+      {
+        name: 'held',
+        n: p.held,
+        color: 'var(--sw-warning)',
+        hint: 'may not start now: down, behind a group member, or over the failure budget',
+        situational: true
+      },
+      {
+        name: 'not answered',
+        n: p.notAnswered,
+        color: CELL_COLOR['not-answered'],
+        hint: 'has not said whether it needs the upgrade',
+        situational: true
+      },
+      { name: 'waiting', n: p.waiting, color: 'var(--sw-bar-rest)', hint: 'needs the upgrade and waits for its turn' }
     ];
   });
   let bars = $derived(segments.filter((s) => s.n > 0));
+  let listed = $derived(segments.filter((s) => s.n > 0 || !s.situational));
+  let label = $derived(segments.map((s) => `${s.n} ${s.name}`).join(', '));
 
   function pct(n: number, total: number): string {
     return total > 0 ? `${((n / total) * 100).toFixed(1)}%` : '0%';
@@ -48,7 +78,7 @@
       class="bar"
       class:compact
       role="img"
-      aria-label={`${counters.succeeded} of ${total} succeeded, ${counters.failed} failed, ${counters.inProgress} in progress`}
+      aria-label={`${total} devices: ${label}`}
     >
       {#each bars as s, i (s.name)}
         <div
@@ -63,7 +93,7 @@
     </div>
     {#if !compact}
       <div class="legend">
-        {#each segments as s (s.name)}
+        {#each listed as s (s.name)}
           <div class="entry" class:empty={s.n === 0} title={s.hint}>
             <span class="swatch" style:background={s.color}></span>
             <span class="name">{s.name}</span>

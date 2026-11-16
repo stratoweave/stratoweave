@@ -27,6 +27,12 @@ function rolledBackFrom(row: DeviceStatusRow): number {
   return STEPS.indexOf(row.postcheck.verdict === 'pass' ? 'commit' : 'postcheck');
 }
 
+/** Whether the member ran the target release before the campaign touched
+ * it, so no step ran: up-to-date from the start, not at the end of a run. */
+export function alreadyOnTarget(row: DeviceStatusRow): boolean {
+  return row.status === 'up-to-date' && row.stage !== 'commit';
+}
+
 export function stageView(row: DeviceStatusRow): StageView {
   const { status, stage } = row;
   switch (status) {
@@ -34,7 +40,7 @@ export function stageView(row: DeviceStatusRow): StageView {
       return chain(STEPS.length, 'todo');
     case 'up-to-date':
       // A run that ended here, or nothing to do from the start.
-      if (stage === 'commit') return chain(STEPS.length, 'todo');
+      if (!alreadyOnTarget(row)) return chain(STEPS.length, 'todo');
       return { steps: STEPS.map((step) => ({ step, state: 'skipped' })), rollback: null };
     case 'rolled-back':
       return chain(rolledBackFrom(row), 'failed', 'done');

@@ -13,9 +13,11 @@
     type CampaignMember,
     type GroupState
   } from '#lib/software/groups.ts';
+  import { heldText } from '#lib/software/device-state.ts';
   import {
     FLEET_LIST,
     REDUNDANCY_GROUPS_ROOT,
+    STATUS_LABEL,
     STEP_LABEL,
     parseFleet,
     parseGroupSeparations,
@@ -115,18 +117,18 @@
         if (stage === null) return 'upgrading';
         return stage === 'rollback' ? 'rolling back' : STEP_LABEL[stage];
       case 'failed':
-        return status;
+        return STATUS_LABEL[status];
       case 'held':
         return 'held';
       case 'waiting':
         if (m.time !== null) return formatClock(m.time);
-        return plan !== null && !m.placed ? 'not placed' : status;
+        return plan !== null && !m.placed ? 'no window' : STATUS_LABEL[status];
     }
   }
 
   function memberTitle(m: CampaignMember): string {
-    if (m.state === 'held') return `waits behind ${m.heldBy.join(', ')}`;
-    return stageDetail(m.row) || m.row.status;
+    if (m.state === 'held') return `held: ${heldText(m.row)}`;
+    return stageDetail(m.row) || STATUS_LABEL[m.row.status];
   }
 
   let takeOut = $state<{ device: string; group: CampaignGroup } | null>(null);

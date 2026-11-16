@@ -7,7 +7,7 @@
   import FieldText from '#lib/core/ui/FieldText.svelte';
   import Section from '#lib/core/ui/Section.svelte';
   import Steps from '#lib/core/ui/Steps.svelte';
-  import { memberImages, modelGroups, withPreselected } from '#lib/software/campaign-images.ts';
+  import { memberImages, modelGroups, targetCounts, withPreselected } from '#lib/software/campaign-images.ts';
   import { DATA_ROOT, campaignCreatePatch, validateNewCampaign, type Device } from '#lib/software/model.ts';
   import ModelImages from '#lib/software/ModelImages.svelte';
   import SelectionBuilder from '#lib/software/SelectionBuilder.svelte';
@@ -33,6 +33,10 @@
   let picks = $state<Record<string, string>>({});
   let name = $state('');
   let allowStaging = $state(false);
+  // A device that runs its image already has nothing to install; one on a
+  // newer release would be downgraded, which can be what is wanted.
+  let leaveOnTarget = $state(true);
+  let leaveNewer = $state(false);
 
   let devicesTouched = $state(false);
   let touched = $state(false);
@@ -45,7 +49,12 @@
   let grouped = $derived(
     modelGroups(selected.map((n) => byName.get(n)).filter((d): d is Device => d !== undefined))
   );
-  let members = $derived(memberImages(grouped.groups, picks, images));
+  let counts = $derived(targetCounts(grouped.groups, picks, images));
+  let members = $derived(
+    memberImages(grouped.groups, picks, images, { onTarget: leaveOnTarget, newer: leaveNewer })
+  );
+  /** Every grouped device is left out: the campaign would have none. */
+  let allLeftOut = $derived(grouped.groups.length > 0 && members.length === 0);
   let errors = $derived(
     validateNewCampaign({ name, devices: members }, campaigns.map((c) => c.name)).errors
   );
@@ -129,6 +138,33 @@
           showErrors={touched}
           onpick={(model, image) => (picks = { ...picks, [model]: image })}
         />
+        {#if counts.onTarget > 0 || counts.newer > 0}
+          <div class="target-checks">
+            {#if counts.onTarget > 0}
+              <label class="check">
+                <input type="checkbox" bind:checked={leaveOnTarget} />
+                <span>
+                  Leave out the {devicesText(counts.onTarget)} that already
+                  {counts.onTarget === 1 ? 'runs its image' : 'run their image'}
+                </span>
+              </label>
+            {/if}
+            {#if counts.newer > 0}
+              <p class="downgrade">
+                {devicesText(counts.newer)}
+                {counts.newer === 1 ? 'runs' : 'run'} a newer release than {counts.newer === 1 ? 'its' : 'their'} image:
+                the campaign would downgrade {counts.newer === 1 ? 'it' : 'them'}.
+              </p>
+              <label class="check">
+                <input type="checkbox" bind:checked={leaveNewer} />
+                <span>Leave out the {devicesText(counts.newer)} on a newer release</span>
+              </label>
+            {/if}
+            <p class="hint">
+              From the release each device last reported. Each device checks again when the campaign reads it.
+            </p>
+          </div>
+        {/if}
       {/if}
     </Section>
   </section>
@@ -157,6 +193,11 @@
           {creating ? 'Creating…' : `Create plan (${devicesText(members.length)})`}
         </button>
       </div>
+      {#if touched && allLeftOut}
+        <p class="field__meta field__meta--error all-left-out">
+          Every selected device is left out above, so the campaign would have none.
+        </p>
+      {/if}
     </Section>
   </section>
 {/if}
@@ -164,6 +205,36 @@
 <style>
   .name {
     max-width: 420px;
+  }
+
+  .target-checks {
+    display: grid;
+    gap: 8px;
+    margin-top: 14px;
+  }
+
+  .check {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--sw-text-sm);
+    cursor: pointer;
+  }
+
+  .downgrade {
+    margin: 4px 0 0;
+    font-size: var(--sw-text-sm);
+    color: var(--sw-warning);
+  }
+
+  .hint {
+    margin: 0;
+    font-size: var(--sw-text-xs);
+    color: var(--sw-text-muted);
+  }
+
+  .all-left-out {
+    text-align: right;
   }
 
   .staging {
