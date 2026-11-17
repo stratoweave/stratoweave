@@ -1,0 +1,716 @@
+"""Draw a campaign plan as text, the way the fleetmgr web UI draws its plan
+timeline (fleetmgr/webui/src/lib/software/plan-timeline.ts and
+PlanTimeline.svelte), with one braille dot for each device.
+
+The input is the layout that Controller.layout() gives: one entry for each
+window that has devices, as (schedule, start, end, devices), and each
+device as (name, start, estimated duration). The output is lines of text
+for a terminal of any width.
+
+The axis covers the spans of the windows, merged. An idle gap that is
+longer than one and a half breaks becomes a break: the axis line shows
+"╱╱" and the label row shows the length of the gap. The label row shows
+the clock at the ticks. A day row is above it when the plan covers more
+than one local day. On the axis line, "┬" is a tick and "▼" is now.
+
+Windows that overlap go in lanes, one above the other. Each window has a
+band with its schedule, its times and its device count. Under the band is
+one dot for each device: a character holds two dot columns and four dot
+rows. A dot column opens at the start of a device and takes the later
+starts that fall in the same dot column. A full column (CAP dots) spills
+into the next dot column. When a spill would go past the end of the
+window, the columns get taller instead.
+
+The scale is a whole number of dot columns per hour from SCALES: the least
+at which no device spills out of the dot column of its start. All
+positions are whole dot columns, so the same plan always gives the same
+text.
+
+Under the drawing, one line for each window gives the exact times: when
+the window opens and closes, its device count, the first start, the last
+start and the last expected end (start plus estimated duration). The times
+are HH:MM, or HH:MM:SS when one of them is not on a whole minute.
+"""
+
+import fleet_ctl
+
+HOUR = 3600
+DAY = 86400
+
+# The scales, in dot columns per hour, least first. At the least scale an
+# hour is 8 characters, so each hour has room for a clock label. Each step
+# is 1.5 or 1.33 times the step before it.
+SCALES = [16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072,
+          4096]
+
+# The width of a break in dot columns: 7 characters.
+BREAK_W = 14
+
+# The longest gap in dot columns that stays at the true scale: 1.5 breaks.
+# A longer gap becomes a break.
+BREAK_MIN = 21
+
+# The empty dot columns before the first window and after the last.
+PAD = 2
+
+# The least distance between two clock labels, in dot columns.
+MIN_TICK = 14
+
+# The most dots in a dot column. The next device spills into the next
+# dot column. 24 dots are 6 rows of text.
+CAP = 24
+
+# The tick steps in seconds, least first.
+TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400]
+
+# The bit of each dot in a braille character, by dot row and dot column.
+DOT_BITS = [[1, 8], [2, 16], [4, 32], [64, 128]]
+
+DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+
+
+def imax(a: int, b: int) -> int:
+    """Return the larger of a and b."""
+    return a if a > b else b
+
+
+def imin(a: int, b: int) -> int:
+    """Return the smaller of a and b."""
+    return a if a < b else b
+
+
+def fdiv(a: int, b: int) -> int:
+    """Return a divided by b, rounded down, also when a is negative. b must
+    be more than 0."""
+    if a >= 0:
+        return a // b
+    return -((-a + b - 1) // b)
+
+
+def two(n: int) -> str:
+    """Return n with two digits at least."""
+    if n < 10:
+        return "0" + str(n)
+    return str(n)
+
+
+def clock(t: int, off: int, seconds: bool) -> str:
+    """Return the time t on the clock at UTC offset off, as HH:MM, or as
+    HH:MM:SS when seconds is true."""
+    s = t + off - fdiv(t + off, DAY) * DAY
+    text = two(s // HOUR) + ":" + two(s % HOUR // 60)
+    if seconds:
+        text += ":" + two(s % 60)
+    return text
+
+
+def local_day(t: int, off: int) -> int:
+    """Return the local day of the time t at UTC offset off, as days since
+    1970-01-01."""
+    return fdiv(t + off, DAY)
+
+
+def day_label(day: int) -> str:
+    """Return the local day as the day of the week and the day of the
+    month, as "Tue 17". The calculation is the civil_from_days algorithm
+    of Howard Hinnant."""
+    z = day + 719468
+    era = fdiv(z, 146097)
+    doe = z - era * 146097
+    yoe = (doe - doe // 1460 + doe // 36524 - doe // 146096) // 365
+    doy = doe - (365 * yoe + yoe // 4 - yoe // 100)
+    mp = (5 * doy + 2) // 153
+    dom = doy - (153 * mp + 2) // 5 + 1
+    return DAY_NAMES[day + 3 - fdiv(day + 3, 7) * 7] + " " + str(dom)
+
+
+def duration(s: int) -> str:
+    """Return s seconds as "3h24m", "9h" or "6d23h", rounded to whole
+    minutes, as the web shows the length of a break. Less than half a
+    minute shows as seconds."""
+    m = (s + 30) // 60
+    if m == 0:
+        return str(s) + "s"
+    text = ""
+    if m >= 1440:
+        text += str(m // 1440) + "d"
+    if m % 1440 >= 60:
+        text += str(m % 1440 // 60) + "h"
+    if m % 60 > 0:
+        text += str(m % 60) + "m"
+    return text
+
+
+def opens_at_launch(start: int) -> bool:
+    """Return True when a window with this start opens at launch: the
+    controller gives such a window a start of 0."""
+    return start <= 0
+
+
+def never_closes(end: int) -> bool:
+    """Return True when a window with this end never closes."""
+    return end >= fleet_ctl.OPEN_END
+
+
+class Window(object):
+    """A window of the layout. schedule, start and end are from the
+    layout. a and b are the start and the end of the window on the axis.
+    names, starts and ests are the devices of the window in the order that
+    the dots fill: by start, then by name.
+
+    A window that opens at launch starts on the axis a margin before its
+    first device starts: 5 percent of the time from the first start to the
+    last expected end, a minute at least. A window that never closes ends
+    on the axis a margin after its last expected end: 5 percent of the
+    time from a to the last expected end, a minute at least. This is
+    windowStart() and windowEnd() of the web."""
+    schedule: str
+    start: int
+    end: int
+    a: int
+    b: int
+    names: list[str]
+    starts: list[int]
+    ests: list[int]
+
+    def __init__(self, schedule: str, start: int, end: int, devices: list[(str, int, int)]):
+        keyed = sorted([(d.1, d.0, d.2) for d in devices])
+        a = start
+        if opens_at_launch(start) and len(keyed) > 0:
+            first = keyed[0].0
+            last = first
+            for k in keyed:
+                last = imax(last, k.0 + k.2)
+            a = first - imax(60, (last - first + 10) // 20)
+        b = end
+        if never_closes(end):
+            last = a
+            for k in keyed:
+                last = imax(last, k.0 + k.2)
+            b = imax(a + 60, last + imax(60, (last - a + 10) // 20))
+        self.schedule = schedule
+        self.start = start
+        self.end = end
+        self.a = a
+        self.b = b
+        self.names = [k.1 for k in keyed]
+        self.starts = [k.0 for k in keyed]
+        self.ests = [k.2 for k in keyed]
+
+    def name(self) -> str:
+        """Return the schedule of the window, or "window" when it has
+        none."""
+        if self.schedule == "":
+            return "window"
+        return self.schedule
+
+    def last_end(self) -> int:
+        """Return the last expected end of the devices of the window."""
+        last = self.a
+        for i in range(len(self.starts)):
+            last = imax(last, self.starts[i] + self.ests[i])
+        return last
+
+
+def windows_of(layout: list[(str, int, int, list[(str, int, int)])]) -> list[Window]:
+    """Return the windows of the layout by start. Windows with the same
+    start keep the order of the layout."""
+    order = sorted([(layout[i].1, i) for i in range(len(layout))])
+    out: list[Window] = []
+    for o in order:
+        e = layout[o.1]
+        out.append(Window(e.0, e.1, e.2, e.3))
+    return out
+
+
+def merge(spans: list[(int, int)]) -> list[(int, int)]:
+    """Return the spans by start, with the spans that overlap or touch
+    merged into one."""
+    out: list[(int, int)] = []
+    for s in sorted(spans):
+        n = len(out)
+        if n > 0 and s.0 <= out[n - 1].1:
+            out[n - 1] = (out[n - 1].0, imax(out[n - 1].1, s.1))
+        else:
+            out.append(s)
+    return out
+
+
+class Axis(object):
+    """The merged spans of the windows on a line of dot columns, d dot
+    columns per hour. segs holds each span as (start, end, x, x_end), with
+    x and x_end in dot columns. cut is True for each span that comes after
+    a break. breaks holds each gap that became a break as (from, to, x). A
+    break starts at a character and is BREAK_W dot columns wide. width is
+    the width of the line in dot columns, with the padding."""
+    d: int
+    segs: list[(int, int, int, int)]
+    cut: list[bool]
+    breaks: list[(int, int, int)]
+    width: int
+
+    def __init__(self, spans: list[(int, int)], d: int):
+        segs: list[(int, int, int, int)] = []
+        cut: list[bool] = []
+        breaks: list[(int, int, int)] = []
+        x = PAD
+        for i in range(len(spans)):
+            s = spans[i]
+            broken = False
+            if i > 0:
+                prev = spans[i - 1]
+                gap = (s.0 - prev.1) * d // HOUR
+                if gap <= BREAK_MIN:
+                    x += gap
+                else:
+                    x += x % 2
+                    breaks.append((prev.1, s.0, x))
+                    x += BREAK_W
+                    broken = True
+            x_end = x + (s.1 - s.0) * d // HOUR
+            segs.append((s.0, s.1, x, x_end))
+            cut.append(broken)
+            x = x_end
+        self.d = d
+        self.segs = segs
+        self.cut = cut
+        self.breaks = breaks
+        self.width = x + PAD
+
+    def x_of(self, t: int) -> int:
+        """Return the dot column of the time t. In a span, and before the
+        first span or after the last, it is at the scale. In a gap, the
+        gap's dot columns divide the gap evenly."""
+        first = self.segs[0]
+        if t <= first.0:
+            return first.2 - ((first.0 - t) * self.d + HOUR - 1) // HOUR
+        n = len(self.segs)
+        for i in range(n):
+            s = self.segs[i]
+            if t <= s.1:
+                return s.2 + (t - s.0) * self.d // HOUR
+            if i + 1 < n:
+                nx = self.segs[i + 1]
+                if t < nx.0:
+                    return s.3 + (t - s.1) * (nx.2 - s.3) // (nx.0 - s.1)
+        last = self.segs[n - 1]
+        return last.3 + (t - last.1) * self.d // HOUR
+
+
+class Placed(object):
+    """A window on the axis. x and x_end are the dot columns of its start
+    and its end: its devices are in the dot columns from x to x_end - 1.
+    c0 and c1 are the first and the last character of its band. lane is
+    the lane of the window. xs is the dot column of the start of each
+    device, in the order that the dots fill."""
+    w: Window
+    x: int
+    x_end: int
+    c0: int
+    c1: int
+    lane: int
+    xs: list[int]
+
+    def __init__(self, w: Window, x: int, x_end: int, c0: int, c1: int, lane: int,
+                 xs: list[int]):
+        self.w = w
+        self.x = x
+        self.x_end = x_end
+        self.c0 = c0
+        self.c1 = c1
+        self.lane = lane
+        self.xs = xs
+
+
+def place(wins: list[Window], axis: Axis) -> list[Placed]:
+    """Return the windows on the axis, in lanes. Each window goes in the
+    first lane where one character at least is free between its band and
+    the band before it, else in a new lane (assignLanes() of the web)."""
+    lane_ends: list[int] = []
+    out: list[Placed] = []
+    for w in wins:
+        x = axis.x_of(w.a)
+        x_end = axis.x_of(w.b)
+        c0 = x // 2
+        c1 = imax(c0 + 1, (x_end - 1) // 2)
+        lane = -1
+        for k in range(len(lane_ends)):
+            if lane < 0 and lane_ends[k] + 2 <= c0:
+                lane = k
+        if lane < 0:
+            lane = len(lane_ends)
+            lane_ends.append(c1)
+        else:
+            lane_ends[lane] = c1
+        out.append(Placed(w, x, x_end, c0, c1, lane, [axis.x_of(t) for t in w.starts]))
+    return out
+
+
+class Cells(object):
+    """The dot columns of a window. cols holds each dot column as (x,
+    first, count): the column at dot column x holds the devices from first
+    to first + count - 1, in the order that the dots fill. displaced is
+    the number of devices that are not in the dot column of their start
+    because a column was full."""
+    cols: list[(int, int, int)]
+    displaced: int
+
+    def __init__(self, cols: list[(int, int, int)], displaced: int):
+        self.cols = cols
+        self.displaced = displaced
+
+
+def layout_cells(p: Placed, cap: int) -> Cells:
+    """Return the dot columns of the window p with columns of cap dots at
+    most (layoutCells() of the web). A column opens at the dot column of a
+    device's start and takes each later device in the same dot column. A
+    full column spills into the next dot column. A device that starts
+    after the last dot column of the window goes in the last dot
+    column."""
+    max_x = p.x_end - 1
+    cols: list[(int, int, int)] = []
+    displaced = 0
+    cx = 0
+    first = 0
+    count = 0
+    for i in range(len(p.xs)):
+        wanted = imax(p.x, imin(max_x, p.xs[i]))
+        if i == 0 or wanted > cx or count >= cap:
+            nx = wanted
+            if i > 0:
+                cols.append((cx, first, count))
+                nx = imax(wanted, cx + 1)
+            cx = nx
+            first = i
+            count = 0
+        if cx != wanted:
+            displaced += 1
+        count += 1
+    if len(p.xs) > 0:
+        cols.append((cx, first, count))
+    return Cells(cols, displaced)
+
+
+def fit_cells(p: Placed) -> Cells:
+    """Return the dot columns of the window p. The columns are CAP dots at
+    most. When a spill goes past the last dot column of the window, the
+    columns are the least number of dots taller that keeps all of them in
+    the window (fitCells() of the web)."""
+    last_x = imax(p.x, p.x_end - 1)
+    c = layout_cells(p, CAP)
+    n = len(c.cols)
+    if n == 0 or c.cols[n - 1].0 <= last_x:
+        return c
+    lo = CAP
+    hi = len(p.xs)
+    best = layout_cells(p, hi)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        m = layout_cells(p, mid)
+        if m.cols[len(m.cols) - 1].0 <= last_x:
+            hi = mid
+            best = m
+        else:
+            lo = mid
+    return best
+
+
+def pick_scale(wins: list[Window], spans: list[(int, int)]) -> int:
+    """Return the least scale in SCALES at which no device is displaced.
+    When each scale displaces devices, return the least scale that
+    displaces the fewest (pickZoom() and fitCellSize() of the web)."""
+    best = SCALES[0]
+    fewest = -1
+    for d in SCALES:
+        n = 0
+        for p in place(wins, Axis(spans, d)):
+            n += layout_cells(p, CAP).displaced
+        if n == 0:
+            return d
+        if fewest < 0 or n < fewest:
+            fewest = n
+            best = d
+    return best
+
+
+def tick_step(d: int) -> int:
+    """Return the least tick step that puts the ticks MIN_TICK dot columns
+    apart at least, at d dot columns per hour."""
+    for s in TICK_STEPS:
+        if s * d >= MIN_TICK * HOUR:
+            return s
+    return TICK_STEPS[len(TICK_STEPS) - 1]
+
+
+def axis_ticks(axis: Axis, step: int, off: int) -> list[(int, int)]:
+    """Return the ticks as (time, span): the multiples of step on the local
+    clock in each span, and the index of the span. A tick less than
+    MIN_TICK dot columns after the tick before it is left out."""
+    out: list[(int, int)] = []
+    last = 0
+    for i in range(len(axis.segs)):
+        seg = axis.segs[i]
+        t = fdiv(seg.0 + off + step - 1, step) * step - off
+        while t <= seg.1:
+            x = axis.x_of(t)
+            if len(out) == 0 or x - last >= MIN_TICK:
+                out.append((t, i))
+                last = x
+            t += step
+    return out
+
+
+def multi_day(wins: list[Window], off: int) -> bool:
+    """Return True when the windows cover more than one local day."""
+    days: set[int] = set()
+    for w in wins:
+        days.add(local_day(w.a, off))
+        days.add(local_day(w.b - 1, off))
+    return len(days) > 1
+
+
+def blank(n: int) -> list[str]:
+    """Return a row of n spaces, one character in each item."""
+    return [" " for _i in range(n)]
+
+
+def put(row: list[str], c: int, text: str) -> None:
+    """Write text into the row from character c. The characters outside
+    the row are left out."""
+    for i in range(len(text)):
+        if c + i >= 0 and c + i < len(row):
+            row[c + i] = text[i]
+
+
+def joined(row: list[str]) -> str:
+    """Return the row as a line, without the spaces at its end."""
+    return "".join(row).rstrip()
+
+
+def axis_rows(axis: Axis, wins: list[Window], off: int, now: ?int, chars: int) -> list[str]:
+    """Return the rows of the axis: the day row when the plan covers more
+    than one local day, the label row, and the axis line.
+
+    A break label is in the middle of its break. A tick label is centered
+    on its tick, but stays in its span on a side where a break is. A tick
+    label that is not one character at least from a label before it is
+    left out. A day label is above the first tick of its day, where that
+    tick's label starts, as the web timeline puts it. The labels can go
+    past the end of the axis line."""
+    wide = chars + 16
+    days = blank(wide)
+    labels = blank(wide)
+    line = ["─" for _i in range(chars)]
+    taken: set[int] = set()
+    for b in axis.breaks:
+        c = b.2 // 2
+        for i in range(BREAK_W // 2):
+            put(line, c + i, " ")
+        put(line, c + 2, "╱╱")
+        text = duration(b.1 - b.0)
+        at = c + fdiv(BREAK_W // 2 - len(text), 2)
+        put(labels, at, text)
+        for k in range(at, at + len(text)):
+            taken.add(k)
+    n = len(axis.segs)
+    several = multi_day(wins, off)
+    used = -1
+    day = -1
+    for tick in axis_ticks(axis, tick_step(axis.d), off):
+        seg = axis.segs[tick.1]
+        c = axis.x_of(tick.0) // 2
+        put(line, c, "┬")
+        text = clock(tick.0, off, False)
+        at = c - len(text) // 2
+        if tick.1 + 1 < n and axis.cut[tick.1 + 1]:
+            at = imin(at, seg.3 // 2 - len(text) + 1)
+        if axis.cut[tick.1]:
+            at = imax(at, seg.2 // 2)
+        at = imax(0, at)
+        free = True
+        for k in range(at - 1, at + len(text) + 1):
+            if k in taken:
+                free = False
+        if free:
+            put(labels, at, text)
+            for k in range(at, at + len(text)):
+                taken.add(k)
+        if several and local_day(tick.0, off) != day:
+            day = local_day(tick.0, off)
+            if at > used:
+                label = day_label(day)
+                put(days, at, label)
+                used = at + len(label)
+    if now is not None:
+        x = imax(PAD, imin(axis.width - PAD - 1, axis.x_of(now)))
+        put(line, x // 2, "▼")
+    out: list[str] = []
+    if several:
+        out.append(joined(days))
+    out.append(joined(labels))
+    out.append(joined(line))
+    return out
+
+
+def band_label(w: Window, off: int, room: int) -> str:
+    """Return the label of the band of window w that fits in room
+    characters with a space on each side. The label parts go from the
+    right: first the times, then the device count, then the name
+    (label() of the web)."""
+    name = w.name()
+    times = ""
+    if opens_at_launch(w.start):
+        if never_closes(w.end):
+            times = "always open"
+        else:
+            times = "until " + clock(w.end, off, False)
+    elif never_closes(w.end):
+        times = clock(w.start, off, False) + " → open"
+    else:
+        times = clock(w.start, off, False) + " → " + clock(w.end, off, False)
+    n = len(w.names)
+    count = str(n) + " devices"
+    if n == 1:
+        count = "1 device"
+    for parts in [[name, times, count], [name, count], [name]]:
+        text = " · ".join(parts)
+        if len(text) + 2 <= room:
+            return text
+    return ""
+
+
+def band(row: list[str], p: Placed, off: int) -> None:
+    """Write the band of window p into the row: "┌─ label ─┐" from its
+    first character to its last."""
+    for c in range(p.c0, p.c1 + 1):
+        put(row, c, "─")
+    put(row, p.c0, "┌")
+    put(row, p.c1, "┐")
+    text = band_label(p.w, off, p.c1 - p.c0 - 3)
+    if text != "":
+        put(row, p.c0 + 2, " " + text + " ")
+
+
+def lane_rows(placed: list[Placed], off: int, chars: int) -> list[str]:
+    """Return the rows of the lanes: for each lane its band row and its
+    braille rows, and an empty row between two lanes. The dot columns hang
+    down from the band."""
+    cells = [fit_cells(p) for p in placed]
+    lanes = 0
+    for p in placed:
+        lanes = imax(lanes, p.lane + 1)
+    out: list[str] = []
+    for lane in range(lanes):
+        if lane > 0:
+            out.append("")
+        head = blank(chars)
+        rows = 0
+        for i in range(len(placed)):
+            if placed[i].lane == lane:
+                band(head, placed[i], off)
+                for col in cells[i].cols:
+                    rows = imax(rows, col.2)
+        out.append(joined(head))
+        grid = [[0 for _c in range(chars)] for _r in range((rows + 3) // 4)]
+        for i in range(len(placed)):
+            if placed[i].lane == lane:
+                for col in cells[i].cols:
+                    c = col.0 // 2
+                    if c >= 0 and c < chars:
+                        for r in range(col.2):
+                            grid[r // 4][c] = grid[r // 4][c] | DOT_BITS[r % 4][col.0 % 2]
+        for g in grid:
+            out.append("".join([chr(0x2800 + v) if v > 0 else " " for v in g]).rstrip())
+    return out
+
+
+def has_seconds(wins: list[Window], off: int) -> bool:
+    """Return True when a time of the window lines is not on a whole
+    minute."""
+    times: list[int] = []
+    for w in wins:
+        if not opens_at_launch(w.start):
+            times.append(w.start)
+        if not never_closes(w.end):
+            times.append(w.end)
+        times.extend(w.starts)
+        times.append(w.last_end())
+    for t in times:
+        if t + off - fdiv(t + off, 60) * 60 != 0:
+            return True
+    return False
+
+
+def window_lines(wins: list[Window], off: int) -> list[str]:
+    """Return one line for each window, by start, with
+    the columns aligned: the schedule, the day when the plan covers more
+    than one local day, when the window opens and closes, the device
+    count, the first start, the last start, and the last expected end.
+    The times are HH:MM, or HH:MM:SS when one of them is not on a whole
+    minute. A time on a later local day than the window's day has "+N"
+    after it, N days later."""
+    seconds = has_seconds(wins, off)
+    several = multi_day(wins, off)
+    digits = 0
+    for w in wins:
+        digits = imax(digits, len(str(len(w.names))))
+    rows: list[list[str]] = []
+    for w in wins:
+        day = local_day(w.a, off)
+        opens = "launch"
+        if not opens_at_launch(w.start):
+            opens = at_day(w.start, off, seconds, day)
+        closes = "open"
+        if not never_closes(w.end):
+            closes = at_day(w.end, off, seconds, day)
+        n = len(w.names)
+        word = "devices"
+        if n == 1:
+            word = "device"
+        row = [w.name()]
+        if several:
+            row.append(day_label(day))
+        row.append(opens + " → " + closes)
+        row.append(str(n).rjust(digits) + " " + word)
+        row.append("first " + at_day(w.starts[0], off, seconds, day))
+        row.append("last " + at_day(w.starts[n - 1], off, seconds, day))
+        row.append("ends " + at_day(w.last_end(), off, seconds, day))
+        rows.append(row)
+    widths = [0 for _c in range(len(rows[0]))]
+    for row in rows:
+        for c in range(len(row)):
+            widths[c] = imax(widths[c], len(row[c]))
+    out: list[str] = []
+    for row in rows:
+        out.append("  ".join([row[c].ljust(widths[c]) for c in range(len(row))]).rstrip())
+    return out
+
+
+def at_day(t: int, off: int, seconds: bool, day: int) -> str:
+    """Return the time t on the clock, with "+N" after it when its local
+    day is N days after day."""
+    text = clock(t, off, seconds)
+    later = local_day(t, off) - day
+    if later != 0:
+        text += "+" + str(later)
+    return text
+
+
+def render(layout: list[(str, int, int, list[(str, int, int)])], off: int, now: ?int) -> str:
+    """Return the plan timeline of the layout as lines of text: the axis,
+    the lanes and the window lines. off is the UTC offset of the clock in
+    seconds. now is the time of the "▼" marker. When now is None, there
+    is no marker."""
+    wins = windows_of(layout)
+    if len(wins) == 0:
+        return "no window has devices\n"
+    spans = merge([(w.a, w.b) for w in wins])
+    axis = Axis(spans, pick_scale(wins, spans))
+    placed = place(wins, axis)
+    chars = (axis.width + 1) // 2
+    lines: list[str] = []
+    lines.extend(axis_rows(axis, wins, off, now, chars))
+    lines.extend(lane_rows(placed, off, chars))
+    lines.append("")
+    lines.extend(window_lines(wins, off))
+    return "\n".join(lines) + "\n"
