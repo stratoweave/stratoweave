@@ -310,10 +310,12 @@ approval behavior.
 
 ## Embedded static assets (web UI)
 
-Applications can embed a built web UI (or any set of text files) into their
+Applications can embed a built web UI (or any set of files) into their
 binary and have the HTTP server serve it alongside the APIs. Pass a
-`static_assets` map (URL path -> file content) to `stratoweave.main()`; it is
-forwarded to `HttpServer` and installed by the `static_assets` module.
+`static_assets` map (URL path -> file content as bytes) to
+`stratoweave.main()`; it is forwarded to `HttpServer` and installed by the
+`static_assets` module. Each asset is sent unchanged, with a `Content-Type`
+from its file extension.
 
 Behavior:
 
@@ -339,8 +341,5 @@ Behavior:
 
 Limitations:
 
-- Only text assets can be served (response bodies are UTF-8 strings). Binary
-  files such as images or fonts must be inlined by the frontend build, e.g. as
-  data URIs.
 - `HEAD` is not supported by the HTTP server; use `curl -sD- -o /dev/null`
   rather than `curl -I` when inspecting response headers.

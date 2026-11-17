@@ -1,11 +1,9 @@
 // Generates src/fleetmgr/webui_assets.act from the static web UI build in
-// webui/build: a module-level `ASSETS: dict[str, str]` constant mapping URL
-// paths to file contents, each embedded verbatim as an Acton raw string
-// literal. Raw literals neither interpolate `{...}` nor process backslash
-// escapes, so text needs no encoding; the only things a raw literal cannot
-// hold are its own closing delimiter and a trailing backslash (see
-// literalFor). The StratoWeave HTTP server serves str bodies, so only text
-// assets embed.
+// webui/build: a module-level `ASSETS: dict[str, bytes]` constant mapping URL
+// paths to file contents, each embedded as an Acton bytes literal. The
+// program uses a bytes literal in place, without a copy when the module
+// loads. The literal keeps printable ASCII, tabs and newlines as they are, so
+// the generated module stays readable in diffs (see bytesLiteralFor).
 //
 // Run via `just gen-webui` (which builds the UI first). The output is
 // committed to git, so the build must stay byte-deterministic (see
@@ -18,15 +16,13 @@ import { fileURLToPath } from 'node:url';
 const BUILD_DIR = fileURLToPath(new URL('../build', import.meta.url));
 const OUT_FILE = fileURLToPath(new URL('../../src/fleetmgr/webui_assets.act', import.meta.url));
 
-// Only known-text formats may be embedded. Anything else is a hard error so
-// a stray binary can never silently corrupt the served UI.
-const TEXT_EXTENSIONS = new Set([
-  '.html', '.js', '.mjs', '.css', '.json', '.map', '.svg', '.txt', '.xml', '.webmanifest'
-]);
-const BINARY_HINTS = new Set([
+// Only known formats may be embedded, each with a Content-Type in
+// src/static_assets.act. Anything else is a hard error, so a file is never
+// served with the wrong type.
+const EXTENSIONS = new Set([
+  '.html', '.js', '.mjs', '.css', '.json', '.map', '.svg', '.txt', '.xml', '.webmanifest',
   '.png', '.jpg', '.jpeg', '.gif', '.ico', '.avif', '.webp',
-  '.woff', '.woff2', '.ttf', '.otf', '.eot',
-  '.gz', '.br', '.zip', '.wasm'
+  '.woff', '.woff2', '.ttf', '.otf', '.wasm'
 ]);
 
 function fail(message) {
@@ -49,19 +45,37 @@ function walk(dir) {
   return files;
 }
 
-// An Acton raw string literal holding `text` verbatim. A trailing backslash
-// would escape the closing quote, and the content must not contain the
-// delimiter itself, so pick the delimiter per asset.
-function literalFor(urlPath, text) {
-  if (text.endsWith('\\')) {
-    fail(`${urlPath}: content ends with a backslash, which a raw string literal cannot hold`);
-  }
-  for (const quote of ['"""', "'''"]) {
-    if (!text.includes(quote)) {
-      return `r${quote}${text}${quote}`;
+// An Acton bytes literal holding `buf`, in triple double quotes. Printable
+// ASCII, tabs and newlines appear as they are. A backslash is escaped, and
+// every other byte is a \xNN escape. A double quote is escaped when it is
+// the third in a row or comes last, where it would close the literal.
+function bytesLiteralFor(buf) {
+  const parts = [];
+  let quotes = 0;
+  for (const byte of buf) {
+    if (byte === 0x22) {
+      if (quotes === 2) {
+        parts.push('\\"');
+        quotes = 0;
+      } else {
+        parts.push('"');
+        quotes += 1;
+      }
+      continue;
+    }
+    quotes = 0;
+    if (byte === 0x5c) {
+      parts.push('\\\\');
+    } else if (byte === 0x09 || byte === 0x0a || (byte >= 0x20 && byte < 0x7f)) {
+      parts.push(String.fromCharCode(byte));
+    } else {
+      parts.push('\\x' + byte.toString(16).padStart(2, '0'));
     }
   }
-  fail(`${urlPath}: content contains both """ and ''', so no raw string delimiter fits`);
+  for (let i = parts.length - 1; i >= 0 && parts[i] === '"'; i--) {
+    parts[i] = '\\"';
+  }
+  return `b"""${parts.join('')}"""`;
 }
 
 if (!existsSync(BUILD_DIR)) {
@@ -73,8 +87,6 @@ if (files.length === 0) {
   fail(`no files under ${BUILD_DIR}`);
 }
 
-// ignoreBOM keeps a leading byte order mark in the text instead of dropping it.
-const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 const entries = [];
 let totalBytes = 0;
 
@@ -85,45 +97,30 @@ for (const file of files) {
   }
 
   const ext = extname(file).toLowerCase();
-  if (!TEXT_EXTENSIONS.has(ext)) {
-    if (BINARY_HINTS.has(ext)) {
-      fail(
-        `${urlPath}: binary/precompressed assets cannot be embedded (the HTTP ` +
-          `server sends str bodies only) — inline it into the bundle (data URI) or drop it`
-      );
-    }
-    fail(`${urlPath}: extension "${ext}" is not in the embed whitelist; add it here if it is a text format`);
+  if (!EXTENSIONS.has(ext)) {
+    fail(
+      `${urlPath}: extension "${ext}" is not in the embed whitelist; add it to ` +
+        `EXTENSIONS here, and its Content-Type to src/static_assets.act`
+    );
   }
 
   const buf = readFileSync(file);
   if (buf.length === 0) {
     fail(`${urlPath}: empty file in build output`);
   }
-  let text;
-  try {
-    text = utf8.decode(buf);
-  } catch {
-    fail(`${urlPath}: not valid UTF-8 — only text assets can be embedded`);
-  }
-  // Control characters survive a raw literal unchanged, except NUL and
-  // carriage return, which break the compile.
-  if (text.includes('\0') || text.includes('\r')) {
-    fail(`${urlPath}: contains NUL or CR, which cannot be embedded — normalize line endings or drop the file`);
-  }
-
   totalBytes += buf.length;
-  entries.push({ urlPath, literal: literalFor(urlPath, text) });
+  entries.push({ urlPath, literal: bytesLiteralFor(buf) });
 }
 
 const out = [];
-out.push('# Embedded fleetmgr web UI: the static webui build, one raw string literal per file.');
+out.push('# Embedded fleetmgr web UI: the static webui build, one bytes literal per file.');
 out.push('# Generated by webui/scripts/gen-embedded-assets.mjs via `just gen-webui`. DO NOT EDIT.');
 out.push(`# ${entries.length} assets, ${totalBytes} bytes.`);
 out.push('');
 out.push('');
 out.push('# URL path -> file content, served by the StratoWeave HTTP server alongside');
 out.push('# the APIs (stratoweave.main(static_assets=...)).');
-out.push('ASSETS: dict[str, str] = {');
+out.push('ASSETS: dict[str, bytes] = {');
 for (const entry of entries) {
   out.push(`    "${entry.urlPath}": ${entry.literal},`);
 }
