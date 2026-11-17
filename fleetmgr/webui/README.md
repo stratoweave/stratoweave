@@ -73,8 +73,9 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   deadline's pace, so pacing by the deadline sets it to 1, the slowest
   pace, and pacing by concurrency removes the deadline. A campaign that
   has a deadline opens paced by it. The same form sets
-  `notification-period` (days, default 0) and `failure-budget` (a
-  decimal64 percent, sent as a string; absent for none). The campaign page sets them. A change PATCHes the leaves;
+  `notification-period` (days, default 0), `failure-budget` (a
+  decimal64 percent, sent as a string; absent for none), `close-margin`
+  (percent, default 150) and `stagger` (percent, default 25). The campaign page sets them. A change PATCHes the leaves;
   clearing the default schedule, the deadline or the failure budget PUTs the entry back
   without the leaf and without `state`, since DELETE on a leaf returns
   500. The controller keeps the devices it has already released, so a

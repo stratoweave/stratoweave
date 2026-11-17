@@ -3,7 +3,13 @@
   import FieldSelect from '#lib/core/ui/FieldSelect.svelte';
   import FieldText from '#lib/core/ui/FieldText.svelte';
   import { scheduleRulesText } from '#lib/maintenance/schedule-form.ts';
-  import { DEFAULT_MAX_CONCURRENCY, DEFAULT_TARGET_CONCURRENCY, type Schedule } from './model';
+  import {
+    DEFAULT_CLOSE_MARGIN,
+    DEFAULT_MAX_CONCURRENCY,
+    DEFAULT_STAGGER,
+    DEFAULT_TARGET_CONCURRENCY,
+    type Schedule
+  } from './model';
   import { perHourText, type PaceBy, type PlanningDraft } from './planning-form';
   import { formatDuration, toLocalInput } from '#lib/core/time.ts';
 
@@ -11,7 +17,7 @@
     schedules: Schedule[];
     draft: PlanningDraft;
     /** By field: deadline, target-concurrency, max-concurrency,
-     * notification-period, failure-budget. */
+     * notification-period, failure-budget, close-margin, stagger. */
     errors: Record<string, string>;
     disabled?: boolean;
     /** Mean install time in seconds, from the plan; without it the devices
@@ -122,6 +128,28 @@
   {#if perHour}
     <p class="per-hour">{perHour}</p>
   {/if}
+  <div class="row limits">
+    <FieldText
+      label="Close margin (%)"
+      value={draft.closeMargin}
+      error={errors['close-margin']}
+      mono={true}
+      {disabled}
+      placeholder={`${DEFAULT_CLOSE_MARGIN}`}
+      help="A device starts only while this share of a slow upgrade is left in its window."
+      onchange={(v) => patch({ closeMargin: v })}
+    />
+    <FieldText
+      label="Stagger (%)"
+      value={draft.stagger}
+      error={errors['stagger']}
+      mono={true}
+      {disabled}
+      placeholder={`${DEFAULT_STAGGER}`}
+      help="Spreads a round of starts over this share of an upgrade; 0 starts them at once."
+      onchange={(v) => patch({ stagger: v })}
+    />
+  </div>
   <div class="row limits">
     <FieldText
       label="Notice (days)"

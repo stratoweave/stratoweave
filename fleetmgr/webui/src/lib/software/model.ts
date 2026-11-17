@@ -176,6 +176,8 @@ export interface CampaignJson {
   'notification-period'?: number;
   /** decimal64 percent, a string in RFC 7951 JSON; absent for none. */
   'failure-budget'?: number | string;
+  'close-margin'?: number;
+  stagger?: number;
   state?: CampaignStateJson;
 }
 
@@ -432,6 +434,8 @@ export interface CampaignCounters {
 /** YANG defaults; a GET omits leaves left at their default. */
 export const DEFAULT_TARGET_CONCURRENCY = 10;
 export const DEFAULT_MAX_CONCURRENCY = 50;
+export const DEFAULT_CLOSE_MARGIN = 150;
+export const DEFAULT_STAGGER = 25;
 export const DEFAULT_PRIORITY = 100;
 
 /** A group's entry under /redundancy-groups, or the defaults of a group
@@ -522,6 +526,11 @@ export interface Campaign {
   notificationPeriod: number;
   /** Percent of the members that may fail; null for no budget. */
   failureBudget: number | null;
+  /** Percent of a slow upgrade that a device needs left in its window to
+   * start there. */
+  closeMargin: number;
+  /** Percent of an upgrade that the starts of a full window spread over. */
+  stagger: number;
   /** Seconds since the Unix epoch: when it first went to run. */
   runSince: number | null;
   counters: CampaignCounters | null;
@@ -711,7 +720,9 @@ function parseCampaignConfig(entry: CampaignJson): CampaignConfig {
     targetConcurrency: entry['target-concurrency'] ?? DEFAULT_TARGET_CONCURRENCY,
     maxConcurrency: entry['max-concurrency'] ?? DEFAULT_MAX_CONCURRENCY,
     notificationPeriod: num(entry['notification-period'] ?? 0),
-    failureBudget: entry['failure-budget'] == null ? null : num(entry['failure-budget'])
+    failureBudget: entry['failure-budget'] == null ? null : num(entry['failure-budget']),
+    closeMargin: num(entry['close-margin'] ?? DEFAULT_CLOSE_MARGIN),
+    stagger: num(entry.stagger ?? DEFAULT_STAGGER)
   };
 }
 

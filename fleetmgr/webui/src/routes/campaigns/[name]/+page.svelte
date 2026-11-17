@@ -554,7 +554,7 @@
           <span class="hint"
             >{planningDirty
               ? 'unsaved changes'
-              : 'change the default schedule, a deadline, how many at once, the notice or the failure budget'}</span
+              : 'change the default schedule, the pace, the close margin, the stagger, the notice or the failure budget'}</span
           >
         {/if}
       </h2>

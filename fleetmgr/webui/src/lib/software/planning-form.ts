@@ -1,7 +1,7 @@
 // A campaign's schedule, pace and limits: the default schedule, the
 // deadline, how many devices upgrade at the same time, the days of notice
-// its members get before their window and its failure budget, as the
-// campaign page edits them.
+// its members get before their window, its failure budget, its close
+// margin and its stagger, as the campaign page edits them.
 //
 // The pace comes from a deadline or from a number of devices at once, not
 // both. The model takes both, with target-concurrency as a floor under the
@@ -14,7 +14,9 @@ import { restconfPatchJson, rewriteListEntry } from '#lib/core/restconf/client.t
 import {
   CAMPAIGN_LIST_ROOT,
   DATA_ROOT,
+  DEFAULT_CLOSE_MARGIN,
   DEFAULT_MAX_CONCURRENCY,
+  DEFAULT_STAGGER,
   DEFAULT_TARGET_CONCURRENCY,
   type Campaign,
   type CampaignJson,
@@ -37,6 +39,9 @@ export interface PlanningDraft {
   notificationPeriod: string;
   /** Percent as typed; '' for no budget. */
   failureBudget: string;
+  /** Percents as typed; '' for the model default. */
+  closeMargin: string;
+  stagger: string;
 }
 
 export interface Planning {
@@ -49,6 +54,9 @@ export interface Planning {
   notificationPeriod: number;
   /** Percent; null for no budget. */
   failureBudget: number | null;
+  /** Percents. */
+  closeMargin: number;
+  stagger: number;
 }
 
 const UINT32_MAX = 4294967295;
@@ -61,7 +69,9 @@ export function planningOf(c: Campaign): Planning {
     targetConcurrency: c.targetConcurrency,
     maxConcurrency: c.maxConcurrency,
     notificationPeriod: c.notificationPeriod,
-    failureBudget: c.failureBudget
+    failureBudget: c.failureBudget,
+    closeMargin: c.closeMargin,
+    stagger: c.stagger
   };
 }
 
@@ -77,13 +87,15 @@ export function planningDraft(p: Planning): PlanningDraft {
       paceBy === 'deadline' || p.targetConcurrency === DEFAULT_TARGET_CONCURRENCY ? '' : String(p.targetConcurrency),
     maxConcurrency: p.maxConcurrency === DEFAULT_MAX_CONCURRENCY ? '' : String(p.maxConcurrency),
     notificationPeriod: p.notificationPeriod === 0 ? '' : String(p.notificationPeriod),
-    failureBudget: p.failureBudget === null ? '' : String(p.failureBudget)
+    failureBudget: p.failureBudget === null ? '' : String(p.failureBudget),
+    closeMargin: p.closeMargin === DEFAULT_CLOSE_MARGIN ? '' : String(p.closeMargin),
+    stagger: p.stagger === DEFAULT_STAGGER ? '' : String(p.stagger)
   };
 }
 
 /** Errors by field: deadline, target-concurrency, max-concurrency,
- * notification-period, failure-budget; only the pace field in use is
- * checked. A deadline must lie ahead of `now`,
+ * notification-period, failure-budget, close-margin, stagger; only the
+ * pace field in use is checked. A deadline must lie ahead of `now`,
  * unless it is the one `saved` already holds. */
 export function validatePlanningDraft(
   draft: PlanningDraft,
@@ -118,6 +130,14 @@ export function validatePlanningDraft(
   if (budget && (!/^\d+(\.\d{1,2})?$/.test(budget) || Number(budget) > 100)) {
     errors['failure-budget'] = 'A percent from 0 to 100, with at most two decimals.';
   }
+  const margin = draft.closeMargin.trim();
+  if (margin && (!/^\d+$/.test(margin) || Number(margin) < 100 || Number(margin) > UINT16_MAX)) {
+    errors['close-margin'] = `A whole percent, 100 to ${UINT16_MAX}.`;
+  }
+  const stagger = draft.stagger.trim();
+  if (stagger && (!/^\d+$/.test(stagger) || Number(stagger) > 100)) {
+    errors['stagger'] = 'A whole percent, 0 to 100.';
+  }
   return errors;
 }
 
@@ -131,7 +151,9 @@ export function planningFromDraft(draft: PlanningDraft): Planning {
     targetConcurrency: byDeadline ? 1 : draft.targetConcurrency.trim() ? Number(draft.targetConcurrency) : DEFAULT_TARGET_CONCURRENCY,
     maxConcurrency: draft.maxConcurrency.trim() ? Number(draft.maxConcurrency) : DEFAULT_MAX_CONCURRENCY,
     notificationPeriod: draft.notificationPeriod.trim() ? Number(draft.notificationPeriod) : 0,
-    failureBudget: draft.failureBudget.trim() ? Number(draft.failureBudget) : null
+    failureBudget: draft.failureBudget.trim() ? Number(draft.failureBudget) : null,
+    closeMargin: draft.closeMargin.trim() ? Number(draft.closeMargin) : DEFAULT_CLOSE_MARGIN,
+    stagger: draft.stagger.trim() ? Number(draft.stagger) : DEFAULT_STAGGER
   };
 }
 
@@ -191,6 +213,8 @@ export function planningChanges(saved: Planning, next: Planning): { set: Partial
     if (next.failureBudget !== null) set['failure-budget'] = String(next.failureBudget);
     else remove.push('failure-budget');
   }
+  if (next.closeMargin !== saved.closeMargin) set['close-margin'] = next.closeMargin;
+  if (next.stagger !== saved.stagger) set.stagger = next.stagger;
   return { set, remove };
 }
 
