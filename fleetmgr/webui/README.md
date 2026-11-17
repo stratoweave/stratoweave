@@ -73,8 +73,9 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   deadline's pace, so pacing by the deadline sets it to 1, the slowest
   pace, and pacing by concurrency removes the deadline. A campaign that
   has a deadline opens paced by it. The same form sets
-  `notification-period` (days, default 0) and `failure-budget` (a
-  decimal64 percent, sent as a string; absent for none). The campaign page sets them. A change PATCHes the leaves;
+  `notification-period` (days, default 0), `failure-budget` (a
+  decimal64 percent, sent as a string; absent for none), `close-margin`
+  (percent, default 150) and `stagger` (percent, default 25). The campaign page sets them. A change PATCHes the leaves;
   clearing the default schedule, the deadline or the failure budget PUTs the entry back
   without the leaf and without `state`, since DELETE on a leaf returns
   500. The controller keeps the devices it has already released, so a
@@ -146,6 +147,14 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   add one, in quarter-hour steps. A rule has one opening time, so moving
   one window moves all of its weekdays in time; sideways only the dragged
   weekday moves.
+- Add device and Import PATCH new fleet entries. `credentials` has the
+  username, the password when typed and the private key file picked, as one
+  `key` entry named by the file name; the file is read in the browser, and
+  one with a passphrase is refused, since the adapters take none. With an
+  address the entry gets an `address` named `oob` and needs a password or a
+  key; without one it is a mock. CLI over SSH adds `extra-adapter`
+  `iosxe-cli`, with the port typed; Import adds it only to the lines with
+  an address, as the CLI of a mock never connects.
 - A device binds to a schedule with the `schedule` leaf on its fleet
   entry. Binding merges, so one PATCH binds any number of devices (1000
   in about a second). Unbinding PUTs each entry back without the leaf,
@@ -158,7 +167,12 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   which campaign members name, with `file`, the path of the image's file in
   the top's image folder (`--software.image-dir`), such as
   `iosxe/17.18/c8000v-universalk9.17.18.03a.SPA.bin`, the name when absent;
-  each has `os`, `version` and a `model` leaf-list. Adding one PATCHes the
+  each has `os`, `version` and a `model` leaf-list. The `checksum` list,
+  keyed by `algorithm` (`md5`, `sha256`, `sha512`), holds the digests the
+  vendor publishes: one Checksum field takes them separated by spaces, the
+  number of hex digits tells the algorithm, and they are saved lowercase.
+  `size` (bytes, a JSON number) comes from the file on upload; the image
+  page shows it and a save keeps it. Adding one PATCHes the
   datastore root, which merges into an image of the same name rather than
   fail, so the add reads the image names again first and refuses one that
   exists; saving one PUTs the whole entry, so a model removed in the form
@@ -233,8 +247,7 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `upgrade-needed`, `in-progress`, `succeeded`, `failed`, `rolled-back`.
   The `succeeded` counter includes `up-to-date`, `failed` includes
   `rolled-back`; `pending`/`unknown` count into nothing, so counters need
-  not sum to `total`. Status is not latched — it tracks live device state
-  and regresses when a campaign goes back to `plan`.
+  not sum to `total`. Status is not latched — it tracks live device state.
 - The Config page shows layer 0, the top's configuration, from
   `GET /layer/0` (next to RESTCONF, not under it): `content=config`,
   `nonconfig` (the state its transforms publish, such as campaign
@@ -268,8 +281,9 @@ anything done here can be done identically over NETCONF or plain RESTCONF.
 Two rules go beyond the model, in the wizard and on the campaign page: a
 newly set deadline must lie ahead, and the pace comes from a deadline or a
 number of devices at once, not both. Rate and ETA are measured since page
-open, and nothing is latched: status tracks live device state and
-regresses when a campaign goes back to plan.
+open, and nothing is latched: status tracks live device state. Pause
+merges `admin-state: plan`: members that upgrade stop before their
+install and go on when the campaign runs again.
 
 Sharding is internal: the top places each device on a flotilla by its
 name, and nothing in the UI shows the placement.

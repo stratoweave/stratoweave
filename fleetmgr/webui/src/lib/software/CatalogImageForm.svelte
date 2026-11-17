@@ -22,14 +22,19 @@
   import {
     IMAGE_FILE_TYPES,
     OS_NAMES,
+    checksumsLabel,
+    checksumsText,
     familyFromName,
     imageCountLabel,
     imageErrors,
     imageFromFileName,
     knownModels,
     otherDefaults,
+    parseChecksums,
     previousImage,
+    sizeText,
     versionFromName,
+    withChecksumError,
     withDraftError,
     withModelsOf,
     type CatalogImage,
@@ -70,6 +75,8 @@
   const given = untrack(() => (image ? image.file : file));
   // Where Cancel and a delete go back to: the folder of the image's file.
   const back = untrack(() => folderHref(given ? parentOf(given) : folder));
+  // Only an upload sets the size; an edit keeps it.
+  const size = untrack(() => image?.size ?? null);
 
   let name = $state(untrack(() => image?.name ?? baseName(file)));
   let os = $state(untrack(() => image?.os ?? ''));
@@ -77,6 +84,7 @@
   let models = $state<string[]>(untrack(() => [...(image?.models ?? [])]));
   let family = $state(untrack(() => image?.family ?? ''));
   let isDefault = $state(untrack(() => image?.isDefault ?? false));
+  let checksumText = $state(untrack(() => checksumsText(image?.checksums ?? [])));
   let modelDraft = $state('');
   // A new image takes its OS, version and family from the name until they
   // are typed.
@@ -98,6 +106,7 @@
   let osOptions = $derived([...new Set([...OS_NAMES, ...images.map((i) => i.os)])]);
   let familyOptions = $derived([...new Set(images.map((i) => i.family).filter((f) => f))]);
 
+  let checksums = $derived(parseChecksums(checksumText));
   // What is typed, as it would be saved. A new image's file is the one it
   // was given, or else its name in the folder it is added in.
   let current = $derived<CatalogImage>({
@@ -107,13 +116,15 @@
     version: version.trim(),
     models,
     family: family.trim(),
-    isDefault
+    isDefault,
+    checksums: checksums.checksums,
+    size
   });
   let taken = $derived(new Set([...images.map((i) => i.name), ...lateNames]));
   let errors = $derived.by(() => {
     const e = imageErrors(current, isNew ? taken : null);
     const bad = isNew && !e.name && current.name ? nameError(current.name) || pathError(current.file) : '';
-    return withDraftError(bad ? { ...e, name: bad } : e, modelDraft);
+    return withChecksumError(withDraftError(bad ? { ...e, name: bad } : e, modelDraft), checksums.error);
   });
   let shown = $derived(touched ? errors : ({} as ImageErrors));
   let modelsMeta = $derived(shown.models ?? (modelDraft.trim() ? 'Press Enter to add it.' : ''));
@@ -129,7 +140,8 @@
       (familyTyped && !!family.trim()) ||
       isDefault ||
       models.length > 0 ||
-      !!modelDraft.trim()
+      !!modelDraft.trim() ||
+      !!checksumText.trim()
   );
 
   function setName(next: string): void {
@@ -145,7 +157,7 @@
   // Files take this page over, one row each. What is typed here goes to the
   // row of the same name; with no such row it would be lost, so ask first.
   function takeFiles(files: File[]): void {
-    const typed = { ...current, models: [...models], draft: modelDraft };
+    const typed = { ...current, models: [...models], draft: modelDraft, checksumText };
     if (files.some((f) => f.name === typed.name)) onfiles?.(files, typed);
     else if (typedAnything) pendingFiles = files;
     else onfiles?.(files, null);
@@ -348,6 +360,22 @@
       <small id={`${uid}-default-meta`} class="field__meta">{defaultMeta || ' '}</small>
     </div>
   </div>
+  <FieldText
+    label="Checksum"
+    value={checksumText}
+    error={shown.checksum}
+    help={checksumsLabel(checksums.checksums)}
+    mono={true}
+    placeholder="MD5, SHA-256 or SHA-512"
+    onchange={(v) => (checksumText = v)}
+    ontouch={() => (touched = true)}
+  />
+  {#if size !== null}
+    <div class="field">
+      <span class="field__label">Size</span>
+      <span class="size">{sizeText(size)}</span>
+    </div>
+  {/if}
 </section>
 
 <ConfirmDialog
@@ -384,6 +412,10 @@
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 12px;
+  }
+
+  .size {
+    font-size: var(--sw-text-sm);
   }
 
   /* As tall as a text input, so that it lines up with Family. */

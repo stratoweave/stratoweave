@@ -649,6 +649,10 @@
   campaigns install. An upload whose file name is already an image's name
   fails before the file is sent. Search covers the folder shown and the
   folders in it, and files that the image list lacks show, ready to add.
+- The web UI's image pages have a Checksum field for the checksums that the
+  vendor publishes: MD5, SHA-256 or SHA-512, told apart by their length. An
+  upload sets the image's `size` from the file. Saving an image no longer
+  drops its checksums and size.
 - The web UI has a Config page that shows the top's configuration, the state
   its transforms publish, or both, as XML, JSON or AData. The Apply config
   page merges JSON or XML configuration into the running system with a
@@ -669,10 +673,20 @@
   the page opens. The failed devices, the redundancy groups and the devices
   fold too, and only the failed devices start open. Folded, the redundancy
   groups say how many of them are held. [#789]
+- The campaign page's Schedule, pace and limits set a campaign's
+  `close-margin` and `stagger`.
+- The campaign page's Revert to plan is now Pause, and its confirmation says
+  what a pause does: members that upgrade stop before their install and go
+  on when the campaign runs again. A campaign in plan that has run shows as
+  paused.
 - The device page is redesigned around the device's upgrade run. [#674]
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for
   all its devices. [#726]
+- The web UI's add and import device forms take a private key file, and a
+  CLI over SSH box that gives the device the `iosxe-cli` extra adapter, on
+  port 22 or the port typed. A device with an address needs a password or a
+  key. Import gives the CLI only to the devices with an address.
 - The web UI works on narrow screens and has better contrast and
   accessibility. The campaign page leads with live progress and failures.
   [#679]
