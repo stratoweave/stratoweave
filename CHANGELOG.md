@@ -673,6 +673,10 @@
   the page opens. The failed devices, the redundancy groups and the devices
   fold too, and only the failed devices start open. Folded, the redundancy
   groups say how many of them are held. [#789]
+- The campaign page's Revert to plan is now Pause, and its confirmation says
+  what a pause does: members that upgrade stop before their install and go
+  on when the campaign runs again. A campaign in plan that has run shows as
+  paused.
 - The device page is redesigned around the device's upgrade run. [#674]
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for

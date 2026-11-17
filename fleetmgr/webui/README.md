@@ -246,8 +246,7 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `upgrade-needed`, `in-progress`, `succeeded`, `failed`, `rolled-back`.
   The `succeeded` counter includes `up-to-date`, `failed` includes
   `rolled-back`; `pending`/`unknown` count into nothing, so counters need
-  not sum to `total`. Status is not latched — it tracks live device state
-  and regresses when a campaign goes back to `plan`.
+  not sum to `total`. Status is not latched — it tracks live device state.
 - The Config page shows layer 0, the top's configuration, from
   `GET /layer/0` (next to RESTCONF, not under it): `content=config`,
   `nonconfig` (the state its transforms publish, such as campaign
@@ -281,8 +280,9 @@ anything done here can be done identically over NETCONF or plain RESTCONF.
 Two rules go beyond the model, in the wizard and on the campaign page: a
 newly set deadline must lie ahead, and the pace comes from a deadline or a
 number of devices at once, not both. Rate and ETA are measured since page
-open, and nothing is latched: status tracks live device state and
-regresses when a campaign goes back to plan.
+open, and nothing is latched: status tracks live device state. Pause
+merges `admin-state: plan`: members that upgrade stop before their
+install and go on when the campaign runs again.
 
 Sharding is internal: the top places each device on a flotilla by its
 name, and nothing in the UI shows the placement.

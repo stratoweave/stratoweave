@@ -251,19 +251,20 @@
   let paged = $derived(paginate(filteredRows, page, PAGE_SIZE));
 
   // No "done" claim anywhere: status is not latched, it tracks live device
-  // state and regresses when the campaign goes back to plan.
+  // state. A campaign in plan that has run is paused.
   let summary = $derived.by(() => {
     const c = campaign;
     if (!c) return '';
     if (c.adminState === 'plan') {
+      const head = c.runSince === null ? 'Planned' : 'Paused';
       const plan = c.plan;
       if (plan !== null && (plan.windows.length > 0 || plan.unplaced.length > 0)) {
         const placed = c.devices.length - plan.unplaced.length;
         const windows = `${plan.windows.length} window${plan.windows.length === 1 ? '' : 's'}`;
         const missing = plan.unplaced.length > 0 ? `, ${plan.unplaced.length} in no window yet` : '';
-        return `Planned — ${placed} of ${c.devices.length} placed in ${windows}${missing}.`;
+        return `${head} — ${placed} of ${c.devices.length} placed in ${windows}${missing}.`;
       }
-      return 'Planned.';
+      return `${head}.`;
     }
     if (counters === null) return 'Running — no state reported yet.';
     if (counters.inProgress > 0)
@@ -283,9 +284,9 @@
       confirmClass: 'btn-primary'
     },
     plan: {
-      title: 'Revert to plan',
-      confirmLabel: 'Revert',
-      confirmClass: 'btn-danger'
+      title: 'Pause campaign',
+      confirmLabel: 'Pause',
+      confirmClass: 'btn-primary'
     },
     delete: {
       title: 'Delete campaign',
@@ -314,7 +315,7 @@
       );
     }
     if (confirmAction === 'plan')
-      return 'Withdraw the software targets? Device statuses revert to live state.';
+      return 'Pause the campaign? Devices upgrading now stop before their install and go on when it runs again. Devices past their install finish.';
     return `Delete campaign ${c.name}? Its targets are withdrawn from the devices.`;
   });
 
@@ -406,7 +407,7 @@
           disabled={busy}
           onclick={() => (confirmAction = 'plan')}
         >
-          Revert to plan
+          Pause
         </button>
       {/if}
     </div>
