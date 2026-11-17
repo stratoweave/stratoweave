@@ -15,13 +15,16 @@
   import {
     IMAGE_FILE_TYPES,
     OS_NAMES,
+    checksumsLabel,
     familyFromName,
     imageCountLabel,
     imageErrors,
     imageFromFileName,
     knownModels,
     otherDefaults,
+    parseChecksums,
     previousImage,
+    withChecksumError,
     withDraftError,
     withModelsOf,
     type CatalogImage,
@@ -55,6 +58,8 @@
     source: File;
     /** A model typed but not added yet. */
     draft: string;
+    /** The checksum field as typed; `checksums` holds what it recognizes. */
+    checksumText: string;
     /** Where the row is once Upload is pressed. */
     upload?: Upload;
   }
@@ -146,6 +151,7 @@
         : owner
           ? `This is the file of the image ${owner}. Remove this row, or move or delete that image first.`
           : imageFileError(row.source, folder);
+      e = withChecksumError(e, parseChecksums(row.checksumText).error);
       return withDraftError(name ? { ...e, name } : e, row.draft);
     });
   });
@@ -164,6 +170,11 @@
     const family = row.family.trim();
     if (!on || !family) return;
     for (const r of rows) if (r.name !== row.name && r.family.trim() === family) r.isDefault = false;
+  }
+
+  function setChecksums(row: Row, text: string): void {
+    row.checksumText = text;
+    row.checksums = parseChecksums(text).checksums;
   }
 
   /** The default in the image list that a row takes over. */
@@ -187,6 +198,9 @@
         draft: '',
         family: familyFromName(file.name),
         isDefault: false,
+        checksums: [],
+        checksumText: '',
+        size: file.size,
         ...imageFromFileName(file.name)
       };
       if (from?.name === file.name) {
@@ -196,6 +210,8 @@
         row.isDefault = from.isDefault;
         row.models = [...from.models];
         row.draft = from.draft;
+        row.checksums = from.checksums;
+        row.checksumText = from.checksumText;
       }
       rows.push(row);
     }
@@ -267,7 +283,9 @@
           version: row.version.trim(),
           models: row.models,
           family: row.family.trim(),
-          isDefault: row.isDefault
+          isDefault: row.isDefault,
+          checksums: row.checksums,
+          size: row.size
         };
         // A default clears the family's current one in the same PATCH, as
         // the list is now: the upload may have taken a while.
@@ -356,6 +374,7 @@
             <th class="col-family">Family</th>
             <th>Models</th>
             <th class="col-default">Default</th>
+            <th class="col-checksum">Checksum</th>
             <th class="col-action"><span class="sr-only">Actions</span></th>
           </tr>
         </thead>
@@ -366,6 +385,7 @@
             {@const id = `${uid}-${index}`}
             {@const modelsMeta = shown.models ?? (row.draft.trim() ? 'Press Enter to add it.' : '')}
             {@const replaces = replacesText(row)}
+            {@const checksumMeta = shown.checksum ?? checksumsLabel(row.checksums)}
             <tr>
               <td class="name-cell">
                 <span class="mono name">{row.name}</span>
@@ -479,6 +499,23 @@
                   onchange={(event) => setDefault(row, event.currentTarget.checked)}
                 />
               </td>
+              <td class="checksum-cell" data-label="Checksum">
+                <input
+                  class="input compact mono"
+                  class:has-error={!!shown.checksum}
+                  aria-label={`Checksum of ${row.name}`}
+                  aria-invalid={shown.checksum ? 'true' : undefined}
+                  aria-describedby={checksumMeta ? `${id}-checksum` : undefined}
+                  placeholder="MD5/SHA"
+                  value={row.checksumText}
+                  oninput={(event) => setChecksums(row, event.currentTarget.value)}
+                />
+                {#if checksumMeta}
+                  <small id={`${id}-checksum`} class="field__meta" class:field__meta--error={!!shown.checksum}>
+                    {checksumMeta}
+                  </small>
+                {/if}
+              </td>
               <td class="col-action action-cell">
                 <!-- An image that already exists has no field to fix: Remove is the way out. -->
                 <button
@@ -519,9 +556,10 @@
     color: var(--sw-danger-text);
   }
 
+  /* Fits the card beside the sidebar of a 1280 px window. */
   .files {
     table-layout: fixed;
-    min-width: 860px;
+    min-width: 920px;
   }
 
   .files td {
@@ -529,7 +567,7 @@
   }
 
   .col-name {
-    width: 17%;
+    width: 14%;
   }
 
   .col-os {
@@ -541,7 +579,11 @@
   }
 
   .col-family {
-    width: 20%;
+    width: 16%;
+  }
+
+  .col-checksum {
+    width: 11%;
   }
 
   /* The checkbox sits under the middle of its header. */
@@ -601,8 +643,8 @@
 
   @media (max-width: 720px) {
     /* Each file becomes a block: its name with Remove, then OS and version
-       side by side, then family and default side by side, then the models,
-       each under its own label. */
+       side by side, then family and default side by side, then the models
+       and the checksum, each under its own label. */
     .files {
       min-width: 0;
       table-layout: auto;
@@ -624,7 +666,8 @@
         'name name'
         'os version'
         'family default'
-        'models models';
+        'models models'
+        'checksum checksum';
       gap: 10px 12px;
       padding: 14px 0;
     }
@@ -676,6 +719,10 @@
 
     .models-cell {
       grid-area: models;
+    }
+
+    .checksum-cell {
+      grid-area: checksum;
     }
 
     .action-cell {

@@ -156,7 +156,19 @@ export function searchTree(tree: ImageTree, folder: string, text: string): Drive
 export type DriveSortKey = SortKey | 'size';
 
 function asImage(e: ImageEntry): CatalogImage {
-  return e.image ?? { name: e.name, file: e.path, os: '', models: [], version: '', family: '', isDefault: false };
+  return (
+    e.image ?? {
+      name: e.name,
+      file: e.path,
+      os: '',
+      models: [],
+      version: '',
+      family: '',
+      isDefault: false,
+      checksums: [],
+      size: null
+    }
+  );
 }
 
 function byName(a: DriveEntry, b: DriveEntry): number {

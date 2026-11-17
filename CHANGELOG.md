@@ -649,6 +649,10 @@
   campaigns install. An upload whose file name is already an image's name
   fails before the file is sent. Search covers the folder shown and the
   folders in it, and files that the image list lacks show, ready to add.
+- The web UI's image pages have a Checksum field for the checksums that the
+  vendor publishes: MD5, SHA-256 or SHA-512, told apart by their length. An
+  upload sets the image's `size` from the file. Saving an image no longer
+  drops its checksums and size.
 - The web UI has a Config page that shows the top's configuration, the state
   its transforms publish, or both, as XML, JSON or AData. The Apply config
   page merges JSON or XML configuration into the running system with a

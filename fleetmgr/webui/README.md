@@ -158,7 +158,12 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   which campaign members name, with `file`, the path of the image's file in
   the top's image folder (`--software.image-dir`), such as
   `iosxe/17.18/c8000v-universalk9.17.18.03a.SPA.bin`, the name when absent;
-  each has `os`, `version` and a `model` leaf-list. Adding one PATCHes the
+  each has `os`, `version` and a `model` leaf-list. The `checksum` list,
+  keyed by `algorithm` (`md5`, `sha256`, `sha512`), holds the digests the
+  vendor publishes: one Checksum field takes them separated by spaces, the
+  number of hex digits tells the algorithm, and they are saved lowercase.
+  `size` (bytes, a JSON number) comes from the file on upload; the image
+  page shows it and a save keeps it. Adding one PATCHes the
   datastore root, which merges into an image of the same name rather than
   fail, so the add reads the image names again first and refuses one that
   exists; saving one PUTs the whole entry, so a model removed in the form

@@ -2,6 +2,13 @@
 // the hardware models it is for, its version and its family. A family has
 // at most one default image.
 
+export type ChecksumAlgorithm = 'md5' | 'sha256' | 'sha512';
+
+export interface Checksum {
+  algorithm: ChecksumAlgorithm;
+  digest: string;
+}
+
 export interface CatalogImage {
   name: string;
   /** Path of its file in the image folder, e.g. iosxe/17.18/x.bin: the
@@ -12,6 +19,9 @@ export interface CatalogImage {
   version: string;
   family: string;
   isDefault: boolean;
+  checksums: Checksum[];
+  /** Bytes; null when unknown. */
+  size: number | null;
 }
 
 export type SortKey = 'name' | 'os' | 'family' | 'models' | 'version';
@@ -126,12 +136,45 @@ export function withModelsOf(models: string[], from: CatalogImage): string[] {
   return [...models, ...from.models.filter((m) => !models.includes(m))];
 }
 
-/** An image as typed in a form, with a model typed but not added yet. */
-export interface TypedImage extends CatalogImage {
-  draft: string;
+const ALGORITHM_BY_LENGTH: Record<number, ChecksumAlgorithm> = { 32: 'md5', 64: 'sha256', 128: 'sha512' };
+
+const ALGORITHM_NAMES: Record<ChecksumAlgorithm, string> = { md5: 'MD5', sha256: 'SHA-256', sha512: 'SHA-512' };
+
+/** The checksums pasted in one field, separated by spaces. The number of hex
+ * digits tells the algorithm. `error` is '' when every one is recognized. */
+export function parseChecksums(text: string): { checksums: Checksum[]; error: string } {
+  const checksums: Checksum[] = [];
+  for (const digest of text.split(/\s+/).filter((d) => d)) {
+    const algorithm = /^[0-9a-fA-F]+$/.test(digest) ? ALGORITHM_BY_LENGTH[digest.length] : undefined;
+    if (!algorithm) {
+      return { checksums, error: 'Not an MD5 (32 hex digits), SHA-256 (64) or SHA-512 (128) checksum.' };
+    }
+    if (checksums.some((c) => c.algorithm === algorithm)) {
+      return { checksums, error: `Two ${ALGORITHM_NAMES[algorithm]} checksums.` };
+    }
+    checksums.push({ algorithm, digest: digest.toLowerCase() });
+  }
+  return { checksums, error: '' };
 }
 
-export type ImageErrors = Partial<Record<'name' | 'os' | 'version' | 'family' | 'models', string>>;
+/** The checksums as the field shows them. */
+export function checksumsText(checksums: Checksum[]): string {
+  return checksums.map((c) => c.digest).join(' ');
+}
+
+/** Which checksums the field holds, e.g. "SHA-512" or "MD5, SHA-512". */
+export function checksumsLabel(checksums: Checksum[]): string {
+  return checksums.map((c) => ALGORITHM_NAMES[c.algorithm]).join(', ');
+}
+
+/** An image as typed in a form, with a model typed but not added yet and
+ * the checksum field as typed. */
+export interface TypedImage extends CatalogImage {
+  draft: string;
+  checksumText: string;
+}
+
+export type ImageErrors = Partial<Record<'name' | 'os' | 'version' | 'family' | 'models' | 'checksum', string>>;
 
 /** What keeps an image from being saved. `taken` holds the names already in
  * the list; null skips the name, which an edit does not change. */
@@ -154,6 +197,25 @@ export function imageErrors(image: CatalogImage, taken: Set<string> | null): Ima
 export function withDraftError(errors: ImageErrors, draft: string): ImageErrors {
   const d = draft.trim();
   return d ? { ...errors, models: `Press Enter to add ${d}, or clear the field.` } : errors;
+}
+
+/** A checksum that is not recognized keeps the image from being saved. */
+export function withChecksumError(errors: ImageErrors, error: string): ImageErrors {
+  return error ? { ...errors, checksum: error } : errors;
+}
+
+/** A file size for people, e.g. "700 MiB (734,003,200 bytes)". */
+export function sizeText(bytes: number): string {
+  const exact = `${bytes.toLocaleString()} bytes`;
+  let value = bytes;
+  let unit = '';
+  for (const next of ['KiB', 'MiB', 'GiB', 'TiB']) {
+    if (value < 1024) break;
+    value /= 1024;
+    unit = next;
+  }
+  if (!unit) return exact;
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${unit} (${exact})`;
 }
 
 /** What a model's count in a pick list means. */

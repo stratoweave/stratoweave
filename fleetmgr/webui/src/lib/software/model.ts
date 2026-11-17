@@ -1,5 +1,5 @@
 import type { ValidationResult } from '#lib/core/validation/types.ts';
-import type { CatalogImage } from '#lib/software/images.ts';
+import type { CatalogImage, Checksum } from '#lib/software/images.ts';
 
 // RESTCONF paths. Writes always PATCH the datastore root: the backend
 // rejects a PATCH whose target resource does not exist yet (RFC 8040),
@@ -198,6 +198,9 @@ export interface ImageJson {
   os?: string;
   version?: string;
   model?: string[];
+  checksum?: Checksum[];
+  // uint64: a number from StratoWeave, a string in RFC 7951 JSON.
+  size?: string | number;
   family?: string;
   default?: boolean;
 }
@@ -817,7 +820,9 @@ function parseImage(entry: ImageJson): CatalogImage {
     models: entry.model ?? [],
     version: entry.version ?? '',
     family: entry.family ?? '',
-    isDefault: entry.default ?? false
+    isDefault: entry.default ?? false,
+    checksums: (entry.checksum ?? []).map((c) => ({ algorithm: c.algorithm, digest: c.digest })),
+    size: entry.size === undefined ? null : Number(entry.size)
   };
 }
 
@@ -887,6 +892,8 @@ export function imageToJson(image: CatalogImage): ImageJson {
     default: image.isDefault
   };
   if (image.family) json.family = image.family;
+  if (image.checksums.length > 0) json.checksum = image.checksums.map((c) => ({ ...c }));
+  if (image.size !== null) json.size = image.size;
   return json;
 }
 
