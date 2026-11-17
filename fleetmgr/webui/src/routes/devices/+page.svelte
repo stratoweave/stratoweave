@@ -5,11 +5,13 @@
   import { onLoaded } from '#lib/core/loading.svelte.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
   import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
+  import FieldFile from '#lib/core/ui/FieldFile.svelte';
   import FieldText from '#lib/core/ui/FieldText.svelte';
   import Section from '#lib/core/ui/Section.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '#lib/core/restconf/client.ts';
   import { bindPatch, unbindDevice } from '#lib/maintenance/binding.ts';
   import { SCHEDULE_COLOR_OTHER, scheduleColors } from '#lib/maintenance/palette.ts';
+  import CliField from '#lib/software/CliField.svelte';
   import ConnectionDot from '#lib/software/ConnectionDot.svelte';
   import { DATA_ROOT, FLEET_DEVICE_LIST_ROOT, parseFleet, type Device, type Schedule } from '#lib/software/model.ts';
   import { groupMatches, nameMatcher, scheduleMatches } from '#lib/software/selection.ts';
@@ -18,9 +20,11 @@
     chunk,
     deviceEntries,
     devicesPatch,
+    keyError,
     parseImport,
     validateNewDevice,
-    type NewDeviceInput
+    type NewDeviceInput,
+    type PrivateKey
   } from '#lib/software/inventory.ts';
   import type { PageProps } from './$types';
 
@@ -42,6 +46,9 @@
   let importType = $state('iosxe');
   let importUsername = $state('');
   let importPassword = $state('');
+  let importKey = $state<PrivateKey | null>(null);
+  let importCli = $state(false);
+  let importCliPort = $state('');
   let touched = $state(false);
   let saving = $state(false);
   let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -253,7 +260,7 @@
   let errors = $derived(touched ? validation.errors : ({} as Record<string, string>));
 
   function openNew(): void {
-    draft = { name: '', type: 'iosxe', address: '', port: '', username: '', password: '' };
+    draft = { name: '', type: 'iosxe', address: '', port: '', username: '', password: '', key: null, cli: false, cliPort: '' };
     importOpen = false;
     touched = false;
     statusMessage = null;
@@ -303,7 +310,14 @@
       saving = true;
       statusMessage = null;
       const existing = new Set(devices.map((d) => d.name));
-      const shared = { type: importType.trim() || 'iosxe', username: importUsername, password: importPassword };
+      const shared = {
+        type: importType.trim() || 'iosxe',
+        username: importUsername,
+        password: importPassword,
+        key: importKey,
+        cli: importCli,
+        cliPort: importCliPort
+      };
       const result = parseImport(importText, shared, existing);
       if (result.errors.length > 0) {
         statusMessage = {
@@ -333,6 +347,7 @@
       statusMessage = { type: 'success', text: `Imported ${entries.length} devices${skipped}.` };
       importText = '';
       importPassword = '';
+      importKey = null;
       closeEditor();
     } catch (importError) {
       statusMessage = {
@@ -461,6 +476,24 @@
           onchange={(value) => patch({ password: value })}
           ontouch={() => (touched = true)}
         />
+        <FieldFile
+          label="Private key"
+          value={draft.key}
+          error={errors['key']}
+          onchange={(key) => {
+            patch({ key });
+            touched = true;
+          }}
+        />
+        <CliField
+          cli={draft.cli}
+          port={draft.cliPort}
+          error={errors['cli']}
+          onchange={(next) => {
+            patch({ cli: next.cli, cliPort: next.port });
+            touched = true;
+          }}
+        />
       </div>
       <div class="editor-actions">
         <button class="btn btn-secondary" type="button" onclick={closeEditor} disabled={saving}>
@@ -505,6 +538,21 @@
           password={true}
           autocomplete="new-password"
           onchange={(value) => (importPassword = value)}
+        />
+        <FieldFile
+          label="Private key"
+          value={importKey}
+          error={importKey ? keyError(importKey.text) : ''}
+          onchange={(key) => (importKey = key)}
+        />
+        <CliField
+          cli={importCli}
+          port={importCliPort}
+          help="Only for devices with an address."
+          onchange={(next) => {
+            importCli = next.cli;
+            importCliPort = next.port;
+          }}
         />
       </div>
       <textarea

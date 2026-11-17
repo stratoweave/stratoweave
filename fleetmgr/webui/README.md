@@ -146,6 +146,14 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   add one, in quarter-hour steps. A rule has one opening time, so moving
   one window moves all of its weekdays in time; sideways only the dragged
   weekday moves.
+- Add device and Import PATCH new fleet entries. `credentials` has the
+  username, the password when typed and the private key file picked, as one
+  `key` entry named by the file name; the file is read in the browser, and
+  one with a passphrase is refused, since the adapters take none. With an
+  address the entry gets an `address` named `oob` and needs a password or a
+  key; without one it is a mock. CLI over SSH adds `extra-adapter`
+  `iosxe-cli`, with the port typed; Import adds it only to the lines with
+  an address, as the CLI of a mock never connects.
 - A device binds to a schedule with the `schedule` leaf on its fleet
   entry. Binding merges, so one PATCH binds any number of devices (1000
   in about a second). Unbinding PUTs each entry back without the leaf,

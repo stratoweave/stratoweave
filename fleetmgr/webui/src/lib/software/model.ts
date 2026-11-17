@@ -59,7 +59,9 @@ export interface DeviceJson {
   'redundancy-priority'?: number;
   'approval-required'?: boolean;
   address?: AddressJson[];
-  credentials?: { username?: string; password?: string };
+  credentials?: { username?: string; password?: string; key?: { key: string; 'private-key'?: string }[] };
+  /** Adapters beside the one of the device type, such as iosxe-cli. */
+  'extra-adapter'?: { type: string; port?: number }[];
   mock?: { enabled?: boolean };
   state?: {
     platform?: { version?: string; model?: string; 'serial-number'?: string };

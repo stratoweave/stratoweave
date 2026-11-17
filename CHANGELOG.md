@@ -677,6 +677,10 @@
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for
   all its devices. [#726]
+- The web UI's add and import device forms take a private key file, and a
+  CLI over SSH box that gives the device the `iosxe-cli` extra adapter, on
+  port 22 or the port typed. A device with an address needs a password or a
+  key. Import gives the CLI only to the devices with an address.
 - The web UI works on narrow screens and has better contrast and
   accessibility. The campaign page leads with live progress and failures.
   [#679]
