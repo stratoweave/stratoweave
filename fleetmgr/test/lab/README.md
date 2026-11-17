@@ -61,8 +61,9 @@ Then:
 
 A campaign shows each CE's upgrade stage, why a failed run stopped, and its
 pre-check and post-check verdicts in `just state`.
-The detail carries what the check saw, "1/1 sessions established, 3 routes
-advertised"; the device is only read while a check runs.
+The detail carries what each check saw, "bgp: 1/1 sessions established, 3
+routes advertised; interfaces: 4 interfaces up/up; ospf: no OSPF
+neighbors"; the device is only read while a check runs.
 `just break-link ce1` takes ce1's WAN down and the session drops within
 15 s, so a campaign started now is refused by the pre-check, with the
 neighbor in the detail; `just heal-link ce1` brings it back.
@@ -102,8 +103,8 @@ is back at the pre-check's baseline before the commit goes out.
 `just load-big` generates what `just demo-big` would start with and loads it
 into the top `just run` started: a thousand mocks, `cpe-0001` onwards, over
 the same ten flotillas, with 120 to 150 s upgrades and a tenth of them
-failing one of the seven ways, picked by a fixed shuffle so the grids show no
-pattern, plus the three regional schedules and the planned campaign
+failing one of the mock's nine ways, picked by a fixed shuffle so the grids
+show no pattern, plus the three regional schedules and the planned campaign
 `fleet-upgrade`. Europe's window opens half a minute after the load;
 americas and asia keep their local midnight. `BIG` changes the count. `just
 load-ces` adds a campaign over the three CEs alone, named like its schedule,

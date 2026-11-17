@@ -121,8 +121,8 @@ device itself. A check added during a run counts from the next run.
 `remove_precheck` and `remove_postcheck` take a check out, also during a run.
 An answer that arrives after its round has ended is ignored.
 
-The BGP device-health check in `fleetmgr/src/flotilla/rfs.act` is a working
-example.
+The device-health checks in `fleetmgr/src/flotilla/rfs.act`, `bgp`,
+`interfaces` and `ospf`, are working examples.
 
 ## State
 
@@ -274,8 +274,9 @@ The YANG for these RPCs and oper nodes is a trimmed copy in
 
 `IosXeSoftwareMock` in `src/adapters/software_iosxe_mock.act` runs behind the
 in-process NETCONF mock server. Like a real device, it answers an RPC before
-the work is done. It also serves one BGP neighbor for checks to read. A mock
-device sets these leaves under `mock/software`:
+the work is done. It also serves one BGP neighbor, seven interfaces and two
+OSPF neighbors for checks to read. A mock device sets these leaves under
+`mock/software`:
 
 | Leaf | Meaning |
 | --- | --- |
@@ -299,4 +300,6 @@ all. An abort takes 240 s.
 | `reverts` | The timer ran out before the commit | `failed` |
 | `bgp-down` | BGP is down from the start, so a BGP pre-check refuses | `failed` |
 | `bgp-lost` | BGP is down on the new release, so a BGP post-check refuses | `rolled-back` |
+| `interface-lost` | GigabitEthernet0/0/1 and Virtual-Access2 have their line protocol down on the new release, so an interface post-check refuses | `rolled-back` |
+| `ospf-lost` | The OSPF neighbor 10.255.0.3 is stuck in init on the new release, so an OSPF post-check refuses | `rolled-back` |
 
