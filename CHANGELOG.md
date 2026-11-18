@@ -230,6 +230,11 @@
   arriving. The NETCONF adapter subscribed to them on the RFC 5277 `NETCONF`
   stream, which the device accepts but sends nothing on. It now subscribes to
   them on `yang-notif-native`, as it does for the `-events` modules. [#782]
+- The device setting `telemetry` selects how the adapter receives the data
+  of subscriptions: `push` (YANG-push) or `poll`. With `poll`, the NETCONF
+  adapter reads with periodic `<get>` and receives event notifications
+  through RFC 5277. Without the setting, ArcOS devices are polled: ArcOS
+  refuses every other RPC on a session that holds a subscription.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with

@@ -39,6 +39,7 @@ MODULE_YANG_PUSH = "ietf-yang-push"
 MODULE_SUBSCRIBED_NOTIFICATIONS = "ietf-subscribed-notifications"
 MODULE_EVENT_NOTIFICATIONS = "ietf-event-notifications"
 MODULE_PREFIX_IOSXR = "Cisco-IOS-XR-"
+MODULE_PREFIX_ARCOS = "arcos-"
 NS_NC_1_0 = "urn:ietf:params:xml:ns:netconf:base:1.0"
 # Seconds before connecting again after an SSH failure that only a change on
 # the device or in its settings fixes: refused credentials, an untrusted host
@@ -74,15 +75,32 @@ def _is_iosxr(modules: dict[str, ModCap]) -> bool:
     return False
 
 
-def _yang_push_event_notifs(modules: dict[str, ModCap]) -> ?bool:
-    """Return the YANG Push RPC dialect, or None when dynamic YANG Push is absent.
+def _is_arcos(modules: dict[str, ModCap]) -> bool:
+    for name in modules.keys():
+        if name.startswith(MODULE_PREFIX_ARCOS):
+            return True
+    return False
+
+
+def _yang_push_event_notifs(modules: dict[str, ModCap], telemetry: ?str) -> ?bool:
+    """Return the YANG Push RPC dialect, or None to poll.
 
     False means the standard RFC 8639/8641 combination: ietf-yang-push over
     ietf-subscribed-notifications. True means IOS XE's non-standard
     ietf-yang-push over ietf-event-notifications shape.
+
+    telemetry is the telemetry setting of the device. poll polls. None
+    polls IOS XR and ArcOS.
     """
-    if _is_iosxr(modules):
+    if telemetry is not None:
+        if telemetry == "poll":
+            return None
+    elif _is_iosxr(modules):
         # TODO: IOS XRd advertises the YANG Push modules but it only works over UDP-Notif (WIP)
+        return None
+    elif _is_arcos(modules):
+        # ArcOS refuses every other RPC on a session that holds a
+        # subscription, a second subscription included.
         return None
     if MODULE_YANG_PUSH not in modules:
         return None
@@ -94,18 +112,29 @@ def _yang_push_event_notifs(modules: dict[str, ModCap]) -> ?bool:
 
 
 def _test_yang_push_dialect():
-    # Advertised module names, and the dialect they resolve to. None means no
-    # dynamic YANG Push, so the device is driven by polling instead.
-    cases: list[(list[str], ?bool)] = [
-        ([MODULE_YANG_PUSH, MODULE_SUBSCRIBED_NOTIFICATIONS, MODULE_EVENT_NOTIFICATIONS], False),
-        ([MODULE_YANG_PUSH, MODULE_EVENT_NOTIFICATIONS], True),
-        ([MODULE_YANG_PUSH], None),
-        ([MODULE_YANG_PUSH, MODULE_SUBSCRIBED_NOTIFICATIONS, "Cisco-IOS-XR-um-hostname-cfg"], None),
-        ([MODULE_YANG_PUSH, MODULE_EVENT_NOTIFICATIONS, "Cisco-IOS-XE-native"], True),
+    # Advertised module names and the telemetry setting, and the dialect they
+    # resolve to. None means no dynamic YANG Push, so the device is driven by
+    # polling instead.
+    standard = [MODULE_YANG_PUSH, MODULE_SUBSCRIBED_NOTIFICATIONS]
+    arcos = standard + ["arcos-openconfig-system-augments"]
+    iosxr = standard + ["Cisco-IOS-XR-um-hostname-cfg"]
+    cases: list[(list[str], ?str, ?bool)] = [
+        (standard + [MODULE_EVENT_NOTIFICATIONS], None, False),
+        ([MODULE_YANG_PUSH, MODULE_EVENT_NOTIFICATIONS], None, True),
+        ([MODULE_YANG_PUSH], None, None),
+        (iosxr, None, None),
+        ([MODULE_YANG_PUSH, MODULE_EVENT_NOTIFICATIONS, "Cisco-IOS-XE-native"], None, True),
+        (arcos, None, None),
+        (standard, "poll", None),
+        ([MODULE_YANG_PUSH, MODULE_EVENT_NOTIFICATIONS], "poll", None),
+        (standard, "push", False),
+        (arcos, "push", False),
+        (iosxr, "push", False),
+        ([MODULE_YANG_PUSH], "push", None),
     ]
-    for names, want in cases:
+    for names, telemetry, want in cases:
         modules = {name: ModCap(name, "") for name in names}
-        testing.assertEqual(_yang_push_event_notifs(modules), want, "modules: {names}")
+        testing.assertEqual(_yang_push_event_notifs(modules, telemetry), want, "modules: {names}, telemetry: {telemetry}")
 
 
 def _xe_native_event_module(module: str) -> bool:
@@ -992,7 +1021,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
             # Pick the monitoring method from the device's modules. A fresh
             # client session invalidates any prior device-side subscriptions, so
             # drop the stale id maps and (re-)establish for this connection.
-            yp_event_notifs = _yang_push_event_notifs(new_modset)
+            yp_event_notifs = _yang_push_event_notifs(new_modset, dmc.telemetry)
             _yang_push = yp_event_notifs is not None
             _yp_event_notifs = False
             if yp_event_notifs is not None:
@@ -1195,13 +1224,14 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         con_log_level = logging.TRACE if new_dmc.debug.connection else logging.WARNING
         _con_log_handler.set_output_level(con_log_level)
 
-        # Reconnect only when session parameters / feature-flags change
+        # Reconnect only when session parameters, feature-flags or telemetry change
         ns = "http://stratoweave.org/yang/stratoweave-rfs"
         if not (old_g.get_opt_cnt(ygdata.Id(ns, "credentials")) == new_g.get_opt_cnt(ygdata.Id(ns, "credentials"))
                 and old_g.get_opt_list(ygdata.Id(ns, "address")) == new_g.get_opt_list(ygdata.Id(ns, "address"))
                 and old_g.get_opt_cnt(ygdata.Id(ns, "mock")) == new_g.get_opt_cnt(ygdata.Id(ns, "mock"))
                 and old_g.get_opt_cnt(ygdata.Id(ns, "ssh")) == new_g.get_opt_cnt(ygdata.Id(ns, "ssh"))
-                and old_g.get_opt_cnt(ygdata.Id(ns, "feature-flags")) == new_g.get_opt_cnt(ygdata.Id(ns, "feature-flags"))):
+                and old_g.get_opt_cnt(ygdata.Id(ns, "feature-flags")) == new_g.get_opt_cnt(ygdata.Id(ns, "feature-flags"))
+                and old_g.get_opt_leaf(ygdata.Id(ns, "telemetry")) == new_g.get_opt_leaf(ygdata.Id(ns, "telemetry"))):
             _log.debug("Device.set_dmc: reconnect required, reconnecting")
             # Through close() so the dedicated notification sessions are torn
             # down too: they hold the old endpoint/credentials (and in mock
