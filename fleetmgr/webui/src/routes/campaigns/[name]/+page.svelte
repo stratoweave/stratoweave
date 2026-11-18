@@ -258,11 +258,12 @@
     if (c.adminState === 'plan') {
       const head = c.runSince === null ? 'Planned' : 'Paused';
       const plan = c.plan;
-      if (plan !== null && (plan.windows.length > 0 || plan.unplaced.length > 0)) {
-        const placed = c.devices.length - plan.unplaced.length;
+      if (plan !== null && (plan.windows.length > 0 || plan.unplaced.length > 0 || plan.done.length > 0)) {
+        const placed = c.devices.length - plan.unplaced.length - plan.done.length;
         const windows = `${plan.windows.length} window${plan.windows.length === 1 ? '' : 's'}`;
         const missing = plan.unplaced.length > 0 ? `, ${plan.unplaced.length} in no window yet` : '';
-        return `${head} — ${placed} of ${c.devices.length} placed in ${windows}${missing}.`;
+        const done = plan.done.length > 0 ? `, ${plan.done.length} already done` : '';
+        return `${head} — ${placed} of ${c.devices.length} placed in ${windows}${missing}${done}.`;
       }
       return `${head}.`;
     }
@@ -300,7 +301,7 @@
     if (!c || !confirmAction) return '';
     if (confirmAction === 'run') {
       const unplaced = c.plan?.unplaced.length ?? 0;
-      const skip = new Set([...(c.plan?.unplaced ?? []), ...onTarget]);
+      const skip = new Set([...(c.plan?.unplaced ?? []), ...(c.plan?.done ?? []), ...onTarget]);
       const placed = c.devices.filter((d) => !skip.has(d)).length;
       const first = c.plan?.windows.find((w) => w.end === null || w.end > Date.now() / 1000);
       const opens =
@@ -489,7 +490,7 @@
     </section>
   {/if}
 
-  {#if campaign.plan !== null && (campaign.plan.windows.length > 0 || campaign.plan.alarms.length > 0 || campaign.plan.unplaced.length > 0)}
+  {#if campaign.plan !== null && (campaign.plan.windows.length > 0 || campaign.plan.alarms.length > 0 || campaign.plan.unplaced.length > 0 || campaign.plan.done.length > 0)}
     {@const plan = campaign.plan}
     <section class="card">
       <div class="grids-head">

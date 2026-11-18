@@ -15,6 +15,7 @@
   import { setDeviceSchedule } from '#lib/maintenance/binding.ts';
   import {
     STEP_LABEL,
+    isFinalStatus,
     type CheckResult,
     type DeviceCampaign,
     type DeviceStatusRow,
@@ -101,10 +102,11 @@
 
   /** This device's start in the plan, real once released, else the
    * planner's estimate; "no window yet" when the plan has the campaign but
-   * no window for it. */
+   * no window for it, unless its status is final and it needs none. */
   function plannedStart(campaign: DeviceCampaign): string {
     if (campaign.start === null) return '—';
-    return campaign.start === 'unplaced' ? 'no window yet' : formatClock(campaign.start);
+    if (campaign.start === 'unplaced') return isFinalStatus(campaign.row.status) ? '—' : 'no window yet';
+    return formatClock(campaign.start);
   }
 
   /** The checks of the last run that have a verdict. */

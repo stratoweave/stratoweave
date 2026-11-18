@@ -272,6 +272,19 @@ export const KNOWN_STATUSES = [
 ] as const;
 export type KnownStatus = (typeof KNOWN_STATUSES)[number];
 
+/** True for a status that ends an upgrade attempt, as the campaign takes
+ * it: a member with one needs no window. not-started counts as a failed
+ * rollback. */
+export function isFinalStatus(status: KnownStatus): boolean {
+  return (
+    status === 'succeeded' ||
+    status === 'up-to-date' ||
+    status === 'failed' ||
+    status === 'rolled-back' ||
+    status === 'not-started'
+  );
+}
+
 function normalizeStatus(raw: unknown): KnownStatus {
   return typeof raw === 'string' && (KNOWN_STATUSES as readonly string[]).includes(raw)
     ? (raw as KnownStatus)
@@ -501,10 +514,14 @@ export interface PlanWindow {
  * Members in no window are not actuated. */
 export interface CampaignPlan {
   windows: PlanWindow[];
-  /** The planner's alarms, which also name the members in no window. */
+  /** The planner's alarms, which also name the members that need a window
+   * and have none (unplaced). */
   alarms: string[];
   /** The members in no window yet, by name. */
   unplaced: string[];
+  /** Members in no window because their status is final before their
+   * release: up to date, or done in an earlier run. They need no window. */
+  done: string[];
 }
 
 export interface Campaign {
@@ -694,6 +711,11 @@ function parseStateParts(state: CampaignStateJson): StateParts {
 export function joinState(parts: StateParts | null, members: string[]): CampaignState {
   const memberSet = new Set(members);
   const extra = parts === null ? [] : [...parts.rows.keys()].filter((device) => !memberSet.has(device));
+  const done = (m: string) => {
+    const row = parts?.rows.get(m);
+    return row !== undefined && isFinalStatus(row.status);
+  };
+  const byName = (a: string, b: string) => a.localeCompare(b);
   return {
     counters: parts?.counters ?? null,
     runSince: parts?.runSince ?? null,
@@ -703,7 +725,8 @@ export function joinState(parts: StateParts | null, members: string[]): Campaign
         : {
             windows: parts.windows,
             alarms: parts.alarms,
-            unplaced: members.filter((m) => !parts.placed.has(m)).sort((a, b) => a.localeCompare(b))
+            unplaced: members.filter((m) => !parts.placed.has(m) && !done(m)).sort(byName),
+            done: members.filter((m) => !parts.placed.has(m) && done(m)).sort(byName)
           },
     deviceStatus: [...members, ...extra].map((device) => parts?.rows.get(device) ?? parseRow({ device }))
   };
