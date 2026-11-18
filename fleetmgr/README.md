@@ -69,7 +69,7 @@ by default or `just demo-fleet 1000` for more: `cpe-0001` onwards, spread
 over the flotillas by name hash, with quick eight-second installs, three
 regional schedules, europe, americas and asia, whose one-hour windows open
 half a minute, a minute and a half and two and a half minutes after the top
-starts, and `fleet-upgrade`, a planned campaign over all of them. Every
+starts, and `fleet-upgrade`, a planned campaign over four fifths of them. Every
 thirtieth device and the next form a redundancy group, `site-0001` and on,
 and `cpe-0003` to `cpe-0005` form `hub`, which packs with a minute between
 upgrades and starts with `cpe-0005`. The
