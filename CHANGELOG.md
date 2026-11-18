@@ -778,6 +778,14 @@
   what the device does. The web UI shows it for each device of a campaign
   and on the device page, with a bar for the transfer of the prepare.
   [#803]
+- `just demo` generates its fleet like `just demo-fleet`: a hundred devices
+  of five models, most on 17.15.04, some older and a few already on
+  17.18.03a, and a campaign over 80 of them whose windows open within three
+  minutes. The other 20 are left to pick for a new campaign. The demo
+  images are four families in three releases, each family in its own
+  folder, with an empty sparse file for each in `out/images`. `demo.xml`,
+  `demo-campaign.xml`, `upgrade.xml`, `just upgrade` and `just
+  upgrade-and-watch` are gone.
 
 ### Dependencies
 
