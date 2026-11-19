@@ -149,7 +149,7 @@ def make_netconf_mock_dmc(name: str, sync_check: bool=True, telemetry: ?str=None
         mock=Mock(enabled=True)
     )
 
-def new_netconf_mock_device_mgr(t: testing.EnvT, name: str, on_reconf: action(str) -> None, extra_models: list[str]=[], sync_check: bool=True) -> swdev.DeviceMgr:
+def new_netconf_mock_device_mgr(t: testing.EnvT, name: str, on_reconf: action(str) -> None, extra_models: list[str]=[], sync_check: bool=True, telemetry: ?str=None) -> swdev.DeviceMgr:
     schema = yang.compile([IETF_SYSTEM_YANG] + extra_models)
     dev_types = {
         "netconf": swdev.DeviceType(
@@ -161,8 +161,12 @@ def new_netconf_mock_device_mgr(t: testing.EnvT, name: str, on_reconf: action(st
 
     schema_registry = swdev.SchemaRegistry()
     dev = swdev.DeviceMgr(dev_types, t.env, name, t.log_handler, on_reconf, schema_registry)
-    dev.set_dmc(make_netconf_mock_dmc(name, sync_check=sync_check))
+    dev.set_dmc(make_netconf_mock_dmc(name, sync_check=sync_check, telemetry=telemetry))
     return dev
+
+def _is_get(rpc: str) -> bool:
+    """Return True if rpc, as the mock server records it, is a get."""
+    return rpc.startswith("<get>") or rpc.startswith("<get ") or rpc.startswith("<get/")
 
 #################################################################################
 ## Tests
@@ -1325,7 +1329,8 @@ actor _test_subscribe_telemetry_setting(t: testing.EnvT):
     """The telemetry setting selects how a periodic subscription reads a
     device that advertises ietf-yang-push. Without the setting the adapter
     uses YANG-push. With the setting poll, the adapter connects again and
-    polls with get."""
+    polls with get. The subscription is declared after the device connected,
+    so only the reconnect can start the polling."""
     name = "dev-telemetry-setting"
     var done = False
     var switched = False
@@ -1359,6 +1364,12 @@ actor _test_subscribe_telemetry_setting(t: testing.EnvT):
             t.success()
 
     def start():
+        if done:
+            return
+        modules, modset_id = dev.get_modules()
+        if modset_id is None:
+            after now 0.01: start()
+            return
         adapter = dev.get_adapter()
         if isinstance(adapter, swna.NetconfAdapter):
             ms = adapter.get_mock_server()
@@ -1371,9 +1382,101 @@ actor _test_subscribe_telemetry_setting(t: testing.EnvT):
         else:
             fail("Expected NetconfAdapter from DeviceMgr")
 
+    def timeout():
+        fail("Timed out waiting for polling after telemetry was set to poll (switched={switched})")
+
     start()
 
-    after 3.0: fail("Timed out waiting for polling after telemetry was set to poll (switched={switched})")
+    after now 2.5: timeout()
+
+
+actor _test_subscribe_telemetry_setting_push(t: testing.EnvT):
+    """A device that the adapter polls because of the telemetry setting poll
+    stops being polled when the setting changes to push. After the reconnect
+    YANG-push delivers the subscription, and the adapter sends no get."""
+    name = "dev-telemetry-push"
+    var done = False
+    var switched = False
+    var pushed = 0
+    var mock_server: ?swna.NetconfMockServer = None
+
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, name, noop_on_reconf, extra_models=YP_CLOSURE, telemetry="poll")
+
+    def fail(msg: str):
+        if done:
+            return
+        done = True
+        t.failure(ValueError(msg))
+
+    def check_no_get():
+        ms = mock_server
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        for rpc in ms!.get_rpc_history():
+            if _is_get(rpc):
+                fail("Expected no get after telemetry was set to push, got {rpc}")
+                return
+        done = True
+        dev.remove_subscriptions("test-telemetry-push")
+        t.success()
+
+    def on_update(n: ?ygdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail("Subscription update error: {err}")
+            return
+        method = dev.subscription_status().method
+        if not switched:
+            if method != swadapt.SUBSCRIPTION_POLL:
+                fail("Expected poll with the setting poll, got {method}")
+                return
+            switched = True
+            dev.set_dmc(make_netconf_mock_dmc(name, telemetry="push"))
+            return
+        if method != swadapt.SUBSCRIPTION_YANG_PUSH:
+            return
+        pushed += 1
+        # A get sent before the reconnect can still answer the first updates.
+        # Record the RPCs from the second update on.
+        if pushed == 2:
+            adapter = dev.get_adapter()
+            if isinstance(adapter, swna.NetconfAdapter):
+                ms = adapter.get_mock_server()
+                if ms is not None:
+                    mock_server = ms
+                    ms.clear_rpc_history()
+        elif pushed == 6:
+            check_no_get()
+
+    def start():
+        if done:
+            return
+        modules, modset_id = dev.get_modules()
+        if modset_id is None:
+            after now 0.01: start()
+            return
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            ms = adapter.get_mock_server()
+            if ms is not None:
+                ms.set_oper_ds(_mock_oper_ds("2026-02-21T10:11:12Z", "2025-12-31T00:00:00Z"))
+                want = set([ygdata.SubscriptionSpec(None, period=0.05)])
+                dev.declare_subscriptions("test-telemetry-push", on_update, want)
+            else:
+                fail("Expected NetconfMockServer from NetconfAdapter")
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    def timeout():
+        fail("Timed out waiting for yang-push after telemetry was set to push (switched={switched}, pushed={pushed})")
+
+    start()
+
+    after now 2.5: timeout()
 
 
 actor _test_subscribe_periodic_yang_push_empty(t: testing.EnvT):
