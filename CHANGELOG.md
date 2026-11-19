@@ -778,6 +778,14 @@
   what the device does. The web UI shows it for each device of a campaign
   and on the device page, with a bar for the transfer of the prepare.
   [#803]
+- `just demo` generates its fleet like `just demo-fleet`: a hundred devices
+  of five models, most on 17.15.04, some older and a few already on
+  17.18.03a, and a campaign over 80 of them whose windows open within three
+  minutes. The other 20 are left to pick for a new campaign. The demo
+  images are four families in three releases, each family in its own
+  folder, with an empty sparse file for each in `out/images`. `demo.xml`,
+  `demo-campaign.xml`, `upgrade.xml`, `just upgrade` and `just
+  upgrade-and-watch` are gone.
 
 ### Dependencies
 
@@ -846,6 +854,11 @@
 - `yang.restconf.resolve_fields()` parses a RESTCONF `fields` value against
   the schema below the target resource, and `select_fields()` narrows data
   to the result. [acton-yang#561] [#805]
+- Fixed subtree filters dropping a list entry when one of its selection
+  nodes selected nothing. A fleet device in no campaign has no software
+  state on its flotilla, so the top's subscription got nothing and the
+  device showed no platform or connection. A content match node that
+  matches is now in the output too. [acton-yang#563] [#822]
 
 #### acton-ssh
 - Fixed SSH events being delivered out of the order libssh raises them.
@@ -1079,6 +1092,7 @@ next. Give it a spin. We’d love to hear what you think.
 [#805]: https://github.com/stratoweave/stratoweave/pull/805
 [#811]: https://github.com/stratoweave/stratoweave/pull/811
 [#814]: https://github.com/stratoweave/stratoweave/pull/814
+[#822]: https://github.com/stratoweave/stratoweave/pull/822
 [acton#2768]: https://github.com/actonlang/acton/pull/2768
 [acton#3211]: https://github.com/actonlang/acton/pull/3211
 [acton#3390]: https://github.com/actonlang/acton/pull/3390
@@ -1108,3 +1122,4 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-yang#558]: https://github.com/stratoweave/acton-yang/pull/558
 [acton-yang#560]: https://github.com/stratoweave/acton-yang/pull/560
 [acton-yang#561]: https://github.com/stratoweave/acton-yang/pull/561
+[acton-yang#563]: https://github.com/stratoweave/acton-yang/pull/563

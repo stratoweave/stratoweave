@@ -46,30 +46,37 @@ Start the top:
     just demo
 
 The top starts ten `flotilla` subprocesses and waits for every NETCONF listener
-before starting its own runtime. The demo has 102 complete mock IOS XE
-entries, `cpe-001` to `cpe-102`, six to fourteen on each flotilla. Every
-device takes 120 to 150 s to upgrade, eighteen of them, picked at random
-when the file was generated so the grids show no pattern, fail in one of
-the mock's nine ways, two per kind, and `cpe-003` already runs the
-target. `demo-campaign.xml` adds `xe-upgrade-fleet`, a planned
-campaign over the 99 devices `upgrade.xml` does not use, bound to a
-`nightly` schedule with a one-hour window at midnight UTC, so the web UI
-has a plan to show. When the demo starts, each of its members reads the
-release it runs, and the campaign holds every install until it is set to
-`run` and its window opens. `demo-images.xml` fills the image list with test IOS XE
-images; `just demo-fleet` loads it too. Both demos keep image files
-uploaded in the web UI in `out/images`. The processes use these ports:
+before starting its own runtime. `just demo` generates a hundred mock IOS XE
+devices, `cpe-0001` to `cpe-0100`, five router models in four families, and
+`fleet-upgrade`, a planned campaign over 80 of them to 17.18.03a. The other
+20 are in no campaign, to pick for a new one in the web UI. Most devices run
+17.15.04, the release before the target, 15 run an older 17.12.03 and 5
+already run 17.18.03a. Every device takes 120 to 150 s to upgrade, and ten of
+them, picked by a fixed shuffle so the grids show no pattern, fail in one of
+the mock's nine ways. The campaign's regional windows open within three
+minutes of the start, so it is ready to run: each member reads the release
+it runs, and the campaign holds every install until it is set to `run` and
+its window opens.
+`demo-images.xml` fills the image list with test IOS XE images, the four
+families in three releases, each family in its own folder, `c1100`,
+`isr4300`, `c8000be` and `c8000v`, with 17.18.03a the default. The demo
+makes an empty file for each in `out/images`, sparse so it takes no disk,
+and keeps image files uploaded in the web UI there too. The processes use
+these ports:
 
     process          HTTP          NETCONF
     fleetmgr         18200         12900
     flotilla-1..10   18201..18210  12901..12910
 
-`just demo-fleet` is the same demo with a generated fleet, a hundred devices
-by default or `just demo-fleet 1000` for more: `cpe-0001` onwards, spread
-over the flotillas by name hash, with quick eight-second installs, three
-regional schedules, europe, americas and asia, whose one-hour windows open
-half a minute, a minute and a half and two and a half minutes after the top
-starts, and `fleet-upgrade`, a planned campaign over all of them. Every
+`just demo` is `just demo-fleet 100 8 16 10 120-150 3600 all`, and `just
+demo-fleet 100 8 16 10` the same with eight-second installs, for a quick
+run. `just demo-fleet` takes the knobs, a hundred devices by default or
+`just demo-fleet 1000` for more: `cpe-0001`
+onwards, spread over the flotillas by name hash, with quick eight-second
+installs, three regional schedules, europe, americas and asia, whose
+one-hour windows open half a minute, a minute and a half and two and a half
+minutes after the top starts, and `fleet-upgrade`, a planned campaign over
+four fifths of them. Every
 thirtieth device and the next form a redundancy group, `site-0001` and on,
 and `cpe-0003` to `cpe-0005` form `hub`, which packs with a minute between
 upgrades and starts with `cpe-0005`. The
@@ -78,7 +85,7 @@ devices upgrading at once, the failing share in percent, the install
 duration in seconds or a range, the window length in seconds, and which
 schedules open soon rather than at their local midnight. `just demo-big`
 is `just demo-fleet 1000 10 20 10 120-150 14400 europe`: a thousand
-devices with `demo.xml`'s knobs, 120 to 150 s installs and a tenth failing
+devices with `just demo`'s knobs, 120 to 150 s installs and a tenth failing
 one of the mock's nine ways, picked by a fixed shuffle so the grids show no
 pattern, in four-hour windows with ten devices at once, where only europe
 opens right away and americas and asia wait for their midnight, as a real
@@ -114,14 +121,15 @@ Virtual-Access1 and Virtual-Access2, and two full OSPF neighbors on
 GigabitEthernet0/0/0, 10.255.0.2 and 10.255.0.3. `mock/platform` takes
 `version`, the release the device runs before any upgrade, 17.18.02 when
 absent, and `model` and `serial-number`, the chassis the device reports,
-C8000V and 9ABCDEFGHIJ when absent; the demo devices report ten IOS XE
-models in a rough field mix, each with its own serial number. In the demo
-eighteen devices each reproduce one of the nine failures: `cpe-034` fails
-its commit, so the campaign aborts it and it ends `rolled-back`, while
-`cpe-007` fails its download and ends `failed`. `cpe-039` refuses on its
-pre-check, and `cpe-016`, `cpe-061` and `cpe-068` roll back on their
-post-checks, which miss a BGP session, an interface and an OSPF neighbor.
-`cpe-003` already runs the target and ends `up-to-date`.
+C8000V and 9ABCDEFGHIJ when absent; the demo devices report five IOS XE
+models in a rough field mix, each with its own serial number. In `just
+demo` ten devices each reproduce one of the nine failures, named in their
+description: `cpe-0036` fails its commit, so the campaign aborts it and it
+ends `rolled-back`, while `cpe-0035` fails its download and ends `failed`.
+`cpe-0010` refuses on its pre-check, and `cpe-0099`, `cpe-0009` and
+`cpe-0032` roll back on their post-checks, which miss a BGP session, an
+interface and an OSPF neighbor. `cpe-0017` and `cpe-0031` already run the
+target and end `up-to-date`.
 The leaves are read when the device is created; change them by deleting and
 re-creating the device.
 
@@ -134,23 +142,11 @@ Inspect the top CFS and the bottom RFS independently:
       http://127.0.0.1:18201/restconf/data
 
 The second response should contain the `stratoweave-rfs:device` entries the
-top placed on `flotilla-1` and rendered there, nine in the demo.
+top placed on `flotilla-1` and rendered there, twelve in the demo.
 
-Run the three-device IOS XE campaign over `cpe-001`, `cpe-003` and `cpe-007`
-and follow its state from the top:
+Follow a campaign's state from the top, `fleet-upgrade` unless named:
 
-    just upgrade-and-watch
-
-The watcher starts before the intent is submitted and stops when every device
-has settled, after about three minutes: the controller releases the two
-devices that need work one after the other, so `cpe-001` ends `succeeded`
-with `version` `17.18.3a` first, `cpe-003` is `up-to-date` at once,
-and `cpe-007` ends `failed` last.
-
-The submission and observation steps are also available separately:
-
-    just watch-campaign       # run first in one terminal
-    just upgrade              # submit upgrade.xml from another terminal
+    just watch-campaign       # print each change until every device settled
     just campaign-status      # print one current snapshot
 
 Set `FLEETMGR_API` to point these targets at a top node on another address.
