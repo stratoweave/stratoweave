@@ -2442,6 +2442,52 @@ def _test_a_member_up_to_date_in_a_redundancy_group_counts_from_its_answer():
                 ends.append((step.0 + 600, n))
 
 
+def _test_a_member_done_without_a_release_counts_from_its_last_boot():
+    """u and b pack in a group with a min-separation of 300 s, one at a
+    time, in a window that never closes, and u answers at 1000 without an
+    upgrade in the run. Without its last boot, an up-to-date u is done at
+    its answer, and b starts 300 s later, at 1300. When its device tells
+    when it last booted, u is done then: b starts at once after a boot at 100, and at 1200 after a boot
+    at 900. A new boot at 1100, after the answer, holds b to 1400. When the
+    boot at 100 comes at 1050, while b waits for 1300, b starts at 1050.
+    Done in an earlier run, u is done at its boot too. A failure still
+    holds the group when the group holds on one."""
+    # (case, u's answer at 1000, its last boots as (when it comes, the
+    # boot), the start of b in the plan at the first decision, -1 for none,
+    # and the devices that start at each decision); a case that ends in
+    # "hold" holds the group on a failure
+    cases: list[(str, str, list[(int, int)], int, list[(int, list[str])])] = [
+        ("no boot", "up-to-date", [], 1300, [(1000, []), (1300, ["b"])]),
+        ("booted long ago", "up-to-date", [(1000, 100)], 1000, [(1000, ["b"])]),
+        ("booted just before", "up-to-date", [(1000, 900)], 1200, [(1000, []), (1200, ["b"])]),
+        ("booted again after the answer", "up-to-date", [(1000, 900), (1100, 1100)], 1200,
+         [(1000, []), (1100, []), (1200, []), (1400, ["b"])]),
+        ("the boot comes later", "up-to-date", [(1050, 100)], 1300,
+         [(1000, []), (1050, ["b"])]),
+        ("succeeded before", "succeeded", [(1000, 100)], 1000, [(1000, ["b"])]),
+        ("failed, hold", "failed", [(1000, 100)], -1, [(1000, []), (1300, [])]),
+    ]
+    devs = [("u", 600, "w"), ("b", 600, "w")]
+    for case in cases:
+        label = case.0
+        hold = hold_all() if label.endswith("hold") else set()
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["u", "b"]},
+                       priority={"u": 1, "b": 2}, separation={"g": (False, 300)},
+                       hold_failed=hold)
+        first = True
+        for step in case.4:
+            for boot in case.2:
+                if boot.0 == step.0:
+                    c.report_last_boot("u", boot.1)
+            if first:
+                c.report("u", case.1, 1000)
+            s = c.decide(step.0)
+            if first:
+                testing.assertEqual(s.plan.starts.get_def("b", (-1, -1)).1, case.3, label)
+                first = False
+            testing.assertEqual(s.started, step.1, "{label} at {step.0}")
+
+
 def _test_a_member_that_ran_before_a_pause_keeps_its_min_separation():
     """a and b pack in a group with a min-separation of 1 h, one at a time,
     in a window that never closes. a succeeds at 600, and the run stops
@@ -2471,6 +2517,42 @@ def _test_a_member_that_ran_before_a_pause_keeps_its_min_separation():
         if len(case.2) == 0:
             testing.assertEqual(s.plan.starts.get_def("b", (-1, -1)).1, case.3, case.0)
             testing.assertEqual(c.decide(case.3).started, ["b"], case.0)
+
+
+def _test_a_member_that_ran_before_a_pause_counts_from_a_later_boot():
+    """a and b pack in a group with a min-separation of 1 h, one at a time,
+    in a window that never closes. a succeeds at 600, and the run stops
+    and starts again at 800, as a pause does, and a reports succeeded
+    again, as the campaign gives it then. The run saw a's upgrade end, so
+    a stays done at 600 when its device booted in the upgrade, at 300, or
+    does not tell: b starts at 4200. A boot at 700, after the upgrade,
+    comes later: b starts at 4300. The plan of a copy that starts a run
+    says the same."""
+    devs = [("a", 600, "w"), ("b", 600, "w")]
+    # (case, a's last boot, or None, the start of b)
+    cases: list[(str, ?int, int)] = [
+        ("no boot", None, 4200),
+        ("booted in the upgrade", 300, 4200),
+        ("booted after the upgrade", 700, 4300),
+    ]
+    for case in cases:
+        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["a", "b"]},
+                       priority={"a": 1, "b": 2}, separation={"g": (False, HOUR)})
+        testing.assertEqual(c.decide(0).started, ["a"], case.0)
+        c.report("a", "succeeded", 600)
+        c.report_last_boot("a", case.1)
+        c.stop()
+        shown = c.copy()
+        shown.start()
+        shown.report("a", "succeeded", 800)
+        p = shown.plan(800)
+        c.start()
+        c.report("a", "succeeded", 800)
+        s = c.decide(800)
+        testing.assertEqual(s.started, [], case.0)
+        testing.assertEqual(p.starts.get_def("b", (-1, -1)).1, case.2, case.0)
+        testing.assertEqual(s.plan.starts.get_def("b", (-1, -1)).1, case.2, case.0)
+        testing.assertEqual(c.decide(case.2).started, ["b"], case.0)
 
 
 def _test_a_success_after_a_failure_keeps_its_time_through_a_pause():
@@ -3280,20 +3362,24 @@ def chains() -> (dict[str, list[str]], dict[str, int], dict[str, (bool, int)]):
 def _test_the_plan_is_the_run_with_members_up_to_date():
     """24 devices of 600 s in a 1 h window every day, two at a time and at
     most four, d0 to d5 in two spread chains. d1, d3, d10 and d17 report
-    up-to-date before the run. Run on the expected durations, the first
-    plan is the run, staggered or not, and places none of the four. Then
-    d20 reports up-to-date at 1000, while it waits with a promise, needs
-    the upgrade again at 100000, and d13 reports failed at 2000, from an
-    earlier run: each decision decides as a new plan would."""
+    up-to-date before the run, and their devices tell no last boot, or d1
+    booted a day before and d3 at 300. Run on the expected durations, the
+    first plan is the run, staggered or not, and places none of the four.
+    Then d20 reports up-to-date at 1000, while it waits with a promise,
+    needs the upgrade again at 100000, and d13 reports failed at 2000, from
+    an earlier run: each decision decides as a new plan would."""
     up = ["d1", "d3", "d10", "d17"]
     groups, priority, separation = chains()
-    for stagger in [0, 100]:
-        label = "stagger {stagger}"
+    boots_cases: list[dict[str, int]] = [{}, {"d1": -DAY, "d3": 300}]
+    for stagger, boots in [(st, bc) for st in [0, 100] for bc in boots_cases]:
+        label = "stagger {stagger}, last boots {boots}"
         c = controller(daily("day", 0, HOUR, 9), devices("d", 24, 600, "day"), 2, 4, False, 1,
                        groups=groups, priority=priority, separation=separation,
                        stagger=stagger)
         for name in up:
             c.report(name, "up-to-date", 0)
+        for name, boot in boots.items():
+            c.report_last_boot(name, boot)
         p = c.plan(0)
         testing.assertEqual([n for n in up if n in p.starts or n in p.held], [], label)
         sim.drive(c, 0, {}, 30 * DAY)
@@ -3305,6 +3391,8 @@ def _test_the_plan_is_the_run_with_members_up_to_date():
                        stagger=stagger)
         for name in up:
             r.report(name, "up-to-date", 0)
+        for name, boot in boots.items():
+            r.report_last_boot(name, boot)
         same_as_a_new_plan(r, {}, 9 * DAY, statuses=[(1000, "d20", "up-to-date"),
                                                       (2000, "d13", "failed"),
                                                       (100000, "d20", "upgrade-needed")])

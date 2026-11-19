@@ -179,7 +179,12 @@ redundancy groups waits the group's `min-separation` from the answer of a
 member that is up to date, or, when that member upgraded in this run
 before a new attempt or before it joined again, from the end of that
 upgrade. After one that upgraded before a pause, it waits the
-`min-separation` from that member's report. A failed one still counts as
+`min-separation` from that member's report. When the member's device
+tells when it last booted, its `last-boot` in `state/platform`, a later
+boot moves that time. A member whose upgrade the campaign did not see end,
+for example after a restart of fleetmgr, counts from that boot instead of
+its answer: the next member need not wait for a device that has run the
+target for months. A failed one still counts as
 failed: it counts against `failure-budget` and holds its redundancy groups
 as their `failure-policy` says. A member that shows `pending` or `unknown`
 has not answered. Until it answers, the plan holds the member in its
@@ -218,7 +223,8 @@ device reads its release again, and the campaign holds the member until
 it answers the new attempt, and releases it in a window. A member that
 succeeded reads again and answers `up-to-date`; when it upgraded in this
 run, the next member of its redundancy groups waits the `min-separation`
-from the end of that upgrade, not from the answer. A member in flight gets
+from the end of that upgrade, or from a later boot of its device, not from
+the answer. A member in flight gets
 the campaign's veto back: its run stops before the install, or, past the
 install, finishes and holds its slot until it ends.
 

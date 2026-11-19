@@ -837,6 +837,15 @@
   `demo-campaign.xml`, `upgrade.xml`, `just upgrade` and `just
   upgrade-and-watch` are gone. [#825]
 - A `/fleet/device` has the device's `last-boot` in `state/platform`. [#841]
+- A member that is done without a release, and whose upgrade the campaign
+  did not see end, is done when its device last booted, when the device
+  tells. After a restart of fleetmgr, the next member of its redundancy
+  groups then need not wait for a device that has run the target for
+  months, and waits the `min-separation` from the boot of one that booted
+  a minute ago. When the campaign saw the member's upgrade end, in the run
+  or before a pause, the member is done at that end, or at a later boot.
+  A member whose device does not tell is done at its answer, as before.
+  [#842]
 
 ### Dependencies
 

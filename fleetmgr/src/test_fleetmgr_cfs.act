@@ -2725,6 +2725,85 @@ actor _test_campaign_holds_a_member_with_a_stale_status(t: testing.AsyncT):
     after 5.0: timeout()
 
 
+actor _SecondMemberStart(t: testing.AsyncT, name: str, boot_ago: ?int, least: int, most: int):
+    """cpe-1 and cpe-2 pack in the group core with a min-separation of 1 h,
+    cpe-1 first, in the campaign name, in plan, with no schedule. cpe-1
+    answers that it runs the target, and its device last booted boot_ago
+    seconds before, or does not tell. cpe-2 needs the upgrade. The plan
+    must start cpe-2 from least to most seconds from now."""
+    var done = False
+    now = time.time().unix_s()
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        r = o.state.device_status.get("cpe-1")
+        answered = False
+        if r is not None:
+            answered = r.status == "up-to-date"
+        if not answered:
+            return
+        for win in o.state.plan.window:
+            for dev in win.device:
+                e = dev.estimated_start
+                if dev.name == "cpe-2" and e is not None:
+                    done = True
+                    at = int(e) - now
+                    if least <= at and at <= most:
+                        t.success()
+                    else:
+                        t.failure(ValueError("cpe-2 starts {at} s from now, want {least} to {most}"))
+                    return
+
+    def timeout() -> None:
+        if not done:
+            done = True
+            t.failure(ValueError("the plan did not start cpe-2"))
+
+    names = ["cpe-1", "cpe-2"]
+    conf = InputCampaign(name=name, admin_state="plan", target_concurrency=u64(1),
+                         max_concurrency=u64(1))
+    for n in names:
+        conf.device.create(n, image=IMAGE)
+    linked = _flat_inventory(names)
+    for n in names:
+        d = linked.fleet.device.get(n)!
+        d.redundancy_group = ["core"]
+        if n == "cpe-1":
+            d.redundancy_priority = u64(1)
+    linked.redundancy_groups.redundancy_group.create("core", separation_policy="pack",
+                                                     min_separation=u64(3600))
+    campaign = cfs.UpgradeCampaignTransform(_campaign_path(name), lambda c: None, on_oper, None)
+    campaign.on_conf(conf, linked.to_gdata())
+    first = _tagged("up-to-date", name, "17.18.03a")
+    if boot_ago is not None:
+        first.platform.last_boot = u64(now - boot_ago)
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), first, None)
+    campaign.on_rfs((rfs_name=cfs.flotilla_of("cpe-2"), device_name="cpe-2"),
+                    _tagged("upgrade-needed", name, "17.18.03a"), None)
+    campaign.on_subscriptions_synced()
+    after 3.0: timeout()
+
+
+actor _test_campaign_counts_the_min_separation_from_the_last_boot(t: testing.AsyncT):
+    """cpe-1's device booted 30 days ago, so cpe-2 need not wait: it
+    starts now."""
+    _SecondMemberStart(t, "boot-long-ago", 30 * 86400, 0, 60)
+
+
+actor _test_campaign_counts_the_min_separation_from_a_recent_boot(t: testing.AsyncT):
+    """cpe-1's device booted 10 minutes ago, so cpe-2 waits the rest of
+    the hour."""
+    _SecondMemberStart(t, "boot-recent", 600, 2940, 3060)
+
+
+actor _test_campaign_counts_the_min_separation_from_the_answer(t: testing.AsyncT):
+    """cpe-1's device does not tell when it booted, so cpe-2 waits the hour
+    from cpe-1's answer."""
+    _SecondMemberStart(t, "boot-unknown", None, 3540, 3660)
+
+
 actor _test_campaign_image_change_holds_a_member_again(t: testing.AsyncT):
     """A member that answered up-to-date for the campaign's target in plan
     has not answered when the campaign runs with an image of another
