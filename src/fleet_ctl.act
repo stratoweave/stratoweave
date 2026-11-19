@@ -462,9 +462,15 @@ class Controller(object):
     upgrade when it answers that it is up to date. A member that succeeded
     or failed in an earlier run is done at its report. When a member done
     without a release reports a new final status that is not a failure,
-    for example up-to-date after a failure, it is done at that report. A
-    failure still counts: it holds the other members of its groups, and
-    counts against the failure budget. The member waits again when its
+    for example up-to-date after a failure, it is done at that report.
+    When its device tells when it last booted (report_last_boot()), a
+    member done at the end of an upgrade that the run saw end is done at
+    the boot when that came later. Any other member is done at the boot
+    instead of its answer or its report: after a restart, the next member
+    need not wait for a device that has run the target for months, and
+    waits the min-separation from the boot of one that booted a minute
+    ago. A failure still counts: it holds the other members of its groups,
+    and counts against the failure budget. The member waits again when its
     final status goes.
 
     A device is up until set_live() says that it is down. A waiting device
@@ -793,12 +799,17 @@ class Controller(object):
     overdue: set[int]
     # Per device number: when it was done, NO_TIME when it is not; and when
     # the last upgrade that it ran in the run ended, if a new attempt made
-    # it wait again after that, or it left the campaign since (drop()),
-    # else NO_TIME. It is NO_TIME again when drop() comes while the device
-    # is still in an upgrade, or when the device, while it is not released,
-    # reports in-progress or answers anything but up-to-date.
+    # it wait again after that, or it left the campaign since (drop()), or
+    # the run stopped and started again since (start()), else NO_TIME. It
+    # is NO_TIME again when drop() comes while the device is still in an
+    # upgrade, or when the device, while it is not released, reports
+    # in-progress or answers anything but up-to-date that it did not
+    # answer before.
     done_at: list[int]
     ran_until: list[int]
+    # Per device number: when its device last booted, by the device's
+    # clock, as report_last_boot() says, or NO_TIME when it does not tell.
+    last_boot: list[int]
     # Per device number: the window promised to it during a run while it
     # waits, as an index into windows, or -1; and the order of the promises.
     promised: list[int]
@@ -926,6 +937,7 @@ class Controller(object):
         self.overdue = set()
         self.done_at = []
         self.ran_until = []
+        self.last_boot = []
         self.promised = []
         self.promise_seq = []
         self.seq = 0
@@ -970,6 +982,7 @@ class Controller(object):
             self.flying.append(False)
             self.done_at.append(NO_TIME)
             self.ran_until.append(NO_TIME)
+            self.last_boot.append(NO_TIME)
             self.promised.append(-1)
             self.promise_seq.append(0)
             self.unset.append(-1)
@@ -1151,8 +1164,9 @@ class Controller(object):
         rung devices, the concurrency at the target, and a device may start
         now. No member is let prepare yet, and the first turn to prepare is
         now. The reports, the answers and the prepare states among them,
-        and the configuration stay. The run takes in flight each device
-        that still reports in-progress (take_running)."""
+        and the configuration stay, and so does the end of each upgrade
+        that the earlier run saw end (ran_until). The run takes in flight
+        each device that still reports in-progress (take_running)."""
         self.running = True
         self.prepare_at = {}
         self.allowed = set()
@@ -1164,6 +1178,14 @@ class Controller(object):
             # after its failure.
             if self.done_at[k] != NO_TIME and self.final_at[k] != NO_TIME:
                 self.final_at[k] = imax(self.final_at[k], self.done_at[k])
+            # As drop() does: the end of the upgrade, for the min-separation
+            # of its groups.
+            if self.released[k]:
+                end = self.done_at[k]
+                if end == NO_TIME and self.reported[k]:
+                    end = self.final_at[k]
+                if end != NO_TIME:
+                    self.ran_until[k] = imax(self.ran_until[k], end)
         self.released = [False for _k in range(n)]
         self.released_at = [0 for _k in range(n)]
         self.released_in = [-1 for _k in range(n)]
@@ -1528,9 +1550,12 @@ class Controller(object):
     def report_n(self, k: int, status: ?str, at: int, rollback_failed: bool=False) -> None:
         """report() for the device with number k."""
         if not self.released[k] and status != "up-to-date" \
+           and status != self.final_status[k] \
            and (status == "in-progress" or is_answer(status)):
             # The device was not done at the end of an earlier upgrade:
-            # its done time counts from its answer.
+            # its done time counts from its answer. A report of the final
+            # status that it had, as the campaign gives after a pause, does
+            # not say so.
             self.ran_until[k] = NO_TIME
         if status is not None and is_final(status):
             self.take_failing(k, is_failure(status))
@@ -1630,6 +1655,33 @@ class Controller(object):
             self.prepare_state[name] = state
         else:
             self.prepare_state.pop(name)
+
+    def report_last_boot(self, name: str, at: ?int) -> None:
+        """Take when the device name last booted, by its clock, or None when
+        it does not tell. A boot before 0 counts as 0, as the controller has
+        no earlier times. Only a device that the controller knows keeps it:
+        configure() knows every member. The done time of a member done
+        without a release can follow the boot (done_time_of()). So when its
+        boot changes, the waiting members of its groups are looked at again,
+        also the ones that wait for the min-separation from its old done
+        time, and the quiet time ends."""
+        k = self.known(name)
+        if k < 0:
+            return
+        boot = NO_TIME
+        if at is not None:
+            boot = imax(0, at)
+        if boot == self.last_boot[k]:
+            return
+        self.last_boot[k] = boot
+        if self.done_unreleased(k) and self.in_group(k):
+            for g in self.groups_of[self.name_of(k)]:
+                for d in self.groups[g]:
+                    j = self.known(d)
+                    if j >= 0 and self.waits(j):
+                        self.parked.discard(j)
+                        self.look_again(j)
+            self.quiet_until = 0
 
     def lost(self, name: str) -> None:
         """Forget the status of a device."""
@@ -1801,18 +1853,25 @@ class Controller(object):
     def done_time_of(self, name: str) -> int:
         """When the device name was done, or -1 when it is not. A member done
         without a release that is up to date was done at the end of the
-        upgrade that it ran in the run (ran_until), or else at its answer.
-        One with another final status was done at its final report, and not
-        before the end of the upgrade that it ran in the run. When it
-        reports a new final status that is not a failure, it is done at that
-        report (report())."""
+        upgrade that it ran in the run (ran_until). One with another final
+        status was done at its final report, and not before the end of that
+        upgrade. When the device tells when it last booted
+        (report_last_boot()), the member was done at the boot if that came
+        later. Without the end of an upgrade, it was done at the boot, or
+        without a boot at its answer or its final report. When it reports a
+        new final status that is not a failure, it has no end of an upgrade
+        (report())."""
         k = self.known(name)
         if k >= 0 and self.done_at[k] != NO_TIME:
             return self.done_at[k]
         if k >= 0 and self.done_unreleased(k):
-            if self.ran_until[k] != NO_TIME and self.final_status[k] == "up-to-date":
-                return self.ran_until[k]
-            return imax(self.final_at[k], self.ran_until[k])
+            boot = self.last_boot[k]
+            if self.ran_until[k] == NO_TIME:
+                return boot if boot != NO_TIME else self.final_at[k]
+            end = self.ran_until[k]
+            if self.final_status[k] != "up-to-date":
+                end = imax(self.final_at[k], end)
+            return imax(end, boot)
         return -1
 
     def prior(self, name: str) -> list[(str, str)]:
@@ -2594,6 +2653,7 @@ class Controller(object):
         c.overdue = copy_set(self.overdue)
         c.done_at = self.done_at.copy()
         c.ran_until = self.ran_until.copy()
+        c.last_boot = self.last_boot.copy()
         c.promised = self.promised.copy()
         c.promise_seq = self.promise_seq.copy()
         c.seq = self.seq
