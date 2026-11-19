@@ -885,6 +885,24 @@
 - Imports Acton library modules from `std`, and the schema code generator
   writes `import std.base64` and `import std.json` into the modules it
   generates. [acton-yang#565] [#833]
+- Fixed the compile failing on an augment whose target is inside a
+  structure: `tailf:structure`, `sx:structure` or `rc:yang-data`. A
+  structure describes a message, not datastore data, and its contents are
+  not compiled, so the augment is now skipped. An augment into any other
+  extension still fails. ConfD's `tailf-rollback` augments a structure of
+  `tailf-yang-patch` like this. [acton-yang#564] [#837]
+- Fixed relative leafref paths in an action, an rpc or a notification. The
+  action, rpc or notification is the parent of its leaves (RFC 7950 6.4.1),
+  but the path left it out, so `..` went one level too far, and in an rpc
+  `../a` resolved to a top-level leaf `a`. A path into another action or rpc
+  than the one that holds the leafref now fails. [acton-yang#564] [#837]
+- A leafref path can have whitespace between two predicates, like
+  `acl-set[name=current()/../name] [type=current()/../type]`, as XPath and
+  ConfD allow. The path used to end at the whitespace, so it pointed at the
+  wrong node. A path with any other trailing input now fails to compile.
+  [acton-yang#564] [#837]
+- A JSON leaf with the value `null` fails to decode, as RFC 7951 requires.
+  [acton-yang#566] [#837]
 
 #### acton-ssh
 - Fixed SSH events being delivered out of the order libssh raises them.
@@ -1150,6 +1168,7 @@ next. Give it a spin. We’d love to hear what you think.
 [#825]: https://github.com/stratoweave/stratoweave/pull/825
 [#832]: https://github.com/stratoweave/stratoweave/pull/832
 [#833]: https://github.com/stratoweave/stratoweave/pull/833
+[#837]: https://github.com/stratoweave/stratoweave/pull/837
 [actmf#76]: https://github.com/stratoweave/actmf/pull/76
 [actmf#77]: https://github.com/stratoweave/actmf/pull/77
 [actmf#78]: https://github.com/stratoweave/actmf/pull/78
@@ -1190,4 +1209,6 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-yang#561]: https://github.com/stratoweave/acton-yang/pull/561
 [acton-yang#562]: https://github.com/stratoweave/acton-yang/pull/562
 [acton-yang#563]: https://github.com/stratoweave/acton-yang/pull/563
+[acton-yang#564]: https://github.com/stratoweave/acton-yang/pull/564
 [acton-yang#565]: https://github.com/stratoweave/acton-yang/pull/565
+[acton-yang#566]: https://github.com/stratoweave/acton-yang/pull/566
