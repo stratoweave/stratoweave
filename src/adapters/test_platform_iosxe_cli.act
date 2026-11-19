@@ -6,6 +6,7 @@
 import logging
 import testing
 import yang
+import yang.schema as yschema
 import yang.gdata as ygdata
 
 import device as swdev
@@ -110,13 +111,19 @@ def _never_connects(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, dmc: Dev
     return _SilentAdapter(bundled_schema, log_handler, env)
 
 
-actor _PlatformRun(t: testing.EnvT, name: str, netconf: bool, want: str):
+proc def _PlatformRun(t: testing.EnvT, name: str, netconf: bool, want: str):
     """A mock device with the IOS XE CLI adapter as extra adapter, which
     answers show version on a C1111. With netconf, the primary adapter is a
     NETCONF mock with another model; without, it never connects. Succeed
     when DeviceMgr publishes want as "os version model serial probe" with
     both adapters' modules known, or with the CLI's when there is no
     NETCONF."""
+    schema = yang.compile(swxe_yang.models)
+    cli_schema = yang.compile(xecli_yang.models)
+    _PlatformRunActor(t=t, name=name, netconf=netconf, want=want, schema=schema, cli_schema=cli_schema)
+
+
+actor _PlatformRunActor(t: testing.EnvT, name: str, netconf: bool, want: str, schema: yschema.DRoot, cli_schema: yschema.DRoot):
     var finished = False
     var dev_ref: ?swdev.DeviceMgr = None
     var attached = False
@@ -182,23 +189,20 @@ actor _PlatformRun(t: testing.EnvT, name: str, netconf: bool, want: str):
         mods = list(d!.get_modules().0.keys()) if d is not None else []
         end(ValueError("timed out: modules {mods}"))
 
-    schema = yang.compile(swxe_yang.models)
-    cli_schema = yang.compile(xecli_yang.models)
-    cli_type = swdev.DeviceType(name="iosxe-cli", adapter_type=xecli.IosXeCliAdapter,
+    cli_type = swdev.DeviceType(name="iosxe-cli", adapter_type=clitest.live_adapter,
                                 src_dnode=cli_schema, oper_src_dnode=cli_schema)
     dev_types = {
         "iosxe": swdev.DeviceType(name="iosxe", adapter_type=swna.NetconfAdapter,
+                                  src_dnode=schema, oper_src_dnode=schema) if netconf else
+                 swdev.DeviceType(name="iosxe", adapter_type=_never_connects,
                                   src_dnode=schema, oper_src_dnode=schema),
         "iosxe-cli": cli_type,
     }
-    if not netconf:
-        dev_types["iosxe"] = swdev.DeviceType(name="iosxe", adapter_type=_never_connects,
-                                              src_dnode=schema, oper_src_dnode=schema)
     d = swdev.DeviceMgr(dev_types, t.env, name, t.log_handler, on_reconf,
                         swdev.SchemaRegistry(), platform_probes=platform_probes.PROBES)
-    dev_ref = d
 
     proc def __startup__():
+        dev_ref = d
         d.set_platform_retry(0.05)
         d.set_update_oper(on_state)
         dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe")
@@ -214,19 +218,31 @@ actor _PlatformRun(t: testing.EnvT, name: str, netconf: bool, want: str):
 actor _test_platform_from_the_cli_without_netconf(t: testing.EnvT):
     """NETCONF never connects, as on IOS XE 16.8: the CLI probe reads the
     platform."""
-    _PlatformRun(t, "d-cli-only", False, "ios-xe 17.15.6 C1111-4PLTEEA FCZ23259186 ios-xe-cli")
 
+    proc def __startup__():
+        _PlatformRun(t, "d-cli-only", False, "ios-xe 17.15.6 C1111-4PLTEEA FCZ23259186 ios-xe-cli")
+
+    __startup__()
 
 actor _test_platform_from_netconf_beside_the_cli(t: testing.EnvT):
     """Both adapters connect: the NETCONF probe reads the platform."""
-    _PlatformRun(t, "d-both", True,
-                 "ios-xe {swxemock.OLD_REPORTED} C8300-1N1S-4T2X FGL2231L0AB ios-xe")
 
+    proc def __startup__():
+        _PlatformRun(t, "d-both", True,
+                     "ios-xe {swxemock.OLD_REPORTED} C8300-1N1S-4T2X FGL2231L0AB ios-xe")
 
-actor _test_platform_from_the_cli_after_netconf_goes(t: testing.EnvT):
+    __startup__()
+
+proc def _test_platform_from_the_cli_after_netconf_goes(t: testing.EnvT):
     """Both adapters connected and NETCONF read the platform. Then NETCONF
     disconnects, as after a reload into a release without it, and the
     release changes: a read of the platform takes the CLI probe."""
+    schema = yang.compile(swxe_yang.models)
+    cli_schema = yang.compile(xecli_yang.models)
+    _test_platform_from_the_cli_after_netconf_goesActor(t=t, schema=schema, cli_schema=cli_schema)
+
+
+actor _test_platform_from_the_cli_after_netconf_goesActor(t: testing.EnvT, schema: yschema.DRoot, cli_schema: yschema.DRoot):
     var finished = False
     var dev_ref: ?swdev.DeviceMgr = None
     var cli: ?xecli.CliMock = None
@@ -285,19 +301,17 @@ actor _test_platform_from_the_cli_after_netconf_goes(t: testing.EnvT):
     def timeout() -> None:
         end(ValueError("timed out at stage {stage}"))
 
-    schema = yang.compile(swxe_yang.models)
-    cli_schema = yang.compile(xecli_yang.models)
     dev_types = {
         "iosxe": swdev.DeviceType(name="iosxe", adapter_type=swna.NetconfAdapter,
                                   src_dnode=schema, oper_src_dnode=schema),
-        "iosxe-cli": swdev.DeviceType(name="iosxe-cli", adapter_type=xecli.IosXeCliAdapter,
+        "iosxe-cli": swdev.DeviceType(name="iosxe-cli", adapter_type=clitest.live_adapter,
                                       src_dnode=cli_schema, oper_src_dnode=cli_schema),
     }
     d = swdev.DeviceMgr(dev_types, t.env, "d-netconf-goes", t.log_handler, on_reconf,
                         swdev.SchemaRegistry(), platform_probes=platform_probes.PROBES)
-    dev_ref = d
 
     proc def __startup__():
+        dev_ref = d
         d.set_platform_retry(0.05)
         d.set_update_oper(on_state)
         dmc = DeviceMetaConfig("d-netconf-goes", Credentials("admin", "admin"), type="iosxe")

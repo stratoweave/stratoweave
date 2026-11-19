@@ -20,7 +20,7 @@ def q(name: str) -> gdata.Id:
     return gdata.Id("urn:test:linked", name)
 
 
-def device(name: str, children: dict[gdata.Id, gdata.Node]={}) -> gdata.Node:
+pure def device(name: str, children: dict[gdata.Id, gdata.Node]={}) -> gdata.Node:
     fields: dict[gdata.Id, gdata.Node] = {q("name"): gdata.Leaf(name), q("id"): gdata.Leaf(7)}
     fields.update(children.items())
     return gdata.Container(fields)
@@ -50,10 +50,14 @@ class LinkedOutput(ttt.TransformFunction):
         return linked, None
 
 
-actor Scenario(t: testing.AsyncT, steps: list[(subscriptions: list[ttt.TaggedPath], updates: list[ttt.LinkUpdate], expected: gdata.Node)]):
+proc def Scenario(t: testing.AsyncT, steps: list[(subscriptions: list[ttt.TaggedPath], updates: list[ttt.LinkUpdate], expected: gdata.Node)]):
     sink_node = ttt.Transform(ttt.TransformFunction)(ttt.PathRoot("sink"), None)
     sink = sink_node.newtrans()
-    out = ttt.Session("out", sink, None, None)
+    out = ttt.Session("out", sink, None, None, None)
+    _ScenarioBody(t=t, steps=steps, sink=sink, out=out)
+
+
+actor _ScenarioBody(t: testing.AsyncT, steps: list[(subscriptions: list[ttt.TaggedPath], updates: list[ttt.LinkUpdate], expected: gdata.Node)], sink, out):
     var step = 0
 
     def build_links(cfg: gdata.Node) -> list[ttt.TaggedPath]:
@@ -62,7 +66,7 @@ actor Scenario(t: testing.AsyncT, steps: list[(subscriptions: list[ttt.TaggedPat
             return steps[index].subscriptions
         raise ValueError("Missing scenario step")
 
-    tx = ttt.TransformTransaction(ttt.PathRoot("subscriber"), LinkedOutput, build_links, None, None)
+    var tx: ?ttt.Transaction = None
 
     def committed(_result: value):
         testing.assertEqual(sink.get(), steps[step].expected)
@@ -74,7 +78,7 @@ actor Scenario(t: testing.AsyncT, steps: list[(subscriptions: list[ttt.TaggedPat
 
     def sink_locked(result: ttt.CfgResult):
         testing.assertEqual(len(result.errors), 0)
-        tx.commit(str(step), True)
+        tx!.commit(str(step), True)
         sink.commit(str(step), True)
         sink.wait_complete(str(step), committed)
 
@@ -85,92 +89,108 @@ actor Scenario(t: testing.AsyncT, steps: list[(subscriptions: list[ttt.TaggedPat
 
     def run():
         case = steps[step]
-        result = tx.configure(str(step), {"test": gdata.Container({q("step"): gdata.Leaf(step)})}, out)
+        result = tx!.configure(str(step), {"test": gdata.Container({q("step"): gdata.Leaf(step)})}, out)
         testing.assertEqual(len(result.errors), 0)
-        result = tx.linkage(str(step), [], case.updates, out)
+        result = tx!.linkage(str(step), [], case.updates, out)
         testing.assertEqual(len(result.errors), 0)
-        tx.lock(str(step), out, locked)
+        tx!.lock(str(step), out, locked)
 
     proc def __startup__():
+        tx = ttt.TransformTransaction(ttt.PathRoot("subscriber"), LinkedOutput, build_links, None, None)
         run()
 
     __startup__()
 
 
 actor updates_replace_complete_subtrees(t: testing.AsyncT):
-    links = subscriptions(["a", "b", "c"])
-    Scenario(t, [
-        (subscriptions=links, updates=[
-            update("a", {q("old"): gdata.Leaf(1)}),
-            update("b", {q("value"): gdata.Leaf(2)}),
-            update("c", {q("keep"): gdata.Leaf(3)}),
-        ], expected=devices([
-            device("a", {q("old"): gdata.Leaf(1)}),
-            device("b", {q("value"): gdata.Leaf(2)}),
-            device("c", {q("keep"): gdata.Leaf(3)}),
-        ])),
-        (subscriptions=links, updates=[
-            update("a", {q("intermediate"): gdata.Leaf(10)}),
-            update("b", {q("value"): gdata.Leaf(20)}),
-            update("a", {q("latest"): gdata.Leaf(30)}),
-        ], expected=devices([
-            device("a", {q("latest"): gdata.Leaf(30)}),
-            device("b", {q("value"): gdata.Leaf(20)}),
-            device("c", {q("keep"): gdata.Leaf(3)}),
-        ])),
-    ])
 
+    proc def __startup__():
+        links = subscriptions(["a", "b", "c"])
+        Scenario(t, [
+            (subscriptions=links, updates=[
+                update("a", {q("old"): gdata.Leaf(1)}),
+                update("b", {q("value"): gdata.Leaf(2)}),
+                update("c", {q("keep"): gdata.Leaf(3)}),
+            ], expected=devices([
+                device("a", {q("old"): gdata.Leaf(1)}),
+                device("b", {q("value"): gdata.Leaf(2)}),
+                device("c", {q("keep"): gdata.Leaf(3)}),
+            ])),
+            (subscriptions=links, updates=[
+                update("a", {q("intermediate"): gdata.Leaf(10)}),
+                update("b", {q("value"): gdata.Leaf(20)}),
+                update("a", {q("latest"): gdata.Leaf(30)}),
+            ], expected=devices([
+                device("a", {q("latest"): gdata.Leaf(30)}),
+                device("b", {q("value"): gdata.Leaf(20)}),
+                device("c", {q("keep"): gdata.Leaf(3)}),
+            ])),
+        ])
+
+    __startup__()
 
 actor only_candidate_subscriptions_contribute(t: testing.AsyncT):
-    Scenario(t, [
-        (subscriptions=subscriptions(["a", "b"]), updates=[update("a", {}), update("b", {})],
-         expected=devices([device("a"), device("b")])),
-        (subscriptions=subscriptions(["b"]), updates=[
-            update("a", {q("removed"): gdata.Leaf(1)}),
-            update("b", {q("value"): gdata.Leaf(2)}),
-            update("b", {q("wrong-tag"): gdata.Leaf(3)}, tag="other"),
-            update("c", {q("unsubscribed"): gdata.Leaf(4)}),
-        ], expected=devices([device("b", {q("value"): gdata.Leaf(2)})])),
-        (subscriptions=[], updates=[], expected=gdata.Container()),
-    ])
 
+    proc def __startup__():
+        Scenario(t, [
+            (subscriptions=subscriptions(["a", "b"]), updates=[update("a", {}), update("b", {})],
+             expected=devices([device("a"), device("b")])),
+            (subscriptions=subscriptions(["b"]), updates=[
+                update("a", {q("removed"): gdata.Leaf(1)}),
+                update("b", {q("value"): gdata.Leaf(2)}),
+                update("b", {q("wrong-tag"): gdata.Leaf(3)}, tag="other"),
+                update("c", {q("unsubscribed"): gdata.Leaf(4)}),
+            ], expected=devices([device("b", {q("value"): gdata.Leaf(2)})])),
+            (subscriptions=[], updates=[], expected=gdata.Container()),
+        ])
+
+    __startup__()
 
 actor empty_update_removes_previous_state(t: testing.AsyncT):
-    path = gdata.FNode(q("settings"))
-    links = [ttt.TaggedPath("peer", path)]
-    initial = gdata.Container({q("settings"): gdata.Container({q("asn"): gdata.Leaf(1)})})
-    Scenario(t, [
-        (subscriptions=links, updates=[ttt.LinkUpdate("peer", path, gdata.FNode(), initial)], expected=initial),
-        (subscriptions=links, updates=[ttt.LinkUpdate("peer", path, gdata.FNode(), gdata.Container())], expected=gdata.Container()),
-    ])
 
+    proc def __startup__():
+        path = gdata.FNode(q("settings"))
+        links = [ttt.TaggedPath("peer", path)]
+        initial = gdata.Container({q("settings"): gdata.Container({q("asn"): gdata.Leaf(1)})})
+        Scenario(t, [
+            (subscriptions=links, updates=[ttt.LinkUpdate("peer", path, gdata.FNode(), initial)], expected=initial),
+            (subscriptions=links, updates=[ttt.LinkUpdate("peer", path, gdata.FNode(), gdata.Container())], expected=gdata.Container()),
+        ])
+
+    __startup__()
 
 actor tags_share_one_publisher_contribution(t: testing.AsyncT):
-    peer = ttt.TaggedPath("peer", address("a"))
-    other = ttt.TaggedPath("other", address("a"))
-    fields: dict[gdata.Id, gdata.Node] = {q("values"): gdata.LeafList([gdata.LeafListEntryMerge(1), gdata.LeafListEntryMerge(2)])}
-    expected = devices([device("a", fields)])
-    Scenario(t, [
-        (subscriptions=[peer, other], updates=[update("a", fields), update("a", fields, "other")], expected=expected),
-        # Removing one tag must retain the publisher even without a new update.
-        (subscriptions=[other], updates=[], expected=expected),
-        (subscriptions=[], updates=[], expected=gdata.Container()),
-    ])
 
+    proc def __startup__():
+        peer = ttt.TaggedPath("peer", address("a"))
+        other = ttt.TaggedPath("other", address("a"))
+        fields: dict[gdata.Id, gdata.Node] = {q("values"): gdata.LeafList([gdata.LeafListEntryMerge(1), gdata.LeafListEntryMerge(2)])}
+        expected = devices([device("a", fields)])
+        Scenario(t, [
+            (subscriptions=[peer, other], updates=[update("a", fields), update("a", fields, "other")], expected=expected),
+            # Removing one tag must retain the publisher even without a new update.
+            (subscriptions=[other], updates=[], expected=expected),
+            (subscriptions=[], updates=[], expected=gdata.Container()),
+        ])
+
+    __startup__()
 
 actor publisher_removal_and_readdition_rebuilds_pairs(t: testing.AsyncT):
-    Scenario(t, [
-        (subscriptions=subscriptions(["a", "b", "c", "d"]),
-         updates=[update(name, {}) for name in ["a", "b", "c", "d"]],
-         expected=devices([device(name) for name in ["a", "b", "c", "d"]])),
-        # C and D now occupy the cached positions previously used by A and B.
-        (subscriptions=subscriptions(["c", "d"]), updates=[],
-         expected=devices([device("c"), device("d")])),
-        (subscriptions=subscriptions(["a", "c", "d"]),
-         updates=[update("a", {q("new"): gdata.Leaf(1)})],
-         expected=devices([device("a", {q("new"): gdata.Leaf(1)}), device("c"), device("d")])),
-    ])
 
+    proc def __startup__():
+        Scenario(t, [
+            (subscriptions=subscriptions(["a", "b", "c", "d"]),
+             updates=[update(name, {}) for name in ["a", "b", "c", "d"]],
+             expected=devices([device(name) for name in ["a", "b", "c", "d"]])),
+            # C and D now occupy the cached positions previously used by A and B.
+            (subscriptions=subscriptions(["c", "d"]), updates=[],
+             expected=devices([device("c"), device("d")])),
+            (subscriptions=subscriptions(["a", "c", "d"]),
+             updates=[update("a", {q("new"): gdata.Leaf(1)})],
+             expected=devices([device("a", {q("new"): gdata.Leaf(1)}), device("c"), device("d")])),
+        ])
+
+    __startup__()
 
 class CheckLinkedReuse(ttt.TransformFunction):
     previous: ?gdata.Node
@@ -187,9 +207,13 @@ class CheckLinkedReuse(ttt.TransformFunction):
         return linked, None
 
 
-actor unchanged_publishers_reuse_merged_input(t: testing.AsyncT):
+proc def _test_unchanged_publishers_reuse_merged_input(t: testing.AsyncT):
     links = subscriptions(["a", "b", "c"])
     tx = ttt.TransformTransaction(ttt.PathRoot("subscriber"), CheckLinkedReuse, lambda cfg: links, None, None)
+    _unchanged_publishers_reuse_merged_inputBody(t=t, tx=tx)
+
+
+actor _unchanged_publishers_reuse_merged_inputBody(t: testing.AsyncT, tx):
 
     def loaded(result: ttt.CfgResult):
         testing.assertEqual(len(result.errors), 0)
@@ -214,17 +238,21 @@ actor unchanged_publishers_reuse_merged_input(t: testing.AsyncT):
     __startup__()
 
 
-actor linked_commit_rebases_pending_updates_and_discards_aborts(t: testing.AsyncT):
+proc def _test_linked_commit_rebases_pending_updates_and_discards_aborts(t: testing.AsyncT):
     links = subscriptions(["a", "b", "c"])
+    sink_node = ttt.Transform(ttt.TransformFunction)(ttt.PathRoot("sink"), None)
+    sink = sink_node.newtrans()
+    outs = {tid: ttt.Session(tid, sink, None, None, None) for tid in ["load", "first", "second", "abort", "last"]}
+    tx = ttt.TransformTransaction(ttt.PathRoot("subscriber"), LinkedOutput, lambda cfg: links, None, None)
+    _linked_commit_rebases_pending_updates_and_discards_abortsBody(t=t, sink=sink, outs=outs, tx=tx)
+
+
+actor _linked_commit_rebases_pending_updates_and_discards_abortsBody(t: testing.AsyncT, sink, outs, tx):
     a0 = device("a", {q("value"): gdata.Leaf(0)})
     a1 = device("a", {q("value"): gdata.Leaf(1)})
     b0 = device("b", {q("value"): gdata.Leaf(0)})
     b2 = device("b", {q("value"): gdata.Leaf(2)})
     c0 = device("c", {q("value"): gdata.Leaf(0)})
-    sink_node = ttt.Transform(ttt.TransformFunction)(ttt.PathRoot("sink"), None)
-    sink = sink_node.newtrans()
-    outs = {tid: ttt.Session(tid, sink, None, None) for tid in ["load", "first", "second", "abort", "last"]}
-    tx = ttt.TransformTransaction(ttt.PathRoot("subscriber"), LinkedOutput, lambda cfg: links, None, None)
 
     def sink_locked(tid: str, result: ttt.CfgResult, done: action(value) -> None):
         testing.assertEqual(len(result.errors), 0)
@@ -281,9 +309,13 @@ class CheckRecreatedSubscriber(ttt.TransformFunction):
         return linked, None
 
 
-actor removed_subscriber_discards_linked_sources(t: testing.AsyncT):
+proc def _test_removed_subscriber_discards_linked_sources(t: testing.AsyncT):
     links = subscriptions(["a"])
     tx = ttt.TransformTransaction(ttt.PathRoot("subscriber"), CheckRecreatedSubscriber, lambda cfg: links, None, None)
+    _removed_subscriber_discards_linked_sourcesBody(t=t, tx=tx)
+
+
+actor _removed_subscriber_discards_linked_sourcesBody(t: testing.AsyncT, tx):
 
     def loaded(result: ttt.CfgResult):
         testing.assertEqual(len(result.errors), 0)
@@ -317,10 +349,14 @@ actor removed_subscriber_discards_linked_sources(t: testing.AsyncT):
     __startup__()
 
 
-actor publisher_keeps_other_tags_and_discards_aborted_subscriptions(t: testing.AsyncT):
+proc def _test_publisher_keeps_other_tags_and_discards_aborted_subscriptions(t: testing.AsyncT):
     publisher = gdata.FNode(q("publisher"))
-    subscriber = gdata.FNode(q("subscriber"))
     tx = ttt.TransformTransaction(ttt.PathRoot("publisher"), ttt.TransformFunction, None, None, None)
+    _publisher_keeps_other_tags_and_discards_aborted_subscriptionsBody(t=t, publisher=publisher, tx=tx)
+
+
+actor _publisher_keeps_other_tags_and_discards_aborted_subscriptionsBody(t: testing.AsyncT, publisher, tx):
+    subscriber = gdata.FNode(q("subscriber"))
     cfg: dict[str, gdata.Node] = {"test": gdata.Container({q("value"): gdata.Leaf(1)})}
 
     def loaded(result: ttt.CfgResult):
