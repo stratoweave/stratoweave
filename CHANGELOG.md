@@ -252,6 +252,10 @@
   adapter reads with periodic `<get>` and receives event notifications
   through RFC 5277. Without the setting, ArcOS devices are polled: ArcOS
   refuses every other RPC on a session that holds a subscription.
+- Runtime schema fetch no longer skips `tailf-rollback`. It was on the list
+  of broken modules because acton-yang failed to compile it, and
+  `tailf-netconf-with-rollback-id` imports it, so a device that lists both,
+  like ArcOS 8.2.1A, got no schema at all. [#837]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
