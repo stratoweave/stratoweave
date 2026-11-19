@@ -95,7 +95,9 @@ This is useful when you need to confirm the live schema seen by the device
 manager.
 
 ### `GET /device/<name>/running?format=<fmt>`
-Returns the current running configuration known for the device.
+Returns the running configuration of the device. StratoWeave reads it from
+the device when it does not have it, see
+[Running configuration](devices.md#running-configuration).
 
 Supported formats:
 
@@ -110,8 +112,8 @@ Example:
 curl "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/running?format=xml"
 ```
 
-If no running configuration is available, the endpoint returns a `200` with the
-plain-text message `# No running configuration available`.
+If the device cannot be read, the endpoint returns a `200` with the
+plain-text message `# No running configuration available: <error>`.
 
 ### `GET /device/<name>/target?format=<fmt>`
 Returns StratoWeave's target configuration for the device: the config the

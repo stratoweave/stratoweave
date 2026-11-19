@@ -261,6 +261,12 @@
   resync now fails with the decode error. A checked edit fails with it before
   it edits the device. When only the configuration after the commit does not
   decode, the edit succeeds and the next checked edit resyncs first.
+- A `DeviceMgr` reads the running configuration of its device, and subscribes
+  to `netconf-config-change`, only from the first configuration for the
+  device, the first `get_config()` or `resync()`, or from the first connect
+  with `track_config=True`. Before, it read it on every connect, so tools that
+  only read data or subscribe, like `ncurl monitor`, read the whole
+  configuration too.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
@@ -1040,6 +1046,10 @@
   device instead: `state/adapter` shows whether it is connected, and the
   inspection API's `/device/<name>/info` and `/device/<name>/log` show its
   queue and what was sent to it. [#792]
+- `DeviceMgr.get_config()` takes a `done` action and gives the running
+  configuration that the `DeviceMgr` keeps, or reads it from the device. It
+  returned the adapter's copy before. `get_running_conf()` gives `None` until
+  the first read.
 - `stratoweave.main()` takes `static_assets` as `dict[str, bytes]`. Have the
   web UI build embed each file as a `bytes` literal, as fleetmgr's
   `gen-embedded-assets.mjs` does. http-router handlers and middleware call

@@ -1,0 +1,262 @@
+"""When a DeviceMgr reads the running configuration of its device: from the
+first configure() call with configuration, the first get_config() call, or
+from the start with track_config. The device is a NETCONF mock that
+advertises ietf-netconf-notifications."""
+
+import testing
+import yang.gdata as ygdata
+
+import adapters.netconf as swna
+import device as swdev
+import test_notif_device as tnd
+
+from test_devicemgr_netconf import new_netconf_mock_device_mgr, system_config
+
+
+def _count(ms: swna.NetconfMockServer, rpc: str) -> int:
+    """The number of RPCs in the history of ms that start with rpc."""
+    n = 0
+    for entry in ms.get_rpc_history():
+        if entry.startswith(rpc):
+            n += 1
+    return n
+
+
+actor _test_connect_without_target_reads_nothing(t: testing.EnvT):
+    """A DeviceMgr without configuration to push does not read the
+    configuration on connect, and does not subscribe to
+    netconf-config-change. The mock records RPCs only from the first
+    clear_rpc_history(), so the test also reports a second connect."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-reads-nothing", noop_on_reconf,
+        extra_models=[tnd.NETCONF_NOTIFICATIONS_YANG])
+    var done = False
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def on_get(n: ?ygdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail("The get failed: {err}")
+            return
+        ms = tnd.mock_server_of(dev)
+        if ms is not None:
+            if _count(ms, "<get-config") > 0:
+                fail("Read the configuration on connect: {ms.get_rpc_history()}")
+            elif dev.get_adapter().get_config() is not None:
+                fail("The driver read the configuration on connect")
+            elif dev.get_running_conf() is not None:
+                fail("Has a running configuration without a read")
+            elif len(dev.notif_status()) > 0:
+                fail("Subscribed to event notifications on connect")
+            else:
+                done = True
+                t.success()
+        else:
+            fail("Missing NETCONF mock server")
+
+    def start():
+        if done:
+            return
+        modules, modset_id = dev.get_modules()
+        if modset_id is None:
+            after now 0.01: start()
+            return
+        ms = tnd.mock_server_of(dev)
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        ms!.clear_rpc_history()
+        dev.on_connect(modules, None)
+        # The get goes after any read that a connect started, on the same
+        # session.
+        dev.get(on_get)
+
+    start()
+    after now 2.0: fail("Timed out waiting for the get")
+
+
+actor _test_get_config_reads_once(t: testing.EnvT):
+    """get_config reads the configuration when the DeviceMgr has none, and
+    gives the kept copy after that. From then on the DeviceMgr subscribes to
+    netconf-config-change."""
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, "dev-get-config", noop_on_reconf,
+        extra_models=[tnd.NETCONF_NOTIFICATIONS_YANG])
+    var done = False
+    var first: ?ygdata.Node = None
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def wait_subscribed():
+        if done:
+            return
+        if len(dev.notif_status()) > 0:
+            done = True
+            t.success()
+        else:
+            after now 0.01: wait_subscribed()
+
+    def on_second(conf: ?ygdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail("The second get_config failed: {err}")
+            return
+        if conf is None or conf != first:
+            fail("The second get_config gave another configuration: {conf}")
+            return
+        ms = tnd.mock_server_of(dev)
+        if ms is not None:
+            if _count(ms, "<get-config") != 1:
+                fail("Expected one read, got {ms.get_rpc_history()}")
+            else:
+                wait_subscribed()
+        else:
+            fail("Missing NETCONF mock server")
+
+    def on_first(conf: ?ygdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail("The first get_config failed: {err}")
+        elif conf is None:
+            fail("The first get_config gave no configuration")
+        else:
+            first = conf
+            dev.get_config(on_second)
+
+    def start():
+        if done:
+            return
+        modules, modset_id = dev.get_modules()
+        if modset_id is None:
+            after now 0.01: start()
+            return
+        ms = tnd.mock_server_of(dev)
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        ms!.clear_rpc_history()
+        dev.get_config(on_first)
+
+    start()
+    after now 2.0: fail("Timed out waiting for get_config")
+
+
+actor _test_configure_tracks_config(t: testing.EnvT):
+    """The first configuration makes the DeviceMgr read the configuration
+    before the edit. From then on it reads it again on netconf-config-change
+    and on each connect, which the test reports to the DeviceMgr, as the mock
+    records RPCs only from the first clear_rpc_history()."""
+    name = "dev-configure-tracks"
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, name, noop_on_reconf,
+        extra_models=[tnd.NETCONF_NOTIFICATIONS_YANG])
+    var done = False
+    var stage = "connect"
+    var mock_server: ?swna.NetconfMockServer = None
+    var baseline = 0
+
+    def fail(msg: str):
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def wait_connect_read():
+        if done:
+            return
+        ms = mock_server
+        if ms is not None and _count(ms, "<get-config") > 0:
+            done = True
+            t.success()
+        else:
+            after now 0.01: wait_connect_read()
+
+    def wait_resync():
+        if done:
+            return
+        ms = mock_server
+        if ms is not None:
+            if _count(ms, "<get-config") > baseline:
+                stage = "connect again"
+                ms.clear_rpc_history()
+                dev.on_connect(dev.get_modules().0, None)
+                wait_connect_read()
+            else:
+                after now 0.01: wait_resync()
+        else:
+            fail("Missing NETCONF mock server")
+
+    def wait_active():
+        if done:
+            return
+        ms = mock_server
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        for st in dev.notif_status():
+            if st.state == "active":
+                stage = "config-change"
+                baseline = _count(ms!, "<get-config")
+                ms!.emit_event(tnd.config_change_xml())
+                wait_resync()
+                return
+        after now 0.01: wait_active()
+
+    def on_configured(result: value):
+        if done:
+            return
+        if isinstance(result, Exception):
+            fail("The configuration failed: {result}")
+            return
+        ms = mock_server
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        history = ms!.get_rpc_history()
+        read = -1
+        edit = -1
+        for i in range(len(history)):
+            if read < 0 and history[i].startswith("<get-config"):
+                read = i
+            if edit < 0 and "edit-config" in history[i]:
+                edit = i
+        if read < 0 or edit < 0 or read > edit:
+            fail("Expected a read before the edit, got {history}")
+        else:
+            stage = "subscribe"
+            wait_active()
+
+    def start():
+        if done:
+            return
+        modules, modset_id = dev.get_modules()
+        if modset_id is None:
+            after now 0.01: start()
+            return
+        ms = tnd.mock_server_of(dev)
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        mock_server = ms
+        ms!.clear_rpc_history()
+        stage = "configure"
+        dev.configure(system_config("edge-1"), modset_id, "first")
+        dev.wait_complete("first", on_configured)
+
+    def timed_out():
+        fail("Timed out at {stage}")
+
+    start()
+    after now 2.0: timed_out()

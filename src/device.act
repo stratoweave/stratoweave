@@ -1035,10 +1035,10 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             devmgr.read_platform()
             _fail("device runs {got} after the commit, not {want}")
             return
-        # New software may mean a different modset, so the device has to be
-        # re-discovered before anything trusts its schema again. The release
-        # can change without a reconnect, so read the platform again too.
-        devmgr.resync()
+        # The install can change the device's configuration, so read it again
+        # if the DeviceMgr keeps it. The release can change without a
+        # reconnect, so read the platform again too.
+        devmgr.refresh_config()
         devmgr.read_platform()
         adapter.cleanup(_on_cleanup_done)
 
@@ -1197,7 +1197,7 @@ class DeviceType(object):
         self.software_adapter_type = software_adapter_type
         self.platform_probes = platform_probes
 
-actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None, platform_probes: list[PlatformProbe]=[]):
+actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_handler: logging.Handler, device_logs: ?swlogs.DeviceLogs=None, platform_probes: list[PlatformProbe]=[], track_config: bool=False):
     """Device Registry keeps track of all devices and hands out references to
     them based on name.
 
@@ -1206,7 +1206,7 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_ha
 
     Each device logs to its own handler under log_handler. With device_logs,
     that handler also writes the device's log file. Every device gets
-    platform_probes, the app's list.
+    platform_probes, the app's list, and track_config, see DeviceMgr.
     """
     var devices = {}
 
@@ -1225,7 +1225,7 @@ actor DeviceRegistry(dev_types: dict[str, DeviceType]={}, env: ?Env=None, log_ha
 
     def get_or_create(name: str) -> DeviceMgr:
         if name not in devices:
-            devices[name] = DeviceMgr(dev_types, env, name, log_handler, reconf_cb, schema_registry, self, device_logs, platform_probes)
+            devices[name] = DeviceMgr(dev_types, env, name, log_handler, reconf_cb, schema_registry, self, device_logs, platform_probes, track_config)
         dev = devices[name]
         return dev
 
@@ -1567,7 +1567,7 @@ class DeviceTreeProvider(ygdata.TreeProvider):
 
 
 
-actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None, device_logs: ?swlogs.DeviceLogs=None, platform_probes: list[PlatformProbe]=[]):
+actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None, device_logs: ?swlogs.DeviceLogs=None, platform_probes: list[PlatformProbe]=[], track_config: bool=False):
     """Device Manager manages a device and represents that device, as an
     abstract device, in the system. Platform specific handling is implemented in
     the DeviceAdapter, i.e.  in subclasses of DeviceAdapter, like NetconfAdapter
@@ -1641,6 +1641,16 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
     them, and runs again after a delay that doubles each time, so a replaced
     box shows once a read succeeds. When no probe applies, the values are
     removed.
+
+    ## Running configuration
+    The DeviceMgr keeps the device's running configuration only when
+    something needs it: from the first configure() call with configuration,
+    the first get_config() or resync() call, or from the start with
+    track_config. Before that it does not read the configuration, so a
+    DeviceMgr that only reads data or subscribes sends no get-config. While
+    it keeps the configuration, it reads it again on each connect, on each
+    netconf-config-change event from the device and after a software
+    install.
 
     ## Logging
     The device and its adapters log to one handler, named after the device.
@@ -1775,6 +1785,10 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
 
     # The device's current running configuration, as we know it.
     var running_conf: ?ygdata.Node = None
+    # Whether the DeviceMgr keeps running_conf current, see the docstring.
+    var config_tracked: bool = track_config
+    # The get_config callers that wait for a read of the configuration.
+    var config_waiters: list[action(?ygdata.Node, ?Exception) -> None] = []
 
     # New configuration received from the transaction engine via the
     # DeviceMgr.configure() method are stored in a configuration queue, which
@@ -1903,7 +1917,8 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         # drift is caught near-immediately rather than on the next reconnect.
         # declare is full-state and idempotent, so reasserting per connect is
         # free; devices without the module cost nothing (no channel opens).
-        if MODULE_NETCONF_NOTIFICATIONS in new_modset:
+        # Only a DeviceMgr that keeps the configuration subscribes.
+        if config_tracked and MODULE_NETCONF_NOTIFICATIONS in new_modset:
             declare_notif_subscriptions("devicemgr-config-change",
                 _on_config_change, {NotifSpec(CONFIG_CHANGE_NOTIF)})
         else:
@@ -1942,7 +1957,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         _set_connected(reporter, True)
         _update_routes()
         new_union = union_modules(_adapter_types(), _modules_by_type())
-        resync()
+        refresh_config()
         _read_platform(get_connected_modules())
         # Any adapter: a device whose NETCONF does not start has its
         # software read and installed over the CLI.
@@ -2634,13 +2649,41 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
                 _log.debug("DeviceMgr.configure: received new intended configuration", {"tid": tid, "new_conf": truncate_conf(new_conf)})
             confq[tid] = ConfigItem(tid, new_conf, modset_id)
             _update_approval_state()
-            _send_config()
+            if config_tracked:
+                _send_config()
+            else:
+                # The first configuration: read the device's configuration
+                # for the diff. _send_config runs when the read is done.
+                resync()
         elif new_conf is None and conf_modset_id is None:
             _log.debug("DeviceMgr.configure: transaction registered intent to configure but awaiting reconf", {"tid": tid})
             reconf_tids.add(tid)
         else:
             if debug_enabled():
                 _log.debug("DeviceMgr.configure: invalid input", {"conf_modset_id": str(conf_modset_id), "new_conf": truncate_conf(new_conf), "tid": tid})
+
+    def _track_config() -> None:
+        """Keep the running configuration from now on, see the docstring."""
+        if not config_tracked:
+            config_tracked = True
+            _ensure_config_change_subscription(modset)
+
+    def refresh_config() -> None:
+        """Read the running configuration again if the DeviceMgr keeps it.
+        A connect or a software install can change it."""
+        if config_tracked:
+            resync()
+
+    def get_config(done: action(?ygdata.Node, ?Exception) -> None) -> None:
+        """Give the device's running configuration: the copy that the
+        DeviceMgr keeps, or else a read from the device. From then on the
+        DeviceMgr keeps the configuration."""
+        rc = running_conf
+        if rc is not None:
+            done(rc, None)
+        else:
+            config_waiters.append(done)
+            resync()
 
     def resync():
         """Ensure our view of the device running configuration is in sync with the real device
@@ -2649,7 +2692,11 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         device supports txid, we can avoid fetching the full config if the
         txid matches our cached version. If the device does not support txid,
         we have to fetch the full config and diff it against our cached version.
+
+        From then on the DeviceMgr keeps the configuration.
         """
+        _track_config()
+
         def on_fetch_config_done(new_conf: ?ygdata.Node, err: ?Exception) -> None:
             if err is not None:
                 _log.error("Error fetching config from device", {"error": err})
@@ -2703,6 +2750,17 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
                         if len(confq) > 0 or len(reconf_tids) > 0:
                             _send_config()
 
+            waiters = config_waiters
+            config_waiters = []
+            rc = running_conf
+            for w in waiters:
+                if err is not None:
+                    w(None, err)
+                elif rc is not None:
+                    w(rc, None)
+                else:
+                    w(None, ValueError("The device gave no configuration"))
+
         _log.debug("DeviceMgr.resync: starting resync", {"local_device_txid": running_conf.txid if running_conf is not None else None})
         adapter.fetch_config(on_fetch_config_done)
 
@@ -2727,15 +2785,6 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
     # TODO: use named fields in the tuple
     def get_modules() -> (dict[str, ModCap], ?str):
         return modset, modset_id
-
-    def get_config():
-        """Get the running config of the device, from the adapter which keeps a cached version of it
-
-        Note how this doesn't actually reach out to the device, but only fetches
-        a local copy. However, since it is in the adapter contract to keep the
-        local view of the config up to date, this is mostly quite safe!
-        """
-        return adapter.get_config()
 
     def fetch_config(done: action(?ygdata.Node, ?Exception) -> None) -> None:
         """Fetch the current configuration from the device
