@@ -1,0 +1,202 @@
+"""Edits and what a restart restores after them."""
+
+import testing
+import file
+
+import db.lmdb as swlmdb
+import ttt
+import yang.gdata as gdata
+
+
+def q(name: str) -> gdata.Id:
+    return gdata.Id("urn:test:restore-after-edit", name)
+
+
+def member_links(cfg: gdata.Node) -> list[ttt.TaggedPath]:
+    """Link each campaign member to the target with the same name."""
+    links = []
+    members = cfg.get_opt_list(q("member"))
+    if members is not None:
+        for member in members.elements.values():
+            name = member.get_opt_value(q("name"))
+            if name is not None:
+                links.append(ttt.TaggedPath("target", gdata.FNode(q("targets"), children=[
+                    gdata.FNode(q("target"), children=[gdata.FNode(q("name"), value_match=name)])])))
+    return links
+
+
+class SeenTargets(ttt.TransformFunction):
+    """Output seen-<name> for each linked target, and had-memory to tell
+    whether the transform got memory. Keep the memory "kept"."""
+    def transform_wrapper(self, cfg, linked, memory, dynstate, prev_output):
+        children: dict[gdata.Id, gdata.Node] = {q("had-memory"): gdata.Leaf(memory is not None)}
+        targets = linked.get_opt_cnt(q("targets"))
+        if targets is not None:
+            target_list = targets.get_opt_list(q("target"))
+            if target_list is not None:
+                for entry in target_list.elements.values():
+                    name = entry.get_opt_value(q("name"))
+                    if name is not None:
+                        children[q("seen-{name}")] = gdata.Leaf(True)
+        return gdata.Container(children), gdata.Leaf("kept")
+
+
+campaign_root = ttt.Container({
+    q("targets"): ttt.Container({
+        q("target"): ttt.List(ttt.Transform(ttt.TransformFunction), [q("name")])
+    }),
+    q("campaign"): ttt.Transform(SeenTargets, None, member_links)
+})
+
+
+def campaign_tree(members: list[str]) -> gdata.Node:
+    """Targets a and b, and a campaign with the given members."""
+    return gdata.Container({
+        q("targets"): gdata.Container({
+            q("target"): gdata.List([q("name")], [
+                gdata.Container({q("name"): gdata.Leaf(name)}) for name in ["a", "b"]
+            ])
+        }),
+        q("campaign"): gdata.Container({
+            q("member"): gdata.List([q("name")], [
+                gdata.Container({q("name"): gdata.Leaf(name)}) for name in members
+            ])
+        })
+    })
+
+
+actor link_removal_survives_restart(t: testing.EnvT):
+    """An edit that removes a campaign member removes only a link. A
+    restart right after the edit restores the campaign without the member."""
+    t.skip("TTT does not save an edit that only removes links: https://github.com/stratoweave/stratoweave/issues/827")
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    db_path = fs.mktmpdir("test_ttt_link_removal_")
+    cap = file.WriteFileCap(fc)
+    var db = swlmdb.LmdbStore(cap, db_path)
+    var layer = ttt.Layer("top", campaign_root, None, db)
+    both = campaign_tree(["a", "b"])
+    only_a = campaign_tree(["a"])
+
+    def restored(error: ?Exception) -> None:
+        await async db.db.close()
+        await async fs.rmtree(db_path)
+        await async fs.rmdir(db_path)
+        try:
+            if error is not None:
+                raise error
+            testing.assertEqual(layer.get().prsrc(True), only_a.prsrc(True), "after the restart")
+        except Exception as e:
+            t.failure(e)
+            return
+        t.success()
+
+    def removed(r: value) -> None:
+        try:
+            if isinstance(r, Exception):
+                raise r
+            testing.assertEqual(layer.get().prsrc(True), only_a.prsrc(True), "before the restart")
+        except Exception as e:
+            t.failure(e)
+            return
+        await async db.db.close()
+        db = swlmdb.LmdbStore(cap, db_path)
+        layer = ttt.Layer("top", campaign_root, None, db)
+        layer.load_from_db(restored)
+
+    def created(r: value) -> None:
+        if isinstance(r, Exception):
+            t.failure(r)
+            return
+        layer.edit_config(gdata.diff(both, only_a)!, removed)
+
+    layer.edit_config(both, created)
+
+
+actor link_removal_reaches_the_layer_below(t: testing.AsyncT):
+    """An edit that removes a campaign member removes only a link. The
+    transform runs with its memory, and the layer below gets its output."""
+    t.skip("TTT does not run a transform for an edit that only removes links: https://github.com/stratoweave/stratoweave/issues/827")
+    stack =ttt.Layer("top", campaign_root, ttt.Sink())
+    both = campaign_tree(["a", "b"])
+    only_a = campaign_tree(["a"])
+    expected = gdata.Container({q("had-memory"): gdata.Leaf(True), q("seen-a"): gdata.Leaf(True)})
+
+    def removed(r: value) -> None:
+        try:
+            if isinstance(r, Exception):
+                raise r
+            testing.assertEqual(stack.below().get().prsrc(True), expected.prsrc(True))
+        except Exception as e:
+            t.failure(e)
+            return
+        t.success()
+
+    def created(r: value) -> None:
+        if isinstance(r, Exception):
+            t.failure(r)
+            return
+        stack.edit_config(gdata.diff(both, only_a)!, None, removed)
+
+    stack.edit_config(both, None, created)
+
+
+actor deleted_element_with_dynstate_survives_restart(t: testing.EnvT):
+    """Delete a list element whose transform has dynstate. A restart
+    restores the list without the element."""
+    t.skip("TTT writes the dynstate of a deleted transform: https://github.com/stratoweave/stratoweave/issues/828")
+    fc = file.FileCap(t.env.cap)
+    fs = file.FS(fc)
+    db_path = fs.mktmpdir("test_ttt_deleted_dynstate_")
+    cap = file.WriteFileCap(fc)
+    var db = swlmdb.LmdbStore(cap, db_path)
+    var element: ?ttt.Node = None
+
+    def element_gen(path: ttt.Path, lower: ?ttt.Layer) -> ttt.Node:
+        node = ttt.Transform(ttt.PassThrough)(path, lower)
+        element = node
+        return node
+
+    root: proc(ttt.Path, ?ttt.Layer) -> ttt.Node = ttt.Container({q("item"): ttt.List(element_gen, [q("name")])})
+    var layer = ttt.Layer("top", root, None, db)
+    one = gdata.Container({q("item"): gdata.List([q("name")], [gdata.Container({q("name"): gdata.Leaf("a")})])})
+    empty = gdata.Container({q("item"): gdata.List([q("name")], [])})
+
+    def restored(error: ?Exception) -> None:
+        await async db.db.close()
+        await async fs.rmtree(db_path)
+        await async fs.rmdir(db_path)
+        try:
+            if error is not None:
+                raise error
+            testing.assertEqual(layer.get().prsrc(True), empty.prsrc(True))
+        except Exception as e:
+            t.failure(e)
+            return
+        t.success()
+
+    def deleted(r: value) -> None:
+        if isinstance(r, Exception):
+            t.failure(r)
+            return
+        await async db.db.close()
+        db = swlmdb.LmdbStore(cap, db_path)
+        layer = ttt.Layer("top", root, None, db)
+        layer.load_from_db(restored)
+
+    def dynstate_set(r: value) -> None:
+        if isinstance(r, Exception):
+            t.failure(r)
+            return
+        layer.edit_config(gdata.diff(one, empty)!, deleted)
+
+    def created(r: value) -> None:
+        if isinstance(r, Exception):
+            t.failure(r)
+            return
+        # As a transform actor's update_dynstate does: set it, then recompute.
+        tr = element!.newtrans()
+        await async tr.update_dynstate(gdata.Leaf(1))
+        ttt.Session("dynstate", tr, None, db).recompute(dynstate_set)
+
+    layer.edit_config(one, created)
