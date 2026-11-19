@@ -145,7 +145,9 @@ with local YANG files instead of downloaded schemas, as for `ncurl monitor`.
 
 ## Automatic drift detection
 
-When a device advertises `ietf-netconf-notifications` (RFC 6470), the
+When a device advertises `ietf-netconf-notifications` (RFC 6470) and
+StratoWeave keeps its running configuration (see
+[Running configuration](../operations/devices.md#running-configuration)), the
 `DeviceMgr` subscribes itself to `netconf-config-change` and triggers a resync
 on it — out-of-band configuration drift is detected the moment the device
 reports it, rather than on the next reconnect. IOS XE reports changes made

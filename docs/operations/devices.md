@@ -45,6 +45,15 @@ managed device:
 In a two-layer system this is the CFS transform. In a three-layer system it
 would be the intermediate layer.
 
+## Running configuration
+
+StratoWeave reads the running configuration of a device when it first has
+configuration for the device, or when something asks for it, like
+`GET /device/<name>/running`. From then on it reads it again on every
+connect, on every `netconf-config-change` from the device and after a
+software upgrade. A device that StratoWeave only reads data from or
+subscribes to gets no configuration reads.
+
 ## Exposing device inputs on the northbound
 
 If device address, credentials, or adapter selection should be operator
