@@ -169,17 +169,25 @@ an earlier attempt is still under way, and else the member's `attempt`.
 Its `attempt` says which one. A member whose device has not answered that
 attempt shows `pending`, and the counters do not count it. A member that
 runs its target release already answers `up-to-date`: `succeeded` counts
-it, and `up-to-date` counts it again. It still waits for a window and is
-released in it, but it installs nothing and is done at once.
+it, and `up-to-date` counts it again.
 
-The campaign releases a member only once the member has answered its
-target: its status is `upgrade-needed`, or a final status. A member that
-shows `pending` or `unknown` has not answered. Until it answers, the plan
-holds the member in its window, and the plan's alarms name it. A campaign
-in `plan` plans again as the answers come in. Its plan is that of a run
-that starts now, so it shows what `run` would do. A campaign created
-directly in `run` promises its windows in the order its members answer.
-Create it in `plan` first to keep the campaign's order.
+A member answers the campaign's target with `upgrade-needed` or a final
+status, and the campaign releases a member only once it answers
+`upgrade-needed`. A member whose status is final while it waits, such as
+`up-to-date`, is done at once: it takes no window. The next member of its
+redundancy groups waits the group's `min-separation` from the answer of a
+member that is up to date, or, when that member upgraded in this run
+before a new attempt or before it joined again, from the end of that
+upgrade. After one that upgraded before a pause, it waits the
+`min-separation` from that member's report. A failed one still counts as
+failed: it counts against `failure-budget` and holds its redundancy groups
+as their `failure-policy` says. A member that shows `pending` or `unknown`
+has not answered. Until it answers, the plan holds the member in its
+window, and the plan's alarms name it. A campaign in `plan` plans again as
+the answers come in. Its plan is that of a run that starts now, so it
+shows what `run` would do. A campaign created directly in `run` promises
+its windows in the order its members answer. Create it in `plan` first to
+keep the campaign's order.
 
 A device in the fleet is in one campaign at most, also while the campaign
 is in `plan` and after it is done. An edit that names a device in a second
@@ -194,10 +202,11 @@ error, until only one campaign names it.
 Setting a running campaign back to `plan` pauses it. A member in flight
 stops before its install and shows `upgrade-needed`. A member past its
 install finishes. Setting the campaign to `run` again releases the paused
-members again. A member that still reports `in-progress` for the campaign
-then, or after a restart of fleetmgr, counts in flight and keeps the
-campaign's veto: it holds a slot and its redundancy groups until it is
-done, or until it stops before its install and waits again.
+members again; the members that ended are done at once. A member that
+still reports `in-progress` for the campaign then, or after a restart of
+fleetmgr, counts in flight and keeps the campaign's veto: it holds a slot
+and its redundancy groups until it is done, or until it stops before its
+install and waits again.
 
 Stopping and running a campaign again does not try its failed members
 again, and neither does removing a member and adding it again: its device
@@ -207,7 +216,9 @@ waits for a window. To try a member again, change its `attempt`, for
 example from 0 to 1. The campaign then takes it as a new member: the
 device reads its release again, and the campaign holds the member until
 it answers the new attempt, and releases it in a window. A member that
-succeeded reads again and answers `up-to-date`. A member in flight gets
+succeeded reads again and answers `up-to-date`; when it upgraded in this
+run, the next member of its redundancy groups waits the `min-separation`
+from the end of that upgrade, not from the answer. A member in flight gets
 the campaign's veto back: its run stops before the install, or, past the
 install, finishes and holds its slot until it ends.
 
@@ -274,11 +285,11 @@ fleetmgr keep it, and deleting the campaign clears it. Before the first run,
 the plan counts from now. A window that opens earlier is left out, also when
 it closes later, and a campaign without a schedule opens its window at the
 end of the period. The prepares spread over the period, because the first
-window that the campaign uses is their deadline. A member added later, and a
-member that is up to date, gets no notice of its own: it gets the first
-window that the campaign uses. Raising `notification-period` during a run
-takes windows away: the members released in them keep them, and the others
-get the next window that is left.
+window that the campaign uses is their deadline. A member added later gets
+no notice of its own: it gets the first window that the campaign uses.
+Raising `notification-period` during a run takes windows away: the members
+released in them keep them, and the others get the next window that is
+left.
 
 With `allow-staging`, a campaign in `run` lets each member that needs the
 upgrade, and that the plan gives a window, prepare once before its window:

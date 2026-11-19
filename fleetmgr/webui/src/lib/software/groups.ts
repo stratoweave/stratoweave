@@ -140,8 +140,8 @@ export function rollbackFailed(row: DeviceStatusRow): boolean {
   return (row.status === 'failed' && row.stage === 'rollback') || row.status === 'not-started';
 }
 
-/** held comes first: only an unreleased member is held, up-to-date ones
- * too, as the controller releases those in their turn as well. */
+/** held comes first: only a member that waits is held. A member whose
+ * status is final while it waits is done at once and waits for nothing. */
 function memberState(status: KnownStatus, held: boolean): MemberState {
   if (held) return 'held';
   if (status === 'succeeded' || status === 'up-to-date') return 'done';
