@@ -946,19 +946,32 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     release, the one in-progress counts, else the member's attempt. A
     not-started attempt counts as a failed rollback. The controller
     releases only the members that answer upgrade-needed. A member whose
-    status is final while it waits is done at once, and the plan holds
-    the members that have not answered with an alarm. A member that still upgrades from before a pause or a restart
-    counts in flight, and keeps the veto. In plan, the actor plans what a
-    new run would do, again when what the members report changes. A member
-    that leaves the campaign is forgotten: added again, it is a new member.
-    So is a member with a new attempt. A run of an earlier attempt that is
-    still under way counts in flight until it ends.
+    status is final while it waits is done at once, and the plan holds the
+    members that have not answered with an alarm. A member that still
+    upgrades from before a pause or a restart counts in flight, and keeps
+    the veto. A pause keeps the run: when the campaign runs again, the
+    members that are done keep their times, the promises, the ramp, the
+    pace and the prepare-starts stay, and a member released before the
+    pause that did not start its run waits again in its window. In plan,
+    the actor plans what run would do, again when what the members report
+    changes: before the first run a run that starts now, and in a pause the
+    run that carries on. A member that leaves the campaign is forgotten:
+    added again, it is a new member. So is a member with a new attempt. A
+    member with a new target release keeps its promise; one that is done
+    for the old target waits again, and upgrades to the new one, or is done
+    again when its device runs it already. One whose rollback failed stays
+    done until its device reports another final status, it gets a new
+    attempt, or it leaves the campaign, also when its status is lost. A run
+    of an earlier attempt that is still under way counts in flight until it
+    ends.
 
     With allow-staging, in run, the actor writes allow-staging for each
     member from its turn to prepare until its prepare ends, it is released,
-    or a window of its schedule opens, as the controller says. A prepare
-    counts only when it is the prepare of the member's attempt and copies
-    the member's target release.
+    a window of its schedule opens, or the campaign is set to plan, as the
+    controller says. When the campaign runs again, each member let that has
+    not prepared is let again, with its prepare-start. A prepare counts
+    only when it is the prepare of the member's attempt and copies the
+    member's target release.
 
     The actor takes run-since from the campaign's memory, gives the
     controller the windows that the notification period lets the campaign
@@ -1008,7 +1021,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var debounce_s = 0.0
     var ctl = fctl.Controller()
     # The controller that made the published plan: ctl in run, and in plan
-    # a copy of it that starts a new run.
+    # a copy of it that runs from now (plan_now).
     var shown = fctl.Controller()
     # The campaign and the inventory from the last on_conf, the target
     # release and the attempt of each member, the output written last, and the
@@ -1026,8 +1039,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
 
     def unheld_now() -> set[str]:
         """Return the members in flight that run an upgrade. A member that
-        still upgrades from before the run keeps the veto: it stops if it
-        has not reached its install."""
+        still upgrades from before a pause or a restart keeps the veto: it
+        stops if it has not reached its install. So does a member whose
+        final report has not counted yet, such as one that finished during
+        a pause."""
         return ctl.upgrading()
 
     def counted(name: str):
@@ -1080,15 +1095,16 @@ actor UpgradeCampaignTransform(path: ttt.Path,
 
     def plan_now(now: int) -> None:
         """Plan at time now. A campaign that does not run plans on a copy of
-        the controller that starts a run now, so the plan shows what run
-        would do: the members that a paused run released wait again, and
-        the ramp and the pace start over."""
+        the controller that runs from now, as on_conf runs it when the
+        campaign goes to run (carried_on). So the plan shows what run would
+        do. Before the first run, that is a run that starts now. In a pause,
+        it is the run that carries on: the members that are done keep their
+        times, the members in flight keep their start, and the promises,
+        the ramp, the pace and the prepare-starts stay."""
         if running:
             shown = ctl
         else:
-            c = ctl.copy()
-            c.start()
-            shown = c
+            shown = ctl.carried_on(now)
         p = shown.plan(now)
         plan_layout = shown.layout(p)
         plan_alarms = p.alarms
@@ -1237,7 +1253,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     def take_live(name: str) -> bool:
         """Tell the controller whether the member name is up, after a change.
         Return True when the campaign must decide for the change. In plan,
-        any change can change the plan: the plan is that of a new run."""
+        any change can change the plan: the plan is that of a run from now
+        (plan_now)."""
         if ctl.set_live(name, live(name)):
             return True
         return not running
@@ -1459,6 +1476,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         for name, r in new_attempts.items():
             if name in member_names and r != attempts.get_def(name, 0):
                 tried_again.add(name)
+        old_names = member_names
         members = ms
         member_names = names
         debounce_s = float(campaign_debounce_s(len(members)))
@@ -1467,6 +1485,14 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         inventory = y_0.root.from_gdata(linked)
         now = time.time().unix_s()
         member_info = campaign_members(conf, inventory)
+        # The members that stay and get a new target release, such as a new
+        # version of their image. A target that appears or goes counts.
+        new_targets = member_targets(conf, inventory)
+        retargeted: set[str] = set()
+        for name in ms:
+            if name in old_names and name not in tried_again \
+               and new_targets.get(name) != targets.get(name):
+                retargeted.add(name)
         # The released devices, the ramp and the promises stay: a replan
         # goes on from where the run is.
         configure_campaign(ctl, conf, inventory, now, member_info, run_since)
@@ -1474,6 +1500,11 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         # a new attempt. Added again, a member waits until it answers, and
         # starts in a window.
         ctl.drop(left | tried_again)
+        # A member done for its old target waits again, and the prepares
+        # for the old target go. This comes before the run starts or
+        # stops, so that a plan in a pause shows what the run does, and
+        # before the members report again below.
+        ctl.retarget(retargeted)
         take_all_live()
         run_now = conf.admin_state == "run"
         if run_now and not running:
@@ -1481,7 +1512,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         elif running and not run_now:
             ctl.stop()
         running = run_now
-        targets = member_targets(conf, inventory)
+        targets = new_targets
         attempts = new_attempts
         # A new image makes the answers and the prepares for the old target
         # stale, and no device reports that. So report every member again.

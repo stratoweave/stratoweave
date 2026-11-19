@@ -681,17 +681,53 @@
   counts them too. [#816]
 - A campaign member whose status is final while it waits is done at once,
   without a release: a member that is up to date, or one that succeeded or
-  failed before a pause. It takes no window and no slot, and adds nothing to
-  the pace or the ramp. The next member of its redundancy groups waits the
-  group's `min-separation` from the answer of a member that is up to date,
-  or, when that member upgraded in the run before it got a new attempt or
-  joined again, from the end of that upgrade. After one that upgraded before
-  a pause it waits the `min-separation` from that member's report. A failed
+  failed before it left the campaign and joined it again with the same
+  attempt. It takes no window and no slot, and adds nothing to the pace or
+  the ramp. The next member of its redundancy groups waits the group's
+  `min-separation` from the answer of a member that is up to date, or, when
+  that member upgraded in the run before it got a new attempt or joined
+  again, from the end of that upgrade. After one that succeeded or failed
+  before, it waits the `min-separation` from that member's report. A failed
   one still counts against the failure budget and holds its groups as their
-  `failure-policy` says. The plan shows it in no window, and the
-  campaign page counts it as already done. It waits again when its final
-  status goes. Before, it waited for a window of its schedule and held a
-  slot there until the next decision. [#830]
+  `failure-policy` says. The plan shows it in no window, and the campaign
+  page counts it as already done. It waits again when its final status
+  goes, unless its rollback failed. Before, it waited for a window of its
+  schedule and held a slot there until the next decision. [#830]
+- A paused campaign carries its run on. Before, setting a campaign from
+  `plan` back to `run` started a new run: the members released before the
+  pause were released again, the windows and the prepare turns were given
+  out again, and the ramp, the concurrency and the expected pace started
+  over. Now the members that are done keep their start and finish, and the
+  next members of their redundancy groups wait the `min-separation` from
+  when they were done. A member that still upgrades keeps its slot and the
+  campaign's veto, also when its final report comes in the pause. A member
+  released before the pause that stopped before its install waits again in
+  the window it was released in, before the members promised that window
+  after it. The waiting members keep their windows, and the ramp, the
+  concurrency and the pace stay. Each member keeps its `prepare-start`: one
+  that prepared is not let prepare again, and one that was let and has not
+  prepared is let again. In `plan`, the plan shows what the run does when it
+  goes on. To start a campaign over, delete it and create it again. A new
+  version of a member's image makes a member that is done wait again and
+  upgrade to it, and lets a member prepare it again. A member whose device
+  runs that version already is done again; when it upgraded in the run, the
+  next members of its redundancy groups still wait the `min-separation` from
+  the end of that upgrade or a later boot, or from its answer or boot when
+  its device answered `upgrade-needed` in between. The next members never
+  wait less than the `min-separation` from the end of an upgrade that a
+  member ran in the run, also when its device tells a boot before then. A
+  member that needs the upgrade waits the `min-separation` from when each
+  other member of its redundancy groups was done after an upgrade in the
+  run, or with a final status other than `up-to-date`, also one after it in
+  the group, as when it waits again after a new version or a new attempt,
+  also after a restart of fleetmgr, or when it is added to a running
+  campaign; before, it could start right after such a member was done. A
+  member whose upgrade to the old version ended in the pause is done for
+  that version, and upgrades to the new one in a window. A member whose
+  rollback failed stays done and failed, holds its redundancy groups and
+  counts against the failure budget, until its device reports another final
+  status, it gets a new attempt, or it leaves the campaign, also when its
+  status is lost.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -868,8 +904,8 @@
   tells. After a restart of fleetmgr, the next member of its redundancy
   groups then need not wait for a device that has run the target for
   months, and waits the `min-separation` from the boot of one that booted
-  a minute ago. When the campaign saw the member's upgrade end, in the run
-  or before a pause, the member is done at that end, or at a later boot.
+  a minute ago. When the campaign saw the member's upgrade end in the run,
+  the member is done at that end, or at a later boot.
   A member whose device does not tell is done at its answer, as before.
   [#842]
 
