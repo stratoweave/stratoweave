@@ -1,7 +1,8 @@
 """Snapshot tests of the plan timeline. The first tests draw small layouts
 that are made by hand, one rule of the drawing in each. The other tests
 draw the plan of the real controller in a set of scenarios, so that the
-snapshots show how the controller shares the slots between windows."""
+snapshots show how the controller shares the slots between windows, and
+how its plan changes through a pause or an edit of a run."""
 
 import testing
 
@@ -651,3 +652,258 @@ def _test_new_attempt_rebooted_after_the_upgrade() -> str:
     c = tried_again(NOV17 + HOUR + 12 * 60)
     return panel("01:15, the r devices have a new attempt and are up to date", c,
                  NOV17 + HOUR + 15 * 60)
+
+
+#############################################################################
+# The plan through a pause and an edit
+#############################################################################
+
+def run(c: fleet_ctl.Controller, t0: int, until: int, took: dict[str, int],
+        flying: list[(int, str)]) -> list[(int, str)]:
+    """Run the controller c as the campaign runs it, from the second t0 to
+    the last decision before the second until. A decision comes at t0, at
+    each wake, and one debounce after an upgrade ends. Each device that
+    starts reports in-progress at its start, and succeeded at its end: the
+    time in took after its start, or else its estimate. flying holds the
+    devices in flight at t0, as (end, name). Return the devices in flight
+    after the last decision."""
+    left = flying
+    t = t0
+    while t < until:
+        still: list[(int, str)] = []
+        for f in left:
+            if f.0 <= t:
+                c.report(f.1, "succeeded", f.0)
+            else:
+                still.append(f)
+        left = still
+        s = c.decide(t)
+        for name in s.started:
+            c.report(name, "in-progress", t)
+            left.append((t + took.get_def(name, c.est[name]), name))
+        if s.finished:
+            break
+        nxt = s.wake
+        for f in left:
+            if nxt < 0 or f.0 + c.debounce < nxt:
+                nxt = f.0 + c.debounce
+        if nxt < 0:
+            break
+        t = nxt
+    return left
+
+
+def pause(c: fleet_ctl.Controller, flying: list[(int, str)], at: int, until: int,
+          stopped: list[str]) -> list[(int, str)]:
+    """Pause the run of c at the second at, and run again at the second
+    until. flying holds the devices in flight at at, as (end, name). The
+    devices in stopped stop before their install one minute after at, and
+    report upgrade-needed. The others report succeeded at their end when it
+    is not after until. Return the devices in flight at until."""
+    c.stop()
+    left: list[(int, str)] = []
+    for f in flying:
+        if f.1 in stopped:
+            c.report(f.1, "upgrade-needed", at + 60)
+        elif f.0 <= until:
+            c.report(f.1, "succeeded", f.0)
+        else:
+            left.append(f)
+    c.start()
+    return left
+
+
+def edit(c: fleet_ctl.Controller, windows: list[(str, int, int)], devs: list[(str, int, str)],
+         target: int, maxc: int, debounce: int, estimate: int, stagger: int) -> None:
+    """Configure c again with the windows, the devices and the limits, as
+    make() configures it."""
+    c.configure([(w.0, NOV17 + w.1, NOV17 + w.2) for w in windows], devs, target, maxc, False,
+                debounce, estimate, {}, {}, {}, fleet_ctl.CLOSE_MARGIN, stagger, False,
+                {d.0: 100 for d in devs}, -1, None)
+
+
+def _test_pause_in_window() -> str:
+    """A pause inside a window. The schedule night has a window from 01:00
+    to 03:00 on Tue 17 and on Wed 18, and 50 devices of 600 s. Target 4,
+    max 8, the ramp from 1, and the run starts at 01:00. At 01:25 the plan
+    runs at concurrency 4. It promises Tue 17 to 41 devices and Wed 18 to
+    9, and the 4 devices that started at 01:20 are in flight. Then the run
+    pauses. d5 stops before its install and reports upgrade-needed, and
+    the other 3 end at 01:30. At 01:45 the run starts again as a new run.
+    The 8 devices that are done are done without a release, so the drawing
+    does not show them. The ramp starts again from 1: 1 device starts at
+    01:45, and 4 every ten minutes from 01:55 to 02:45, 25 devices in Tue
+    17. The plan stays at concurrency 4, so the other 8 devices of Tue 17
+    go to Wed 18, which has 17 devices from 01:00 to 01:40."""
+    wins = daily("night", HOUR, 2 * HOUR, 2)
+    c = make(wins, devices("d", 50, 600, "night"), 4, 8, 0, 600, 0, 1)
+    flying = run(c, NOV17 + HOUR, NOV17 + HOUR + 25 * 60, {}, [])
+    before = panel("01:25, before the pause", c, NOV17 + HOUR + 25 * 60)
+    pause(c, flying, NOV17 + HOUR + 25 * 60, NOV17 + HOUR + 45 * 60, ["d5"])
+    return before + "\n" + panel("01:45, after the pause", c, NOV17 + HOUR + 45 * 60)
+
+
+def _test_pause_across_close() -> str:
+    """A long pause in which a window closes. The schedule night has a
+    window from 01:00 to 03:00 on Tue 17, Wed 18 and Thu 19, and 60 devices
+    of 600 s. Target 4, max 8, the ramp from 1, and the run starts at 01:00
+    on Tue 17. At 01:25 the plan runs at concurrency 4, and promises Tue 17
+    to 41 devices and Wed 18 to 19. Then the run pauses until 00:30 on Wed
+    18. The 4 devices in flight end at 01:30, and the window of Tue 17
+    closes at 03:00. At 00:30 on Wed 18 the run starts again as a new run.
+    The 9 devices that are done are done without a release, so the drawing
+    has no window of Tue 17. The ramp starts again from 1, and the plan
+    stays at concurrency 4: Wed 18 starts 1 device at 01:00, and 4 every
+    ten minutes from 01:10 to 02:40, 41 devices. The other 10 devices go to
+    Thu 19, from 01:00 to 01:20."""
+    wins = daily("night", HOUR, 2 * HOUR, 3)
+    c = make(wins, devices("d", 60, 600, "night"), 4, 8, 0, 600, 0, 1)
+    flying = run(c, NOV17 + HOUR, NOV17 + HOUR + 25 * 60, {}, [])
+    before = panel("Tue 01:25, before the pause", c, NOV17 + HOUR + 25 * 60)
+    pause(c, flying, NOV17 + HOUR + 25 * 60, NOV17 + DAY + 30 * 60, [])
+    return before + "\n" + panel("Wed 00:30, after the pause", c, NOV17 + DAY + 30 * 60)
+
+
+def _test_pause_in_groups_after_a_boot() -> str:
+    """A pause in redundancy groups, with devices that booted again after
+    their upgrade. The schedule night has a window from 01:00 to 03:00 on
+    Tue 17 and on Wed 18. For each N from 0 to 3, the group gN has rN and
+    then sN, with a min-separation of 30 minutes. All 8 devices take 600 s.
+    Target 4, max 4, the ramp at 4, and the run starts at 01:00. r0 to r3
+    start at 01:00 and succeed at 01:10, and their devices boot again at
+    01:12. The run pauses at 01:13 and goes on at 01:15, and each rN
+    reports succeeded again, as the campaign gives it then. Or each rN gets
+    a new attempt in the pause, and answers at 01:15 that it runs the
+    target. In both cases the run starts again as a new run at 01:15, and
+    the r devices are done without a release, so the drawing does not show
+    them. The boot is later than the end of their upgrades, so the s
+    devices wait the min-separation from the boot, and start at 01:42."""
+    t0 = NOV17 + HOUR
+    t = t0 + 15 * 60
+    out: list[str] = []
+    for again in [False, True]:
+        c = pairs(4)
+        for i in range(4):
+            c.report("r{i}", "upgrade-needed", 0)
+            c.report("s{i}", "upgrade-needed", 0)
+        c.start(4)
+        for name in c.decide(t0).started:
+            c.report(name, "in-progress", t0)
+        for i in range(4):
+            c.report("r{i}", "succeeded", t0 + 600)
+        c.decide(t0 + 600)
+        booted(c, ["r{i}" for i in range(4)], t0 + 12 * 60)
+        c.stop()
+        if again:
+            c.drop({"r{i}" for i in range(4)})
+        c.start(4)
+        for i in range(4):
+            c.report("r{i}", "up-to-date" if again else "succeeded", t)
+        label = "01:15, the run goes on after a pause"
+        if again:
+            label = "01:15, the r devices got a new attempt in the pause and are up to date"
+        out.append(panel(label, c, t))
+    return "\n".join(out)
+
+
+def _test_restart_in_groups_after_an_upgrade() -> str:
+    """A restart of fleetmgr in redundancy groups, after the second member
+    of each group upgraded. The schedule night has a window from 01:00 to
+    03:00 on Tue 17 and on Wed 18. For each N from 0 to 3, the group gN
+    has rN and then sN, with a min-separation of 30 minutes. All 8 devices
+    take 600 s. Target 4, max 4, and the ramp at 4. Before the restart, s0
+    to s3 upgraded and succeeded, and each rN got a new attempt. The run
+    starts again at 01:15, with a new controller that does not know of
+    these upgrades: each sN reports that it succeeded, and each rN answers
+    that it needs the upgrade. In the first panel, the s devices tell
+    that they last booted at 01:08; in the second, they tell
+    no boot. The s devices are done without a release, so the drawing
+    does not show them. The r devices go first in their groups and wait
+    for no other member, so in both panels they start at once, at 01:15,
+    as the ramp at 4 lets them."""
+    t = NOV17 + HOUR + 15 * 60
+    out: list[str] = []
+    for boot in [True, False]:
+        c = pairs(4)
+        for i in range(4):
+            c.report("r{i}", "upgrade-needed", t)
+        if boot:
+            booted(c, ["s{i}" for i in range(4)], NOV17 + HOUR + 8 * 60)
+        for i in range(4):
+            c.report("s{i}", "succeeded", t)
+        c.start(4)
+        label = "01:15, after a restart, the s devices booted at 01:08"
+        if not boot:
+            label = "01:15, after a restart, the s devices tell no boot"
+        out.append(panel(label, c, t))
+    return "\n".join(out)
+
+
+def _test_edit_higher_limits() -> str:
+    """A higher target-concurrency or max-concurrency in the middle of a
+    run. The schedule night has a window from 01:00 to 03:00 on Tue 17 and
+    on Wed 18, and 60 devices of 600 s. Target 4, max 8, the ramp from 1,
+    and the run starts at 01:00. d0 takes 1200 s, two times its estimate.
+    The ramp waits for it until 01:20, and the run goes to concurrency 6 to
+    keep its promises. Tue 17 starts 1 device at 01:00, 4 at 01:20, and 6
+    every ten minutes from 01:30 to 02:20: 41 devices. Wed 18 starts 6
+    devices at 01:00, 01:10 and 01:20, and 1 at 01:30. At 02:05 the
+    target-concurrency goes from 4 to 5, or the max-concurrency goes from 8
+    to 10. Each edit drops the concurrency to the target: to 5 after the
+    new target, and to 4 after the new max. So the last start of Tue 17
+    moves from 02:20 to 02:30, and after the new max the last start of Wed
+    18 moves from 01:30 to 01:40."""
+    wins = daily("night", HOUR, 2 * HOUR, 2)
+    devs = devices("d", 60, 600, "night")
+    c = make(wins, devs, 4, 8, 0, 600, 0, 1)
+    t = NOV17 + 2 * HOUR + 5 * 60
+    run(c, NOV17 + HOUR, t, {"d0": 1200}, [])
+    higher = c.copy()
+    edit(higher, wins, devs, 5, 8, 0, 600, 0)
+    wider = c.copy()
+    edit(wider, wins, devs, 4, 10, 0, 600, 0)
+    return panel("02:05, before the edit", c, t) + "\n" \
+        + panel("02:05, after the target-concurrency goes from 4 to 5", higher, t) + "\n" \
+        + panel("02:05, after the max-concurrency goes from 8 to 10", wider, t)
+
+
+def _test_edit_window_moved() -> str:
+    """Windows that an edit moves while devices are promised to them. The
+    schedule night has a window from 01:00 to 03:00 on Tue 17, Wed 18 and
+    Thu 19, and 100 devices of 600 s. Target 4, max 8, the ramp from 1,
+    and the run starts at 00:00. At 00:30 the plan runs at concurrency 4,
+    and promises Tue 17 to 41 devices, Wed 18 to 44 and Thu 19 to 15. Then
+    each window moves an hour later, to 02:00 to 04:00, as a new
+    utc-offset of the schedule does. The promises of the windows that
+    moved go to the first window that has not closed, Tue 17. The plan
+    goes to concurrency 8, the max, and starts 77 devices in Tue 17 and 23
+    in Wed 18, with an alarm that these 23 devices will miss the window
+    they were promised. Thu 19 has no devices."""
+    wins = daily("night", HOUR, 2 * HOUR, 3)
+    devs = devices("d", 100, 600, "night")
+    c = make(wins, devs, 4, 8, 0, 600, 0, 1)
+    run(c, NOV17, NOV17 + 30 * 60, {}, [])
+    before = panel("00:30, before the edit", c, NOV17 + 30 * 60)
+    edit(c, daily("night", 2 * HOUR, 2 * HOUR, 3), devs, 4, 8, 0, 600, 0)
+    return before + "\n" + panel("00:30, after the windows move an hour later", c,
+                                 NOV17 + 30 * 60)
+
+
+def _test_edit_promised_nowhere() -> str:
+    """Devices that the plan can start in no window. The schedule night has
+    a window from 01:00 to 03:00 on Tue 17 and on Wed 18, and 50 devices of
+    600 s. Target 4 and max 4, the ramp from 1, and the run starts at
+    00:00. At 00:30 the plan promises Tue 17 to 41 devices and Wed 18 to 9,
+    d41 to d49. Then an edit takes away the window of Wed 18. Its promises
+    go to Tue 17. At max 4, Tue 17 has room only for the 41 devices
+    promised to it before. So the plan starts d41 to d49 in no window, and
+    gives an alarm for them. The drawing does not show them: Tue 17 has 41
+    devices."""
+    wins = daily("night", HOUR, 2 * HOUR, 2)
+    devs = devices("d", 50, 600, "night")
+    c = make(wins, devs, 4, 4, 0, 600, 0, 1)
+    run(c, NOV17, NOV17 + 30 * 60, {}, [])
+    before = panel("00:30, before the edit", c, NOV17 + 30 * 60)
+    edit(c, daily("night", HOUR, 2 * HOUR, 1), devs, 4, 4, 0, 600, 0)
+    return before + "\n" + panel("00:30, after the edit takes away the window of Wed 18", c,
+                                 NOV17 + 30 * 60)
