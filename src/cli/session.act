@@ -8,10 +8,10 @@ so a slow device never stops the editor.
 if there is none with changes yet. The candidate lives in the session: it
 stays when the user leaves configuration mode, and goes when the CLI exits.
 
-Without a terminal on stdout, the session reads commands line by line from
-stdin and prints only their output. A command script ends with `exit`, after
-`exit configuration-mode` when it is in configuration mode. A command given as
-arguments runs alone, and the CLI exits after it.
+Without a terminal on both stdin and stdout, the session reads commands line
+by line from stdin and prints only their output. A command script ends with
+`exit`, after `exit configuration-mode` when it is in configuration mode. A
+command given as arguments runs alone, and the CLI exits after it.
 """
 
 import std.argparse
@@ -33,6 +33,11 @@ import cli.candidate as candidate
 import cli.command as command
 import cli.lineedit as lineedit
 import cli.path as cpath
+
+
+# Terminal sequences that turn bracketed paste on and off.
+BRACKETED_PASTE_ON = "\x1b[?2004h"
+BRACKETED_PASTE_OFF = "\x1b[?2004l"
 
 
 class EditorSink(logging.Sink):
@@ -76,7 +81,7 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
     module_sets = args.get_strlist("module-set")
     timeout = float(args.get_int("timeout"))
     oneshot = args.get_strlist("command")
-    interactive = len(oneshot) == 0 and env.stdio.is_tty()
+    interactive = len(oneshot) == 0 and env.stdio.stdin_is_tty() and env.stdio.stdout_is_tty()
     op_prompt = "{username}@{host}> "
     config_prompt = "{username}@{host}# "
     editor = lineedit.LineEditor(op_prompt)
@@ -115,6 +120,8 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
     def finish(code: int):
         if not done:
             done = True
+            if interactive:
+                out(BRACKETED_PASTE_OFF)
             env.exit(code)
 
     def fail(msg: str):
@@ -434,6 +441,10 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
         elif kind == "interrupt":
             out("\n")
             editor.reset()
+            if confirm:
+                # Ctrl-C answers no.
+                execute("no")
+                return
             prompt()
         elif kind == "complete":
             on_complete()
@@ -446,11 +457,27 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
         else:
             out(editor.render())
 
+    def interrupt():
+        """Stop waiting on Ctrl-C: exit while connecting, else drop the
+        request in flight and the keys typed ahead."""
+        out("\n")
+        if not ready:
+            finish(1)
+            return
+        busy = False
+        request += 1
+        pending = None
+        pending_keys = []
+        prompt()
+
     def on_key(k: lineedit.Key):
         if done:
             return
         if not ready or busy:
-            pending_keys.append(k)
+            if k.name == "ctrl-c":
+                interrupt()
+            else:
+                pending_keys.append(k)
         else:
             handle_key(k)
 
@@ -482,6 +509,17 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
                 prompt()
 
     def start():
+        # Take stdin before the YANG load, so keys typed during it wait for
+        # the prompt.
+        if len(oneshot) > 0:
+            lines.append(" ".join(oneshot))
+        else:
+            env.stdio.stdin_install(on_stdin_bytes=on_bytes)
+            if interactive:
+                env.stdio.set_stdin(raw=True)
+                # The terminal marks pasted text, so the line editor inserts
+                # it as it is.
+                out(BRACKETED_PASTE_ON)
         try:
             if yang_dir != "":
                 local_schema = local_yang.load(file.FileCap(env.cap), yang_dir, modules, module_sets)
@@ -495,12 +533,6 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
             return
         if interactive:
             out("Connecting to {host}:{port}...\n")
-        if len(oneshot) > 0:
-            lines.append(" ".join(oneshot))
-        else:
-            env.stdio.stdin_install(on_stdin_bytes=on_bytes)
-            if interactive:
-                env.stdio.set_stdin(canonical=False, echo=False)
         ls = local_schema
         bundled = ls if ls is not None else yschema.DRoot()
         dev_types = {

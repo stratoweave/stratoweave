@@ -864,7 +864,8 @@
 - Requires Acton newer than 0.31.0, for explicit parameter defaults
   [acton#3211], the `Env` services [acton#2768], the write barriers of the
   generational garbage collector [acton#3390], HTTP server bodies as bytes
-  [acton#3403] and compressed HTTP responses [acton#3404].
+  [acton#3403], compressed HTTP responses [acton#3404] and the raw terminal
+  mode of stdin [acton#3419].
 
 #### acton-yang
 - gdata is encoded as compact XML and JSON by default, as in the Acton
@@ -1239,6 +1240,7 @@ next. Give it a spin. We’d love to hear what you think.
 [acton#3403]: https://github.com/actonlang/acton/pull/3403
 [acton#3404]: https://github.com/actonlang/acton/pull/3404
 [acton#3410]: https://github.com/actonlang/acton/pull/3410
+[acton#3419]: https://github.com/actonlang/acton/pull/3419
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
 [acton-ssh#6]: https://github.com/actonlang/acton-ssh/pull/6
 [acton-ssh#15]: https://github.com/actonlang/acton-ssh/pull/15
