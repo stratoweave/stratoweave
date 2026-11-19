@@ -823,6 +823,7 @@
   folder, with an empty sparse file for each in `out/images`. `demo.xml`,
   `demo-campaign.xml`, `upgrade.xml`, `just upgrade` and `just
   upgrade-and-watch` are gone. [#825]
+- A `/fleet/device` has the device's `last-boot` in `state/platform`. [#841]
 
 ### Dependencies
 
