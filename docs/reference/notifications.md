@@ -110,6 +110,9 @@ channels:
   session per stream** — forced by 5277 itself: one anonymous subscription per
   session, no modify or cancel, and no other RPCs without `:interleave`.
 
+A device that the adapter polls, because its `telemetry` device setting is
+`poll` or, without the setting, on IOS XR and ArcOS, uses RFC 5277.
+
 Demux is always by notification name on our side; device-side filters are only
 bandwidth optimizations. That also means routing mistakes fail soft — but a
 name routed to a stream the device never emits it on is **silent

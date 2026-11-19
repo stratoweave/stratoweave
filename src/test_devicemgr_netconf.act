@@ -9,6 +9,7 @@ import yang.gdata as ygdata
 import yang.schema as yschema
 
 import device as swdev
+import adapters.adapter as swadapt
 import adapters.netconf as swna
 import netconf
 import ssh.pipe as sshpipe
@@ -137,13 +138,14 @@ def _has_boot_datetime(n: ?ygdata.Node) -> bool:
                 return clock.get_opt_leaf(_q("boot-datetime")) is not None
     return False
 
-def make_netconf_mock_dmc(name: str, sync_check: bool=True) -> DeviceMetaConfig:
+def make_netconf_mock_dmc(name: str, sync_check: bool=True, telemetry: ?str=None) -> DeviceMetaConfig:
     return DeviceMetaConfig(
         name=name,
         credentials=Credentials("admin", "admin"),
         type="netconf",
         address=[Address(name="primary", address="127.0.0.1", port=u64(830))],
         sync_check=sync_check,
+        telemetry=telemetry,
         mock=Mock(enabled=True)
     )
 
@@ -1317,6 +1319,61 @@ actor _test_subscribe_periodic_yang_push(t: testing.EnvT):
     start()
 
     after 2.0: fail("Timed out waiting for periodic yang-push subscription updates")
+
+
+actor _test_subscribe_telemetry_setting(t: testing.EnvT):
+    """The telemetry setting selects how a periodic subscription reads a
+    device that advertises ietf-yang-push. Without the setting the adapter
+    uses YANG-push. With the setting poll, the adapter connects again and
+    polls with get."""
+    name = "dev-telemetry-setting"
+    var done = False
+    var switched = False
+
+    def noop_on_reconf(name: str):
+        pass
+    dev = new_netconf_mock_device_mgr(t, name, noop_on_reconf, extra_models=YP_CLOSURE)
+
+    def fail(msg: str):
+        if done:
+            return
+        done = True
+        t.failure(ValueError(msg))
+
+    def on_update(n: ?ygdata.Node, err: ?Exception):
+        if done:
+            return
+        if err is not None:
+            fail("Subscription update error: {err}")
+            return
+        method = dev.subscription_status().method
+        if not switched:
+            if method != swadapt.SUBSCRIPTION_YANG_PUSH:
+                fail("Expected yang-push without the setting, got {method}")
+                return
+            switched = True
+            dev.set_dmc(make_netconf_mock_dmc(name, telemetry="poll"))
+        elif method == swadapt.SUBSCRIPTION_POLL:
+            done = True
+            dev.remove_subscriptions("test-telemetry-setting")
+            t.success()
+
+    def start():
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            ms = adapter.get_mock_server()
+            if ms is not None:
+                ms.set_oper_ds(_mock_oper_ds("2026-02-21T10:11:12Z", "2025-12-31T00:00:00Z"))
+                want = set([ygdata.SubscriptionSpec(None, period=0.05)])
+                dev.declare_subscriptions("test-telemetry-setting", on_update, want)
+            else:
+                fail("Expected NetconfMockServer from NetconfAdapter")
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    start()
+
+    after 3.0: fail("Timed out waiting for polling after telemetry was set to poll (switched={switched})")
 
 
 actor _test_subscribe_periodic_yang_push_empty(t: testing.EnvT):

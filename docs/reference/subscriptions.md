@@ -300,7 +300,8 @@ The delivery contract:
 Both TTT and device providers decide on-change from `period` alone. The
 legacy `on_change` field on `SubscriptionSpec` does not select the mode.
 The `NetconfDriver` accepts on-change only against a device that pushes
-natively; a device without YANG-Push reports an error instead of polling.
+natively; a device without YANG-Push, or with the `telemetry` device setting
+`poll`, reports an error instead of polling.
 
 ### Periodic Subscriptions
 
@@ -463,8 +464,9 @@ invalid. Redeclaring starts or joins a new stream and obtains a complete
 baseline before changes resume. A periodic read error keeps the stream;
 its next successful snapshot delivers the selected state again.
 
-Transport capabilities determine how device reads run: periodic YANG-Push
-when supported, otherwise periodic NETCONF reads; native YANG-Push for
-on-change. Native YANG-Push periods are rounded down to whole centiseconds
+Transport capabilities and the `telemetry` device setting determine how
+device reads run: periodic YANG-Push when the device supports it, otherwise
+periodic NETCONF reads; native YANG-Push for on-change. With the setting
+`poll`, or without it on IOS XR and ArcOS, reads are periodic NETCONF reads. Native YANG-Push periods are rounded down to whole centiseconds
 with a minimum of one centisecond. Delivery roots are local to the provider and
 do not require one wire subscription per instance.
