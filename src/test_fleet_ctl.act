@@ -750,8 +750,10 @@ class Paused(object):
         """Check the first decision of the run that goes on at t: each
         device promised a window when the run paused, or taken back, starts
         in that window or keeps its promise while the window has not
-        closed; once it has, in the next window of its schedule. The
-        concurrency is not lower."""
+        closed; once it has, in the next window of its schedule. When an
+        edit took the window away before it closed, the device is in the
+        window of its schedule nearest it (moved()). The concurrency is not
+        lower."""
         testing.assertTrue(c.c >= self.kept_state.1, "concurrency at {t}")
         wins: dict[str, (str, int, int)] = {n: w for n, w in self.promised.items()}
         for name in self.back:
@@ -761,15 +763,25 @@ class Paused(object):
         for name, w in wins.items():
             want: ?(str, int, int) = w
             if t >= w.2 or w not in c.current:
-                want = None
-                for x in sorted([(cw.1, cw.2) for cw in c.current
-                                 if cw.0 == w.0 and t < cw.2 and cw != w]):
-                    if want is None:
-                        want = (w.0, x.0, x.1)
+                want = moved(w, c.current, t)
             got = c.release_windows().get(name)
             if got is None:
                 got = c.promised_window(name)
             testing.assertEqual(got, want, "{name} promised before the pause, at {t}")
+
+
+def moved(w: (str, int, int), windows: list[(str, int, int)], t: int) -> ?(str, int, int):
+    """The window that a promise of the window w moves to at t, among the
+    windows windows: when w has closed, the first window of its schedule
+    that has not; otherwise the one of those whose opening is nearest w's,
+    the later one of two as near. None when there is none."""
+    best = (-1, -1)
+    for x in sorted([(cw.1, cw.2) for cw in windows if cw.0 == w.0 and t < cw.2 and cw != w]):
+        if best.0 < 0 or (t < w.2 and abs(x.0 - w.1) <= abs(best.0 - w.1)):
+            best = x
+    if best.0 < 0:
+        return None
+    return (w.0, best.0, best.1)
 
 
 def _test_the_plan_is_the_run_uniform():
@@ -1137,6 +1149,100 @@ def _test_a_promise_ends_when_the_device_changes_schedule():
     testing.assertEqual(sim.planned(c, p), {"d1": (wins[1], 4000)})
 
 
+def _test_a_window_edit_keeps_the_promises():
+    """d0 to d14 of 600 s in a 1 h window at 06:00 on three days, one at
+    a time: the decision at 0 promises d0 to d4 day 1's window, d5 to d9
+    day 2's and d10 to d14 day 3's. An edit of the windows before they
+    open moves each promise to the window whose opening is nearest its
+    own, so a window moved by less than half a day keeps its promises on
+    their day. A utc-offset of +60 min is the
+    window an hour earlier. A shorter window keeps the promises that it
+    can no longer keep, and the plan gives an alarm. A shift of 12 h puts
+    day 2's and day 3's windows as near the evening before as their own
+    evening: the later one keeps them on their day. When a day's window
+    is gone, its promises go to the nearest window that is left, the
+    later of two as near: day 1's to day 2, day 2's to day 3, and day 3's,
+    which a deadline cuts off, to day 2."""
+    wins = daily("w", 6 * HOUR, HOUR, 3)
+    cut = ("w", 2 * DAY + 6 * HOUR, 2 * DAY + 6 * HOUR + 1800)
+    # (case, the windows after the edit, the windows of day 1's, day 2's
+    # and day 3's members after it)
+    cases: list[(str, list[(str, int, int)], list[(str, int, int)])] = [
+        ("an hour later", daily("w", 7 * HOUR, HOUR, 3), daily("w", 7 * HOUR, HOUR, 3)),
+        ("an hour earlier, utc-offset +60 min", daily("w", 5 * HOUR, HOUR, 3),
+         daily("w", 5 * HOUR, HOUR, 3)),
+        ("half an hour earlier", daily("w", 5 * HOUR + 1800, HOUR, 3),
+         daily("w", 5 * HOUR + 1800, HOUR, 3)),
+        ("longer", daily("w", 6 * HOUR, 2 * HOUR, 3), daily("w", 6 * HOUR, 2 * HOUR, 3)),
+        ("shorter", daily("w", 6 * HOUR, 1800, 3), daily("w", 6 * HOUR, 1800, 3)),
+        ("12 h later", daily("w", 18 * HOUR, HOUR, 3), daily("w", 18 * HOUR, HOUR, 3)),
+        ("a deadline in day 3's window", [wins[0], wins[1], cut], [wins[0], wins[1], cut]),
+        ("a deadline before day 3", [wins[0], wins[1]], [wins[0], wins[1], wins[1]]),
+        ("the notice leaves out day 1", [wins[1], wins[2]], [wins[1], wins[1], wins[2]]),
+        ("day 2 gone", [wins[0], wins[2]], [wins[0], wins[2], wins[2]]),
+    ]
+    devs = devices("d", 15, 600, "w")
+    for case in cases:
+        c = controller(wins, devs, 1, 1)
+        c.decide(0)
+        for i in range(15):
+            testing.assertEqual(c.promised_window("d{i}"), wins[i // 5], "{case.0}: before")
+        edit(c, case.1, devs)
+        c.decide(1)
+        for i in range(15):
+            testing.assertEqual(c.promised_window("d{i}"), case.2[i // 5], "{case.0}: d{i}")
+
+
+def _test_an_edit_gives_a_held_member_no_lost_window_alarm():
+    """The windows and members of _test_a_window_edit_keeps_the_promises.
+    d7, promised day 2's window, is held by a veto of another holder, and
+    the window moves an hour later. d7's promise moves to day 2's 07:00
+    window, so it lost no window, and the plan says nothing of the kind.
+    When that window closes with d7 still held, d7 lost it, and the plan
+    says so."""
+    wins = daily("w", 6 * HOUR, HOUR, 3)
+    new = daily("w", 7 * HOUR, HOUR, 3)
+    devs = devices("d", 15, 600, "w")
+    c = controller(wins, devs, 1, 1)
+    c.decide(0)
+    c.set_vetoed("d7", "health")
+    edit(c, new, devs)
+    p = c.decide(1).plan
+    testing.assertEqual(c.promised_window("d7"), new[1])
+    testing.assertEqual([a for a in p.alarms if "lost their promised window" in a], [])
+    q = c.plan(new[1].2)
+    testing.assertEqual([a for a in q.alarms if "lost their promised window" in a],
+                        ["1 device(s) lost their promised window while held: d7"])
+
+
+def _test_a_broken_promise_keeps_its_row():
+    """d0 to d3 of 600 s in a window [10150, 13750), one at a time, with
+    prepare: the decision at 0 promises each of them the window. d3's
+    estimate then grows to 3000 s, and one and a half times that is
+    longer than the window, so the run ahead starts d3 in no window. The
+    plan keeps d3 in the window promised to it, at the window's opening,
+    with its turn to prepare, and its alarms name d3. d3 is not held: it
+    has no reason."""
+    win = ("w", 10150, 10150 + HOUR)
+    devs = devices("d", 4, 600, "w")
+    c = controller([win], devs, 1, 1, prepare=True)
+    c.decide(0)
+    edit(c, [win], devs[:3] + [("d3", 3000, "w")])
+    s = c.decide(1)
+    p = s.plan
+    testing.assertEqual((p.held, p.why), ({"d3": (0, 10150)}, {}))
+    testing.assertEqual(c.layout(p), [(win.0, win.1, win.2, [("d0", 10150, 600),
+                                                          ("d3", 10150, 3000),
+                                                          ("d1", 10750, 600),
+                                                          ("d2", 11350, 600)])])
+    testing.assertEqual(s.prepares.starts, {"d0": 0, "d1": 3333, "d2": 6666, "d3": 10000})
+    testing.assertEqual(p.alarms, [
+        "1 device(s) will miss the window they were promised even at max-concurrency 1: d3",
+        "1 device(s) fit in no window: 150 percent of their slow time, 600 s at the "
+        + "campaign's estimate, is longer than the time left in every window of their "
+        + "schedule: d3"])
+
+
 def _test_a_removed_device_does_not_count_for_the_ramp():
     """d0 and d1 are in flight at a ramp of two when d0 leaves the
     campaign. Its report does not count towards the ramp, so the run
@@ -1374,18 +1480,46 @@ def _test_the_stagger_takes_turns_between_open_windows():
     testing.assertEqual(c.decide(300).started, ["b0"])
 
 
-def _test_new_limits_start_the_concurrency_over():
-    """During a run the concurrency rises to keep promises. New limits
-    start it over at the new target."""
+def _test_new_limits_keep_the_concurrency_within_them():
+    """RISEN runs at 14 at 1000, and would keep its promises at 6. A
+    higher max, or a target up to 14, keeps 14 and the ramp. A target
+    above 14 raises the next plan to it, and a max below 14 caps it. A
+    lower target starts the concurrency over at the target, the ramp at
+    most at the target, and the next plan rises to what the promises
+    need. A higher max keeps every start of the plan, and a max below the
+    concurrency caps the plan, so the starts move; a new target takes the
+    pace from the same upgrade times again, so the starts move."""
+    # (case, the new target, the new max, the concurrency and the ramp
+    # after the change, the concurrency of the next plan, whether its
+    # starts stay)
+    cases: list[(str, int, int, int, int, int, bool)] = [
+        ("max 20 to 30", 10, 30, 14, 20, 14, True),
+        ("target 10 to 12", 12, 20, 14, 20, 14, False),
+        ("target 10 to 16", 16, 20, 14, 20, 16, False),
+        ("max 20 to 12", 10, 12, 14, 20, 12, False),
+        ("target 10 to 5", 5, 20, 5, 5, 6, False),
+    ]
+    for case in cases:
+        c = risen()
+        p = c.plan(1000)
+        testing.assertEqual(p.c, 14, case.0)
+        c.configure([("w", 0, HOUR)], devices("d", 70, 600, "w"), case.1, case.2, True, 0, 600)
+        r = (c.c, c.rung)
+        q = c.plan(1000)
+        testing.assertEqual((r.0, r.1, q.c, p.starts == q.starts),
+                            (case.3, case.4, case.5, case.6), case.0)
+
+
+def risen() -> Controller:
+    """RISEN: d0 to d69 of 600 s, which must start in a window [0, 3600),
+    ten at once and at most 20, the ramp at 20. 50 fit at ten at once, so
+    the run goes at 14. d0 to d27 take 300 s. Run until 1000."""
     c = Controller()
-    c.configure([("w", 0, HOUR)], devices("d", 50, 600, "w"), 10, 20, False, 0, 600)
+    c.configure([("w", 0, HOUR)], devices("d", 70, 600, "w"), 10, 20, True, 0, 600)
     sim.answer_all(c, 0)
-    c.start(10)
-    c.plan(0)
-    sim.drive(c, 0, {"d{i}": 900 for i in range(50)}, 1000)
-    testing.assertTrue(c.c > 10, "the concurrency must rise above the target")
-    c.configure([("w", 0, HOUR)], devices("d", 50, 600, "w"), 5, 20, False, 0, 600)
-    testing.assertEqual(c.c, 5)
+    c.start(20)
+    sim.drive(c, 0, {"d{i}": 300 for i in range(28)}, 1000)
+    return c
 
 
 def _test_finished_when_every_device_is_done():
@@ -1869,6 +2003,159 @@ def _test_a_pause_carries_the_run_on_with_late_answers():
 
 def _test_a_pause_carries_the_run_on_while_the_members_prepare():
     pauses_carry_the_run_on("prepare")
+
+
+def limits(c: Controller, target: int, maxc: int) -> None:
+    """Configure c again as it is, with the target target and the max
+    concurrency maxc."""
+    c.configure(c.current, c.devices, target, maxc, c.must_place, c.debounce, c.estimate_s,
+                c.groups, c.priority, c.separation, c.close_margin, c.stagger, c.prepare,
+                c.prepare_est, c.failure_budget, c.hold_failed)
+
+
+def where(c: Controller, name: str) -> ?(str, int, int):
+    """The window the device name was released in, or else the window
+    promised to it, or None."""
+    w = c.release_windows().get(name)
+    if w is not None:
+        return w
+    return c.promised_window(name)
+
+
+def later(w: (str, int, int), at: int) -> (str, int, int):
+    """The window w an hour later when it opens after at."""
+    if w.1 > at:
+        return (w.0, w.1 + HOUR, w.2 + HOUR)
+    return w
+
+
+def promise_order(c: Controller, names: list[str], shift: int) -> list[((str, int, int), str)]:
+    """The devices of names that wait with a promise, as (window, name),
+    by window and then in the order of the promises. With shift at 0 or
+    later, each window that opens after shift counts as an hour later."""
+    out: list[((str, int, int), int, str)] = []
+    for name in names:
+        w = c.promised_window(name)
+        if c.is_waiting(name) and w is not None:
+            out.append((later(w, shift) if shift >= 0 else w, c.promise_seq[c.known(name)],
+                        name))
+    return [(e.0, e.2) for e in sorted(out)]
+
+
+def replans_move_little(name: str) -> int:
+    """Run the campaign name of pause_fixture(), with prepare and
+    in-progress reports, until each of its pause_points(), next to a
+    copy, and change one thing in the run: the max concurrency or the
+    target rises, the windows that open later move an hour later, a
+    member x0 joins at the end and answers, the last member that waits
+    leaves, goes down, or gets a veto of another holder, or a member z
+    that has not answered reports failed, as when it left the campaign and
+    joined it again with the same attempt, at a failure budget of zero.
+    Both decide, the down member comes back up, the veto goes and z's
+    status goes, and both decide a second later.
+    Each device with a release or a promise before the change, other than
+    the one it changes, keeps its window, an hour later when an edit moved
+    it, and the devices that wait keep the order of their promises. A
+    higher max changes nothing in the plan. The time each member was let
+    prepare stays. New limits change no prepare. Nor does a hold of the
+    failure budget when the copy lets no member prepare in it. Return how
+    many times that last check ran."""
+    f = pause_fixture(name)
+    events = ["max raised", "target raised", "windows later", "member added",
+              "member removed", "down and up", "veto on and off", "short budget hold"]
+    held_turns = 0
+    for p in pause_points(f):
+        for event in events:
+            label = "{name}, {event} at {p}"
+            c = f.make()
+            if event == "short budget hold":
+                edit(c, c.current, c.devices + [("z", f.devs[0].1, f.devs[0].2)])
+                reconfigure(c, c.devices, 0)
+            sim.drive(c, 0, f.durations, p, answers=f.answers, prepare_reports=True,
+                      in_progress=True)
+            last = ""
+            for n in c.order:
+                if c.is_waiting(n) and n != "z":
+                    last = n
+            testing.assertTrue(last != "", "{label}: no member waits")
+            kept = [n for n in c.order if where(c, n) is not None]
+            let = {n: at for n, at in c.prepare_at.items()}
+            x = c.copy()
+            y = c.copy()
+            shift = -1
+            # The member the event changes, if any: the others keep their
+            # windows and their order.
+            touched = ""
+            if event in ["member removed", "down and up", "veto on and off"]:
+                touched = last
+            if event == "max raised":
+                limits(y, y.target, y.maxc + 4)
+            elif event == "target raised":
+                limits(y, y.target + 1, y.maxc)
+            elif event == "windows later":
+                shift = p
+                edit(y, [later(w, p) for w in y.current], y.devices)
+            elif event == "member added":
+                touched = "x0"
+                edit(y, y.current, y.devices + [("x0", f.devs[0].1, f.devs[0].2)])
+                y.report("x0", "upgrade-needed", p)
+            elif event == "member removed":
+                edit(y, y.current, [d for d in y.devices if d.0 != last])
+                y.drop({last})
+            elif event == "down and up":
+                y.set_live(last, False)
+            elif event == "veto on and off":
+                y.set_vetoed(last, "health")
+            else:
+                touched = "z"
+                y.report("z", "failed", p)
+            x.decide(p)
+            y.decide(p)
+            if event == "down and up":
+                y.set_live(last, True)
+            elif event == "veto on and off":
+                y.set_vetoed(last, "")
+            elif event == "short budget hold":
+                y.lost("z")
+            sx = x.decide(p + 1)
+            sy = y.decide(p + 1)
+            if event == "max raised":
+                testing.assertEqual((sy.started, sy.plan.c, sy.plan.starts),
+                                    (sx.started, sx.plan.c, sx.plan.starts), "{label}: the plan")
+            names = [n for n in kept if n != touched]
+            for n in names:
+                wx = where(x, n)
+                if wx is not None and shift >= 0:
+                    wx = later(wx, shift)
+                testing.assertEqual(where(y, n), wx, "{label}: {n}'s window")
+            testing.assertEqual(promise_order(y, names, -1), promise_order(x, names, shift),
+                                "{label}: the order of the promises")
+            for n, at in let.items():
+                if n != touched or event != "member removed":
+                    testing.assertEqual(y.prepare_at.get(n), at, "{label}: {n} let at")
+            same_turns = False
+            if event == "max raised" or event == "target raised":
+                same_turns = True
+            elif event == "short budget hold" \
+               and len([n for n, at in x.prepare_at.items() if at >= p]) == 0:
+                same_turns = True
+                held_turns += 1
+            if same_turns:
+                testing.assertEqual((y.prepare_at, y.prepares(p + 1).starts),
+                                    (x.prepare_at, x.prepares(p + 1).starts),
+                                    "{label}: the prepares")
+    return held_turns
+
+
+def _test_replans_move_little():
+    """replans_move_little() for every campaign of pause_fixture(). A hold
+    of the failure budget keeps the turns at least once."""
+    held_turns = 0
+    for name in ["uniform", "close margin 200", "stagger", "overlapping", "mixed",
+                 "two schedules", "deadline", "pairs", "spread pairs", "chains",
+                 "late answers", "prepare"]:
+        held_turns += replans_move_little(name)
+    testing.assertTrue(held_turns > 0, "no hold kept the turns")
 
 
 def _test_a_device_taken_back_keeps_its_window_and_place():
@@ -5653,11 +5940,13 @@ def _test_decisions_over_the_failure_budget_decide_as_a_new_plan():
 
 def _test_no_member_prepares_while_more_members_failed_than_the_budget():
     """ONE with a budget of zero: the decision at 0 lets d0 prepare. d4
-    reports failed at 50, from an earlier run, so more members failed
-    than the budget: d0 is let no more, no member has a turn, and the
-    prepares show only d0's from 0. When the budget rises to one at 2500,
-    the turns go on from then: d1 goes at once, and d2 and d3 share the
-    time to their deadline at 10000. d0 has had its turn in this run."""
+    reports failed at 50, as when it left the campaign and joined it again
+    with the same attempt, so more members failed than the budget: d0 is
+    let no more, no member has a turn, and the prepares show only d0's
+    from 0. The hold keeps d0's turn. When the budget rises to one at
+    2500, the turns go on from d0's: d1, d2 and d3 share the time to their
+    deadline at 10000, so d1 goes at 3333. d0 has had its turn in this
+    run."""
     c = controller([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
                    prepare=True, failure_budget=0)
     c.decide(0)
@@ -5669,8 +5958,39 @@ def _test_no_member_prepares_while_more_members_failed_than_the_budget():
     testing.assertEqual(s.prepares.starts, {"d0": 0})
     reconfigure(c, c.devices, 1)
     s = c.decide(2500)
+    testing.assertEqual((len(c.allowed), s.wake), (0, 3333))
+    testing.assertEqual(s.prepares.starts, {"d0": 0, "d1": 3333, "d2": 6666, "d3": 10000})
+    c.decide(3333)
     testing.assertEqual(sorted(list(c.allowed)), ["d1"])
-    testing.assertEqual(s.prepares.starts, {"d0": 0, "d1": 2500, "d2": 6250, "d3": 10000})
+
+
+def _test_a_short_budget_hold_keeps_the_turns():
+    """ONE with a budget of zero, and x, which has not answered: d0 goes
+    at 0, and d1 to d4 have their turns 2500 s apart. x reports failed at
+    1000, as when it left the campaign and joined it again with the same
+    attempt, so more members failed than the budget: no member is let, and
+    no member has a turn. When x's status goes, the hold ends. A hold that
+    ends before d1's turn keeps the turns. One that ends after it lets d1
+    at once and spreads the rest from then."""
+    # (case, the end of the hold, the decision's wake, the starts after it)
+    cases: list[(str, int, int, dict[str, int])] = [
+        ("ends before d1's turn", 2000, 2500,
+         {"d0": 0, "d1": 2500, "d2": 5000, "d3": 7500, "d4": 10000}),
+        ("ends after d1's turn", 3000, 5333,
+         {"d0": 0, "d1": 3000, "d2": 5333, "d3": 7666, "d4": 10000}),
+    ]
+    for case in cases:
+        c = controller([("w", 10150, fleet_ctl.OPEN_END)],
+                       devices("d", 5, 600, "w") + [("x", 600, "w")], 2, 10, prepare=True,
+                       failure_budget=0)
+        c.report("x", None, 0)
+        c.decide(0)
+        c.report("x", "failed", 1000)
+        s = c.decide(1000)
+        testing.assertEqual((len(c.allowed), s.prepares.starts), (0, {"d0": 0}), case.0)
+        c.lost("x")
+        s = c.decide(case.1)
+        testing.assertEqual((s.wake, s.prepares.starts), (case.2, case.3), case.0)
 
 
 def _test_a_failure_budget_with_redundancy_groups():

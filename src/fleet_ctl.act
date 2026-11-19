@@ -303,10 +303,13 @@ class Plan(object):
     controller's windows, and the time. held gives each device that is
     held the window promised to it, or else the first window of its
     schedule that has not closed, and the earliest time it could start
-    there. why gives each device that is held, also one without a
-    window, its reason and its holder as Controller gives them: a device,
-    the holder of a veto, or "" for neither. alarms says which promises the run breaks
-    and which devices are held."""
+    there. held also gives each waiting device that keeps a promise but
+    that the run does not start, in the window promised to it, so the
+    plan shows it where it was promised. why gives each device that is
+    held, also one without a window, its reason and its holder as
+    Controller gives them: a device, the holder of a veto, or "" for
+    neither. A device that the run does not start has no reason. alarms
+    says which promises the run breaks and which devices are held."""
     c: int
     starts: dict[str, (int, int)]
     held: dict[str, (int, int)]
@@ -607,6 +610,13 @@ class Controller(object):
     devices promised to it first, in the order of the promises, then the
     others in their order. A device that misses its window keeps its
     place in that order and is promised the next window of its schedule.
+    A window that an edit takes away before it closes gives each of
+    its promises the window of the schedule that has not closed and
+    whose opening is nearest its own, the later one of two as near, so
+    a window moved by less than half a day that closes after the edit
+    keeps its promises on their day. A held device whose promise an
+    edit moves keeps it with no alarm; one whose window closes while it is
+    held gets the alarm that it lost its promised window.
     A released device that waits again is promised the window it was
     released in, in its place in that order, and first when it had no
     promise. A pause keeps the promises.
@@ -615,8 +625,10 @@ class Controller(object):
     max-concurrency that breaks no more promises than max-concurrency
     does, counting each window a device misses, and, with a deadline,
     leaves no more devices without a start before it. During a run the
-    concurrency only rises until the limits change. The promises a plan
-    breaks are its alarms.
+    concurrency only rises, until the target falls: then it starts over at
+    the target. A lower max-concurrency caps it. The promises a plan
+    breaks are its alarms. A device that the run ahead starts in no window
+    keeps its promise, and the plan shows it in that window.
 
     A plan places the members of a spread group in windows as far apart
     as the windows its run ahead uses allow. When it promises windows, a
@@ -656,11 +668,13 @@ class Controller(object):
     member left has its turn by its deadline. So the turns are as far
     apart as the deadlines allow, and they cover the whole time to the
     last deadline. A turn depends only on the last turn and the members
-    left. A decision lets each member whose turn is before the end of the
-    decision's debounce slot, and wakes at the slot of the next turn: the
-    members whose turns are in one slot start together. So when nothing
-    comes in, each member is let at the time that prepares() showed. When a decision comes after a turn's slot, it lets
-    one member now and spreads the rest from now. A member stops being let
+    left. A hold of the failure budget keeps the last turn, so a short one
+    moves no turn. A decision lets each member whose turn is before the
+    end of the decision's debounce slot, and wakes at the slot of the next
+    turn: the members whose turns are in one slot start together. So when
+    nothing comes in, each member is let at the time that prepares()
+    showed. When a decision comes after a turn's slot, it lets one member
+    now and spreads the rest from now. A member stops being let
     when its prepare is done or failed, it is released, its latest report
     no longer says that it needs the upgrade, it leaves the campaign, a
     window of its schedule opens, prepare goes off, the run pauses, or more
@@ -800,7 +814,8 @@ class Controller(object):
     prepare_at: dict[str, int]
     allowed: set[str]
     # The turn of the last member let prepare, in microseconds; -1 when no
-    # member was let since the last turns ended.
+    # member was let since the turns last ran out. A hold of the failure
+    # budget keeps it.
     prep_last: int
     # Per device number: the time the first of its latest in-progress
     # reports came, NO_TIME when its latest report is not in-progress.
@@ -1151,12 +1166,14 @@ class Controller(object):
         the members may prepare, each member's expected prepare time in
         seconds, the most members that may fail, below 0 for no limit, and
         the groups that hold on a failure, none when None. A group without
-        a separation packs with none. New limits
-        start the concurrency over at the target, and the ramp at most at
-        the target. New limits keep the last upgrade times, and the pace
-        and the slow time are taken from them again. Prepare and the
-        prepare times change no release decision. When prepare goes off,
-        no member is let prepare any more."""
+        a separation packs with none. A lower target starts the
+        concurrency over at the target, and the ramp at most at the
+        target. Other new limits keep the concurrency: the next plan keeps
+        it between the target and the max concurrency. New limits keep the
+        last upgrade times, and the pace and the slow time are taken from
+        them again. Prepare and the prepare times change no release
+        decision. When prepare goes off, no member is let prepare any
+        more."""
         self.prepare_est = prepare_est
         if prepare != self.prepare:
             self.prepare = prepare
@@ -1182,7 +1199,7 @@ class Controller(object):
         self.quiet_until = 0
         self.failure_budget = budget
         retarget = target != self.target
-        if retarget or m != self.maxc:
+        if target < self.target:
             self.c = target
             self.rung = imin(self.rung, target)
         if e != self.estimate_s:
@@ -1225,9 +1242,8 @@ class Controller(object):
         promises in their order, and the pace, the slow time, the ramp, the
         concurrency, the last start of the stagger and the members let
         prepare stay. The ramp is set to rung devices, and the observed pace
-        and the slow time to observed_s, when they are given; configure()
-        sets them on a new controller to one device and the campaign's
-        estimate, and the concurrency to the target.
+        and the slow time to observed_s, when they are given; on a new
+        controller they are one device and the campaign's estimate.
 
         A released device that is not done keeps its slot while its final
         report has not counted yet: the next step counts it at the time it
@@ -2308,10 +2324,16 @@ class Controller(object):
         return self.waiting[q] if q >= 0 else 0
 
     def move_promises(self, t: int) -> list[int]:
-        """Promise the devices still waiting for a window that has closed,
-        or that the schedules no longer give, the next window of their
-        schedule, in the same place in the order of the promises. Return
-        the devices whose promise moved, as numbers."""
+        """Move the promises of the devices still waiting for a window that
+        has closed, or that the schedules no longer give, in the same place
+        in the order of the promises. A window that has closed gives its
+        promises the next window of their schedule. A window that has not
+        closed, which an edit of the schedule, the notice or the deadline
+        took away, gives each promise the window of its schedule that has
+        not closed and whose opening is nearest its own, the later one of
+        two as near: a window moved by less than half a day that closes
+        after the edit keeps its promises on their day. Return the devices
+        whose promised window closed while they waited, as numbers."""
         moved: list[int] = []
         moves: dict[int, list[(int, str, int)]] = {}
         for i in range(len(self.windows)):
@@ -2319,11 +2341,17 @@ class Controller(object):
             if self.moved[i] or (t < win.2 and self.is_current[i]):
                 continue
             self.moved[i] = True
+            closed = win.2 <= t
             for k in self.pqueue[i]:
                 if not self.released[k] and self.promised[k] == i:
                     nxt = -1
+                    # The windows go by opening, so <= takes the later of
+                    # two as near.
                     for j in self.wins_of(k):
-                        if nxt < 0 and j != i and t < self.windows[j].2:
+                        w = self.windows[j]
+                        if j != i and t < w.2 and (nxt < 0 or (
+                                not closed
+                                and abs(w.1 - win.1) <= abs(self.windows[nxt].1 - win.1))):
                             nxt = j
                     self.promised[k] = nxt
                     if nxt >= 0:
@@ -2331,7 +2359,8 @@ class Controller(object):
                             moves[nxt] = []
                         moves[nxt].append((self.promise_seq[k], self.name_of(k), k))
                     self.moves += 1
-                    moved.append(k)
+                    if closed:
+                        moved.append(k)
         for j, ms in moves.items():
             # Both lists are in the order of the promises.
             q = self.pqueue[j]
@@ -3241,8 +3270,15 @@ class Controller(object):
         if len(missed) > 0:
             alarms.append("{len(missed)} device(s) will miss the window they were "
                           + "promised{at_max}: {names_text(missed)}")
-        # The devices with no promise that start in no window.
-        unplaced = [name for name in b.1 if s.promise(s.names.num[name], t) < 0]
+        # The devices with no promise that start in no window. One with a
+        # promise stays in the window promised to it.
+        unplaced: list[str] = []
+        for name in b.1:
+            i = s.promise(s.names.num[name], t)
+            if i < 0:
+                unplaced.append(name)
+            else:
+                held[name] = (i, imax(t, s.windows[i].1))
         if len(unplaced) > 0:
             if self.must_place:
                 alarms.append("{len(unplaced)} device(s) cannot start before the deadline"
@@ -3513,7 +3549,10 @@ class Controller(object):
         (revoke_prepares), and let prepare each member whose turn is
         before the end of t's debounce slot. Return the start of the
         debounce slot of the next turn, or -1 when no turn is left. With no
-        turn left, the next member that comes to wait goes at once."""
+        turn left, the next member that comes to wait goes at once. While
+        more members have failed than the failure budget, no turn is left,
+        but the last turn stays: when the hold ends before the next turn,
+        the turns go on as they were."""
         self.revoke_prepares(t)
         tr = self.turns(t)
         end = (self.slot(t) + imax(1, self.debounce)) * MICRO
@@ -3525,7 +3564,7 @@ class Controller(object):
                 self.prep_last = e.0
             elif wake < 0:
                 wake = self.slot(e.0 // MICRO)
-        if wake < 0:
+        if wake < 0 and not self.over_budget():
             self.prep_last = -1
         return wake
 
@@ -3533,8 +3572,9 @@ class Controller(object):
         """The windows with their devices, by start: one (schedule, start,
         end, devices) entry per window that has devices, each device as
         (name, start, estimated duration), with its real start when it was
-        released, the plan's start when it waits, and, when it is held, the
-        earliest start in the window that the plan's held gives it."""
+        released, the plan's start when it waits, and, when it is held or
+        the run does not start it, the earliest start in the window that
+        the plan's held gives it."""
         released: list[list[(int, str, int)]] = [[] for _w in self.windows]
         planned: list[list[(int, str)]] = [[] for _w in self.windows]
         for k in range(self.size):

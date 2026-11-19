@@ -728,6 +728,22 @@
   counts against the failure budget, until its device reports another final
   status, it gets a new attempt, or it leaves the campaign, also when its
   status is lost.
+- A change to a running campaign moves less of its plan. A higher
+  `target-concurrency` or a new `max-concurrency` keeps the concurrency
+  that the run rose to, capped at the new max; only a lower target starts
+  it over. Before, any change of the limits dropped it to the target. An
+  edit of a schedule's windows or `utc-offset`, or of the campaign's
+  `deadline` or `notification-period`, that takes away a window promised
+  to waiting members moves each promise to the window that has not closed
+  and whose opening is nearest, the later one of two as near, so a window
+  moved by less than half a day that closes after the edit keeps its members
+  on their day. Before, every promise of an edited window went to the first
+  window that had not closed, where many of them broke. A member that the
+  plan can start in no window stays in its promised window in the plan, with
+  its `prepare-start`, while the alarm names it; before, it left the plan. A
+  hold of the failure budget that ends before the next member's
+  `prepare-start` keeps the `prepare-start`s; before, the turns started over
+  when the hold ended.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead

@@ -232,6 +232,23 @@ promised that window after them. The campaign may raise its concurrency, up
 to `max-concurrency`, to keep the windows it promised. To start a campaign
 over, delete it and create it again.
 
+A change to a running campaign keeps its plan where it can. Once the
+concurrency has risen above `target-concurrency`, it stays there for the
+run: a higher target or a new `max-concurrency` keeps it, capped at the
+new max, and only a lower target starts it over at the new target. An edit
+that takes away a window promised to waiting members before it closes, of
+a schedule's windows or its `utc-offset`, or of the campaign's `deadline`
+or `notification-period`, moves each promise to the window of the schedule
+that has not closed and whose opening is nearest, the later one of two as
+near. So a window moved by less than half a day, or made longer or
+shorter, that closes after the edit keeps its members on their day, in the
+order of their promises; a larger move can put them on the day before or
+after. A member that keeps a promise but that the plan can start in no
+window stays in its promised window in the plan, and the plan's alarm says
+that it will miss it. A hold of `failure-budget` keeps the turns to
+prepare: when it ends before the next member's `prepare-start`, the
+`prepare-start`s stay.
+
 A new version of a member's image, or another image with another version,
 gives the member a new target release. A waiting member keeps its window.
 A member that is done, also one that failed, waits again until it answers
