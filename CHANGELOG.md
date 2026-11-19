@@ -256,6 +256,11 @@
   of broken modules because acton-yang failed to compile it, and
   `tailf-netconf-with-rollback-id` imports it, so a device that lists both,
   like ArcOS 8.2.1A, got no schema at all. [#837]
+- The device platform has `last-boot`: when the device last booted, in
+  seconds since the Unix epoch by the device's clock. The IOS XE probe reads
+  it from `boot-time` and the SR Linux probe from `last-booted`; the other
+  probes leave it out. The IOS XE mock boots when it starts and at each
+  reload of an upgrade. [#841]
 - Fixed a NETCONF resync or checked edit that never finished when the device
   configuration does not match the schema, like a value outside a range. The
   resync now fails with the decode error. A checked edit fails with it before
@@ -831,6 +836,7 @@
   folder, with an empty sparse file for each in `out/images`. `demo.xml`,
   `demo-campaign.xml`, `upgrade.xml`, `just upgrade` and `just
   upgrade-and-watch` are gone. [#825]
+- A `/fleet/device` has the device's `last-boot` in `state/platform`. [#841]
 
 ### Dependencies
 

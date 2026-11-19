@@ -1,8 +1,8 @@
 # Device platform
 
 StratoWeave reads what each device is: its operating system family, its
-release, its chassis model and its serial number. A platform probe does the
-read. StratoWeave comes with probes, and an app can add its own or replace
+release, its chassis model, its serial number and when it last booted. A
+platform probe does the read. StratoWeave comes with probes, and an app can add its own or replace
 them.
 
 ## Parts
@@ -30,6 +30,7 @@ persisted: after a restart it is empty until the device connects.
 | `version` | Release the device runs, as it reports it, for example `17.18.2`. |
 | `model` | Chassis model, for example `C8000V`. |
 | `serial-number` | Chassis serial number. |
+| `last-boot` | When the device last booted, in seconds since the Unix epoch by the device's clock. Absent when the probe does not read it. |
 | `probe` | Name of the probe that read the values. |
 
 The version is the release as the device spells it, without what the device
@@ -145,7 +146,8 @@ class IosXeProbe(swdev.GetPlatformProbe):
 | `parse(root)` | The `Platform` in the reply, `None` when the reply has no values, or raises `PlatformMismatch`. |
 
 Set the fields the probe knows on `swdev.Platform(os, version, model,
-serial_number)`; leave the others `None`.
+serial_number, last_boot)`; leave the others `None`. `swdev.epoch_seconds`
+gives the `last_boot` of a `yang:date-and-time`.
 
 ### The device type's schema
 
@@ -188,15 +190,15 @@ so a probe that reads two subtrees sends two gets.
 
 ## The probes
 
-| Probe | Applies when the device lists | Reads | Model | Serial number |
-| --- | --- | --- | --- | --- |
-| `ios-xe` | `Cisco-IOS-XE-device-hardware-oper` | one get: inventory and version banner | chassis part number | chassis entry |
-| `ios-xe-cli` | `stratoweave-iosxe-cli`, from the IOS XE CLI adapter | one get: `show version` | the word after `cisco` on the processor line | `Processor board ID` |
-| `ios-xr` | `Cisco-IOS-XR-install-oper` | two gets: `install/version`, the rack inventory | `chassis-pid`, else the rack's model | the rack with the lowest name |
-| `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information` | `product-model` | `serial-number` of system information |
-| `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis |
-| `sros` | `nokia-state` | one get: `/state/system` and `/state/chassis` | `system/platform` | router chassis with the lowest number |
-| `arcos` | `arcos-openconfig-system-augments` | one get: `system/version/state` | `platform` | `serial-number` |
+| Probe | Applies when the device lists | Reads | Model | Serial number | Last boot |
+| --- | --- | --- | --- | --- | --- |
+| `ios-xe` | `Cisco-IOS-XE-device-hardware-oper` | one get: inventory, version banner and boot time | chassis part number | chassis entry | `boot-time` of `device-system-data` |
+| `ios-xe-cli` | `stratoweave-iosxe-cli`, from the IOS XE CLI adapter | one get: `show version` | the word after `cisco` on the processor line | `Processor board ID` | not read |
+| `ios-xr` | `Cisco-IOS-XR-install-oper` | two gets: `install/version`, the rack inventory | `chassis-pid`, else the rack's model | the rack with the lowest name | not read |
+| `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information` | `product-model` | `serial-number` of system information | not read |
+| `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis | `last-booted` of `system/information` |
+| `sros` | `nokia-state` | one get: `/state/system` and `/state/chassis` | `system/platform` | router chassis with the lowest number | not read |
+| `arcos` | `arcos-openconfig-system-augments` | one get: `system/version/state` | `platform` | `serial-number` | not read |
 
 Each probe but Junos reads through YANG that its module ships pruned in
 `platform_<os>_yang.act` (`software_iosxe_yang.act` for IOS XE), with the
@@ -221,7 +223,9 @@ returned invalid UTF-8 in that tree.
 `IosXeSoftwareMock` serves a chassis entry: part-number `C8000V` and serial
 number `9ABCDEFGHIJ`, or the `model` and `serial` it is given. A mock device
 sets them as `mock/platform/model` and `mock/platform/serial-number`, and the
-release it starts on as `mock/platform/version`.
+release it starts on as `mock/platform/version`. The mock boots when it
+starts, or at the `last_boot` it is given, and again at each reload: an
+activate, an abort, a one-shot install and the abort timer of `reverts`.
 
 ### IOS XE over the CLI
 
@@ -291,7 +295,7 @@ component has neither part nor serial number there.
 | `src/test_platform.act` | Which probe runs and what `DeviceMgr` publishes, with fake probes: order, device type first, mismatch, failure, removal, every connect. |
 | `src/adapters/test_platform_lab.act` | What virtual devices of each platform answered, recorded in `test_platform_lab_data.act`: which probe each device's module list picks, what each probe makes of the device's replies, and what `DeviceMgr` publishes when a mock NETCONF server serves them. |
 | `src/adapters/test_platform_<os>.act` | Each probe's parse of replies not recorded there, like hardware with serial numbers and Junos with two routing engines, and `applies`. |
-| `src/adapters/test_platform_iosxe.act` | Also the IOS XE filter and the error for a device type without the hardware module. |
+| `src/adapters/test_platform_iosxe.act` | Also the IOS XE filter, the error for a device type without the hardware module, and the last boot after an upgrade reloads the mock. |
 
 To add a platform, record a device's module list and its replies in
 `test_platform_lab_data.act`, and add it to `test_platform_lab.act`. The selection test then checks that no other

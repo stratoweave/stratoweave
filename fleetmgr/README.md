@@ -408,9 +408,9 @@ its own members, each with the version and model its platform reports. It
 also subscribes to the top's `/device` entries of the flotillas, to learn
 whether the top is connected to each flotilla. Each `/fleet/device` actor
 subscribes to its RFS entry's platform and publishes it as its own
-`state/platform`: OS, version, model and serial number. It also subscribes
-to the entry's `state/connected` and to the top's `/device` entry of its
-flotilla, and publishes whether the device can be reached as
+`state/platform`: OS, version, model, serial number and last boot. It also
+subscribes to the entry's `state/connected` and to the top's `/device` entry
+of its flotilla, and publishes whether the device can be reached as
 `state/connected`: `connected`, `device-down`, or `flotilla-down` while the
 top is not connected to the flotilla and the device was not down before.
 The connection is absent until the device first connects.
