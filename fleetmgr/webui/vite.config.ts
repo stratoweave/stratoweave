@@ -53,12 +53,6 @@ export default defineConfig({
       version: { name: contentVersion() }
     })
   ],
-  build: {
-    // Inline imported assets (the logo SVG, the latin woff2 font subsets of
-    // roughly 24 KB each) as data URIs: the embedded asset pipeline can only
-    // serve text files.
-    assetsInlineLimit: 32768
-  },
   server: {
     proxy: {
       '^/restconf(/|$)': { target: API_PROXY_TARGET },
