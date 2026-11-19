@@ -28,6 +28,11 @@ curl -H "Accept: application/yang-data+json" \
   "$STRATOWEAVE_API_ORIGIN/restconf/data"
 ```
 
+### Compression
+
+Compression of responses larger than 1KiB is enabled in the server. Clients may
+request their preferred compression algorithm via the `Accept-Encoding` header.
+
 ## Editing northbound intent
 
 The RESTCONF root is also used for configuration operations such as `PATCH` and
