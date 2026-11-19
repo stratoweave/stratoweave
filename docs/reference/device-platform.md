@@ -310,6 +310,3 @@ device's.
 - The mock NETCONF server's subtree filter returns no data at all when a node
   the filter selects is absent, where a device returns the other nodes. A
   mocked device must serve every node that the probe selects.
-- With runtime schema fetch on, ArcOS 8.2.1A gets no schema, so no probe
-  reads it: an ArcOS module imports `tailf-rollback`, which ArcOS does not
-  list.
