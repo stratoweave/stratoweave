@@ -31,6 +31,7 @@ import adapters.adapter as swadapt
 from adapters.adapter import \
     DeviceAdapter, ModCap, DISCONNECTED, CONNECTING, CONNECTED, TRANSACTION, \
     NotConnectedError, BusyError, LockedError, TxidMismatchError, ConfigError, \
+    PermanentError, \
     DeviceStream, Subscription, parse_cap, ssh_transport_config, dmc_for_log, \
     subscription_delay, merge_subscription_tree, \
     SubscriptionStatus, SUBSCRIPTION_YANG_PUSH, SUBSCRIPTION_POLL, SUBSCRIPTION_CONNECTING
@@ -1375,11 +1376,34 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 txid=new_txid)
         raise ValueError("Can only attach txid to Container")
 
-    def get_txid(done: action(netconf.Client, str, ?ygdata.Node) -> None):
+    def _config_schema() -> ?yschema.DRoot:
+        # The schema to parse configuration against: the runtime-fetched one
+        # when enabled, else the bundled config schema.
+        if dmc.feature_flags.runtime_schema_fetch:
+            return schema_registry.get_schema(schema_key)
+        return bundled_schema.src_dnode
+
+    def _parse_config(data_tag: xml.Node) -> ?ygdata.Node:
+        """Parse the <data> element of a <get-config> reply
+
+        Returns None when there is no schema yet. A configuration that does not
+        match the schema raises PermanentError: the device sends the same
+        configuration again until it changes.
+        """
+        s = _config_schema()
+        if s is not None:
+            try:
+                return yxml.from_xml(s, data_tag, loose=True)
+            except Exception as e:
+                raise PermanentError("Cannot decode the device configuration: {e}")
+        return None
+
+    def get_txid(done: action(netconf.Client, str, ?ygdata.Node, ?Exception) -> None):
         """Get txid from device
 
         Dispatches to device-specific txid retrieval methods.
-        Returns client, txid as string, and optionally the full config if it was fetched.
+        Returns client, txid as string, optionally the full config if it was
+        fetched, and an error if the fetched config does not decode.
         """
         _log.debug("Device.get_txid: fetching txid")
 
@@ -1392,14 +1416,14 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         else:
             get_txid_generic(done)
 
-    def get_txid_junos(done: action(netconf.Client, str, ?ygdata.Node) -> None):
+    def get_txid_junos(done: action(netconf.Client, str, ?ygdata.Node, ?Exception) -> None):
         """Get txid for JUNOS devices - try to extract junos:commit-seconds first"""
         _log.debug("Device.get_txid_junos: fetching minimal config for txid")
 
         def on_junos_txid_data(c: netconf.Client, r: ?xml.Node, error: ?netconf.NetconfError):
             """Process JUNOS config data to extract txid"""
             if _is_stale(c, error):
-                done(c, "", None)
+                done(c, "", None, None)
                 return
             if error is not None:
                 _log.error("Device.get_txid_junos: error fetching config", {"error": error})
@@ -1414,7 +1438,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     if txid is not None:
                         _log.debug("Device.get_txid_junos: extracted JUNOS txid", {"txid": txid})
                         # Return client and txid string, no config since we only have a subtree
-                        done(c, txid, None)
+                        done(c, txid, None, None)
                     else:
                         _log.warning("Device.get_txid_junos: no junos:commit-seconds found, falling back to generic")
                         # Fallback to generic method - fetch full config and hash
@@ -1446,32 +1470,30 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
         else:
             raise NotConnectedError()
 
-    def get_txid_generic(done: action(netconf.Client, str, ?ygdata.Node) -> None):
+    def get_txid_generic(done: action(netconf.Client, str, ?ygdata.Node, ?Exception) -> None):
         """Get txid for generic devices - fetch full config and hash it"""
         _log.debug("Device.get_txid_generic: fetching full config for hash")
 
         def on_generic_txid_data(c: netconf.Client, r: ?xml.Node, error: ?netconf.NetconfError):
             if _is_stale(c, error):
-                done(c, "", None)
+                done(c, "", None, None)
                 return
             if error is not None:
                 _log.error("Device.get_txid_generic: error fetching config", {"error": error})
                 # Can't recover from this, return empty txid
-                done(c, "", None)
+                done(c, "", None, None)
             elif r is not None:
                 _log.debug("Device.get_txid_generic: got full config")
                 # Extract current config and compute hash
                 data_tag = r.children[0] if len(r.children) > 0 else None
                 if data_tag is not None:
                     current = None
-                    if dmc.feature_flags.runtime_schema_fetch:
-                        fetched_schema = schema_registry.get_schema(schema_key)
-                        if fetched_schema is not None:
-                            current = yxml.from_xml(fetched_schema, data_tag, loose=True)
-                        else:
-                            _log.error("Device.get_txid_generic: no schemas compiled")
-                    else:
-                        current = yxml.from_xml(bundled_schema.src_dnode, data_tag, loose=True)
+                    try:
+                        current = _parse_config(data_tag)
+                    except PermanentError as e:
+                        _log.error("Device.get_txid_generic: cannot decode config", {"error": str(e)})
+                        done(c, "", None, e)
+                        return
                     if current is not None:
                         # Compute hash of the entire config as txid
                         current_xml_bytes = current.to_xmlstr().encode()
@@ -1486,16 +1508,16 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                         _log.debug("Device.get_txid_generic: updated running_conf")
 
                         # Return client, txid and full config
-                        done(c, conf_hash, current_with_txid)
+                        done(c, conf_hash, current_with_txid, None)
                     else:
-                        _log.error("Device.get_txid_generic: failed to parse config")
-                        done(c, "", None)
+                        _log.error("Device.get_txid_generic: no schemas compiled")
+                        done(c, "", None, None)
                 else:
                     _log.error("Device.get_txid_generic: no data in response")
-                    done(c, "", None)
+                    done(c, "", None, None)
             else:
                 _log.error("Device.get_txid_generic: no response")
-                done(c, "", None)
+                done(c, "", None, None)
 
         # Fetch full config for hashing
         if client is not None:
@@ -1604,10 +1626,15 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                 _log.debug("Device.configure: sync check disabled, applying edit without checking device configuration")
                 send_edit(c)
 
-        def on_txid_received(c: netconf.Client, current_txid: str, current_conf: ?ygdata.Node):
+        def on_txid_received(c: netconf.Client, current_txid: str, current_conf: ?ygdata.Node, error: ?Exception):
             """Called after txid has been retrieved from device"""
             if _is_stale(c):
                 _abort_stale_tx()
+                return
+            if error is not None:
+                # Without the device configuration there is nothing to check
+                # the edit against.
+                abort(error)
                 return
             # Check if txid matches our expected
             expected_txid = old_conf.txid if old_conf is not None else None
@@ -1702,10 +1729,19 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
 
             _log.debug("Device.configure: transaction complete, fetching new txid")
 
-            def on_resulting_txid(c: netconf.Client, txid: str, final_conf: ?ygdata.Node):
+            def on_resulting_txid(c: netconf.Client, txid: str, final_conf: ?ygdata.Node, error: ?Exception):
                 """Called with the new txid after configuration is complete"""
                 if _is_stale(c):
                     _abort_stale_tx()
+                    return
+                if error is not None:
+                    # The device committed the edit, but its configuration
+                    # does not decode. Continue as after an unchecked edit:
+                    # the next checked edit first fetches the configuration.
+                    _log.error("Device.configure: committed, but cannot read the resulting configuration", {"error": str(error)})
+                    running_conf = new_conf
+                    unchecked_since_sync = True
+                    finish_with_config(c, new_conf)
                     return
                 _log.debug("Device.configure: got new txid", {"txid": txid})
                 # If we got a full config, update our running_conf
@@ -1891,14 +1927,12 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                     # <data>\n<configuration xmlns="http://xml.juniper.net/xnm/1.1/xnm" junos:commit-seconds="1756279893" junos:commit-localtime="2025-08-27 07:31:33 UTC" junos:commit-user="root">
                     # We want to extract the junos:commit-seconds and attach as txid on the root node in running_conf
                     new_conf = None
-                    if dmc.feature_flags.runtime_schema_fetch:
-                        fetched_schema = schema_registry.get_schema(schema_key)
-                        if fetched_schema is not None:
-                            new_conf = yxml.from_xml(fetched_schema, r.children[0], loose=True)
-                        else:
-                            _log.error("Device.on_get_config: no schemas compiled")
-                    else:
-                        new_conf = yxml.from_xml(bundled_schema.src_dnode, r.children[0], loose=True)
+                    try:
+                        new_conf = _parse_config(data_tag)
+                    except PermanentError as e:
+                        running_conf = None
+                        done(None, e)
+                        return
                     if new_conf is not None:
                         if new_conf.txid is None:
                             txid = extract_txid(data_tag)
@@ -1920,6 +1954,7 @@ actor NetconfDriver(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc
                         unchecked_since_sync = False
                         done(running_conf, None)
                     else:
+                        _log.error("Device.on_get_config: no schemas compiled")
                         running_conf = None
                         done(None, Exception("Failed to parse configuration from device"))
                 else:

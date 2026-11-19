@@ -75,8 +75,33 @@ IETF_SYSTEM_YANG = r"""module ietf-system {
   }
 }"""
 
+LIMITS_NS = "urn:example:limits"
+
+LIMITS_YANG = r"""module limits {
+  yang-version "1.1";
+  namespace "urn:example:limits";
+  prefix lim;
+  container limits {
+    leaf mtu {
+      type uint16 {
+        range "68..9000";
+      }
+    }
+  }
+}"""
+
 def _q(name: str) -> ygdata.Id:
     return ygdata.Id(IETF_SYSTEM_NS, name)
+
+def _config_reply(children: list[xml.Node]) -> list[xml.Node]:
+    """The children of a <get-config> reply with this configuration."""
+    return [xml.Node("data", nsdefs=[(None, swna.NS_NC_1_0)], children=children)]
+
+def _undecodable_config() -> list[xml.Node]:
+    """A configuration whose mtu is outside the range of the schema."""
+    return _config_reply([
+        xml.Node("limits", nsdefs=[(None, LIMITS_NS)], children=[xml.Node("mtu", text="1")])
+    ])
 
 def _mock_oper_ds(current_datetime: str, boot_datetime: str) -> ygdata.Node:
     """Mock data for the operational datastore of the mock NETCONF server."""
@@ -324,6 +349,233 @@ actor _test_reenabling_sync_check_resyncs_before_edit(t: testing.EnvT):
 
     start()
     after 3.0: fail("Timed out re-enabling sync checks")
+
+
+actor _test_fetch_config_decode_error(t: testing.EnvT):
+    """A device configuration that does not match the schema fails the fetch
+    with PermanentError, and the driver drops its copy of the running
+    configuration."""
+    def noop_on_reconf(name: str):
+        pass
+
+    dev: swdev.DeviceMgr = new_netconf_mock_device_mgr(
+        t,
+        "dev-fetch-decode-error",
+        noop_on_reconf,
+        extra_models=[LIMITS_YANG],
+    )
+    var done = False
+
+    def fail(msg: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def undecodable(request: xml.Node, reply: action(?list[xml.Node], ?str, ?str) -> None) -> None:
+        reply(_undecodable_config(), None, None)
+
+    def on_fetched(conf: ?ygdata.Node, err: ?Exception) -> None:
+        if done:
+            return
+        if conf is not None:
+            fail("Fetch returned a configuration: {conf}")
+        elif not isinstance(err, swadapt.PermanentError):
+            fail("Expected PermanentError, got {err}")
+        elif dev.get_config() is not None:
+            fail("The driver kept its running configuration")
+        else:
+            done = True
+            t.success()
+
+    def start() -> None:
+        if done:
+            return
+        if dev.get_running_conf() is None:
+            after 0.01: start()
+            return
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            ms = adapter.get_mock_server()
+            if ms is None:
+                fail("Expected NetconfMockServer from NetconfAdapter")
+                return
+            ms!.set_rpc_cb(undecodable, overrides={"get-config"})
+            dev.fetch_config(on_fetched)
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    start()
+    after 2.0: fail("Timed out waiting for the configuration fetch")
+
+
+actor _test_checked_configure_decode_error(t: testing.EnvT):
+    """A checked edit fails with PermanentError, and does not edit the
+    device, when the device configuration does not match the schema."""
+    def noop_on_reconf(name: str):
+        pass
+
+    dev: swdev.DeviceMgr = new_netconf_mock_device_mgr(
+        t,
+        "dev-checked-decode-error",
+        noop_on_reconf,
+        extra_models=[LIMITS_YANG],
+    )
+    var done = False
+    var mock_server: ?swna.NetconfMockServer = None
+
+    def fail(msg: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def undecodable(request: xml.Node, reply: action(?list[xml.Node], ?str, ?str) -> None) -> None:
+        reply(_undecodable_config(), None, None)
+
+    def on_configured(result: value) -> None:
+        if done:
+            return
+        if not isinstance(result, swadapt.PermanentError):
+            fail("Expected PermanentError, got {result}")
+            return
+        ms = mock_server
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        history = ms!.get_rpc_history()
+        for rpc in history:
+            if "edit-config" in rpc:
+                fail("Edited the device after a failed sync check: {history}")
+                return
+        done = True
+        t.success()
+
+    def start() -> None:
+        if done:
+            return
+        modules, modset_id = dev.get_modules()
+        if IETF_SYSTEM_MODULE not in modules or modset_id is None or dev.get_running_conf() is None:
+            after 0.01: start()
+            return
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            ms = adapter.get_mock_server()
+            if ms is None:
+                fail("Expected NetconfMockServer from NetconfAdapter")
+                return
+            mock_server = ms
+            ms!.set_rpc_cb(undecodable, overrides={"get-config"})
+            ms!.clear_rpc_history()
+            dev.configure(_system_config("edge-1"), modset_id, "checked")
+            dev.wait_complete("checked", on_configured)
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    start()
+    after 2.0: fail("Timed out waiting for the checked edit")
+
+
+actor _test_commit_result_decode_error(t: testing.EnvT):
+    """When the configuration after a commit does not match the schema, the
+    edit succeeds, and the next checked edit fetches the device configuration
+    before it edits."""
+    def noop_on_reconf(name: str):
+        pass
+
+    dev: swdev.DeviceMgr = new_netconf_mock_device_mgr(
+        t,
+        "dev-commit-decode-error",
+        noop_on_reconf,
+        extra_models=[LIMITS_YANG],
+    )
+    var done = False
+    var mock_server: ?swna.NetconfMockServer = None
+    var get_configs = 0
+
+    def fail(msg: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(msg))
+
+    def reads(request: xml.Node, reply: action(?list[xml.Node], ?str, ?str) -> None) -> None:
+        # The read before the first edit gets the empty configuration of the
+        # first resync. The read after its commit does not decode.
+        get_configs += 1
+        if get_configs == 1:
+            reply(_config_reply([]), None, None)
+        else:
+            reply(_undecodable_config(), None, None)
+
+    def on_second(result: value) -> None:
+        if done:
+            return
+        if isinstance(result, Exception):
+            fail("Second edit failed: {result}")
+            return
+        ms = mock_server
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        history = ms!.get_rpc_history()
+        edit_index = -1
+        for i in range(len(history)):
+            if "edit-config" in history[i]:
+                edit_index = i
+                break
+        if edit_index <= 0:
+            fail("Expected a configuration read before the second edit, got {history}")
+        elif "get-config" not in history[0]:
+            fail("Expected a resync before the second edit, got {history}")
+        elif ygdata.diff(dev.get_running_conf(), _system_config("edge-2")) is not None:
+            fail("The second edit did not reach the target")
+        else:
+            done = True
+            t.success()
+
+    def on_first(result: value) -> None:
+        if done:
+            return
+        if isinstance(result, Exception):
+            fail("First edit failed: {result}")
+            return
+        ms = mock_server
+        if ms is None:
+            fail("Missing NETCONF mock server")
+            return
+        modules, modset_id = dev.get_modules()
+        if modset_id is None:
+            fail("Missing module-set id")
+            return
+        # From here the mock answers get-config from its datastore.
+        ms!.set_rpc_cb(reads, overrides=set())
+        ms!.clear_rpc_history()
+        dev.configure(_system_config("edge-2"), modset_id, "second")
+        dev.wait_complete("second", on_second)
+
+    def start() -> None:
+        if done:
+            return
+        modules, modset_id = dev.get_modules()
+        if IETF_SYSTEM_MODULE not in modules or modset_id is None or dev.get_running_conf() is None:
+            after 0.01: start()
+            return
+        adapter = dev.get_adapter()
+        if isinstance(adapter, swna.NetconfAdapter):
+            ms = adapter.get_mock_server()
+            if ms is None:
+                fail("Expected NetconfMockServer from NetconfAdapter")
+                return
+            mock_server = ms
+            ms!.set_rpc_cb(reads, overrides={"get-config"})
+            dev.configure(_system_config("edge-1"), modset_id, "first")
+            dev.wait_complete("first", on_first)
+        else:
+            fail("Expected NetconfAdapter from DeviceMgr")
+
+    def timed_out() -> None:
+        fail("Timed out after {get_configs} get-config replies")
+
+    start()
+    after 3.0: timed_out()
 
 
 actor _test_software_dmc_preserves_system_mock_adapter(t: testing.EnvT):

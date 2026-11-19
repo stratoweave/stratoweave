@@ -256,6 +256,11 @@
   of broken modules because acton-yang failed to compile it, and
   `tailf-netconf-with-rollback-id` imports it, so a device that lists both,
   like ArcOS 8.2.1A, got no schema at all. [#837]
+- Fixed a NETCONF resync or checked edit that never finished when the device
+  configuration does not match the schema, like a value outside a range. The
+  resync now fails with the decode error. A checked edit fails with it before
+  it edits the device. When only the configuration after the commit does not
+  decode, the edit succeeds and the next checked edit resyncs first.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
