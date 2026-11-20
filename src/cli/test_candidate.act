@@ -1,0 +1,257 @@
+"""Tests for the candidate configuration and the configuration mode commands."""
+
+import testing
+
+import cli.candidate as candidate
+import cli.command as command
+import cli.fixture as fixture
+import cli.path as cpath
+
+
+class _Config(object):
+    """Run configuration mode commands on a candidate, as the CLI session does."""
+    op: command.Context
+    cand: candidate.Candidate
+    edit: list[cpath.Step]
+    back: list[list[cpath.Step]]
+
+    def __init__(self):
+        self.op = fixture.context()
+        self.cand = candidate.Candidate(self.op.root, self.op.data)
+        self.edit = []
+        self.back = []
+
+    def ctx(self) -> command.Context:
+        return command.Context(self.op.root, self.cand.data, "config", self.edit, self.cand.base, self.op.data, self.back)
+
+    def run(self, line: str) -> str:
+        """Run one command line and return its output, or the parse error."""
+        c = self.ctx()
+        r = command.parse(c, line)
+        cmd = r.cmd
+        if cmd is not None:
+            a = command.apply(c, self.cand, cmd)
+            self.edit = a.edit
+            self.back = a.back
+            return "LEAVE" if a.leave else a.text
+        return "error: {r.error} at {r.column}"
+
+    def level(self) -> str:
+        return " ".join(cpath.path_tokens(self.ctx().start, self.edit))
+
+
+def _run(lines: list[str]) -> str:
+    """Run command lines on a fresh candidate and return the output of the last one."""
+    cfg = _Config()
+    res = ""
+    for line in lines:
+        res = cfg.run(line)
+    return res
+
+
+def _test_edit_and_compare():
+    # (name, command lines, output of the last line)
+    cases = [
+        ("no changes", ["show | compare"], ""),
+        ("change a leaf", ["set system host-name r2", "show | compare"], r"""[edit system]
+-   host-name r1;
++   host-name r2;"""),
+        ("set the same value", ["set system host-name r1", "show | compare"], ""),
+        ("new nokeyword entry", ["set interfaces ge-0/0/1 description \"new link\"", "show | compare"], r"""[edit interfaces]
++   ge-0/0/1 {
++       description "new link";
++   }"""),
+        ("new entry shows", ["set interfaces ge-0/0/1 mtu 1500", "show interfaces ge-0/0/1"], "mtu 1500;"),
+        ("new multi-key entry", ["set routing route 192.0.2.0/24 198.51.100.1 metric 10", "show routing route | display set"], r"""set routing route 10.0.0.0/8 192.0.2.1 metric 5
+set routing route 192.0.2.0/24 198.51.100.1 metric 10"""),
+        ("key that reads as a keyword", ["set interfaces \"traceoptions\" mtu 1500", "show | compare"], r"""[edit interfaces]
++   "traceoptions" {
++       mtu 1500;
++   }"""),
+        ("nested change", ["set interfaces ge-0/0/0 unit 0 vlan-id 20", "show | compare"], r"""[edit interfaces ge-0/0/0 unit 0]
+-   vlan-id 10;
++   vlan-id 20;"""),
+        ("delete a leaf", ["delete system host-name", "show | compare"], r"""[edit system]
+-   host-name r1;"""),
+        ("delete an entry", ["delete interfaces ge-0/0/0 unit 0", "show | compare"], r"""[edit interfaces ge-0/0/0]
+-   unit 0 {
+-       vlan-id 10;
+-       family inet {
+-           address 10.0.0.1/24;
+-       }
+-       family inet6;
+-   }"""),
+        ("delete what is not there", ["delete interfaces xe-9/9/9"], "warning: statement not found"),
+        ("delete a leaf-list value", ["delete system name-server 10.0.0.1", "show system name-server"], "name-server 10.0.0.2;"),
+        ("delete a missing leaf-list value", ["delete system name-server 10.9.9.9"], "warning: statement not found"),
+        ("add a leaf-list value", ["set system name-server 10.0.0.3", "show system name-server"], "name-server [ 10.0.0.1 10.0.0.2 10.0.0.3 ];"),
+        ("leaf-list change", ["set system name-server 10.0.0.3", "show | compare"], r"""[edit system]
+-   name-server [ 10.0.0.1 10.0.0.2 ];
++   name-server [ 10.0.0.1 10.0.0.2 10.0.0.3 ];"""),
+        ("empty leaf", ["set system services ssh", "show system services"], "ssh;"),
+        ("new presence container", ["delete system services", "set system services", "show system services | display set"], "set system services"),
+        ("emptied container goes", ["delete snmp d:location", "delete snmp x:location", "show | compare"], r"""[edit]
+-   snmp {
+-       d:location dc1;
+-       x:location rack4;
+-   }"""),
+        ("several hunks", ["set system host-name r2", "set interfaces lo0 description loop", "show | compare"], r"""[edit system]
+-   host-name r1;
++   host-name r2;
+[edit interfaces lo0]
++   description loop;"""),
+        ("compare a leaf", ["set system host-name r2", "set interfaces lo0 mtu 1500", "show system host-name | compare"], r"""[edit system]
+-   host-name r1;
++   host-name r2;"""),
+        ("compare a deleted entry by path", ["delete interfaces lo0", "show interfaces lo0 | compare"], "[edit interfaces]\n-   lo0;"),
+        ("compare an added entry by path", ["set interfaces ge-0/0/9", "show interfaces ge-0/0/9 | compare"], "[edit interfaces]\n+   ge-0/0/9;"),
+        ("compare a deleted container by path", ["delete system services", "show system services | compare"], "[edit system]\n-   services;"),
+        ("compare an entry of a deleted list", ["delete routing policy", "show routing policy p1 | compare"], r"""[edit routing]
+-   policy p1 {
+-       action accept;
+-   }"""),
+        ("compare an entry of a new list", ["set interfaces lo0 unit 0", "set interfaces lo0 unit 1", "show interfaces lo0 unit 0 | compare"], "[edit interfaces lo0]\n+   unit 0;"),
+        ("compare at a deleted entry", ["edit interfaces lo0", "top delete interfaces", "show | compare"], "[edit interfaces]\n-   lo0;"),
+        ("oneliner change", ["set system syslog file messages any any", "show | compare"], r"""[edit system syslog file messages]
+-   any notice;
++   any any notice;"""),
+        ("homogeneous change", ["delete interfaces ge-0/0/0 unit 0 family inet6", "show | compare"], r"""[edit interfaces ge-0/0/0 unit 0]
+-   family inet6;"""),
+        ("user order change", ["delete routing policy p1", "set routing policy p1 action accept", "show | compare"], r"""[edit routing]
+-   policy p1 {
+-       action accept;
+-   }
+-   policy p2 {
+-       action reject;
+-   }
++   policy p2 {
++       action reject;
++   }
++   policy p1 {
++       action accept;
++   }"""),
+        ("leaf-list order change", ["delete system name-server 10.0.0.1", "set system name-server 10.0.0.1", "show | compare"], r"""[edit system]
+-   name-server [ 10.0.0.1 10.0.0.2 ];
++   name-server [ 10.0.0.2 10.0.0.1 ];"""),
+        ("empty brackets", ["set system name-server [ ]"], "error: missing argument. at 25"),
+        ("top run", ["top run show configuration"], "error: syntax error. at 4"),
+        ("top top", ["top top"], "error: syntax error. at 4"),
+        ("run configure", ["run configure"], "error: syntax error. at 4"),
+        ("rollback", ["set system host-name r2", "rollback"], "load complete"),
+        ("rollback clears", ["set system host-name r2", "rollback 0", "show | compare"], ""),
+        ("xml of a new entry", ["set interfaces ge-0/0/1 mtu 1500", "show interfaces ge-0/0/1 mtu | display xml"], r"""<interfaces xmlns="urn:demo">
+  <interface>
+    <name>ge-0/0/1</name>
+    <mtu>1500</mtu>
+  </interface>
+</interfaces>"""),
+        ("augment namespace", ["set snmp x:location rack5", "show snmp x:location | display xml"], r"""<snmp xmlns="urn:demo">
+  <location xmlns="urn:demo-extra">rack5</location>
+</snmp>"""),
+        ("missing value", ["set system host-name"], "error: missing argument. at 20"),
+        ("bad value", ["set interfaces ge-0/0/0 mtu 10"], "error: '10' is not a valid value, expected uint16 with range 256..9192 at 28"),
+        ("set needs a path", ["set"], "error: missing argument. at 3"),
+        ("edit a leaf", ["edit system host-name"], "error: syntax error. at 12"),
+        ("edit a whole list", ["edit routing route"], "error: missing argument. at 18"),
+        ("exit at the top", ["exit"], "LEAVE"),
+        ("exit configuration-mode", ["edit system", "exit configuration-mode"], "LEAVE"),
+    ]
+    for name, lines, expected in cases:
+        testing.assertEqual(_run(lines), expected, name)
+
+
+def _test_edit_levels():
+    cfg = _Config()
+    # (command line, edit level after it, output)
+    steps = [
+        ("edit interfaces ge-0/0/0", "interfaces ge-0/0/0", ""),
+        ("set mtu 1500", "interfaces ge-0/0/0", ""),
+        ("show mtu", "interfaces ge-0/0/0", "mtu 1500;"),
+        ("show | compare", "interfaces ge-0/0/0", "[edit interfaces ge-0/0/0]\n-   mtu 9000;\n+   mtu 1500;"),
+        ("edit unit 0", "interfaces ge-0/0/0 unit 0", ""),
+        ("show vlan-id", "interfaces ge-0/0/0 unit 0", "vlan-id 10;"),
+        ("up", "interfaces ge-0/0/0", ""),
+        ("edit unit 0 family inet", "interfaces ge-0/0/0 unit 0 family inet", ""),
+        ("up 2", "interfaces ge-0/0/0 unit 0", ""),
+        ("top set system host-name r9", "interfaces ge-0/0/0 unit 0", ""),
+        ("top show system host-name", "interfaces ge-0/0/0 unit 0", "host-name r9;"),
+        ("top edit routing", "routing", ""),
+        ("exit", "", ""),
+        ("edit interfaces lo0", "interfaces lo0", ""),
+        ("up 9", "", ""),
+        ("edit interfaces ge-0/0/7", "interfaces ge-0/0/7", ""),
+        ("show", "interfaces ge-0/0/7", ""),
+        ("top", "", ""),
+    ]
+    for line, level, output in steps:
+        testing.assertEqual(cfg.run(line), output, "output of {line}")
+        testing.assertEqual(cfg.level(), level, "edit level after {line}")
+
+
+def _test_exit_returns_to_the_last_level():
+    cfg = _Config()
+    steps = [
+        ("edit interfaces ge-0/0/0 unit 0", "interfaces ge-0/0/0 unit 0", ""),
+        ("exit", "", ""),
+        ("edit interfaces", "interfaces", ""),
+        ("edit ge-0/0/0", "interfaces ge-0/0/0", ""),
+        ("exit", "interfaces", ""),
+        ("exit", "", ""),
+        ("exit", "", "LEAVE"),
+    ]
+    for line, level, output in steps:
+        testing.assertEqual(cfg.run(line), output, "output of {line}")
+        testing.assertEqual(cfg.level(), level, "edit level after {line}")
+
+
+def _test_order_change_is_a_change():
+    cfg = _Config()
+    cfg.run("delete routing policy p1")
+    cfg.run("set routing policy p1 action accept")
+    testing.assertTrue(cfg.cand.changed(), "a moved entry of an ordered-by user list is a change")
+
+
+def _test_candidate_edits():
+    cfg = _Config()
+    testing.assertFalse(cfg.cand.changed(), "a new candidate has no changes")
+    cfg.run("set system host-name r2")
+    cfg.run("delete interfaces lo0")
+    testing.assertTrue(cfg.cand.changed(), "changed after set")
+    testing.assertEqual([e.op for e in cfg.cand.edits], ["set", "delete"], "edits in order")
+    testing.assertEqual(cpath.path_tokens(cfg.ctx().start, cfg.cand.edits[0].steps), ["system", "host-name", "r2"], "edit path")
+    cfg.run("delete interfaces xe-9/9/9")
+    testing.assertEqual(len(cfg.cand.edits), 2, "a delete of nothing is no edit")
+    cfg.run("rollback")
+    testing.assertFalse(cfg.cand.changed(), "no changes after rollback")
+    testing.assertEqual(len(cfg.cand.edits), 0, "no edits after rollback")
+
+
+def _texts(r: command.Reply) -> list[str]:
+    return [c.text for c in r.items]
+
+
+def _test_config_complete():
+    cfg = _Config()
+    cases = [
+        ("commands", "", ["delete", "edit", "exit", "quit", "rollback", "run", "set", "show", "top", "up"]),
+        ("set", "set ", ["system", "interfaces", "routing", "snmp"]),
+        ("set enum", "set interfaces ge-0/0/0 speed ", ["auto", "10m", "100m", "1g"]),
+        ("delete leaf-list value", "delete system name-server ", ["<[Enter]>", "<name-server>", "10.0.0.1", "10.0.0.2"]),
+        ("edit offers levels", "edit ", ["system", "interfaces", "routing", "snmp"]),
+        ("edit leaves out leaves", "edit system ", ["<[Enter]>", "services", "syslog"]),
+        ("show pipes", "show | ", ["compare", "display"]),
+        ("run", "run ", ["show"]),
+        ("top", "top ", ["<[Enter]>", "delete", "edit", "exit", "quit", "rollback", "set", "show", "up"]),
+        ("edit whole list", "edit routing route ", ["<prefix>", "10.0.0.0/8"]),
+        ("run show", "run show ", ["configuration"]),
+        ("top", "top s", ["set", "show"]),
+        ("rollback", "rollback ", ["<[Enter]>", "0"]),
+        ("exit", "exit ", ["<[Enter]>", "configuration-mode"]),
+    ]
+    for name, line, texts in cases:
+        r = command.complete(cfg.ctx(), line)
+        testing.assertEqual(r.error, None, "no error {name}")
+        testing.assertEqual(_texts(r), texts, "completions {name}")
+    cfg.run("set interfaces ge-0/0/5 mtu 1500")
+    r = command.complete(cfg.ctx(), "edit interfaces ge-0/0/")
+    testing.assertEqual(_texts(r), ["<name>", "ge-0/0/0", "ge-0/0/5"], "keys come from the candidate")

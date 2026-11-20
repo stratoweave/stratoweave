@@ -1,0 +1,601 @@
+"""Commands of the CLI.
+
+In operational mode the commands are `configure`, `show configuration [path]
+[| display set|xml|json]`, `exit` and `quit`. In configuration mode they are
+`set`, `delete`, `edit`, `up [N]`, `top [command]`, `show [path] [| compare |
+display set|xml|json]`, `rollback [0]`, `run <command>` and `exit
+[configuration-mode]`. Keywords take a unique prefix, so `sh conf` is `show
+configuration`.
+
+One walk over the words serves both parsing and completion. It returns the
+command or an error, and what can follow the words.
+"""
+
+import yang.schema as yschema
+import yang.gdata as ygdata
+
+import cli.candidate as candidate
+import cli.hints as hints
+import cli.path as cpath
+import cli.render as render
+
+
+_OP = [
+    ("configure", "Enter configuration mode"),
+    ("exit", "Exit the CLI"),
+    ("quit", "Exit the CLI"),
+    ("show", "Show information"),
+]
+
+_CONFIG = [
+    ("delete", "Delete a statement"),
+    ("edit", "Move to a level of the configuration"),
+    ("exit", "Return to the level before the last edit, or leave configuration mode at the top"),
+    ("quit", "Return to the level before the last edit, or leave configuration mode at the top"),
+    ("rollback", "Discard the changes in the candidate configuration"),
+    ("run", "Run an operational mode command"),
+    ("set", "Set a value"),
+    ("show", "Show the candidate configuration"),
+    ("top", "Move to the top level, or run a command there"),
+    ("up", "Move up one level, or more"),
+]
+
+_SHOW = [
+    ("configuration", "Show the running configuration"),
+]
+
+_EXIT = [
+    ("configuration-mode", "Leave configuration mode"),
+]
+
+_ROLLBACK = [
+    ("0", "Discard the changes in the candidate configuration"),
+]
+
+_PIPE_OP = [
+    ("display", "Show the output in another format"),
+]
+
+_PIPE_CONFIG = [
+    ("compare", "Compare with the running configuration"),
+    ("display", "Show the output in another format"),
+]
+
+_DISPLAY = [
+    ("json", "Show the configuration as JSON"),
+    ("set", "Show the configuration as set commands"),
+    ("xml", "Show the configuration as XML"),
+]
+
+ENTER = cpath.Completion("<[Enter]>", " ", "Execute this command", insert=False)
+PIPE = cpath.Completion("|", " ", "Pipe through a command", insert=False)
+
+
+class Context(object):
+    """What commands work on.
+
+    mode is "op" or "config". data is the configuration that paths complete
+    against and that show prints: the running configuration in operational
+    mode, the candidate in configuration mode. base is the running
+    configuration the candidate started from, and running is the newest copy
+    of the running configuration. All three are trees at the schema root.
+    root_path holds the containers above the start node of CLI paths. edit is
+    the edit level below the start node; here and here_data are the node and
+    the data at that level. back holds the levels that exit returns to, the
+    newest last.
+    """
+    root: yschema.DRoot
+    mode: str
+    data: ?ygdata.Node
+    base: ?ygdata.Node
+    running: ?ygdata.Node
+    root_path: list[yschema.DNode]
+    start: yschema.DNode
+    start_data: ?ygdata.Node
+    edit: list[cpath.Step]
+    here: yschema.DNode
+    here_data: ?ygdata.Node
+    back: list[list[cpath.Step]]
+
+    def __init__(self, root: yschema.DRoot, data: ?ygdata.Node=None, mode: str="op", edit: list[cpath.Step]=[], base: ?ygdata.Node=None, running: ?ygdata.Node=None, back: list[list[cpath.Step]]=[]):
+        self.root = root
+        self.mode = mode
+        self.data = data
+        self.base = base
+        self.running = running if running is not None else data
+        self.root_path = hints.cli_root(root)
+        top = cpath.descend(root, data, [cpath.Step(n) for n in self.root_path])
+        self.start = top.node
+        self.start_data = top.data
+        self.edit = edit
+        h = cpath.descend(self.start, self.start_data, edit)
+        self.here = h.node
+        self.here_data = h.data
+        self.back = back
+
+    def at_top(self) -> Context:
+        """Return the same context at the top edit level."""
+        return Context(self.root, self.data, self.mode, [], self.base, self.running, self.back)
+
+    def op(self) -> Context:
+        """Return the operational mode context over the running configuration."""
+        return Context(self.root, self.running, "op")
+
+
+class Command(object):
+    """A parsed command.
+
+    name is the command: "configure", "exit", "exit configuration-mode",
+    "show configuration", "show", "set", "delete", "edit", "up", "top",
+    "rollback", "run", or "" for an empty line. path is relative to the edit
+    level edit. display is the format a `| display` pipe asks for, and compare
+    is True for `| compare`. count is the number of levels for up. sub is the
+    command that top or run runs.
+    """
+    name: str
+    path: ?cpath.PathResult
+    edit: list[cpath.Step]
+    display: str
+    compare: bool
+    count: int
+    sub: ?Command
+
+    def __init__(self, name: str, path: ?cpath.PathResult=None, edit: list[cpath.Step]=[], count: int=1, sub: ?Command=None):
+        self.name = name
+        self.path = path
+        self.edit = edit
+        self.display = ""
+        self.compare = False
+        self.count = count
+        self.sub = sub
+
+    def steps(self) -> list[cpath.Step]:
+        """Return the path from the start node: the edit level and then the command's path."""
+        p = self.path
+        if p is not None:
+            return self.edit + p.steps
+        return self.edit
+
+
+class ParseResult(object):
+    """A parsed command, or an error at a character position of the line."""
+    cmd: ?Command
+    error: ?str
+    column: int
+    matches: list[str]
+
+    def __init__(self, cmd: ?Command, error: ?str=None, column: int=0, matches: list[str]=[]):
+        self.cmd = cmd
+        self.error = error
+        self.column = column
+        self.matches = matches
+
+
+class _Word(object):
+    word: ?str
+    error: ?str
+    matches: list[str]
+
+    def __init__(self, word: ?str, error: ?str=None, matches: list[str]=[]):
+        self.word = word
+        self.error = error
+        self.matches = matches
+
+
+def _match_word(words: list[(str, str)], t: cpath.Token) -> _Word:
+    if t.quoted:
+        return _Word(None, "syntax error.")
+    found = []
+    for w, _ in words:
+        if w == t.text:
+            return _Word(w)
+        if w.startswith(t.text):
+            found.append(w)
+    if len(found) == 1:
+        return _Word(found[0])
+    if len(found) > 1:
+        return _Word(None, "'{t.text}' is ambiguous.", found)
+    return _Word(None, "syntax error.")
+
+
+def _msg(err: ?str) -> str:
+    if err is not None:
+        return err
+    return "syntax error."
+
+
+def _column(line: str, toks: list[cpath.Token], i: int) -> int:
+    if i < len(toks):
+        return toks[i].start
+    return len(line)
+
+
+def _words(words: list[(str, str)]) -> list[cpath.Completion]:
+    return [cpath.Completion(w, " ", h, keyword=True) for w, h in words]
+
+
+class _Walk(object):
+    """The result of walking the words of a line.
+
+    cmd is the command when the words make one. Otherwise error is set, at is
+    the index of the word it points at, and matches lists the keywords of an
+    ambiguous prefix. items are what can follow the words.
+    """
+    cmd: ?Command
+    error: ?str
+    at: int
+    matches: list[str]
+    items: list[cpath.Completion]
+
+    def __init__(self, cmd: ?Command, items: list[cpath.Completion]=[], error: ?str=None, at: int=0, matches: list[str]=[]):
+        self.cmd = cmd
+        self.items = items
+        self.error = error
+        self.at = at
+        self.matches = matches
+
+
+def _fail(error: ?str, at: int, matches: list[str]=[], items: list[cpath.Completion]=[]) -> _Walk:
+    return _Walk(None, items, _msg(error), at, matches)
+
+
+def _done(cmd: Command, toks: list[cpath.Token], i: int) -> _Walk:
+    """Return the command when no words follow it."""
+    if i < len(toks):
+        return _fail("syntax error.", i)
+    return _Walk(cmd, [ENTER])
+
+
+def _optional_word(cmd: Command, with_word: str, words: list[(str, str)], toks: list[cpath.Token], i: int) -> _Walk:
+    """Return the command, renamed with_word when one of words follows it."""
+    if i >= len(toks):
+        return _Walk(cmd, [ENTER] + _words(words))
+    w = _match_word(words, toks[i])
+    if w.word is None:
+        return _fail(w.error, i, w.matches)
+    cmd.name = with_word
+    return _done(cmd, toks, i + 1)
+
+
+def _sub(name: str, sub: _Walk) -> _Walk:
+    c = sub.cmd
+    if c is not None:
+        return _Walk(Command(name, sub=c), sub.items)
+    return sub
+
+
+def _pipe(cmd: Command, pipes: list[(str, str)], toks: list[cpath.Token], p: int) -> _Walk:
+    """Parse the pipe that starts at word p."""
+    if p + 1 >= len(toks):
+        return _fail("missing argument.", p + 1, items=_words(pipes))
+    w = _match_word(pipes, toks[p + 1])
+    if w.word is None:
+        return _fail(w.error, p + 1, w.matches)
+    if w.word == "compare":
+        cmd.compare = True
+        return _done(cmd, toks, p + 2)
+    if p + 2 >= len(toks):
+        return _fail("missing argument.", p + 2, items=_words(_DISPLAY))
+    f = _match_word(_DISPLAY, toks[p + 2])
+    fw = f.word
+    if fw is not None:
+        cmd.display = fw
+        return _done(cmd, toks, p + 3)
+    return _fail(f.error, p + 2, f.matches)
+
+
+def _path(ctx: Context, toks: list[cpath.Token], i: int, name: str, node: yschema.DNode, data: ?ygdata.Node, edit: list[cpath.Step], pipes: list[(str, str)], values: bool=False, optional: bool=False, need_path: bool=False) -> _Walk:
+    """Parse a path from word i, then an optional pipe."""
+    p = len(toks)
+    for j in range(i, len(toks)):
+        if toks[j].is_pipe():
+            p = j
+            break
+    r = cpath.complete(ctx.root, node, data, toks[i:p], values, optional)
+    res = r.path
+    err = res.error
+    if need_path and p == i:
+        return _fail("missing argument.", i, items=r.items)
+    if err is not None:
+        return _fail(err, i + res.error_at, res.matches, r.items)
+    cmd = Command(name, res, edit)
+    if p == len(toks):
+        return _Walk(cmd, [ENTER] + r.items + ([PIPE] if len(pipes) > 0 else []))
+    if len(pipes) == 0:
+        return _fail("syntax error.", p)
+    return _pipe(cmd, pipes, toks, p)
+
+
+def _edit(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
+    """Parse `edit <path>`. The path ends at a container or a list entry."""
+    w = _path(ctx, toks, i, "edit", ctx.here, ctx.here_data, ctx.edit, [], need_path=True)
+    # Leaves are not levels, so completion leaves them out.
+    w.items = [c for c in w.items if not c.keyword or c.marker == ">"]
+    c = w.cmd
+    if c is not None:
+        res = c.path
+        if res is not None:
+            if res.pos.kind == "keys":
+                return _fail("missing argument.", len(toks), items=[it for it in w.items if it.text != "<[Enter]>"])
+            if res.pos.kind == "end":
+                return _fail("syntax error.", i + res.used - 1)
+    return w
+
+
+def _up(toks: list[cpath.Token], i: int) -> _Walk:
+    if i >= len(toks):
+        return _Walk(Command("up"), [ENTER, cpath.Completion("<number>", " ", "Number of levels to move up", insert=False)])
+    n = 0
+    try:
+        n = int(toks[i].text)
+    except ValueError:
+        return _fail("'{toks[i].text}' is not a number.", i)
+    if n < 1:
+        return _fail("'{toks[i].text}' is not a number of levels.", i)
+    return _done(Command("up", count=n), toks, i + 1)
+
+
+def _walk(ctx: Context, toks: list[cpath.Token], i: int, exclude: set[str]=set()) -> _Walk:
+    """Walk the words from word i in the context's mode, without the commands in exclude."""
+    words = [(w, h) for w, h in (_CONFIG if ctx.mode == "config" else _OP) if w not in exclude]
+    if i >= len(toks):
+        return _Walk(Command(""), _words(words))
+    w = _match_word(words, toks[i])
+    word = w.word
+    if word is None:
+        return _fail(w.error, i, w.matches)
+    if ctx.mode == "op":
+        if word == "exit" or word == "quit":
+            return _done(Command("exit"), toks, i + 1)
+        if word == "configure":
+            return _done(Command("configure"), toks, i + 1)
+        if i + 1 >= len(toks):
+            return _fail("missing argument.", i + 1, items=_words(_SHOW))
+        s = _match_word(_SHOW, toks[i + 1])
+        if s.word is None:
+            return _fail(s.error, i + 1, s.matches)
+        return _path(ctx, toks, i + 2, "show configuration", ctx.start, ctx.start_data, [], _PIPE_OP)
+    if word == "set":
+        return _path(ctx, toks, i + 1, "set", ctx.here, ctx.here_data, ctx.edit, [], values=True, need_path=True)
+    if word == "delete":
+        return _path(ctx, toks, i + 1, "delete", ctx.here, ctx.here_data, ctx.edit, [], values=True, optional=True, need_path=True)
+    if word == "edit":
+        return _edit(ctx, toks, i + 1)
+    if word == "show":
+        return _path(ctx, toks, i + 1, "show", ctx.here, ctx.here_data, ctx.edit, _PIPE_CONFIG)
+    if word == "up":
+        return _up(toks, i + 1)
+    if word == "top":
+        # top runs one configuration command at the top level, but not top or run.
+        no = {"top", "run"}
+        if i + 1 >= len(toks):
+            return _Walk(Command("top"), [ENTER] + _words([(w, h) for w, h in _CONFIG if w not in no]))
+        return _sub("top", _walk(ctx.at_top(), toks, i + 1, no))
+    if word == "run":
+        # run takes the operational mode commands that do not change the mode.
+        no = {"configure", "exit", "quit"}
+        if i + 1 >= len(toks):
+            return _fail("missing argument.", i + 1, items=_words([(w, h) for w, h in _OP if w not in no]))
+        return _sub("run", _walk(ctx.op(), toks, i + 1, no))
+    if word == "rollback":
+        return _optional_word(Command("rollback"), "rollback", _ROLLBACK, toks, i + 1)
+    return _optional_word(Command("exit"), "exit configuration-mode", _EXIT, toks, i + 1)
+
+
+def parse(ctx: Context, line: str) -> ParseResult:
+    """Parse one command line."""
+    tk = cpath.tokenize(line)
+    toks = tk.items
+    if tk.open_quote:
+        return ParseResult(None, "missing closing quote.", _column(line, toks, len(toks) - 1))
+    w = _walk(ctx, toks, 0)
+    e = w.error
+    if e is not None:
+        return ParseResult(None, e, _column(line, toks, w.at), w.matches)
+    return ParseResult(w.cmd)
+
+
+class Reply(object):
+    """Completions for the word under the cursor.
+
+    partial is the start of the word under the cursor, and start is the
+    character position where that word begins; items are filtered by it. error
+    is set when the words before the cursor do not parse; column is then its
+    character position.
+    """
+    items: list[cpath.Completion]
+    partial: str
+    start: int
+    error: ?str
+    column: int
+    matches: list[str]
+
+    def __init__(self, items: list[cpath.Completion], partial: str, start: int=0, error: ?str=None, column: int=0, matches: list[str]=[]):
+        self.items = items
+        self.partial = partial
+        self.start = start
+        self.error = error
+        self.column = column
+        self.matches = matches
+
+
+def _matches(c: cpath.Completion, partial: str) -> bool:
+    """Return True when a completion starts with the partial word.
+
+    A keyword also matches by its name without the module prefix.
+    """
+    if c.value.startswith(partial):
+        return True
+    if c.keyword:
+        return c.value[c.value.find(":") + 1:].startswith(partial)
+    return False
+
+
+def complete(ctx: Context, line: str) -> Reply:
+    """Return the completions at the end of a line.
+
+    The line is the text up to the cursor. When it does not end in white space,
+    its last word is the partial word to complete.
+    """
+    tk = cpath.tokenize(line)
+    if tk.open_quote:
+        return Reply([], "", len(line))
+    toks = tk.items
+    partial = ""
+    start = len(line)
+    if not tk.trailing and len(toks) > 0:
+        partial = toks[-1].text
+        start = toks[-1].start
+        toks = toks[:-1]
+    w = _walk(ctx, toks, 0)
+    e = w.error
+    if e is not None and not (e == "missing argument." and w.at >= len(toks)):
+        return Reply([], partial, start, e, _column(line, toks, w.at), w.matches)
+    items = []
+    for c in w.items:
+        if c.insert:
+            if _matches(c, partial):
+                items.append(c)
+        elif partial == "" or (c.text != "<[Enter]>" and c.text != "|"):
+            items.append(c)
+    return Reply(items, partial, start)
+
+
+def help_text(items: list[cpath.Completion]) -> str:
+    """Format completions as the `?` help list."""
+    lines = ["Possible completions:"]
+    first = []
+    by_text = {}
+    last = []
+    for c in items:
+        if c.text == "|":
+            last.append(c)
+        elif c.text.startswith("<"):
+            first.append(c)
+        elif c.text not in by_text:
+            by_text[c.text] = c
+    middle = [by_text[t] for t in sorted(by_text.keys())]
+    for c in first + middle + last:
+        name = c.text
+        if c.help == "":
+            lines.append("{c.marker} {name}")
+        elif len(name) < 21:
+            lines.append("{c.marker} {name.ljust(21)}{c.help}")
+        else:
+            lines.append("{c.marker} {name}  {c.help}")
+    return "\n".join(lines)
+
+
+def output(ctx: Context, cmd: Command) -> str:
+    """Return the output of a show configuration or show command.
+
+    In operational mode it shows ctx.data, the running configuration. In
+    configuration mode it shows the candidate, or compares it with base.
+    """
+    pres = cmd.path
+    d = ctx.data
+    if pres is not None and d is not None:
+        steps = cmd.steps()
+        if cmd.compare:
+            return "\n".join(_compare(ctx, steps, pres.pos))
+        if cmd.display == "set":
+            return render.set_lines(ctx.start, steps, pres.pos)
+        if cmd.display == "xml" or cmd.display == "json":
+            sub = render.prune(ctx.root_path, steps, d)
+            if sub is not None:
+                return sub.to_xmlstr(pretty=True) if cmd.display == "xml" else sub.to_yang_jsonstr(pretty=True)
+            return ""
+        return render.curly(pres.pos)
+    return ""
+
+
+class Applied(object):
+    """The result of a configuration mode command.
+
+    edit is the new edit level, back the new list of levels that exit returns
+    to, text the output to print, and leave is True when the command leaves
+    configuration mode.
+    """
+    edit: list[cpath.Step]
+    back: list[list[cpath.Step]]
+    text: str
+    leave: bool
+
+    def __init__(self, edit: list[cpath.Step], back: list[list[cpath.Step]], text: str="", leave: bool=False):
+        self.edit = edit
+        self.back = back
+        self.text = text
+        self.leave = leave
+
+
+def apply(ctx: Context, cand: candidate.Candidate, cmd: Command) -> Applied:
+    """Run a configuration mode command on the candidate at the context's edit level.
+
+    run, configure and show configuration need the device, so the caller runs
+    them.
+    """
+    n = cmd.name
+    edit = ctx.edit
+    back = ctx.back
+    if n == "show":
+        return Applied(edit, back, output(ctx, cmd))
+    if n == "edit":
+        return Applied(cmd.steps(), back + [edit])
+    if n == "up":
+        return Applied(edit[:len(edit) - cmd.count] if cmd.count < len(edit) else [], back)
+    if n == "top":
+        sub = cmd.sub
+        if sub is not None:
+            r = apply(ctx.at_top(), cand, sub)
+            # A command run at the top keeps the edit level, unless it moves.
+            if sub.name in {"edit", "up", "exit", "exit configuration-mode"}:
+                return r
+            return Applied(edit, back, r.text, r.leave)
+        return Applied([], back)
+    if n == "exit":
+        if len(back) > 0:
+            return Applied(back[-1], back[:-1])
+        if len(edit) > 0:
+            return Applied([], [])
+        return Applied([], [], leave=True)
+    if n == "exit configuration-mode":
+        return Applied([], [], leave=True)
+    if n == "rollback":
+        cand.rollback()
+        return Applied(edit, back, "load complete")
+    steps = [cpath.Step(r) for r in ctx.root_path] + cmd.steps()
+    if n == "set":
+        cand.set(steps)
+    elif n == "delete":
+        if not cand.delete(steps):
+            return Applied(edit, back, "warning: statement not found")
+    return Applied(edit, back)
+
+
+def refresh(ctx: Context, cmd: Command) -> Command:
+    """Return the command with its path resolved again against the context's data."""
+    p = cmd.path
+    if p is not None:
+        h = cpath.descend(ctx.start, ctx.start_data, cmd.edit)
+        words = cpath.path_tokens(h.node, p.steps)
+        res = cpath.resolve(ctx.root, h.node, h.data, cpath.tokenize(" ".join(words)).items)
+        c = Command(cmd.name, res, cmd.edit, cmd.count, cmd.sub)
+        c.display = cmd.display
+        c.compare = cmd.compare
+        return c
+    return cmd
+
+
+def _compare(ctx: Context, steps: list[cpath.Step], pos: cpath.Position) -> list[str]:
+    base_start = cpath.descend(ctx.root, ctx.base, [cpath.Step(n) for n in ctx.root_path]).data
+    old = cpath.descend(ctx.start, base_start, steps).data
+    if pos.kind == "inner" and (len(steps) == 0 or (old is not None and pos.data is not None)):
+        return candidate.compare(ctx.start, steps, pos.node, old, pos.data)
+    # At a list, a leaf, or a node that only one side has, compare that one
+    # child of its parent, so an added or removed node shows as a whole.
+    last = steps[-1]
+    parent_steps = steps[:-1]
+    old_parent = cpath.descend(ctx.start, base_start, parent_steps)
+    new_parent = cpath.descend(ctx.start, ctx.start_data, parent_steps)
+    entry: ?list[value] = last.keys if pos.kind == "inner" and len(last.keys) > 0 else None
+    return candidate.compare(ctx.start, parent_steps, old_parent.node, old_parent.data, new_parent.data, last.node, entry)

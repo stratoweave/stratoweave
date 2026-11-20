@@ -272,6 +272,17 @@
   with `track_config=True`. Before, it read it on every connect, so tools that
   only read data or subscribe, like `ncurl monitor`, read the whole
   configuration too.
+- `ncurl cli` is an interactive command line in the style of the Junos CLI.
+  Its commands, completion with TAB and space, and `?` help come from the
+  device schema, shaped by the Junos `cli-feature` and the Tail-f
+  `cli-drop-node-name` and `cli-no-keyword` statements in it.
+  `show configuration` prints the running configuration in curly braces, or
+  in other formats with `| display set`, `| display xml` and
+  `| display json`. `configure` starts configuration mode on a candidate
+  kept in the CLI, with `set`, `delete`, `edit`, `up`, `top`, `rollback`,
+  `run`, `show` and `show | compare`. With a command as arguments, it runs
+  that command and exits. Without a terminal, it reads commands line by line
+  from stdin.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
@@ -853,7 +864,8 @@
 - Requires Acton newer than 0.31.0, for explicit parameter defaults
   [acton#3211], the `Env` services [acton#2768], the write barriers of the
   generational garbage collector [acton#3390], HTTP server bodies as bytes
-  [acton#3403] and compressed HTTP responses [acton#3404].
+  [acton#3403], compressed HTTP responses [acton#3404] and the raw terminal
+  mode of stdin [acton#3419].
 
 #### acton-yang
 - gdata is encoded as compact XML and JSON by default, as in the Acton
@@ -1228,6 +1240,7 @@ next. Give it a spin. We’d love to hear what you think.
 [acton#3403]: https://github.com/actonlang/acton/pull/3403
 [acton#3404]: https://github.com/actonlang/acton/pull/3404
 [acton#3410]: https://github.com/actonlang/acton/pull/3410
+[acton#3419]: https://github.com/actonlang/acton/pull/3419
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
 [acton-ssh#6]: https://github.com/actonlang/acton-ssh/pull/6
 [acton-ssh#15]: https://github.com/actonlang/acton-ssh/pull/15

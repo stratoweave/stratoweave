@@ -1,0 +1,553 @@
+"""Interactive CLI session for one device.
+
+The session owns the line editor and a DeviceMgr for the device. Key presses
+and device replies arrive as messages, and every device request has a timeout,
+so a slow device never stops the editor.
+
+`configure` starts a candidate configuration from the running configuration,
+if there is none with changes yet. The candidate lives in the session: it
+stays when the user leaves configuration mode, and goes when the CLI exits.
+
+Without a terminal on both stdin and stdout, the session reads commands line
+by line from stdin and prints only their output. A command script ends with
+`exit`, after `exit configuration-mode` when it is in configuration mode. A
+command given as arguments runs alone, and the CLI exits after it.
+"""
+
+import std.argparse
+import file
+import logging
+
+import yang.schema as yschema
+import yang.gdata as ygdata
+
+import adapters.netconf as swna
+import device as swdev
+import yang_dir as local_yang
+from device_meta_config import \
+    stratoweave_rfs__device_entry as DeviceMetaConfig, \
+    stratoweave_rfs__device__credentials as Credentials, \
+    stratoweave_rfs__device__ssh as DeviceMetaConfigSsh
+
+import cli.candidate as candidate
+import cli.command as command
+import cli.lineedit as lineedit
+import cli.path as cpath
+
+
+# Terminal sequences that turn bracketed paste on and off.
+BRACKETED_PASTE_ON = "\x1b[?2004h"
+BRACKETED_PASTE_OFF = "\x1b[?2004l"
+
+
+class EditorSink(logging.Sink):
+    """Send log lines to the CLI session, which prints them above the prompt."""
+    @property
+    on_line: action(str) -> None
+
+    def __init__(self, on_line: action(str) -> None):
+        self.formatter = logging.DefaultFormatter()
+        self.on_line = on_line
+
+    def handle(self, m: logging.Message):
+        text = self.formatter.format(m)
+        if text is not None:
+            data = m.data
+            if data is not None:
+                text += " - " + str(data)
+            self.on_line(text)
+
+
+def common_prefix(words: list[str]) -> str:
+    """Return the longest common prefix of some words."""
+    if len(words) == 0:
+        return ""
+    res = words[0]
+    for w in words[1:]:
+        n = 0
+        while n < len(res) and n < len(w) and res[n] == w[n]:
+            n += 1
+        res = res[:n]
+    return res
+
+
+actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler, credentials: Credentials, ssh: DeviceMetaConfigSsh):
+    """Run the CLI against the device that the global options name, with the given credentials and SSH settings."""
+    host = args.get_str("host")
+    port = args.get_int("port")
+    username = args.get_str("username")
+    yang_dir = args.get_str("yang-dir")
+    modules = args.get_strlist("module")
+    module_sets = args.get_strlist("module-set")
+    timeout = float(args.get_int("timeout"))
+    oneshot = args.get_strlist("command")
+    interactive = len(oneshot) == 0 and env.stdio.stdin_is_tty() and env.stdio.stdout_is_tty()
+    op_prompt = "{username}@{host}> "
+    config_prompt = "{username}@{host}# "
+    editor = lineedit.LineEditor(op_prompt)
+    decoder = lineedit.KeyDecoder()
+
+    var local_schema: ?yschema.DRoot = None
+    var schema: ?yschema.DRoot = None
+    var running: ?ygdata.Node = None
+    var cand: ?candidate.Candidate = None
+    var mode = "op"
+    var edit: list[cpath.Step] = []
+    var back: list[list[cpath.Step]] = []
+    var confirm = False
+    var dev: ?swdev.DeviceMgr = None
+    var ready = False
+    var busy = False
+    var done = False
+    var failed = False
+    var pending_keys: list[lineedit.Key] = []
+    var lines: list[str] = []
+    var partial_line = b""
+    var esc_gen = 0
+    var request = 0
+    var pending: ?command.Command = None
+
+    def out(text: str):
+        print(text, end="", flush=True)
+
+    def say(text: str):
+        """Print a message line: on stdout in the interactive CLI, else on stderr."""
+        if interactive:
+            out(text + "\n")
+        else:
+            print(text, err=True)
+
+    def finish(code: int):
+        if not done:
+            done = True
+            if interactive:
+                out(BRACKETED_PASTE_OFF)
+            env.exit(code)
+
+    def fail(msg: str):
+        say("error: " + msg)
+        failed = True
+
+    def show_error(line: str, column: int, msg: str, matches: list[str]):
+        if interactive:
+            out(" " * (len(editor.prompt) + column) + "^\n")
+        else:
+            print(line, err=True)
+            print(" " * column + "^", err=True)
+            failed = True
+        say(msg)
+        if len(matches) > 0:
+            say("Possible completions:")
+            for m in matches:
+                say("  " + m)
+
+    def make_ctx() -> ?command.Context:
+        """Return the command context for the current mode and edit level."""
+        s = schema
+        if s is not None:
+            c = cand
+            if mode == "config" and c is not None:
+                return command.Context(s, c.data, "config", edit, c.base, running, back)
+            return command.Context(s, running)
+        return None
+
+    def banner() -> str:
+        c = make_ctx()
+        if c is not None:
+            words = cpath.path_tokens(c.start, edit)
+            if len(words) > 0:
+                return "[edit " + " ".join(words) + "]"
+        return "[edit]"
+
+    def prompt():
+        """Show the prompt, then handle the keys or lines that wait."""
+        if done or busy:
+            return
+        if interactive:
+            if mode == "config" and not confirm:
+                out("\n" + banner() + "\n")
+            out(editor.render())
+            while not busy and not done and len(pending_keys) > 0:
+                handle_key(pending_keys.pop(0))
+        elif len(lines) > 0:
+            execute(lines.pop(0))
+        elif len(oneshot) > 0:
+            finish(1 if failed else 0)
+
+    def enter_config():
+        mode = "config"
+        edit = []
+        back = []
+        editor.set_prompt(config_prompt)
+        say("Entering configuration mode")
+        c = cand
+        if c is not None and c.changed():
+            say("The candidate configuration has changes that are not committed")
+
+    def leave_config():
+        mode = "op"
+        edit = []
+        back = []
+        editor.set_prompt(op_prompt)
+        say("Exiting configuration mode")
+
+    def leave_cli():
+        """Exit, after the user confirms when the candidate has changes."""
+        c = cand
+        if c is not None and c.changed():
+            if interactive:
+                confirm = True
+                editor.set_prompt("Discard uncommitted changes? [yes,no] (no) ")
+                return
+            say("warning: discarding uncommitted changes")
+        finish(1 if failed else 0)
+
+    def execute(line: str):
+        if confirm:
+            confirm = False
+            editor.set_prompt(config_prompt if mode == "config" else op_prompt)
+            if line.strip() in {"yes", "y"}:
+                finish(1 if failed else 0)
+                return
+        else:
+            c = make_ctx()
+            if c is not None:
+                r = command.parse(c, line)
+                e = r.error
+                cmd = r.cmd
+                if e is not None:
+                    show_error(line, r.column, e, r.matches)
+                elif cmd is not None:
+                    run_command(c, cmd)
+                    return
+        prompt()
+
+    def run_command(c: command.Context, cmd: command.Command):
+        """Run a parsed command, then show the prompt unless the command waits for the device."""
+        n = cmd.name
+        ca = cand
+        fresh = True
+        if ca is not None and n == "configure":
+            fresh = not ca.changed()
+        if n == "show configuration" or (n == "configure" and fresh):
+            pending = cmd
+            fetch()
+            return
+        if n == "configure":
+            enter_config()
+        elif n == "exit" and c.mode == "op":
+            leave_cli()
+        elif n == "run":
+            sub = cmd.sub
+            if sub is not None:
+                run_command(c.op(), sub)
+                return
+        elif ca is not None and c.mode == "config":
+            r = command.apply(c, ca, cmd)
+            edit = r.edit
+            back = r.back
+            if r.text != "":
+                if interactive:
+                    out(r.text + "\n")
+                else:
+                    print(r.text)
+            if r.leave:
+                leave_config()
+        prompt()
+
+    def fetch():
+        """Read the running configuration; on_fetch gets the reply."""
+        d = dev
+        if d is not None:
+            busy = True
+            request += 1
+            n = request
+            d.fetch_config(lambda data, e: self.on_fetch(n, data, e))
+            after timeout: fetch_timeout(n)
+
+    def fetch_timeout(n: int):
+        if busy and n == request:
+            busy = False
+            request += 1
+            if not ready:
+                fail("no configuration from {host}:{port} within {int(timeout)} seconds")
+                finish(1)
+                return
+            fail("no reply from the device within {int(timeout)} seconds")
+            prompt()
+
+    def on_fetch(n: int, data: ?ygdata.Node, e: ?Exception):
+        if not busy or n != request:
+            return
+        busy = False
+        s = schema
+        p = pending
+        pending = None
+        if e is not None:
+            fail("cannot read the configuration: {e}")
+            if not ready:
+                finish(1)
+                return
+        elif s is not None:
+            running = data
+            if ready and p is not None:
+                if p.name == "configure":
+                    cand = candidate.Candidate(s, data)
+                    enter_config()
+                else:
+                    show_running(command.Context(s, data), p)
+            ready = True
+        prompt()
+
+    def show_running(c: command.Context, cmd: command.Command):
+        """Print a show configuration command against freshly read running configuration."""
+        text = command.output(c, command.refresh(c, cmd))
+        if text != "":
+            if interactive:
+                out(text + "\n")
+            else:
+                print(text)
+
+    def on_reconf(name: str):
+        if schema is not None or done:
+            return
+        d = dev
+        if d is not None:
+            ls = local_schema
+            s = ls if ls is not None else d.get_fetched_schema()
+            if s is not None:
+                schema = s
+                if interactive:
+                    # Completion offers the keys in the running configuration.
+                    fetch()
+                else:
+                    # Each show command reads the configuration itself.
+                    ready = True
+                    prompt()
+            else:
+                fail("no schema for {host}:{port}; use --yang-dir")
+                finish(1)
+
+    def connect_timeout():
+        if schema is None:
+            fail("cannot connect to {host}:{port} within {int(timeout)} seconds")
+            finish(1)
+
+    def log_line(text: str):
+        if interactive and ready and not busy and not done:
+            out(editor.hide() + text + "\n" + editor.render())
+        else:
+            print(text, err=True)
+
+    def complete_line(suffix: str="") -> ?command.Reply:
+        """Return completions for the text before the cursor, or None inside an open quote.
+
+        suffix is added to the text, so a space completes the next word.
+        """
+        c = make_ctx()
+        if c is not None and not confirm:
+            text = editor.line()[:editor.cursor()] + suffix
+            if cpath.tokenize(text).open_quote:
+                return None
+            return command.complete(c, text)
+        return None
+
+    def echo_line(line: str):
+        """Print the prompt and the whole line, so an error caret below it lines up."""
+        out("\r" + editor.prompt + line + "\x1b[0K\n")
+
+    def show_reply_error(reply: command.Reply) -> bool:
+        e = reply.error
+        if e is not None:
+            echo_line(editor.line())
+            show_error("", reply.column, e, reply.matches)
+            return True
+        return False
+
+    def quoted_end() -> bool:
+        """Return True when the cursor is right after a closed quoted word."""
+        tk = cpath.tokenize(editor.line()[:editor.cursor()])
+        return not tk.open_quote and not tk.trailing and len(tk.items) > 0 and tk.items[-1].quoted
+
+    def replace_word(reply: command.Reply, text: str):
+        """Replace the word under the cursor with text."""
+        line = editor.line()
+        editor.set_line(line[:reply.start] + text + line[editor.cursor():], reply.start + len(text))
+
+    def on_help():
+        reply = complete_line(" " if quoted_end() else "")
+        if reply is not None:
+            if not show_reply_error(reply):
+                out("\n" + command.help_text(reply.items) + "\n")
+        else:
+            editor.insert("?")
+        out(editor.render())
+
+    def on_complete():
+        if quoted_end():
+            editor.insert(" ")
+            out(editor.render())
+            return
+        reply = complete_line()
+        if reply is not None and not show_reply_error(reply):
+            words = []
+            for i in reply.items:
+                if i.insert and i.text not in words:
+                    words.append(i.text)
+            if len(words) == 1:
+                replace_word(reply, words[0] + " ")
+            else:
+                p = common_prefix(words)
+                if len(p) > len(reply.partial) and p.startswith(reply.partial):
+                    replace_word(reply, p)
+                elif len(reply.items) > 0:
+                    out("\n" + command.help_text(reply.items) + "\n")
+        out(editor.render())
+
+    def on_space():
+        reply = complete_line()
+        if reply is not None and reply.error is None and reply.partial != "" and not quoted_end():
+            words = []
+            for i in reply.items:
+                if i.keyword and i.text not in words:
+                    words.append(i.text)
+            if len(words) == 1 and words[0] != reply.partial:
+                replace_word(reply, words[0] + " ")
+                out(editor.render())
+                return
+        editor.insert(" ")
+        out(editor.render())
+
+    def handle_key(k: lineedit.Key):
+        r = editor.key(k)
+        kind = r.kind
+        if kind == "submit":
+            echo_line(r.line)
+            if not confirm:
+                editor.add_history(r.line)
+            editor.reset()
+            execute(r.line)
+        elif kind == "eof":
+            out("\n")
+            if confirm:
+                # Ctrl-D answers no.
+                execute("no")
+                return
+            if mode == "config":
+                leave_config()
+            else:
+                leave_cli()
+            prompt()
+        elif kind == "interrupt":
+            out("\n")
+            editor.reset()
+            if confirm:
+                # Ctrl-C answers no.
+                execute("no")
+                return
+            prompt()
+        elif kind == "complete":
+            on_complete()
+        elif kind == "help":
+            on_help()
+        elif kind == "space":
+            on_space()
+        elif kind == "clear":
+            out("\x1b[H\x1b[2J" + editor.render())
+        else:
+            out(editor.render())
+
+    def interrupt():
+        """Stop waiting on Ctrl-C: exit while connecting, else drop the
+        request in flight and the keys typed ahead."""
+        out("\n")
+        if not ready:
+            finish(1)
+            return
+        busy = False
+        request += 1
+        pending = None
+        pending_keys = []
+        prompt()
+
+    def on_key(k: lineedit.Key):
+        if done:
+            return
+        if not ready or busy:
+            if k.name == "ctrl-c":
+                interrupt()
+            else:
+                pending_keys.append(k)
+        else:
+            handle_key(k)
+
+    def esc_timeout(gen: int):
+        if gen == esc_gen and not done:
+            for k in decoder.flush():
+                on_key(k)
+
+    def on_bytes(data: bytes):
+        if done:
+            return
+        if interactive:
+            for k in decoder.feed(data):
+                on_key(k)
+            if decoder.pending():
+                esc_gen += 1
+                g = esc_gen
+                after 0.05: esc_timeout(g)
+        else:
+            # TODO: upstream EOF delivery to Acton's Env.
+            parts = (partial_line + data).split(b"\n")
+            partial_line = parts[-1]
+            for p in parts[:-1]:
+                try:
+                    lines.append(p.decode().rstrip("\r"))
+                except ValueError:
+                    fail("input is not valid UTF-8")
+            if ready and not busy:
+                prompt()
+
+    def start():
+        # Take stdin before the YANG load, so keys typed during it wait for
+        # the prompt.
+        if len(oneshot) > 0:
+            lines.append(" ".join(oneshot))
+        else:
+            env.stdio.stdin_install(on_stdin_bytes=on_bytes)
+            if interactive:
+                env.stdio.set_stdin(raw=True)
+                # The terminal marks pasted text, so the line editor inserts
+                # it as it is.
+                out(BRACKETED_PASTE_ON)
+        try:
+            if yang_dir != "":
+                local_schema = local_yang.load(file.FileCap(env.cap), yang_dir, modules, module_sets)
+        except Exception as e:
+            fail("cannot load --yang-dir {yang_dir}: {e}")
+            finish(1)
+            return
+        if yang_dir == "" and (len(modules) > 0 or len(module_sets) > 0):
+            fail("--module and --module-set need --yang-dir")
+            finish(1)
+            return
+        if interactive:
+            out("Connecting to {host}:{port}...\n")
+        ls = local_schema
+        bundled = ls if ls is not None else yschema.DRoot()
+        dev_types = {
+            "netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter, src_dnode=bundled)
+        }
+        dmc = DeviceMetaConfig(name="ncurl-cli", credentials=credentials, type="netconf")
+        dmc.address.create("primary", host, u64(port))
+        dmc.ssh = ssh
+        dmc.feature_flags.runtime_schema_fetch = ls is None
+        device = swdev.DeviceMgr(dev_types, env, "ncurl-cli", log_handler, on_reconf, swdev.SchemaRegistry())
+        device.set_dmc(dmc)
+        dev = device
+        after timeout: connect_timeout()
+
+    if args.get_bool("verbose"):
+        log_handler.set_output_level(logging.TRACE)
+        log_handler.add_sink(EditorSink(log_line))
+    start()

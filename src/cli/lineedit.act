@@ -1,0 +1,666 @@
+"""Line editor for the interactive CLI.
+
+KeyDecoder turns raw terminal bytes into keys. LineEditor holds one line of
+input with its cursor, history and cut buffer. Neither class does I/O.
+LineEditor returns the text that redraws the line, and the caller writes that
+text to the terminal.
+"""
+
+
+REPLACEMENT = "�"
+PASTE_END = b"\x1b[201~"
+
+
+class Key(object):
+    """One decoded key press.
+
+    name: the key name, for example "char", "enter", "ctrl-c" or "alt-b".
+    text: the character for "char", else "".
+    pasted: True when the key came from a bracketed paste.
+    """
+    name: str
+    text: str
+    pasted: bool
+
+    def __init__(self, name: str, text: str="", pasted: bool=False):
+        self.name = name
+        self.text = text
+        self.pasted = pasted
+
+    def __repr__(self) -> str:
+        args = [repr(self.name)]
+        if self.text != "":
+            args.append(repr(self.text))
+        if self.pasted:
+            args.append("pasted=True")
+        return "Key(" + ", ".join(args) + ")"
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+extension Key(Eq):
+    def __eq__(self, other: Key) -> bool:
+        return self.name == other.name and self.text == other.text and self.pasted == other.pasted
+
+
+def _control_key(b: int) -> ?str:
+    """Return the key name for a C0 control byte, or None for a byte without a key."""
+    if b == 0x0d or b == 0x0a:
+        return "enter"
+    if b == 0x09:
+        return "tab"
+    if b == 0x08:
+        return "backspace"
+    if b >= 0x01 and b <= 0x1a:
+        return "ctrl-" + chr(0x60 + b)
+    if b == 0x1f:
+        return "ctrl-_"
+    return None
+
+
+def _is_c1(c: str) -> bool:
+    """Return True when c is a C1 control character (U+0080 to U+009F)."""
+    cp = ord(c)
+    return cp >= 0x80 and cp <= 0x9f
+
+
+def _utf8_char(buf: bytes, i: int, final: bool) -> (int, str):
+    """Decode the UTF-8 character that starts at buf[i].
+
+    Return the number of bytes used and the character. When the buffer ends
+    before the character is complete, return (0, ""), or, when final is True,
+    use the bytes that are there and give U+FFFD. An invalid sequence gives one
+    U+FFFD for its longest valid start, which is at least one byte.
+    """
+    b = buf[i]
+    if b < 0x80:
+        return (1, chr(b))
+    need = 0
+    cp = 0
+    lo = 0x80
+    hi = 0xbf
+    if b >= 0xc2 and b <= 0xdf:
+        need = 1
+        cp = b & 0x1f
+    elif b >= 0xe0 and b <= 0xef:
+        need = 2
+        cp = b & 0x0f
+        # The limits on the second byte reject overlong forms and surrogates.
+        if b == 0xe0:
+            lo = 0xa0
+        elif b == 0xed:
+            hi = 0x9f
+    elif b >= 0xf0 and b <= 0xf4:
+        need = 3
+        cp = b & 0x07
+        # The limits on the second byte reject overlong forms and values above U+10FFFF.
+        if b == 0xf0:
+            lo = 0x90
+        elif b == 0xf4:
+            hi = 0x8f
+    else:
+        return (1, REPLACEMENT)
+    j = 1
+    while j <= need:
+        if i + j >= len(buf):
+            if final:
+                return (j, REPLACEMENT)
+            return (0, "")
+        c = buf[i + j]
+        if c < lo or c > hi:
+            return (j, REPLACEMENT)
+        cp = (cp << 6) | (c & 0x3f)
+        lo = 0x80
+        hi = 0xbf
+        j += 1
+    return (need + 1, chr(cp))
+
+
+def _cursor_key(final: int, modifier: int) -> ?str:
+    """Return the key name for an arrow, home or end final byte, or None.
+
+    modifier is the xterm modifier parameter: 1 plus a bit mask of shift (1),
+    alt (2) and ctrl (4). Left and right with alt or ctrl move by word. Other
+    modifiers give the plain key.
+    """
+    by_word = ((modifier - 1) & 6) != 0
+    if final == 0x41:
+        return "up"
+    if final == 0x42:
+        return "down"
+    if final == 0x43:
+        return "word-right" if by_word else "right"
+    if final == 0x44:
+        return "word-left" if by_word else "left"
+    if final == 0x48:
+        return "home"
+    if final == 0x46:
+        return "end"
+    return None
+
+
+def _csi_key(params: str, final: int) -> ?str:
+    """Return the key name for a CSI sequence, or None for an unknown sequence.
+
+    The parameters of a cursor key are empty, "1" or "1;<modifier>". The key
+    name "paste-start" marks the start of a bracketed paste.
+    """
+    if final == 0x7e:
+        code = params.split(";")[0]
+        if code == "1" or code == "7":
+            return "home"
+        if code == "4" or code == "8":
+            return "end"
+        if code == "3":
+            return "delete"
+        if code == "200":
+            return "paste-start"
+        return None
+    if params == "" or params == "1":
+        return _cursor_key(final, 1)
+    fields = params.split(";")
+    if len(fields) == 2 and fields[0] == "1" and fields[1].isdecimal():
+        return _cursor_key(final, int(fields[1]))
+    return None
+
+
+class KeyDecoder(object):
+    """Turn raw terminal bytes into keys.
+
+    The terminal can split its output at any byte. The decoder keeps an
+    incomplete UTF-8 character or escape sequence until the next call to
+    feed(). A lone ESC is a key or the start of a sequence. The decoder cannot
+    tell which until more bytes arrive, so the caller calls flush() after a
+    short timeout.
+
+    Inside a bracketed paste, the decoder marks every key as pasted. It drops
+    control bytes other than CR, LF and TAB, and it drops an ESC that does not
+    start the paste end marker.
+    """
+    _buf: bytes
+    _in_paste: bool
+    _paste_cr: bool
+
+    def __init__(self):
+        self._buf = b""
+        self._in_paste = False
+        self._paste_cr = False
+
+    def feed(self, data: bytes) -> list[Key]:
+        """Decode the bytes and return the complete keys.
+
+        The decoder keeps an incomplete sequence at the end for the next call.
+        """
+        self._buf = self._buf + data
+        return self._decode(False)
+
+    def pending(self) -> bool:
+        """Return True when bytes wait outside a paste, for example a lone ESC.
+
+        The caller then calls flush() when no more bytes arrive within about
+        50 ms. Inside a paste, the decoder waits for the rest of the paste, so
+        pending() is False.
+        """
+        return len(self._buf) > 0 and not self._in_paste
+
+    def flush(self) -> list[Key]:
+        """Return the waiting bytes as keys.
+
+        A lone ESC becomes Key("esc"). ESC [ and ESC O become "alt-[" and
+        "alt-O". An incomplete UTF-8 character becomes U+FFFD. The decoder drops
+        other incomplete escape sequences. Inside a paste, flush() does nothing.
+        """
+        if self._in_paste:
+            return []
+        return self._decode(True)
+
+    def _decode(self, final: bool) -> list[Key]:
+        """Decode the buffer up to the first incomplete sequence."""
+        buf = self._buf
+        keys: list[Key] = []
+        i = 0
+        while i < len(buf):
+            used = self._paste_step(buf, i, keys) if self._in_paste else self._step(buf, i, keys, final)
+            if used == 0:
+                break
+            i += used
+        self._buf = buf[i:]
+        return keys
+
+    def _step(self, buf: bytes, i: int, keys: list[Key], final: bool) -> int:
+        """Decode one key at buf[i] outside a paste.
+
+        Add the key to keys and return the number of bytes used. Return 0 when
+        the sequence is incomplete.
+        """
+        b = buf[i]
+        if b == 0x1b:
+            return self._escape(buf, i, keys, final)
+        if b == 0x7f:
+            keys.append(Key("backspace"))
+            return 1
+        if b < 0x20:
+            name = _control_key(b)
+            if name is not None:
+                keys.append(Key(name))
+            return 1
+        used, c = _utf8_char(buf, i, final)
+        if used > 0 and not _is_c1(c):
+            keys.append(Key("char", c))
+        return used
+
+    def _escape(self, buf: bytes, i: int, keys: list[Key], final: bool) -> int:
+        """Decode the escape sequence or alt key at buf[i]."""
+        n = len(buf)
+        if i + 1 >= n:
+            if final:
+                keys.append(Key("esc"))
+                return 1
+            return 0
+        c = buf[i + 1]
+        if c == 0x5b:
+            return self._csi(buf, i, keys, final)
+        if c == 0x4f:
+            if i + 2 >= n:
+                if final:
+                    keys.append(Key("alt-O"))
+                    return 2
+                return 0
+            f = buf[i + 2]
+            if f >= 0x40 and f <= 0x7e:
+                name = _cursor_key(f, 1)
+                if name is not None:
+                    keys.append(Key(name))
+                return 3
+            keys.append(Key("alt-O"))
+            return 2
+        if c == 0x7f or c == 0x08:
+            keys.append(Key("alt-backspace"))
+            return 2
+        if c > 0x20 and c < 0x7f:
+            keys.append(Key("alt-" + chr(c)))
+            return 2
+        # ESC before a control byte, a space or a non-ASCII byte is a key of its own.
+        keys.append(Key("esc"))
+        return 1
+
+    def _csi(self, buf: bytes, i: int, keys: list[Key], final: bool) -> int:
+        """Decode the CSI sequence (ESC [) at buf[i].
+
+        A CSI sequence has parameter bytes (0x30 to 0x3f), then intermediate
+        bytes (0x20 to 0x2f), then one final byte (0x40 to 0x7e).
+        """
+        n = len(buf)
+        if i + 2 < n and buf[i + 2] == 0x5b:
+            # The Linux console sends F1 to F5 as ESC [ [ A to ESC [ [ E. Drop them.
+            if i + 3 >= n and not final:
+                return 0
+            return 4 if n - i > 4 else n - i
+        j = i + 2
+        while j < n and buf[j] >= 0x30 and buf[j] <= 0x3f:
+            j += 1
+        params_end = j
+        while j < n and buf[j] >= 0x20 and buf[j] <= 0x2f:
+            j += 1
+        if j >= n:
+            if not final:
+                return 0
+            if j == i + 2:
+                keys.append(Key("alt-["))
+            return j - i
+        f = buf[j]
+        if f < 0x40 or f > 0x7e:
+            # This is not a CSI sequence. Decode the byte at j again.
+            if j == i + 2:
+                keys.append(Key("alt-["))
+            return j - i
+        if j == params_end:
+            name = _csi_key(buf[i + 2:params_end].decode(), f)
+            if name is not None:
+                if name == "paste-start":
+                    self._in_paste = True
+                    self._paste_cr = False
+                else:
+                    keys.append(Key(name))
+        return j + 1 - i
+
+    def _paste_step(self, buf: bytes, i: int, keys: list[Key]) -> int:
+        """Decode one key at buf[i] inside a paste.
+
+        CR, LF and CRLF each give one pasted enter. TAB gives a pasted space.
+        """
+        b = buf[i]
+        after_cr = self._paste_cr
+        if b == 0x1b:
+            marker = buf[i:i + len(PASTE_END)]
+            if marker == PASTE_END:
+                self._in_paste = False
+                self._paste_cr = False
+                return len(PASTE_END)
+            if len(marker) < len(PASTE_END) and PASTE_END.startswith(marker):
+                return 0
+            self._paste_cr = False
+            return 1
+        if b < 0x20 or b == 0x7f:
+            self._paste_cr = b == 0x0d
+            if b == 0x0d or (b == 0x0a and not after_cr):
+                keys.append(Key("enter", pasted=True))
+            elif b == 0x09:
+                keys.append(Key("char", " ", pasted=True))
+            return 1
+        used, c = _utf8_char(buf, i, False)
+        if used > 0:
+            self._paste_cr = False
+            if not _is_c1(c):
+                keys.append(Key("char", c, pasted=True))
+        return used
+
+
+class EditResult(object):
+    """The result of one key press.
+
+    kind tells the caller what to do next:
+    - "none": redraw the line.
+    - "submit": run the line (enter).
+    - "eof": end the session (ctrl-d on an empty line).
+    - "interrupt": drop the line (ctrl-c).
+    - "complete": complete the word at the cursor (tab).
+    - "help": show the possible completions (a typed "?").
+    - "space": complete the word or insert a space (a typed space).
+    - "clear": clear the screen and redraw the line (ctrl-l).
+    line: the line after the key.
+    """
+    kind: str
+    line: str
+
+    def __init__(self, kind: str, line: str):
+        self.kind = kind
+        self.line = line
+
+
+def _word_start(line: str, pos: int) -> int:
+    """Return the start of the word before pos, after the spaces before pos."""
+    i = pos
+    while i > 0 and line[i - 1].isspace():
+        i -= 1
+    while i > 0 and not line[i - 1].isspace():
+        i -= 1
+    return i
+
+
+def _word_end(line: str, pos: int) -> int:
+    """Return the end of the word after pos, after the spaces after pos."""
+    n = len(line)
+    i = pos
+    while i < n and line[i].isspace():
+        i += 1
+    while i < n and not line[i].isspace():
+        i += 1
+    return i
+
+
+def _printable(text: str) -> str:
+    """Return the text with each control character replaced by "?"."""
+    out: list[str] = []
+    for c in text:
+        cp = ord(c)
+        if cp < 0x20 or (cp >= 0x7f and cp <= 0x9f):
+            out.append("?")
+        else:
+            out.append(c)
+    return "".join(out)
+
+
+class LineEditor(object):
+    """Hold one line of input, the cursor and the history.
+
+    key() changes the line for one key and tells the caller what to do next.
+    render() returns the text that redraws the line. The cursor position counts
+    code points.
+    """
+    prompt: str
+    width: int
+    _line: str
+    _pos: int
+    _history: list[str]
+    _history_size: int
+    _history_pos: int
+    _saved: str
+    _kill: str
+    _start: int
+
+    def __init__(self, prompt: str="> ", width: int=80, history_size: int=500):
+        self.prompt = prompt
+        self.width = width
+        self._line = ""
+        self._pos = 0
+        self._history = []
+        self._history_size = history_size if history_size > 0 else 0
+        self._history_pos = 0
+        self._saved = ""
+        self._kill = ""
+        self._start = 0
+
+    def set_prompt(self, prompt: str) -> None:
+        """Set the prompt. The prompt must not contain escape sequences."""
+        self.prompt = prompt
+
+    def set_width(self, width: int) -> None:
+        """Set the terminal width in columns."""
+        self.width = width
+
+    def line(self) -> str:
+        """Return the current line."""
+        return self._line
+
+    def cursor(self) -> int:
+        """Return the cursor position in code points."""
+        return self._pos
+
+    def set_line(self, text: str, cursor: ?int=None) -> None:
+        """Replace the line and move the cursor.
+
+        When cursor is None, the cursor goes to the end of the line. A cursor
+        outside the line moves to the nearest end.
+        """
+        self._line = text
+        n = len(text)
+        pos = n
+        if cursor is not None:
+            pos = cursor
+        if pos < 0:
+            pos = 0
+        elif pos > n:
+            pos = n
+        self._pos = pos
+
+    def insert(self, text: str) -> None:
+        """Insert text at the cursor and move the cursor after it."""
+        self._line = self._line[:self._pos] + text + self._line[self._pos:]
+        self._pos += len(text)
+
+    def history(self) -> list[str]:
+        """Return a copy of the history, oldest entry first."""
+        return list(self._history)
+
+    def add_history(self, line: str) -> None:
+        """Add a line to the end of the history.
+
+        The editor skips a line that is empty or has only spaces, and a line
+        that is equal to the newest entry. It drops the oldest entries above
+        history_size. The history position moves to the end.
+        """
+        if line.strip() != "":
+            n = len(self._history)
+            if n == 0 or self._history[n - 1] != line:
+                self._history.append(line)
+            n = len(self._history)
+            if n > self._history_size:
+                self._history = self._history[n - self._history_size:]
+        self._history_pos = len(self._history)
+        self._saved = ""
+
+    def reset(self) -> None:
+        """Empty the line, move the cursor to 0 and the history position to the end."""
+        self._line = ""
+        self._pos = 0
+        self._start = 0
+        self._history_pos = len(self._history)
+        self._saved = ""
+
+    def key(self, k: Key) -> EditResult:
+        """Apply one key to the line and return what the caller does next."""
+        name = k.name
+        if name == "char":
+            if not k.pasted and k.text == "?":
+                return EditResult("help", self._line)
+            if not k.pasted and k.text == " ":
+                return EditResult("space", self._line)
+            self.insert(k.text)
+        elif name == "tab":
+            if not k.pasted:
+                return EditResult("complete", self._line)
+            self.insert(" ")
+        elif name == "enter":
+            return EditResult("submit", self._line)
+        elif name == "ctrl-c":
+            return EditResult("interrupt", self._line)
+        elif name == "ctrl-d":
+            if self._line == "":
+                return EditResult("eof", self._line)
+            self._cut(self._pos, self._pos + 1)
+        elif name == "ctrl-l":
+            return EditResult("clear", self._line)
+        elif name in {"left", "ctrl-b"}:
+            if self._pos > 0:
+                self._pos -= 1
+        elif name in {"right", "ctrl-f"}:
+            if self._pos < len(self._line):
+                self._pos += 1
+        elif name in {"home", "ctrl-a"}:
+            self._pos = 0
+        elif name in {"end", "ctrl-e"}:
+            self._pos = len(self._line)
+        elif name in {"word-left", "alt-b"}:
+            self._pos = _word_start(self._line, self._pos)
+        elif name in {"word-right", "alt-f"}:
+            self._pos = _word_end(self._line, self._pos)
+        elif name in {"backspace", "ctrl-h"}:
+            if self._pos > 0:
+                self._cut(self._pos - 1, self._pos)
+        elif name == "delete":
+            self._cut(self._pos, self._pos + 1)
+        elif name == "ctrl-k":
+            self._kill_text(self._pos, len(self._line))
+        elif name == "ctrl-u":
+            self._kill_text(0, self._pos)
+        elif name in {"ctrl-w", "alt-backspace"}:
+            self._kill_text(_word_start(self._line, self._pos), self._pos)
+        elif name == "alt-d":
+            self._kill_text(self._pos, _word_end(self._line, self._pos))
+        elif name == "ctrl-y":
+            self.insert(self._kill)
+        elif name == "ctrl-t":
+            self._transpose()
+        elif name in {"up", "ctrl-p"}:
+            self._history_prev()
+        elif name in {"down", "ctrl-n"}:
+            self._history_next()
+        return EditResult("none", self._line)
+
+    def render(self) -> str:
+        """Return the text that redraws the prompt and the line in place.
+
+        The text returns to column 0, writes the prompt and the visible part of
+        the line, clears the rest of the terminal line and moves the cursor to
+        its column. A line that does not fit scrolls horizontally:
+        - The text area has width - 1 - len(prompt) columns. The last terminal
+          column stays empty, so the terminal never wraps.
+        - A prompt that leaves fewer than 10 columns, or half the width, shows
+          only its end.
+        - The view moves only when the cursor leaves it. The cursor stays on a
+          visible character, or just after the last one at the end of the line.
+        - The editor cuts the characters to the right of the text area.
+        Control characters show as "?".
+        """
+        # TODO: upstream charwidth to Acton
+        # Each code point counts as one column.
+        prompt = self.prompt
+        keep = self.width - 1 - min([10, (self.width - 1) // 2])
+        if len(prompt) > keep:
+            prompt = prompt[len(prompt) - keep:] if keep > 0 else ""
+        plen = len(prompt)
+        cols = self.width - 1 - plen
+        if cols < 1:
+            cols = 1
+        n = len(self._line)
+        start = self._start
+        if self._pos < start:
+            start = self._pos
+        limit = cols if self._pos == n else cols - 1
+        if self._pos - start > limit:
+            start = self._pos - limit
+        if start > 0 and n - start < cols:
+            # Show more of the line on the left when its end leaves room.
+            start = max([0, min([start, n - cols if self._pos == n else n - cols + 1])])
+        self._start = start
+        visible = self._line[start:start + cols]
+        col = plen + self._pos - start
+        out = "\r" + prompt + _printable(visible) + "\x1b[0K\r"
+        if col > 0:
+            out += "\x1b[" + str(col) + "C"
+        return out
+
+    def hide(self) -> str:
+        """Return the text that clears the current terminal line."""
+        return "\r\x1b[0K"
+
+    def _cut(self, start: int, end: int) -> str:
+        """Remove the text from start to end, move the cursor to start and return the text."""
+        text = self._line[start:end]
+        self._line = self._line[:start] + self._line[end:]
+        self._pos = start
+        return text
+
+    def _kill_text(self, start: int, end: int) -> None:
+        """Remove the text from start to end and keep it in the cut buffer.
+
+        When the text is empty, the cut buffer does not change.
+        """
+        text = self._cut(start, end)
+        if text != "":
+            self._kill = text
+
+    def _transpose(self) -> None:
+        """Swap the characters before and at the cursor, and move the cursor right.
+
+        At the end of the line, swap the last two characters.
+        """
+        n = len(self._line)
+        if n < 2 or self._pos == 0:
+            return
+        p = self._pos if self._pos < n else n - 1
+        line = self._line
+        self._line = line[:p - 1] + line[p] + line[p - 1] + line[p + 1:]
+        self._pos = p + 1
+
+    def _history_prev(self) -> None:
+        """Show the previous history entry. Keep the edited line when leaving it."""
+        if self._history_pos == 0:
+            return
+        if self._history_pos == len(self._history):
+            self._saved = self._line
+        self._history_pos -= 1
+        self.set_line(self._history[self._history_pos])
+
+    def _history_next(self) -> None:
+        """Show the next history entry, or the edited line after the newest entry."""
+        n = len(self._history)
+        if self._history_pos >= n:
+            return
+        self._history_pos += 1
+        if self._history_pos == n:
+            self.set_line(self._saved)
+        else:
+            self.set_line(self._history[self._history_pos])

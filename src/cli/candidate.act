@@ -1,0 +1,360 @@
+"""A local candidate configuration.
+
+The candidate starts as a copy of the running configuration. The user edits
+it with set and delete, and the CLI shows it and compares it with the running
+configuration it started from. The candidate keeps the edits in the order the
+user made them.
+"""
+
+import yang.schema as yschema
+import yang.gdata as ygdata
+import yang.data as ydata
+
+import cli.hints as hints
+import cli.path as cpath
+import cli.render as render
+
+
+class Edit(object):
+    """One change to the candidate: "set" or "delete" at a path from the schema root."""
+    op: str
+    steps: list[cpath.Step]
+
+    def __init__(self, op: str, steps: list[cpath.Step]):
+        self.op = op
+        self.steps = steps
+
+
+class Candidate(object):
+    """The running configuration a candidate started from, the edits, and the result.
+
+    base and data are configuration trees at the schema root.
+    """
+    root: yschema.DRoot
+    base: ygdata.Node
+    data: ygdata.Node
+    edits: list[Edit]
+
+    def __init__(self, root: yschema.DRoot, base: ?ygdata.Node):
+        self.root = root
+        b = base if base is not None else ygdata.Container({})
+        self.base = b
+        self.data = b
+        self.edits = []
+
+    def set(self, steps: list[cpath.Step]) -> None:
+        """Set the value, entry or presence container at the end of a path.
+
+        A leaf takes the step's single value. A leaf-list gets the step's values
+        that it does not hold yet. Containers and list entries on the way are
+        created.
+        """
+        self.data = _set(self.root, self.data, None, None, steps, 0)
+        self.edits.append(Edit("set", steps))
+
+    def delete(self, steps: list[cpath.Step]) -> bool:
+        """Delete the node at the end of a path. Return False when it does not exist.
+
+        A leaf-list step with values deletes only those values. A list step
+        without keys deletes all entries.
+        """
+        r = _delete(self.root, self.data, steps, 0)
+        d = r.data
+        if r.found and d is not None:
+            self.data = d
+            self.edits.append(Edit("delete", steps))
+        return r.found
+
+    def rollback(self) -> None:
+        """Discard all edits."""
+        self.data = self.base
+        self.edits = []
+
+    def changed(self) -> bool:
+        """Return True when the candidate differs from the configuration it started from."""
+        if len(self.edits) == 0:
+            return False
+        return len(compare(self.root, [], self.root, self.base, self.data)) > 0
+
+
+def _child_ns(parent: yschema.DNode, n: yschema.DNode) -> (ns: ?str, module: ?str):
+    """Return the namespace and module a new data node carries.
+
+    As in parsed data, a node carries them only where the namespace changes.
+    """
+    if n.namespace != parent.namespace:
+        return (ns=n.namespace, module=n.module)
+    return (ns=None, module=None)
+
+
+def _copy(d: ?ygdata.Node, children: dict[ygdata.Id, ygdata.Node], ns: ?str, module: ?str, presence: bool) -> ygdata.Container:
+    """Return a container with new children and the other attributes of d, or the given ones when d is None."""
+    if isinstance(d, ygdata.Container):
+        return ygdata.Container(children, presence=d.presence, ns=d.ns, module=d.module)
+    return ygdata.Container(children, presence=presence, ns=ns, module=module)
+
+
+def _children(d: ?ygdata.Node) -> dict[ygdata.Id, ygdata.Node]:
+    if d is not None:
+        return {k: v for k, v in d.children.items()}
+    return {}
+
+
+def _new_entry(n: yschema.DList, keys: list[value]) -> ygdata.Node:
+    children = {}
+    kl = hints.key_leaves(n)
+    for j in range(len(kl)):
+        children[ygdata.Id(n.namespace, kl[j].name)] = ygdata.Leaf(keys[j])
+    return ygdata.Container(children)
+
+
+def _with_entry(n: yschema.DList, cd: ?ygdata.Node, keys: list[value], entry: ?ygdata.Node, ns: ?str, module: ?str) -> ?ygdata.Node:
+    """Return the list with the entry for keys replaced, added or, when entry is None, removed."""
+    ks = cpath.key_str(keys)
+    kl = hints.key_leaves(n)
+    entries = []
+    found = False
+    for e in cpath.list_entries(cd):
+        if cpath.key_str(cpath.entry_keys(e, kl)) == ks:
+            found = True
+            if entry is not None:
+                entries.append(entry)
+        else:
+            entries.append(e)
+    if not found and entry is not None:
+        entries.append(entry)
+    if len(entries) == 0:
+        return None
+    lns = cd.ns if cd is not None else ns
+    lmod = cd.module if cd is not None else module
+    return ydata.list_node(n, entries, lns, lmod)
+
+
+def _set(s: yschema.DNode, d: ?ygdata.Node, ns: ?str, module: ?str, steps: list[cpath.Step], i: int) -> ygdata.Node:
+    """Return a copy of d, the data at schema node s, with steps[i:] set below it."""
+    children = _children(d)
+    st = steps[i]
+    n = st.node
+    cid = ygdata.Id(n.namespace, n.name)
+    cd = children.get(cid)
+    cns = _child_ns(s, n)
+    last = (i == len(steps) - 1)
+    if isinstance(n, yschema.DLeaf):
+        if len(st.values) > 0:
+            children[cid] = ygdata.Leaf(st.values[0], ns=cns.ns, module=cns.module)
+    elif isinstance(n, yschema.DLeafList):
+        entries = list(cd.entries) if isinstance(cd, ygdata.LeafList) else []
+        have = set([ygdata.yang_str(e.val) for e in entries])
+        for v in st.values:
+            t = ygdata.yang_str(v)
+            if t not in have:
+                have.add(t)
+                entries.append(ygdata.LeafListEntryMerge(v))
+        children[cid] = ygdata.LeafList(entries, user_order=n.ordered_by == "user", ns=cns.ns, module=cns.module)
+    elif isinstance(n, yschema.DContainer):
+        if last:
+            children[cid] = _copy(cd, _children(cd), cns.ns, cns.module, n.presence)
+        else:
+            children[cid] = _set(n, cd, cns.ns, cns.module, steps, i + 1)
+    elif isinstance(n, yschema.DList):
+        entry = cpath.list_entry(cd, st.keys)
+        if entry is None:
+            entry = _new_entry(n, st.keys)
+        if not last:
+            entry = _set(n, entry, None, None, steps, i + 1)
+        lst = _with_entry(n, cd, st.keys, entry, cns.ns, cns.module)
+        if lst is not None:
+            children[cid] = lst
+    presence = isinstance(s, yschema.DContainer) and s.presence
+    return _copy(d, children, ns, module, presence)
+
+
+class _Deleted(object):
+    data: ?ygdata.Node
+    found: bool
+
+    def __init__(self, data: ?ygdata.Node, found: bool):
+        self.data = data
+        self.found = found
+
+
+def _delete(s: yschema.DNode, d: ygdata.Node, steps: list[cpath.Step], i: int) -> _Deleted:
+    """Return a copy of d, the data at schema node s, with the node at steps[i:] deleted.
+
+    A non-presence container that becomes empty is removed too.
+    """
+    children = _children(d)
+    st = steps[i]
+    n = st.node
+    cid = ygdata.Id(n.namespace, n.name)
+    cd = children.get(cid)
+    last = (i == len(steps) - 1)
+    found = cd is not None
+    if isinstance(n, yschema.DLeafList) and isinstance(cd, ygdata.LeafList) and len(st.values) > 0:
+        drop = set([ygdata.yang_str(v) for v in st.values])
+        entries = [e for e in cd.entries if ygdata.yang_str(e.val) not in drop]
+        found = len(entries) < len(cd.entries)
+        if len(entries) > 0:
+            children[cid] = ygdata.LeafList(entries, user_order=cd.user_order, ns=cd.ns, module=cd.module)
+        else:
+            del children[cid]
+    elif isinstance(n, yschema.DList) and isinstance(cd, ygdata.List) and len(st.keys) > 0:
+        entry = cpath.list_entry(cd, st.keys)
+        found = entry is not None
+        if entry is not None:
+            new_entry: ?ygdata.Node = None
+            if not last:
+                r = _delete(n, entry, steps, i + 1)
+                found = r.found
+                new_entry = r.data
+            lst = _with_entry(n, cd, st.keys, new_entry, cd.ns, cd.module)
+            if lst is not None:
+                children[cid] = lst
+            else:
+                del children[cid]
+    elif isinstance(n, yschema.DContainer) and isinstance(cd, ygdata.Container) and not last:
+        r = _delete(n, cd, steps, i + 1)
+        found = r.found
+        rd = r.data
+        if isinstance(rd, ygdata.Container) and (rd.presence or len(rd.children) > 0):
+            children[cid] = rd
+        else:
+            del children[cid]
+    elif cd is not None:
+        del children[cid]
+    if not found:
+        return _Deleted(d, False)
+    presence = isinstance(s, yschema.DContainer) and s.presence
+    return _Deleted(_copy(d, children, None, None, presence), True)
+
+
+def _signed(sign: str, lines: list[str]) -> list[str]:
+    return [sign + "   " + line for line in lines]
+
+
+class _Diff(object):
+    out: list[str]
+    header: str
+
+    def __init__(self):
+        self.out = []
+        self.header = ""
+
+    def add(self, header: str, lines: list[str]):
+        if len(lines) == 0:
+            return
+        if header != self.header:
+            self.out.append(header)
+            self.header = header
+        self.out.extend(lines)
+
+
+def compare(start: yschema.DNode, steps: list[cpath.Step], s: yschema.DNode, old: ?ygdata.Node, new: ?ygdata.Node, only: ?yschema.DNode=None, entry: ?list[value]=None) -> list[str]:
+    """Compare two configurations at a schema node, in the `show | compare` format.
+
+    start is the node CLI paths start from, and steps lead from it to s. Each
+    change shows under an `[edit ...]` header that names the deepest node
+    holding it: a removed statement starts with "-", an added one with "+".
+    With only set, compare just that child of s, and with entry also set, just
+    the list entry with those keys.
+    """
+    diff = _Diff()
+    _compare(start, steps, s, old, new, diff, only, entry)
+    return diff.out
+
+
+def _header(start: yschema.DNode, steps: list[cpath.Step]) -> str:
+    words = cpath.path_tokens(start, steps)
+    if len(words) == 0:
+        return "[edit]"
+    return "[edit " + " ".join(words) + "]"
+
+
+def _emit(diff: _Diff, header: ?str, start: yschema.DNode, steps: list[cpath.Step], lines: list[str]):
+    """Add lines under the given header, or under the header for steps."""
+    if len(lines) > 0:
+        diff.add(header if header is not None else _header(start, steps), lines)
+
+
+def _same_values(old: ygdata.Node, new: ygdata.Node) -> bool:
+    """Return True when two leaf-lists hold the same values in any order."""
+    if isinstance(old, ygdata.LeafList) and isinstance(new, ygdata.LeafList):
+        return sorted([ygdata.yang_str(e.val) for e in old.entries]) == sorted([ygdata.yang_str(e.val) for e in new.entries])
+    return False
+
+
+def _compare(start: yschema.DNode, steps: list[cpath.Step], s: yschema.DNode, old: ?ygdata.Node, new: ?ygdata.Node, diff: _Diff, only: ?yschema.DNode=None, entry: ?list[value]=None, prefix: list[str]=[], header: ?str=None):
+    """Add the changes below schema node s to diff.
+
+    prefix holds the keywords of homogeneous containers above, and header is
+    their parent's header. Changes in such a container show under that header,
+    as `show` prints them.
+    """
+    for c in cpath.candidates(s):
+        if only is not None and (c.name != only.name or c.namespace != only.namespace):
+            continue
+        oc = cpath.child_data(old, c)
+        nc = cpath.child_data(new, c)
+        if oc is not None and nc is not None:
+            # Unchanged subtrees are the same nodes as in the base, so this is quick.
+            if oc == nc:
+                continue
+            if isinstance(c, yschema.DList):
+                _compare_list(start, steps, s, c, oc, nc, diff, entry, prefix, header)
+                continue
+            if isinstance(c, yschema.DContainer) and not render.one_line(c, oc) and not render.one_line(c, nc):
+                if hints.hints(c).homogeneous:
+                    h = header if header is not None else _header(start, steps)
+                    _compare(start, steps + [cpath.Step(c)], c, oc, nc, diff, prefix=prefix + [render.keyword(s, c)], header=h)
+                else:
+                    _compare(start, steps + [cpath.Step(c)], c, oc, nc, diff)
+                continue
+            if isinstance(c, yschema.DLeafList) and c.ordered_by != "user" and _same_values(oc, nc):
+                continue
+        if oc is None and nc is None:
+            continue
+        if isinstance(c, yschema.DList) and entry is not None:
+            _compare_list(start, steps, s, c, oc, nc, diff, entry, prefix, header)
+            continue
+        old_lines = render.node_lines(s, c, oc, prefix) if oc is not None else []
+        new_lines = render.node_lines(s, c, nc, prefix) if nc is not None else []
+        if old_lines != new_lines:
+            _emit(diff, header, start, steps, _signed("-", old_lines) + _signed("+", new_lines))
+
+
+def _compare_list(start: yschema.DNode, steps: list[cpath.Step], s: yschema.DNode, c: yschema.DList, oc: ?ygdata.Node, nc: ?ygdata.Node, diff: _Diff, entry: ?list[value], prefix: list[str], header: ?str):
+    kl = hints.key_leaves(c)
+    olds = cpath.list_entries(oc)
+    news = cpath.list_entries(nc)
+    okeys = [cpath.key_str(cpath.entry_keys(e, kl)) for e in olds]
+    nkeys = [cpath.key_str(cpath.entry_keys(e, kl)) for e in news]
+    oset = set(okeys)
+    nset = set(nkeys)
+    want: ?str = cpath.key_str(entry) if entry is not None else None
+    if c.ordered_by == "user" and want is None:
+        if [k for k in okeys if k in nset] != [k for k in nkeys if k in oset]:
+            # The order changed: show the whole list as removed, then added in the new order.
+            lines = []
+            for e in olds:
+                lines.extend(_signed("-", render.entry_lines(s, c, e, prefix)))
+            for e in news:
+                lines.extend(_signed("+", render.entry_lines(s, c, e, prefix)))
+            _emit(diff, header, start, steps, lines)
+            return
+    for j in range(len(olds)):
+        if okeys[j] not in nset and (want is None or okeys[j] == want):
+            _emit(diff, header, start, steps, _signed("-", render.entry_lines(s, c, olds[j], prefix)))
+    for j in range(len(news)):
+        e = news[j]
+        if want is not None and nkeys[j] != want:
+            continue
+        keys = cpath.entry_keys(e, kl)
+        if nkeys[j] in oset:
+            oe = cpath.list_entry(oc, keys)
+            if oe is not None and oe != e:
+                if render.one_line(c, oe) or render.one_line(c, e):
+                    _emit(diff, header, start, steps, _signed("-", render.entry_lines(s, c, oe, prefix)) + _signed("+", render.entry_lines(s, c, e, prefix)))
+                else:
+                    _compare(start, steps + [cpath.Step(c, keys)], c, oe, e, diff)
+        else:
+            _emit(diff, header, start, steps, _signed("+", render.entry_lines(s, c, e, prefix)))

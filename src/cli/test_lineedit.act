@@ -1,0 +1,442 @@
+import testing
+
+import cli.lineedit as le
+
+
+BAD = "�"
+
+
+def ch(c: str) -> le.Key:
+    return le.Key("char", c)
+
+
+def pch(c: str) -> le.Key:
+    return le.Key("char", c, pasted=True)
+
+
+def k(name: str) -> le.Key:
+    return le.Key(name)
+
+
+def pk(name: str) -> le.Key:
+    return le.Key(name, pasted=True)
+
+
+def decode(chunks: list[bytes]) -> list[le.Key]:
+    """Feed the chunks to a new decoder, then flush it, and return all keys."""
+    d = le.KeyDecoder()
+    keys: list[le.Key] = []
+    for chunk in chunks:
+        keys.extend(d.feed(chunk))
+    keys.extend(d.flush())
+    return keys
+
+
+def _test_decode():
+    """Each case decodes in one chunk, in two chunks split at every byte, and one byte at a time."""
+    cases: list[(str, bytes, list[le.Key])] = [
+        # Characters
+        ("ascii", b"ab1 ?~", [ch("a"), ch("b"), ch("1"), ch(" "), ch("?"), ch("~")]),
+        ("utf-8 two bytes", b"\xc3\xa5", [ch("å")]),
+        ("utf-8 three bytes", b"\xe2\x82\xac", [ch("€")]),
+        ("utf-8 four bytes", b"\xf0\x9f\x98\x80", [ch("😀")]),
+        ("utf-8 between ascii", b"a\xc3\xa5\xe2\x82\xacb", [ch("a"), ch("å"), ch("€"), ch("b")]),
+        ("lone continuation byte", b"\x80a", [ch(BAD), ch("a")]),
+        ("invalid byte ff", b"\xff", [ch(BAD)]),
+        ("overlong lead c0", b"\xc0\xaf", [ch(BAD), ch(BAD)]),
+        ("overlong three bytes", b"\xe0\x80\x80", [ch(BAD), ch(BAD), ch(BAD)]),
+        ("surrogate", b"\xed\xa0\x80", [ch(BAD), ch(BAD), ch(BAD)]),
+        ("above U+10FFFF", b"\xf4\x90\x80\x80", [ch(BAD), ch(BAD), ch(BAD), ch(BAD)]),
+        ("truncated by ascii", b"\xe2\x82a", [ch(BAD), ch("a")]),
+        ("truncated at end", b"a\xe2\x82", [ch("a"), ch(BAD)]),
+        ("c1 control dropped", b"a\xc2\x85b", [ch("a"), ch("b")]),
+        # Control bytes
+        ("cr", b"\r", [k("enter")]),
+        ("lf", b"\n", [k("enter")]),
+        ("crlf outside paste", b"\r\n", [k("enter"), k("enter")]),
+        ("tab", b"\t", [k("tab")]),
+        ("del", b"\x7f", [k("backspace")]),
+        ("bs", b"\x08", [k("backspace")]),
+        ("ctrl-a", b"\x01", [k("ctrl-a")]),
+        ("ctrl-c", b"\x03", [k("ctrl-c")]),
+        ("ctrl-d", b"\x04", [k("ctrl-d")]),
+        ("ctrl-k", b"\x0b", [k("ctrl-k")]),
+        ("ctrl-l", b"\x0c", [k("ctrl-l")]),
+        ("ctrl-u", b"\x15", [k("ctrl-u")]),
+        ("ctrl-w", b"\x17", [k("ctrl-w")]),
+        ("ctrl-y", b"\x19", [k("ctrl-y")]),
+        ("ctrl-z", b"\x1a", [k("ctrl-z")]),
+        ("ctrl-_", b"\x1f", [k("ctrl-_")]),
+        ("other c0 ignored", b"\x00\x1c\x1d\x1ea", [ch("a")]),
+        # Cursor keys
+        ("csi up", b"\x1b[A", [k("up")]),
+        ("csi down", b"\x1b[B", [k("down")]),
+        ("csi right", b"\x1b[C", [k("right")]),
+        ("csi left", b"\x1b[D", [k("left")]),
+        ("ss3 up", b"\x1bOA", [k("up")]),
+        ("ss3 down", b"\x1bOB", [k("down")]),
+        ("ss3 right", b"\x1bOC", [k("right")]),
+        ("ss3 left", b"\x1bOD", [k("left")]),
+        ("csi H", b"\x1b[H", [k("home")]),
+        ("ss3 H", b"\x1bOH", [k("home")]),
+        ("csi 1~", b"\x1b[1~", [k("home")]),
+        ("csi 7~", b"\x1b[7~", [k("home")]),
+        ("csi F", b"\x1b[F", [k("end")]),
+        ("ss3 F", b"\x1bOF", [k("end")]),
+        ("csi 4~", b"\x1b[4~", [k("end")]),
+        ("csi 8~", b"\x1b[8~", [k("end")]),
+        ("csi 3~", b"\x1b[3~", [k("delete")]),
+        ("csi 1A", b"\x1b[1A", [k("up")]),
+        ("ctrl-right", b"\x1b[1;5C", [k("word-right")]),
+        ("ctrl-left", b"\x1b[1;5D", [k("word-left")]),
+        ("alt-right", b"\x1b[1;3C", [k("word-right")]),
+        ("alt-left", b"\x1b[1;3D", [k("word-left")]),
+        ("shift-right", b"\x1b[1;2C", [k("right")]),
+        ("ctrl-up", b"\x1b[1;5A", [k("up")]),
+        ("ctrl-home", b"\x1b[1;5H", [k("home")]),
+        ("ctrl-delete", b"\x1b[3;5~", [k("delete")]),
+        # Unknown sequences
+        ("insert dropped", b"a\x1b[2~b", [ch("a"), ch("b")]),
+        ("page up dropped", b"\x1b[5~", []),
+        ("f5 dropped", b"\x1b[15~", []),
+        ("focus in dropped", b"\x1b[I", []),
+        ("linux console f1 dropped", b"\x1b[[Aa", [ch("a")]),
+        ("cursor report dropped", b"\x1b[12;40R", []),
+        ("private csi dropped", b"\x1b[?1u", []),
+        ("intermediate byte dropped", b"\x1b[1 q", []),
+        ("csi 5C dropped", b"\x1b[5C", []),
+        ("stray paste end dropped", b"\x1b[201~a", [ch("a")]),
+        ("ss3 f1 dropped", b"\x1bOPa", [ch("a")]),
+        # Alt keys
+        ("alt-b", b"\x1bb", [k("alt-b")]),
+        ("alt-f", b"\x1bf", [k("alt-f")]),
+        ("alt-d", b"\x1bd", [k("alt-d")]),
+        ("alt-.", b"\x1b.", [k("alt-.")]),
+        ("alt-x", b"\x1bx", [k("alt-x")]),
+        ("alt-del", b"\x1b\x7f", [k("alt-backspace")]),
+        ("alt-bs", b"\x1b\x08", [k("alt-backspace")]),
+        # ESC alone and broken sequences
+        ("lone esc", b"\x1b", [k("esc")]),
+        ("esc esc", b"\x1b\x1b", [k("esc"), k("esc")]),
+        ("esc before csi", b"\x1b\x1b[A", [k("esc"), k("up")]),
+        ("esc before control", b"\x1b\x03", [k("esc"), k("ctrl-c")]),
+        ("esc before space", b"\x1b ", [k("esc"), ch(" ")]),
+        ("esc before utf-8", b"\x1b\xc3\xa5", [k("esc"), ch("å")]),
+        ("esc [ at end", b"\x1b[", [k("alt-[")]),
+        ("esc O at end", b"\x1bO", [k("alt-O")]),
+        ("incomplete csi at end", b"a\x1b[1;5", [ch("a")]),
+        ("esc [ before control", b"\x1b[\x03", [k("alt-["), k("ctrl-c")]),
+        ("csi params before control", b"\x1b[1\x03", [k("ctrl-c")]),
+        ("esc O before control", b"\x1bO\x03", [k("alt-O"), k("ctrl-c")]),
+        # Bracketed paste
+        ("paste", b"\x1b[200~a ?\tb\x1b[201~",
+         [pch("a"), pch(" "), pch("?"), pch(" "), pch("b")]),
+        ("paste newlines", b"\x1b[200~a\r\nb\nc\rd\r\re\x1b[201~",
+         [pch("a"), pk("enter"), pch("b"), pk("enter"), pch("c"), pk("enter"),
+          pch("d"), pk("enter"), pk("enter"), pch("e")]),
+        ("paste lf cr", b"\x1b[200~\n\r\x1b[201~", [pk("enter"), pk("enter")]),
+        ("paste then typed keys", b"\x1b[200~a\x1b[201~? \t",
+         [pch("a"), ch("?"), ch(" "), k("tab")]),
+        ("paste utf-8", b"\x1b[200~\xc3\xa5\xe2\x82\xac\x1b[201~", [pch("å"), pch("€")]),
+        ("paste invalid utf-8", b"\x1b[200~\xff\x1b[201~", [pch(BAD)]),
+        ("paste drops control bytes", b"\x1b[200~a\x03\x04\x7f\x08b\x1b[201~", [pch("a"), pch("b")]),
+        ("paste drops esc", b"\x1b[200~\x1bb\x1b[A\x1b[201~", [pch("b"), pch("["), pch("A")]),
+        ("empty paste", b"\x1b[200~\x1b[201~", []),
+        ("paste never ends", b"\x1b[200~ab", [pch("a"), pch("b")]),
+        ("paste end incomplete", b"\x1b[200~a\x1b[20", [pch("a")]),
+    ]
+    for name, data, expected in cases:
+        testing.assertEqual(decode([data]), expected, name + ": one chunk")
+        for cut in range(1, len(data)):
+            testing.assertEqual(decode([data[:cut], data[cut:]]), expected, name + ": split at " + str(cut))
+        testing.assertEqual(decode([data[i:i + 1] for i in range(len(data))]), expected, name + ": one byte at a time")
+
+
+def _test_decode_pending():
+    """Each case feeds one chunk and checks feed(), pending() and flush()."""
+    cases: list[(str, bytes, list[le.Key], bool, list[le.Key])] = [
+        ("nothing", b"", [], False, []),
+        ("complete key", b"a", [ch("a")], False, []),
+        ("complete sequence", b"\x1b[A", [k("up")], False, []),
+        ("lone esc", b"\x1b", [], True, [k("esc")]),
+        ("char then esc", b"a\x1b", [ch("a")], True, [k("esc")]),
+        ("esc [", b"\x1b[", [], True, [k("alt-[")]),
+        ("esc O", b"\x1bO", [], True, [k("alt-O")]),
+        ("incomplete csi", b"\x1b[1;5", [], True, []),
+        ("incomplete utf-8", b"a\xe2\x82", [ch("a")], True, [ch(BAD)]),
+        ("open paste", b"\x1b[200~x", [pch("x")], False, []),
+        ("incomplete utf-8 in paste", b"\x1b[200~\xe2\x82", [], False, []),
+        ("incomplete paste end", b"\x1b[200~x\x1b[20", [pch("x")], False, []),
+    ]
+    for name, data, fed, waiting, flushed in cases:
+        d = le.KeyDecoder()
+        testing.assertEqual(d.feed(data), fed, name + ": feed")
+        testing.assertEqual(d.pending(), waiting, name + ": pending")
+        testing.assertEqual(d.flush(), flushed, name + ": flush")
+        testing.assertEqual(d.pending(), False, name + ": pending after flush")
+
+
+def _test_decode_after_flush():
+    """Each case feeds chunks with a flush after each one."""
+    cases: list[(str, list[bytes], list[le.Key])] = [
+        ("esc then [A", [b"\x1b", b"[A"], [k("esc"), ch("["), ch("A")]),
+        ("esc then b", [b"\x1b", b"b"], [k("esc"), ch("b")]),
+        ("utf-8 split by flush", [b"\xe2\x82", b"\xac"], [ch(BAD), ch(BAD)]),
+        ("paste end after flush", [b"\x1b[200~a\x1b[20", b"1~? "], [pch("a"), ch("?"), ch(" ")]),
+        ("paste over three chunks", [b"\x1b[200~a\r", b"\nb", b"\x1b[201~?"],
+         [pch("a"), pk("enter"), pch("b"), ch("?")]),
+    ]
+    for name, chunks, expected in cases:
+        d = le.KeyDecoder()
+        keys: list[le.Key] = []
+        for chunk in chunks:
+            keys.extend(d.feed(chunk))
+            keys.extend(d.flush())
+        testing.assertEqual(keys, expected, name)
+
+
+def _test_key_repr():
+    cases: list[(str, le.Key, str)] = [
+        ("name only", k("up"), "Key('up')"),
+        ("char", ch("a"), "Key('char', 'a')"),
+        ("pasted", pk("enter"), "Key('enter', pasted=True)"),
+    ]
+    for name, key, expected in cases:
+        testing.assertEqual(repr(key), expected, name)
+
+
+def _test_edit_keys():
+    """Each case starts from a line and cursor, applies keys, and checks the line, cursor and the kind of the last result."""
+    cases: list[(str, str, int, list[le.Key], str, int, str)] = [
+        # Insert
+        ("insert at end", "ab", 2, [ch("c")], "abc", 3, "none"),
+        ("insert in middle", "ac", 1, [ch("b")], "abc", 2, "none"),
+        ("insert at start", "bc", 0, [ch("a")], "abc", 1, "none"),
+        ("insert utf-8", "a", 1, [ch("å"), ch("€")], "aå€", 3, "none"),
+        # Typed and pasted ?, space and tab
+        ("typed ? is help", "ab", 1, [ch("?")], "ab", 1, "help"),
+        ("typed space is space", "ab", 2, [ch(" ")], "ab", 2, "space"),
+        ("typed tab is complete", "ab", 2, [k("tab")], "ab", 2, "complete"),
+        ("pasted ? inserts", "ab", 2, [pch("?")], "ab?", 3, "none"),
+        ("pasted space inserts", "ab", 1, [pch(" ")], "a b", 2, "none"),
+        ("pasted tab inserts space", "ab", 2, [pk("tab")], "ab ", 3, "none"),
+        # Line results
+        ("enter submits", "show", 2, [k("enter")], "show", 2, "submit"),
+        ("pasted enter submits", "show", 4, [pk("enter")], "show", 4, "submit"),
+        ("ctrl-c interrupts", "abc", 1, [k("ctrl-c")], "abc", 1, "interrupt"),
+        ("ctrl-d on empty line is eof", "", 0, [k("ctrl-d")], "", 0, "eof"),
+        ("ctrl-d deletes at cursor", "abc", 1, [k("ctrl-d")], "ac", 1, "none"),
+        ("ctrl-d at end", "abc", 3, [k("ctrl-d")], "abc", 3, "none"),
+        ("ctrl-l clears", "abc", 1, [k("ctrl-l")], "abc", 1, "clear"),
+        # Movement
+        ("left", "abc", 2, [k("left")], "abc", 1, "none"),
+        ("ctrl-b", "abc", 2, [k("ctrl-b")], "abc", 1, "none"),
+        ("left at start", "abc", 0, [k("left")], "abc", 0, "none"),
+        ("right", "abc", 1, [k("right")], "abc", 2, "none"),
+        ("ctrl-f", "abc", 1, [k("ctrl-f")], "abc", 2, "none"),
+        ("right at end", "abc", 3, [k("right")], "abc", 3, "none"),
+        ("home", "abc", 2, [k("home")], "abc", 0, "none"),
+        ("ctrl-a", "abc", 2, [k("ctrl-a")], "abc", 0, "none"),
+        ("end", "abc", 0, [k("end")], "abc", 3, "none"),
+        ("ctrl-e", "abc", 0, [k("ctrl-e")], "abc", 3, "none"),
+        ("word-left in word", "foo bar  baz", 11, [k("word-left")], "foo bar  baz", 9, "none"),
+        ("alt-b over spaces", "foo bar  baz", 9, [k("alt-b")], "foo bar  baz", 4, "none"),
+        ("alt-b at start", "foo", 0, [k("alt-b")], "foo", 0, "none"),
+        ("word-right in word", "foo bar  baz", 1, [k("word-right")], "foo bar  baz", 3, "none"),
+        ("alt-f over spaces", "foo bar  baz", 7, [k("alt-f")], "foo bar  baz", 12, "none"),
+        ("alt-f at end", "foo", 3, [k("alt-f")], "foo", 3, "none"),
+        # Deletion
+        ("backspace", "abc", 2, [k("backspace")], "ac", 1, "none"),
+        ("ctrl-h", "abc", 2, [k("ctrl-h")], "ac", 1, "none"),
+        ("backspace at start", "abc", 0, [k("backspace")], "abc", 0, "none"),
+        ("backspace utf-8", "aåb", 2, [k("backspace")], "ab", 1, "none"),
+        ("delete", "abc", 1, [k("delete")], "ac", 1, "none"),
+        ("delete at end", "abc", 3, [k("delete")], "abc", 3, "none"),
+        ("ctrl-k", "abc def", 3, [k("ctrl-k")], "abc", 3, "none"),
+        ("ctrl-u", "abc def", 4, [k("ctrl-u")], "def", 0, "none"),
+        ("ctrl-w at end", "foo bar  ", 9, [k("ctrl-w")], "foo ", 4, "none"),
+        ("ctrl-w in word", "foo bar", 6, [k("ctrl-w")], "foo r", 4, "none"),
+        ("ctrl-w at start", "foo", 0, [k("ctrl-w")], "foo", 0, "none"),
+        ("alt-backspace", "foo bar  ", 9, [k("alt-backspace")], "foo ", 4, "none"),
+        ("alt-d", "foo bar baz", 3, [k("alt-d")], "foo baz", 3, "none"),
+        ("alt-d in word", "foo bar", 1, [k("alt-d")], "f bar", 1, "none"),
+        ("alt-d at end", "foo", 3, [k("alt-d")], "foo", 3, "none"),
+        # Kill and yank
+        ("ctrl-k then ctrl-y", "abc def", 3, [k("ctrl-k"), k("ctrl-a"), k("ctrl-y")], " defabc", 4, "none"),
+        ("ctrl-u then ctrl-y", "abc def", 4, [k("ctrl-u"), k("ctrl-e"), k("ctrl-y")], "defabc ", 7, "none"),
+        ("ctrl-w then ctrl-y", "foo bar", 7, [k("ctrl-w"), k("ctrl-a"), k("ctrl-y")], "barfoo ", 3, "none"),
+        ("alt-d then ctrl-y", "foo bar", 0, [k("alt-d"), k("ctrl-e"), k("ctrl-y")], " barfoo", 7, "none"),
+        ("yank twice", "ab", 2, [k("ctrl-u"), k("ctrl-y"), k("ctrl-y")], "abab", 4, "none"),
+        ("kill replaces buffer", "ab cd", 5, [k("ctrl-w"), k("ctrl-w"), k("ctrl-y")], "ab ", 3, "none"),
+        ("empty kill keeps buffer", "ab", 2, [k("ctrl-u"), k("ctrl-k"), k("ctrl-y")], "ab", 2, "none"),
+        ("yank empty buffer", "ab", 1, [k("ctrl-y")], "ab", 1, "none"),
+        ("backspace does not kill", "ab", 2, [k("backspace"), k("ctrl-y")], "a", 1, "none"),
+        # Transpose
+        ("ctrl-t in middle", "abc", 1, [k("ctrl-t")], "bac", 2, "none"),
+        ("ctrl-t at end", "abc", 3, [k("ctrl-t")], "acb", 3, "none"),
+        ("ctrl-t at start", "abc", 0, [k("ctrl-t")], "abc", 0, "none"),
+        ("ctrl-t one char", "a", 1, [k("ctrl-t")], "a", 1, "none"),
+        ("ctrl-t twice drags char", "abc", 1, [k("ctrl-t"), k("ctrl-t")], "bca", 3, "none"),
+        # Keys that do nothing
+        ("esc", "abc", 1, [k("esc")], "abc", 1, "none"),
+        ("unknown alt key", "abc", 1, [k("alt-x")], "abc", 1, "none"),
+        ("unbound ctrl key", "abc", 1, [k("ctrl-z")], "abc", 1, "none"),
+        ("history on empty history", "abc", 1, [k("up"), k("down")], "abc", 1, "none"),
+    ]
+    for name, line, cursor, keys, exp_line, exp_cursor, exp_kind in cases:
+        ed = le.LineEditor()
+        ed.set_line(line, cursor)
+        kind = ""
+        result_line = ""
+        for key in keys:
+            r = ed.key(key)
+            kind = r.kind
+            result_line = r.line
+        testing.assertEqual(ed.line(), exp_line, name + ": line")
+        testing.assertEqual(ed.cursor(), exp_cursor, name + ": cursor")
+        testing.assertEqual(kind, exp_kind, name + ": kind")
+        testing.assertEqual(result_line, exp_line, name + ": result line")
+
+
+def _test_history_walk():
+    """Each step applies one key and checks the line and cursor."""
+    ed = le.LineEditor()
+    for line in ["one", "two", "three"]:
+        ed.add_history(line)
+    ed.set_line("draft", 2)
+    steps: list[(str, le.Key, str, int)] = [
+        ("up to newest", k("up"), "three", 5),
+        ("ctrl-p", k("ctrl-p"), "two", 3),
+        ("up to oldest", k("up"), "one", 3),
+        ("up at oldest", k("up"), "one", 3),
+        ("down", k("down"), "two", 3),
+        ("edit entry", ch("x"), "twox", 4),
+        ("ctrl-n", k("ctrl-n"), "three", 5),
+        ("up shows entry unchanged", k("up"), "two", 3),
+        ("down again", k("down"), "three", 5),
+        ("down past newest restores draft", k("down"), "draft", 5),
+        ("down at draft", k("down"), "draft", 5),
+        ("edit draft", ch("y"), "drafty", 6),
+        ("up keeps edited draft", k("up"), "three", 5),
+        ("down restores edited draft", k("down"), "drafty", 6),
+    ]
+    for name, key, exp_line, exp_cursor in steps:
+        r = ed.key(key)
+        testing.assertEqual(r.kind, "none", name + ": kind")
+        testing.assertEqual(ed.line(), exp_line, name + ": line")
+        testing.assertEqual(ed.cursor(), exp_cursor, name + ": cursor")
+
+
+def _test_history_after_submit():
+    """reset() and add_history() move the history position to the end, in either order."""
+    cases: list[(str, bool)] = [
+        ("reset first", True),
+        ("add_history first", False),
+    ]
+    for name, reset_first in cases:
+        ed = le.LineEditor()
+        ed.add_history("one")
+        ed.key(k("up"))
+        ed.key(k("up"))
+        ed.set_line("two")
+        if reset_first:
+            ed.reset()
+            ed.add_history("two")
+        else:
+            ed.add_history("two")
+            ed.reset()
+        testing.assertEqual(ed.line(), "", name + ": line after reset")
+        testing.assertEqual(ed.cursor(), 0, name + ": cursor after reset")
+        ed.key(k("up"))
+        testing.assertEqual(ed.line(), "two", name + ": up shows newest")
+        ed.key(k("down"))
+        testing.assertEqual(ed.line(), "", name + ": down restores empty line")
+
+
+def _test_add_history():
+    cases: list[(str, int, list[str], list[str])] = [
+        ("keeps order", 10, ["a", "b", "c"], ["a", "b", "c"]),
+        ("skips empty line", 10, ["", "a", ""], ["a"]),
+        ("skips line with only spaces", 10, ["  ", "a"], ["a"]),
+        ("skips repeat of newest", 10, ["a", "a", "b", "a"], ["a", "b", "a"]),
+        ("keeps newest entries", 3, ["a", "b", "c", "d", "e"], ["c", "d", "e"]),
+        ("dedup before limit", 2, ["a", "b", "b"], ["a", "b"]),
+        ("size one", 1, ["a", "b"], ["b"]),
+        ("size zero", 0, ["a"], []),
+    ]
+    for name, size, lines, expected in cases:
+        ed = le.LineEditor(history_size=size)
+        for line in lines:
+            ed.add_history(line)
+        testing.assertEqual(ed.history(), expected, name)
+
+
+def _test_set_line_and_insert():
+    cases: list[(str, str, ?int, str, str, int)] = [
+        ("cursor None goes to end", "abc", None, "", "abc", 3),
+        ("cursor in middle", "abc", 1, "", "abc", 1),
+        ("cursor past end", "abc", 9, "", "abc", 3),
+        ("negative cursor", "abc", -1, "", "abc", 0),
+        ("insert at cursor", "abc", 1, "xy", "axybc", 3),
+        ("insert utf-8", "ab", 1, "åä", "aåäb", 3),
+    ]
+    for name, line, cursor, text, exp_line, exp_cursor in cases:
+        ed = le.LineEditor()
+        ed.set_line(line, cursor)
+        ed.insert(text)
+        testing.assertEqual(ed.line(), exp_line, name + ": line")
+        testing.assertEqual(ed.cursor(), exp_cursor, name + ": cursor")
+
+
+def _test_render():
+    cases: list[(str, str, int, str, int, str)] = [
+        ("empty line", "> ", 80, "", 0, "\r> \x1b[0K\r\x1b[2C"),
+        ("empty prompt and line", "", 80, "", 0, "\r\x1b[0K\r"),
+        ("cursor at end", "> ", 80, "show", 4, "\r> show\x1b[0K\r\x1b[6C"),
+        ("cursor in middle", "> ", 80, "show", 1, "\r> show\x1b[0K\r\x1b[3C"),
+        ("cursor at start", "> ", 80, "show", 0, "\r> show\x1b[0K\r\x1b[2C"),
+        ("utf-8 counts code points", "> ", 80, "åäö", 3, "\r> åäö\x1b[0K\r\x1b[5C"),
+        ("control char shows as ?", "> ", 80, "a\x01b\x7f", 4, "\r> a?b?\x1b[0K\r\x1b[6C"),
+        ("line fills text area", "> ", 10, "abcdefg", 7, "\r> abcdefg\x1b[0K\r\x1b[9C"),
+        ("long line, cursor at end", "> ", 10, "abcdefghijkl", 12, "\r> fghijkl\x1b[0K\r\x1b[9C"),
+        ("long line, cursor at start", "> ", 10, "abcdefghijkl", 0, "\r> abcdefg\x1b[0K\r\x1b[2C"),
+        ("long line, cursor just past first view", "> ", 10, "abcdefghijkl", 7, "\r> bcdefgh\x1b[0K\r\x1b[8C"),
+        ("long line, cursor past first view", "> ", 10, "abcdefghijkl", 9, "\r> defghij\x1b[0K\r\x1b[8C"),
+        ("prompt fills terminal", "router> ", 5, "ab", 2, "\r> ab\x1b[0K\r\x1b[4C"),
+    ]
+    for name, prompt, width, line, cursor, expected in cases:
+        ed = le.LineEditor(prompt, width)
+        ed.set_line(line, cursor)
+        testing.assertEqual(ed.render(), expected, name)
+
+
+def _test_render_after_set():
+    ed = le.LineEditor()
+    ed.set_line("abcdefghijkl", 12)
+    ed.set_prompt("# ")
+    ed.set_width(10)
+    testing.assertEqual(ed.render(), "\r# fghijkl\x1b[0K\r\x1b[9C", "set_prompt and set_width")
+    testing.assertEqual(ed.prompt, "# ", "prompt attribute")
+    testing.assertEqual(ed.width, 10, "width attribute")
+
+
+def _test_render_keeps_view():
+    """Moving left inside the view does not scroll; leaving it scrolls by the distance moved."""
+    ed = le.LineEditor("> ", 10)
+    ed.set_line("abcdefghijkl")
+    cases = [
+        ("end of line", 12, "\r> fghijkl\x1b[0K\r\x1b[9C"),
+        ("one left", 11, "\r> fghijkl\x1b[0K\r\x1b[8C"),
+        ("first visible", 5, "\r> fghijkl\x1b[0K\r\x1b[2C"),
+        ("left of view", 3, "\r> defghij\x1b[0K\r\x1b[2C"),
+        ("back to end", 12, "\r> fghijkl\x1b[0K\r\x1b[9C"),
+    ]
+    for name, cursor, expected in cases:
+        ed.set_line("abcdefghijkl", cursor)
+        testing.assertEqual(ed.render(), expected, name)
+
+
+def _test_hide():
+    ed = le.LineEditor()
+    ed.set_line("abc")
+    testing.assertEqual(ed.hide(), "\r\x1b[0K", "hide")
