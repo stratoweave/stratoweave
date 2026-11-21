@@ -47,12 +47,18 @@
   predicates both match, like a NETCONF subtree filter with `<service>` by
   name next to `<service>` by a leaf value. The entry had only what the first
   filter selects, and now has what each of them selects, as a subscription
-  to the same filters does.
+  to the same filters does. [#812]
 - Reading a big list is faster. The list asks all its entries at once, so
   they are read on all worker threads instead of one after the other. In
   Fleet Manager with 10,000 devices, a read of the whole fleet takes 61 ms
   instead of 75 ms, and of the whole datastore 88 ms instead of 103 ms, for
-  about 13% more CPU time.
+  about 13% more CPU time. [#812]
+- Actors do their setup in `__startup__`, for Acton's declarative actor
+  construction and automatic startup [acton#3442]. [#846]
+- Fixed TTT restore from DB after a restart. A transform wrote its output to
+  the layer below under a source name taken from its (actor wrapper) object
+  address on the heap, which obviously does not work across restarts. The
+  source name is now a hash of the transform's path. [#857]
 
 ### Northbound APIs
 - Fixed NETCONF `<get-config>` returning the operational state published by
@@ -110,11 +116,11 @@
 - `GET /device/<name>/log-entries` reads a device's log file when asked:
   the newest messages, older ones a page at a time, and the ones written
   since an earlier answer, filtered by levels and text, with a count of the
-  messages of each level. Each message is an
-  object like a line of the `json` log format, from either format. An
-  application gives `stratoweave.main()` a `remote_device_http` function
-  for the devices that another StratoWeave system manages, and the request
-  goes on to that system.
+  messages of each level. Each message is an object like a line of the
+  `json` log format, from either format. An application gives
+  `stratoweave.main()` a `remote_device_http` function for the devices that
+  another StratoWeave system manages, and the request goes on to that
+  system. [#853]
 
 ### Devices & Adapters
 - SNMP device adapters are generated from MIBs. The system generator
@@ -268,8 +274,11 @@
 - The device setting `telemetry` selects how the adapter receives the data
   of subscriptions: `push` (YANG-push) or `poll`. With `poll`, the NETCONF
   adapter reads with periodic `<get>` and receives event notifications
-  through RFC 5277. Without the setting, ArcOS devices are polled: ArcOS
-  refuses every other RPC on a session that holds a subscription.
+  through RFC 5277, and an on-change subscription fails. Without the
+  setting, ArcOS devices are polled, as IOS XR devices already were. ArcOS
+  refuses every other RPC on a session that holds a subscription. A change
+  of the setting reconnects the device and moves its subscriptions to the
+  new method. [#831] [#838]
 - Runtime schema fetch no longer skips `tailf-rollback`. It was on the list
   of broken modules because acton-yang failed to compile it, and
   `tailf-netconf-with-rollback-id` imports it, so a device that lists both,
@@ -287,18 +296,21 @@
   device's clock is not in UTC. The IOS XE CLI probe subtracts the uptime in
   `show version`, which is to the minute, from StratoWeave's clock. A new
   read of the same boot keeps the published last boot. The IOS XE CLI
-  adapter has the uptime in `version/uptime`.
+  adapter has the uptime in `version/uptime`. [#865]
 - Fixed a NETCONF resync or checked edit that never finished when the device
   configuration does not match the schema, like a value outside a range. The
   resync now fails with the decode error. A checked edit fails with it before
   it edits the device. When only the configuration after the commit does not
-  decode, the edit succeeds and the next checked edit resyncs first.
+  decode, the edit succeeds and the next checked edit resyncs first. [#839]
 - A `DeviceMgr` reads the running configuration of its device, and subscribes
   to `netconf-config-change`, only from the first configuration for the
   device, the first `get_config()` or `resync()`, or from the first connect
   with `track_config=True`. Before, it read it on every connect, so tools that
   only read data or subscribe, like `ncurl monitor`, read the whole
-  configuration too.
+  configuration too. `get_config()` takes a `done` action and reads the
+  configuration from the device when the `DeviceMgr` does not keep it.
+  `GET /device/<name>/running` uses it, so it also gives the configuration
+  of a device that StratoWeave does not configure. [#840]
 - `ncurl cli` is an interactive command line in the style of the Junos CLI.
   Its commands, completion with TAB and space, and `?` help come from the
   device schema, shaped by the Junos `cli-feature` and the Tail-f
@@ -316,7 +328,7 @@
   candidate kept in the CLI, with `set`, `delete`, `edit`, `up`, `top`,
   `rollback`, `run`, `show` and `show | compare`. With a command as
   arguments, it runs that command and exits. Without a terminal, it reads
-  commands line by line from stdin.
+  commands line by line from stdin. [#843] [#862] [#866] [#871]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
@@ -471,11 +483,11 @@
   `state/veto`, with their reasons. [#811]
 - Fixed the software messages of a device's log naming the job, `prepare`
   or `install`, as the device in their `device` field once its adapter
-  had reported a step.
+  had reported a step. [#853]
 - `/images/prepare-max-bandwidth` is the bandwidth that the image server
   gives to prepares: the most that the members of one software campaign
   use together to copy their images, when the campaign sets none. It is 1
-  Gbit/s by default.
+  Gbit/s by default. [#856]
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -622,12 +634,10 @@
   upgrade, and that the plan gives a window, prepare its image once before
   its window, under the campaign's veto. The first member prepares at once.
   The others follow as far apart as their deadlines allow: the opening of
-  the next window of the member's schedule, less `close-margin` percent of
-  its expected prepare time. No member prepares while a window of its
-  schedule is open, and a failed prepare is not tried again. In `plan`
-  nothing is copied. The plan's new `prepare-start` says when each member
-  prepares, and `prepare-concurrency` how many copies run at most at once;
-  there is no cap. `device-status` shows each member's `prepare`, and the
+  a window, less `close-margin` percent of the member's expected prepare
+  time. In `plan` nothing is copied. The plan's new `prepare-start` says
+  when each member prepares, and `prepare-concurrency` how many copies run
+  at most at once. `device-status` shows each member's `prepare`, and the
   new counters `preparing` and `prepared` count the members that wait for
   their release. New plan alarms: "N device(s) cannot prepare before their
   window opens" and "N device(s) failed to prepare and copy the image in
@@ -642,13 +652,18 @@
   Prepare chip in front of the bar hides all of it, and the plan's prepare
   alarms with it. The device list has a Prepare column and a prepare
   failed filter, and Schedule and pace turns Prepare ahead on or off.
+  [#851]
 - The new-campaign wizard sets the campaign's `notification-period`, as
-  Notice in days, as the campaign page does.
+  Notice in days, as the campaign page does. [#851]
 - The new-campaign wizard and the campaign page's Schedule and pace set when
   the members prepare, under Prepare ahead: before the first window, between
   windows and during windows, and the campaign's Max bandwidth in Mbit/s,
   empty for the image list's. Between windows is automatic, and says whether
   the plan has it on now, until it is set on or off; Automatic puts it back.
+  [#856]
+- The web UI shows a prepare that is `retrying`, and a run that waits to
+  prepare again. A campaign member's page has a Prepare again button, which
+  raises the member's `prepare-attempt`. [#869] [#870]
 - A campaign releases a member only once the member's status answers the
   campaign's target: `upgrade-needed`, or a final status. Until then the
   plan holds the member in its window, with the alarm "N device(s) have not
@@ -689,17 +704,18 @@
 - A campaign member has an `attempt`. Changing it tries the member again:
   the campaign takes it as a new member, its device reads its release
   again, and a member that failed is released again in a window. A member
-  in flight gets the campaign's veto back; a run past its install finishes
-  and holds its slot until it ends. Removing a member and adding it again
-  no longer tries it again: its device keeps the final status of its
-  attempt. `device-status` shows the attempt that counts, the one in
-  progress or else the member's attempt, in its new `attempt`, and no
-  longer the `upgrade-campaign` and `target-release` of the device. A
+  in flight gets the campaign's veto back. A run past its install finishes
+  and holds its slot and its redundancy groups until it ends, also when the
+  same edit gives the member's image a new version. Removing a member and
+  adding it again no longer tries it again: its device keeps the final
+  status of its attempt. `device-status` shows the attempt that counts, the
+  one in progress or else the member's attempt, in its new `attempt`, and
+  no longer the `upgrade-campaign` and `target-release` of the device. A
   member with a new attempt no longer counts against the failure budget.
   A new attempt set while a run fails its rollback does not start: the
   member shows `not-started`, counts as failed, and holds its redundancy
   groups as a failed rollback does, until it has another attempt. [#804]
-  [#814]
+  [#814] [#854]
 - A redundancy group's new `failure-policy` says what a failed member does
   to the other members. With `continue`, the default, a member that failed
   or rolled back holds them only until it is done and up again, and the
@@ -739,41 +755,39 @@
   page counts it as already done. It waits again when its final status
   goes, unless its rollback failed. Before, it waited for a window of its
   schedule and held a slot there until the next decision. [#830]
-- A paused campaign carries its run on. Before, setting a campaign from
-  `plan` back to `run` started a new run: the members released before the
-  pause were released again, the windows and the prepare turns were given
-  out again, and the ramp, the concurrency and the expected pace started
-  over. Now the members that are done keep their start and finish, and the
-  next members of their redundancy groups wait the `min-separation` from
-  when they were done. A member that still upgrades keeps its slot and the
-  campaign's veto, also when its final report comes in the pause. A member
-  released before the pause that stopped before its install waits again in
-  the window it was released in, before the members promised that window
-  after it. The waiting members keep their windows, and the ramp, the
-  concurrency and the pace stay. Each member keeps its `prepare-start`: one
-  that prepared is not let prepare again, and one that was let and has not
-  prepared is let again. In `plan`, the plan shows what the run does when it
-  goes on. To start a campaign over, delete it and create it again. A new
-  version of a member's image makes a member that is done wait again and
-  upgrade to it, and lets a member prepare it again. A member whose device
-  runs that version already is done again; when it upgraded in the run, the
-  next members of its redundancy groups still wait the `min-separation` from
-  the end of that upgrade or a later boot, or from its answer or boot when
-  its device answered `upgrade-needed` in between. The next members never
-  wait less than the `min-separation` from the end of an upgrade that a
-  member ran in the run, also when its device tells a boot before then. A
-  member that needs the upgrade waits the `min-separation` from when each
-  other member of its redundancy groups was done after an upgrade in the
-  run, or with a final status other than `up-to-date`, also one after it in
-  the group, as when it waits again after a new version or a new attempt,
-  also after a restart of fleetmgr, or when it is added to a running
-  campaign; before, it could start right after such a member was done. A
-  member whose upgrade to the old version ended in the pause is done for
-  that version, and upgrades to the new one in a window. A member whose
-  rollback failed stays done and failed, holds its redundancy groups and
-  counts against the failure budget, until its device reports another final
-  status, it gets a new attempt, or it leaves the campaign, also when its
-  status is lost.
+- A paused campaign carries its run on. Before, setting a campaign from `plan`
+  back to `run` started a new run: the members released before the pause were
+  released again, the windows and the prepare turns were given out again, and
+  the ramp, the concurrency and the expected pace started over. Now the members
+  that are done keep their start and finish, and the next members of their
+  redundancy groups wait the `min-separation` from when they were done. A member
+  that still upgrades keeps its slot and the campaign's veto, also when its
+  final report comes in the pause or its image gets a new version. A member
+  released before the pause that stopped before its install waits again in the
+  window it was released in, before the members promised that window after it.
+  The waiting members keep their windows, and the ramp, the concurrency and the
+  pace stay. Each member keeps its `prepare-start`: one that prepared is not let
+  prepare again, and one that was let and has not prepared is let again. In
+  `plan`, the plan shows what the run does when it goes on. To start a campaign
+  over, delete it and create it again. A new version of a member's image makes a
+  member that is done wait again and upgrade to it, and lets a member prepare it
+  again. A member whose device runs that version already is done again; when it
+  upgraded in the run, the next members of its redundancy groups still wait the
+  `min-separation` from the end of that upgrade or a later boot, or from its
+  answer or boot when its device answered `upgrade-needed` in between. The next
+  members never wait less than the `min-separation` from the end of an upgrade
+  that a member ran in the run, also when its device tells a boot before then. A
+  member that needs the upgrade waits the `min-separation` from when each other
+  member of its redundancy groups was done after an upgrade in the run, or with
+  a final status other than `up-to-date`, also one after it in the group, as
+  when it waits again after a new version or a new attempt, also after a restart
+  of fleetmgr, or when it is added to a running campaign; before, it could start
+  right after such a member was done. A member whose upgrade to the old version
+  ended in the pause is done for that version, and upgrades to the new one in a
+  window. A member whose rollback failed stays done and failed, holds its
+  redundancy groups and counts against the failure budget, until its device
+  reports another final status, it gets a new attempt, or it leaves the
+  campaign, also when its status is lost. [#855] [#854]
 - A change to a running campaign moves less of its plan. A higher
   `target-concurrency` or a new `max-concurrency` keeps the concurrency
   that the run rose to, capped at the new max; only a lower target starts
@@ -789,16 +803,14 @@
   its `prepare-start`, while the alarm names it; before, it left the plan. A
   hold of the failure budget that ends before the next member's
   `prepare-start` keeps the `prepare-start`s; before, the turns started over
-  when the hold ended.
+  when the hold ended. [#855]
 - A campaign with `allow-staging` has three settings that say when its
   members may prepare: `prepare-before-first-window`, on by default,
   `prepare-between-windows`, automatic when absent, and
   `prepare-during-windows`, off by default. By default each member prepares
   before the campaign's first window opens, also a member of a later window
-  or of another schedule; before, each member prepared before the next
-  window of its own schedule, so the members of a later schedule prepared
-  while the window of an earlier one was open. The campaign's first window
-  stays the first once it opens, also after it closes. The new
+  or of another schedule. The campaign's first window stays the first once
+  it opens, also after it closes. The new
   `prepare-max-bandwidth` caps the bandwidth that the members use together
   to prepare, each the size of its image divided by its expected prepare
   time, and none for an image without a size. Without it, the campaign
@@ -813,20 +825,18 @@
   open; without it, no member prepares while any window of the campaign is
   open, nor in the time before each opening that the longest prepare needs.
   The plan has the settings in effect, the cap, the bandwidth over time in
-  `prepare-bandwidth`, and its peak in `prepare-peak-bandwidth`.
+  `prepare-bandwidth`, and its peak in `prepare-peak-bandwidth`. [#856]
 - The prepare turns of a campaign stay put. A member that waits to prepare
   keeps its `prepare-start` when other members join, leave, go down or
   answer late; a new member takes the middle of the widest time between two
   turns. A turn that passed, as after a pause or a hold of the failure
   budget, one that a moved window puts after the member's deadline, and one
   that the cap no longer allows move, and a change of a setting or of the
-  cap gives the waiting members new turns. Before, every change spread all
-  waiting turns again. A member that was let prepare and has not prepared
-  when a window opens, or when a hold of the failure budget begins, is let
-  again, with its first `prepare-start`, once it may prepare and by its
-  deadline; its prepare counts from then. Before, only a pause let it
-  again, also after its deadline, and a hold left it out for the rest of
-  the run. After its deadline, the alarm names it.
+  cap gives the waiting members new turns. A member that was let prepare
+  and has not prepared when a window opens, or when a hold of the failure
+  budget begins, is let again, with its first `prepare-start`, once it may
+  prepare and by its deadline; its prepare counts from then. After its
+  deadline, the alarm names it. [#856]
 - A prepare of a campaign member that fails for a transient reason, such as
   a device that is not connected or a connection that drops, is `retrying`:
   while `allow-staging` is on, the device's software manager tries it again
@@ -840,7 +850,7 @@
   which one it ran for. A member let that has not begun its prepare a
   debounce after it was let, or that retries it, is named in the alarm
   "N device(s) cannot prepare before their window opens" once its deadline
-  has passed. Before, a failed prepare was never tried again.
+  has passed. [#869]
 - A window run of a campaign member whose prepare fails for a transient
   reason, such as a connection that drops during the copy, no longer fails.
   It waits, `in-progress` at the stage `prepare`, and the device's software
@@ -850,11 +860,11 @@
   no sample of the pace. Once a try that starts then no longer fits the
   window with its `close-margin`, the campaign puts its veto back: the
   device stops the run before the install, and the member waits for its next
-  window. An install that fails still fails the run. Before, the run failed
-  and counted against the failure budget. A member released while its device
-  is not connected, so that its run reports `unknown`, waits the same way:
-  past the last start that fits its window, the campaign puts its veto back.
-  Before, its device could start the run when it connected after the window.
+  window. An install that fails still fails the run. Before, the run
+  failed. A member released while its device is not connected, so that its
+  run reports `unknown`, waits the same way: past the last start that fits
+  its window, the campaign puts its veto back. Before, its device could
+  start the run when it connected after the window. [#870]
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -894,9 +904,11 @@
   vendor publishes: MD5, SHA-256 or SHA-512, told apart by their length. An
   upload sets the image's `size` from the file. [#823]
 - The web UI has a Config page that shows the top's configuration, the state
-  its transforms publish, or both, as XML, JSON or AData. The Apply config
-  page merges JSON or XML configuration into the running system with a
-  RESTCONF PATCH, after a confirmation. [#736]
+  its transforms publish, or both, as XML, JSON or AData, and downloads it as
+  a file. It draws the text in chunks, so a configuration of hundreds of
+  thousands of lines does not freeze the page. The Apply config page merges
+  JSON or XML configuration into the running system with a RESTCONF PATCH,
+  after a confirmation. [#736] [#848]
 - The web UI has a search, in the header or with Ctrl/⌘+K, that jumps to a
   page, campaign, image, device or schedule by name. [#737]
 - The web UI has redundancy group pages: a list, one page per group with its
@@ -918,7 +930,16 @@
   on when the campaign runs again. A campaign in plan that has run shows as
   paused. Schedule, pace and limits set the campaign's `close-margin` and
   `stagger`. [#823]
-- The device page is redesigned around the device's upgrade run. [#674]
+- The device page holds the device's settings in one form with one Save,
+  and shows its configuration as JSON with the secrets masked. The upgrade
+  run of a campaign member, with its stage chain, checks and jobs, has a
+  page of its own, opened from the campaign page. [#674] [#850]
+- Web UI pages explain their fields in tooltips instead of intro text. A
+  page whose read fails shows the error with a Retry button instead of an
+  empty page. The schedule editor asks before it discards unsaved changes
+  or saves a schedule that is in use. The campaign page no longer shows a
+  rate and an ETA, which were measured only from when the page was opened.
+  [#850] [#851]
 - The web UI's add and import device forms take a username and password,
   instead of writing admin/admin for every device. Import uses one pair for
   all its devices. [#726]
@@ -947,7 +968,7 @@
 - Fixed a tall last column in plan timeline windows whose devices start
   until the window closes. Every start in the window's last few pixels
   went to that column; the starts are now spread over the window's
-  columns.
+  columns. [#851]
 - The campaign page shows why members wait. Its progress bar splits the
   members that it upgraded from those that were up to date already, and
   the members that wait into held, not answered and waiting, and says what
@@ -961,7 +982,7 @@
   that already run their target, which are listed above it. The redundancy
   groups take whom each member waits behind from the campaign, and offer to
   take out only the failed members that others wait behind. A `pending`
-  member shows as not answered, and the device page names the attempt it
+  member shows as not answered, and the member's page names the attempt it
   has not answered. [#816]
 - The campaign page sets the campaign's notification period and failure
   budget, shows how many failures the budget allows and how many there
@@ -1015,7 +1036,7 @@
 - The upgrade status of a fleet device, and the `device-status` of a
   campaign, have `install`: the device's install job, whose message says
   what the device does. The web UI shows it for each device of a campaign
-  and on the device page, with a bar for the transfer of the prepare.
+  and on each member's page, with a bar for the transfer of the prepare.
   [#803]
 - `just demo` generates its fleet like `just demo-fleet`: a hundred devices
   of five models, most on 17.15.04, some older and a few already on
@@ -1024,7 +1045,8 @@
   images are four families in three releases, each family in its own
   folder, with an empty sparse file for each in `out/images`. `demo.xml`,
   `demo-campaign.xml`, `upgrade.xml`, `just upgrade` and `just
-  upgrade-and-watch` are gone. [#825]
+  upgrade-and-watch` are gone. Each demo device names its schedule, and the
+  campaign has no default schedule. [#825] [#872]
 - A `/fleet/device` has the device's `last-boot` in `state/platform`. [#841]
 - A member that is done without a release, and whose upgrade the campaign
   did not see end, is done when its device last booted, when the device
@@ -1040,7 +1062,7 @@
   level and text, following new messages while Live is on, and older ones a
   page at a time. The log's header shows the level the device logs at,
   which its settings set (`debug/log-level`). The top sends a fleet
-  device's log request on to the device's flotilla.
+  device's log request on to the device's flotilla. [#853]
 
 ### Dependencies
 
@@ -1048,8 +1070,10 @@
 - Requires Acton newer than 0.31.0, for explicit parameter defaults
   [acton#3211], the `Env` services [acton#2768], the write barriers of the
   generational garbage collector [acton#3390], HTTP server bodies as bytes
-  [acton#3403], compressed HTTP responses [acton#3404] and the raw terminal
-  mode of stdin [acton#3419].
+  [acton#3403], compressed HTTP responses [acton#3404], the raw terminal
+  mode of stdin [acton#3419], the `on_listen` callback of HTTP listeners
+  [acton#3418] and declarative actor construction with automatic startup
+  [acton#3442].
 
 #### acton-yang
 - gdata is encoded as compact XML and JSON by default, as in the Acton
@@ -1142,6 +1166,10 @@
   [acton-yang#564] [#837]
 - A JSON leaf with the value `null` fails to decode, as RFC 7951 requires.
   [acton-yang#566] [#837]
+- The YANG tokenizer no longer copies the rest of the line for every token.
+  Parsing the 1115 modules of Cisco XRd 25.3.1 takes 26% less time and
+  allocates 76% less. Their full compile is only about 4% faster, because
+  many modules are parsed concurrently. [acton-yang#567] [#847] [#860]
 
 #### acton-ssh
 - Fixed SSH events being delivered out of the order libssh raises them.
@@ -1181,9 +1209,19 @@
 - A failed connect or a dropped connection reports the socket's error, such
   as "connection refused" or "no route to host", instead of "bad file
   descriptor". [acton-ssh#22] [#818]
+- Builds with Acton's declarative actor construction and automatic startup.
+  [acton-ssh#26] [acton-ssh#27] [#847]
+- Copies the strings and buffers of libssh messages before its callbacks get
+  them, as Acton's C string and bytes constructors borrow the buffer instead
+  of copying it [acton#3448]. [#849]
 
 #### acton-lmdb
 - Builds with Zig 0.17. [acton-lmdb#6] [#670]
+- Builds with Acton's declarative actor construction and automatic startup.
+  [acton-lmdb#7] [#847]
+- Copies the values of lookups and cursors before the transaction or cursor
+  moves on, as Acton's C bytes constructors borrow the buffer instead of
+  copying it [acton#3448]. [#849]
 
 #### actmf
 - Updated for explicit defaults, for Acton library modules imported from
@@ -1203,6 +1241,11 @@
 - Imports Acton library modules from `std`. [#833]
 - The `respond` callback of handlers and middleware takes the body as
   `bytes` instead of `str`, as `http.Server` in Acton does. [acton#3403]
+
+#### pipe
+- `create_actor_pipe_pair()` creates the two ends of an actor pipe in an
+  actor body, and `connect_actor_pipe_pair()` connects them in
+  `__startup__`. `actor_pipe_pair()` does both. [pipe#2] [#847]
 
 ### Documentation
 - The software upgrade reference is rewritten to match the code, and is part
@@ -1225,10 +1268,21 @@
 - The `gc-check` CI job runs the fleetmgr tests with `acton test --gc-check`
   and the fleetmgr demo for a minute under the GC write-barrier checker.
   [#764]
+- `stratoweave.plan_timeline.render()` draws a campaign plan from
+  `Controller.layout()` as braille text, the way the Fleet Manager web UI
+  draws its plan timeline. Snapshot tests of the controller draw its plans
+  with it, so a change to how the controller shares slots between windows
+  shows as a changed drawing. [#826]
 
 ### Compatibility Notes
 - Requires Acton newer than 0.31.0. Regenerate generated code with `make gen`
   after upgrading. [#704] [#714] [#764]
+- An actor body can no longer call a `proc` or wait for another actor's
+  reply [acton#3442]. Move such calls into `proc def __startup__()`, like
+  `stratoweave.main()` in an application's `main` actor and the system
+  generator's `compile()` and `gen_app()`. A transform actor that took
+  `dev.tree_provider()` in its body can build `swdev.DeviceTreeProvider(dev)`
+  there instead. [#846]
 - `adapter_type` and `software_adapter_type` in a `DeviceType` take `?Env`
   instead of `?net.TCPConnectCap`. Adapters in other repositories, like
   sw-adapter-cisco-ios-cli, need the same change. [#702]
@@ -1270,10 +1324,6 @@
   device instead: `state/adapter` shows whether it is connected, and the
   inspection API's `/device/<name>/info` and `/device/<name>/log` show its
   queue and what was sent to it. [#792]
-- `DeviceMgr.get_config()` takes a `done` action and gives the running
-  configuration that the `DeviceMgr` keeps, or reads it from the device. It
-  returned the adapter's copy before. `get_running_conf()` gives `None` until
-  the first read.
 - `stratoweave.main()` takes `static_assets` as `dict[str, bytes]`. Have the
   web UI build embed each file as a `bytes` literal, as fleetmgr's
   `gen-embedded-assets.mjs` does. http-router handlers and middleware call
@@ -1399,6 +1449,7 @@ next. Give it a spin. We’d love to hear what you think.
 [#806]: https://github.com/stratoweave/stratoweave/pull/806
 [#807]: https://github.com/stratoweave/stratoweave/pull/807
 [#811]: https://github.com/stratoweave/stratoweave/pull/811
+[#812]: https://github.com/stratoweave/stratoweave/pull/812
 [#814]: https://github.com/stratoweave/stratoweave/pull/814
 [#815]: https://github.com/stratoweave/stratoweave/pull/815
 [#816]: https://github.com/stratoweave/stratoweave/pull/816
@@ -1409,10 +1460,37 @@ next. Give it a spin. We’d love to hear what you think.
 [#822]: https://github.com/stratoweave/stratoweave/pull/822
 [#823]: https://github.com/stratoweave/stratoweave/pull/823
 [#825]: https://github.com/stratoweave/stratoweave/pull/825
+[#826]: https://github.com/stratoweave/stratoweave/pull/826
 [#830]: https://github.com/stratoweave/stratoweave/pull/830
+[#831]: https://github.com/stratoweave/stratoweave/pull/831
 [#832]: https://github.com/stratoweave/stratoweave/pull/832
 [#833]: https://github.com/stratoweave/stratoweave/pull/833
 [#837]: https://github.com/stratoweave/stratoweave/pull/837
+[#838]: https://github.com/stratoweave/stratoweave/pull/838
+[#839]: https://github.com/stratoweave/stratoweave/pull/839
+[#840]: https://github.com/stratoweave/stratoweave/pull/840
+[#841]: https://github.com/stratoweave/stratoweave/pull/841
+[#842]: https://github.com/stratoweave/stratoweave/pull/842
+[#843]: https://github.com/stratoweave/stratoweave/pull/843
+[#846]: https://github.com/stratoweave/stratoweave/pull/846
+[#847]: https://github.com/stratoweave/stratoweave/pull/847
+[#848]: https://github.com/stratoweave/stratoweave/pull/848
+[#849]: https://github.com/stratoweave/stratoweave/pull/849
+[#850]: https://github.com/stratoweave/stratoweave/pull/850
+[#851]: https://github.com/stratoweave/stratoweave/pull/851
+[#853]: https://github.com/stratoweave/stratoweave/pull/853
+[#854]: https://github.com/stratoweave/stratoweave/pull/854
+[#855]: https://github.com/stratoweave/stratoweave/pull/855
+[#856]: https://github.com/stratoweave/stratoweave/pull/856
+[#857]: https://github.com/stratoweave/stratoweave/pull/857
+[#860]: https://github.com/stratoweave/stratoweave/pull/860
+[#862]: https://github.com/stratoweave/stratoweave/pull/862
+[#865]: https://github.com/stratoweave/stratoweave/pull/865
+[#866]: https://github.com/stratoweave/stratoweave/pull/866
+[#869]: https://github.com/stratoweave/stratoweave/pull/869
+[#870]: https://github.com/stratoweave/stratoweave/pull/870
+[#871]: https://github.com/stratoweave/stratoweave/pull/871
+[#872]: https://github.com/stratoweave/stratoweave/pull/872
 [actmf#76]: https://github.com/stratoweave/actmf/pull/76
 [actmf#77]: https://github.com/stratoweave/actmf/pull/77
 [actmf#78]: https://github.com/stratoweave/actmf/pull/78
@@ -1424,8 +1502,12 @@ next. Give it a spin. We’d love to hear what you think.
 [acton#3403]: https://github.com/actonlang/acton/pull/3403
 [acton#3404]: https://github.com/actonlang/acton/pull/3404
 [acton#3410]: https://github.com/actonlang/acton/pull/3410
+[acton#3418]: https://github.com/actonlang/acton/pull/3418
 [acton#3419]: https://github.com/actonlang/acton/pull/3419
+[acton#3442]: https://github.com/actonlang/acton/pull/3442
+[acton#3448]: https://github.com/actonlang/acton/pull/3448
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
+[acton-lmdb#7]: https://github.com/stratoweave/acton-lmdb/pull/7
 [acton-ssh#6]: https://github.com/actonlang/acton-ssh/pull/6
 [acton-ssh#15]: https://github.com/actonlang/acton-ssh/pull/15
 [acton-ssh#17]: https://github.com/actonlang/acton-ssh/pull/17
@@ -1436,6 +1518,8 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-ssh#23]: https://github.com/actonlang/acton-ssh/pull/23
 [acton-ssh#24]: https://github.com/actonlang/acton-ssh/pull/24
 [acton-ssh#25]: https://github.com/actonlang/acton-ssh/pull/25
+[acton-ssh#26]: https://github.com/actonlang/acton-ssh/pull/26
+[acton-ssh#27]: https://github.com/actonlang/acton-ssh/pull/27
 [acton-yang#541]: https://github.com/stratoweave/acton-yang/pull/541
 [acton-yang#544]: https://github.com/stratoweave/acton-yang/pull/544
 [acton-yang#545]: https://github.com/stratoweave/acton-yang/pull/545
@@ -1457,3 +1541,5 @@ next. Give it a spin. We’d love to hear what you think.
 [acton-yang#564]: https://github.com/stratoweave/acton-yang/pull/564
 [acton-yang#565]: https://github.com/stratoweave/acton-yang/pull/565
 [acton-yang#566]: https://github.com/stratoweave/acton-yang/pull/566
+[acton-yang#567]: https://github.com/stratoweave/acton-yang/pull/567
+[pipe#2]: https://github.com/actonlang/pipe/pull/2
