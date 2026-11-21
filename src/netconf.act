@@ -18,7 +18,7 @@ import net
 import std.random
 import testing
 import std.xml as xml
-from pipe import Pipe, actor_pipe_pair as _actor_pipe_pair
+from pipe import Pipe, actor_pipe_pair, create_actor_pipe_pair, connect_actor_pipe_pair
 
 from netconf.buffer import Buffer
 from netconf.fixups import FIXUPS
@@ -48,9 +48,6 @@ NS_YANG_ACTION = "urn:ietf:params:xml:ns:yang:1"
 def is_ok_reply(rpc_reply: xml.Node) -> bool:
     """Return whether an rpc-reply is a successful response with no data."""
     return rpc_reply.tag == "rpc-reply" and len(rpc_reply.children) == 1 and rpc_reply.children[0].tag == "ok"
-
-def actor_pipe_pair() -> (client: Pipe, server: Pipe):
-    return _actor_pipe_pair()
 
 # TODO: I think this should be in __builtin__
 class UnreachableError(Exception):
@@ -176,6 +173,10 @@ state_name = {
 }
 
 
+pure def _private_key(text: str) -> ssh.PrivateKey:
+    return ssh.PrivateKey(text.encode())
+
+
 actor Client(
         connect_cap: ?net.TCPConnectCap,
         address: str,
@@ -192,11 +193,10 @@ actor Client(
         ssh_transport: ?ssh.TransportConfig=None):
 
     _log = logging.Logger(log_handler)
-    _log.info("Connecting to " + address + ":" + str(port) + " as " + username)
 
     # `key` is the private key material itself (PEM / OpenSSH text), not a path;
     # the SSH library keeps keys in memory and never reads the filesystem.
-    _private_keys: ?list[ssh.PrivateKey] = [ssh.PrivateKey(key.encode())] if key is not None else None
+    _private_keys: ?list[ssh.PrivateKey] = [_private_key(key)] if key is not None else None
 
     var framing = SEPARATOR_FRAMING
     var recv_buf = Buffer()
@@ -1138,7 +1138,10 @@ actor Client(
                 connect_pending = True
                 p.read_cb(_on_pipe_event)
 
-    _connect()
+    proc def __startup__():
+        _log.info("Connecting to " + address + ":" + str(port) + " as " + username)
+        _connect()
+
 
 
 actor Server(
@@ -1399,7 +1402,9 @@ actor Server(
             if _on_connect is not None:
                 _on_connect(self, err)
 
-    pipe.read_cb(_on_pipe_event)
+    proc def __startup__():
+        pipe.read_cb(_on_pipe_event)
+
 
 
 class NsMaps(object):
@@ -1537,7 +1542,6 @@ def _test_reply_value(result: ?xml.Node) -> ?str:
 actor _test_client_server_actor_pipe_get(t: testing.EnvT):
     """Test in-process Client <-> Server over ActorPipe with a static <get> reply."""
     log = logging.Logger(t.log_handler)
-    pipes = actor_pipe_pair()
 
     def _on_server_rpc(s: Server,
                        message_id: str,
@@ -1583,17 +1587,21 @@ actor _test_client_server_actor_pipe_get(t: testing.EnvT):
         else:
             t.failure(ValueError("Unexpected hostname in reply: {hostname}"))
 
-    server = Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
-    client = Client(None,
-                    address="actor-pipe",
-                    username="actor-pipe",
-                    key=None,
-                    password=None,
-                    port=0,
-                    on_connect=_on_connect,
-                    on_notif=None,
-                    log_handler=t.log_handler,
-                    pipe=pipes.client)
+    proc def __startup__():
+        pipes = actor_pipe_pair()
+
+        server = Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+        client = Client(None,
+                        address="actor-pipe",
+                        username="actor-pipe",
+                        key=None,
+                        password=None,
+                        port=0,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        log_handler=t.log_handler,
+                        pipe=pipes.client)
+
 
 
 actor _test_client_correlates_malformed_out_of_order_rpc_replies(t: testing.EnvT):
@@ -1602,7 +1610,7 @@ actor _test_client_correlates_malformed_out_of_order_rpc_replies(t: testing.EnvT
     Concurrent Server dispatch deliberately lets the second request complete first.
     This keeps peer-violation hardening separate from normal server behavior.
     """
-    pipes = actor_pipe_pair()
+    pipes = create_actor_pipe_pair()
     var done = False
     var first_message_id: ?str = None
     var got_first = False
@@ -1677,10 +1685,14 @@ actor _test_client_correlates_malformed_out_of_order_rpc_replies(t: testing.EnvT
                     log_handler=t.log_handler,
                     pipe=pipes.client)
 
+    proc def __startup__():
+        connect_actor_pipe_pair(pipes)
+
+
 
 actor _test_client_uses_oldest_rpc_for_reply_without_message_id(t: testing.EnvT):
     """A malformed reply without message-id consumes the oldest pending callback."""
-    pipes = actor_pipe_pair()
+    pipes = create_actor_pipe_pair()
     var done = False
     var first_message_id: ?str = None
     var got_first = False
@@ -1758,11 +1770,15 @@ actor _test_client_uses_oldest_rpc_for_reply_without_message_id(t: testing.EnvT)
                     log_handler=t.log_handler,
                     pipe=pipes.client)
 
+    proc def __startup__():
+        connect_actor_pipe_pair(pipes)
+
+
 
 actor _test_client_reply_with_repeated_xmlns(t: testing.EnvT):
     """A reply that repeats the xmlns of its <rpc-reply>, as Junos 10.4 sends
     it, reaches the callback through the default fixups."""
-    pipes = actor_pipe_pair()
+    pipes = create_actor_pipe_pair()
 
     def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
         if error is not None:
@@ -1801,6 +1817,11 @@ actor _test_client_reply_with_repeated_xmlns(t: testing.EnvT):
                     pipe=pipes.client)
 
 
+    proc def __startup__():
+        connect_actor_pipe_pair(pipes)
+
+
+
 class _TestRawValueFixup(Fixup):
     def __init__(self):
         Fixup.__init__(self, "test-raw-value")
@@ -1811,8 +1832,6 @@ class _TestRawValueFixup(Fixup):
 
 actor _test_client_raw_message_fixup_on_parsable_reply(t: testing.EnvT):
     """A raw message fixup also rewrites a reply that parses as it is."""
-    pipes = actor_pipe_pair()
-    test_fixups: list[proc() -> Fixup] = [_TestRawValueFixup]
 
     def _on_get(c: Client, result: ?xml.Node, error: ?NetconfError):
         if error is not None:
@@ -1834,23 +1853,28 @@ actor _test_client_raw_message_fixup_on_parsable_reply(t: testing.EnvT):
         else:
             c.get(_on_get)
 
-    server = Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
-    client = Client(None,
-                    address="actor-pipe",
-                    username="actor-pipe",
-                    key=None,
-                    password=None,
-                    port=0,
-                    on_connect=_on_connect,
-                    on_notif=None,
-                    log_handler=t.log_handler,
-                    pipe=pipes.client,
-                    fixups=test_fixups)
+    proc def __startup__():
+        pipes = actor_pipe_pair()
+        test_fixups: list[proc() -> Fixup] = [_TestRawValueFixup]
+
+        server = Server(pipe=pipes.server, on_rpc=_on_server_rpc, log_handler=t.log_handler)
+        client = Client(None,
+                        address="actor-pipe",
+                        username="actor-pipe",
+                        key=None,
+                        password=None,
+                        port=0,
+                        on_connect=_on_connect,
+                        on_notif=None,
+                        log_handler=t.log_handler,
+                        pipe=pipes.client,
+                        fixups=test_fixups)
+
 
 
 actor _test_client_restart_fails_pending_rpc(t: testing.EnvT):
     """Restarting the client completes a pending RPC with a SessionClosedError"""
-    pipes = actor_pipe_pair()
+    pipes = create_actor_pipe_pair()
     var done = False
     var client: ?Client = None
 
@@ -1884,7 +1908,7 @@ actor _test_client_restart_fails_pending_rpc(t: testing.EnvT):
 
     server = Server(pipe=pipes.server, on_rpc=_on_server_rpc,
                     capabilities=[CAP_NC_1_0], log_handler=t.log_handler)
-    Client(None,
+    client_instance = Client(None,
            address="actor-pipe",
            username="actor-pipe",
            key=None,
@@ -1895,10 +1919,14 @@ actor _test_client_restart_fails_pending_rpc(t: testing.EnvT):
            log_handler=t.log_handler,
            pipe=pipes.client)
 
+    proc def __startup__():
+        connect_actor_pipe_pair(pipes)
+
+
 
 actor _test_server_serializes_pipelined_rpc_dispatch(t: testing.EnvT):
     """Server dispatches the next pipelined RPC only after the first replies."""
-    pipes = actor_pipe_pair()
+    pipes = create_actor_pipe_pair()
     var done = False
     var first_completed = False
     var dispatch_count = 0
@@ -1936,24 +1964,27 @@ actor _test_server_serializes_pipelined_rpc_dispatch(t: testing.EnvT):
         else:
             _fail_once(ValueError("Unexpected message-id: {message_id}"))
 
-    server = Server(pipe=pipes.server, on_rpc=_on_server_rpc,
-                    capabilities=[CAP_NC_1_0], log_handler=t.log_handler)
+    proc def __startup__():
+        connect_actor_pipe_pair(pipes)
+        server = Server(pipe=pipes.server, on_rpc=_on_server_rpc,
+                        capabilities=[CAP_NC_1_0], log_handler=t.log_handler)
 
-    request_buf = Buffer()
-    client_hello = xml.Node("hello", [(None, NS_NC_1_0)], children=[
-        xml.Node("capabilities", children=[
-            xml.Node("capability", text=CAP_NC_1_0)
+        request_buf = Buffer()
+        client_hello = xml.Node("hello", [(None, NS_NC_1_0)], children=[
+            xml.Node("capabilities", children=[
+                xml.Node("capability", text=CAP_NC_1_0)
+            ])
         ])
-    ])
-    request_buf.write_str(xml.encode(client_hello))
-    request_buf.write_bytes(LEGACY_SEPARATOR)
-    for message_id in ["1", "2"]:
-        rpc = xml.Node("rpc", [(None, NS_NC_1_0)], None,
-                       [("message-id", message_id)],
-                       [xml.Node("get", [(None, NS_NC_1_0)])])
-        request_buf.write_str(xml.encode(rpc))
+        request_buf.write_str(xml.encode(client_hello))
         request_buf.write_bytes(LEGACY_SEPARATOR)
-    pipes.client.write(request_buf.read_all_bytes())
+        for message_id in ["1", "2"]:
+            rpc = xml.Node("rpc", [(None, NS_NC_1_0)], None,
+                           [("message-id", message_id)],
+                           [xml.Node("get", [(None, NS_NC_1_0)])])
+            request_buf.write_str(xml.encode(rpc))
+            request_buf.write_bytes(LEGACY_SEPARATOR)
+        pipes.client.write(request_buf.read_all_bytes())
+
 
 
 actor _test_client_server_tcp_get(t: testing.EnvT):
@@ -2053,8 +2084,10 @@ actor _test_client_server_tcp_get(t: testing.EnvT):
     def _on_timeout():
         _fail_once(ValueError("Timed out waiting for loopback TCP NETCONF <get>"))
 
-    after 2.0: _on_timeout()
-    listener = TcpPipeListener(listen_cap, "127.0.0.1", port, _on_listen, _on_accept)
+    proc def __startup__():
+        after 2.0: _on_timeout()
+        listener = TcpPipeListener(listen_cap, "127.0.0.1", port, _on_listen, _on_accept)
+
 
 
 _ssh_test_username = "netconf"
@@ -2093,16 +2126,18 @@ actor _SshTestServer(t: testing.EnvT,
     def _auth(user: str, password: ?str, pubkey: ?bytes, respond: action(bool) -> None):
         respond(user == _ssh_test_username and password == _ssh_test_password)
 
-    listener = sshpipe.SshPipeListener(
-        net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))),
-        address="127.0.0.1",
-        port=0,
-        on_listen=_on_listen,
-        on_accept=_on_accept,
-        auth_check=_auth,
-        subsystem="netconf",
-        transport=transport,
-        log_handler=t.log_handler)
+    proc def __startup__():
+        listener = sshpipe.SshPipeListener(
+            net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))),
+            address="127.0.0.1",
+            port=0,
+            on_listen=_on_listen,
+            on_accept=_on_accept,
+            auth_check=_auth,
+            subsystem="netconf",
+            transport=transport,
+            log_handler=t.log_handler)
+
 
 
 actor _test_client_server_ssh_get(t: testing.EnvT):
@@ -2185,8 +2220,10 @@ actor _test_client_server_ssh_get(t: testing.EnvT):
     def _on_timeout():
         _fail_once(ValueError("Timed out waiting for loopback SSH NETCONF <get>"))
 
-    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
-    after 10.0: _on_timeout()
+    proc def __startup__():
+        srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
+        after 10.0: _on_timeout()
+
 
 
 actor _test_client_server_ssh_legacy_framing(t: testing.EnvT):
@@ -2256,8 +2293,10 @@ actor _test_client_server_ssh_legacy_framing(t: testing.EnvT):
     def _on_timeout():
         _fail_once(ValueError("Timed out waiting for legacy framing SSH NETCONF <get>"))
 
-    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error, capabilities=[CAP_NC_1_0])
-    after 10.0: _on_timeout()
+    proc def __startup__():
+        srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error, capabilities=[CAP_NC_1_0])
+        after 10.0: _on_timeout()
+
 
 
 actor _test_client_server_ssh_transport_config(t: testing.EnvT):
@@ -2331,8 +2370,10 @@ actor _test_client_server_ssh_transport_config(t: testing.EnvT):
     def _on_timeout():
         _fail_once(ValueError("Timed out waiting for pinned-transport SSH NETCONF <get>"))
 
-    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error, transport=transport)
-    after 10.0: _on_timeout()
+    proc def __startup__():
+        srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error, transport=transport)
+        after 10.0: _on_timeout()
+
 
 
 actor _test_client_server_ssh_transport_mismatch(t: testing.EnvT):
@@ -2385,8 +2426,10 @@ actor _test_client_server_ssh_transport_mismatch(t: testing.EnvT):
                 s.close()
             t.failure(ValueError("Timed out waiting for SSH transport mismatch"))
 
-    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error, transport=server_transport)
-    after 10.0: _on_timeout()
+    proc def __startup__():
+        srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error, transport=server_transport)
+        after 10.0: _on_timeout()
+
 
 
 actor _test_client_server_ssh_auth_reject(t: testing.EnvT):
@@ -2435,8 +2478,10 @@ actor _test_client_server_ssh_auth_reject(t: testing.EnvT):
                 s.close()
             t.failure(ValueError("Timed out waiting for SSH auth reject"))
 
-    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
-    after 10.0: _on_timeout()
+    proc def __startup__():
+        srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
+        after 10.0: _on_timeout()
+
 
 
 actor _test_client_server_ssh_large_reply(t: testing.EnvT):
@@ -2521,14 +2566,15 @@ actor _test_client_server_ssh_large_reply(t: testing.EnvT):
     def _on_timeout():
         _fail_once(ValueError("Timed out waiting for large SSH NETCONF reply"))
 
-    srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
-    after 15.0: _on_timeout()
+    proc def __startup__():
+        srv = _SshTestServer(t, _on_server_rpc, _on_port, _on_error)
+        after 15.0: _on_timeout()
+
 
 
 actor _test_netconf(t: testing.EnvT):
     """Test SSH client towards a NETCONF server, like notconf
     """
-    t.require("notconf-server")
     log = logging.Logger(t.log_handler)
 
     def _on_connect(c: Client, e: ?Exception):
@@ -2550,22 +2596,24 @@ actor _test_netconf(t: testing.EnvT):
             log.info("<get-config> success")
             t.success()
 
-    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
-                on_connect=_on_connect,
-                address=test_address,
-                username=test_username,
-                key=None,
-                password=test_password,
-                port=test_port,
-                on_notif=None,
-                skip_host_key_check=True,
-                log_handler=t.log_handler)
+    proc def __startup__():
+        t.require("notconf-server")
+        c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                    on_connect=_on_connect,
+                    address=test_address,
+                    username=test_username,
+                    key=None,
+                    password=test_password,
+                    port=test_port,
+                    on_notif=None,
+                    skip_host_key_check=True,
+                    log_handler=t.log_handler)
+
 
 
 actor _test_get_schema(t: testing.EnvT):
     """Test SSH client get-schema operation towards a NETCONF server
     """
-    t.require("notconf-server")
     log = logging.Logger(t.log_handler)
 
     def _on_connect(c: Client, e: ?Exception):
@@ -2590,22 +2638,24 @@ actor _test_get_schema(t: testing.EnvT):
             log.error("<get-schema> received null response")
             t.failure(ValueError("get-schema returned null"))
 
-    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
-                on_connect=_on_connect,
-                on_notif=None,
-                address=test_address,
-                username=test_username,
-                key=None,
-                password=test_password,
-                port=test_port,
-                skip_host_key_check=True,
-                log_handler=t.log_handler)
+    proc def __startup__():
+        t.require("notconf-server")
+        c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                    on_connect=_on_connect,
+                    on_notif=None,
+                    address=test_address,
+                    username=test_username,
+                    key=None,
+                    password=test_password,
+                    port=test_port,
+                    skip_host_key_check=True,
+                    log_handler=t.log_handler)
+
 
 
 actor _test_list_schemas(t: testing.EnvT):
     """Test listing available schemas from a NETCONF server
     """
-    t.require("notconf-server")
     log = logging.Logger(t.log_handler)
 
     def _on_connect(c: Client, e: ?Exception):
@@ -2630,23 +2680,24 @@ actor _test_list_schemas(t: testing.EnvT):
                 log.warning("No schemas found")
                 t.failure(Exception("No schemas found"))
 
-    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
-                on_connect=_on_connect,
-                on_notif=None,
-                address=test_address,
-                username=test_username,
-                key=None,
-                password=test_password,
-                port=test_port,
-                skip_host_key_check=True,
-                log_handler=t.log_handler)
+    proc def __startup__():
+        t.require("notconf-server")
+        c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                    on_connect=_on_connect,
+                    on_notif=None,
+                    address=test_address,
+                    username=test_username,
+                    key=None,
+                    password=test_password,
+                    port=test_port,
+                    skip_host_key_check=True,
+                    log_handler=t.log_handler)
+
 
 
 actor _test_schema_getter(t: testing.EnvT):
     """Test listing available schemas from a NETCONF server
     """
-    t.require("notconf-server")
-    t.timeout(10.0)
     log = logging.Logger(t.log_handler)
     expected = 0
     var count = 0
@@ -2691,22 +2742,25 @@ actor _test_schema_getter(t: testing.EnvT):
         else:
             t.success()
 
-    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
-                on_connect=_on_connect,
-                on_notif=None,
-                address=test_address,
-                username=test_username,
-                key=None,
-                password=test_password,
-                port=test_port,
-                skip_host_key_check=True,
-                log_handler=t.log_handler)
+    proc def __startup__():
+        t.timeout(10.0)
+        t.require("notconf-server")
+        c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                    on_connect=_on_connect,
+                    on_notif=None,
+                    address=test_address,
+                    username=test_username,
+                    key=None,
+                    password=test_password,
+                    port=test_port,
+                    skip_host_key_check=True,
+                    log_handler=t.log_handler)
+
 
 
 actor _test_lock_unlock(t: testing.EnvT):
     """Test lock and unlock operations on a datastore
     """
-    t.require("notconf-server")
     log = logging.Logger(t.log_handler)
 
     def _on_connect(c: Client, e: ?Exception):
@@ -2735,22 +2789,24 @@ actor _test_lock_unlock(t: testing.EnvT):
             log.info("Lock and unlock test completed successfully")
             t.success()
 
-    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
-                on_connect=_on_connect,
-                on_notif=None,
-                address=test_address,
-                username=test_username,
-                key=None,
-                password=test_password,
-                port=test_port,
-                skip_host_key_check=True,
-                log_handler=t.log_handler)
+    proc def __startup__():
+        t.require("notconf-server")
+        c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                    on_connect=_on_connect,
+                    on_notif=None,
+                    address=test_address,
+                    username=test_username,
+                    key=None,
+                    password=test_password,
+                    port=test_port,
+                    skip_host_key_check=True,
+                    log_handler=t.log_handler)
+
 
 
 actor _test_get_config_with_filter(t: testing.EnvT):
     """Test get-config operation with a subtree filter
     """
-    t.require("notconf-server")
     log = logging.Logger(t.log_handler)
 
     def _on_connect(c: Client, e: ?Exception):
@@ -2795,22 +2851,24 @@ actor _test_get_config_with_filter(t: testing.EnvT):
             log.error("<get-config> with filter received null response")
             t.failure(ValueError("get-config with filter returned null"))
 
-    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
-                on_connect=_on_connect,
-                on_notif=None,
-                address=test_address,
-                username=test_username,
-                key=None,
-                password=test_password,
-                port=test_port,
-                skip_host_key_check=True,
-                log_handler=t.log_handler)
+    proc def __startup__():
+        t.require("notconf-server")
+        c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                    on_connect=_on_connect,
+                    on_notif=None,
+                    address=test_address,
+                    username=test_username,
+                    key=None,
+                    password=test_password,
+                    port=test_port,
+                    skip_host_key_check=True,
+                    log_handler=t.log_handler)
+
 
 
 actor _test_get_config_with_xpath_filter(t: testing.EnvT):
     """Test get-config operation with an XPath filter
     """
-    t.require("notconf-server")
     log = logging.Logger(t.log_handler)
 
     def _on_connect(c: Client, e: ?Exception):
@@ -2851,16 +2909,19 @@ actor _test_get_config_with_xpath_filter(t: testing.EnvT):
             log.error("<get-config> with XPath filter received null response")
             t.failure(ValueError("get-config with XPath filter returned null"))
 
-    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
-                on_connect=_on_connect,
-                on_notif=None,
-                address=test_address,
-                username=test_username,
-                key=None,
-                password=test_password,
-                port=test_port,
-                skip_host_key_check=True,
-                log_handler=t.log_handler)
+    proc def __startup__():
+        t.require("notconf-server")
+        c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                    on_connect=_on_connect,
+                    on_notif=None,
+                    address=test_address,
+                    username=test_username,
+                    key=None,
+                    password=test_password,
+                    port=test_port,
+                    skip_host_key_check=True,
+                    log_handler=t.log_handler)
+
 
 
 actor _test_rpc_error_repr(t: testing.EnvT):
@@ -2869,7 +2930,6 @@ actor _test_rpc_error_repr(t: testing.EnvT):
     This test intentionally triggers an RPC error by trying to lock a
     non-existent datastore, then verifies the repr() output.
     """
-    t.require("notconf-server")
     log = logging.Logger(t.log_handler)
 
     def _on_connect(c: Client, e: ?Exception):
@@ -2890,13 +2950,15 @@ actor _test_rpc_error_repr(t: testing.EnvT):
             log.error("Expected an error from invalid lock operation, but got success")
             t.failure(ValueError("Lock on non-existent datastore should have failed"))
 
-    c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
-                on_connect=_on_connect,
-                on_notif=None,
-                address=test_address,
-                username=test_username,
-                key=None,
-                password=test_password,
-                port=test_port,
-                skip_host_key_check=True,
-                log_handler=t.log_handler)
+    proc def __startup__():
+        t.require("notconf-server")
+        c = Client(net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap))),
+                    on_connect=_on_connect,
+                    on_notif=None,
+                    address=test_address,
+                    username=test_username,
+                    key=None,
+                    password=test_password,
+                    port=test_port,
+                    skip_host_key_check=True,
+                    log_handler=t.log_handler)
