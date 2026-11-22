@@ -556,8 +556,8 @@
 
   {#if !tree.filesOn}
     <p class="note">
-      The server has no image folder, so images cannot be uploaded, moved or kept in new folders. Start it with
-      <span class="mono">--software.image-dir</span> to use one.
+      The server has no image folder, so uploads, moves and new folders are off. Start it with
+      <span class="mono">--software.image-dir</span> to turn them on.
     </p>
   {/if}
 
@@ -570,9 +570,9 @@
   {:else if rows.length === 0 && !searching}
     <div class="empty-state">
       {#if folder}
-        This folder is empty. Drop image files here to upload them into it.
+        This folder is empty. Drop image files here to upload them.
       {:else}
-        No images yet. Add one by hand, or drop image files anywhere on this page.
+        No images yet. Add one, or drop image files on this page to upload them.
       {/if}
     </div>
   {:else}
@@ -653,17 +653,20 @@
               <td class="name-cell">
                 <div class="name-line">
                   <DriveIcon kind={entry.kind === 'folder' ? 'folder' : entry.image ? 'image' : 'file'} />
-                  {#if entry.kind === 'folder'}
-                    <a class="entry-name mono" href={folderHref(entry.path)}>{entry.name}</a>
-                  {:else if entry.image}
-                    <a class="entry-name mono" href={imageHref(entry.image.name)}>{entry.name}</a>
-                    {#if entry.image.isDefault}<span class="tag default">default</span>{/if}
-                  {:else}
-                    <span class="entry-name mono plain" tabindex="-1">{entry.name}</span>
-                    <a class="tag unlisted" href={addHref(entry.path)} title="This file is not in the image list. Add it.">
-                      not listed · add
-                    </a>
-                  {/if}
+                  <!-- A tag that does not fit goes under the name rather than breaking it. -->
+                  <span class="name-wrap">
+                    {#if entry.kind === 'folder'}
+                      <a class="entry-name mono" href={folderHref(entry.path)}>{entry.name}</a>
+                    {:else if entry.image}
+                      <a class="entry-name mono" href={imageHref(entry.image.name)}>{entry.name}</a>
+                      {#if entry.image.isDefault}<span class="tag default">default</span>{/if}
+                    {:else}
+                      <span class="entry-name mono plain" tabindex="-1">{entry.name}</span>
+                      <a class="tag unlisted" href={addHref(entry.path)} title="This file is not in the image list. Add it.">
+                        not listed · add
+                      </a>
+                    {/if}
+                  </span>
                 </div>
                 {#if entry.kind === 'image' && entry.image && entry.image.name !== entry.name}
                   <span class="listed">image <span class="mono">{entry.image.name}</span></span>
@@ -892,8 +895,25 @@
     box-shadow: inset 0 0 0 1px var(--sw-accent);
   }
 
+  /* A ring round the whole row, as round a crumb that takes the drop. */
+  tr.drop td {
+    box-shadow:
+      inset 0 1px 0 var(--sw-accent),
+      inset 0 -1px 0 var(--sw-accent);
+  }
+
   tr.drop td:first-child {
-    box-shadow: inset 2px 0 0 var(--sw-accent);
+    box-shadow:
+      inset 1px 0 0 var(--sw-accent),
+      inset 0 1px 0 var(--sw-accent),
+      inset 0 -1px 0 var(--sw-accent);
+  }
+
+  tr.drop td:last-child {
+    box-shadow:
+      inset -1px 0 0 var(--sw-accent),
+      inset 0 1px 0 var(--sw-accent),
+      inset 0 -1px 0 var(--sw-accent);
   }
 
   .tools {
@@ -1017,6 +1037,14 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 0;
+  }
+
+  .name-wrap {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 8px;
     min-width: 0;
   }
 

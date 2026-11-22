@@ -169,8 +169,7 @@
   }
 
   .name {
-    font-family: var(--sw-font-mono, ui-monospace, monospace);
-    font-size: 12px;
+    font-size: var(--sw-text-sm);
     color: var(--sw-text-secondary);
   }
 

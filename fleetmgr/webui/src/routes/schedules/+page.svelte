@@ -53,7 +53,6 @@
 <div class="page-header">
   <div>
     <h1>Maintenance schedules</h1>
-    <p>When devices may be upgraded. Campaigns place each device in its schedule's windows.</p>
   </div>
   <div class="page-actions">
     <a class="btn btn-primary" href="/schedules/new">New schedule</a>
@@ -67,7 +66,6 @@
 <section class="card">
   <div class="grids-head">
     <h2 class="panel-title">Next seven days</h2>
-    <span class="hint">every schedule's windows in your local time · click one to edit its schedule</span>
   </div>
   {#if list === null}
     <div class="empty-state" aria-busy="true">Loading schedules…</div>
@@ -88,7 +86,7 @@
             <th>UTC offset</th>
             <th>Windows</th>
             <th class="right">Bound devices</th>
-            <th>Default of</th>
+            <th>Default for</th>
           </tr>
         </thead>
         <tbody>
@@ -145,11 +143,6 @@
   .panel-title {
     margin: 0;
     font-size: 14px;
-  }
-
-  .hint {
-    font-size: 12px;
-    color: var(--sw-text-muted);
   }
 
   .schedule-name,

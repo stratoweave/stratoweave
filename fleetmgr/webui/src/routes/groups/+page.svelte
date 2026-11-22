@@ -57,7 +57,8 @@
         class="input compact mono filter-input"
         type="text"
         aria-label="Filter by name"
-        placeholder="filter by name (glob with * and ?)"
+        placeholder="Filter by name"
+        title="Matches part of a name, or a glob with * and ?"
         bind:value={filterText}
         oninput={() => (page = 1)}
       />

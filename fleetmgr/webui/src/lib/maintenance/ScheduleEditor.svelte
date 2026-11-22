@@ -74,13 +74,11 @@
   let upcoming = $derived(upcomingAll.slice(0, 8));
 
   let usageText = $derived.by(() => {
-    if (isNew) {
-      return 'Created in one write. Devices bind to a schedule by name on their inventory entry and campaigns name one as their default; both re-plan whenever the schedule changes.';
-    }
-    const devices = `${usage.boundDevices} bound device${usage.boundDevices === 1 ? '' : 's'}`;
+    if (isNew) return '';
+    const devices = `${usage.boundDevices.toLocaleString()} bound device${usage.boundDevices === 1 ? '' : 's'}`;
     const campaigns =
-      usage.defaultOf.length > 0 ? `default of ${usage.defaultOf.join(', ')}` : 'default of no campaign';
-    return `${devices} · ${campaigns}. Saving replaces the schedule; everything that references it re-plans.`;
+      usage.defaultOf.length > 0 ? `default for ${usage.defaultOf.join(', ')}` : 'not a campaign default';
+    return `${devices} · ${campaigns}`;
   });
 
   function rulePreview(w: WindowDraft): string {
@@ -199,7 +197,7 @@
     <h1 title={`YANG: /maintenance:schedules/schedule${isNew ? '' : `=${schedule?.name}`}`}>
       {isNew ? 'New schedule' : schedule?.name}
     </h1>
-    <p>{usageText}</p>
+    {#if usageText}<p>{usageText}</p>{/if}
   </div>
   <div class="page-actions">
     {#if !isNew}
@@ -234,7 +232,7 @@
           error={errors['name']}
           mono={true}
           disabled={!isNew}
-          placeholder="e.g., europe"
+          placeholder="e.g. europe"
           onchange={(v) => (draft = { ...draft, name: v })}
           ontouch={() => (touched = true)}
         />
@@ -244,7 +242,7 @@
           error={errors['utc-offset']}
           mono={true}
           placeholder="+01:00"
-          help="no daylight saving"
+          help="No daylight saving"
           onchange={(v) => (draft = { ...draft, utcOffset: v })}
           ontouch={() => (touched = true)}
         />
@@ -288,7 +286,7 @@
           <div class="field" role="group" aria-label={`Rule ${index + 1} weekdays`}>
             <span class="field__label">
               Weekdays
-              <span class="days-hint">{w.days.length === 0 ? 'none picked: every day' : ''}</span>
+              <span class="days-hint">{w.days.length === 0 ? 'Every day' : ''}</span>
             </span>
             <div class="days">
               {#each WEEKDAYS as day (day)}
@@ -299,7 +297,7 @@
                   aria-pressed={w.days.includes(day)}
                   onclick={() => toggleDay(w, day)}
                 >
-                  {day}
+                  {day[0].toUpperCase() + day.slice(1)}
                 </button>
               {/each}
             </div>
@@ -318,7 +316,7 @@
   <section class="card">
     <div class="grids-head">
       <h2 class="panel-title">Next seven days</h2>
-      <span class="hint">drag to move or resize, across a day to add · your local time</span>
+      <span class="hint">Drag to add, move or resize windows · local time</span>
     </div>
     <WeekCalendar
       schedules={[previewSchedule]}
@@ -329,7 +327,7 @@
       onrulechange={changeRuleFromCalendar}
       onrulecreate={addRuleFromCalendar}
     />
-    <h2 class="panel-title upcoming-title">Windows the planner would use</h2>
+    <h2 class="panel-title upcoming-title">Upcoming windows</h2>
     {#if upcoming.length === 0}
       <p class="hint">None within the planner's {HORIZON_DAYS} days.</p>
     {:else}
@@ -356,7 +354,7 @@
         </table>
       </div>
       <p class="hint">
-        {upcomingAll.length} occurrence{upcomingAll.length === 1 ? '' : 's'} within the planner's {HORIZON_DAYS} days{upcomingAll.length > upcoming.length ? `, ${upcoming.length} shown` : ''}.
+        {upcomingAll.length} window{upcomingAll.length === 1 ? '' : 's'} in the planner's {HORIZON_DAYS}-day horizon{upcomingAll.length > upcoming.length ? `, first ${upcoming.length} shown` : ''}.
       </p>
     {/if}
   </section>
@@ -443,7 +441,6 @@
     border: 1px solid var(--sw-border-default);
     background: var(--sw-bg-input);
     color: var(--sw-text-muted);
-    font-family: var(--sw-font-mono);
     font-size: var(--sw-text-xs);
     cursor: pointer;
   }

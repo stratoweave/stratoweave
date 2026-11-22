@@ -160,9 +160,7 @@
                 <span>Leave out the {devicesText(counts.newer)} on a newer release</span>
               </label>
             {/if}
-            <p class="hint">
-              From the release each device last reported. Each device checks again when the campaign reads it.
-            </p>
+            <p class="hint">Based on the release each device last reported.</p>
           </div>
         {/if}
       {/if}
@@ -178,7 +176,7 @@
           value={name}
           error={touched ? errors['name'] : ''}
           yangType="string"
-          placeholder="e.g., xe-1718-emea"
+          placeholder="e.g. xe-1718-emea"
           onchange={(v) => (name = v)}
           ontouch={() => (touched = true)}
         />

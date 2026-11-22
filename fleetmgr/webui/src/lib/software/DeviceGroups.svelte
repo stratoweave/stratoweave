@@ -140,7 +140,7 @@
     onchange={(next) => (picked = next)}
   />
   <div class="save-row">
-    <label class="dim" for={`${uid}-priority`}>Priority</label>
+    <label class="field__label" for={`${uid}-priority`}>Priority</label>
     <input
       id={`${uid}-priority`}
       class="input compact mono priority"

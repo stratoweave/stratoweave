@@ -383,9 +383,6 @@
 <div class="page-header">
   <div>
     <h1>Devices</h1>
-    <p>
-      The fleet inventory. Lab deploys usually onboard devices over RESTCONF.
-    </p>
   </div>
   <div class="page-actions">
     <button class="btn btn-secondary" type="button" onclick={openImport} disabled={loading || saving || applying}>
@@ -409,11 +406,7 @@
 
 {#if draft}
   <section class="card editor-card">
-    <Section
-      title="Add device"
-      description="An address makes it a real endpoint; mock entries need none."
-      yangPath="fleetmgr:fleet/device"
-    >
+    <Section title="Add device" yangPath="fleetmgr:fleet/device">
       <div class="grid-2">
         <FieldText
           label="Name"
@@ -421,7 +414,7 @@
           value={draft.name}
           error={errors['name']}
           yangType="string"
-          placeholder="e.g., ce1"
+          placeholder="e.g. ce1"
           onchange={(value) => patch({ name: value })}
           ontouch={() => (touched = true)}
         />
@@ -443,6 +436,7 @@
           yangType="inet:host"
           mono={true}
           placeholder="hostname or IP"
+          help="Leave empty for a mock device."
           onchange={(value) => patch({ address: value })}
           ontouch={() => (touched = true)}
         />
@@ -511,7 +505,7 @@
   <section class="card editor-card">
     <Section
       title="Import devices"
-      description="One device per line: name[,address[,port]]. Lines starting with # are ignored; existing names are skipped."
+      description="One device per line: name[,address[,port]]. Lines starting with # and existing names are skipped."
       yangPath="fleetmgr:fleet/device"
     >
       <div class="grid-2">
@@ -584,7 +578,8 @@
         class="input compact mono filter-input"
         type="text"
         aria-label="Filter by name"
-        placeholder="filter by name (glob with * and ?)"
+        placeholder="Filter by name"
+        title="Matches part of a name, or a glob with * and ?"
         bind:value={filterText}
         oninput={() => (page = 1)}
       />
@@ -971,8 +966,9 @@
       max-width: none;
     }
 
+    /* Two filters to a row; four in one leave no room for their labels. */
     .filter-row .select {
-      flex: 1;
+      flex: 1 1 calc(50% - 5px);
       width: auto;
     }
 

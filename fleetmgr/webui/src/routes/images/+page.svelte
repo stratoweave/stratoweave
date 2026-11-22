@@ -60,10 +60,6 @@
 <div class="page-header">
   <div>
     <h1>Images</h1>
-    <p>
-      Software images, kept in folders, with the OS each runs and the hardware models it is for. Drop image files
-      anywhere on this page to upload them into the folder you are in.
-    </p>
   </div>
   <div class="page-actions">
     <button
@@ -110,7 +106,7 @@
         value={urlBase}
         oninput={(e) => (urlBase = e.currentTarget.value)}
       />
-      <small class="field__meta">A device fetches an image from this followed by the path of its file.</small>
+      <small class="field__meta">Devices fetch an image from this URL followed by its file path.</small>
     </label>
     <button
       class="btn btn-secondary"

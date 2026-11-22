@@ -94,10 +94,7 @@
 
 <div class="builder">
   <div class="filters-side">
-    <div class="filters-head">
-      <span class="kick">Filters — devices matching all of these</span>
-      <span class="hint">from the fleet inventory</span>
-    </div>
+    <div class="kick">Filters</div>
     <div class="filters">
       <div class="frow">
         <span class="flabel">Device type</span>
@@ -128,7 +125,8 @@
           class="fld mono"
           type="text"
           aria-label="Name matches"
-          placeholder="substring, or glob with * and ?"
+          placeholder="anything"
+          title="Matches part of a name, or a glob with * and ?"
           value={selection.namePattern}
           oninput={(e) => patch({ namePattern: e.currentTarget.value })}
         />
@@ -178,22 +176,24 @@
       </div>
     </div>
 
-    <textarea
-      class="input mono"
-      rows="3"
-      aria-label="Explicit device names"
-      placeholder="optional: explicit names, one per line or comma-separated — used instead of the whole inventory"
-      value={selection.pasted}
-      oninput={(e) => patch({ pasted: e.currentTarget.value })}
-    ></textarea>
+    <label class="paste">
+      <span class="kick">Limit to these devices <span class="optional">(optional)</span></span>
+      <textarea
+        class="input mono"
+        rows="3"
+        placeholder="One name per line, or comma-separated"
+        value={selection.pasted}
+        oninput={(e) => patch({ pasted: e.currentTarget.value })}
+      ></textarea>
+    </label>
 
     <div class="count-row">
-      <div>
-        <div class="count tn" class:empty={expansion.names.length === 0}>
+      <p class="count-line">
+        <span class="count tn" class:empty={expansion.names.length === 0}>
           {expansion.names.length.toLocaleString()}
-        </div>
-        <div class="hint">devices match now</div>
-      </div>
+        </span>
+        matching device{expansion.names.length === 1 ? '' : 's'}
+      </p>
       {#if error}
         <span class="err">{error}</span>
       {/if}
@@ -208,7 +208,7 @@
   </div>
 
   <div class="rail">
-    <div class="kick" style:margin-bottom="12px">Excluded, and why</div>
+    <div class="kick" style:margin-bottom="12px">Excluded</div>
     {#if expansion.excluded.length === 0}
       <div class="hint">Nothing excluded.</div>
     {/if}
@@ -223,7 +223,7 @@
     {/each}
 
     {#if expansion.sample.length > 0}
-      <div class="kick" style:margin="20px 0 10px">Sample of the match</div>
+      <div class="kick" style:margin="20px 0 10px">Sample</div>
       <table class="sample">
         <tbody>
           {#each expansion.sample as d (d.name)}
@@ -262,12 +262,14 @@
     align-content: start;
   }
 
-  .filters-head {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 4px 12px;
+  .paste {
+    display: grid;
+    gap: 6px;
+  }
+
+  .optional {
+    font-weight: 400;
+    color: var(--sw-text-muted);
   }
 
   .filters {
@@ -389,10 +391,19 @@
     border-bottom: 1px solid var(--sw-border-subtle);
   }
 
+  .count-line {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin: 0;
+    font-size: var(--sw-text-sm);
+    color: var(--sw-text-secondary);
+  }
+
   .count {
-    font-size: var(--sw-text-3xl);
+    font-size: var(--sw-text-xl);
     font-weight: 600;
-    line-height: 1;
+    color: var(--sw-text-primary);
   }
 
   .count.empty {

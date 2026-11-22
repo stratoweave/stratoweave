@@ -271,10 +271,8 @@
 
   .cmdk-group-label {
     padding: 8px 12px 4px;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
+    font-size: var(--sw-text-xs);
+    font-weight: 500;
     color: var(--sw-text-muted);
   }
 

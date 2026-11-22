@@ -37,8 +37,8 @@
 
   let scheduleOptions = $derived.by(() => {
     const options = [
-      { value: '', label: 'none — one always-open window when no member is bound' },
-      ...schedules.map((s) => ({ value: s.name, label: `${s.name} — ${scheduleRulesText(s)}` }))
+      { value: '', label: 'None (always open)' },
+      ...schedules.map((s) => ({ value: s.name, label: `${s.name} · ${scheduleRulesText(s)}` }))
     ];
     if (draft.defaultSchedule && !schedules.some((s) => s.name === draft.defaultSchedule)) {
       options.push({ value: draft.defaultSchedule, label: `${draft.defaultSchedule} (missing)` });
@@ -110,7 +110,6 @@
         mono={true}
         {disabled}
         placeholder={`${DEFAULT_TARGET_CONCURRENCY}`}
-        help="Devices upgrading at the same time."
         onchange={(v) => patch({ targetConcurrency: v })}
       />
     {/if}
@@ -168,7 +167,7 @@
       mono={true}
       {disabled}
       placeholder="none"
-      help="No more devices start once more than this share of the members have failed."
+      help="No new starts once more than this share of the members have failed."
       onchange={(v) => patch({ failureBudget: v })}
     />
   </div>

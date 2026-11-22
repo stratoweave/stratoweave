@@ -174,6 +174,13 @@
       ? (campaign.runSince ?? now) + campaign.notificationPeriod * 86400
       : null
   );
+  let noticeText = $derived.by(() => {
+    if (!campaign || noticeFrom === null) return '';
+    const n = campaign.notificationPeriod;
+    const days = n === 1 ? "1 day's" : `${n} days'`;
+    const from = campaign.runSince === null ? ' from now' : '';
+    return `${days} notice${from}: windows from ${formatClock(noticeFrom)} on.`;
+  });
 
   let savedPlanning = $derived(campaign ? planningOf(campaign) : null);
   let savedDraft = $derived(savedPlanning ? planningDraft(savedPlanning) : null);
@@ -261,19 +268,19 @@
       if (plan !== null && (plan.windows.length > 0 || plan.unplaced.length > 0 || plan.done.length > 0)) {
         const placed = c.devices.length - plan.unplaced.length - plan.done.length;
         const windows = `${plan.windows.length} window${plan.windows.length === 1 ? '' : 's'}`;
-        const missing = plan.unplaced.length > 0 ? `, ${plan.unplaced.length} in no window yet` : '';
-        const done = plan.done.length > 0 ? `, ${plan.done.length} already done` : '';
-        return `${head} — ${placed} of ${c.devices.length} placed in ${windows}${missing}${done}.`;
+        const missing = plan.unplaced.length > 0 ? `, ${plan.unplaced.length.toLocaleString()} in no window yet` : '';
+        const done = plan.done.length > 0 ? `, ${plan.done.length.toLocaleString()} already done` : '';
+        return `${head}: ${placed.toLocaleString()} of ${c.devices.length.toLocaleString()} placed in ${windows}${missing}${done}.`;
       }
       return `${head}.`;
     }
-    if (counters === null) return 'Running — no state reported yet.';
+    if (counters === null) return 'Running: no state reported yet.';
     if (counters.inProgress > 0)
-      return `Running — ${counters.inProgress} of ${counters.total} installing.`;
+      return `Running: ${counters.inProgress.toLocaleString()} of ${counters.total.toLocaleString()} installing.`;
     if (counters.total > 0 && counters.remainder === 0) {
       const upgraded = counters.succeeded - counters.upToDate;
-      const already = counters.upToDate > 0 ? `, ${counters.upToDate} already up to date` : '';
-      return `No work outstanding — ${upgraded} upgraded${already}, ${counters.failed} failed.`;
+      const already = counters.upToDate > 0 ? `, ${counters.upToDate.toLocaleString()} already up to date` : '';
+      return `No work outstanding: ${upgraded.toLocaleString()} upgraded${already}, ${counters.failed.toLocaleString()} failed.`;
     }
     return 'Running.';
   });
@@ -376,10 +383,7 @@
           {#if campaign.runSince !== null}
             First ran {formatClock(campaign.runSince)}.
           {/if}
-          {#if noticeFrom !== null}
-            {campaign.notificationPeriod} day{campaign.notificationPeriod === 1 ? '' : 's'} of notice: it uses
-            windows from {formatClock(noticeFrom)}{campaign.runSince === null ? ', counted from now until it runs' : ''}.
-          {/if}
+          {noticeText}
         </p>
       {/if}
     </div>
@@ -470,8 +474,7 @@
         <div class="status-foot">
           <p class="rate">
             {#if rate !== null}
-              ~{rate.toFixed(1)} devices finished/min{eta !== null ? ` · ETA ${formatEta(eta)}` : ''} ·
-              measured since this page opened
+              ~{rate.toFixed(1)} devices/min since this page opened{eta !== null ? ` · ETA ${formatEta(eta)}` : ''}
             {:else}
               The rate shows once devices finish.
             {/if}
@@ -495,7 +498,7 @@
     <section class="card">
       <div class="grids-head">
         <h2 class="panel-title">Plan</h2>
-        <span class="hint">estimates in your local time</span>
+        <span class="hint">Local time</span>
       </div>
       {#if plan.alarms.length > 0}
         <ul class="alarms">
@@ -539,7 +542,7 @@
     <section class="card" aria-busy="true">
       <div class="grids-head">
         <h2 class="panel-title">Plan</h2>
-        <span class="hint">estimates in your local time</span>
+        <span class="hint">Local time</span>
       </div>
       <div class="placeholder-plan">Planning…</div>
     </section>
@@ -551,12 +554,8 @@
         <button class="fold" type="button" aria-expanded={paceOpen} onclick={() => (paceOpen = !paceOpen)}>
           Schedule, pace and limits
         </button>
-        {#if !paceOpen}
-          <span class="hint"
-            >{planningDirty
-              ? 'unsaved changes'
-              : 'change the default schedule, the pace, the close margin, the stagger, the notice or the failure budget'}</span
-          >
+        {#if !paceOpen && planningDirty}
+          <span class="hint">Unsaved changes</span>
         {/if}
       </h2>
       {#if paceOpen}
@@ -707,7 +706,8 @@
             class="input compact mono search"
             type="text"
             aria-label="Find device"
-            placeholder="find device (glob with * and ?)"
+            placeholder="Find device"
+            title="Matches part of a name, or a glob with * and ?"
             bind:value={searchText}
             oninput={() => (page = 1)}
           />

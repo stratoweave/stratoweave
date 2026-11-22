@@ -316,7 +316,7 @@
 <div class="page-header">
   <div>
     <h1>Add images</h1>
-    {#if folder}<p>Into the folder <span class="mono">{folder}</span>.</p>{/if}
+    {#if folder}<p>Into <span class="mono">{folder}</span></p>{/if}
   </div>
   <div class="page-actions">
     <FileDrop
@@ -686,10 +686,8 @@
       content: attr(data-label);
       display: block;
       margin-bottom: 4px;
-      font-size: var(--sw-text-2xs);
-      font-weight: 600;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
+      font-size: var(--sw-text-xs);
+      font-weight: 500;
       color: var(--sw-text-muted);
     }
 

@@ -581,7 +581,7 @@
           ariaLabel="Separation policy"
           onchange={pickSeparation}
         />
-        <label class="dim" for={`${uid}-min`}>Min separation</label>
+        <label class="inline-label" for={`${uid}-min`}>Min separation</label>
         <input
           id={`${uid}-min`}
           class="input compact mono min"
@@ -786,6 +786,14 @@
     align-items: center;
     flex-wrap: wrap;
     gap: 10px;
+  }
+
+  /* A second label inside a policy row, styled as the row's own. */
+  .inline-label {
+    margin-left: 10px;
+    font-size: var(--sw-text-sm);
+    font-weight: 500;
+    color: var(--sw-text-label);
   }
 
   .min {

@@ -239,7 +239,7 @@
     const held = row === undefined ? '' : heldText(row);
     const start = `${d.started === null ? 'starts' : 'started'} ${formatClock(deviceStart(d))}`;
     const took = `${d.finished === null ? '~' : 'took '}${formatDuration(deviceDuration(d))}`;
-    return `${d.name} — ${status}${held ? ` (held: ${held})` : ''} · ${start} · ${took}`;
+    return `${d.name}: ${status}${held ? ` (held: ${held})` : ''} · ${start} · ${took}`;
   }
 
   function onClick(event: MouseEvent): void {
@@ -257,7 +257,6 @@
 
 <div class="bar">
   <div class="key">
-    <span class="hint">one cell per device at its start</span>
     <ul class="legend" aria-label="Cell colours">
       {#each legend as kind (kind)}
         <li><span class="swatch" style:background={CELL_COLOR[kind]}></span>{CELL_LABEL[kind]}</li>
@@ -267,7 +266,7 @@
   <div class="chips">
     {#if zoom > 1}
       <button class="chip" class:active={follow} type="button" onclick={() => (follow = !follow)}>
-        {follow ? 'following now' : 'follow now'}
+        {follow ? 'Following now' : 'Follow now'}
       </button>
     {/if}
     {#each ZOOMS as z (z)}
@@ -376,11 +375,6 @@
     gap: 8px;
     flex-wrap: wrap;
     margin-bottom: 8px;
-  }
-
-  .hint {
-    font-size: 13px;
-    color: var(--sw-text-muted);
   }
 
   .key {

@@ -283,7 +283,7 @@
           style:left={`calc(${(b.lane / b.lanes) * 100}% + 2px)`}
           style:width={`calc(${100 / b.lanes}% - 5px)`}
           style:background={`color-mix(in srgb, ${color} 32%, var(--sw-bg-card))`}
-          style:border-left-color={color}
+          style:border-color={`color-mix(in srgb, ${color} 70%, transparent)`}
         >
           {#if h >= 16}
             <span class="name">{b.occurrence.schedule}</span>
@@ -334,7 +334,7 @@
         <span class="rule">{scheduleRulesText(s)}</span>
       </span>
     {/each}
-    <span class="tz">times in your clock, UTC{viewerOffset}</span>
+    <span class="tz">Local time, UTC{viewerOffset}</span>
   </div>
 {/if}
 
@@ -349,10 +349,8 @@
   .corner,
   .head {
     padding: 0 6px 8px;
-    font-size: 11px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    font-size: var(--sw-text-xs);
+    font-weight: 500;
     color: var(--sw-text-muted);
     white-space: nowrap;
     overflow: hidden;
@@ -404,7 +402,7 @@
     gap: 1px;
     padding: 2px 5px;
     border-radius: var(--sw-radius-xs);
-    border-left: 3px solid;
+    border: 1px solid;
     box-sizing: border-box;
     overflow: hidden;
     color: var(--sw-text-primary);
@@ -478,6 +476,12 @@
 
     .wd-narrow {
       display: inline;
+    }
+
+    /* A phone's day column fits "S 22" only without the side padding. */
+    .head {
+      padding: 0 0 8px;
+      text-align: center;
     }
   }
 

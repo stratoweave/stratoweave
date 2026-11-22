@@ -530,8 +530,16 @@
       margin: 24px 0 20px;
     }
 
+    /* The step, its verdict and the baseline tag on one line, the detail
+       under them and the time last, so that none of them wraps. */
     .check {
-      grid-template-columns: auto auto 1fr auto;
+      grid-template-columns: auto auto minmax(0, 1fr);
+      gap: 8px 12px;
+      padding: 12px 14px;
+    }
+
+    .check-name {
+      white-space: nowrap;
     }
 
     .check-detail {
@@ -544,7 +552,9 @@
     }
 
     .at {
-      grid-column: 4;
+      grid-column: 1 / -1;
+      grid-row: 3;
+      font-size: var(--sw-text-xs);
     }
   }
 </style>

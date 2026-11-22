@@ -79,10 +79,13 @@
 <div class="page-header">
   <div>
     <h1>Upgrade campaigns</h1>
-    <p>
-      Each campaign upgrades its own devices, a few at a time, as their
-      maintenance schedules open.
-    </p>
+    {#if campaigns.length > 0}
+      <p class="totals tn">
+        {kpis.running} running · {kpis.inFlight.toLocaleString()} devices in flight ·
+        <span class:alert-text={kpis.failed > 0}>{kpis.failed.toLocaleString()} failed</span> ·
+        {kpis.total.toLocaleString()} devices in campaigns
+      </p>
+    {/if}
   </div>
   <div class="page-actions">
     <a class="btn btn-primary" href="/campaigns/new">New campaign</a>
@@ -92,25 +95,6 @@
 {#if data.loadError}
   <div class="error-state status">{data.loadError}</div>
 {/if}
-
-<div class="kpis">
-  <div class="kpi">
-    <div class="kick">Running campaigns</div>
-    <div class="kpi-n tn">{kpis.running}</div>
-  </div>
-  <div class="kpi">
-    <div class="kick">Devices in flight</div>
-    <div class="kpi-n tn" class:progress-text={kpis.inFlight > 0}>{kpis.inFlight.toLocaleString()}</div>
-  </div>
-  <div class="kpi" class:alert={kpis.failed > 0}>
-    <div class="kick">Failed, needs an operator</div>
-    <div class="kpi-n tn" class:alert-text={kpis.failed > 0}>{kpis.failed.toLocaleString()}</div>
-  </div>
-  <div class="kpi">
-    <div class="kick">Devices in campaigns</div>
-    <div class="kpi-n tn">{kpis.total.toLocaleString()}</div>
-  </div>
-</div>
 
 <section class="card">
   {#if campaigns.length === 0}
@@ -186,37 +170,9 @@
 </section>
 
 <style>
-  .kpis {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 12px;
-    margin-bottom: 16px;
-  }
-
-  .kpi {
-    border: 1px solid var(--sw-border-subtle);
-    border-radius: var(--sw-radius-md);
-    padding: 12px 16px;
-    background: var(--sw-bg-elevated);
-  }
-
-  .kpi.alert {
-    border-color: rgb(var(--sw-danger-rgb) / 0.4);
-    background: rgb(var(--sw-danger-rgb) / 0.1);
-  }
-
   .alert-text {
     color: var(--sw-danger-text);
-  }
-
-  .progress-text {
-    color: var(--sw-accent);
-  }
-
-  .kpi-n {
-    font-size: var(--sw-text-3xl);
-    font-weight: 600;
-    line-height: 1.15;
+    font-weight: 500;
   }
 
   .state-col {
@@ -257,19 +213,6 @@
   }
 
   @media (max-width: 720px) {
-    .kpis {
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-    }
-
-    .kpi {
-      padding: 10px 12px;
-    }
-
-    .kpi-n {
-      font-size: var(--sw-text-2xl);
-    }
-
     /* Each campaign becomes a block of labelled lines. */
     table,
     tbody,
@@ -300,10 +243,8 @@
     td[data-label]::before {
       content: attr(data-label);
       margin-right: auto;
-      font-size: var(--sw-text-2xs);
-      font-weight: 600;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
+      font-size: var(--sw-text-xs);
+      font-weight: 500;
       color: var(--sw-text-muted);
       text-align: left;
     }

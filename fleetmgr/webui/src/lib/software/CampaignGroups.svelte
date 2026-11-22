@@ -235,7 +235,8 @@
           class="input compact mono search"
           type="text"
           aria-label="Find group"
-          placeholder="find group (glob with * and ?)"
+          placeholder="Find group"
+          title="Matches part of a name, or a glob with * and ?"
           bind:value={searchText}
           oninput={() => (page = 1)}
         />

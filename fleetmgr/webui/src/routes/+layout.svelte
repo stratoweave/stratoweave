@@ -81,7 +81,7 @@
   <!-- Sidebar -->
   <aside class="sidebar">
     <div class="sidebar-logo">
-      <a class="logo-link" href="/campaigns" aria-label="fleetmgr — go to campaigns">
+      <a class="logo-link" href="/campaigns" aria-label="fleetmgr, go to campaigns">
         <img
           class="logo-img"
           src={logoUrl}
