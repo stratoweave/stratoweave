@@ -8,8 +8,8 @@
     | 'config'
     | 'apply'
     | 'refresh'
-    | 'wrap'
     | 'copy'
+    | 'download'
     | 'check';
 </script>
 
@@ -54,12 +54,11 @@
     <path d="M14 3H5v18h14V8zM14 3v5h5m-11 6 3 3 5-6" />
   {:else if name === 'refresh'}
     <path d="M20 4v5h-5M4 20v-5h5M20 9a8 8 0 0 0-14-3M4 15a8 8 0 0 0 14 3" />
-  {:else if name === 'wrap'}
-    <path d="M3 6h18M3 12h13a3 3 0 0 1 0 6h-3M3 18h6" />
-    <path d="m15 15-2 3 2 3" />
   {:else if name === 'copy'}
     <rect x="9" y="9" width="11" height="11" rx="2" />
     <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+  {:else if name === 'download'}
+    <path d="M12 4v11m-5-5 5 5 5-5M5 20h14" />
   {:else if name === 'check'}
     <path d="m5 12.5 4.5 4.5L19 7.5" />
   {/if}

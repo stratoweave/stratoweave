@@ -1,18 +1,26 @@
 <script lang="ts">
-  // Read-only text with line numbers, a wrap toggle and a copy button.
-  // Ported from the sorespo web UI without its diff colouring.
+  // Read-only text with line numbers, a copy button and, given a file name,
+  // a download button. Ported from the sorespo web UI without its diff
+  // colouring or line wrap.
   import NavIcon from '#lib/core/ui/NavIcon.svelte';
+
+  // A whole layer runs to hundreds of thousands of lines, so the text goes in
+  // chunks of plain text, one node each, that the browser skips laying out
+  // while they are off screen. Find in page and selection still see it all.
+  const CHUNK_LINES = 500;
 
   let {
     content = '',
     minHeight = '',
     maxHeight = '',
-    label = 'Code'
+    label = 'Code',
+    filename = ''
   }: {
     content?: string;
     minHeight?: string;
     maxHeight?: string;
     label?: string;
+    filename?: string;
   } = $props();
 
   // A trailing newline does not add an empty line.
@@ -24,7 +32,20 @@
   });
   let gutterWidth = $derived(`${Math.max(2, String(lines.length).length)}ch`);
 
-  let wrap = $state(false);
+  // Every chunk is as wide as the longest line, so the horizontal scroll
+  // range does not change as chunks come on screen.
+  let longest = $derived(lines.reduce((max, line) => Math.max(max, line.length), 0));
+
+  let chunks = $derived.by(() => {
+    const result: { count: number; numbers: string; text: string }[] = [];
+    for (let start = 0; start < lines.length; start += CHUNK_LINES) {
+      const part = lines.slice(start, start + CHUNK_LINES);
+      const numbers = part.map((_, index) => start + index + 1).join('\n');
+      result.push({ count: part.length, numbers, text: part.join('\n') });
+    }
+    return result;
+  });
+
   let copyResult = $state<'copied' | 'failed' | null>(null);
   let copyTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -64,34 +85,44 @@
     if (copyTimer) clearTimeout(copyTimer);
     copyTimer = setTimeout(() => (copyResult = null), 1600);
   }
+
+  function download(): void {
+    const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    // Safari still reads the URL a moment after the click.
+    setTimeout(() => URL.revokeObjectURL(url), 40_000);
+  }
 </script>
 
 <div class="code" style={`${minHeight ? `min-height: ${minHeight};` : ''}${maxHeight ? `max-height: ${maxHeight};` : ''}`}>
   <div class="code__toolbar">
     <span class="code__meta">{lines.length} line{lines.length === 1 ? '' : 's'}</span>
-    <button
-      class="code__tool"
-      class:active={wrap}
-      type="button"
-      onclick={() => (wrap = !wrap)}
-      aria-pressed={wrap}
-      title={wrap ? 'Disable line wrap' : 'Wrap long lines'}
-    >
-      <NavIcon name="wrap" size={14} /> Wrap
-    </button>
     <button class="code__tool" type="button" onclick={copy} title={`Copy ${label.toLowerCase()} to clipboard`}>
       <NavIcon name={copyResult === 'copied' ? 'check' : 'copy'} size={14} />
       {copyResult === 'copied' ? 'Copied' : copyResult === 'failed' ? 'Copy failed' : 'Copy'}
     </button>
+    {#if filename}
+      <button class="code__tool" type="button" onclick={download} title={`Download as ${filename}`}>
+        <NavIcon name="download" size={14} /> Download
+      </button>
+    {/if}
   </div>
 
-  <div class="code__scroll" class:code__scroll--wrap={wrap}>
+  <div class="code__scroll">
     {#if lines.length === 0}
       <div class="code__empty">Empty</div>
     {:else}
-      <pre class="code__pre" style={`--gutter: ${gutterWidth}`}>{#each lines as line, index}<div
-          class="code__line"
-        ><span class="code__gutter" aria-hidden="true">{index + 1}</span><span class="code__text">{line || ' '}</span></div>{/each}</pre>
+      <div class="code__body" style={`--gutter: ${gutterWidth}; --longest: ${longest}`}>
+        {#each chunks as chunk}
+          <div class="code__chunk" style={`--count: ${chunk.count}`}>
+            <pre class="code__gutter" aria-hidden="true">{chunk.numbers}</pre>
+            <pre class="code__text">{chunk.text}</pre>
+          </div>
+        {/each}
+      </div>
     {/if}
   </div>
 </div>
@@ -144,11 +175,6 @@
     color: var(--sw-text-primary);
   }
 
-  .code__tool.active {
-    color: var(--sw-accent);
-    background: var(--sw-accent-glow);
-  }
-
   .code__scroll {
     flex: 1;
     min-height: 0;
@@ -157,27 +183,29 @@
     scrollbar-width: thin;
   }
 
-  .code__pre {
-    margin: 0;
-    padding: 10px 0;
-    border: none;
-    border-radius: 0;
-    background: transparent;
+  .code__body {
     min-width: max-content;
+    padding: 10px 0;
     font-family: var(--sw-font-mono);
     font-size: 12.5px;
     line-height: 1.6;
     tab-size: 2;
   }
 
-  .code__scroll--wrap .code__pre {
-    min-width: 0;
+  /* An off-screen chunk is not laid out but keeps its height, so the
+     scrollbar stays true. */
+  .code__chunk {
+    display: flex;
+    min-width: calc(var(--gutter) + 24px + var(--longest) * 1ch + 16px);
+    padding-right: 16px;
+    content-visibility: auto;
+    contain-intrinsic-block-size: auto calc(var(--count) * 1lh);
   }
 
-  .code__line {
-    display: flex;
-    align-items: flex-start;
-    padding-right: 16px;
+  .code__gutter,
+  .code__text {
+    margin: 0;
+    font: inherit;
   }
 
   .code__gutter {
@@ -193,14 +221,7 @@
 
   .code__text {
     flex: 1 1 auto;
-    min-width: 0;
-    white-space: pre;
     color: var(--sw-text-secondary);
-  }
-
-  .code__scroll--wrap .code__text {
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
   }
 
   .code__empty {

@@ -25,6 +25,18 @@ const ACCEPT: Record<LayerFormat, string> = {
   adata: 'application/yang-data+acton-adata'
 };
 
+// AData is Acton source.
+const EXTENSION: Record<LayerFormat, string> = {
+  xml: 'xml',
+  json: 'json',
+  adata: 'act'
+};
+
+export function layerFilename(content: LayerContent, format: LayerFormat): string {
+  const name = CONTENT_OPTIONS.find((option) => option.value === content)?.label.toLowerCase() ?? content;
+  return `stratoweave-${name}.${EXTENSION[format]}`;
+}
+
 export function parseContent(value: string | null): LayerContent {
   return CONTENT_OPTIONS.find((option) => option.value === value)?.value ?? 'config';
 }
