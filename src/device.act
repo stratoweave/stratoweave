@@ -272,6 +272,19 @@ def error_text(err: Exception) -> str:
     return text if text != "" else str(err).rstrip(": ")
 
 
+# These builders only initialize newly allocated adata objects.
+pure def _initial_software_state() -> SoftwareState:
+    return SoftwareState()
+
+
+pure def _initial_device_oper(name: str) -> DeviceOper:
+    return DeviceOper(name)
+
+
+pure def _initial_device_config(name: str) -> DeviceMetaConfig:
+    return DeviceMetaConfig(name, Credentials("", None))
+
+
 actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr):
     """Per-device software manager, one per DeviceMgr.
 
@@ -391,7 +404,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     # The device/software/state oper tree this manager owns. Every change is
     # pushed to the DeviceMgr, which fuses it into the device entry's oper.
-    var state: SoftwareState = SoftwareState()
+    var state: SoftwareState = _initial_software_state()
 
     #### configuration ######################################################
 
@@ -1054,8 +1067,10 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         _record(ST_SUCCEEDED)
         _done()
 
-    # Report the initial state, so the DeviceMgr's entry oper starts complete.
-    devmgr.on_software_state(state.copy())
+    def __startup__():
+        # Report the initial state, so the DeviceMgr's entry oper starts complete.
+        devmgr.on_software_state(state.copy())
+
 
 
 #############################################################################
@@ -1196,20 +1211,22 @@ class GetPlatformProbe(PlatformProbe):
 actor _GetPlatformRead(dev: DeviceMgr, probe: GetPlatformProbe,
                        done: action(?Platform, ?Exception) -> None):
     """One read of a GetPlatformProbe: the get, then the probe's parse."""
-    def on_reply(root: ?ygdata.Node, err: ?Exception) -> None:
-        if err is not None:
-            done(None, err)
-            return
-        try:
-            p = probe.parse(root)
-            if p is not None:
-                done(p, None)
-            else:
-                done(None, ValueError("the reply has no platform values"))
-        except Exception as e:
-            done(None, e)
+    proc def __startup__():
+        def on_reply(root: ?ygdata.Node, err: ?Exception) -> None:
+            if err is not None:
+                done(None, err)
+                return
+            try:
+                p = probe.parse(root)
+                if p is not None:
+                    done(p, None)
+                else:
+                    done(None, ValueError("the reply has no platform values"))
+            except Exception as e:
+                done(None, e)
 
-    dev.get(on_reply, probe.filt)
+        dev.get(on_reply, probe.filt)
+
 
 
 ## DeviceType represents a type of device, i.e. a specific platform or
@@ -1600,7 +1617,7 @@ def _same_parts[T(Hashable)](a: dict[str, set[T]], b: dict[str, set[T]]) -> bool
 class DeviceTreeProvider(ygdata.TreeProvider):
     dev: DeviceMgr
 
-    def __init__(self, dev: DeviceMgr):
+    pure def __init__(self, dev: DeviceMgr):
         self.dev = dev
 
     proc def rpc(self, cb: action(?ygdata.Node, ?Exception) -> None, gdata_rpc: ygdata.Node):
@@ -1611,7 +1628,6 @@ class DeviceTreeProvider(ygdata.TreeProvider):
 
     proc def remove_subscriptions(self, owner_id: str):
         self.dev.remove_subscriptions(owner_id)
-
 
 
 actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, log_handler: logging.Handler, on_reconf: action(str) -> None, schema_registry: SchemaRegistry, device_registry: ?DeviceRegistry=None, device_logs: ?swlogs.DeviceLogs=None, platform_probes: list[PlatformProbe]=[], track_config: bool=False):
@@ -1707,10 +1723,6 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
     """
     _default_log_level = _default_device_log_level(device_logs)
     _log_handler = logging.Handler(name)
-    _log_handler.set_handler(log_handler)
-    _log_handler.set_output_level(_default_log_level)
-    if device_logs is not None:
-        device_logs.add_file(_log_handler, name)
     _log = logging.Logger(_log_handler)
 
     def debug_enabled() -> bool:
@@ -1719,12 +1731,11 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         return logging.DEBUG <= _log_handler.get_level()
 
     system_mock = env is None
-    _log.debug("DeviceMgr starting up", {"name": name, "system_mock": system_mock})
 
     # The device entry's oper tree, in the adata generated from the same
     # YANG as the DeviceMetaConfig. Sub-components push their subtree; the
     # DeviceMgr fuses it in and publishes the whole entry.
-    var oper: DeviceOper = DeviceOper(name)
+    var oper: DeviceOper = _initial_device_oper(name)
 
     # The device entry's true update_oper, handed over by TTT when the entry
     # node is created.
@@ -1770,11 +1781,12 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         update_oper()
 
     # The device's meta configuration, like address, credentials, etc.
-    var dmc: DeviceMetaConfig = DeviceMetaConfig(name, Credentials("", None))
+    var dmc: DeviceMetaConfig = _initial_device_config(name)
 
     # The bundled schema is compiled at build time and bundled with stratoweave
-    var bundled_schema: DeviceSchema = DeviceSchema.mock()
-    var adapter: DeviceAdapter = MockAdapter(lambda m, k: self.on_connect(m, k), bundled_schema, _log_handler, env) if system_mock else NoAdapter(bundled_schema, _log_handler, env)
+    initial_schema = DeviceSchema.mock()
+    var bundled_schema: DeviceSchema = initial_schema
+    var adapter: DeviceAdapter = MockAdapter(lambda m, k: self.on_connect(m, k), initial_schema, _log_handler, env) if system_mock else NoAdapter(initial_schema, _log_handler, env)
     # The device type of the primary adapter, "" before the device has one.
     var primary_type: str = ""
     # The extra adapters by device type, in configured order, and the log
@@ -3058,3 +3070,10 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
 
     def get_conf_log():
         return conf_log
+
+    proc def __startup__():
+        _log_handler.set_handler(log_handler)
+        _log_handler.set_output_level(_default_log_level)
+        if device_logs is not None:
+            device_logs.add_file(_log_handler, name)
+        _log.debug("DeviceMgr starting up", {"name": name, "system_mock": system_mock})

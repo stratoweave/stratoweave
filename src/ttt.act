@@ -521,7 +521,6 @@ def _delay(period: u64) -> float:
     return float(period) / 1000000000.0
 
 
-
 class Read(object):
     """One read of a consumer's actor: a folded filter, read on its period,
     and the latest tree for a destination rooted at the top."""
@@ -962,7 +961,7 @@ actor Subscription(owner: str, node: Node, cb0: action(?gdata.Node, ?Exception) 
                 a.built = None
         return down[i]
 
-def _db_path(path: Path) -> list[value]:
+pure def _db_path(path: Path) -> list[value]:
     if isinstance(path, PathElem):
         par = _db_path(path.parent)
         par.append(gdata.Id(path.ns, path.name))
@@ -1298,12 +1297,21 @@ actor LayerRestore(
         except Exception as e:
             finish(e)
 
-    store.get(swdb.META_KEY, got_metadata)
+    proc def __startup__():
+        store.get(swdb.META_KEY, got_metadata)
 
 
-actor Layer(name: str, rootgen: proc(Path, ?Layer)->Node, lower: ?Layer, db_arg: ?swdb.Store=None):
+
+proc def layer(name: str, rootgen: proc(Path, ?Layer)->Node, lower: ?Layer, db_arg: ?swdb.Store=None) -> Layer:
+    """Compatibility factory for generators that still require synchronous setup."""
     root = rootgen(PathRoot(name), lower)
-    root.bind_db(db_arg)
+    com def prepared_root(path: Path, lower: ?Layer) -> Node:
+        return root
+    return Layer(name, prepared_root, lower, db_arg)
+
+
+actor Layer(name: str, rootgen: com(Path, ?Layer)->Node, lower: ?Layer, db_arg: ?swdb.Store=None):
+    root = rootgen(PathRoot(name), lower)
     var subscribers: dict[str, Subscription] = {}
     var roots: dict[str, ?gdata.FNode] = {}
 
@@ -1315,7 +1323,10 @@ actor Layer(name: str, rootgen: proc(Path, ?Layer)->Node, lower: ?Layer, db_arg:
             done(ValueError("Missing db for TTT persistence restore in layer {name}"))
 
     def newsession(dbuf: ?swdb.Buffer=None):
-        return Session(name, root.newtrans(), lower, db_arg, dbuf)
+        transaction = root.newtrans()
+        buffer = dbuf if dbuf is not None else swdb.Buffer() if db_arg is not None else None
+        lower_session = lower.newsession(buffer) if lower is not None else None
+        return Session(name, transaction, lower_session, db_arg, buffer)
 
     def below():
         return lower if lower is not None else self
@@ -1370,10 +1381,12 @@ actor Layer(name: str, rootgen: proc(Path, ?Layer)->Node, lower: ?Layer, db_arg:
             del subscribers[owner_id]
             del roots[owner_id]
 
+    proc def __startup__():
+        root.bind_db(db_arg)
 
-actor Session(name: str, root: Transaction, lowerlayer: ?Layer, db: ?swdb.Store, dbuf_arg: ?swdb.Buffer=None):
-    dbuf: ?swdb.Buffer = dbuf_arg if dbuf_arg is not None else swdb.Buffer() if db is not None else None
-    lower: ?Session = lowerlayer.newsession(dbuf) if lowerlayer is not None else None
+
+
+actor Session(name: str, root: Transaction, lower: ?Session, db: ?swdb.Store, dbuf: ?swdb.Buffer):
 
     var buf: dict[str, gdata.Node] = {}
     var lock_cont: ?action(CfgResult) -> None = None
@@ -1583,8 +1596,13 @@ class LayerTreeProvider(gdata.TreeProvider):
 
 ############## Containers ##################
 
-def Container(template={}, ns:?str=None, module:?str=None) -> proc(Path, ?Layer)->Node:
-    return lambda path, lower: Node(_Container(path, template, ns, module, lower))
+def Container(template: dict[gdata.Id, com(Path, ?Layer)->Node]={}, ns:?str=None, module:?str=None) -> com(Path, ?Layer)->Node:
+    return lambda path, lower: Node(_Container(path, {child: templ(PathElem(child, path), lower) for child, templ in template.items()}, ns, module))
+
+
+def container(template: dict[gdata.Id, proc(Path, ?Layer)->Node], ns:?str=None, module:?str=None) -> proc(Path, ?Layer)->Node:
+    """Compatibility generator for children that still require synchronous setup."""
+    return lambda path, lower: Node(_Container(path, {child: templ(PathElem(child, path), lower) for child, templ in template.items()}, ns, module))
 
 
 actor ContainerRestore(
@@ -1640,18 +1658,20 @@ actor ContainerRestore(
             return
         try:
             child_range = swdb.children_range(db_path, codec)
-            children = swdb.RangeReader(reader, child_range.start, child_range.end, each_child, done)
+            children = swdb.range_reader(reader, child_range.start, child_range.end, each_child, done)
         except Exception as e:
             done(e)
 
     def start() -> None:
         try:
             attr_range = swdb.attrs_range(db_path, codec)
-            swdb.RangeReader(reader, attr_range.start, attr_range.end, each_attr, attrs_done)
+            swdb.range_reader(reader, attr_range.start, attr_range.end, each_attr, attrs_done)
         except Exception as e:
             done(e)
 
-    start()
+    proc def __startup__():
+        start()
+
 
 
 class _Container(_Node):
@@ -1660,9 +1680,9 @@ class _Container(_Node):
     ns: ?str
     module: ?str
 
-    def __init__(self, path, template: dict[gdata.Id, proc(Path, ?Layer)->Node], ns, module, lower: ?Layer):
+    def __init__(self, path, elems: dict[gdata.Id, Node], ns, module):
         self.path = path
-        self.elems = {child: templ(PathElem(child,path), lower) for child, templ in template.items()}
+        self.elems = elems
         self.containerstate = ContainerState(path, set(self.elems.keys()))
         self.ns = ns
         self.module = module
@@ -2147,7 +2167,7 @@ class _ContainerTransaction(_Transaction):
 
 ################# Lists ####################
 
-def List(template, key_names: list[gdata.Id], ns:?str=None, module:?str=None) -> proc(Path, ?Layer)->Node:
+def List(template, key_names: list[gdata.Id], ns:?str=None, module:?str=None) -> com(Path, ?Layer)->Node:
     return lambda path, lower: Node(_List(path, template, key_names, ns, module, lower))
 
 class _List(_Node):
@@ -2291,18 +2311,21 @@ actor ListRestore(
             return
         try:
             element_range = swdb.children_range(db_path, codec)
-            elements = swdb.RangeReader(reader, element_range.start, element_range.end, each_element_data, done)
+            elements = swdb.range_reader(reader, element_range.start, element_range.end, each_element_data, done)
         except Exception as e:
             done(e)
 
     def start() -> None:
         try:
             entry_range = swdb.attrs_range(db_path, codec)
-            swdb.RangeReader(reader, entry_range.start, entry_range.end, each_entry, entries_done)
+            swdb.range_reader(reader, entry_range.start, entry_range.end, each_entry, entries_done)
         except Exception as e:
             done(e)
 
-    start()
+    proc def __startup__():
+        start()
+
+
 
 actor ListState(path, template: proc(Path, ?Layer) -> Node, lower: ?Layer):
     # All element nodes by key, including provisional nodes.
@@ -2908,53 +2931,54 @@ actor TransformRestore(
     the transform. The merged running tree is built once all attributes
     have been loaded.
     """
+    proc def __startup__():
+        db_path = _db_path(path)
 
-    db_path = _db_path(path)
+        def each_child(record: (key: bytes, value: bytes), proceed: action(?Exception) -> None) -> None:
+            try:
+                child = swdb.child_from_key(db_path, record.key, codec)
+                proceed(ValueError("Unexpected persisted descendant under transform {_format_path(path)}: {child.name}"))
+            except Exception as e:
+                proceed(e)
 
-    def each_child(record: (key: bytes, value: bytes), proceed: action(?Exception) -> None) -> None:
-        try:
-            child = swdb.child_from_key(db_path, record.key, codec)
-            proceed(ValueError("Unexpected persisted descendant under transform {_format_path(path)}: {child.name}"))
-        except Exception as e:
-            proceed(e)
+        def each_attr(record: (key: bytes, value: bytes), proceed: action(?Exception) -> None) -> None:
+            try:
+                parsed = swdb.parse_attr_key(record.key, codec)
+                await async transaction.restore(parsed.attr, parsed.qualifier, record.value)
+                proceed(None)
+            except Exception as e:
+                proceed(e)
 
-    def each_attr(record: (key: bytes, value: bytes), proceed: action(?Exception) -> None) -> None:
-        try:
-            parsed = swdb.parse_attr_key(record.key, codec)
-            await async transaction.restore(parsed.attr, parsed.qualifier, record.value)
-            proceed(None)
-        except Exception as e:
-            proceed(e)
+        def attrs_done(error: ?Exception) -> None:
+            if error is not None:
+                done(error)
+                return
+            try:
+                await async transaction.restored()
+            except Exception as e:
+                done(e)
+                return
+            done(None)
 
-    def attrs_done(error: ?Exception) -> None:
-        if error is not None:
-            done(error)
-            return
-        try:
-            await async transaction.restored()
-        except Exception as e:
-            done(e)
-            return
-        done(None)
+        def children_done(error: ?Exception) -> None:
+            if error is not None:
+                done(error)
+                return
+            try:
+                attr_range = swdb.attrs_range(db_path, codec)
+                swdb.range_reader(reader, attr_range.start, attr_range.end, each_attr, attrs_done)
+            except Exception as e:
+                done(e)
 
-    def children_done(error: ?Exception) -> None:
-        if error is not None:
-            done(error)
-            return
-        try:
-            attr_range = swdb.attrs_range(db_path, codec)
-            swdb.RangeReader(reader, attr_range.start, attr_range.end, each_attr, attrs_done)
-        except Exception as e:
-            done(e)
+        def start() -> None:
+            try:
+                child_range = swdb.children_range(db_path, codec)
+                swdb.range_reader(reader, child_range.start, child_range.end, each_child, children_done)
+            except Exception as e:
+                done(e)
 
-    def start() -> None:
-        try:
-            child_range = swdb.children_range(db_path, codec)
-            swdb.RangeReader(reader, child_range.start, child_range.end, each_child, children_done)
-        except Exception as e:
-            done(e)
+        start()
 
-    start()
 
 
 class _TransformBase(_Node):
@@ -3454,7 +3478,11 @@ class _TransformTransactionBase(_Transaction):
         return None
 
     proc def write_output(self, actself: Transaction, conf: gdata.Node):
-        Session(self.me, actself, self.lower, self.db).write_output(conf)
+        lower = self.lower
+        db = self.db
+        dbuf = swdb.Buffer() if db is not None else None
+        lower_session = lower.newsession(dbuf) if lower is not None else None
+        Session(self.me, actself, lower_session, db, dbuf).write_output(conf)
 
     proc def update_dynstate(self, actself, dynstate):
         if self.dynstate == dynstate:
@@ -3462,7 +3490,11 @@ class _TransformTransactionBase(_Transaction):
         self.dynstate = dynstate
         _node = self.node
         if _node is not None:
-            Session(self.me, actself, self.lower, self.db).recompute() # TODO: Verify that this always succeeds (due to no input diff)?
+            lower = self.lower
+            db = self.db
+            dbuf = swdb.Buffer() if db is not None else None
+            lower_session = lower.newsession(dbuf) if lower is not None else None
+            Session(self.me, actself, lower_session, db, dbuf).recompute() # TODO: Verify that this always succeeds (due to no input diff)?
 
     proc def subscribe_oper(self, sub_id: str, sub: Subscription, filts: list[gdata.FNode]) -> (Path, ?gdata.Node, list[(Node, list[gdata.FNode])]):
         """Keep the subscription and its filters, so every later update_oper
@@ -3522,12 +3554,12 @@ class TransformActor:
         self.on_conf = on_conf
         self.shutdown = shutdown
 
-def Transform(function, act: ?(proc(TransformActorParams) -> TransformActor)=None, build_links: ?proc(gdata.Node) -> list[TaggedPath]=None, lower: ?Layer=None, log_handler: ?logging.Handler=None) -> proc(Path, ?Layer)->Node:
-    proc def _create_transform_node(path, lower):
+def Transform(function: com(?logging.Handler) -> TransformFunction, act: ?(proc(TransformActorParams) -> TransformActor)=None, build_links: ?proc(gdata.Node) -> list[TaggedPath]=None, lower: ?Layer=None, log_handler: ?logging.Handler=None) -> com(Path, ?Layer)->Node:
+    com def _create_transform_node(path, lower):
         transform = _Transform(path, function, build_links, lower, log_handler)
         node = Node(transform)
         if act is not None:
-            transform.init_actor(node, act)
+            async transform.transaction.init_actor(node, act)
         return node
     return _create_transform_node
 
@@ -3535,9 +3567,6 @@ class _Transform(_TransformBase):
     def __init__(self, path, function, build_links, lower, log_handler):
         self.path = path
         self.transaction = TransformTransaction(path, function, build_links, lower, log_handler)
-
-    proc def init_actor(self, node, act: proc(TransformActorParams) -> TransformActor):
-        self.transaction.init_actor(node, act)
 
 def TransformTransaction(path, function, build_links, lower, log_handler):
     return Transaction(_TransformTransaction(path, function, build_links, lower, log_handler))
@@ -3548,7 +3577,7 @@ class _TransformTransaction(_TransformTransactionBase):
     delivered_linked: ?gdata.Node
     delivered_memory: ?gdata.Node
 
-    def __init__(self, path, function: proc(?logging.Handler) -> TransformFunction, build_links, lower: ?Layer, log_handler):
+    def __init__(self, path, function: com(?logging.Handler) -> TransformFunction, build_links, lower: ?Layer, log_handler):
         _TransformTransactionBase.__init__(self, path, build_links, lower)
         self.function = function(log_handler)
         self.delivered_conf = None
