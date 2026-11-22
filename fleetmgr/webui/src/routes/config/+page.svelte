@@ -2,7 +2,13 @@
   import { goto } from '$app/navigation';
   import { navigating } from '$app/state';
 
-  import { CONTENT_OPTIONS, FORMAT_OPTIONS, type LayerContent, type LayerFormat } from '#lib/core/layer-config.ts';
+  import {
+    CONTENT_OPTIONS,
+    FORMAT_OPTIONS,
+    layerFilename,
+    type LayerContent,
+    type LayerFormat
+  } from '#lib/core/layer-config.ts';
   import CodeBlock from '#lib/core/ui/CodeBlock.svelte';
   import SegmentedControl from '#lib/core/ui/SegmentedControl.svelte';
 
@@ -45,7 +51,13 @@
     <div class="error-state">{data.loadError}</div>
   {:else}
     <div class:loading aria-busy={loading}>
-      <CodeBlock content={data.text} minHeight="26rem" maxHeight="calc(100vh - 220px)" label="Config" />
+      <CodeBlock
+        content={data.text}
+        minHeight="26rem"
+        maxHeight="calc(100vh - 220px)"
+        label="Config"
+        filename={layerFilename(data.content, data.format)}
+      />
     </div>
   {/if}
 </section>

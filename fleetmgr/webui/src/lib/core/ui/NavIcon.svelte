@@ -9,6 +9,7 @@
     | 'apply'
     | 'refresh'
     | 'copy'
+    | 'download'
     | 'check';
 </script>
 
@@ -56,6 +57,8 @@
   {:else if name === 'copy'}
     <rect x="9" y="9" width="11" height="11" rx="2" />
     <path d="M5 15V6a2 2 0 0 1 2-2h9" />
+  {:else if name === 'download'}
+    <path d="M12 4v11m-5-5 5 5 5-5M5 20h14" />
   {:else if name === 'check'}
     <path d="m5 12.5 4.5 4.5L19 7.5" />
   {/if}

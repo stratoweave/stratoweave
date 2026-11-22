@@ -1,6 +1,7 @@
 <script lang="ts">
-  // Read-only text with line numbers and a copy button. Ported from the
-  // sorespo web UI without its diff colouring or line wrap.
+  // Read-only text with line numbers, a copy button and, given a file name,
+  // a download button. Ported from the sorespo web UI without its diff
+  // colouring or line wrap.
   import NavIcon from '#lib/core/ui/NavIcon.svelte';
 
   // A whole layer runs to hundreds of thousands of lines, so the text goes in
@@ -12,12 +13,14 @@
     content = '',
     minHeight = '',
     maxHeight = '',
-    label = 'Code'
+    label = 'Code',
+    filename = ''
   }: {
     content?: string;
     minHeight?: string;
     maxHeight?: string;
     label?: string;
+    filename?: string;
   } = $props();
 
   // A trailing newline does not add an empty line.
@@ -82,6 +85,16 @@
     if (copyTimer) clearTimeout(copyTimer);
     copyTimer = setTimeout(() => (copyResult = null), 1600);
   }
+
+  function download(): void {
+    const url = URL.createObjectURL(new Blob([content], { type: 'text/plain;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.click();
+    // Safari still reads the URL a moment after the click.
+    setTimeout(() => URL.revokeObjectURL(url), 40_000);
+  }
 </script>
 
 <div class="code" style={`${minHeight ? `min-height: ${minHeight};` : ''}${maxHeight ? `max-height: ${maxHeight};` : ''}`}>
@@ -91,6 +104,11 @@
       <NavIcon name={copyResult === 'copied' ? 'check' : 'copy'} size={14} />
       {copyResult === 'copied' ? 'Copied' : copyResult === 'failed' ? 'Copy failed' : 'Copy'}
     </button>
+    {#if filename}
+      <button class="code__tool" type="button" onclick={download} title={`Download as ${filename}`}>
+        <NavIcon name="download" size={14} /> Download
+      </button>
+    {/if}
   </div>
 
   <div class="code__scroll">
