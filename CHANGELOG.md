@@ -97,6 +97,14 @@
   replies and the web UI's files, with gzip or deflate when the client
   accepts it in `Accept-Encoding`. In Fleet Manager with 100,000 devices,
   the 14 MB fleet list goes out as about 1.3 MB. [#832]
+- `GET /device/<name>/log-entries` reads a device's log file when asked:
+  the newest messages, older ones a page at a time, and the ones written
+  since an earlier answer, filtered by levels and text, with a count of the
+  messages of each level. Each message is an
+  object like a line of the `json` log format, from either format. An
+  application gives `stratoweave.main()` a `remote_device_http` function
+  for the devices that another StratoWeave system manages, and the request
+  goes on to that system.
 
 ### Devices & Adapters
 - SNMP device adapters are generated from MIBs. The system generator
@@ -872,6 +880,12 @@
   or before a pause, the member is done at that end, or at a later boot.
   A member whose device does not tell is done at its answer, as before.
   [#842]
+- The device page of the web UI shows the device's log under its upgrade
+  runs, newest first, read from its flotilla: filtered by level and text,
+  following new messages while Live is on, and older ones a page at a time.
+  The record control in the log's header sets the level the device logs at,
+  `debug/log-level`. The top sends a fleet device's log request on to the
+  device's flotilla.
 
 ### Dependencies
 

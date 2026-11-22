@@ -171,6 +171,62 @@ Supported diff renderings inside the JSON payload:
 
 `adata` is not implemented for this endpoint.
 
+### `GET /device/<name>/log-entries`
+Returns messages from the device's log file, `devices/<name>.log` in the log
+directory, as JSON. The file is read when the request comes, so a log that
+nobody reads costs nothing.
+
+Query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `level` | The levels to return, comma separated, such as `error,warning`; all levels without it. `error` takes in `emerg`, `alert` and `crit`, `info` takes in `notice` and `debug` takes in `verb` |
+| `q` | Only lines that hold this text, in any case |
+| `limit` | The most messages to return: 200 without it, at most 1000 |
+| `before` | The `start` of an earlier answer: the messages before it |
+| `after` | The `end` of an earlier answer: the messages written since |
+
+Without `before` and `after`, the answer has the newest messages. `before`
+pages back through the file and then through its rotated files. `after`
+follows the file, also when it was rotated in between.
+
+```json
+{
+  "entries": [
+    {"time": "2026-11-19T10:55:02.123456789+01:00", "level": "warn",
+     "logger": "cpe-001", "actor": "stratoweave.device.DeviceMgr",
+     "actor_id": 42, "msg": "DeviceMgr: platform read failed",
+     "data": {"error": "timeout"}}
+  ],
+  "start": "1234567:20480",
+  "end": "1234567:40960",
+  "gap": false,
+  "level": "warning",
+  "counts": {"warning": 1, "info": 12}
+}
+```
+
+- `entries` are oldest first, each the object that the `json` log format
+  writes for the line. A line of the `text` format gives its data values as
+  strings, and its message as written, with line breaks escaped.
+- `start` asks for older messages, and is `null` when there are none.
+- `end` asks for the messages written since.
+- `gap` is `true` when messages since `after` are missing: more than `limit`
+  matched, or the file rotated more often than `log.rotate.keep` since.
+- `level` is the level the device logs at.
+- `counts` has the number of lines of each level that the answer read and
+  that hold `q`, also of the levels that `level` leaves out. Added up over
+  the answers, they count the messages in the time the entries span.
+
+A system that writes no log files, with an empty `log.dir`, answers `404`.
+
+On a Fleet Manager top, a fleet device is managed by a flotilla, and the top
+sends the request on to the flotilla's HTTP server.
+
+```sh
+curl "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/log-entries?level=error,warning&q=commit"
+```
+
 ### `GET /device/<name>/q`
 Returns the device's configuration queue as JSON.
 

@@ -1,0 +1,211 @@
+import file
+import logging
+import testing
+
+import device as swdev
+import device_log_api as swdevlog
+import logs as swlogs
+
+
+def _line(level: int, msg: str) -> str:
+    text = swlogs.TextFormatter().format(logging.Message(level, ["rtr1"], None, msg, None))
+    return (text if text is not None else "") + "\n"
+
+
+def _msgs(body: dict[str, ?value]) -> list[str]:
+    """The messages of the entries in an answer, oldest first."""
+    res: list[str] = []
+    entries = body["entries"]
+    if isinstance(entries, list):
+        for e in entries:
+            if isinstance(e, dict):
+                res.append(str(e["msg"]))
+    return res
+
+
+def _count(body: dict[str, ?value], name: str) -> int:
+    counts = body["counts"]
+    if isinstance(counts, dict):
+        n = counts.get(name)
+        if isinstance(n, int):
+            return n
+    return 0
+
+
+def _cursor(body: dict[str, ?value], key: str) -> ?(int, int):
+    c = body[key]
+    if isinstance(c, str):
+        return swdevlog.parse_cursor(c)
+    return None
+
+
+def _test_parse_cursor():
+    c = swdevlog.parse_cursor("12:345")
+    testing.assertEqual(c.0, 12)
+    testing.assertEqual(c.1, 345)
+    for text in ["", "12", "a:1", "1:-2", "1:2:3"]:
+        try:
+            swdevlog.parse_cursor(text)
+            testing.error(f"parse_cursor accepted '{text}'")
+        except ValueError:
+            pass
+
+
+def _test_parse_levels():
+    testing.assertEqual(swdevlog.parse_levels("error, warning"), {logging.ERR, logging.WARNING})
+    testing.assertEqual(swdevlog.parse_levels("trace"), {logging.TRACE})
+    for text in ["off", "bogus", "error,"]:
+        try:
+            swdevlog.parse_levels(text)
+            testing.error(f"parse_levels accepted '{text}'")
+        except ValueError:
+            pass
+
+
+def _test_match():
+    line = _line(logging.WARNING, "Failed to connect").strip().encode()
+    group, entry = swdevlog.match(line, {logging.WARNING}, "")
+    testing.assertEqual(str(group), str(logging.WARNING), "counts under its level")
+    testing.assertTrue(entry is not None, "its level is asked for")
+    group, entry = swdevlog.match(line, {logging.ERR}, "")
+    testing.assertEqual(str(group), str(logging.WARNING), "counts when its level is not asked for")
+    testing.assertTrue(entry is None, "its level is not asked for")
+    testing.assertTrue(swdevlog.match(line, None, "failed").1 is not None, "text in any case")
+    group, entry = swdevlog.match(line, None, "refused")
+    testing.assertTrue(group is None and entry is None, "other text")
+    group, entry = swdevlog.match(b"not a log line", {logging.ERR}, "")
+    testing.assertTrue(group is None, "a line of another kind counts under no level")
+    if entry is not None:
+        testing.assertEqual(str(entry["msg"]), "not a log line")
+    else:
+        testing.error("a line of another kind is kept")
+    testing.assertTrue(swdevlog.match(b"", None, "").1 is None, "empty line")
+    crit = _line(logging.CRITICAL, "x").strip().encode()
+    testing.assertEqual(str(swdevlog.match(crit, None, "").0), str(logging.ERR), "crit counts as error")
+
+
+actor _test_pages(t: testing.EnvT):
+    """Newest first a page at a time, filtered, and what is written since."""
+    proc def __startup__():
+        fc = file.FileCap(t.env.cap)
+        fs = file.FS(fc)
+        tmp = fs.mktmpdir("test_device_log_api_")
+        path = tmp + "/devices/rtr1.log"
+        f = swlogs.LogFile(fc, path)
+        for level, msg in [(logging.INFO, "one"), (logging.DEBUG, "two"), (logging.WARNING, "three"),
+                           (logging.INFO, "four"), (logging.ERR, "five")]:
+            f.write(_line(level, msg))
+        await async f.flush()
+        device_logs = swlogs.DeviceLogs(fc, tmp, "text", 0, 0, logging.INFO)
+        api = swdevlog.DeviceLogApi(device_logs, swdev.DeviceRegistry(log_handler=logging.Handler(None)))
+
+        every = api.older("rtr1", None, None, "", 200)
+        testing.assertEqual(_msgs(every), ["one", "two", "three", "four", "five"], "all")
+        testing.assertTrue(every["start"] is None, "nothing older")
+        for name, n in [("error", 1), ("warning", 1), ("info", 2), ("debug", 1), ("trace", 0)]:
+            testing.assertEqual(_count(every, name), n, f"{name} count")
+        problems = api.older("rtr1", None, {logging.WARNING, logging.ERR}, "", 200)
+        testing.assertEqual(_msgs(problems), ["three", "five"], "levels")
+        testing.assertEqual(_count(problems, "info"), 2, "counts the levels not asked for")
+        testing.assertEqual(_msgs(api.older("rtr1", None, None, "FOUR", 200)), [], "text is lower case")
+        four = api.older("rtr1", None, None, "four", 200)
+        testing.assertEqual(_msgs(four), ["four"], "text")
+        testing.assertEqual(_count(four, "info"), 1, "counts the lines with the text")
+        testing.assertEqual(_count(four, "debug"), 0, "not the lines without it")
+
+        page = api.older("rtr1", None, None, "", 2)
+        testing.assertEqual(_msgs(page), ["four", "five"], "newest page")
+        page = api.older("rtr1", _cursor(page, "start"), None, "", 2)
+        testing.assertEqual(_msgs(page), ["two", "three"], "older page")
+        page = api.older("rtr1", _cursor(page, "start"), None, "", 2)
+        testing.assertEqual(_msgs(page), ["one"], "oldest page")
+        testing.assertTrue(page["start"] is None, "no more pages")
+
+        end = _cursor(every, "end")
+        if end is not None:
+            none_yet = api.newer("rtr1", end, None, "", 200)
+            testing.assertEqual(_msgs(none_yet), [], "nothing new")
+            testing.assertEqual(str(none_yet["end"]), str(every["end"]), "same end")
+            f.write(_line(logging.INFO, "six"))
+            f.write(_line(logging.DEBUG, "seven"))
+            await async f.flush()
+            new = api.newer("rtr1", end, {logging.INFO}, "", 200)
+            testing.assertEqual(_msgs(new), ["six"], "new at the level")
+            testing.assertEqual(_count(new, "debug"), 1, "new counted")
+            testing.assertEqual(str(new["gap"]), "False", "no gap")
+            many = api.newer("rtr1", end, None, "", 1)
+            testing.assertEqual(_msgs(many), ["seven"], "the newest when more than limit")
+            testing.assertEqual(str(many["gap"]), "True", "a gap when more than limit")
+        else:
+            testing.error("no end")
+        await async fs.rmtree(tmp)
+        t.success()
+
+
+actor _test_rotation(t: testing.EnvT):
+    """A cursor follows its file when the file is rotated, and pages go on
+    into the rotated files."""
+    proc def __startup__():
+        fc = file.FileCap(t.env.cap)
+        fs = file.FS(fc)
+        tmp = fs.mktmpdir("test_device_log_api_")
+        path = tmp + "/devices/rtr1.log"
+        f = swlogs.LogFile(fc, path)
+        f.write(_line(logging.INFO, "one"))
+        await async f.flush()
+        device_logs = swlogs.DeviceLogs(fc, tmp, "text", 0, 2, logging.INFO)
+        api = swdevlog.DeviceLogApi(device_logs, swdev.DeviceRegistry(log_handler=logging.Handler(None)))
+        first = api.older("rtr1", None, None, "", 200)
+
+        f.write(_line(logging.INFO, "two"))
+        await async f.flush()
+        await async fs.rename(path, path + ".1")
+        f.write(_line(logging.INFO, "three"))
+        # A line that is still being written is left for the next answer.
+        f.write("2026-")
+        await async f.flush()
+
+        end = _cursor(first, "end")
+        if end is not None:
+            new = api.newer("rtr1", end, None, "", 200)
+            testing.assertEqual(_msgs(new), ["two", "three"], "across the rotation")
+            testing.assertEqual(str(new["gap"]), "False", "no gap")
+            lost = api.newer("rtr1", (end.0 + 1000000, 0), None, "", 200)
+            testing.assertEqual(_msgs(lost), ["three"], "a lost cursor starts at the current file")
+            testing.assertEqual(str(lost["gap"]), "True", "a lost cursor is a gap")
+        else:
+            testing.error("no end")
+
+        page = api.older("rtr1", None, None, "", 2)
+        testing.assertEqual(_msgs(page), ["two", "three"], "newest across files")
+        page = api.older("rtr1", _cursor(page, "start"), None, "", 2)
+        testing.assertEqual(_msgs(page), ["one"], "older in the rotated file")
+        testing.assertTrue(page["start"] is None, "no more pages")
+        await async fs.rmtree(tmp)
+        t.success()
+
+
+actor _test_no_file(t: testing.EnvT):
+    """A device that has not logged has no entries, and its end finds the
+    file once it is written."""
+    proc def __startup__():
+        fc = file.FileCap(t.env.cap)
+        fs = file.FS(fc)
+        tmp = fs.mktmpdir("test_device_log_api_")
+        device_logs = swlogs.DeviceLogs(fc, tmp, "text", 0, 0, logging.INFO)
+        api = swdevlog.DeviceLogApi(device_logs, swdev.DeviceRegistry(log_handler=logging.Handler(None)))
+        empty = api.older("rtr1", None, None, "", 200)
+        testing.assertEqual(_msgs(empty), [], "no entries")
+        testing.assertTrue(empty["start"] is None, "nothing older")
+        end = _cursor(empty, "end")
+        if end is not None:
+            f = swlogs.LogFile(fc, tmp + "/devices/rtr1.log")
+            f.write(_line(logging.INFO, "one"))
+            await async f.flush()
+            new = api.newer("rtr1", end, None, "", 200)
+            testing.assertEqual(_msgs(new), ["one"], "the first line")
+            testing.assertEqual(str(new["gap"]), "False", "no gap")
+        else:
+            testing.error("no end")
+        await async fs.rmtree(tmp)
+        t.success()

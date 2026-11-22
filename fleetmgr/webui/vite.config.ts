@@ -58,7 +58,8 @@ export default defineConfig({
       '^/restconf(/|$)': { target: API_PROXY_TARGET },
       '^/image-(file|folder)(/|$)': { target: API_PROXY_TARGET },
       '^/image-move$': { target: API_PROXY_TARGET },
-      '^/layer(/|$)': { target: API_PROXY_TARGET }
+      '^/layer(/|$)': { target: API_PROXY_TARGET },
+      '^/device/[^/]+/log-entries([?]|$)': { target: API_PROXY_TARGET }
     }
   }
 });

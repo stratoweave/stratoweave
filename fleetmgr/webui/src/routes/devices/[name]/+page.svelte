@@ -12,6 +12,7 @@
   import LoadError from '#lib/core/ui/LoadError.svelte';
   import { campaignsText } from '#lib/maintenance/schedule-form.ts';
   import ConnectionDot from '#lib/software/ConnectionDot.svelte';
+  import DeviceLog from '#lib/software/DeviceLog.svelte';
   import DeviceSettings from '#lib/software/DeviceSettings.svelte';
   import { campaignDeviceHref } from '#lib/software/links.ts';
   import { FLEET_DEVICE_LIST_ROOT, STATUS_LABEL, modeLabel } from '#lib/software/model.ts';
@@ -189,6 +190,10 @@
       reload={reloadDevice}
       bind:dirty
     />
+  {/key}
+
+  {#key data.name}
+    <DeviceLog name={data.name} />
   {/key}
 {/if}
 
