@@ -206,7 +206,7 @@ so a probe that reads two subtrees sends two gets.
 | `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information`, `get-system-uptime-information` | `product-model` | `serial-number` of system information | `junos:seconds` of `system-booted-time` |
 | `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis | `last-booted` of `system/information` |
 | `sros` | `nokia-state` | one get: `/state/system` and `/state/chassis` | `system/platform` | router chassis with the lowest number | not read |
-| `arcos` | `arcos-openconfig-system-augments` | one get: `system/version/state` | `platform` | `serial-number` | not read |
+| `arcos` | `arcos-openconfig-system-augments` | one get: `system/version/state` and `system/state/boot-time` | `platform` | `serial-number` | `boot-time` of `system/state` |
 
 Each probe but Junos reads through YANG that its module ships pruned in
 `platform_<os>_yang.act` (`software_iosxe_yang.act` for IOS XE), with the
@@ -300,6 +300,10 @@ the serial number comes from the router chassis with the lowest number.
 `system/version/state` holds what `show version` prints. On a container the
 platform is `Virtual` and there is no serial number. The OpenConfig chassis
 component has neither part nor serial number there.
+
+`boot-time` in `system/state` of `openconfig-system` counts nanoseconds since
+the epoch; the probe drops the fraction of a second. A `boot-time` of 0 gives
+no last boot.
 
 ## Testing
 
