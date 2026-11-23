@@ -1,27 +1,40 @@
 // A device's settings as its page edits them. The page reads the device's
 // config entry with content=config and puts SECRET_PLACEHOLDER in place of
 // every password and private key at once, so that none is kept or shown.
-// Each card saves only the leaves it changed, into the entry as stored at
-// the save: the rest of the entry, secrets included, stays as it is.
+// The settings come in sections. A save writes only the leaves each
+// section changed, into the entry as stored at the save: the rest of the
+// entry, secrets included, stays as it is.
 
 import { errorText } from '#lib/core/errors.ts';
 import { rewriteListEntry } from '#lib/core/restconf/client.ts';
+import { MAX_PRIORITY, applyMembership, parsePriority, type Membership } from '#lib/software/groups.ts';
 import { keyError, validPort, type PrivateKey } from '#lib/software/inventory.ts';
-import { FLEET_DEVICE_LIST_ROOT, parseDeviceEntry, type Device } from '#lib/software/model.ts';
+import { DEFAULT_PRIORITY, FLEET_DEVICE_LIST_ROOT, parseDeviceEntry, type Device } from '#lib/software/model.ts';
 
 type Json = Record<string, unknown>;
 
 export type Errors = Record<string, string>;
 
-/** What a card hands its fields. */
-export interface CardFields<D> {
+/** What a section hands its fields. */
+export interface SectionFields<D> {
   draft: D;
   set: (next: D) => void;
-  /** By field, once the card has been touched. */
+  /** By field, once the form has been touched. */
   errors: Errors;
-  /** A field was left: the card's errors show from then on. */
+  /** A field was left: the errors show from then on. */
   touch: () => void;
   disabled: boolean;
+}
+
+/** A section of the settings: its draft as read from the entry, and how
+ * a draft is compared, checked and written. */
+export interface Section<D> {
+  read: (entry: DeviceConfig) => D;
+  same: (a: D, b: D) => boolean;
+  validate: (draft: D) => Errors;
+  /** `entry` with what `draft` changed from `base`, the read it was
+   * edited from. */
+  apply: (entry: Json, base: D, draft: D) => Json;
 }
 
 interface KeyJson {
@@ -30,7 +43,7 @@ interface KeyJson {
 }
 
 /** A device's config entry as YANG JSON, typed for the lists and leaves
- * that are not plain leaves of a card; the rest goes through as read. */
+ * that are not plain leaves of a section; the rest goes through as read. */
 export interface DeviceConfig {
   name: string;
   address?: { name: string; address?: string; port?: number | string }[];
@@ -143,7 +156,7 @@ export function rewriteDevice(name: string, edit: (entry: Json) => Json): Promis
   });
 }
 
-// ── Cards of plain leaves ──
+// ── Sections of plain leaves ──
 
 interface LeafSpec {
   /** From the device entry, e.g. ['mock', 'software', 'failure']. */
@@ -160,17 +173,9 @@ interface LeafSpec {
 
 type LeafSpecs = Record<string, LeafSpec>;
 
-/** A card's leaves as its fields show them: a bool as a checkbox, the rest
- * as text, '' for an absent leaf. */
+/** A section's leaves as its fields show them: a bool as a checkbox, the
+ * rest as text, '' for an absent leaf. */
 export type LeafDraft<S extends LeafSpecs> = { [F in keyof S]: S[F] extends { kind: 'bool' } ? boolean : string };
-
-export interface LeafCard<S extends LeafSpecs> {
-  read: (entry: DeviceConfig) => LeafDraft<S>;
-  same: (a: LeafDraft<S>, b: LeafDraft<S>) => boolean;
-  validate: (draft: LeafDraft<S>) => Errors;
-  /** `entry` with the leaves that `draft` changed from `base`. */
-  apply: (entry: Json, base: LeafDraft<S>, draft: LeafDraft<S>) => Json;
-}
 
 /** What a field stores: undefined for nothing. A whole number goes as a
  * number, other text as typed, for its error. */
@@ -199,7 +204,9 @@ function setPath(obj: Json, path: readonly string[], value: unknown): Json {
   return next;
 }
 
-function leafCard<S extends LeafSpecs>(specs: S): LeafCard<S> {
+/** The section of the leaves `specs` names; `apply` writes only the
+ * leaves the draft changed. */
+function leafSection<S extends LeafSpecs>(specs: S): Section<LeafDraft<S>> {
   const fields = Object.entries(specs);
   const shown = (draft: LeafDraft<S>, field: string) => (draft as Record<string, string | boolean>)[field];
   const changed = (a: LeafDraft<S>, b: LeafDraft<S>) =>
@@ -238,30 +245,35 @@ function leafCard<S extends LeafSpecs>(specs: S): LeafCard<S> {
   };
 }
 
-export const generalLeaves = leafCard({
+export const generalLeaves = leafSection({
   type: { path: ['type'], kind: 'text', required: 'A device type is required.' },
   description: { path: ['description'], kind: 'text' }
 });
 
 // An absent wait keeps the flotilla's own: 45 s and 600 s.
-export const checkLeaves = leafCard({
+export const checkLeaves = leafSection({
   enabled: { path: ['upgrade-checks', 'enabled'], kind: 'bool', fallback: true },
   precheckWait: { path: ['upgrade-checks', 'precheck-wait'], kind: 'uint', min: 1, max: 65535 },
   postcheckWait: { path: ['upgrade-checks', 'postcheck-wait'], kind: 'uint', min: 1, max: 65535 }
 });
 
-export const changeLeaves = leafCard({
+export const changeLeaves = leafSection({
   approvalRequired: { path: ['approval-required'], kind: 'bool', fallback: false },
   syncCheck: { path: ['sync-check'], kind: 'bool', fallback: true }
 });
 
+// No schedule: each campaign's default schedule.
+export const scheduleLeaves = leafSection({
+  schedule: { path: ['schedule'], kind: 'enum' }
+});
+
 // No log level: the log.device.level setting's.
-export const loggingLeaves = leafCard({
+export const loggingLeaves = leafSection({
   logLevel: { path: ['debug', 'log-level'], kind: 'enum' },
   connection: { path: ['debug', 'connection'], kind: 'bool', fallback: false }
 });
 
-export const mockLeaves = leafCard({
+export const mockLeaves = leafSection({
   enabled: { path: ['mock', 'enabled'], kind: 'bool', fallback: false },
   duration: { path: ['mock', 'software', 'upgrade-duration'], kind: 'uint', min: 0, max: 65535 },
   variance: { path: ['mock', 'software', 'upgrade-duration-variance'], kind: 'uint', min: 0, max: 100 },
@@ -294,7 +306,7 @@ export const MOCK_FAILURES: { value: string; label: string; title: string }[] = 
 // ── Connection ──
 
 // Each row keeps the key it was read with in `original`, which finds what
-// the card does not edit in the stored entry: an address's initial
+// the form does not edit in the stored entry: an address's initial
 // credentials, a stored private key, an adapter's own credentials and SSH
 // settings. A new row has null. A row's id is its place in the read, so
 // that a poll does not make new rows of the same ones.
@@ -467,7 +479,7 @@ function portValue(text: string): number | undefined {
 }
 
 /** `entry` with what `draft` changed from `base`. A list that changed goes
- * back whole, each entry with what the card does not edit as stored. */
+ * back whole, each entry with what the form does not edit as stored. */
 export function applyConnection(entry: Json, base: ConnectionDraft, draft: ConnectionDraft): Json {
   const next = { ...entry };
   if (addressesKey(draft.addresses) !== addressesKey(base.addresses)) {
@@ -522,14 +534,139 @@ export function applyConnection(entry: Json, base: ConnectionDraft, draft: Conne
   return next;
 }
 
+export const connectionSection: Section<ConnectionDraft> = {
+  read: connectionOf,
+  same: sameConnection,
+  validate: connectionErrors,
+  apply: applyConnection
+};
+
+// ── Redundancy groups ──
+
+export interface MembershipDraft {
+  groups: string[];
+  /** As typed. */
+  priority: string;
+  /** A group name typed but not added yet: it counts as added. */
+  typed: string;
+}
+
+function joinedGroups(draft: MembershipDraft): string[] {
+  const typed = draft.typed.trim();
+  return typed && !draft.groups.includes(typed) ? [...draft.groups, typed] : draft.groups;
+}
+
+/** What `draft` stores; a priority that is no number keeps `priority`. */
+function membershipOf(draft: MembershipDraft, priority: number): Membership {
+  return { groups: joinedGroups(draft), priority: parsePriority(draft.priority) ?? priority };
+}
+
+export const membershipSection: Section<MembershipDraft> = {
+  read(entry) {
+    const groups = entry['redundancy-group'];
+    return {
+      groups: Array.isArray(groups) ? groups.filter((g): g is string => typeof g === 'string') : [],
+      priority: String(entry['redundancy-priority'] ?? DEFAULT_PRIORITY),
+      typed: ''
+    };
+  },
+  same: (a, b) =>
+    JSON.stringify([...joinedGroups(a)].sort()) === JSON.stringify([...joinedGroups(b)].sort()) &&
+    (parsePriority(a.priority) ?? a.priority.trim()) === (parsePriority(b.priority) ?? b.priority.trim()),
+  validate: (draft): Errors =>
+    parsePriority(draft.priority) === null
+      ? { priority: `Must be a whole number from 0 to ${MAX_PRIORITY.toLocaleString()}.` }
+      : {},
+  apply(entry, base, draft) {
+    const before = membershipOf(base, DEFAULT_PRIORITY);
+    return applyMembership(entry, before, membershipOf(draft, before.priority));
+  }
+};
+
+// ── All the sections ──
+
+export const SECTIONS = {
+  general: generalLeaves,
+  connection: connectionSection,
+  schedule: scheduleLeaves,
+  membership: membershipSection,
+  checks: checkLeaves,
+  changes: changeLeaves,
+  logging: loggingLeaves,
+  mock: mockLeaves
+};
+
+export type SectionKey = keyof typeof SECTIONS;
+
+/** Each section's draft. */
+export type Settings = { [K in SectionKey]: (typeof SECTIONS)[K] extends Section<infer D> ? D : never };
+
+/** The sections being edited, each with its draft and the read it was
+ * edited from. A section that is not in it follows the device as polled. */
+export type Edits = { [K in SectionKey]?: { base: Settings[K]; draft: Settings[K] } };
+
+const KEYS = Object.keys(SECTIONS) as SectionKey[];
+
+// Each section has a draft of its own, which a lookup by a key that may be
+// any of them does not keep apart.
+function sectionOf<K extends SectionKey>(key: K): Section<Settings[K]> {
+  return SECTIONS[key] as unknown as Section<Settings[K]>;
+}
+
+export function settingsOf(entry: DeviceConfig): Settings {
+  return Object.fromEntries(KEYS.map((k) => [k, sectionOf(k).read(entry)])) as Settings;
+}
+
+/** What the form shows: each edited section's draft, the rest as read. */
+export function draftOf(read: Settings, edits: Edits): Settings {
+  return Object.fromEntries(KEYS.map((k) => [k, edits[k]?.draft ?? read[k]])) as Settings;
+}
+
+function changed(key: SectionKey, read: Settings, edits: Edits): boolean {
+  const edit = edits[key];
+  return edit !== undefined && !sectionOf(key).same(edit.draft, read[key]);
+}
+
+/** Whether any edit differs from the settings as read. */
+export function settingsChanged(read: Settings, edits: Edits): boolean {
+  return KEYS.some((k) => changed(k, read, edits));
+}
+
+/** The errors of each section an edit changed. A section as read is as
+ * stored, and is not checked again. */
+export function settingsErrors(read: Settings, edits: Edits): Record<SectionKey, Errors> {
+  return Object.fromEntries(
+    KEYS.map((k) => {
+      const edit = edits[k];
+      return [k, edit && changed(k, read, edits) ? sectionOf(k).validate(edit.draft) : {}];
+    })
+  ) as Record<SectionKey, Errors>;
+}
+
+/** `entry` with what each edit changed from the read it was edited from:
+ * what someone else changed meanwhile stays. */
+export function applySettings(entry: Json, edits: Edits): Json {
+  return KEYS.reduce((next, k) => {
+    const edit = edits[k];
+    return edit ? sectionOf(k).apply(next, edit.base, edit.draft) : next;
+  }, entry);
+}
+
 // ── The whole entry as JSON ──
+
+/** The entry as read with the edits in it, as the JSON view shows it: a
+ * new password or private key is masked like a stored one. */
+export function editedConfig(config: DeviceConfig, edits: Edits): DeviceConfig {
+  return maskSecrets(applySettings(config, edits)) as DeviceConfig;
+}
 
 export function configText(config: DeviceConfig): string {
   return JSON.stringify(config, null, 2);
 }
 
 /** Why `text` cannot replace the entry of device `name`. `config` is the
- * entry as read: its placeholders show where a secret is stored. */
+ * entry it was edited from, masked: its placeholders show where a secret
+ * is stored. */
 export function configTextErrors(text: string, name: string, config: DeviceConfig): Errors {
   let value: unknown;
   try {

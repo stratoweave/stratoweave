@@ -13,9 +13,8 @@
   import { campaignsText } from '#lib/maintenance/schedule-form.ts';
   import ConnectionDot from '#lib/software/ConnectionDot.svelte';
   import DeviceSettings from '#lib/software/DeviceSettings.svelte';
-  import StatusPill from '#lib/software/StatusPill.svelte';
   import { campaignDeviceHref } from '#lib/software/links.ts';
-  import { FLEET_DEVICE_LIST_ROOT, modeLabel } from '#lib/software/model.ts';
+  import { FLEET_DEVICE_LIST_ROOT, STATUS_LABEL, modeLabel } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -45,10 +44,10 @@
   let confirmDelete = $state(false);
   let deleting = $state(false);
   let deleteError = $state('');
-  // The cards with changes to save, and where the operator asked to go
-  // with them unsaved.
-  let dirty = $state<string[]>([]);
-  let unsaved = $derived(device && config ? dirty : []);
+  // Whether the settings have changes to save, and where the operator
+  // asked to go with them unsaved.
+  let dirty = $state(false);
+  let unsaved = $derived(!!device && !!config && dirty);
   let leaveTo = $state<URL | null>(null);
   let leaving = false;
 
@@ -63,7 +62,7 @@
   // Leaving drops the changes, so it is asked first. A reload or a closed
   // tab gets the browser's own question.
   beforeNavigate(({ cancel, to, willUnload }) => {
-    if (unsaved.length === 0 || leaving) return;
+    if (!unsaved || leaving) return;
     cancel();
     if (!willUnload && to) leaveTo = to.url;
   });
@@ -74,11 +73,6 @@
     if (!to) return;
     leaving = true;
     void goto(to);
-  }
-
-  /** "General", "General and Mock", "General, Connection and Mock". */
-  function listText(names: string[]): string {
-    return names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : (names[0] ?? '');
   }
 
   async function handleDelete(): Promise<void> {
@@ -97,7 +91,7 @@
     }
   }
 
-  /** For the cards: reads the device again and waits for it. */
+  /** For the settings: reads the device again and waits for it. */
   async function reloadDevice(): Promise<void> {
     await invalidate('data:device');
     await data.device;
@@ -147,6 +141,22 @@
           · last boot <span class="mono">{formatClock(deviceLoad.lastBoot)}</span>
         {/if}
       </p>
+      <div class="campaigns">
+        {#if campaignsLoad === null}
+          <span aria-busy="true">Loading campaigns…</span>
+        {:else if campaignsLoad.loadError}
+          <LoadError message={`Its campaigns could not be read. ${campaignsLoad.loadError}`} />
+        {:else if campaigns.length === 0}
+          Not in any campaign.
+        {:else}
+          In
+          {#each campaigns as campaign, i (campaign.name)}
+            {#if i > 0}{i === campaigns.length - 1 ? ' and' : ','}{/if}
+            <a class="mono campaign-link" href={campaignDeviceHref(campaign.name, device.name)}>{campaign.name}</a>
+            ({STATUS_LABEL[campaign.row.status]} · {modeLabel(campaign.adminState, campaign.runSince)})
+          {/each}
+        {/if}
+      </div>
     </div>
     <div class="page-actions">
       <button
@@ -169,40 +179,6 @@
   {#if pollError}
     <LoadError message={pollError} />
   {/if}
-
-  <section class="card">
-    <h2 class="panel-title">Campaigns</h2>
-    {#if campaignsLoad === null}
-      <p class="none" aria-busy="true">Loading campaigns…</p>
-    {:else if campaignsLoad.loadError}
-      <div class="read-error"><LoadError message={campaignsLoad.loadError} /></div>
-    {:else if campaigns.length === 0}
-      <p class="none">Not in any campaign.</p>
-    {:else}
-      <div class="table-wrap">
-        <table class="dense">
-          <thead>
-            <tr>
-              <th>Campaign</th>
-              <th>Status</th>
-              <th>Mode</th>
-            </tr>
-          </thead>
-          <tbody>
-            {#each campaigns as campaign (campaign.name)}
-              <tr>
-                <td>
-                  <a class="mono campaign-link" href={campaignDeviceHref(campaign.name, device.name)}>{campaign.name}</a>
-                </td>
-                <td><StatusPill status={campaign.row.status} raw={campaign.row.raw} /></td>
-                <td>{modeLabel(campaign.adminState, campaign.runSince)}</td>
-              </tr>
-            {/each}
-          </tbody>
-        </table>
-      </div>
-    {/if}
-  </section>
 
   {#key data.name}
     <DeviceSettings
@@ -229,7 +205,7 @@
 <ConfirmDialog
   open={leaveTo !== null}
   title="Discard unsaved changes?"
-  message={`The changes in ${listText(unsaved)} are not saved.`}
+  message="Your changes are not saved."
   confirmLabel="Discard"
   cancelLabel="Keep editing"
   confirmClass="btn-danger"
@@ -242,13 +218,16 @@
     color: var(--sw-text-muted);
   }
 
-  .none {
-    margin: 0;
+  .campaigns {
+    margin-top: var(--sw-space-1);
+    font-size: var(--sw-text-sm);
     color: var(--sw-text-muted);
   }
 
-  .read-error :global(.load-error) {
-    margin-bottom: 0;
+  .campaigns :global(.load-error) {
+    margin: 0;
+    padding: var(--sw-space-1) var(--sw-space-3);
+    font-size: var(--sw-text-sm);
   }
 
   .campaign-link {
