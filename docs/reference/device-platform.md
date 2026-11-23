@@ -30,7 +30,7 @@ persisted: after a restart it is empty until the device connects.
 | `version` | Release the device runs, as it reports it, for example `17.18.2`. |
 | `model` | Chassis model, for example `C8000V`. |
 | `serial-number` | Chassis serial number. |
-| `last-boot` | When the device last booted, in seconds since the Unix epoch by the device's clock. Absent when the probe does not read it. |
+| `last-boot` | When the device last booted, in seconds since the Unix epoch by the device's clock, or by StratoWeave's clock when the device reports only how long it has been up. Absent when the probe does not read it. |
 | `probe` | Name of the probe that read the values. |
 
 The version is the release as the device spells it, without what the device
@@ -146,8 +146,16 @@ class IosXeProbe(swdev.GetPlatformProbe):
 | `parse(root)` | The `Platform` in the reply, `None` when the reply has no values, or raises `PlatformMismatch`. |
 
 Set the fields the probe knows on `swdev.Platform(os, version, model,
-serial_number, last_boot)`; leave the others `None`. `swdev.epoch_seconds`
-gives the `last_boot` of a `yang:date-and-time`.
+serial_number, last_boot, last_boot_tolerance)`; leave the others `None`.
+`swdev.epoch_seconds` gives the `last_boot` of a `yang:date-and-time`.
+
+A probe that works the boot out from an uptime sets `last_boot_tolerance`:
+how much the uptime is rounded, in seconds, plus `swdev.REPLY_DELAY` when it
+subtracts the uptime from StratoWeave's clock. Each read of the same boot then
+gives a slightly different last boot. While a read gives one within its
+tolerance of the published one, `DeviceMgr` keeps the published one, so the
+value does not change on every read. A probe that reads the boot time leaves
+the tolerance at 0.
 
 ### The device type's schema
 
