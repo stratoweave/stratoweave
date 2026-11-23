@@ -1,6 +1,17 @@
 <script lang="ts">
   import { tick } from 'svelte';
-  import { CELL_COLOR, CELL_KINDS, CELL_LABEL, cellKind, type CellKind } from '#lib/software/cells.ts';
+  import {
+    CELL_COLOR,
+    CELL_KINDS,
+    CELL_LABEL,
+    READY_COLOR,
+    READY_KINDS,
+    READY_LABEL,
+    cellKind,
+    readyKind,
+    type CellKind,
+    type ReadyKind
+  } from '#lib/software/cells.ts';
   import { heldText } from '#lib/software/device-state.ts';
   import {
     STATUS_LABEL,
@@ -31,12 +42,16 @@
     type Placed,
     type WindowCells
   } from '#lib/software/plan-timeline.ts';
+  import type { PrepareView } from '#lib/software/prepare.ts';
   import { clockLabel, dayLabel, formatClockSeconds, formatDuration, sameLocalDay } from '#lib/core/time.ts';
 
   interface Props {
     plan: CampaignPlan;
     /** Each member's row, by device name. */
     rows: Map<string, DeviceStatusRow>;
+    /** Each member that prepares ahead, by name; see prepare.ts. A waiting
+     * member's cell then shows whether its image is ready. */
+    prepare?: Map<string, PrepareView>;
     /** Unix seconds, ticking. */
     now: number;
     /** Open at the zoom that fits the whole plan, and do not follow now:
@@ -48,13 +63,15 @@
     ondevice?: (name: string) => void;
   }
 
-  let { plan, rows, now, fitPlan = false, zoomKey, ondevice }: Props = $props();
+  let { plan, rows, prepare = new Map(), now, fitPlan = false, zoomKey, ondevice }: Props = $props();
 
   // The plan on a wall-clock axis. Each window is a band as wide as its
   // duration with one cell per device below it, in a column at its
   // start; devices released together stack in one column.
   // Windows that overlap sit in lanes above each other, idle stretches
   // between windows collapse to a break, and a marker shows now.
+  // A waiting member that prepares ahead shows how far its prepare is, and
+  // a window that has not opened says how many of its members are ready.
   const PAD_L = 30;
   const PAD_R = 30;
   // Axis rows: the marker's clock, the day, the time of day, then the line.
@@ -80,6 +97,12 @@
   const BAND_CHAR_W = 7.4;
   /** Space between two day labels, so they do not read as one. */
   const DAY_GAP = 16;
+
+  /** What a cell shows: its kind, or for a waiting member, its prepare. */
+  type Fill = CellKind | ReadyKind;
+  const FILL_COLOR: Record<Fill, string> = { ...CELL_COLOR, ...READY_COLOR };
+  const FILL_LABEL: Record<Fill, string> = { ...CELL_LABEL, ...READY_LABEL };
+  const FILLS: Fill[] = [...CELL_KINDS, ...READY_KINDS];
 
   interface Block {
     p: Placed;
@@ -177,13 +200,35 @@
 
   // Statuses: the cells, each window's done share and the legend of the
   // kinds that show.
-  let paths = $derived(cellPaths(blocks, rows, cells.size, cells.pitch));
+  function fillOf(name: string): Fill {
+    const kind = cellKind(rows.get(name));
+    const ready = kind === 'waiting' ? readyKind(prepare.get(name)) : null;
+    return ready ?? kind;
+  }
+
+  let paths = $derived(cellPaths(blocks, fillOf, cells.size, cells.pitch));
   let done = $derived(placed.map((p) => windowDone(p.w, rows)));
-  let legend = $derived.by((): CellKind[] => {
-    const shown = new Set<CellKind>();
-    for (const w of windows) for (const d of w.devices) shown.add(cellKind(rows.get(d.name)));
-    return CELL_KINDS.filter((k) => shown.has(k));
+  let legend = $derived.by((): Fill[] => {
+    const shown = new Set<Fill>();
+    for (const w of windows) for (const d of w.devices) shown.add(fillOf(d.name));
+    return FILLS.filter((k) => shown.has(k));
   });
+
+  // Each window's members that prepare ahead and wait for its run, and how
+  // many of them have their image prepared.
+  let readiness = $derived(
+    placed.map((p) => {
+      let due = 0;
+      let got = 0;
+      for (const d of p.w.devices) {
+        const state = prepare.get(d.name)?.state;
+        if (state === undefined || state === 'released') continue;
+        due++;
+        if (state === 'prepared') got++;
+      }
+      return { due, got };
+    })
+  );
 
   // The clock: the marker and which windows are open.
   let markerX = $derived(Math.min(axis.width - PAD_R, Math.max(PAD_L, axis.xOf(now))));
@@ -287,8 +332,10 @@
   }
 
   /** The label parts that fit the band from x on: first to go is the
-   * range, then the progress, then the count. */
-  function label(b: Block, share: number, x: number): string {
+   * range, then the progress, then the count. Before a window opens with
+   * members that prepare ahead, how many are ready takes the count's
+   * place. */
+  function label(b: Block, share: number, ready: { due: number; got: number }, x: number): string {
     const w = b.p.w;
     const name = windowName(w);
     const range = opensAtLaunch(w)
@@ -298,12 +345,11 @@
       : `${clockLabel(w.start)} → ${w.end === null ? 'open' : clockLabel(w.end)}`;
     const count = devices(w.devices.length);
     const pct = now >= w.start ? `${Math.round(share * 100)}%` : null;
-    const options = [
-      [name, range, count, pct],
-      [name, count, pct],
-      [name, count],
-      [name]
-    ];
+    const readyText = `${ready.got.toLocaleString()} of ${ready.due.toLocaleString()} ready`;
+    const options =
+      ready.due > 0 && now < w.start
+        ? [[name, range, readyText], [name, readyText], [`${ready.got}/${ready.due} ready`], [name]]
+        : [[name, range, count, pct], [name, count, pct], [name, count], [name]];
     for (const parts of options) {
       const text = parts.filter((p) => p !== null).join(' · ');
       if (text.length * BAND_CHAR_W + 12 <= b.p.x + b.bandW - x) return text;
@@ -363,7 +409,25 @@
     return sameLocalDay(t, now) ? clockLabel(t) : `${dayLabel(t)} ${clockLabel(t)}`;
   }
 
-  let info = $derived.by((): { name: string; text: string; kind: CellKind | null } | null => {
+  /** Where a device's prepare ahead is, while its window run has not
+   * started; '' otherwise. */
+  function prepareText(v: PrepareView | undefined): string {
+    if (v === undefined) return '';
+    switch (v.state) {
+      case 'scheduled':
+        return v.start > now ? `prepares ${when(v.start)}` : `may prepare since ${when(v.start)}`;
+      case 'preparing':
+        return v.progress === null ? `preparing since ${when(v.start)}` : `preparing, ${v.progress}%`;
+      case 'prepared':
+        return 'image prepared';
+      case 'failed':
+        return `prepare failed${v.message ? `: ${v.message}` : ''}, copies its image in its window`;
+      default:
+        return '';
+    }
+  }
+
+  let info = $derived.by((): { name: string; text: string; kind: Fill | null } | null => {
     if (shown?.kind === 'window') {
       const w = shown.w;
       const opens = opensAtLaunch(w) ? 'opens at launch' : `opens ${when(w.start)}`;
@@ -377,10 +441,11 @@
     const parts = [
       STATUS_LABEL[row?.status ?? 'pending'],
       held ? `held: ${held}` : '',
+      prepareText(prepare.get(d.name)),
       `${d.started === null ? 'starts' : 'started'} ${when(deviceStart(d))}`,
       `${d.finished === null ? '~' : 'took '}${formatDuration(deviceDuration(d))}`
     ];
-    return { name: d.name, text: parts.filter((p) => p !== '').join(' · '), kind: cellKind(row) };
+    return { name: d.name, text: parts.filter((p) => p !== '').join(' · '), kind: fillOf(d.name) };
   });
 
   function onMove(event: PointerEvent): void {
@@ -404,8 +469,8 @@
   }
 </script>
 
-{#snippet swatch(kind: CellKind)}
-  <span class="swatch" style:background={CELL_COLOR[kind]}></span>
+{#snippet swatch(kind: Fill)}
+  <span class="swatch" style:background={FILL_COLOR[kind]}></span>
 {/snippet}
 
 {#snippet edge(b: Block, side: 'left' | 'right')}
@@ -424,7 +489,7 @@
   <div class="key">
     <ul class="legend" aria-label="Cell colours">
       {#each legend as kind (kind)}
-        <li>{@render swatch(kind)}{CELL_LABEL[kind]}</li>
+        <li>{@render swatch(kind)}{FILL_LABEL[kind]}</li>
       {/each}
     </ul>
   </div>
@@ -504,12 +569,12 @@
         <rect class="open" x={b.p.x} y={b.y} width={b.bandW} height={HEAD_H - 4} />
       {/if}
       {@const lx = labelX(b)}
-      <text class="blk" x={lx + 6} y={b.y + 13}>{label(b, done[i], lx)}</text>
+      <text class="blk" x={lx + 6} y={b.y + 13}>{label(b, done[i], readiness[i], lx)}</text>
     {/each}
 
-    {#each CELL_KINDS as kind (kind)}
+    {#each FILLS as kind (kind)}
       {#if paths[kind] !== undefined}
-        <path d={paths[kind]} style:fill={CELL_COLOR[kind]} />
+        <path d={paths[kind]} style:fill={FILL_COLOR[kind]} />
       {/if}
     {/each}
     {#if spot !== null}

@@ -12,6 +12,7 @@
   import { memberImages, modelGroups, targetCounts, withPreselected } from '#lib/software/campaign-images.ts';
   import { DATA_ROOT, campaignCreatePatch, validateNewCampaign, type Device } from '#lib/software/model.ts';
   import ModelImages from '#lib/software/ModelImages.svelte';
+  import { NOTICE_ERROR, noticeDays } from '#lib/software/planning-form.ts';
   import SelectionBuilder from '#lib/software/SelectionBuilder.svelte';
   import { campaignOwners, emptySelection, type Selection } from '#lib/software/selection.ts';
   import type { PageProps } from './$types';
@@ -41,6 +42,8 @@
   // newer release would be downgraded, which can be what is wanted.
   let leaveOnTarget = $state(true);
   let leaveNewer = $state(false);
+  /** Days of notice as typed; '' for none. */
+  let notice = $state('');
 
   let devicesTouched = $state(false);
   let touched = $state(false);
@@ -59,9 +62,13 @@
   );
   /** Every grouped device is left out: the campaign would have none. */
   let allLeftOut = $derived(grouped.groups.length > 0 && members.length === 0);
-  let errors = $derived(
-    validateNewCampaign({ name, devices: members }, campaigns.map((c) => c.name)).errors
-  );
+  let errors = $derived.by((): Record<string, string> => {
+    const out: Record<string, string> = {
+      ...validateNewCampaign({ name, devices: members }, campaigns.map((c) => c.name)).errors
+    };
+    if (noticeDays(notice) === null) out['notification-period'] = NOTICE_ERROR;
+    return out;
+  });
 
   function devicesText(n: number): string {
     return n === 1 ? '1 device' : `${n.toLocaleString()} devices`;
@@ -92,7 +99,15 @@
       creating = true;
       createError = '';
       const campaign = name.trim();
-      await restconfPatchJson(DATA_ROOT, campaignCreatePatch({ name: campaign, devices: members, allowStaging }));
+      await restconfPatchJson(
+        DATA_ROOT,
+        campaignCreatePatch({
+          name: campaign,
+          devices: members,
+          allowStaging,
+          notificationPeriod: noticeDays(notice) ?? 0
+        })
+      );
       await goto(`/campaigns/${encodeURIComponent(campaign)}`, { refreshAll: true });
     } catch (error) {
       createError = errorText(error, 'Failed to create the campaign.');
@@ -178,7 +193,6 @@
                 <span>Leave out the {devicesText(counts.newer)} on a newer release</span>
               </label>
             {/if}
-            <p class="hint">Based on the release each device last reported.</p>
           </div>
         {/if}
       {/if}
@@ -187,22 +201,31 @@
 
   <section class="card">
     <Section title="Campaign" yangPath="software:software/upgrade-campaign">
-      <div class="name">
+      <div class="fields">
+        <div class="name">
+          <FieldText
+            label="Name"
+            required={true}
+            value={name}
+            error={touched ? errors['name'] : ''}
+            yangType="string"
+            placeholder="e.g. xe-1718-emea"
+            onchange={(v) => (name = v)}
+            ontouch={() => (touched = true)}
+          />
+        </div>
         <FieldText
-          label="Name"
-          required={true}
-          value={name}
-          error={touched ? errors['name'] : ''}
-          yangType="string"
-          placeholder="e.g. xe-1718-emea"
-          onchange={(v) => (name = v)}
-          ontouch={() => (touched = true)}
+          label="Notice (days)"
+          value={notice}
+          error={errors['notification-period']}
+          yangType="uint16, days"
+          placeholder="0"
+          onchange={(v) => (notice = v)}
         />
-      </div>
-      <div class="staging">
-        <input id="allow-staging" type="checkbox" bind:checked={allowStaging} aria-describedby="staging-help" />
-        <label for="allow-staging">Allow staging the image before the impacting step</label>
-        <p class="hint" id="staging-help">Devices copy their image before their window opens, with no outage.</p>
+        <label class="check ahead">
+          <input type="checkbox" bind:checked={allowStaging} />
+          <span>Prepare ahead</span>
+        </label>
       </div>
       <div>
         <!-- In place before any message, so that a screen reader reads it. -->
@@ -228,8 +251,36 @@
 {/if}
 
 <style>
+  /* The name has a row of its own. The notice takes a number's width; the
+     box beside it sits level with its input, above the line the field keeps
+     for a message. */
+  .fields {
+    display: grid;
+    grid-template-columns: 220px auto;
+    justify-content: start;
+    gap: 0 24px;
+  }
+
   .name {
+    grid-column: 1 / -1;
     max-width: 420px;
+  }
+
+  .ahead {
+    align-self: end;
+    /* An input's padding and border, so as tall as one. */
+    padding-block: 10px;
+    margin-bottom: calc(1rem + 6px);
+  }
+
+  @media (max-width: 560px) {
+    .fields {
+      grid-template-columns: 1fr;
+    }
+
+    .ahead {
+      padding-block: 0;
+    }
   }
 
   .target-checks {
@@ -252,31 +303,8 @@
     color: var(--sw-warning);
   }
 
-  .hint {
-    margin: 0;
-    font-size: var(--sw-text-xs);
-    color: var(--sw-text-muted);
-  }
-
   .all-left-out {
     text-align: right;
-  }
-
-  /* The help lines up with the label's text, past the box. */
-  .staging {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
-    align-items: center;
-    gap: 2px 8px;
-    font-size: var(--sw-text-sm);
-  }
-
-  .staging label {
-    cursor: pointer;
-  }
-
-  .staging .hint {
-    grid-column: 2;
   }
 
   .editor-actions {

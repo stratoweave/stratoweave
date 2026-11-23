@@ -592,6 +592,17 @@
   window opens" and "N device(s) failed to prepare and copy the image in
   their window". The upgrade in the window still copies the image again.
   Before, `allow-staging` on a campaign had no effect. [#784]
+- The web UI's campaign page shows preparing ahead. With `allow-staging`,
+  a bar over the plan timeline counts the members that prepared, that
+  prepare and that failed to, as "443 / 1,115 · 7 failed", with the rest
+  of the bar still to start. On the timeline a waiting member's cell says
+  whether its image is prepared, preparing or failed to prepare, and a
+  window that has not opened says how many of its members are ready. The
+  Prepare chip in front of the bar hides all of it, and the plan's prepare
+  alarms with it. The device list has a Prepare column and a prepare
+  failed filter, and Schedule and pace turns Prepare ahead on or off.
+- The new-campaign wizard sets the campaign's `notification-period`, as
+  Notice in days, as the campaign page does.
 - A campaign releases a member only once the member's status answers the
   campaign's target: `upgrade-needed`, or a final status. Until then the
   plan holds the member in its window, with the alarm "N device(s) have not
@@ -770,6 +781,10 @@
   show no model or version until the page is loaded again. [#754]
 - Fixed the campaign plan timeline drawing a crowded window past its end.
   Its columns grow taller instead. [#761]
+- Fixed a tall last column in plan timeline windows whose devices start
+  until the window closes. Every start in the window's last few pixels
+  went to that column; the starts are now spread over the window's
+  columns.
 - The campaign page shows why members wait. Its progress bar splits the
   members that it upgraded from those that were up to date already, and
   the members that wait into held, not answered and waiting, and says what

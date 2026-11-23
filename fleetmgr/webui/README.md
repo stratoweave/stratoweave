@@ -49,8 +49,9 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   The devices that run their image are left out unless the operator
   unticks that; the newer ones get a downgrade warning and are left out
   only on request. Plan: Create sends one PATCH with
-  `admin-state: plan` and opens the campaign page, which shows the plan
-  and sets schedule and pace.
+  `admin-state: plan`, the notice in days as `notification-period` when it
+  is more than 0, and `allow-staging` when Prepare ahead is ticked, and
+  opens the campaign page, which shows the plan and sets schedule and pace.
 - The image list's `url-base`, set on the images page, is where devices
   fetch images from: url-base followed by the image name.
 - Each fleet device entry carries config-false `state/platform`: `os`,
@@ -80,7 +81,8 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   500. The controller keeps the devices it has already released, so a
   running campaign can be edited too. With a plan, the campaign page also
   shows the devices at once as devices per hour, from the plan's install
-  estimates.
+  estimates. Prepare ahead, in the same form, sets `allow-staging`; a merge
+  sets it true or false.
 - Progress is config-false `state` under each campaign, merged into GET
   responses; each `device-status` row also carries `version`, `model`,
   `stage`, `reason`, the `precheck` and `postcheck` verdicts, the `attempt`
@@ -98,7 +100,9 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `started`, and `finished` once done, instead of `estimated-start`.
   Members in no plan window are not actuated; the UI shows them as one
   count that expands to the device list. The plan timeline draws these
-  times on the wall clock with a marker for now.
+  times on the wall clock with a marker for now. With `allow-staging`,
+  each plan `device` that prepares ahead also has `prepare-start`, and the
+  plan has `prepare-concurrency`, the most members that prepare at once.
 - Reads of the fleet and of the campaigns ask with the RFC 8040 `fields`
   parameter for only what the page shows; `src/lib/software/model.ts` has
   one constant per selection. The fleet list (`data/fleetmgr:fleet`
@@ -271,7 +275,9 @@ the campaign page draws them on a timeline, one cell per device, that takes
 the live status as the run passes them. Below it, each device's run is a
 chain of its steps, prepare, pre-check, install, post-check and commit: the
 step running now pulses, a failed step is red with a cross, and a rollback
-shows as ↺ after it; the device's `reason` says why the run stopped. Next to
+shows as ↺ after it; the device's `reason` says why the run stopped. A
+device that waits for its window shows prepare running while it prepares
+its target ahead, and done once it has. Next to
 the chain, the message of the device's `prepare` or `install` says what the
 device does now, as `add: extract`, with a bar while the prepare transfers
 the image, and after the install when the commit window ends. The UI
@@ -279,10 +285,25 @@ adds no semantics the model does not carry —
 anything done here can be done identically over NETCONF or plain RESTCONF.
 Two rules go beyond the model, in the wizard and on the campaign page: a
 newly set deadline must lie ahead, and the pace comes from a deadline or a
-number of devices at once, not both. Rate and ETA are measured since page
-open, and nothing is latched: status tracks live device state. Pause
-merges `admin-state: plan`: members that upgrade stop before their
-install and go on when the campaign runs again.
+number of devices at once, not both. Nothing is latched: status tracks
+live device state. Pause merges `admin-state: plan`: members that upgrade
+stop before their install and go on when the campaign runs again.
+
+With `allow-staging` (Prepare ahead), members copy their image before
+their window. A member's prepare is scheduled, preparing, prepared or
+failed from its `prepare` job while it waits for its window, and only
+when the job is for its `target-release`; a member without a report yet
+is scheduled. A failed prepare is a warning: the device copies its image
+in its window. Once the member's window run starts, that run fills the
+same `prepare` entry, so the member only counts as released. A bar over
+the timeline counts the prepared, preparing and failed members; its
+tooltip adds when the last prepare starts and names the failed ones. On
+the timeline, a waiting member's cell shows its prepare once it has
+started, and a window that has not opened says how many of its members
+that prepare ahead are ready. The Prepare chip in front of the bar hides
+the bar, the cells' prepare colours and the plan's prepare alarms; the
+browser keeps the choice. The device list gets a Prepare column and a
+prepare failed filter.
 
 Sharding is internal: the top places each device on a flotilla by its
 name, and nothing in the UI shows the placement.

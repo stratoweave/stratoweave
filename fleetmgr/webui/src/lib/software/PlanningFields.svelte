@@ -54,13 +54,6 @@
     return `${value} (default)`;
   }
 
-  let budgetField: HTMLElement | undefined = $state();
-
-  /** Focus the failure budget, as the run dialog's Set one does. */
-  export function focusBudget(): void {
-    budgetField?.querySelector('input')?.focus();
-  }
-
   let perHour = $derived(installSeconds ? perHourText(draft, installSeconds) : '');
 
   let deadlineHint = $derived.by(() => {
@@ -174,7 +167,7 @@
       tooltip="Uses only windows that open this long after the campaign first runs."
       onchange={(v) => patch({ notificationPeriod: v })}
     />
-    <div class="slot" bind:this={budgetField}>
+    <div class="slot">
       <FieldText
         label="Failure budget (%)"
         value={draft.failureBudget}
@@ -187,6 +180,15 @@
       />
     </div>
   </div>
+  <label class="ahead" class:disabled>
+    <input
+      type="checkbox"
+      checked={draft.allowStaging}
+      {disabled}
+      onchange={(e) => patch({ allowStaging: e.currentTarget.checked })}
+    />
+    <span class="ahead-name">Prepare ahead</span>
+  </label>
 </div>
 
 <style>
@@ -208,6 +210,25 @@
   /* Holds a field for a reference to it, not a box of its own. */
   .slot {
     display: contents;
+  }
+
+  .ahead {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 12px;
+    cursor: pointer;
+  }
+
+  .ahead-name {
+    font-size: var(--sw-text-sm);
+    font-weight: 500;
+    color: var(--sw-text-primary);
+  }
+
+  .ahead.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   /* Two radios drawn as one segmented control, as tall as an input. */
