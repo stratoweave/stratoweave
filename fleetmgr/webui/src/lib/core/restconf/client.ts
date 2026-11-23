@@ -13,9 +13,29 @@ export class RestconfError extends Error {
   status: number;
 
   constructor(status: number, message: string) {
-    super(`RESTCONF ${status}: ${message}`);
+    super(describeFailure(status, message));
     this.status = status;
   }
+}
+
+/** A failed request in an operator's words: the server's own error-message
+ * when it sent RFC 8040 errors, its plain-text answer when short, and
+ * otherwise what the status means, with the status code last. */
+function describeFailure(status: number, body: string): string {
+  const text = body.trim();
+  try {
+    const errors = (JSON.parse(text) as { 'ietf-restconf:errors'?: { error?: unknown } })['ietf-restconf:errors']?.error;
+    const list = (Array.isArray(errors) ? errors : [errors]) as { 'error-message'?: string }[];
+    const messages = list.map((e) => e?.['error-message']).filter((m): m is string => !!m);
+    if (messages.length > 0) return `${messages.join(' ')} (${status})`;
+  } catch {
+    // not JSON
+  }
+  if (status === 502 || status === 503 || status === 504) {
+    return `The server did not answer (${status}). It may be restarting or overloaded.`;
+  }
+  if (text && text.length <= 300 && !text.startsWith('<')) return `${text} (${status})`;
+  return `The request failed (${status}${text ? ` ${text.slice(0, 80)}` : ''}).`;
 }
 
 function normalizePath(path: string): string {

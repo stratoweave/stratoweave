@@ -6,19 +6,28 @@
   import { restconfPatchJson } from '#lib/core/restconf/client.ts';
   import FieldText from '#lib/core/ui/FieldText.svelte';
   import { focusFirstError } from '#lib/core/ui/focus.ts';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import SegmentedControl from '#lib/core/ui/SegmentedControl.svelte';
   import TokenSelect from '#lib/core/ui/TokenSelect.svelte';
-  import { groupCreatePatch, parseSeparation, suggestNames, validateNewGroup } from '#lib/software/groups.ts';
+  import {
+    FAILURE_TEXT,
+    SEPARATION_TEXT,
+    groupCreatePatch,
+    parseSeparation,
+    suggestNames,
+    validateNewGroup
+  } from '#lib/software/groups.ts';
   import { DATA_ROOT, type FailurePolicy, type SeparationPolicy } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
 
-  const SEPARATIONS: { value: SeparationPolicy; label: string }[] = [
-    { value: 'spread', label: 'spread' },
-    { value: 'pack', label: 'pack' }
+  // What each option does, as its tooltip.
+  const SEPARATIONS: { value: SeparationPolicy; label: string; title: string }[] = [
+    { value: 'spread', label: 'spread', title: SEPARATION_TEXT.spread },
+    { value: 'pack', label: 'pack', title: SEPARATION_TEXT.pack }
   ];
-  const FAILURES: { value: FailurePolicy; label: string }[] = [
-    { value: 'continue', label: 'continue' },
-    { value: 'hold', label: 'hold' }
+  const FAILURES: { value: FailurePolicy; label: string; title: string }[] = [
+    { value: 'continue', label: 'continue', title: FAILURE_TEXT.continue },
+    { value: 'hold', label: 'hold', title: FAILURE_TEXT.hold }
   ];
 
   let { data }: PageProps = $props();
@@ -85,90 +94,94 @@
   <div>
     <h1>New group</h1>
   </div>
+  <!-- The name and member checks need the fleet and the groups. -->
   <div class="page-actions">
     <a class="btn btn-secondary" href="/groups">Cancel</a>
-    <button class="btn btn-primary" type="button" disabled={saving} onclick={create}>
+    <button class="btn btn-primary" type="button" disabled={saving || !!data.loadError} onclick={create}>
       {saving ? 'Creating…' : 'Create group'}
     </button>
   </div>
 </div>
 
+<!-- In place before any message, so that a screen reader reads each one. -->
+<div role="alert">
+  {#if statusMessage}
+    <div class="error-state status">{statusMessage}</div>
+  {/if}
+</div>
+
 {#if data.loadError}
-  <div class="error-state status">{data.loadError}</div>
-{/if}
-
-{#if statusMessage}
-  <div class="error-state status" role="alert">{statusMessage}</div>
-{/if}
-
-<section bind:this={form} class="card form">
-  <FieldText
-    label="Name"
-    required={true}
-    value={name}
-    error={errors['name']}
-    mono={true}
-    placeholder="e.g. site-0042"
-    onchange={(v) => (name = v)}
-    ontouch={() => (touched = true)}
-  />
-  <div class="field">
-    <label class="field__label" for={`${uid}-members`}>
-      Members <span class="field__required" aria-hidden="true">*</span>
-    </label>
-    <TokenSelect
-      id={`${uid}-members`}
-      options={memberOptions}
-      selected={members}
-      label="Members"
-      placeholder="add device"
-      suggest={true}
-      required={true}
-      invalid={!!errors['members']}
-      describedby={`${uid}-members-meta`}
-      bind:draft={memberDraft}
-      onchange={(next) => (members = next)}
-    />
-    <small id={`${uid}-members-meta`} class="field__meta" class:field__meta--error={!!errors['members']}>
-      {errors['members'] || ' '}
-    </small>
-  </div>
-  <div class="grid">
-    <div class="field">
-      <span class="field__label">Separation</span>
-      <div class="policy">
-        <SegmentedControl
-          options={SEPARATIONS}
-          value={separationPolicy}
-          ariaLabel="Separation policy"
-          onchange={(next) => (separationPolicy = next)}
-        />
-      </div>
-      <small class="field__meta"> </small>
-    </div>
+  <LoadError message={data.loadError} />
+{:else}
+  <section bind:this={form} class="card form">
     <FieldText
-      label="Min separation"
-      value={minSeparation}
-      error={errors['min-separation']}
+      label="Name"
+      required={true}
+      value={name}
+      error={errors['name']}
       mono={true}
-      placeholder="e.g. 30m"
-      onchange={(v) => (minSeparation = v)}
+      placeholder="e.g. site-0042"
+      onchange={(v) => (name = v)}
       ontouch={() => (touched = true)}
     />
     <div class="field">
-      <span class="field__label">On failure</span>
-      <div class="policy">
-        <SegmentedControl
-          options={FAILURES}
-          value={failurePolicy}
-          ariaLabel="Failure policy"
-          onchange={(next) => (failurePolicy = next)}
-        />
-      </div>
-      <small class="field__meta"> </small>
+      <label class="field__label" for={`${uid}-members`}>
+        Members <span class="field__required" aria-hidden="true">*</span>
+      </label>
+      <TokenSelect
+        id={`${uid}-members`}
+        options={memberOptions}
+        selected={members}
+        label="Members"
+        placeholder="add device"
+        suggest={true}
+        required={true}
+        invalid={!!errors['members']}
+        describedby={`${uid}-members-meta`}
+        bind:draft={memberDraft}
+        onchange={(next) => (members = next)}
+      />
+      <small id={`${uid}-members-meta`} class="field__meta" class:field__meta--error={!!errors['members']}>
+        {errors['members'] || ' '}
+      </small>
     </div>
-  </div>
-</section>
+    <div class="grid">
+      <div class="field">
+        <span class="field__label">Separation</span>
+        <div class="policy">
+          <SegmentedControl
+            options={SEPARATIONS}
+            value={separationPolicy}
+            ariaLabel="Separation policy"
+            onchange={(next) => (separationPolicy = next)}
+          />
+        </div>
+        <small class="field__meta"> </small>
+      </div>
+      <FieldText
+        label="Min separation"
+        value={minSeparation}
+        error={errors['min-separation']}
+        mono={true}
+        placeholder="e.g. 30m"
+        onchange={(v) => (minSeparation = v)}
+        ontouch={() => (touched = true)}
+      />
+      <div class="field">
+        <span class="field__label">On failure</span>
+        <div class="policy">
+          <SegmentedControl
+            options={FAILURES}
+            value={failurePolicy}
+            ariaLabel="Failure policy"
+            onchange={(next) => (failurePolicy = next)}
+          />
+        </div>
+        <small class="field__meta"> </small>
+      </div>
+    </div>
+  </section>
+{/if}
 
 <style>
   .form {
@@ -181,6 +194,14 @@
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 12px;
+  }
+
+  /* One field to a row on a phone, where a policy's line has no room
+     beside the next field. */
+  @media (max-width: 720px) {
+    .grid {
+      grid-template-columns: minmax(0, 1fr);
+    }
   }
 
   /* The control keeps its own width, as the field next to it is a row of

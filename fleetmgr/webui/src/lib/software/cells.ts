@@ -16,14 +16,20 @@ export type CellKind =
   | 'held'
   | 'down';
 
+/** Each kind's cell fill. The design tokens go by var(), so they follow
+ * app.css and must be set through CSS, not an SVG presentation attribute;
+ * the rest are the cells' own. Waiting and not answered stay dim: most
+ * members wait before a run, and brighter they would read as one heavy
+ * block. */
 export const CELL_COLOR: Record<CellKind, string> = {
-  upgraded: '#16a34a',
+  upgraded: 'var(--sw-success)',
   // Done like upgraded, but dimmer: the device was on the target release
   // already.
-  'up-to-date': '#166534',
-  'in-progress': '#22d3ee',
-  failed: '#ef4444',
-  'rolled-back': '#991b1b',
+  'up-to-date': '#15803d',
+  'in-progress': 'var(--sw-accent)',
+  failed: 'var(--sw-danger)',
+  // Dimmer than failed.
+  'rolled-back': '#c53030',
   // A device that needs the upgrade and waits for its turn.
   waiting: '#1d2c49',
   // A device that has not said whether it needs the upgrade.
@@ -36,7 +42,7 @@ export const CELL_COLOR: Record<CellKind, string> = {
 
 export const CELL_LABEL: Record<CellKind, string> = {
   upgraded: 'upgraded',
-  'up-to-date': 'already up to date',
+  'up-to-date': 'up to date',
   'in-progress': 'in progress',
   failed: 'failed',
   'rolled-back': 'rolled back',
@@ -73,9 +79,6 @@ export function cellKind(row: DeviceStatusRow | undefined): CellKind {
       return 'not-answered';
   }
 }
-
-/** The gutter between cells; also the grid background. */
-export const CELL_BG = '#0f1a30';
 
 /** Gutter width for a cell size: 1 px up to 8 px cells, then an eighth. */
 export function gutter(size: number): number {

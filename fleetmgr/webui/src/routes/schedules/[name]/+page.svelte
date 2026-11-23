@@ -1,4 +1,5 @@
 <script lang="ts">
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import ScheduleEditor from '#lib/maintenance/ScheduleEditor.svelte';
   import type { PageProps } from './$types';
 
@@ -6,10 +7,8 @@
 </script>
 
 {#if data.loadError}
-  <div class="error-state status">{data.loadError}</div>
-{/if}
-
-{#if data.schedule === null}
+  <LoadError message={data.loadError} />
+{:else if data.schedule === null}
   <section class="card">
     <div class="empty-state">
       No schedule named {data.name}. <a href="/schedules">Back to schedules</a>

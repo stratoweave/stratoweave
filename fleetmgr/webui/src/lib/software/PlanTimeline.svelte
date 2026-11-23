@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { CELL_BG, CELL_COLOR, CELL_KINDS, CELL_LABEL, cellKind, type CellKind } from '#lib/software/cells.ts';
+  import { tick } from 'svelte';
+  import { CELL_COLOR, CELL_KINDS, CELL_LABEL, cellKind, type CellKind } from '#lib/software/cells.ts';
   import { heldText } from '#lib/software/device-state.ts';
   import {
     STATUS_LABEL,
@@ -16,7 +17,7 @@
     axisSpans,
     axisTicks,
     cellAt,
-    cellRects,
+    cellPaths,
     columnAt,
     fitter,
     holdWindows,
@@ -28,17 +29,9 @@
     tickStep,
     windowDone,
     type Placed,
-    type Rect,
     type WindowCells
   } from '#lib/software/plan-timeline.ts';
-  import {
-    clockLabel,
-    dayLabel,
-    formatClock,
-    formatClockSeconds,
-    formatDuration,
-    sameLocalDay
-  } from '#lib/core/time.ts';
+  import { clockLabel, dayLabel, formatClockSeconds, formatDuration, sameLocalDay } from '#lib/core/time.ts';
 
   interface Props {
     plan: CampaignPlan;
@@ -46,10 +39,16 @@
     rows: Map<string, DeviceStatusRow>;
     /** Unix seconds, ticking. */
     now: number;
+    /** Open at the zoom that fits the whole plan, and do not follow now:
+     * for a campaign in plan mode, where nothing runs. */
+    fitPlan?: boolean;
+    /** Keeps the zoom the viewer picks under this key, such as the
+     * campaign's name. */
+    zoomKey?: string;
     ondevice?: (name: string) => void;
   }
 
-  let { plan, rows, now, ondevice }: Props = $props();
+  let { plan, rows, now, fitPlan = false, zoomKey, ondevice }: Props = $props();
 
   // The plan on a wall-clock axis. Each window is a band as wide as its
   // duration with one cell per device below it, in a column at its
@@ -69,11 +68,18 @@
   const MAX_STACK = 200;
   const FALLBACK_WIDTH = 960;
   const ZOOMS = [1, 2, 4, 8];
-  /** The smallest cell the timeline opens with when a zoom can give it. */
+  /** The smallest cell a run opens with when a zoom can give it. */
   const READABLE_SIZE = 8;
-  const NOW_COLOR = '#22d3ee';
-  const DONE_COLOR = '#16a34a';
-  const uid = $props.id();
+  /** The same for a plan, which is read whole rather than cell by cell. */
+  const FIT_SIZE = 4;
+  /** Where the zoom the viewer picked is kept, under zoomKey. */
+  const ZOOM_STORE = 'fleetmgr.timeline.zoom.';
+  /** A character of the 11px axis labels and the 12px band labels, with
+   * room for the wider fallback monospace fonts. */
+  const AXIS_CHAR_W = 6.8;
+  const BAND_CHAR_W = 7.4;
+  /** Space between two day labels, so they do not read as one. */
+  const DAY_GAP = 16;
 
   interface Block {
     p: Placed;
@@ -87,11 +93,14 @@
 
   let scroller = $state<HTMLDivElement | null>(null);
   let width = $state(0);
-  // Until a chip is picked, the timeline opens at the least zoom whose cells
-  // are readable: 1× on a wide screen, more on a phone, where the fitted
-  // axis would shrink the cells to a few pixels.
-  let zoomChoice = $state<number | null>(null);
-  let follow = $state(true);
+  let scrollX = $state(0);
+  // The zoom the viewer picked, kept per zoomKey. Until one is picked, the
+  // timeline opens at the least zoom whose cells are readable. A plan takes
+  // smaller ones, so it opens fitted whole at 1×, unless that would shrink
+  // them to a few pixels, as on a phone.
+  let zoomChoice = $derived(storedZoom(zoomKey));
+  // A run follows now; in a plan nothing runs to follow.
+  let follow = $derived(!fitPlan);
   let lastSet = -1;
 
   // Geometry: rebuilt when the plan's times, the width or the zoom change.
@@ -106,7 +115,7 @@
   let fit = $derived(
     fitter(ordered, axisSpans(spans, anchor, step), width > 0 ? width : FALLBACK_WIDTH, PAD_L, PAD_R, MAX_STACK)
   );
-  let autoZoom = $derived(width === 0 ? 1 : pickZoom(ZOOMS, READABLE_SIZE, fit));
+  let autoZoom = $derived(width === 0 ? 1 : pickZoom(ZOOMS, fitPlan ? FIT_SIZE : READABLE_SIZE, fit));
   let zoom = $derived(zoomChoice ?? autoZoom);
   let axis = $derived(fit(zoom).axis);
   let placed = $derived(fit(zoom).placed);
@@ -146,11 +155,29 @@
 
   let ticks = $derived(axisTicks(axis, tickStep(axis.pxPerHour)));
 
-  // Statuses: the colours, each window's done share and the legend of the
-  // colours that show.
-  let rects = $derived(
-    blocks.map((b): Rect[] => cellRects(b.cells, rows, b.gy, cells.size, cells.pitch))
-  );
+  // Day labels: at the first tick and wherever the day changes, centred on
+  // the tick but kept inside the chart. One that would run into the next
+  // day's moves left of it, or goes when there is no room.
+  let days = $derived.by(() => {
+    const out: { text: string; x: number; w: number }[] = [];
+    ticks.forEach((t, i) => {
+      if (i > 0 && sameLocalDay(ticks[i - 1], t)) return;
+      const text = dayLabel(t);
+      const w = text.length * AXIS_CHAR_W;
+      const x = Math.max(2, Math.min(axis.width - 2 - w, axis.xOf(t) - w / 2));
+      const prev = out[out.length - 1];
+      if (prev !== undefined && prev.x + prev.w + DAY_GAP > x) {
+        if (x - DAY_GAP - prev.w >= 2) prev.x = x - DAY_GAP - prev.w;
+        else out.pop();
+      }
+      out.push({ text, x, w });
+    });
+    return out;
+  });
+
+  // Statuses: the cells, each window's done share and the legend of the
+  // kinds that show.
+  let paths = $derived(cellPaths(blocks, rows, cells.size, cells.pitch));
   let done = $derived(placed.map((p) => windowDone(p.w, rows)));
   let legend = $derived.by((): CellKind[] => {
     const shown = new Set<CellKind>();
@@ -177,21 +204,99 @@
 
   function onScroll(): void {
     if (!scroller) return;
+    scrollX = scroller.scrollLeft;
     if (Math.abs(scroller.scrollLeft - lastSet) > 1) follow = false;
   }
 
-  /** The label parts that fit the band: first to go is the range, then
-   * the progress, then the count. */
-  function label(b: Block, share: number): string {
+  function storedZoom(key: string | undefined): number | null {
+    if (key === undefined) return null;
+    try {
+      const z = Number(localStorage.getItem(ZOOM_STORE + key));
+      return ZOOMS.includes(z) ? z : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Zooms to z and keeps it for zoomKey. A run then follows now; a plan
+   * keeps what is in the middle of the view there. */
+  async function setZoom(z: number): Promise<void> {
+    if (zoomKey !== undefined) {
+      try {
+        localStorage.setItem(ZOOM_STORE + zoomKey, String(z));
+      } catch {
+        // Without storage the zoom lasts while the page is open.
+      }
+    }
+    if (!fitPlan) follow = true;
+    const mid = scroller !== null && !follow ? (scroller.scrollLeft + scroller.clientWidth / 2) / axis.width : null;
+    zoomChoice = z;
+    if (mid === null) return;
+    await tick();
+    if (scroller === null) return;
+    scroller.scrollLeft = mid * axis.width - scroller.clientWidth / 2;
+    lastSet = scroller.scrollLeft;
+  }
+
+  // Where the view starts: the last scroll, clamped to an axis that a zoom
+  // may have just shrunk.
+  let viewX = $derived(Math.max(0, Math.min(scrollX, axis.width - width)));
+
+  // Windows outside the scrolled view: the nearest one on each side gets a
+  // marker above that edge of the chart, which scrolls it into view. Their
+  // row shows while the chart is wider than the view; over the chart they
+  // would hide a band's label or the clock.
+  let overflows = $derived(width > 0 && axis.width > width);
+  let edges = $derived.by(() => {
+    let left: Block | null = null;
+    let right: Block | null = null;
+    if (!overflows) return { left, right };
+    for (const b of blocks) {
+      const end = b.p.x + b.bandW;
+      if (end <= viewX && (left === null || end > left.p.x + left.bandW)) left = b;
+      if (b.p.x >= viewX + width && (right === null || b.p.x < right.p.x)) right = b;
+    }
+    return { left, right };
+  });
+
+  /** Scrolls a window's band to the middle of the view, or its start to the
+   * left edge when it is wider than the view. */
+  function reveal(b: Block): void {
+    if (scroller === null) return;
+    const view = scroller.clientWidth;
+    const left = b.bandW + PAD_L + PAD_R <= view ? b.p.x + b.bandW / 2 - view / 2 : b.p.x - PAD_L;
+    follow = false;
+    const still = matchMedia('(prefers-reduced-motion: reduce)').matches;
+    scroller.scrollTo({ left, behavior: still ? 'auto' : 'smooth' });
+    // The marker goes once its window shows; focus stays on the timeline.
+    scroller.focus({ preventScroll: true });
+  }
+
+  function windowName(w: PlanWindow): string {
+    return w.schedule || 'window';
+  }
+
+  function devices(n: number): string {
+    return `${n.toLocaleString()} device${n === 1 ? '' : 's'}`;
+  }
+
+  /** Where a band's label starts: at the band, or at the view's left edge
+   * while the band starts left of it. */
+  function labelX(b: Block): number {
+    return Math.max(b.p.x, Math.min(viewX, b.p.x + b.bandW));
+  }
+
+  /** The label parts that fit the band from x on: first to go is the
+   * range, then the progress, then the count. */
+  function label(b: Block, share: number, x: number): string {
     const w = b.p.w;
-    const name = w.schedule || 'window';
+    const name = windowName(w);
     const range = opensAtLaunch(w)
       ? w.end === null
         ? 'always open'
         : `until ${clockLabel(w.end)}`
       : `${clockLabel(w.start)} → ${w.end === null ? 'open' : clockLabel(w.end)}`;
-    const n = w.devices.length;
-    const count = `${n.toLocaleString()} device${n === 1 ? '' : 's'}`;
+    const count = devices(w.devices.length);
     const pct = now >= w.start ? `${Math.round(share * 100)}%` : null;
     const options = [
       [name, range, count, pct],
@@ -201,12 +306,19 @@
     ];
     for (const parts of options) {
       const text = parts.filter((p) => p !== null).join(' · ');
-      if (text.length * 6.8 + 12 <= b.bandW) return text;
+      if (text.length * BAND_CHAR_W + 12 <= b.p.x + b.bandW - x) return text;
     }
     return '';
   }
 
-  type Hit = { kind: 'device'; d: PlanDevice } | { kind: 'window'; w: PlanWindow } | null;
+  type Hit = { kind: 'device'; name: string } | { kind: 'window'; w: PlanWindow } | null;
+
+  // The line under the chart shows what the pointer is on, else the last
+  // thing tapped: touch has no hover to show it with.
+  let hover = $state<Hit>(null);
+  let pinned = $state<Hit>(null);
+  let shown = $derived(hover ?? pinned);
+  let pointer = 'mouse';
 
   function hitAt(event: MouseEvent): Hit {
     const svg = event.currentTarget as SVGSVGElement;
@@ -219,47 +331,100 @@
       if (py >= b.gy && py < b.gy + b.gridH && px < b.p.x + b.gridW) {
         const col = columnAt(b.cells.cols, px, cells.size);
         const d = col < 0 ? null : cellAt(b.cells, col, Math.floor((py - b.gy) / cells.pitch));
-        if (d !== null) return { kind: 'device', d };
+        if (d !== null) return { kind: 'device', name: d.name };
       }
     }
     return null;
   }
 
-  function describe(hit: Hit): string {
-    if (hit === null) return '';
-    if (hit.kind === 'window') {
-      const w = hit.w;
-      const opens = opensAtLaunch(w) ? 'opens at launch' : `opens ${formatClock(w.start)}`;
-      const closes = w.end === null ? 'never closes' : `closes ${formatClock(w.end)}`;
-      return `${w.schedule || 'window'}: ${opens}, ${closes}, ${w.devices.length} device(s)`;
+  function sameHit(a: Hit, b: Hit): boolean {
+    if (a === null || b === null) return a === b;
+    if (a.kind === 'device') return b.kind === 'device' && a.name === b.name;
+    return b.kind === 'window' && a.w === b.w;
+  }
+
+  /** A device's cell in the current layout. */
+  function locate(name: string): { d: PlanDevice; x: number; y: number } | null {
+    for (const b of blocks) {
+      for (const col of b.cells.cols) {
+        for (let row = 0; row < col.count; row++) {
+          const d = b.cells.devices[col.first + row];
+          if (d.name === name) return { d, x: col.x, y: b.gy + row * cells.pitch };
+        }
+      }
     }
-    const d = hit.d;
+    return null;
+  }
+
+  let spot = $derived(shown?.kind === 'device' ? locate(shown.name) : null);
+
+  /** A time as the axis reads it: the clock, and the day unless today. */
+  function when(t: number): string {
+    return sameLocalDay(t, now) ? clockLabel(t) : `${dayLabel(t)} ${clockLabel(t)}`;
+  }
+
+  let info = $derived.by((): { name: string; text: string; kind: CellKind | null } | null => {
+    if (shown?.kind === 'window') {
+      const w = shown.w;
+      const opens = opensAtLaunch(w) ? 'opens at launch' : `opens ${when(w.start)}`;
+      const closes = w.end === null ? 'never closes' : `closes ${when(w.end)}`;
+      return { name: windowName(w), text: `${opens}, ${closes} · ${devices(w.devices.length)}`, kind: null };
+    }
+    if (spot === null) return null;
+    const d = spot.d;
     const row = rows.get(d.name);
-    const status = STATUS_LABEL[row?.status ?? 'pending'];
     const held = row === undefined ? '' : heldText(row);
-    const start = `${d.started === null ? 'starts' : 'started'} ${formatClock(deviceStart(d))}`;
-    const took = `${d.finished === null ? '~' : 'took '}${formatDuration(deviceDuration(d))}`;
-    return `${d.name}: ${status}${held ? ` (held: ${held})` : ''} · ${start} · ${took}`;
+    const parts = [
+      STATUS_LABEL[row?.status ?? 'pending'],
+      held ? `held: ${held}` : '',
+      `${d.started === null ? 'starts' : 'started'} ${when(deviceStart(d))}`,
+      `${d.finished === null ? '~' : 'took '}${formatDuration(deviceDuration(d))}`
+    ];
+    return { name: d.name, text: parts.filter((p) => p !== '').join(' · '), kind: cellKind(row) };
+  });
+
+  function onMove(event: PointerEvent): void {
+    // Touch has no hover; a tap shows what it hit instead.
+    if (event.pointerType === 'touch') return;
+    const hit = hitAt(event);
+    (event.currentTarget as SVGSVGElement).style.cursor = hit?.kind === 'device' ? 'pointer' : 'default';
+    if (!sameHit(hit, hover)) hover = hit;
   }
 
   function onClick(event: MouseEvent): void {
     const hit = hitAt(event);
-    if (hit !== null && hit.kind === 'device') ondevice?.(hit.d.name);
-  }
-
-  function onMove(event: MouseEvent): void {
-    const svg = event.currentTarget as SVGSVGElement;
-    const hit = hitAt(event);
-    svg.querySelector('title')!.textContent = describe(hit);
-    svg.style.cursor = hit !== null && hit.kind === 'device' ? 'pointer' : 'default';
+    if (pointer !== 'touch') {
+      if (hit?.kind === 'device') ondevice?.(hit.name);
+      return;
+    }
+    // A tap keeps what it hit under the chart; a second tap on a device
+    // opens it.
+    if (hit?.kind === 'device' && pinned?.kind === 'device' && pinned.name === hit.name) ondevice?.(hit.name);
+    else pinned = hit;
   }
 </script>
+
+{#snippet swatch(kind: CellKind)}
+  <span class="swatch" style:background={CELL_COLOR[kind]}></span>
+{/snippet}
+
+{#snippet edge(b: Block, side: 'left' | 'right')}
+  {@const w = b.p.w}
+  <button
+    class="edge {side}"
+    type="button"
+    aria-label={`Scroll to ${windowName(w)}: ${devices(w.devices.length)}`}
+    onclick={() => reveal(b)}
+  >
+    {side === 'left' ? '‹ ' : ''}{windowName(w)} · {w.devices.length.toLocaleString()}{side === 'right' ? ' ›' : ''}
+  </button>
+{/snippet}
 
 <div class="bar">
   <div class="key">
     <ul class="legend" aria-label="Cell colours">
       {#each legend as kind (kind)}
-        <li><span class="swatch" style:background={CELL_COLOR[kind]}></span>{CELL_LABEL[kind]}</li>
+        <li>{@render swatch(kind)}{CELL_LABEL[kind]}</li>
       {/each}
     </ul>
   </div>
@@ -270,23 +435,35 @@
       </button>
     {/if}
     {#each ZOOMS as z (z)}
-      <button
-        class="chip"
-        class:active={zoom === z}
-        type="button"
-        aria-pressed={zoom === z}
-        onclick={() => {
-          zoomChoice = z;
-          follow = true;
-        }}
-      >
+      <button class="chip" class:active={zoom === z} type="button" aria-pressed={zoom === z} onclick={() => setZoom(z)}>
         {z}×
       </button>
     {/each}
   </div>
 </div>
 
-<div class="scroller" bind:this={scroller} bind:clientWidth={width} onscroll={onScroll}>
+{#if overflows}
+  <div class="edges">
+    {#if edges.left !== null}
+      {@render edge(edges.left, 'left')}
+    {/if}
+    {#if edges.right !== null}
+      {@render edge(edges.right, 'right')}
+    {/if}
+  </div>
+{/if}
+
+<!-- Focusable, so Safari scrolls it by keyboard too. -->
+<!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+<div
+  class="scroller"
+  tabindex="0"
+  role="region"
+  aria-label="Plan timeline"
+  bind:this={scroller}
+  bind:clientWidth={width}
+  onscroll={onScroll}
+>
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <svg
@@ -297,36 +474,18 @@
     role="img"
     aria-label="The plan's windows over time, one cell per device at its start"
     onclick={onClick}
-    onmousemove={onMove}
+    onpointerdown={(event) => (pointer = event.pointerType)}
+    onpointermove={onMove}
+    onpointerleave={() => (hover = null)}
   >
-    <title></title>
-    <defs>
-      <!-- One row-gutter pattern per grid, anchored at that grid's corner;
-           columns sit at their own x, so only rows need re-cutting. -->
-      {#each blocks as b, i (i)}
-        {#if b.gridW > 0}
-          <pattern
-            id={`${uid}-${i}`}
-            x={b.p.x}
-            y={b.gy}
-            width="1"
-            height={cells.pitch}
-            patternUnits="userSpaceOnUse"
-          >
-            <rect x="0" y={cells.size} width="1" height={cells.pitch - cells.size} fill={CELL_BG} />
-          </pattern>
-        {/if}
-      {/each}
-    </defs>
-
     <line class="axis" x1={PAD_L} x2={axis.width - PAD_R} y1={AXIS_Y} y2={AXIS_Y} />
-    {#each ticks as t, i (t)}
+    {#each ticks as t (t)}
       {@const x = axis.xOf(t)}
       <line class="tick" x1={x} x2={x} y1={AXIS_Y - 5} y2={lanes.height} />
-      {#if i === 0 || !sameLocalDay(ticks[i - 1], t)}
-        <text class="lbl mid day" x={x} y={DAY_Y}>{dayLabel(t)}</text>
-      {/if}
       <text class="lbl mid" x={x} y={TIME_Y}>{clockLabel(t)}</text>
+    {/each}
+    {#each days as d (d.text)}
+      <text class="lbl day" x={d.x} y={DAY_Y}>{d.text}</text>
     {/each}
     {#each axis.breaks as b (b.from)}
       {@const mid = b.x + b.width / 2}
@@ -339,33 +498,42 @@
     {#each blocks as b, i (i)}
       <rect class="head" x={b.p.x} y={b.y} width={b.bandW} height={HEAD_H - 4} />
       {#if done[i] > 0}
-        <rect x={b.p.x} y={b.y} width={b.bandW * done[i]} height={HEAD_H - 4} fill={DONE_COLOR} />
+        <rect class="done" x={b.p.x} y={b.y} width={b.bandW * done[i]} height={HEAD_H - 4} />
       {/if}
       {#if isOpen(b.p.w)}
-        <rect x={b.p.x} y={b.y} width={b.bandW} height={HEAD_H - 4} fill="none" stroke={NOW_COLOR} />
+        <rect class="open" x={b.p.x} y={b.y} width={b.bandW} height={HEAD_H - 4} />
       {/if}
-      <text class="blk" x={b.p.x + 6} y={b.y + 13}>{label(b, done[i])}</text>
-      {#each rects[i] as r, j (j)}
-        <rect x={r.x} y={r.y} width={r.w} height={r.h} fill={r.fill} />
-      {/each}
-      {#if b.gridW > 0}
-        <rect
-          x={b.p.x}
-          y={b.gy}
-          width={b.gridW}
-          height={b.gridH}
-          fill={`url(#${uid}-${i})`}
-          pointer-events="none"
-        />
-      {/if}
+      {@const lx = labelX(b)}
+      <text class="blk" x={lx + 6} y={b.y + 13}>{label(b, done[i], lx)}</text>
     {/each}
 
-    <line x1={markerX} x2={markerX} y1={MARK_Y - 8} y2={lanes.height} stroke={NOW_COLOR} pointer-events="none" />
+    {#each CELL_KINDS as kind (kind)}
+      {#if paths[kind] !== undefined}
+        <path d={paths[kind]} style:fill={CELL_COLOR[kind]} />
+      {/if}
+    {/each}
+    {#if spot !== null}
+      <rect class="ring" x={spot.x - 1.5} y={spot.y - 1.5} width={cells.size + 3} height={cells.size + 3} />
+    {/if}
+
+    <line class="now-line" x1={markerX} x2={markerX} y1={MARK_Y - 8} y2={lanes.height} />
     <text class="now" class:left={markerLabelLeft} x={markerLabelLeft ? markerX - 4 : markerX + 4} y={MARK_Y}>
       {formatClockSeconds(now)}
     </text>
   </svg>
 </div>
+
+<p class="inspect">
+  {#if info !== null}
+    {#if info.kind !== null}{@render swatch(info.kind)}{/if}
+    {#if info.kind !== null && pinned?.kind === 'device' && hover === null}
+      <button class="name open-device" type="button" onclick={() => ondevice?.(info.name)}>{info.name}</button>:
+    {:else}
+      <span class="name">{info.name}</span>:
+    {/if}
+    {info.text}
+  {/if}
+</p>
 
 <style>
   .bar {
@@ -402,6 +570,8 @@
   }
 
   .swatch {
+    display: inline-block;
+    flex: none;
     width: 9px;
     height: 9px;
     border-radius: 2px;
@@ -416,6 +586,38 @@
     overflow-x: auto;
     overflow-y: hidden;
     scrollbar-width: thin;
+  }
+
+  .edges {
+    display: flex;
+    min-height: 24px;
+    /* Clears the scroller's focus outline. */
+    margin-bottom: 6px;
+  }
+
+  /* A window outside the scrolled view, named at the edge it is past. */
+  .edge {
+    min-height: 24px;
+    padding: 0 8px;
+    border: 1px solid var(--sw-border-default);
+    border-radius: var(--sw-radius-pill);
+    background: var(--sw-bg-elevated);
+    color: var(--sw-text-secondary);
+    font-family: var(--sw-font-mono);
+    font-variant-ligatures: none;
+    font-size: var(--sw-text-xs);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+
+  .edge.right {
+    margin-left: auto;
+  }
+
+  .edge:hover {
+    color: var(--sw-text-primary);
+    border-color: var(--sw-accent-glow-strong);
   }
 
   svg {
@@ -437,7 +639,8 @@
 
   .lbl {
     font-family: var(--sw-font-mono, ui-monospace, monospace);
-    font-size: 11px;
+    font-variant-ligatures: none;
+    font-size: var(--sw-text-2xs);
     fill: var(--sw-text-secondary);
   }
 
@@ -454,21 +657,77 @@
     fill: var(--sw-bg-elevated);
   }
 
+  /* Darker than the upgraded cells, so the white label over it keeps
+     4.5:1 (5.8:1 here; on the plain success green it was 3.2:1). */
+  .done {
+    fill: color-mix(in srgb, var(--sw-success) 72%, #000);
+  }
+
+  .open {
+    fill: none;
+    stroke: var(--sw-accent);
+  }
+
   .blk {
     font-family: var(--sw-font-mono, ui-monospace, monospace);
-    font-size: 11px;
+    font-variant-ligatures: none;
+    font-size: var(--sw-text-xs);
     fill: var(--sw-text-primary);
+    pointer-events: none;
+  }
+
+  /* The device the line below the chart describes. */
+  .ring {
+    fill: none;
+    stroke: var(--sw-text-primary);
+    pointer-events: none;
+  }
+
+  .now-line {
+    stroke: var(--sw-accent);
     pointer-events: none;
   }
 
   .now {
     font-family: var(--sw-font-mono, ui-monospace, monospace);
-    font-size: 11px;
+    font-variant-ligatures: none;
+    font-size: var(--sw-text-2xs);
     fill: var(--sw-accent);
     pointer-events: none;
   }
 
   .now.left {
     text-anchor: end;
+  }
+
+  /* Kept a line tall while empty, so the page does not shift as it fills. */
+  .inspect {
+    min-height: 20px;
+    margin: 6px 0 0;
+    font-size: var(--sw-text-xs);
+    line-height: 20px;
+    color: var(--sw-text-secondary);
+  }
+
+  .inspect .swatch {
+    margin-right: 6px;
+    vertical-align: -1px;
+  }
+
+  .name {
+    font-family: var(--sw-font-mono);
+    font-variant-ligatures: none;
+    color: var(--sw-text-primary);
+  }
+
+  .open-device {
+    padding: 0;
+    border: 0;
+    background: none;
+    font-size: inherit;
+    color: var(--sw-accent-bright);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
   }
 </style>

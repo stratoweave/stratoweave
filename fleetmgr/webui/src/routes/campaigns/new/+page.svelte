@@ -1,10 +1,12 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { goto } from '$app/navigation';
 
   import { errorText } from '#lib/core/errors.ts';
   import { onLoaded } from '#lib/core/loading.svelte.ts';
   import { restconfPatchJson } from '#lib/core/restconf/client.ts';
   import FieldText from '#lib/core/ui/FieldText.svelte';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import Section from '#lib/core/ui/Section.svelte';
   import Steps from '#lib/core/ui/Steps.svelte';
   import { memberImages, modelGroups, targetCounts, withPreselected } from '#lib/software/campaign-images.ts';
@@ -26,6 +28,8 @@
   const STEPS = ['Devices', 'Images', 'Plan'];
 
   let step = $state(1);
+  /** The first card of the step shown. */
+  let stepCard: HTMLElement | undefined = $state();
   // Held here, so that Back to the devices finds the filters as they were.
   let selection = $state<Selection>(emptySelection());
   let selected = $state<string[]>([]);
@@ -63,11 +67,22 @@
     return n === 1 ? '1 device' : `${n.toLocaleString()} devices`;
   }
 
+  /** Next and Back replace the card that had focus: focus goes to the
+   * new step's heading instead of falling back to the page. */
+  async function show(next: number): Promise<void> {
+    step = next;
+    await tick();
+    const heading = stepCard?.querySelector<HTMLElement>('h2');
+    if (!heading) return;
+    heading.tabIndex = -1;
+    heading.focus();
+  }
+
   function toImages(): void {
     devicesTouched = true;
     if (selected.length === 0) return;
     picks = withPreselected(grouped.groups, picks, images);
-    step = 2;
+    void show(2);
   }
 
   async function create(): Promise<void> {
@@ -95,15 +110,13 @@
 
 <Steps steps={STEPS} current={step} />
 
-{#if createError || inventory?.loadError}
-  <div class="error-state status">{createError || inventory?.loadError}</div>
-{/if}
-
 {#if step === 1}
-  <section class="card">
+  <section class="card" bind:this={stepCard}>
     <Section title="Devices">
       {#if inventory === null}
         <div class="empty-state" aria-busy="true">Loading devices…</div>
+      {:else if inventory.loadError}
+        <LoadError message={inventory.loadError} />
       {:else if devices.length === 0}
         <div class="empty-state">No devices in the inventory.</div>
       {:else}
@@ -118,14 +131,19 @@
       {/if}
       <div class="editor-actions">
         <a class="btn btn-secondary" href="/campaigns">Cancel</a>
-        <button class="btn btn-primary" type="button" onclick={toImages} disabled={inventory === null}>
+        <button
+          class="btn btn-primary"
+          type="button"
+          onclick={toImages}
+          disabled={inventory === null || !!inventory.loadError}
+        >
           Next: images ({devicesText(selected.length)})
         </button>
       </div>
     </Section>
   </section>
 {:else}
-  <section class="card">
+  <section class="card" bind:this={stepCard}>
     <Section title="Images" yangPath="software:software/upgrade-campaign/device/image">
       {#if grouped.groups.length === 0}
         <div class="empty-state">None of the selected devices has reported a model.</div>
@@ -181,15 +199,24 @@
           ontouch={() => (touched = true)}
         />
       </div>
-      <label class="staging">
-        <input type="checkbox" bind:checked={allowStaging} />
-        <span>Allow staging the image before the impacting step</span>
-      </label>
-      <div class="editor-actions">
-        <button class="btn btn-secondary" type="button" onclick={() => (step = 1)}>Back</button>
-        <button class="btn btn-primary" type="button" onclick={create} disabled={creating}>
-          {creating ? 'Creating…' : `Create plan (${devicesText(members.length)})`}
-        </button>
+      <div class="staging">
+        <input id="allow-staging" type="checkbox" bind:checked={allowStaging} aria-describedby="staging-help" />
+        <label for="allow-staging">Allow staging the image before the impacting step</label>
+        <p class="hint" id="staging-help">Devices copy their image before their window opens, with no outage.</p>
+      </div>
+      <div>
+        <!-- In place before any message, so that a screen reader reads it. -->
+        <div role="alert">
+          {#if createError}
+            <div class="error-state status">{createError}</div>
+          {/if}
+        </div>
+        <div class="editor-actions">
+          <button class="btn btn-secondary" type="button" onclick={() => void show(1)}>Back</button>
+          <button class="btn btn-primary" type="button" onclick={create} disabled={creating}>
+            {creating ? 'Creating…' : `Create plan (${devicesText(members.length)})`}
+          </button>
+        </div>
       </div>
       {#if touched && allLeftOut}
         <p class="field__meta field__meta--error all-left-out">
@@ -235,12 +262,21 @@
     text-align: right;
   }
 
+  /* The help lines up with the label's text, past the box. */
   .staging {
-    display: flex;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
     align-items: center;
-    gap: 8px;
+    gap: 2px 8px;
     font-size: var(--sw-text-sm);
+  }
+
+  .staging label {
     cursor: pointer;
+  }
+
+  .staging .hint {
+    grid-column: 2;
   }
 
   .editor-actions {

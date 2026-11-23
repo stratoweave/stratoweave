@@ -127,7 +127,7 @@ export function validateScheduleDraft(
     } else if (duration <= 0) {
       errors[`window.${w.id}.duration`] = 'Longer than zero.';
     } else if (duration > DURATION_MAX) {
-      errors[`window.${w.id}.duration`] = `At most ${DURATION_MAX} seconds.`;
+      errors[`window.${w.id}.duration`] = `At most ${DURATION_MAX.toLocaleString()} seconds.`;
     }
   }
   if (draft.windows.length === 0) {
@@ -150,6 +150,20 @@ export function draftToSchedule(draft: ScheduleDraft): Schedule {
   }
   windows.sort((a, b) => a.at - b.at);
   return { name: draft.name.trim(), utcOffset: parseUtcOffset(draft.utcOffset) ?? 0, windows };
+}
+
+/** The draft as a save would store it, to tell an edited draft from the
+ * one loaded: a row compares by value where it parses ("4h" is "240m"),
+ * as typed where it does not, and the rows in any order. */
+export function draftKey(draft: ScheduleDraft): string {
+  const rows = draft.windows.map((w) =>
+    JSON.stringify([
+      parseTimeOfDay(w.at) ?? w.at.trim(),
+      parseDuration(w.duration) ?? w.duration.trim(),
+      WEEKDAYS.filter((d) => w.days.includes(d))
+    ])
+  );
+  return JSON.stringify([draft.name.trim(), parseUtcOffset(draft.utcOffset) ?? draft.utcOffset.trim(), rows.sort()]);
 }
 
 /** The draft row a rule of draftToSchedule(draft) came from: the first
@@ -204,4 +218,25 @@ export function scheduleUsage(name: string, devices: Device[], campaigns: Campai
     boundDevices: devices.filter((d) => d.schedule === name).length,
     defaultOf: campaigns.filter((c) => c.defaultSchedule === name).map((c) => c.name)
   };
+}
+
+/** "The campaign a", "The campaigns a and b", "The campaigns a, b, c and
+ * 2 more": the start of a sentence. */
+export function campaignsText(names: string[]): string {
+  const shown = names.length > 3 ? [...names.slice(0, 3), `${(names.length - 3).toLocaleString()} more`] : names;
+  const list = shown.length > 1 ? `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]}` : (shown[0] ?? '');
+  return `The campaign${names.length === 1 ? '' : 's'} ${list}`;
+}
+
+/** What re-plans when a schedule changes: "The campaign fleet-upgrade and
+ * 300 bound devices use it, and their windows change."; '' when nothing
+ * uses it. */
+export function usageChangeText(usage: ScheduleUsage): string {
+  const users: string[] = [];
+  if (usage.defaultOf.length > 0) users.push(campaignsText(usage.defaultOf));
+  const n = usage.boundDevices;
+  if (n > 0) users.push(`${n.toLocaleString()} bound device${n === 1 ? '' : 's'}`);
+  if (users.length === 0) return '';
+  const one = usage.defaultOf.length + n === 1;
+  return `${users.join(' and ')} ${one ? 'uses' : 'use'} it, and ${one ? 'its' : 'their'} windows change.`;
 }

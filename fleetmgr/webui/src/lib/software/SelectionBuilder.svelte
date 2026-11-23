@@ -27,6 +27,8 @@
     onchange
   }: Props = $props();
 
+  const uid = $props.id();
+
   let types = $derived([...new Set(inventory.map((d) => d.type))].sort());
   // '' stands for devices that have not reported a model or version; it
   // sorts first.
@@ -96,28 +98,28 @@
   <div class="filters-side">
     <div class="kick">Filters</div>
     <div class="filters">
-      <div class="frow">
-        <span class="flabel">Device type</span>
-        <span class="fop">is any of</span>
+      <div class="frow" role="group" aria-labelledby="{uid}-type {uid}-type-op">
+        <span class="flabel" id="{uid}-type">Device type</span>
+        <span class="fop" id="{uid}-type-op">is any of</span>
         {#if types.length === 0}
           <span class="hint">no devices</span>
         {:else}
           {@render tokens(types, selection.types, (next) => patch({ types: next }))}
         {/if}
       </div>
-      <div class="andr">AND</div>
-      <div class="frow">
-        <span class="flabel">Model</span>
-        <span class="fop">is any of</span>
+      <div class="andr">and</div>
+      <div class="frow" role="group" aria-labelledby="{uid}-model {uid}-model-op">
+        <span class="flabel" id="{uid}-model">Model</span>
+        <span class="fop" id="{uid}-model-op">is any of</span>
         {@render tokens(models, selection.models, (next) => patch({ models: next }))}
       </div>
-      <div class="andr">AND</div>
-      <div class="frow">
-        <span class="flabel">Version</span>
-        <span class="fop">is any of</span>
+      <div class="andr">and</div>
+      <div class="frow" role="group" aria-labelledby="{uid}-version {uid}-version-op">
+        <span class="flabel" id="{uid}-version">Version</span>
+        <span class="fop" id="{uid}-version-op">is any of</span>
         {@render tokens(versions, selection.versions, (next) => patch({ versions: next }))}
       </div>
-      <div class="andr">AND</div>
+      <div class="andr">and</div>
       <div class="frow">
         <span class="flabel">Name</span>
         <span class="fop">matches</span>
@@ -131,7 +133,7 @@
           oninput={(e) => patch({ namePattern: e.currentTarget.value })}
         />
       </div>
-      <div class="andr">AND</div>
+      <div class="andr">and</div>
       <div class="frow">
         <span class="flabel">Address</span>
         <span class="fop">contains</span>
@@ -144,7 +146,7 @@
           oninput={(e) => patch({ addressContains: e.currentTarget.value })}
         />
       </div>
-      <div class="andr">AND</div>
+      <div class="andr">and</div>
       <div class="frow">
         <span class="flabel">Description</span>
         <span class="fop">contains</span>
@@ -157,7 +159,7 @@
           oninput={(e) => patch({ descriptionContains: e.currentTarget.value })}
         />
       </div>
-      <div class="andr">AND</div>
+      <div class="andr">and</div>
       <div class="frow">
         <span class="flabel">Schedule</span>
         <span class="fop">is</span>
@@ -188,15 +190,18 @@
     </label>
 
     <div class="count-row">
-      <p class="count-line">
+      <p class="count-line" role="status">
         <span class="count tn" class:empty={expansion.names.length === 0}>
           {expansion.names.length.toLocaleString()}
         </span>
         matching device{expansion.names.length === 1 ? '' : 's'}
       </p>
-      {#if error}
-        <span class="err">{error}</span>
-      {/if}
+      <!-- In place before the error, so that a screen reader reads it. -->
+      <span role="alert">
+        {#if error}
+          <span class="err">{error}</span>
+        {/if}
+      </span>
     </div>
 
     {#if typeBars.length > 0}
@@ -213,11 +218,12 @@
       <div class="hint">Nothing excluded.</div>
     {/if}
     {#each expansion.excluded as e (e.what)}
-      <div class="excl">
+      <!-- The model's path is for those who know it: a tooltip. -->
+      <div class="excl" title={e.path || undefined}>
         <span class="excl-n tn">{e.n.toLocaleString()}</span>
         <div class="excl-body">
           <div class="excl-what">{e.what}</div>
-          <div class="mono excl-path">{e.path}</div>
+          <div class="mono excl-detail">{e.detail}</div>
         </div>
       </div>
     {/each}
@@ -288,11 +294,12 @@
     align-items: center;
   }
 
-  /* On a phone the field and its operator share a line; the value takes
-     the next one. */
+  /* On a phone the field and its operator share a line, read as one
+     phrase; the value takes the next one. */
   @media (max-width: 560px) {
     .frow {
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: auto minmax(0, 1fr);
+      row-gap: 2px;
     }
 
     .frow > :last-child {
@@ -300,22 +307,26 @@
     }
   }
 
+  /* Plain words, not boxes: they name the field and how it matches, and
+     cannot be changed. As tall as a field, so each row lines up. */
   .flabel,
   .fop {
-    background: var(--sw-bg-card);
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-sm);
-    padding: 7px 10px;
+    padding: 7px 0;
     font-size: var(--sw-text-sm);
   }
 
+  .flabel {
+    font-weight: 500;
+    color: var(--sw-text-label);
+  }
+
   .fop {
-    color: var(--sw-text-secondary);
+    color: var(--sw-text-muted);
   }
 
   .fld {
     background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
+    border: 1px solid var(--sw-border-control);
     border-radius: var(--sw-radius-sm);
     color: var(--sw-text-primary);
     padding: 7px 10px;
@@ -334,6 +345,12 @@
 
   .fld::placeholder {
     color: var(--sw-text-muted);
+  }
+
+  @media (pointer: coarse) {
+    .fld {
+      min-height: 44px;
+    }
   }
 
   /* The same focus as every other text field. */
@@ -357,6 +374,7 @@
     border-radius: var(--sw-radius-xs);
     padding: 3px 8px;
     font-family: var(--sw-font-mono, monospace);
+    font-variant-ligatures: none;
     font-size: var(--sw-text-xs);
     color: var(--sw-text-secondary);
     cursor: pointer;
@@ -375,11 +393,8 @@
   }
 
   .andr {
-    font-size: var(--sw-text-2xs);
-    font-weight: 500;
-    letter-spacing: 0.1em;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-muted);
-    padding-left: 4px;
   }
 
   .count-row {
@@ -411,7 +426,7 @@
   }
 
   .err {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-danger-text);
   }
 
@@ -492,17 +507,17 @@
     font-size: var(--sw-text-sm);
   }
 
-  .excl-path {
+  .excl-detail {
     color: var(--sw-text-muted);
     margin-top: 2px;
-    font-size: 11px;
-    word-break: break-all;
+    font-size: var(--sw-text-2xs);
+    overflow-wrap: anywhere;
   }
 
   .sample {
     width: 100%;
     border-collapse: collapse;
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
   }
 
   .sample td {
@@ -519,7 +534,7 @@
   }
 
   .hint {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-muted);
   }
 </style>

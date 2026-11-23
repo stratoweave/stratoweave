@@ -305,19 +305,28 @@ export const STATUS_TONE: Record<KnownStatus, StatusTone> = {
   'not-started': 'danger'
 };
 
-/** How a status reads. pending is a member whose device has no status for
- * the member's attempt: it has not answered the campaign's target. */
+/** How a status reads, in the same words as the plan timeline and the
+ * progress bar; the wire value goes in a tooltip. pending is a member whose
+ * device has no status for the member's attempt: it has not answered the
+ * campaign's target. */
 export const STATUS_LABEL: Record<KnownStatus, string> = {
   pending: 'not answered',
   unknown: 'unknown',
-  'up-to-date': 'up-to-date',
-  'upgrade-needed': 'upgrade-needed',
-  'in-progress': 'in-progress',
-  succeeded: 'succeeded',
+  'up-to-date': 'up to date',
+  'upgrade-needed': 'waiting',
+  'in-progress': 'in progress',
+  succeeded: 'upgraded',
   failed: 'failed',
-  'rolled-back': 'rolled-back',
-  'not-started': 'not-started'
+  'rolled-back': 'rolled back',
+  'not-started': 'not started'
 };
+
+/** How a campaign's admin-state reads: plan before it first ran is
+ * planned, plan after it is paused. */
+export function modeLabel(state: AdminState, runSince: number | null): string {
+  if (state === 'run') return 'running';
+  return runSince === null ? 'planned' : 'paused';
+}
 
 /** Why a campaign holds a member, as device-status/held names it. */
 export const HELD_REASONS = [
@@ -559,6 +568,8 @@ export interface Campaign {
 export interface DeviceCampaign {
   name: string;
   adminState: AdminState;
+  /** When the campaign first ran, which tells paused from planned. */
+  runSince: number | null;
   defaultSchedule: string;
   /** The image the device installs; '' for none. */
   image: string;

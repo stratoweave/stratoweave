@@ -1,85 +1,103 @@
 <script lang="ts">
   import { onMount } from 'svelte';
-  import { invalidate } from '$app/navigation';
+  import { beforeNavigate, goto, invalidate } from '$app/navigation';
 
-  import ConnectionDot from '#lib/software/ConnectionDot.svelte';
-  import DeviceGroups from '#lib/software/DeviceGroups.svelte';
-  import DevicePicture from '#lib/software/DevicePicture.svelte';
-  import JobProgress from '#lib/software/JobProgress.svelte';
-  import StageChain from '#lib/software/StageChain.svelte';
-  import HeldText from '#lib/software/HeldText.svelte';
-  import StatusPill from '#lib/software/StatusPill.svelte';
   import { errorText } from '#lib/core/errors.ts';
   import { onLoaded } from '#lib/core/loading.svelte.ts';
+  import { leaveNotice } from '#lib/core/notice.ts';
   import { createPoller } from '#lib/core/polling/poller.ts';
-  import { setDeviceSchedule } from '#lib/maintenance/binding.ts';
-  import {
-    STEP_LABEL,
-    isFinalStatus,
-    type CheckResult,
-    type DeviceCampaign,
-    type DeviceStatusRow,
-    type Step
-  } from '#lib/software/model.ts';
-  import { pendingText } from '#lib/software/device-state.ts';
-  import { jobDetail, jobProgress, stageDetail, stageView } from '#lib/software/stages.ts';
+  import { getListEntryPath, restconfDelete } from '#lib/core/restconf/client.ts';
   import { formatClock } from '#lib/core/time.ts';
+  import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
+  import { campaignsText } from '#lib/maintenance/schedule-form.ts';
+  import ConnectionDot from '#lib/software/ConnectionDot.svelte';
+  import DeviceSettings from '#lib/software/DeviceSettings.svelte';
+  import StatusPill from '#lib/software/StatusPill.svelte';
+  import { campaignDeviceHref } from '#lib/software/links.ts';
+  import { FLEET_DEVICE_LIST_ROOT, modeLabel } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
   // null until their reads are in; a poll keeps what is shown until then.
   let deviceLoad = $state.raw<Awaited<typeof data.device> | null>(null);
   let campaignsLoad = $state.raw<Awaited<typeof data.campaigns> | null>(null);
-  onLoaded(() => data.device, (value) => (deviceLoad = value));
+  // A read that failed once the device shows: what shows stays, with
+  // the edits in it.
+  let pollError = $state('');
+  onLoaded(
+    () => data.device,
+    (value) => {
+      if (value.loadError && deviceLoad?.device) {
+        pollError = value.loadError;
+        return;
+      }
+      pollError = '';
+      deviceLoad = value;
+    }
+  );
   onLoaded(() => data.campaigns, (value) => (campaignsLoad = value));
   /** undefined while loading, null when there is no such device. */
   let device = $derived(deviceLoad?.device);
-  let schedules = $derived(deviceLoad?.schedules ?? []);
+  let config = $derived(deviceLoad?.config ?? null);
   let campaigns = $derived(campaignsLoad?.campaigns ?? []);
-  let loadError = $derived(deviceLoad?.loadError || campaignsLoad?.loadError || '');
 
-  // null follows the device as polled; a pick holds until it is saved.
-  let picked = $state<string | null>(null);
-  let savingSchedule = $state(false);
-  let scheduleMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
-  let bound = $derived(device?.schedule ?? '');
-  let choice = $derived(picked ?? bound);
-  let scheduleOptions = $derived.by(() => {
-    const options = schedules.map((s) => ({ name: s.name, label: s.name }));
-    if (bound && !schedules.some((s) => s.name === bound)) {
-      options.push({ name: bound, label: `${bound} (missing)` });
-    }
-    return options;
-  });
-  // Unbound, the device follows each campaign's default schedule.
-  let defaultLabel = $derived.by(() => {
-    const names = new Set(campaigns.map((c) => c.defaultSchedule || 'none'));
-    return `${names.size > 0 ? [...names].join(', ') : 'none'} (default)`;
+  let confirmDelete = $state(false);
+  let deleting = $state(false);
+  let deleteError = $state('');
+  // The cards with changes to save, and where the operator asked to go
+  // with them unsaved.
+  let dirty = $state<string[]>([]);
+  let unsaved = $derived(device && config ? dirty : []);
+  let leaveTo = $state<URL | null>(null);
+  let leaving = false;
+
+  let deleteMessage = $derived.by(() => {
+    const text = `Delete ${data.name} from the fleet? The orchestrator disconnects from it.`;
+    if (campaignsLoad?.loadError) return `${text} Its campaigns could not be read.`;
+    if (campaigns.length === 0) return text;
+    const one = campaigns.length === 1;
+    return `${text} ${campaignsText(campaigns.map((c) => c.name))} ${one ? 'keeps' : 'keep'} it as a member but can no longer upgrade it.`;
   });
 
-  async function saveSchedule(): Promise<void> {
-    if (!device || choice === bound) return;
-    const schedule = choice;
+  // Leaving drops the changes, so it is asked first. A reload or a closed
+  // tab gets the browser's own question.
+  beforeNavigate(({ cancel, to, willUnload }) => {
+    if (unsaved.length === 0 || leaving) return;
+    cancel();
+    if (!willUnload && to) leaveTo = to.url;
+  });
+
+  function leave(): void {
+    const to = leaveTo;
+    leaveTo = null;
+    if (!to) return;
+    leaving = true;
+    void goto(to);
+  }
+
+  /** "General", "General and Mock", "General, Connection and Mock". */
+  function listText(names: string[]): string {
+    return names.length > 1 ? `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}` : (names[0] ?? '');
+  }
+
+  async function handleDelete(): Promise<void> {
     try {
-      savingSchedule = true;
-      scheduleMessage = null;
-      await setDeviceSchedule(device.name, schedule);
-      // Drops the reads from before the write; the new ones come in after.
-      await invalidate('data:device');
-      if (deviceLoad?.device) deviceLoad = { ...deviceLoad, device: { ...deviceLoad.device, schedule } };
-      picked = null;
-      scheduleMessage = { type: 'success', text: schedule ? `Bound to ${schedule}.` : 'Unbound.' };
-    } catch (saveError) {
-      scheduleMessage = {
-        type: 'error',
-        text: errorText(saveError, 'Failed to save the schedule.')
-      };
+      deleting = true;
+      deleteError = '';
+      await restconfDelete(getListEntryPath(FLEET_DEVICE_LIST_ROOT, data.name));
+      leaving = true;
+      leaveNotice(`Deleted device ${data.name}.`);
+      await goto('/devices');
+    } catch (error) {
+      deleteError = errorText(error, 'Failed to delete the device.');
     } finally {
-      savingSchedule = false;
+      deleting = false;
+      confirmDelete = false;
     }
   }
 
-  /** For the groups card: reads the device again and waits for it. */
+  /** For the cards: reads the device again and waits for it. */
   async function reloadDevice(): Promise<void> {
     await invalidate('data:device');
     await data.device;
@@ -95,466 +113,150 @@
     poller.start();
     return () => poller.stop();
   });
-
-  function campaignHref(campaign: DeviceCampaign): string {
-    return `/campaigns/${encodeURIComponent(campaign.name)}`;
-  }
-
-  /** This device's start in the plan, real once released, else the
-   * planner's estimate; "no window yet" when the plan has the campaign but
-   * no window for it, unless its status is final and it needs none. */
-  function plannedStart(campaign: DeviceCampaign): string {
-    if (campaign.start === null) return '—';
-    if (campaign.start === 'unplaced') return isFinalStatus(campaign.row.status) ? '—' : 'no window yet';
-    return formatClock(campaign.start);
-  }
-
-  /** The checks of the last run that have a verdict. */
-  function checks(row: DeviceStatusRow): { step: Step; result: CheckResult }[] {
-    const all: { step: Step; result: CheckResult }[] = [
-      { step: 'precheck', result: row.precheck },
-      { step: 'postcheck', result: row.postcheck }
-    ];
-    return all.filter((c) => c.result.verdict !== 'not-run');
-  }
-
-  /** "a: x; b: y" -> one part per check, with the check's name apart. */
-  function detailParts(detail: string): { source: string; text: string }[] {
-    return detail.split('; ').map((part) => {
-      const i = part.indexOf(': ');
-      return i > 0 ? { source: part.slice(0, i + 1), text: part.slice(i + 2) } : { source: '', text: part };
-    });
-  }
-
-  /** What neither the chain nor the check rows show: what the device does
-   * now, or what stopped it. */
-  function note(row: DeviceStatusRow): string {
-    const doing = jobDetail(row);
-    if (doing) return doing;
-    const view = stageView(row);
-    if (view.steps[0].state === 'skipped') return 'already on the target release';
-    if (!view.steps.some((s) => s.state === 'failed')) return '';
-    // A refusing check says why in its own row.
-    const refused = row.precheck.verdict === 'fail' || row.postcheck.verdict === 'fail';
-    if (refused && view.rollback !== 'failed') return '';
-    return stageDetail(row);
-  }
 </script>
 
-{#if loadError}
-  <div class="error-state status">{loadError}</div>
-{/if}
-
-{#if device === undefined}
-  <section class="card hero" aria-busy="true">
-    <div class="head">
-      <DevicePicture />
-      <div class="ident">
-        <h1>{data.name}</h1>
-        <p class="meta">Loading…</p>
-      </div>
+{#if deviceLoad === null}
+  <div class="page-header">
+    <div>
+      <h1>{data.name}</h1>
+      <p aria-busy="true">Loading…</p>
     </div>
-  </section>
-{:else if device === null}
+  </div>
+{:else if deviceLoad.loadError}
+  <LoadError message={deviceLoad.loadError} />
+{:else if !device || !config}
   <section class="card">
     <div class="empty-state">No device named {data.name}.</div>
   </section>
 {:else}
-  {@const single = campaigns.length === 1}
-  <section class="card hero">
-    <div class="head">
-      <DevicePicture />
-      <div class="ident">
-        <h1 title={`YANG: /fleet/device=${device.name}`}>{device.name}</h1>
-        <p class="meta">
-          <ConnectionDot connection={device.connection} text />
-          · type <span class="mono">{device.type}</span>
-          {#if device.model}
-            · model <span class="mono">{device.model}</span>
-          {/if}
-          {#if device.version}
-            · version <span class="mono">{device.version}</span>
-          {/if}
-          {#if device.serialNumber}
-            · serial number <span class="mono">{device.serialNumber}</span>
-          {/if}
-          {#if device.address}
-            · OOB <span class="mono">{device.address}</span>
-          {/if}
-          {#if device.description}
-            · {device.description}
-          {/if}
-          {#if device.schedule}
-            · schedule <span class="mono">{device.schedule}</span>
-          {/if}
-        </p>
-      </div>
-      {#if single}
-        {@const row = campaigns[0].row}
-        <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
-      {/if}
+  <div class="page-header">
+    <div>
+      <h1 title={`YANG: /fleet/device=${device.name}`}>{device.name}</h1>
+      <p class="summary">
+        <ConnectionDot connection={device.connection} text />
+        {#if device.model}
+          · model <span class="mono">{device.model}</span>
+        {/if}
+        {#if device.version}
+          · version <span class="mono">{device.version}</span>
+        {/if}
+        {#if device.serialNumber}
+          · serial number <span class="mono">{device.serialNumber}</span>
+        {/if}
+        {#if deviceLoad.lastBoot !== null}
+          · last boot <span class="mono">{formatClock(deviceLoad.lastBoot)}</span>
+        {/if}
+      </p>
     </div>
+    <div class="page-actions">
+      <button
+        class="btn btn-secondary btn-danger-ghost"
+        type="button"
+        disabled={deleting}
+        onclick={() => (confirmDelete = true)}
+      >
+        Delete
+      </button>
+    </div>
+  </div>
 
-    {#if campaignsLoad === null}
-      <p class="none" aria-busy="true">Loading campaigns…</p>
-    {:else if campaigns.length === 0}
-      <p class="none">Not a member of any campaign.</p>
+  <!-- In place before any message, so that a screen reader reads each one. -->
+  <div role="alert">
+    {#if deleteError}
+      <div class="error-state status">{deleteError}</div>
     {/if}
-    {#each campaigns as campaign (campaign.name)}
-      {@const row = campaign.row}
-      {@const text = note(row)}
-      {@const progress = jobProgress(row)}
-      <div class="run">
-        <div class="run-head">
-          <div class="facts">
-            <span class="fact">
-              <span class="fact-label">Campaign</span>
-              <a class="mono campaign-name" href={campaignHref(campaign)}>{campaign.name}</a>
-            </span>
-            <span class="fact">
-              <span class="fact-label">Mode</span>
-              <span class="mono">{campaign.adminState}</span>
-            </span>
-            <span class="fact">
-              <span class="fact-label">Image</span>
-              <span class="mono">{campaign.image || '—'}</span>
-            </span>
-            <span class="fact">
-              <span class="fact-label">Planned start</span>
-              <span class="mono">{plannedStart(campaign)}</span>
-            </span>
-          </div>
-          {#if !single}
-            <div class="status"><StatusPill status={row.status} raw={row.raw} /></div>
-          {/if}
-        </div>
-        <div class="track"><StageChain {row} large /></div>
-        {#if progress !== null}
-          <div class="transfer">
-            <JobProgress value={progress} label={`Image transfer to ${device.name}`} />
-            <span class="mono percent">{progress}%</span>
-          </div>
-        {/if}
-        {#if row.held !== null}
-          <!-- Not having answered names the attempt. A member held before
-               its window may prepare ahead of it. -->
-          {@const pending = row.status === 'pending' ? pendingText(row) : ''}
-          <p class="note held">
-            <span class="held-label">held:</span>
-            {#if row.held === 'not-answered' && pending}{pending}{:else}<HeldText {row} />{/if}{#if text}{` · ${text}`}{/if}
-          </p>
-        {:else if row.status === 'pending'}
-          <p class="note">{pendingText(row)}</p>
-        {:else if text}
-          <p class="note">{text}</p>
-        {/if}
-        {#each checks(row) as check (check.step)}
-          {@const verdict = check.result.verdict}
-          <div class="check" class:pass={verdict === 'pass'} class:fail={verdict === 'fail'}>
-            <span class="check-name">{STEP_LABEL[check.step]}</span>
-            <span class="pill verdict" class:success={verdict === 'pass'} class:danger={verdict === 'fail'}>
-              {verdict}
-            </span>
-            <span class="check-detail mono">
-              {#each detailParts(check.result.detail) as part, i (i)}
-                <span class="part">
-                  {#if part.source}<span class="source">{part.source}</span>{/if}
-                  {part.text}
-                </span>
-              {/each}
-            </span>
-            {#if check.step === 'precheck' && verdict === 'pass'}
-              <span class="baseline mono" title="The post-check compares against this.">baseline</span>
-            {/if}
-            <span class="at mono">{check.result.at !== null ? formatClock(check.result.at) : ''}</span>
-          </div>
-        {/each}
-      </div>
-    {/each}
-  </section>
+  </div>
+  {#if pollError}
+    <LoadError message={pollError} />
+  {/if}
 
   <section class="card">
-    <h2 class="panel-title">Maintenance schedule</h2>
-    <div class="binding">
-      <select
-        class="select binding-select"
-        aria-label="Maintenance schedule"
-        value={choice}
-        disabled={savingSchedule}
-        onchange={(e) => (picked = e.currentTarget.value)}
-      >
-        <option value="">{defaultLabel}</option>
-        {#each scheduleOptions as option (option.name)}
-          <option value={option.name}>{option.label}</option>
-        {/each}
-      </select>
-      <button
-        class="btn btn-primary"
-        type="button"
-        disabled={savingSchedule || choice === bound}
-        onclick={saveSchedule}
-      >
-        {savingSchedule ? 'Saving…' : 'Save'}
-      </button>
-      {#if scheduleMessage}
-        <span class={scheduleMessage.type === 'error' ? 'save-error' : 'save-ok'}>{scheduleMessage.text}</span>
-      {/if}
-    </div>
+    <h2 class="panel-title">Campaigns</h2>
+    {#if campaignsLoad === null}
+      <p class="none" aria-busy="true">Loading campaigns…</p>
+    {:else if campaignsLoad.loadError}
+      <div class="read-error"><LoadError message={campaignsLoad.loadError} /></div>
+    {:else if campaigns.length === 0}
+      <p class="none">Not in any campaign.</p>
+    {:else}
+      <div class="table-wrap">
+        <table class="dense">
+          <thead>
+            <tr>
+              <th>Campaign</th>
+              <th>Status</th>
+              <th>Mode</th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each campaigns as campaign (campaign.name)}
+              <tr>
+                <td>
+                  <a class="mono campaign-link" href={campaignDeviceHref(campaign.name, device.name)}>{campaign.name}</a>
+                </td>
+                <td><StatusPill status={campaign.row.status} raw={campaign.row.raw} /></td>
+                <td>{modeLabel(campaign.adminState, campaign.runSince)}</td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
   </section>
 
-  {#key device.name}
-    <DeviceGroups {device} reload={reloadDevice} />
+  {#key data.name}
+    <DeviceSettings
+      {device}
+      {config}
+      schedules={deviceLoad.schedules}
+      campaigns={campaignsLoad}
+      reload={reloadDevice}
+      bind:dirty
+    />
   {/key}
 {/if}
 
+<ConfirmDialog
+  open={confirmDelete}
+  title="Delete device"
+  message={deleteMessage}
+  confirmLabel={deleting ? 'Deleting…' : 'Delete'}
+  confirmClass="btn-danger"
+  oncancel={() => (confirmDelete = false)}
+  onconfirm={handleDelete}
+/>
+
+<ConfirmDialog
+  open={leaveTo !== null}
+  title="Discard unsaved changes?"
+  message={`The changes in ${listText(unsaved)} are not saved.`}
+  confirmLabel="Discard"
+  cancelLabel="Keep editing"
+  confirmClass="btn-danger"
+  oncancel={() => (leaveTo = null)}
+  onconfirm={leave}
+/>
+
 <style>
-  .hero {
-    padding: 28px;
-  }
-
-  .head {
-    display: flex;
-    align-items: center;
-    gap: 28px;
-  }
-
-  .ident {
-    min-width: 0;
-  }
-
-  .ident h1 {
-    font-size: var(--sw-text-3xl);
-    font-weight: 700;
-    letter-spacing: -0.025em;
-    line-height: 1.15;
-    overflow-wrap: anywhere;
-  }
-
-  .meta {
-    margin: 4px 0 0;
-    color: var(--sw-text-secondary);
-    font-size: var(--sw-text-md);
-  }
-
-  .status {
-    margin-left: auto;
-  }
-
-  .status :global(.pill) {
-    padding: 4px 12px;
-    font-size: var(--sw-text-sm);
-  }
-
-  .none {
-    margin: 24px 0 0;
+  .summary {
     color: var(--sw-text-muted);
   }
 
-  .run {
-    margin-top: 24px;
+  .none {
+    margin: 0;
+    color: var(--sw-text-muted);
   }
 
-  .run + .run {
-    padding-top: 24px;
-    border-top: 1px solid var(--sw-border-subtle);
+  .read-error :global(.load-error) {
+    margin-bottom: 0;
   }
 
-  .run-head {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-  }
-
-  .facts {
-    flex: 1;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px 28px;
-  }
-
-  .fact {
-    font-size: var(--sw-text-sm);
-    font-weight: 600;
-    color: var(--sw-text-primary);
-  }
-
-  .fact .fact-label {
-    margin-right: 6px;
-  }
-
-  .campaign-name {
+  .campaign-link {
     color: var(--sw-accent-bright);
     text-decoration: none;
   }
 
-  .campaign-name:hover {
+  .campaign-link:hover {
     color: var(--sw-accent);
-  }
-
-  .track {
-    display: flex;
-    justify-content: center;
-    margin: 32px 0 28px;
-  }
-
-  .note {
-    margin: -12px 0 20px;
-    text-align: center;
-    font-size: 13px;
-    color: var(--sw-text-secondary);
-  }
-
-  /* Under the chain, above the note that says what the device does. */
-  .transfer {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    width: min(100%, 420px);
-    margin: -12px auto 20px;
-  }
-
-  .transfer > :global(.bar) {
-    flex: 1;
-  }
-
-  .transfer + .note {
-    margin-top: -12px;
-  }
-
-  .percent {
-    font-size: 13px;
-    color: var(--sw-text-muted);
-  }
-
-  .held-label {
-    color: var(--sw-warning);
-  }
-
-  .check {
-    display: grid;
-    grid-template-columns: 120px 72px minmax(0, 1fr) auto auto;
-    align-items: center;
-    gap: 16px;
-    padding: 14px 20px;
-    border: 1px solid var(--sw-border-default);
-    border-radius: var(--sw-radius-md);
-    background: var(--sw-bg-deep);
-  }
-
-  .check + .check {
-    margin-top: 10px;
-  }
-
-  .check.pass {
-    border-color: rgb(var(--sw-success-rgb) / 0.3);
-  }
-
-  .check.fail {
-    border-color: rgb(var(--sw-danger-rgb) / 0.3);
-  }
-
-  .check-name {
-    font-size: var(--sw-text-md);
-    font-weight: 600;
-  }
-
-  .verdict {
-    justify-self: start;
-    padding: 2px 10px;
-    font-size: var(--sw-text-xs);
-  }
-
-  .check-detail {
-    font-size: 13px;
-    color: var(--sw-text-primary);
-  }
-
-  .part {
-    display: block;
-  }
-
-  .source {
-    color: var(--sw-text-muted);
-  }
-
-  .baseline {
-    padding: 1px 7px;
-    border: 1px solid rgb(var(--sw-accent-rgb) / 0.4);
-    border-radius: var(--sw-radius-xs);
-    font-size: var(--sw-text-2xs);
-    color: var(--sw-accent);
-  }
-
-  .at {
-    grid-column: 5;
-    font-size: 13px;
-    color: var(--sw-text-muted);
-  }
-
-  .binding {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 10px;
-  }
-
-  .binding-select {
-    width: min(100%, 260px);
-  }
-
-  .save-ok {
-    font-size: 12px;
-    color: var(--sw-text-secondary);
-  }
-
-  .save-error {
-    font-size: 12px;
-    color: var(--sw-danger-text);
-  }
-
-  @media (max-width: 720px) {
-    .hero {
-      padding: 20px 16px;
-    }
-
-    .head > :global(.device-picture) {
-      display: none;
-    }
-
-    .ident h1 {
-      font-size: var(--sw-text-2xl);
-    }
-
-    .track {
-      margin: 24px 0 20px;
-    }
-
-    /* The step, its verdict and the baseline tag on one line, the detail
-       under them and the time last, so that none of them wraps. */
-    .check {
-      grid-template-columns: auto auto minmax(0, 1fr);
-      gap: 8px 12px;
-      padding: 12px 14px;
-    }
-
-    .check-name {
-      white-space: nowrap;
-    }
-
-    .check-detail {
-      grid-column: 1 / -1;
-      grid-row: 2;
-    }
-
-    .baseline {
-      justify-self: start;
-    }
-
-    .at {
-      grid-column: 1 / -1;
-      grid-row: 3;
-      font-size: var(--sw-text-xs);
-    }
   }
 </style>

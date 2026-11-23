@@ -7,6 +7,8 @@
 
   let { open = $bindable(false) }: { open: boolean } = $props();
 
+  const uid = $props.id();
+  const listId = `${uid}-results`;
   let query = $state('');
   let selectedIndex = $state(0);
   let inputEl: HTMLInputElement | null = $state(null);
@@ -43,6 +45,10 @@
   let flat = $derived(groups.flatMap((group) => group.entries));
   // Clamp instead of writing back: the raw index may point past a shrunken result set.
   let activeIndex = $derived(Math.min(selectedIndex, Math.max(0, flat.length - 1)));
+
+  function optionId(index: number): string {
+    return `${uid}-option-${index}`;
+  }
 
   $effect(() => {
     if (!open) return;
@@ -136,6 +142,8 @@
     <div class="cmdk-panel card">
       <div class="cmdk-search">
         <span class="cmdk-prompt" aria-hidden="true">⌘</span>
+        <!-- A combobox: focus stays in the field, and the arrow keys move
+             the selected option, which the field names to a screen reader. -->
         <input
           bind:this={inputEl}
           bind:value={query}
@@ -143,6 +151,12 @@
           onkeydown={handleKey}
           type="text"
           class="cmdk-input"
+          role="combobox"
+          aria-label="Search"
+          aria-autocomplete="list"
+          aria-expanded={flat.length > 0}
+          aria-controls={listId}
+          aria-activedescendant={flat.length > 0 ? optionId(activeIndex) : undefined}
           placeholder="Jump to a campaign, image, device, group or schedule…"
           autocomplete="off"
           spellcheck="false"
@@ -150,35 +164,43 @@
       </div>
 
       <div class="cmdk-results" bind:this={resultsEl}>
-        {#if pending > 0}
-          <div class="cmdk-hint-row">Loading…</div>
-        {/if}
+        <!-- In place before any message, so that a screen reader reads each one. -->
+        <div role="status">
+          {#if pending > 0}
+            <div class="cmdk-hint-row">Loading…</div>
+          {:else if flat.length === 0}
+            <div class="cmdk-empty">No results for “{query}”</div>
+          {/if}
+        </div>
 
-        {#if flat.length === 0 && pending === 0}
-          <div class="cmdk-empty">No results for “{query}”</div>
-        {:else}
-          {#each groups as group (group.category)}
-            <div class="cmdk-group">
-              <div class="cmdk-group-label">{group.category}</div>
+        <div id={listId} role="listbox" aria-label="Results">
+          {#each groups as group, g (group.category)}
+            <div class="cmdk-group" role="group" aria-labelledby={`${uid}-group-${g}`}>
+              <div class="cmdk-group-label" id={`${uid}-group-${g}`} role="presentation">{group.category}</div>
               {#each group.entries as entry (entry.id)}
                 {@const index = flat.indexOf(entry)}
-                <button
+                <!-- The keys work in the field, as in any combobox. -->
+                <!-- svelte-ignore a11y_click_events_have_key_events -->
+                <div
+                  id={optionId(index)}
                   class="cmdk-entry"
                   class:cmdk-entry--selected={index === activeIndex}
                   class:cmdk-entry--more={entry.more}
+                  role="option"
+                  aria-selected={index === activeIndex}
+                  tabindex="-1"
                   onmouseenter={() => (selectedIndex = index)}
                   onclick={() => select(entry)}
-                  type="button"
                 >
                   <span class="cmdk-entry-label">{entry.label}</span>
                   {#if entry.description}
                     <span class="cmdk-entry-desc">{entry.description}</span>
                   {/if}
-                </button>
+                </div>
               {/each}
             </div>
           {/each}
-        {/if}
+        </div>
       </div>
 
       <div class="cmdk-footer">
@@ -241,8 +263,9 @@
 
   .cmdk-prompt {
     font-family: var(--sw-font-mono);
+    font-variant-ligatures: none;
     color: var(--sw-text-muted);
-    font-size: 14px;
+    font-size: var(--sw-text-md);
   }
 
   .cmdk-input {
@@ -250,7 +273,7 @@
     border: 0;
     background: transparent;
     color: var(--sw-text-primary);
-    font-size: 15px;
+    font-size: var(--sw-text-lg);
     outline: none;
   }
 
@@ -286,7 +309,7 @@
     border-radius: var(--sw-radius-md);
     background: transparent;
     color: var(--sw-text-primary);
-    font-size: 13px;
+    font-size: var(--sw-text-sm);
     text-align: left;
     cursor: pointer;
     transition: background 0.1s;
@@ -317,7 +340,8 @@
   .cmdk-entry-desc {
     color: var(--sw-text-muted);
     font-family: var(--sw-font-mono);
-    font-size: 11px;
+    font-variant-ligatures: none;
+    font-size: var(--sw-text-2xs);
     flex-shrink: 0;
     max-width: 50%;
     white-space: nowrap;
@@ -335,7 +359,7 @@
     padding: 18px;
     text-align: center;
     color: var(--sw-text-muted);
-    font-size: 13px;
+    font-size: var(--sw-text-sm);
   }
 
   .cmdk-footer {
@@ -344,7 +368,7 @@
     padding: 10px 16px;
     border-top: 1px solid var(--sw-border-subtle);
     color: var(--sw-text-muted);
-    font-size: 11px;
+    font-size: var(--sw-text-2xs);
   }
 
   .cmdk-footer kbd {
@@ -355,6 +379,7 @@
     border-radius: 4px;
     background: var(--sw-bg-deep);
     font-family: var(--sw-font-mono);
-    font-size: 11px;
+    font-variant-ligatures: none;
+    font-size: var(--sw-text-2xs);
   }
 </style>

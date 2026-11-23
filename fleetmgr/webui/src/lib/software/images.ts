@@ -220,7 +220,7 @@ export function sizeText(bytes: number): string {
 
 /** What a model's count in a pick list means. */
 export function imageCountLabel(count: number): string {
-  return count === 1 ? 'in 1 image' : `in ${count} images`;
+  return count === 1 ? 'in 1 image' : `in ${count.toLocaleString()} images`;
 }
 
 /** Models in use, most used first, for pick lists. */

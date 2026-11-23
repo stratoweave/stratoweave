@@ -26,9 +26,11 @@
     device: Device;
     /** Reads the device again; resolves once the page shows the new read. */
     reload: () => Promise<void>;
+    /** Whether it has changes to save. */
+    dirty?: boolean;
   }
 
-  let { device, reload }: Props = $props();
+  let { device, reload, dirty = $bindable(false) }: Props = $props();
 
   const uid = $props.id();
   // More groups than this pick from suggestions instead of toggles.
@@ -57,6 +59,10 @@
       groups.length !== device.groups.length ||
       groups.some((g) => !device.groups.includes(g))
   );
+
+  $effect(() => {
+    dirty = changed;
+  });
 
   let members = $derived(groupMembers(fleet));
   // Every group with how many devices it has, this device as polled.
@@ -129,6 +135,7 @@
 
 <section class="card">
   <h2 class="panel-title" title="YANG: /fleet/device/redundancy-group">Redundancy groups</h2>
+  <!-- An edit replaces what the last save said. -->
   <TokenSelect
     {options}
     selected={groups}
@@ -137,7 +144,10 @@
     suggest={many}
     countLabel={devicesText}
     bind:draft
-    onchange={(next) => (picked = next)}
+    onchange={(next) => {
+      picked = next;
+      message = null;
+    }}
   />
   <div class="save-row">
     <label class="field__label" for={`${uid}-priority`}>Priority</label>
@@ -147,23 +157,29 @@
       class:has-error={priority === null}
       inputmode="numeric"
       aria-invalid={priority === null ? 'true' : undefined}
+      aria-describedby={priority === null ? `${uid}-priority-error` : undefined}
       value={typedPriority}
       disabled={saving}
-      oninput={(e) => (priorityText = e.currentTarget.value)}
+      oninput={(e) => {
+        priorityText = e.currentTarget.value;
+        message = null;
+      }}
     />
     <button class="btn btn-primary" type="button" disabled={saving || !changed || priority === null} onclick={save}>
       {saving ? 'Saving…' : 'Save'}
     </button>
     {#if priority === null}
-      <span class="save-error">0 to 65535, lower goes first.</span>
-    {:else if message}
-      <span class={message.type === 'error' ? 'save-error' : 'save-ok'}>{message.text}</span>
+      <span id={`${uid}-priority-error`} class="save-error">0 to 65535, lower goes first.</span>
     {/if}
+    <!-- In place before any message, so that a screen reader reads each one. -->
+    <span role="status">{#if message?.type === 'success'}<span class="save-ok">{message.text}</span>{/if}</span>
+    <span role="alert">{#if message?.type === 'error'}<span class="save-error">{message.text}</span>{/if}</span>
   </div>
   {#if readError}
     <p class="save-error">{readError}</p>
   {/if}
-  {#if device.groups.length > 0}
+  <!-- Without the other devices the order would show this one alone. -->
+  {#if device.groups.length > 0 && !readError}
     <div class="orders">
       {#each device.groups as group (group)}
         {@const order = orderOf(group)}
@@ -184,7 +200,7 @@
             {#if part.after}<span class="dim">→ …</span>{/if}
           </span>
           {#if part.before || part.after}
-            <span class="dim tn">{k + 1} of {order.length}</span>
+            <span class="dim tn">{(k + 1).toLocaleString()} of {order.length.toLocaleString()}</span>
           {/if}
         </div>
       {/each}
@@ -248,12 +264,12 @@
   }
 
   .save-ok {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-secondary);
   }
 
   .save-error {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-danger-text);
   }
 

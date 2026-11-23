@@ -34,7 +34,7 @@
 </script>
 
 <div class="field">
-  <span class="field__label" id={`${uid}-label`}>{label}</span>
+  <label class="field__label" id={`${uid}-label`} for={`${uid}-choose`}>{label}</label>
   <!-- A box like the text inputs beside it, with the file name for its
        value. A click opens the file chooser. -->
   <div class="file">
@@ -104,7 +104,7 @@
     border-radius: var(--sw-radius-sm);
     color: var(--sw-text-secondary);
     font: inherit;
-    font-size: 16px;
+    font-size: var(--sw-text-lg);
     line-height: 1;
     cursor: pointer;
   }

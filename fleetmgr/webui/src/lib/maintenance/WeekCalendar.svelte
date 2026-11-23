@@ -53,6 +53,10 @@
   const HOURS = [0, 3, 6, 9, 12, 15, 18, 21];
   // Less pointer movement than this is a click.
   const DRAG_PX = 4;
+  // A touch drags only once held this long and this still: the days cover
+  // most of a phone's screen, and a swipe over them has to scroll the page.
+  const HOLD_MS = 450;
+  const HOLD_PX = 8;
 
   type Drag =
     | {
@@ -70,6 +74,11 @@
 
   // Raw, not proxied: the drag holds the very rule objects it compares.
   let drag = $state.raw<Drag | null>(null);
+  // The pointer the drag follows; another finger is not it.
+  let dragPointer = -1;
+  // A touch waiting out the hold.
+  type Hold = { pointer: number; x: number; y: number; target: HTMLElement; timer: ReturnType<typeof setTimeout> };
+  let hold: Hold | null = null;
   let calEl: HTMLDivElement;
 
   let editable = $derived(!!onrulechange && schedules.length === 1);
@@ -152,36 +161,88 @@
   }
 
   function onPointerDown(event: PointerEvent): void {
-    if (!editable || event.button !== 0) return;
+    if (!editable || event.button !== 0 || drag || hold) return;
     const target = event.target as HTMLElement;
+    if (event.pointerType !== 'touch') {
+      // A mouse or a pen drags at once.
+      if (startDrag(target, event.clientX, event.clientY, event.pointerId, false)) event.preventDefault();
+      return;
+    }
+    // Touch events keep going to the element first touched even once a
+    // drag has redrawn it out of the calendar, so it stops the scroll too.
+    // The same listener added twice is added once.
+    target.addEventListener('touchmove', noScroll, { passive: false });
+    hold = {
+      pointer: event.pointerId,
+      x: event.clientX,
+      y: event.clientY,
+      target,
+      timer: setTimeout(endHold, HOLD_MS)
+    };
+    window.addEventListener('pointermove', onHoldMove);
+    window.addEventListener('pointerup', dropHold);
+    window.addEventListener('pointercancel', dropHold);
+    window.addEventListener('blur', dropHold);
+  }
+
+  function onHoldMove(event: PointerEvent): void {
+    const h = hold;
+    if (h && event.pointerId === h.pointer && Math.hypot(event.clientX - h.x, event.clientY - h.y) > HOLD_PX) {
+      dropHold();
+    }
+  }
+
+  function endHold(): void {
+    const h = hold;
+    dropHold();
+    if (h) startDrag(h.target, h.x, h.y, h.pointer, true);
+  }
+
+  function dropHold(): void {
+    if (hold) clearTimeout(hold.timer);
+    hold = null;
+    window.removeEventListener('pointermove', onHoldMove);
+    window.removeEventListener('pointerup', dropHold);
+    window.removeEventListener('pointercancel', dropHold);
+    window.removeEventListener('blur', dropHold);
+  }
+
+  /** A drag from a press at (x, y) on `target`; false when there is
+   * nothing there to drag. A held touch shows at once, before it moves,
+   * so the finger knows the hold took: the window it grabbed stands out,
+   * an empty stretch shows where the new one opens. */
+  function startDrag(target: HTMLElement, x: number, y: number, pointer: number, held: boolean): boolean {
     const dayEl = target.closest<HTMLElement>('[data-col]');
-    if (!dayEl) return;
+    if (!dayEl) return false;
     const col = Number(dayEl.dataset.col);
     const blockEl = target.closest<HTMLElement>('[data-block]');
     let next: Drag;
     if (blockEl) {
       const b = perDay[col]?.[Number(blockEl.dataset.block)];
-      if (!b) return;
+      if (!b) return false;
       const edge = target.closest<HTMLElement>('[data-edge]')?.dataset.edge;
       const kind = edge === 'start' ? 'start' : edge === 'end' ? 'end' : 'move';
-      next = { kind, occ: b.occurrence, col0: col, col, x0: event.clientX, y0: event.clientY, moved: false, proposed: null };
+      const proposed = held ? b.occurrence.rule : null;
+      next = { kind, occ: b.occurrence, col0: col, col, x0: x, y0: y, moved: false, proposed };
     } else if (onrulecreate) {
-      const t = snapTime(timeAt(col, event.clientY));
-      next = { kind: 'create', col, t0: t, t1: t, x0: event.clientX, y0: event.clientY, moved: false };
+      const t = snapTime(timeAt(col, y));
+      next = { kind: 'create', col, t0: t, t1: t, x0: x, y0: y, moved: held };
     } else {
-      return;
+      return false;
     }
-    event.preventDefault();
     drag = next;
+    dragPointer = pointer;
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
     window.addEventListener('pointercancel', stop);
     window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('blur', stop);
+    return true;
   }
 
   function onPointerMove(event: PointerEvent): void {
     const d = drag;
-    if (!d) return;
+    if (!d || event.pointerId !== dragPointer) return;
     if (!d.moved && Math.abs(event.clientX - d.x0) < DRAG_PX && Math.abs(event.clientY - d.y0) < DRAG_PX) return;
     if (d.kind === 'create') {
       drag = { ...d, moved: true, t1: snapTime(timeAt(d.col, event.clientY)) };
@@ -206,7 +267,8 @@
     drag = { ...d, moved: true, proposed, col: columnAt(event.clientX) };
   }
 
-  function onPointerUp(): void {
+  function onPointerUp(event: PointerEvent): void {
+    if (event.pointerId !== dragPointer) return;
     const d = drag;
     stop();
     if (!d || !d.moved) return;
@@ -227,25 +289,53 @@
     if (event.key === 'Escape') stop();
   }
 
+  // A cancelled pointer or a window losing focus ends the drag as Escape
+  // does: no pointerup may follow.
   function stop(): void {
+    dropHold();
     drag = null;
     window.removeEventListener('pointermove', onPointerMove);
     window.removeEventListener('pointerup', onPointerUp);
     window.removeEventListener('pointercancel', stop);
     window.removeEventListener('keydown', onKeyDown);
+    window.removeEventListener('blur', stop);
   }
 
   // Leaving the page mid-drag drops the window listeners.
   $effect(() => stop);
+
+  // Until the hold the page scrolls (touch-action: pan-y); once a touch
+  // drags, its moves are the drag's, which takes a listener that is not
+  // passive.
+  function noScroll(event: TouchEvent): void {
+    if (drag && event.cancelable) event.preventDefault();
+  }
+
+  // On the calendar from the start, so that the browser lets the listener
+  // cancel a touch begun on it. The long press opens no menu either.
+  $effect(() => {
+    if (!editable) return;
+    const el = calEl;
+    const noMenu = (event: Event) => {
+      if (drag || hold) event.preventDefault();
+    };
+    el.addEventListener('touchmove', noScroll, { passive: false });
+    el.addEventListener('contextmenu', noMenu);
+    return () => {
+      el.removeEventListener('touchmove', noScroll);
+      el.removeEventListener('contextmenu', noMenu);
+    };
+  });
 </script>
 
+<!-- Without links the calendar is a picture: the schedule editor's rules
+     and its table of upcoming windows say the same for a screen reader. -->
 <div
   class="cal"
   class:editable
   bind:this={calEl}
   data-drag={drag?.moved ? drag.kind : undefined}
-  role={editable ? 'application' : undefined}
-  aria-label={editable ? 'Drag a window to move it, an edge to resize it, an empty stretch to add one' : undefined}
+  aria-hidden={hrefFor ? undefined : 'true'}
   style:--days={columns.length}
   style:--hour-px={`${hourPx}px`}
   onpointerdown={onPointerDown}
@@ -269,21 +359,23 @@
         {@const color = colorOf(b.occurrence.schedule)}
         {@const h = height(b)}
         {@const dragged = draggedRule !== null && b.occurrence.rule === draggedRule}
+        <!-- A window already closed fades in its fill, not its text, which
+             keeps full contrast. -->
+        {@const past = b.end <= now}
         <svelte:element
           this={hrefFor ? 'a' : 'div'}
           class="block"
-          class:past={b.end <= now}
           class:dragged
           data-block={j}
           href={hrefFor ? hrefFor(b.occurrence.schedule) : undefined}
           title={drag ? undefined : describe(b)}
-          aria-label={describe(b)}
+          aria-label={hrefFor ? describe(b) : undefined}
           style:top={`${top(b, col.start)}px`}
           style:height={`${h}px`}
           style:left={`calc(${(b.lane / b.lanes) * 100}% + 2px)`}
           style:width={`calc(${100 / b.lanes}% - 5px)`}
-          style:background={`color-mix(in srgb, ${color} 32%, var(--sw-bg-card))`}
-          style:border-color={`color-mix(in srgb, ${color} 70%, transparent)`}
+          style:background={`color-mix(in srgb, ${color} ${past ? 14 : 32}%, var(--sw-bg-card))`}
+          style:border-color={`color-mix(in srgb, ${color} ${past ? 35 : 70}%, transparent)`}
         >
           {#if h >= 16}
             <span class="name">{b.occurrence.schedule}</span>
@@ -407,17 +499,13 @@
     overflow: hidden;
     color: var(--sw-text-primary);
     text-decoration: none;
-    font-size: 11px;
+    font-size: var(--sw-text-2xs);
     line-height: 1.3;
   }
 
   a.block:hover,
   a.block:focus-visible {
     filter: brightness(1.2);
-  }
-
-  .block.past {
-    opacity: 0.5;
   }
 
   .name {
@@ -490,7 +578,7 @@
     flex-wrap: wrap;
     gap: 8px 20px;
     margin-top: 12px;
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-secondary);
   }
 
@@ -518,13 +606,15 @@
   /* Editing */
   .cal.editable {
     user-select: none;
+    -webkit-touch-callout: none;
   }
 
-  /* Time tags while dragging are wider than a day. */
+  /* Time tags while dragging are wider than a day. A touch scrolls the
+     page until it is held; pinch zoom stays. */
   .cal.editable .day {
     overflow: visible;
     cursor: crosshair;
-    touch-action: none;
+    touch-action: pan-y pinch-zoom;
   }
 
   .cal.editable .block {
@@ -537,6 +627,13 @@
     right: 0;
     height: min(6px, 30%);
     cursor: ns-resize;
+  }
+
+  /* A fingertip needs more edge to catch. */
+  @media (pointer: coarse) {
+    .edge {
+      height: min(14px, 30%);
+    }
   }
 
   .edge.top {

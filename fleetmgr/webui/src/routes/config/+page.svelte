@@ -10,6 +10,7 @@
     type LayerFormat
   } from '#lib/core/layer-config.ts';
   import CodeBlock from '#lib/core/ui/CodeBlock.svelte';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import SegmentedControl from '#lib/core/ui/SegmentedControl.svelte';
 
   import type { PageProps } from './$types';
@@ -48,7 +49,7 @@
   </div>
 
   {#if data.loadError}
-    <div class="error-state">{data.loadError}</div>
+    <LoadError message={data.loadError} />
   {:else}
     <div class:loading aria-busy={loading}>
       <CodeBlock
@@ -78,6 +79,11 @@
 
   .viewer > div {
     min-width: 0;
+  }
+
+  /* The card's gap already sets it apart. */
+  .viewer > :global(.load-error) {
+    margin-bottom: 0;
   }
 
   .loading {

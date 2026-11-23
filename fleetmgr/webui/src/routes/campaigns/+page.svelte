@@ -2,12 +2,14 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import AdminStatePill from '#lib/software/AdminStatePill.svelte';
   import CampaignProgress from '#lib/software/CampaignProgress.svelte';
   import { createPoller, nextSeq } from '#lib/core/polling/poller.ts';
   import { withSignal } from '#lib/core/restconf/client.ts';
   import { fetchCounters } from '#lib/software/counters.ts';
   import type { Campaign, CampaignCounters } from '#lib/software/model.ts';
+  import { progressOf } from '#lib/software/progress.ts';
   import type { PageProps } from './$types';
 
   let { data }: PageProps = $props();
@@ -93,81 +95,85 @@
 </div>
 
 {#if data.loadError}
-  <div class="error-state status">{data.loadError}</div>
-{/if}
-
-<section class="card">
-  {#if campaigns.length === 0}
-    <div class="empty-state">
-      No campaigns yet. <a href="/campaigns/new">Create one</a> to plan an upgrade; nothing
-      changes on the devices until you run it.
-    </div>
-  {:else}
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Campaign</th>
-            <th>Mode</th>
-            <th>Devices</th>
-            <th>Plan</th>
-            <th class="state-col">State</th>
-            <th>Succeeded</th>
-            <th>Failed</th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each campaigns as campaign (campaign.name)}
+  <LoadError message={data.loadError} />
+{:else}
+  <section class="card">
+    {#if campaigns.length === 0}
+      <div class="empty-state">
+        No campaigns yet. <a href="/campaigns/new">Create one</a> to plan an upgrade; nothing
+        changes on the devices until you run it.
+      </div>
+    {:else}
+      <div class="table-wrap">
+        <table>
+          <thead>
             <tr>
-              <td class="name-cell">
-                <a class="campaign-name mono" href={`/campaigns/${encodeURIComponent(campaign.name)}`}>
-                  {campaign.name}
-                </a>
-              </td>
-              <td data-label="Mode">
-                <AdminStatePill state={campaign.adminState} />
-              </td>
-              <td class="tn" data-label="Devices">{campaign.devices.length.toLocaleString()}</td>
-              <td class="plan-cell" data-label="Plan">
-                {#if campaign.counters !== null}
-                  {@const alarms = data.alarms[campaign.name] ?? []}
-                  <span class="dim">planned</span>
-                  {#if alarms.length > 0}
-                    <span class="pill warning" title={alarms.join('\n')}>
-                      <span class="dot"></span>
-                      {alarms.length} alarm{alarms.length === 1 ? '' : 's'}
-                    </span>
-                  {/if}
-                {:else}
-                  <span class="dim">—</span>
-                {/if}
-              </td>
-              <td class="state-col" data-label="State">
-                {#if campaign.counters !== null}
-                  <CampaignProgress counters={campaign.counters} compact={true} />
-                {:else}
-                  <span class="dim">—</span>
-                {/if}
-              </td>
-              <td
-                class="tn"
-                data-label="Succeeded"
-                title={campaign.counters && campaign.counters.upToDate > 0
-                  ? `${campaign.counters.succeeded - campaign.counters.upToDate} upgraded, ${campaign.counters.upToDate} already up to date`
-                  : undefined}
-              >
-                {campaign.counters?.succeeded.toLocaleString() ?? '—'}
-              </td>
-              <td class="tn" class:failed-cell={(campaign.counters?.failed ?? 0) > 0} data-label="Failed">
-                {campaign.counters?.failed.toLocaleString() ?? '—'}
-              </td>
+              <th>Campaign</th>
+              <th>Mode</th>
+              <th>Devices</th>
+              <th>Plan</th>
+              <th class="state-col">State</th>
+              <th>Upgraded</th>
+              <th>Failed</th>
             </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
-  {/if}
-</section>
+          </thead>
+          <tbody>
+            {#each campaigns as campaign (campaign.name)}
+              <tr>
+                <td class="name-cell">
+                  <a class="campaign-name mono" href={`/campaigns/${encodeURIComponent(campaign.name)}`}>
+                    {campaign.name}
+                  </a>
+                </td>
+                <td data-label="Mode">
+                  <AdminStatePill state={campaign.adminState} runSince={campaign.runSince} />
+                </td>
+                <td class="tn" data-label="Devices">{campaign.devices.length.toLocaleString()}</td>
+                <td class="plan-cell" data-label="Plan">
+                  {#if campaign.counters !== null}
+                    {@const alarms = data.alarms[campaign.name] ?? []}
+                    {#if alarms.length > 0}
+                      {@const text = `${alarms.length} alarm${alarms.length === 1 ? '' : 's'}`}
+                      <!-- The campaign's page lists the alarms. -->
+                      <a
+                        class="pill warning alarms"
+                        href={`/campaigns/${encodeURIComponent(campaign.name)}`}
+                        aria-label={`${text} in ${campaign.name}`}
+                        title={alarms.join('\n')}
+                      >
+                        <span class="dot"></span>
+                        {text}
+                      </a>
+                    {:else}
+                      <span class="dim">no alarms</span>
+                    {/if}
+                  {:else}
+                    <span class="dim">—</span>
+                  {/if}
+                </td>
+                <td class="state-col" data-label="State">
+                  {#if campaign.counters !== null}
+                    <CampaignProgress counters={campaign.counters} compact={true} />
+                  {:else}
+                    <span class="dim">—</span>
+                  {/if}
+                </td>
+                <!-- Not the members up to date before the campaign: they count
+                     as succeeded, but were never upgraded. -->
+                <td class="tn" data-label="Upgraded">
+                  {campaign.counters ? progressOf(campaign.counters, 0).upgraded.toLocaleString() : '—'}
+                </td>
+                <td class="tn" class:failed-cell={(campaign.counters?.failed ?? 0) > 0} data-label="Failed">
+                  {campaign.counters?.failed.toLocaleString() ?? '—'}
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+    {/if}
+  </section>
+{/if}
 
 <style>
   .alert-text {
@@ -199,8 +205,12 @@
     white-space: nowrap;
   }
 
-  .plan-cell .pill {
-    margin-left: 8px;
+  .alarms {
+    text-decoration: none;
+  }
+
+  .alarms:hover {
+    border-color: var(--sw-warning);
   }
 
   .failed-cell {

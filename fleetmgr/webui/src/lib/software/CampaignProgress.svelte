@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { CELL_COLOR } from '#lib/software/cells.ts';
+  import { CELL_COLOR, CELL_LABEL } from '#lib/software/cells.ts';
   import type { CampaignCounters } from '#lib/software/model.ts';
   import { progressOf } from '#lib/software/progress.ts';
 
@@ -31,31 +31,36 @@
     if (counters === null) return [];
     const p = progressOf(counters, notAnswered);
     return [
-      { name: 'upgraded', n: p.upgraded, color: 'var(--sw-success)', hint: 'upgraded by this campaign' },
+      { name: CELL_LABEL.upgraded, n: p.upgraded, color: 'var(--sw-success)', hint: 'upgraded by this campaign' },
       {
-        name: 'already up to date',
+        name: CELL_LABEL['up-to-date'],
         n: p.upToDate,
         color: CELL_COLOR['up-to-date'],
         hint: 'ran the target release already: nothing to install',
         situational: true
       },
-      { name: 'in progress', n: p.inProgress, color: 'var(--sw-accent)', hint: 'upgrading now', pulse: true },
-      { name: 'failed', n: p.failed, color: 'var(--sw-danger)', hint: 'failed or rolled back' },
+      { name: CELL_LABEL['in-progress'], n: p.inProgress, color: 'var(--sw-accent)', hint: 'upgrading now', pulse: true },
+      { name: CELL_LABEL.failed, n: p.failed, color: 'var(--sw-danger)', hint: 'failed or rolled back' },
       {
-        name: 'held',
+        name: CELL_LABEL.held,
         n: p.held,
         color: 'var(--sw-warning)',
         hint: 'may not start now: down, behind a group member, or over the failure budget',
         situational: true
       },
       {
-        name: 'not answered',
+        name: CELL_LABEL['not-answered'],
         n: p.notAnswered,
         color: CELL_COLOR['not-answered'],
         hint: 'has not said whether it needs the upgrade',
         situational: true
       },
-      { name: 'waiting', n: p.waiting, color: 'var(--sw-bar-rest)', hint: 'needs the upgrade and waits for its turn' }
+      {
+        name: CELL_LABEL.waiting,
+        n: p.waiting,
+        color: 'var(--sw-bar-rest)',
+        hint: 'needs the upgrade and waits for its turn'
+      }
     ];
   });
   let bars = $derived(segments.filter((s) => s.n > 0));

@@ -1,10 +1,11 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { goto } from '$app/navigation';
 
   import { errorText } from '#lib/core/errors.ts';
   import { onLoaded } from '#lib/core/loading.svelte.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
   import CampaignGroups from '#lib/software/CampaignGroups.svelte';
   import CampaignProgress from '#lib/software/CampaignProgress.svelte';
@@ -13,8 +14,9 @@
   import PlanTimeline from '#lib/software/PlanTimeline.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '#lib/core/restconf/client.ts';
   import { createPoller } from '#lib/core/polling/poller.ts';
-  import { CampaignLive, FAST_MS, type LiveView } from '#lib/software/campaign-live.ts';
+  import { Announcer, CampaignLive, FAST_MS, type LiveFacts, type LiveView } from '#lib/software/campaign-live.ts';
   import {
+    paceText,
     planningChanges,
     planningDraft,
     planningFromDraft,
@@ -28,6 +30,7 @@
   import { formatClock } from '#lib/core/time.ts';
   import { imageCounts } from '#lib/software/campaign-images.ts';
   import { HELD_KINDS, HELD_KIND_LABEL, heldCounts, heldKind, type HeldKind } from '#lib/software/device-state.ts';
+  import { campaignDeviceHref } from '#lib/software/links.ts';
   import { nameMatcher } from '#lib/software/selection.ts';
   import { alreadyOnTarget } from '#lib/software/stages.ts';
   import {
@@ -36,22 +39,35 @@
     KNOWN_STATUSES,
     STATUS_LABEL,
     adminStatePatch,
+    isFinalStatus,
     joinState,
+    modeLabel,
     type CampaignPlan,
     type DeviceStatusRow,
     type KnownStatus,
+    type PlanWindow,
     type Schedule
   } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
 
   const PAGE_SIZE = 100;
   const FAILED_LIMIT = 200;
+  /** Next windows the run dialog names one by one. */
+  const NEXT_LISTED = 3;
 
   let { data }: PageProps = $props();
 
   let busy = $state(false);
   let actionError = $state('');
   let confirmAction = $state<'run' | 'plan' | 'delete' | null>(null);
+
+  // Polled changes for a screen reader: emptied first, so that the same
+  // words said again are read again.
+  let announcement = $state('');
+  const announcer = new Announcer((text) => {
+    announcement = '';
+    void tick().then(() => (announcement = text));
+  });
 
   // Each load starts with the failed devices open and the pace and the
   // devices folded.
@@ -70,6 +86,7 @@
   let planningEdit = $state<PlanningDraft | null>(null);
   let planningSaving = $state(false);
   let planningMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
+  let planningFields: ReturnType<typeof PlanningFields> | undefined = $state();
 
   /** Unix seconds, ticking, for the timeline's marker. */
   let now = $state(Date.now() / 1000);
@@ -93,13 +110,22 @@
     }
   );
   let schedules = $state.raw<Schedule[]>([]);
-  onLoaded(() => data.schedules, (value) => (schedules = value));
+  let schedulesError = $state('');
+  onLoaded(
+    () => data.schedules,
+    (value) => {
+      schedules = value.schedules;
+      schedulesError = value.error;
+    }
+  );
 
   // Another campaign starts over, its form and filters too.
   let shownName: string | null = null;
   $effect.pre(() => {
     if (data.name !== shownName) {
       shownName = data.name;
+      announcer.reset();
+      announcement = '';
       actionError = '';
       confirmAction = null;
       failedOpen = true;
@@ -122,6 +148,7 @@
       poller.stop();
       clearInterval(clock);
       live.dispose();
+      announcer.dispose();
     };
   });
 
@@ -175,11 +202,11 @@
       : null
   );
   let noticeText = $derived.by(() => {
-    if (!campaign || noticeFrom === null) return '';
+    if (!campaign || noticeFrom === null) return 'no notice';
     const n = campaign.notificationPeriod;
-    const days = n === 1 ? "1 day's" : `${n} days'`;
+    const days = n === 1 ? "1 day's" : `${n.toLocaleString()} days'`;
     const from = campaign.runSince === null ? ' from now' : '';
-    return `${days} notice${from}: windows from ${formatClock(noticeFrom)} on.`;
+    return `${days} notice${from}: windows from ${formatClock(noticeFrom)} on`;
   });
 
   let savedPlanning = $derived(campaign ? planningOf(campaign) : null);
@@ -201,6 +228,22 @@
       ? savedPlanning.targetConcurrency
       : null
   );
+
+  /** The stored pace and limits, as the header's one line says them. */
+  let limitsText = $derived.by(() => {
+    if (!savedPlanning) return '';
+    const budgetPart =
+      savedPlanning.failureBudget === null ? 'no failure budget' : `failure budget ${savedPlanning.failureBudget}%`;
+    return [capitalized(paceText(savedPlanning)), budgetPart, noticeText].join(' · ');
+  });
+
+  function capitalized(text: string): string {
+    return text.charAt(0).toUpperCase() + text.slice(1);
+  }
+
+  function devicesText(n: number): string {
+    return n === 1 ? '1 device' : `${n.toLocaleString()} devices`;
+  }
 
   async function savePlanning(): Promise<void> {
     if (!planningForm || !savedPlanning) return;
@@ -303,29 +346,107 @@
     }
   } as const;
 
+  /** What Run starts, for its dialog: the windows open now and the ones
+   * after, each with the members it has left to upgrade. */
+  let preflight = $derived.by(() => {
+    if (confirmAction !== 'run' || !savedPlanning) return null;
+    const left = (name: string) => !isFinalStatus(rowsByName.get(name)?.status ?? 'unknown');
+    const windows = (timelinePlan?.windows ?? [])
+      .filter((w) => w.end === null || w.end > now)
+      .map((w) => ({ w, n: w.devices.filter((d) => left(d.name)).length }))
+      .filter(({ n }) => n > 0);
+    const open = windows.filter(({ w }) => w.start <= now);
+    const openDevices = open.reduce((sum, { n }) => sum + n, 0);
+    const p = savedPlanning;
+    const atOnce =
+      p.deadline !== null
+        ? "at the deadline's pace"
+        : openDevices <= p.targetConcurrency
+          ? 'all at once'
+          : `${p.targetConcurrency.toLocaleString()} at once`;
+    const next = windows.filter(({ w }) => w.start > now);
+    const later = next.slice(NEXT_LISTED);
+    return {
+      total: windows.reduce((sum, { n }) => sum + n, 0),
+      open: open.length === 0 ? '' : `${open.map(({ w, n }) => `${openText(w)}, ${devicesText(n)}`).join(' · ')}, ${atOnce}`,
+      next: next.slice(0, NEXT_LISTED).map(({ w, n }) => `${nextText(w)}: ${devicesText(n)}`),
+      later:
+        later.length === 0
+          ? ''
+          : `${later.length.toLocaleString()} more ${later.length === 1 ? 'window' : 'windows'}: ${devicesText(later.reduce((sum, { n }) => sum + n, 0))}`
+    };
+  });
+
+  // Without a schedule a campaign runs through one window of its own,
+  // open from launch, or from the end of its notice, to its deadline.
+
+  /** An open window: its schedule and when it closes. */
+  function openText(w: PlanWindow): string {
+    const until = w.end === null ? '' : ` until ${formatClock(w.end)}`;
+    return `${w.schedule || 'No schedule'}${until}`;
+  }
+
+  /** A window still to open: its schedule and when it opens. */
+  function nextText(w: PlanWindow): string {
+    return w.schedule ? `${w.schedule} opens ${formatClock(w.start)}` : `From ${formatClock(w.start)}`;
+  }
+
   let confirmMessage = $derived.by(() => {
     const c = campaign;
     if (!c || !confirmAction) return '';
     if (confirmAction === 'run') {
-      const unplaced = c.plan?.unplaced.length ?? 0;
-      const skip = new Set([...(c.plan?.unplaced ?? []), ...(c.plan?.done ?? []), ...onTarget]);
-      const placed = c.devices.filter((d) => !skip.has(d)).length;
-      const first = c.plan?.windows.find((w) => w.end === null || w.end > Date.now() / 1000);
-      const opens =
-        first && first.start > Date.now() / 1000
-          ? ` The first window${first.schedule ? `, ${first.schedule},` : ''} opens at ${formatClock(first.start)}.`
-          : '';
-      return (
-        `Start upgrading ${placed} device(s) to their images? Devices are released a few at a time as their windows open and completions come in. Real installs reload devices and take several minutes.` +
-        opens +
-        (onTarget.length > 0 ? ` ${onTarget.length} device(s) already run their target and need nothing.` : '') +
-        (unplaced > 0 ? ` ${unplaced} device(s) are in no window yet and do not start.` : '')
-      );
+      if (!preflight || preflight.total === 0) return 'Run the campaign? No device in a window needs an upgrade.';
+      return `Start upgrading ${devicesText(preflight.total)}?`;
     }
     if (confirmAction === 'plan')
       return 'Pause the campaign? Devices upgrading now stop before their install and go on when it runs again. Devices past their install finish.';
     return `Delete campaign ${c.name}? Its targets are withdrawn from the devices.`;
   });
+
+  /** From the run dialog: the failure budget field, in the fold opened. */
+  async function setBudget(): Promise<void> {
+    confirmAction = null;
+    paceOpen = true;
+    // The dialog has closed and given focus back to Run by then.
+    await tick();
+    planningFields?.focusBudget();
+  }
+
+  // What the announcer compares between polls.
+  let facts = $derived.by((): LiveFacts | null => {
+    if (!campaign || counters === null) return null;
+    return {
+      mode: modeLabel(campaign.adminState, campaign.runSince),
+      failed: counters.failed,
+      overBudget: budget?.over ?? false,
+      idle: campaign.adminState === 'run' && counters.total > 0 && counters.inProgress === 0 && counters.remainder === 0,
+      idleText: summary
+    };
+  });
+  $effect(() => {
+    if (facts !== null) announcer.update(facts);
+  });
+
+  /** Whether the image pills scroll, and whether more lie past the right
+   * edge. */
+  let pills = $state({ scroll: false, more: false });
+
+  function watchPills(scroller: HTMLElement): () => void {
+    const measure = () => {
+      const scroll = scroller.scrollWidth > scroller.clientWidth + 1;
+      const more = scroll && scroller.scrollLeft + scroller.clientWidth < scroller.scrollWidth - 1;
+      if (scroll !== pills.scroll || more !== pills.more) pills = { scroll, more };
+    };
+    // The track is as wide as the pills, so it resizes when they change.
+    const observer = new ResizeObserver(measure);
+    observer.observe(scroller);
+    if (scroller.firstElementChild) observer.observe(scroller.firstElementChild);
+    scroller.addEventListener('scroll', measure, { passive: true });
+    return () => {
+      observer.disconnect();
+      scroller.removeEventListener('scroll', measure);
+    };
+  }
 
   async function handleConfirm(): Promise<void> {
     const action = confirmAction;
@@ -353,9 +474,13 @@
   }
 </script>
 
-{#if actionError || loadError}
-  <div class="error-state status">{actionError || loadError}</div>
-{/if}
+<!-- In place before any message, so that a screen reader reads each one. -->
+<div role="alert">
+  {#if actionError}
+    <div class="error-state status">{actionError}</div>
+  {/if}
+</div>
+<div class="sr-only" role="status">{announcement}</div>
 
 {#if shown === null}
   <div class="page-header">
@@ -372,19 +497,26 @@
     <section class="card">
       <div class="empty-state">No campaign named {data.name}.</div>
     </section>
+  {:else}
+    <div class="page-header">
+      <div>
+        <h1>{data.name}</h1>
+      </div>
+    </div>
+    <LoadError message={loadError || 'Failed to load the campaign.'} />
   {/if}
 {:else}
+  <!-- A refresh that failed: what shows is from the read before. -->
+  {#if loadError}
+    <LoadError message={loadError} />
+  {/if}
   <div class="page-header">
     <div>
       <h1>{campaign.name}</h1>
       <p class="summary">{summary}</p>
-      {#if campaign.runSince !== null || noticeFrom !== null}
-        <p class="since">
-          {#if campaign.runSince !== null}
-            First ran {formatClock(campaign.runSince)}.
-          {/if}
-          {noticeText}
-        </p>
+      <p class="meta">{limitsText}</p>
+      {#if campaign.runSince !== null}
+        <p class="meta">First ran {formatClock(campaign.runSince)}.</p>
       {/if}
     </div>
     <div class="page-actions">
@@ -419,14 +551,26 @@
   </div>
 
   {#if campaign.images.length > 0}
-    <!-- The full width under the header, so a few images fit one line. -->
-    <div class="image-pills" aria-label="Images">
-      {#each imageCounts(campaign.images) as [image, n] (image)}
-        <span class="pill image-pill">
-          <span class="mono">{image || 'no image'}</span>
-          <span class="n tn">{n.toLocaleString()}</span>
-        </span>
-      {/each}
+    <!-- The full width under the header, so a few images fit one line;
+         more scroll sideways, so the strip takes focus then. -->
+    <div class="image-pills" class:more={pills.more}>
+      <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+      <div
+        class="pills-scroll"
+        role="region"
+        aria-label="Images"
+        tabindex={pills.scroll ? 0 : undefined}
+        {@attach watchPills}
+      >
+        <div class="pills-track">
+          {#each imageCounts(campaign.images) as [image, n] (image)}
+            <span class="pill image-pill">
+              <span class="mono">{image || 'no image'}</span>
+              <span class="n tn">{n.toLocaleString()}</span>
+            </span>
+          {/each}
+        </div>
+      </div>
     </div>
   {/if}
 
@@ -521,7 +665,7 @@
           {#if onTargetOpen}
             <ul class="names">
               {#each onTarget as name (name)}
-                <li><a class="mono" href={`/devices/${encodeURIComponent(name)}`}>{name}</a></li>
+                <li><a class="mono" href={campaignDeviceHref(data.name, name)}>{name}</a></li>
               {/each}
             </ul>
           {/if}
@@ -532,7 +676,9 @@
           plan={timelinePlan}
           rows={rowsByName}
           {now}
-          ondevice={(name) => goto(`/devices/${encodeURIComponent(name)}`)}
+          fitPlan={campaign.adminState === 'plan'}
+          zoomKey={campaign.name}
+          ondevice={(name) => goto(campaignDeviceHref(data.name, name))}
         />
       {/if}
     </section>
@@ -558,9 +704,16 @@
           <span class="hint">Unsaved changes</span>
         {/if}
       </h2>
-      {#if paceOpen}
+      {#if paceOpen && schedulesError}
+        <!-- The schedule field offers the schedules: without them it would
+             call the campaign's one missing. -->
+        <div class="pace-body">
+          <LoadError message={schedulesError} />
+        </div>
+      {:else if paceOpen}
         <div class="pace-body">
           <PlanningFields
+            bind:this={planningFields}
             {schedules}
             draft={planningForm}
             errors={planningErrors}
@@ -572,9 +725,17 @@
             }}
           />
           <div class="planning-actions">
-            {#if planningMessage}
-              <span class={planningMessage.type === 'error' ? 'save-error' : 'save-ok'}>{planningMessage.text}</span>
-            {:else if alsoTargetConcurrency !== null}
+            <span role="status">
+              {#if planningMessage?.type === 'success'}
+                <span class="save-ok">{planningMessage.text}</span>
+              {/if}
+            </span>
+            <span role="alert">
+              {#if planningMessage?.type === 'error'}
+                <span class="save-error">{planningMessage.text}</span>
+              {/if}
+            </span>
+            {#if !planningMessage && alsoTargetConcurrency !== null}
               <span class="save-ok">{alsoTargetConcurrency} at once also applies; saving sets it to 1.</span>
             {/if}
             <button
@@ -611,7 +772,7 @@
       </h2>
       {#if failedOpen}
         <div class="failed-body">
-          <DeviceStatusTable rows={failedRows.slice(0, FAILED_LIMIT)} />
+          <DeviceStatusTable campaign={data.name} rows={failedRows.slice(0, FAILED_LIMIT)} />
           {#if failedRows.length > FAILED_LIMIT}
             <p class="rate">showing {FAILED_LIMIT} of {failedRows.length}</p>
           {/if}
@@ -622,6 +783,7 @@
 
   {#key data.name}
     <CampaignGroups
+      campaign={data.name}
       members={campaign.devices}
       rows={campaign.deviceStatus}
       plan={campaign.plan}
@@ -712,7 +874,7 @@
             oninput={() => (page = 1)}
           />
         </div>
-        <DeviceStatusTable rows={paged.rows} />
+        <DeviceStatusTable campaign={data.name} rows={paged.rows} />
         <Pager page={paged.page} pageCount={paged.pageCount} onchange={(p) => (page = p)} />
       {/if}
     {/if}
@@ -720,10 +882,49 @@
 
 {/if}
 
+{#snippet runDetails()}
+  {#if preflight && campaign && savedPlanning}
+    <dl class="preflight">
+      <dt>Open now</dt>
+      <dd>{preflight.open || 'No window'}</dd>
+      {#if preflight.next.length > 0}
+        <dt>Next</dt>
+        <dd>
+          {#each preflight.next as line, i (i)}
+            <span class="line">{line}</span>
+          {/each}
+          {#if preflight.later}
+            <span class="line">{preflight.later}</span>
+          {/if}
+        </dd>
+      {/if}
+      <dt>Pace</dt>
+      <dd>{capitalized(paceText(savedPlanning))}</dd>
+      <dt>Failure budget</dt>
+      <dd>
+        {#if campaign.failureBudget === null}
+          None · <button class="link" type="button" onclick={setBudget}>Set one</button>
+        {:else}
+          {campaign.failureBudget}%{budget !== null ? `, ${devicesText(budget.allowed)}` : ''}
+        {/if}
+      </dd>
+      {#if onTarget.length > 0}
+        <dt>On target</dt>
+        <dd>{devicesText(onTarget.length)}, nothing to install</dd>
+      {/if}
+      {#if (campaign.plan?.unplaced.length ?? 0) > 0}
+        <dt>In no window</dt>
+        <dd>{devicesText(campaign.plan?.unplaced.length ?? 0)}, they do not start</dd>
+      {/if}
+    </dl>
+  {/if}
+{/snippet}
+
 <ConfirmDialog
   open={confirmAction !== null}
   title={confirmAction ? CONFIRMS[confirmAction].title : ''}
   message={confirmMessage}
+  details={confirmAction === 'run' ? runDetails : undefined}
   confirmLabel={confirmAction ? CONFIRMS[confirmAction].confirmLabel : ''}
   confirmClass={confirmAction ? CONFIRMS[confirmAction].confirmClass : 'btn-primary'}
   oncancel={() => (confirmAction = null)}
@@ -737,13 +938,33 @@
     font-size: var(--sw-text-md);
   }
 
-  /* One line; more images than fit scroll sideways. */
+  /* One line; more images than fit scroll sideways, and fade out at the
+     edge while more lie past it. */
   .image-pills {
-    display: flex;
-    gap: 8px;
+    position: relative;
     margin: -12px 0 20px;
+  }
+
+  .image-pills.more::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 48px;
+    background: linear-gradient(to right, transparent, var(--sw-bg-deep));
+    pointer-events: none;
+  }
+
+  .pills-scroll {
     overflow-x: auto;
     scrollbar-width: thin;
+  }
+
+  .pills-track {
+    display: flex;
+    gap: 8px;
+    width: max-content;
   }
 
   .image-pill {
@@ -773,7 +994,7 @@
     margin: 0;
   }
 
-  .since {
+  .meta {
     margin: 2px 0 0;
     font-size: var(--sw-text-xs);
     color: var(--sw-text-muted);
@@ -882,6 +1103,10 @@
     margin-top: 16px;
   }
 
+  .pace-body > :global(.load-error) {
+    margin-bottom: 0;
+  }
+
   .planning-actions {
     display: flex;
     align-items: center;
@@ -950,7 +1175,7 @@
   .names {
     display: flex;
     flex-wrap: wrap;
-    gap: 4px 14px;
+    gap: 8px 14px;
     max-height: 240px;
     overflow-y: auto;
     margin: 8px 0 2px;
@@ -958,7 +1183,11 @@
     list-style: none;
   }
 
+  /* Targets 24 px tall at least, 8 px apart, so a name is easy to hit. */
   .names a {
+    display: inline-flex;
+    align-items: center;
+    min-height: 24px;
     color: var(--sw-text-secondary);
     font-size: var(--sw-text-xs);
     text-decoration: none;
@@ -980,6 +1209,34 @@
   .search {
     width: auto;
     margin-left: auto;
+  }
+
+  /* The run dialog's checks: a label column and what it says. */
+  .preflight {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 6px 16px;
+    margin: 0;
+    font-size: var(--sw-text-sm);
+  }
+
+  .preflight dt {
+    color: var(--sw-text-muted);
+  }
+
+  .preflight dd {
+    margin: 0;
+    color: var(--sw-text-primary);
+  }
+
+  .preflight .line {
+    display: block;
+  }
+
+  .preflight .link {
+    padding: 2px 4px;
+    margin: -2px -4px;
+    color: var(--sw-accent-bright);
   }
 
   @media (max-width: 720px) {

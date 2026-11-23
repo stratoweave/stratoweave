@@ -3,16 +3,22 @@
 // type as 30m, 2h30m or 1d.
 
 const UNIT_SECONDS: Record<string, number> = { s: 1, m: 60, h: 3600, d: 86400 };
+const UNIT_ORDER = 'dhms';
 
 /** "600", "10m", "2h30m", "1d 12h" -> seconds; null when unparsable. A bare
- * number is seconds. */
+ * number is seconds. Each unit comes at most once, largest first. */
 export function parseDuration(text: string): number | null {
   const t = text.trim().toLowerCase();
   if (!t) return null;
   if (/^\d+$/.test(t)) return Number(t);
   let total = 0;
   let matched = '';
+  let last = -1;
   for (const m of t.matchAll(/(\d+)\s*([smhd])/g)) {
+    // "4h3h" or "30m1h" is a typo, not 7h or 1h30m.
+    const rank = UNIT_ORDER.indexOf(m[2]);
+    if (rank <= last) return null;
+    last = rank;
     total += Number(m[1]) * UNIT_SECONDS[m[2]];
     matched += m[0];
   }

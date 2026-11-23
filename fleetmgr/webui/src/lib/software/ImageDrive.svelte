@@ -48,12 +48,15 @@
     /** The campaigns that name each image; null when they could not be
      * read. A move reads them again before it starts. */
     inUse: Map<string, string[]> | null;
+    /** The image folder could not be read: the page says so, and the
+     * server may well have one. */
+    filesFailed?: boolean;
     /** Files dragged over the window, to upload into this folder. */
     dragging: boolean;
     onstatus: (status: { type: 'success' | 'error'; text: string } | null) => void;
   }
 
-  let { folder, tree, inUse, dragging, onstatus }: Props = $props();
+  let { folder, tree, inUse, filesFailed = false, dragging, onstatus }: Props = $props();
 
   const COLUMNS: { key: DriveSortKey; label: string }[] = [
     { key: 'name', label: 'Name' },
@@ -146,6 +149,14 @@
     return ascending ? 'ascending' : 'descending';
   }
 
+  function itemsText(n: number): string {
+    return n === 1 ? '1 item' : `${n.toLocaleString()} items`;
+  }
+
+  function imagesText(n: number): string {
+    return n === 1 ? '1 image' : `${n.toLocaleString()} images`;
+  }
+
   function campaignsText(names: string[]): string {
     return names.length === 1 ? `Campaign ${names[0]}` : `Campaigns ${names.join(', ')}`;
   }
@@ -154,7 +165,8 @@
    * they can. Without an image folder the files are elsewhere and would
    * not move with their paths. */
   function moveRefusal(entries: DriveEntry[]): string {
-    return tree.filesOn || entries.length === 0 ? '' : 'The server has no image folder.';
+    if (tree.filesOn || entries.length === 0) return '';
+    return filesFailed ? 'The image folder could not be read.' : 'The server has no image folder.';
   }
 
   /** What a move of entries does to the campaigns that install their
@@ -164,7 +176,7 @@
     if (used.length === 0) return '';
     const campaigns = [...new Set(used.flatMap((u) => u.campaigns))].sort();
     const one = used.length === 1;
-    return `${campaignsText(campaigns)} ${campaigns.length === 1 ? 'installs' : 'install'} ${one ? 'this image' : `${used.length} of these images`}: devices that have not fetched ${one ? 'it' : 'them'} yet fetch ${one ? 'it' : 'them'} from the new path.`;
+    return `${campaignsText(campaigns)} ${campaigns.length === 1 ? 'installs' : 'install'} ${one ? 'this image' : `${used.length.toLocaleString()} of these images`}: devices that have not fetched ${one ? 'it' : 'them'} yet fetch ${one ? 'it' : 'them'} from the new path.`;
   }
 
   function open(entry: DriveEntry): void {
@@ -310,7 +322,7 @@
   }
 
   function movedText(moves: Move[], target: string | null): string {
-    const what = moves.length === 1 ? moves[0].entry.name : `${moves.length} items`;
+    const what = moves.length === 1 ? moves[0].entry.name : itemsText(moves.length);
     if (target === null) return `Renamed ${moves[0].entry.name} to ${baseName(moves[0].to)}.`;
     return `Moved ${what} to ${target ? baseName(target) : 'Images'}.`;
   }
@@ -319,11 +331,11 @@
   async function runMoves(moves: Move[], target: string | null): Promise<void> {
     if (moves.length === 0) return;
     const focusIndex = paged.rows.findIndex((r) => r.path === moves[0].entry.path);
-    busy = moves.length === 1 ? 'Moving…' : `Moving, 0 of ${moves.length}…`;
+    busy = moves.length === 1 ? 'Moving…' : `Moving, 0 of ${moves.length.toLocaleString()}…`;
     onstatus(null);
     try {
       await moveEntries(moves, (done) => {
-        if (moves.length > 1) busy = `Moving, ${done} of ${moves.length}…`;
+        if (moves.length > 1) busy = `Moving, ${done.toLocaleString()} of ${moves.length.toLocaleString()}…`;
       });
       onstatus({ type: 'success', text: movedText(moves, target) });
       for (const m of moves) selected.delete(m.entry.path);
@@ -358,15 +370,16 @@
       const e = outer[0];
       if (e.kind === 'image') text = e.image ? `Delete ${e.name} and its file?` : `Delete the file ${e.name}?`;
       else if (images.length > 0) {
-        text = `Delete the folder ${e.name} and the ${images.length === 1 ? 'image' : `${images.length} images`} in it?`;
+        text = `Delete the folder ${e.name} and the ${images.length === 1 ? 'image' : imagesText(images.length)} in it?`;
       } else text = (counts.get(e.path) ?? 0) > 0 ? `Delete the folder ${e.name} and its folders?` : `Delete the empty folder ${e.name}?`;
     } else {
-      text = `Delete ${outer.length} items${images.length > 0 ? `, with ${images.length === 1 ? '1 image' : `${images.length} images`} in all` : ''}?`;
+      text = `Delete ${itemsText(outer.length)}${images.length > 0 ? `, with ${imagesText(images.length)} in all` : ''}?`;
     }
     const used = inUse ? imagesInUse(tree, outer, inUse) : [];
     if (used.length > 0) {
       const campaigns = [...new Set(used.flatMap((u) => u.campaigns))].sort();
-      const which = outer.length === 1 && outer[0].kind === 'image' ? 'it' : used.length === 1 ? 'one of them' : `${used.length} of them`;
+      const which =
+        outer.length === 1 && outer[0].kind === 'image' ? 'it' : used.length === 1 ? 'one of them' : `${used.length.toLocaleString()} of them`;
       text += ` ${campaignsText(campaigns)} ${campaigns.length === 1 ? 'installs' : 'install'} ${which}, and will report ${used.length === 1 ? 'it' : 'them'} missing.`;
     }
     return text;
@@ -376,13 +389,13 @@
     await closeDialog();
     const outer = outermost(entries);
     const focusIndex = paged.rows.findIndex((r) => r.path === outer[0]?.path);
-    busy = outer.length === 1 ? 'Deleting…' : `Deleting, 0 of ${outer.length}…`;
+    busy = outer.length === 1 ? 'Deleting…' : `Deleting, 0 of ${outer.length.toLocaleString()}…`;
     onstatus(null);
     try {
       await deleteEntries(outer, (done) => {
-        if (outer.length > 1) busy = `Deleting, ${done} of ${outer.length}…`;
+        if (outer.length > 1) busy = `Deleting, ${done.toLocaleString()} of ${outer.length.toLocaleString()}…`;
       });
-      onstatus({ type: 'success', text: outer.length === 1 ? `Deleted ${outer[0].name}.` : `Deleted ${outer.length} items.` });
+      onstatus({ type: 'success', text: outer.length === 1 ? `Deleted ${outer[0].name}.` : `Deleted ${itemsText(outer.length)}.` });
       for (const e of outer) selected.delete(e.path);
     } catch (deleteError) {
       onstatus({ type: 'error', text: errorText(deleteError, 'Failed to delete.') });
@@ -408,7 +421,7 @@
     event.dataTransfer.setData(DRAG_TYPE, dragPaths.join('\n'));
     event.dataTransfer.effectAllowed = 'move';
     if (dragLabel) {
-      dragLabel.textContent = moving.length === 1 ? moving[0].name : `${moving.length} items`;
+      dragLabel.textContent = moving.length === 1 ? moving[0].name : itemsText(moving.length);
       event.dataTransfer.setDragImage(dragLabel, 14, 14);
     }
   }
@@ -525,7 +538,7 @@
         {#if selectedRows.length > 0}
           {@const why = moveRefusal(selectedRows)}
           <div class="selection" role="group" aria-label="Selected">
-            <span class="count tn">{selectedRows.length} selected</span>
+            <span class="count tn">{selectedRows.length.toLocaleString()} selected</span>
             <button
               class="btn btn-secondary btn-sm"
               type="button"
@@ -547,14 +560,15 @@
           </div>
         {:else}
           <span class="count tn">
-            {busy || (searching ? `${rows.length} ${rows.length === 1 ? 'match' : 'matches'}` : `${rows.length} ${rows.length === 1 ? 'item' : 'items'}`)}
+            {busy ||
+              (searching ? `${rows.length.toLocaleString()} ${rows.length === 1 ? 'match' : 'matches'}` : itemsText(rows.length))}
           </span>
         {/if}
       </div>
     {/if}
   </div>
 
-  {#if !tree.filesOn}
+  {#if !tree.filesOn && !filesFailed}
     <p class="note">
       The server has no image folder, so uploads, moves and new folders are off. Start it with
       <span class="mono">--software.image-dir</span> to turn them on.
@@ -686,7 +700,7 @@
                 <td class="models-cell"></td>
                 <td class="version-cell"></td>
                 {@const n = counts.get(entry.path) ?? 0}
-                <td class="size-cell dim tn">{n === 0 ? 'empty' : n === 1 ? '1 item' : `${n} items`}</td>
+                <td class="size-cell dim tn">{n === 0 ? 'empty' : itemsText(n)}</td>
               {:else}
                 <td class="os-cell nowrap">{entry.image?.os ?? ''}</td>
                 <td class="family-cell mono" title={entry.image?.family}>{entry.image?.family ?? ''}</td>
@@ -796,7 +810,7 @@
   {@const d = dialog}
   <ConfirmDialog
     open={true}
-    title={d.entries.length === 1 ? `Move ${d.entries[0].name}` : `Move ${d.entries.length} items`}
+    title={d.entries.length === 1 ? `Move ${d.entries[0].name}` : `Move ${itemsText(d.entries.length)}`}
     message={`Choose the folder to move to. ${campaignsNote(d.entries)}`.trim()}
     confirmLabel={d.to === null ? 'Move' : `Move to ${d.to ? baseName(d.to) : 'Images'}`}
     confirmClass="btn-primary"
@@ -1169,6 +1183,7 @@
     background: var(--sw-bg-elevated);
     color: var(--sw-text-primary);
     font-family: var(--sw-font-mono);
+    font-variant-ligatures: none;
     font-size: var(--sw-text-xs);
     white-space: nowrap;
     pointer-events: none;

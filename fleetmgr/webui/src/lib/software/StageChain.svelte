@@ -222,13 +222,18 @@
   }
 
   /* Five names do not fit side by side on a phone: they shrink and break
-     at their hyphens, under narrower ends. */
+     at their hyphens. A rollback takes a share like a step, so its name
+     breaks at its space, not letter by letter. */
   @media (max-width: 560px) {
     .chain.large {
-      --end: 8px;
       --dot: 18px;
       --dot-running: 20px;
       --dot-failed: 24px;
+    }
+
+    .large .end {
+      flex: 1 1 0;
+      min-width: 0;
     }
 
     .large .name {

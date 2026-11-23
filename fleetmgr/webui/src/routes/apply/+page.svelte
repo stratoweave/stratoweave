@@ -195,13 +195,15 @@
   .toolbar__meta {
     margin-left: auto;
     color: var(--sw-text-muted);
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     font-family: var(--sw-font-mono);
+    font-variant-ligatures: none;
   }
 
+  /* The text field's edge, drawn as the other fields'. */
   .dropzone {
     position: relative;
-    border: 1px solid var(--sw-border-subtle);
+    border: 1px solid var(--sw-border-control);
     border-radius: var(--sw-radius-md);
     background: var(--sw-bg-card);
     overflow: hidden;
@@ -226,7 +228,8 @@
     resize: vertical;
     color: var(--sw-text-primary);
     font-family: var(--sw-font-mono);
-    font-size: 13px;
+    font-variant-ligatures: none;
+    font-size: var(--sw-text-sm);
     line-height: 1.55;
   }
 
@@ -244,7 +247,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 14px;
+    font-size: var(--sw-text-md);
     font-weight: 500;
     pointer-events: none;
   }

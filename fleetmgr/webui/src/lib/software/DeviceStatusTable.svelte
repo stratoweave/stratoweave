@@ -3,18 +3,17 @@
   import JobProgress from '#lib/software/JobProgress.svelte';
   import StageChain from '#lib/software/StageChain.svelte';
   import StatusPill from '#lib/software/StatusPill.svelte';
+  import { campaignDeviceHref } from '#lib/software/links.ts';
   import type { DeviceStatusRow } from '#lib/software/model.ts';
   import { jobDetail, jobProgress, stageDetail } from '#lib/software/stages.ts';
 
-  function deviceHref(name: string): string {
-    return `/devices/${encodeURIComponent(name)}`;
-  }
-
   interface Props {
+    /** The campaign the rows are of: a device opens as it shows it. */
+    campaign: string;
     rows: DeviceStatusRow[];
   }
 
-  let { rows }: Props = $props();
+  let { campaign, rows }: Props = $props();
 </script>
 
 <div class="table-wrap">
@@ -33,7 +32,7 @@
       {#each rows as row (row.device)}
         {@const progress = jobProgress(row)}
         <tr>
-          <td><a class="device-name" href={deviceHref(row.device)}>{row.device}</a></td>
+          <td><a class="device-name" href={campaignDeviceHref(campaign, row.device)}>{row.device}</a></td>
           <td><StatusPill status={row.status} raw={row.raw} /></td>
           <td><StageChain {row} /></td>
           <td>
@@ -54,7 +53,7 @@
             {#if row.held !== null}
               <!-- A member held before its window may prepare ahead of it. -->
               {@const doing = jobDetail(row)}
-              <span class="held">held:</span> <HeldText {row} />{#if doing}{` · ${doing}`}{/if}
+              <span class="held">held:</span> <HeldText {row} {campaign} />{#if doing}{` · ${doing}`}{/if}
             {:else}
               {stageDetail(row) || '—'}
             {/if}

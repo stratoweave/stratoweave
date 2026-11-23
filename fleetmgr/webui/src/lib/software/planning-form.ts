@@ -22,7 +22,7 @@ import {
   type CampaignJson,
   type CampaignPlan
 } from './model';
-import { formatDuration, toLocalInput } from '#lib/core/time.ts';
+import { formatClock, formatDuration, toLocalInput } from '#lib/core/time.ts';
 
 export type PaceBy = 'deadline' | 'concurrency';
 
@@ -187,6 +187,20 @@ export function perHourText(draft: PlanningDraft, installSeconds: number): strin
   const head = `At ${install}, ${target.toLocaleString()} at once is about ${devices(hourly(target))} per hour`;
   if (max <= target) return `${head}.`;
   return `${head}, up to ${hourly(max).toLocaleString()} per hour at ${max.toLocaleString()} when a window falls behind.`;
+}
+
+/** The stored pace in a few words: "10 at once, up to 50", or the
+ * deadline with the most at once it may take. */
+export function paceText(p: Planning): string {
+  const target = p.targetConcurrency.toLocaleString();
+  const max = p.maxConcurrency.toLocaleString();
+  if (p.deadline !== null) {
+    // Pacing by the deadline stores 1; a campaign set up elsewhere may
+    // keep a higher floor.
+    const floor = p.targetConcurrency > 1 ? `, at least ${target} at once` : '';
+    return `deadline ${formatClock(p.deadline)}${floor}, up to ${max} at once`;
+  }
+  return p.maxConcurrency > p.targetConcurrency ? `${target} at once, up to ${max}` : `${target} at once`;
 }
 
 type RemovableLeaf = 'default-schedule' | 'deadline' | 'failure-budget';

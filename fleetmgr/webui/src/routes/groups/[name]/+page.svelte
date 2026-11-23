@@ -1,4 +1,5 @@
 <script lang="ts">
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import GroupEditor from '#lib/software/GroupEditor.svelte';
   import type { PageProps } from './$types';
 
@@ -6,18 +7,18 @@
 </script>
 
 {#if data.loadError}
-  <div class="error-state status">{data.loadError}</div>
+  <LoadError message={data.loadError} />
+{:else}
+  <!-- Another group gets a fresh editor, not the edits made here. -->
+  {#key data.name}
+    <GroupEditor
+      name={data.name}
+      members={data.members}
+      otherGroups={data.otherGroups}
+      campaignsOf={data.campaignsOf}
+      policy={data.policy}
+      hasEntry={data.hasEntry}
+      deviceNames={data.deviceNames}
+    />
+  {/key}
 {/if}
-
-<!-- Another group gets a fresh editor, not the edits made here. -->
-{#key data.name}
-  <GroupEditor
-    name={data.name}
-    members={data.members}
-    otherGroups={data.otherGroups}
-    campaignsOf={data.campaignsOf}
-    policy={data.policy}
-    hasEntry={data.hasEntry}
-    deviceNames={data.deviceNames}
-  />
-{/key}

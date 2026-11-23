@@ -62,6 +62,17 @@ export function defaultPolicy(name: string): GroupPolicy {
   return { name, separationPolicy: 'spread', minSeparation: 0, failurePolicy: 'continue' };
 }
 
+/** What each policy does, in one line from its YANG description. */
+export const SEPARATION_TEXT: Record<SeparationPolicy, string> = {
+  spread: 'Later members move to later windows of the campaign, as far apart as its windows allow.',
+  pack: 'Each member starts as soon as the member before it is done.'
+};
+
+export const FAILURE_TEXT: Record<FailurePolicy, string> = {
+  continue: 'A member that failed or rolled back holds the others only until it is done and up again.',
+  hold: 'While a member is failed, the others wait for an operator.'
+};
+
 /** "pack, 1m · holds on failure". */
 export function policyText(p: GroupPolicy): string {
   const separation =

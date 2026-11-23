@@ -1,18 +1,18 @@
 import { errorText } from '#lib/core/errors.ts';
 import { nextSeq } from '#lib/core/polling/poller.ts';
-import { restconfGetJson } from '#lib/core/restconf/client.ts';
+import { restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import { fetchCampaignEntry } from '#lib/software/counters.ts';
 import { SCHEDULES_ROOT, parseSchedules, type CampaignConfig, type Schedule, type StateParts } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 
-async function loadSchedules(fetch: typeof globalThis.fetch): Promise<Schedule[]> {
-  // The campaign renders without them; a failure only blanks the
-  // default-schedule windows line.
+async function loadSchedules(fetch: typeof globalThis.fetch): Promise<{ schedules: Schedule[]; error: string }> {
+  // The campaign renders without them; only its schedule field needs them.
+  // None at all is a 404.
   try {
-    return parseSchedules(await restconfGetJson<unknown>(SCHEDULES_ROOT, fetch));
-  } catch {
-    return [];
+    return { schedules: parseSchedules(await restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch)), error: '' };
+  } catch (error) {
+    return { schedules: [], error: errorText(error, 'Failed to load the schedules.') };
   }
 }
 
