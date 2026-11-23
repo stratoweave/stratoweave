@@ -187,6 +187,21 @@
       />
     </div>
   </div>
+  <label class="ahead" class:disabled>
+    <input
+      type="checkbox"
+      checked={draft.allowStaging}
+      {disabled}
+      onchange={(e) => patch({ allowStaging: e.currentTarget.checked })}
+    />
+    <span>
+      <span class="ahead-name">Prepare ahead</span>
+      <small class="field__meta">
+        Devices copy their image before their window, without an outage. Turning it off stops the prepares not
+        started yet.
+      </small>
+    </span>
+  </label>
 </div>
 
 <style>
@@ -208,6 +223,34 @@
   /* Holds a field for a reference to it, not a box of its own. */
   .slot {
     display: contents;
+  }
+
+  .ahead {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    margin-top: 12px;
+    cursor: pointer;
+  }
+
+  .ahead input {
+    margin-top: 3px;
+  }
+
+  .ahead > span {
+    display: grid;
+    gap: 2px;
+  }
+
+  .ahead-name {
+    font-size: var(--sw-text-sm);
+    font-weight: 500;
+    color: var(--sw-text-primary);
+  }
+
+  .ahead.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   /* Two radios drawn as one segmented control, as tall as an input. */

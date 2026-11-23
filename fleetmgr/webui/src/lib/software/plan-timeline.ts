@@ -9,7 +9,7 @@
 // change, colours when statuses change, and the clock only moves the
 // marker.
 
-import { cellKind, gutter, type CellKind } from './cells';
+import { gutter } from './cells';
 import {
   deviceDuration,
   deviceStart,
@@ -468,25 +468,25 @@ export function pickZoom(zooms: number[], readable: number, fit: (zoom: number) 
 }
 
 /** Cells as one SVG path per kind, a square per cell, so a grid of any size
- * is a few nodes. */
-export function cellPaths(
+ * is a few nodes. kindOf gives a device's kind by its name. */
+export function cellPaths<K extends string>(
   grids: { cells: WindowCells; gy: number }[],
-  rows: Map<string, DeviceStatusRow>,
+  kindOf: (name: string) => K,
   size: number,
   pitch: number
-): Partial<Record<CellKind, string>> {
-  const parts: Partial<Record<CellKind, string[]>> = {};
+): Partial<Record<K, string>> {
+  const parts: Partial<Record<K, string[]>> = {};
   for (const { cells, gy } of grids) {
     for (const col of cells.cols) {
       for (let row = 0; row < col.count; row++) {
-        const kind = cellKind(rows.get(cells.devices[col.first + row].name));
+        const kind = kindOf(cells.devices[col.first + row].name);
         const y = gy + row * pitch;
         (parts[kind] ??= []).push(`M${col.x} ${y}h${size}v${size}h${-size}z`);
       }
     }
   }
-  const out: Partial<Record<CellKind, string>> = {};
-  for (const [kind, d] of Object.entries(parts) as [CellKind, string[]][]) out[kind] = d.join('');
+  const out: Partial<Record<K, string>> = {};
+  for (const [kind, d] of Object.entries(parts) as [K, string[]][]) out[kind] = d.join('');
   return out;
 }
 

@@ -2,6 +2,7 @@
 // shares for the states it has in common.
 
 import type { DeviceStatusRow } from './model';
+import type { PrepareState, PrepareView } from './prepare';
 
 /** What a cell shows of its device: its status, or why the campaign holds
  * it when it waits. */
@@ -83,4 +84,51 @@ export function cellKind(row: DeviceStatusRow | undefined): CellKind {
 /** Gutter width for a cell size: 1 px up to 8 px cells, then an eighth. */
 export function gutter(size: number): number {
   return Math.max(1, Math.round(size / 8));
+}
+
+// Preparing ahead, in a violet the rest of the page does not use. Its
+// states differ by lightness, so they read without hue: scheduled sits
+// near the waiting navy, released dims once the window run takes over,
+// prepared clears 3:1 against the grid and preparing is the lightest.
+// Amber is a failed prepare: a warning only, as the device copies its
+// image in its window instead.
+export const PREPARE_COLOR: Record<PrepareState, string> = {
+  scheduled: '#262b52',
+  preparing: '#ddd6fe',
+  prepared: '#7b6fd6',
+  failed: '#f59e0b',
+  released: '#463f86'
+};
+
+/** What a waiting member's cell shows instead when it prepares ahead and
+ * its prepare has started: whether its image is ready for its window. */
+export type ReadyKind = 'prepared' | 'preparing' | 'prepare-failed';
+
+export const READY_COLOR: Record<ReadyKind, string> = {
+  prepared: PREPARE_COLOR.prepared,
+  preparing: PREPARE_COLOR.preparing,
+  'prepare-failed': PREPARE_COLOR.failed
+};
+
+export const READY_LABEL: Record<ReadyKind, string> = {
+  prepared: 'ready: image prepared',
+  preparing: 'preparing',
+  'prepare-failed': 'prepare failed, copies in its window'
+};
+
+/** The legend's order, after the cell kinds. */
+export const READY_KINDS = Object.keys(READY_COLOR) as ReadyKind[];
+
+/** A prepare's ready kind; null before it starts and once the member's
+ * window run has. */
+export function readyKind(view: PrepareView | undefined): ReadyKind | null {
+  switch (view?.state) {
+    case 'prepared':
+    case 'preparing':
+      return view.state;
+    case 'failed':
+      return 'prepare-failed';
+    default:
+      return null;
+  }
 }

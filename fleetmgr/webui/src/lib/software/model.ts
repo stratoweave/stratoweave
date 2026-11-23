@@ -85,6 +85,7 @@ interface CheckResultJson {
 /** A job of the device's upgrade run, relayed as strings. */
 interface JobJson {
   state?: string;
+  /** The release the job copies or installs. */
   release?: string;
   message?: string;
   progress?: number | string;
@@ -99,6 +100,8 @@ interface DeviceStatusJson {
   held?: string;
   /** The device or flotilla that holds it, when another one does. */
   'held-by'?: string;
+  /** The target release of the intent the status is for. */
+  'target-release'?: string;
   /** What the device runs, from its platform. */
   version?: string;
   /** The chassis model, from its platform. */
@@ -130,6 +133,7 @@ interface PlanDeviceJson {
   name: string;
   'estimated-start'?: number | string;
   'estimated-duration'?: number | string;
+  'prepare-start'?: number | string;
   started?: number | string;
   finished?: number | string;
 }
@@ -144,6 +148,7 @@ interface PlanWindowJson {
 interface PlanJson {
   window?: PlanWindowJson[];
   alarm?: string[];
+  'prepare-concurrency'?: number | string;
 }
 
 /** Counters are optional and do not sum to total: pending, unknown and
@@ -407,6 +412,8 @@ export type JobState = 'running' | 'done' | 'failed' | null;
  * reports it. */
 export interface Job {
   state: JobState;
+  /** The release it copies or installs; '' when not reported. */
+  release: string;
   /** While it runs, what the device does: "add: extract". When it failed,
    * why. After the install, when the commit window ends. '' for none. */
   message: string;
@@ -419,6 +426,8 @@ export interface DeviceStatusRow {
   device: string;
   status: KnownStatus;
   raw: string;
+  /** The target release of the intent the status is for; '' for none. */
+  targetRelease: string;
   version: string;
   model: string;
   /** The step the run is in or ended in; null before any run. */
@@ -497,6 +506,10 @@ export interface PlanDevice {
    * device and saw it done; null until then. */
   started: number | null;
   finished: number | null;
+  /** Seconds since the Unix epoch: when the campaign let the device
+   * prepare its image ahead of its window in this run, or, for one that
+   * waits to prepare, when it will. null when it does not prepare ahead. */
+  prepareStart: number | null;
 }
 
 /** When a device starts: its real start once released, else the estimate. */
@@ -523,6 +536,9 @@ export interface PlanWindow {
  * Members in no window are not actuated. */
 export interface CampaignPlan {
   windows: PlanWindow[];
+  /** The most members that prepare at once in the plan; null when none
+   * prepares ahead. */
+  prepareConcurrency: number | null;
   /** The planner's alarms, which also name the members that need a window
    * and have none (unplaced). */
   alarms: string[];
@@ -535,6 +551,8 @@ export interface CampaignPlan {
 
 export interface Campaign {
   name: string;
+  /** Whether members prepare their image ahead of their window. */
+  allowStaging: boolean;
   devices: string[];
   /** The image of each member, in the order of devices. */
   images: string[];
@@ -591,6 +609,7 @@ export interface StateParts {
   counters: CampaignCounters | null;
   runSince: number | null;
   windows: PlanWindow[];
+  prepareConcurrency: number | null;
   alarms: string[];
   placed: Set<string>;
   rows: Map<string, DeviceStatusRow>;
@@ -651,6 +670,7 @@ function parseJob(json: JobJson | undefined): Job {
   const state = json?.state === 'running' || json?.state === 'done' || json?.state === 'failed' ? json.state : null;
   return {
     state,
+    release: json?.release ?? '',
     message: json?.message ?? '',
     progress: json?.progress == null ? null : num(json.progress)
   };
@@ -674,6 +694,7 @@ function parseRow(row: DeviceStatusJson): DeviceStatusRow {
     device: row.device,
     status: normalizeStatus(raw),
     raw,
+    targetRelease: row['target-release'] ?? '',
     version: row.version ?? '',
     model: row.model ?? '',
     stage: parseStage(row.stage),
@@ -698,7 +719,8 @@ function parseStateParts(state: CampaignStateJson): StateParts {
       estimatedStart: num(d['estimated-start']),
       estimatedDuration: num(d['estimated-duration']),
       started: d.started == null ? null : num(d.started),
-      finished: d.finished == null ? null : num(d.finished)
+      finished: d.finished == null ? null : num(d.finished),
+      prepareStart: d['prepare-start'] == null ? null : num(d['prepare-start'])
     }))
   }));
   windows.sort((a, b) => a.start - b.start);
@@ -710,6 +732,7 @@ function parseStateParts(state: CampaignStateJson): StateParts {
     counters: parseCounters(state),
     runSince: state['run-since'] == null ? null : num(state['run-since']),
     windows,
+    prepareConcurrency: state.plan?.['prepare-concurrency'] == null ? null : num(state.plan['prepare-concurrency']),
     alarms: state.plan?.alarm ?? [],
     placed: new Set(windows.flatMap((w) => w.devices.map((d) => d.name))),
     rows
@@ -735,6 +758,7 @@ export function joinState(parts: StateParts | null, members: string[]): Campaign
         ? null
         : {
             windows: parts.windows,
+            prepareConcurrency: parts.prepareConcurrency,
             alarms: parts.alarms,
             unplaced: members.filter((m) => !parts.placed.has(m) && !done(m)).sort(byName),
             done: members.filter((m) => !parts.placed.has(m) && done(m)).sort(byName)
@@ -746,6 +770,7 @@ export function joinState(parts: StateParts | null, members: string[]): Campaign
 function parseCampaignConfig(entry: CampaignJson): CampaignConfig {
   return {
     name: entry.name,
+    allowStaging: entry['allow-staging'] === true,
     devices: (entry.device ?? []).map((m) => m.name),
     images: (entry.device ?? []).map((m) => m.image ?? ''),
     adminState: entry['admin-state'] === 'run' ? 'run' : 'plan',
@@ -908,6 +933,8 @@ export interface NewCampaign {
   /** Each member with the image it installs. */
   devices: { name: string; image: string }[];
   allowStaging?: boolean;
+  /** Days; 0 or absent leaves the model default, no notice. */
+  notificationPeriod?: number;
 }
 
 /** A new campaign, in plan: schedule and pace are set on its page. */
@@ -918,6 +945,7 @@ export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
     'admin-state': 'plan'
   };
   if (input.allowStaging) entry['allow-staging'] = true;
+  if (input.notificationPeriod) entry['notification-period'] = input.notificationPeriod;
   return { 'software:software': { 'upgrade-campaign': [entry] } };
 }
 

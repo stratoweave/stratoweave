@@ -12,6 +12,7 @@
   import { memberImages, modelGroups, targetCounts, withPreselected } from '#lib/software/campaign-images.ts';
   import { DATA_ROOT, campaignCreatePatch, validateNewCampaign, type Device } from '#lib/software/model.ts';
   import ModelImages from '#lib/software/ModelImages.svelte';
+  import { NOTICE_ERROR, noticeDays } from '#lib/software/planning-form.ts';
   import SelectionBuilder from '#lib/software/SelectionBuilder.svelte';
   import { campaignOwners, emptySelection, type Selection } from '#lib/software/selection.ts';
   import type { PageProps } from './$types';
@@ -41,6 +42,8 @@
   // newer release would be downgraded, which can be what is wanted.
   let leaveOnTarget = $state(true);
   let leaveNewer = $state(false);
+  /** Days of notice as typed; '' for none. */
+  let notice = $state('');
 
   let devicesTouched = $state(false);
   let touched = $state(false);
@@ -59,9 +62,13 @@
   );
   /** Every grouped device is left out: the campaign would have none. */
   let allLeftOut = $derived(grouped.groups.length > 0 && members.length === 0);
-  let errors = $derived(
-    validateNewCampaign({ name, devices: members }, campaigns.map((c) => c.name)).errors
-  );
+  let errors = $derived.by((): Record<string, string> => {
+    const out: Record<string, string> = {
+      ...validateNewCampaign({ name, devices: members }, campaigns.map((c) => c.name)).errors
+    };
+    if (noticeDays(notice) === null) out['notification-period'] = NOTICE_ERROR;
+    return out;
+  });
 
   function devicesText(n: number): string {
     return n === 1 ? '1 device' : `${n.toLocaleString()} devices`;
@@ -92,7 +99,15 @@
       creating = true;
       createError = '';
       const campaign = name.trim();
-      await restconfPatchJson(DATA_ROOT, campaignCreatePatch({ name: campaign, devices: members, allowStaging }));
+      await restconfPatchJson(
+        DATA_ROOT,
+        campaignCreatePatch({
+          name: campaign,
+          devices: members,
+          allowStaging,
+          notificationPeriod: noticeDays(notice) ?? 0
+        })
+      );
       await goto(`/campaigns/${encodeURIComponent(campaign)}`, { refreshAll: true });
     } catch (error) {
       createError = errorText(error, 'Failed to create the campaign.');
@@ -187,7 +202,7 @@
 
   <section class="card">
     <Section title="Campaign" yangPath="software:software/upgrade-campaign">
-      <div class="name">
+      <div class="fields">
         <FieldText
           label="Name"
           required={true}
@@ -198,10 +213,19 @@
           onchange={(v) => (name = v)}
           ontouch={() => (touched = true)}
         />
+        <FieldText
+          label="Notice (days)"
+          value={notice}
+          error={errors['notification-period']}
+          yangType="uint16, days"
+          placeholder="0"
+          help="Uses only windows that open this long after the campaign first runs."
+          onchange={(v) => (notice = v)}
+        />
       </div>
       <div class="staging">
         <input id="allow-staging" type="checkbox" bind:checked={allowStaging} aria-describedby="staging-help" />
-        <label for="allow-staging">Allow staging the image before the impacting step</label>
+        <label for="allow-staging">Prepare ahead</label>
         <p class="hint" id="staging-help">Devices copy their image before their window opens, with no outage.</p>
       </div>
       <div>
@@ -228,8 +252,17 @@
 {/if}
 
 <style>
-  .name {
-    max-width: 420px;
+  /* The name takes the width, the notice a number's. */
+  .fields {
+    display: grid;
+    grid-template-columns: minmax(0, 420px) 220px;
+    gap: 12px;
+  }
+
+  @media (max-width: 560px) {
+    .fields {
+      grid-template-columns: 1fr;
+    }
   }
 
   .target-checks {

@@ -101,6 +101,14 @@ export function formatClock(epochSeconds: number, now = Date.now() / 1000): stri
   return sameLocalDay(epochSeconds, now) ? time : `${localDate(new Date(epochSeconds * 1000))} ${time}`;
 }
 
+/** Epoch seconds -> "21:57" on the local clock, or "Sat 01:23" when it
+ * is not the day of `now`: for times within a few days, where a date
+ * would be noise. */
+export function formatDayClock(epochSeconds: number, now = Date.now() / 1000): string {
+  if (sameLocalDay(epochSeconds, now)) return clockLabel(epochSeconds);
+  return `${new Date(epochSeconds * 1000).toLocaleDateString(undefined, { weekday: 'short' })} ${clockLabel(epochSeconds)}`;
+}
+
 /** Epoch seconds -> "2026-10-05T14:30" on the local clock, for a
  * `datetime-local` input. */
 export function toLocalInput(epochSeconds: number): string {

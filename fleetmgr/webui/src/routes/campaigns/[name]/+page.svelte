@@ -12,6 +12,7 @@
   import DeviceStatusTable from '#lib/software/DeviceStatusTable.svelte';
   import PlanningFields from '#lib/software/PlanningFields.svelte';
   import PlanTimeline from '#lib/software/PlanTimeline.svelte';
+  import PrepareBar from '#lib/software/PrepareBar.svelte';
   import { getListEntryPath, restconfDelete, restconfPatchJson } from '#lib/core/restconf/client.ts';
   import { createPoller } from '#lib/core/polling/poller.ts';
   import { Announcer, CampaignLive, FAST_MS, type LiveFacts, type LiveView } from '#lib/software/campaign-live.ts';
@@ -27,7 +28,14 @@
     type PlanningDraft
   } from '#lib/software/planning-form.ts';
   import { formatEta } from '#lib/software/rate.ts';
-  import { formatClock } from '#lib/core/time.ts';
+  import {
+    isPrepareAlarm,
+    prepareTally,
+    prepareViews,
+    preparesLeft,
+    type PrepareView
+  } from '#lib/software/prepare.ts';
+  import { formatClock, formatDayClock } from '#lib/core/time.ts';
   import { imageCounts } from '#lib/software/campaign-images.ts';
   import { HELD_KINDS, HELD_KIND_LABEL, heldCounts, heldKind, type HeldKind } from '#lib/software/device-state.ts';
   import { campaignDeviceHref } from '#lib/software/links.ts';
@@ -75,9 +83,9 @@
   let devicesOpen = $state(false);
   let paceOpen = $state(false);
   let onTargetOpen = $state(false);
-  /** The devices table's filter: '' for all, one status or held kind, or
-   * the members in no window. */
-  type RowFilter = '' | `status:${KnownStatus}` | `held:${HeldKind}` | 'unplaced';
+  /** The devices table's filter: '' for all, one status or held kind, the
+   * members in no window, or the members whose prepare ahead failed. */
+  type RowFilter = '' | `status:${KnownStatus}` | `held:${HeldKind}` | 'unplaced' | 'prepare-failed';
   let filter = $state<RowFilter>('');
   let searchText = $state('');
   let page = $state(1);
@@ -208,6 +216,33 @@
     const from = campaign.runSince === null ? ' from now' : '';
     return `${days} notice${from}: windows from ${formatClock(noticeFrom)} on`;
   });
+  // The members that prepare ahead, and where their prepares are.
+  let prepare = $derived(prepareViews(campaign?.plan ?? null, campaign?.deviceStatus ?? []));
+  let prepared = $derived(prepareTally(prepare));
+
+  // The Prepare chip over the plan: off, the plan shows nothing of preparing
+  // ahead, neither the bar nor the cells nor its alarms. Kept per browser.
+  const PREPARE_STORE = 'fleetmgr.plan.prepare';
+  const NO_PREPARE = new Map<string, PrepareView>();
+  let showPrepare = $state(storedShowPrepare());
+
+  function storedShowPrepare(): boolean {
+    try {
+      return localStorage.getItem(PREPARE_STORE) !== 'hidden';
+    } catch {
+      return true;
+    }
+  }
+
+  function setShowPrepare(shown: boolean): void {
+    showPrepare = shown;
+    try {
+      if (shown) localStorage.removeItem(PREPARE_STORE);
+      else localStorage.setItem(PREPARE_STORE, 'hidden');
+    } catch {
+      // Without storage the choice lasts while the page is open.
+    }
+  }
 
   let savedPlanning = $derived(campaign ? planningOf(campaign) : null);
   let savedDraft = $derived(savedPlanning ? planningDraft(savedPlanning) : null);
@@ -290,6 +325,7 @@
   function passes(r: DeviceStatusRow, f: RowFilter): boolean {
     if (f === '') return true;
     if (f === 'unplaced') return unplacedSet.has(r.device);
+    if (f === 'prepare-failed') return prepare.get(r.device)?.state === 'failed';
     if (f.startsWith('status:')) return `status:${r.status}` === f;
     return r.held !== null && `held:${heldKind(r.held)}` === f;
   }
@@ -320,6 +356,11 @@
     if (counters === null) return 'Running: no state reported yet.';
     if (counters.inProgress > 0)
       return `Running: ${counters.inProgress.toLocaleString()} of ${counters.total.toLocaleString()} installing.`;
+    if (preparesLeft(prepared)) {
+      const next = c.plan?.windows.find((w) => w.start > Date.now() / 1000);
+      const opens = next ? ` The next window opens ${formatDayClock(next.start)}.` : '';
+      return `Running: preparing ahead, ${prepared.prepared.toLocaleString()} of ${prepared.waiting.toLocaleString()} prepared.${opens}`;
+    }
     if (counters.total > 0 && counters.remainder === 0) {
       const upgraded = counters.succeeded - counters.upToDate;
       const already = counters.upToDate > 0 ? `, ${counters.upToDate.toLocaleString()} already up to date` : '';
@@ -620,6 +661,9 @@
             {#if rate !== null}
               ~{rate.toFixed(1)} devices/min since this page opened{eta !== null ? ` · ETA ${formatEta(eta)}` : ''}
             {:else}
+              {#if prepared.prepared + prepared.preparing > 0}
+                {prepared.prepared.toLocaleString()} of {prepared.waiting.toLocaleString()} waiting devices prepared ahead.
+              {/if}
               The rate shows once devices finish.
             {/if}
           </p>
@@ -639,14 +683,15 @@
 
   {#if campaign.plan !== null && (campaign.plan.windows.length > 0 || campaign.plan.alarms.length > 0 || campaign.plan.unplaced.length > 0 || campaign.plan.done.length > 0)}
     {@const plan = campaign.plan}
+    {@const alarms = showPrepare ? plan.alarms : plan.alarms.filter((a) => !isPrepareAlarm(a))}
     <section class="card">
       <div class="grids-head">
         <h2 class="panel-title">Plan</h2>
         <span class="hint">Local time</span>
       </div>
-      {#if plan.alarms.length > 0}
+      {#if alarms.length > 0}
         <ul class="alarms">
-          {#each plan.alarms as alarm, i (i)}
+          {#each alarms as alarm, i (i)}
             <li>{alarm}</li>
           {/each}
         </ul>
@@ -672,9 +717,11 @@
         </div>
       {/if}
       {#if timelinePlan !== null && timelinePlan.windows.length > 0}
+        <PrepareBar {prepare} {now} shown={showPrepare} onchange={setShowPrepare} />
         <PlanTimeline
           plan={timelinePlan}
           rows={rowsByName}
+          prepare={showPrepare ? prepare : NO_PREPARE}
           {now}
           fitPlan={campaign.adminState === 'plan'}
           zoomKey={campaign.name}
@@ -864,6 +911,20 @@
               {/if}
             {/each}
           {/if}
+          {#if prepared.failed > 0}
+            <button
+              class="chip"
+              class:active={filter === 'prepare-failed'}
+              type="button"
+              aria-pressed={filter === 'prepare-failed'}
+              onclick={() => {
+                filter = 'prepare-failed';
+                page = 1;
+              }}
+            >
+              prepare failed {prepared.failed}
+            </button>
+          {/if}
           <input
             class="input compact mono search"
             type="text"
@@ -874,7 +935,7 @@
             oninput={() => (page = 1)}
           />
         </div>
-        <DeviceStatusTable campaign={data.name} rows={paged.rows} />
+        <DeviceStatusTable campaign={data.name} rows={paged.rows} prepare={prepare.size > 0 ? prepare : null} {now} />
         <Pager page={paged.page} pageCount={paged.pageCount} onchange={(p) => (page = p)} />
       {/if}
     {/if}
