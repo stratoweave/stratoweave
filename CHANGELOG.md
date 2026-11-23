@@ -443,6 +443,9 @@
   replacing anything. [#806]
 - The software state shows the vetoes of the configuration under
   `state/veto`, with their reasons. [#811]
+- Fixed the software messages of a device's log naming the job, `prepare`
+  or `install`, as the device in their `device` field once its adapter
+  had reported a step.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
