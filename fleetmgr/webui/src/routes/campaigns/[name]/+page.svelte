@@ -466,7 +466,7 @@
     if (!c || !confirmAction) return '';
     if (confirmAction === 'run') {
       if (firstStart === null) return 'Run the campaign? No device in a window needs an upgrade.';
-      if (firstStart <= now) return 'Run the campaign? The first upgrade starts at once.';
+      if (firstStart <= now) return 'Run the campaign? The first upgrade starts now.';
       return `Run the campaign? The first upgrade starts ${opensText(firstStart)}.`;
     }
     if (confirmAction === 'plan')
