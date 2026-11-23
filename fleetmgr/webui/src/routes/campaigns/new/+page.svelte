@@ -193,7 +193,6 @@
                 <span>Leave out the {devicesText(counts.newer)} on a newer release</span>
               </label>
             {/if}
-            <p class="hint">Based on the release each device last reported.</p>
           </div>
         {/if}
       {/if}
@@ -203,30 +202,30 @@
   <section class="card">
     <Section title="Campaign" yangPath="software:software/upgrade-campaign">
       <div class="fields">
-        <FieldText
-          label="Name"
-          required={true}
-          value={name}
-          error={touched ? errors['name'] : ''}
-          yangType="string"
-          placeholder="e.g. xe-1718-emea"
-          onchange={(v) => (name = v)}
-          ontouch={() => (touched = true)}
-        />
+        <div class="name">
+          <FieldText
+            label="Name"
+            required={true}
+            value={name}
+            error={touched ? errors['name'] : ''}
+            yangType="string"
+            placeholder="e.g. xe-1718-emea"
+            onchange={(v) => (name = v)}
+            ontouch={() => (touched = true)}
+          />
+        </div>
         <FieldText
           label="Notice (days)"
           value={notice}
           error={errors['notification-period']}
           yangType="uint16, days"
           placeholder="0"
-          help="Uses only windows that open this long after the campaign first runs."
           onchange={(v) => (notice = v)}
         />
-      </div>
-      <div class="staging">
-        <input id="allow-staging" type="checkbox" bind:checked={allowStaging} aria-describedby="staging-help" />
-        <label for="allow-staging">Prepare ahead</label>
-        <p class="hint" id="staging-help">Devices copy their image before their window opens, with no outage.</p>
+        <label class="check ahead">
+          <input type="checkbox" bind:checked={allowStaging} />
+          <span>Prepare ahead</span>
+        </label>
       </div>
       <div>
         <!-- In place before any message, so that a screen reader reads it. -->
@@ -252,16 +251,35 @@
 {/if}
 
 <style>
-  /* The name takes the width, the notice a number's. */
+  /* The name has a row of its own. The notice takes a number's width; the
+     box beside it sits level with its input, above the line the field keeps
+     for a message. */
   .fields {
     display: grid;
-    grid-template-columns: minmax(0, 420px) 220px;
-    gap: 12px;
+    grid-template-columns: 220px auto;
+    justify-content: start;
+    gap: 0 24px;
+  }
+
+  .name {
+    grid-column: 1 / -1;
+    max-width: 420px;
+  }
+
+  .ahead {
+    align-self: end;
+    /* An input's padding and border, so as tall as one. */
+    padding-block: 10px;
+    margin-bottom: calc(1rem + 6px);
   }
 
   @media (max-width: 560px) {
     .fields {
       grid-template-columns: 1fr;
+    }
+
+    .ahead {
+      padding-block: 0;
     }
   }
 
@@ -285,31 +303,8 @@
     color: var(--sw-warning);
   }
 
-  .hint {
-    margin: 0;
-    font-size: var(--sw-text-xs);
-    color: var(--sw-text-muted);
-  }
-
   .all-left-out {
     text-align: right;
-  }
-
-  /* The help lines up with the label's text, past the box. */
-  .staging {
-    display: grid;
-    grid-template-columns: auto minmax(0, 1fr);
-    align-items: center;
-    gap: 2px 8px;
-    font-size: var(--sw-text-sm);
-  }
-
-  .staging label {
-    cursor: pointer;
-  }
-
-  .staging .hint {
-    grid-column: 2;
   }
 
   .editor-actions {

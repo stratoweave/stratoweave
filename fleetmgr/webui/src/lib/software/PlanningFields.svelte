@@ -194,13 +194,7 @@
       {disabled}
       onchange={(e) => patch({ allowStaging: e.currentTarget.checked })}
     />
-    <span>
-      <span class="ahead-name">Prepare ahead</span>
-      <small class="field__meta">
-        Devices copy their image before their window, without an outage. Turning it off stops the prepares not
-        started yet.
-      </small>
-    </span>
+    <span class="ahead-name">Prepare ahead</span>
   </label>
 </div>
 
@@ -227,19 +221,10 @@
 
   .ahead {
     display: flex;
-    align-items: flex-start;
+    align-items: center;
     gap: 10px;
     margin-top: 12px;
     cursor: pointer;
-  }
-
-  .ahead input {
-    margin-top: 3px;
-  }
-
-  .ahead > span {
-    display: grid;
-    gap: 2px;
   }
 
   .ahead-name {
