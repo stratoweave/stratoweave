@@ -29,7 +29,6 @@
     validatePlanningDraft,
     type PlanningDraft
   } from '#lib/software/planning-form.ts';
-  import { formatEta } from '#lib/software/rate.ts';
   import {
     isPrepareAlarm,
     prepareTally,
@@ -167,8 +166,6 @@
   let parts = $derived(shown?.state ?? null);
   let campaign = $derived(config ? { ...config, ...joinState(parts, config.devices) } : null);
   let counters = $derived(shown?.counters ?? null);
-  let rate = $derived(shown?.rate ?? null);
-  let eta = $derived(shown?.eta ?? null);
   // A failed load stops showing once a later read got through.
   let loadError = $derived((shown?.seq ?? 0) > applied.seq ? '' : applied.loadError);
   let rowsByName = $derived(
@@ -693,20 +690,6 @@
           {/if}
         </div>
       {/if}
-      {#if campaign.adminState === 'run'}
-        <div class="status-foot">
-          <p class="rate">
-            {#if rate !== null}
-              ~{rate.toFixed(1)} devices/min since this page opened{eta !== null ? ` · ETA ${formatEta(eta)}` : ''}
-            {:else}
-              {#if prepared.prepared + prepared.preparing > 0}
-                {prepared.prepared.toLocaleString()} of {prepared.waiting.toLocaleString()} waiting devices prepared ahead.
-              {/if}
-              The rate shows once devices finish.
-            {/if}
-          </p>
-        </div>
-      {/if}
     </section>
   {/if}
 
@@ -1106,19 +1089,6 @@
 
   .status-card {
     padding-bottom: 16px;
-  }
-
-  .status-foot {
-    display: flex;
-    align-items: baseline;
-    flex-wrap: wrap;
-    justify-content: space-between;
-    gap: 8px 16px;
-    margin-top: 12px;
-  }
-
-  .status-foot .rate {
-    margin: 0;
   }
 
   .held-foot {

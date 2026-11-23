@@ -20,7 +20,6 @@ import { nextSeq } from '#lib/core/polling/poller.ts';
 import { withSignal } from '#lib/core/restconf/client.ts';
 import { FAST_ENTRY_LIMIT, fetchCampaignEntry, fetchCampaignState, fetchCounters } from './counters';
 import type { CampaignConfig, CampaignCounters, StateParts } from './model';
-import { RateTracker } from './rate';
 
 export const FAST_MS = 1500;
 export const SLOW_MS = 12_000;
@@ -35,10 +34,6 @@ export interface LiveView {
   /** null while the campaign has published no state. */
   state: StateParts | null;
   counters: CampaignCounters | null;
-  /** Devices finished per minute and the ms left, measured since the page
-   * opened. */
-  rate: number | null;
-  eta: number | null;
 }
 
 interface Stamped<T> {
@@ -71,9 +66,6 @@ export class CampaignLive {
   private slowGap = SLOW_MS;
   private lastFailed: number | null = null;
   private failedMoved = false;
-  private tracker = new RateTracker();
-  private rate: number | null = null;
-  private eta: number | null = null;
   private disposed = false;
 
   constructor(
@@ -150,9 +142,7 @@ export class CampaignLive {
       config: this.config.value,
       seq: Math.max(this.config.seq, this.state.seq, this.counters.seq),
       state: this.state.value,
-      counters,
-      rate: this.rate,
-      eta: this.eta
+      counters
     };
   }
 
@@ -168,9 +158,6 @@ export class CampaignLive {
     this.slowGap = SLOW_MS;
     this.lastFailed = null;
     this.failedMoved = false;
-    this.tracker.reset();
-    this.rate = null;
-    this.eta = null;
   }
 
   private abortReads(): void {
@@ -269,15 +256,10 @@ export class CampaignLive {
     return true;
   }
 
-  /** Failure tracking and the rate, from counters newer than any before. */
+  /** Failure tracking, from counters newer than any before. */
   private observe(c: CampaignCounters): void {
     if (this.lastFailed !== null && c.failed !== this.lastFailed) this.failedMoved = true;
     this.lastFailed = c.failed;
-    if (this.config.value?.adminState !== 'run') return;
-    this.tracker.push(c.succeeded + c.failed, this.clock());
-    this.rate = this.tracker.ratePerMin();
-    const remaining = c.total - c.succeeded - c.failed;
-    this.eta = remaining > 0 ? this.tracker.etaMs(remaining) : null;
   }
 
   private emit(): void {

@@ -283,10 +283,9 @@ adds no semantics the model does not carry —
 anything done here can be done identically over NETCONF or plain RESTCONF.
 Two rules go beyond the model, in the wizard and on the campaign page: a
 newly set deadline must lie ahead, and the pace comes from a deadline or a
-number of devices at once, not both. Rate and ETA are measured since page
-open, and nothing is latched: status tracks live device state. Pause
-merges `admin-state: plan`: members that upgrade stop before their
-install and go on when the campaign runs again.
+number of devices at once, not both. Nothing is latched: status tracks
+live device state. Pause merges `admin-state: plan`: members that upgrade
+stop before their install and go on when the campaign runs again.
 
 With `allow-staging` (Prepare ahead), members copy their image before
 their window. A member's prepare is scheduled, preparing, prepared or
