@@ -1,7 +1,7 @@
 // Picking the image each selected device installs: one pick per hardware
 // model, from the images that list the model.
 
-import { compareVersions, type CatalogImage } from '#lib/software/images.ts';
+import { compareVersions, versionFromName, type CatalogImage } from '#lib/software/images.ts';
 import type { Device } from '#lib/software/model.ts';
 
 export interface ModelDevice {
@@ -146,10 +146,39 @@ export function memberImages(
   return members.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
-/** The distinct images of a campaign's members and how many install each,
- * most first. */
-export function imageCounts(images: string[]): [string, number][] {
-  const counts = new Map<string, number>();
-  for (const image of images) counts.set(image, (counts.get(image) ?? 0) + 1);
-  return [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+export interface UpgradeCount {
+  /** The members' hardware model; '' when they have not reported it. */
+  model: string;
+  /** The release they upgrade to: their image's version in the catalog, or
+   * the one its name carries; '' when neither says. */
+  version: string;
+  /** The images they install. */
+  images: string[];
+  count: number;
+}
+
+/** A campaign's members by hardware model and the release they upgrade to,
+ * most first. members and images are the campaign's, in its order; modelOf
+ * gives a member's model. Members whose release is unknown count by image. */
+export function upgradeCounts(
+  members: string[],
+  images: string[],
+  modelOf: (name: string) => string,
+  catalog: CatalogImage[]
+): UpgradeCount[] {
+  const versions = new Map(catalog.map((i) => [i.name, i.version]));
+  const groups = new Map<string, UpgradeCount>();
+  members.forEach((name, i) => {
+    const image = images[i] ?? '';
+    const model = modelOf(name);
+    const version = versions.get(image) || versionFromName(image);
+    const key = `${model}\0${version || image}`;
+    let g = groups.get(key);
+    if (g === undefined) groups.set(key, (g = { model, version, images: [], count: 0 }));
+    if (!g.images.includes(image)) g.images.push(image);
+    g.count++;
+  });
+  return [...groups.values()].sort(
+    (a, b) => b.count - a.count || a.model.localeCompare(b.model) || compareVersions(a.version, b.version)
+  );
 }

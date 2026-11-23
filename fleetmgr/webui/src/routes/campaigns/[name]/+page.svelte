@@ -36,7 +36,8 @@
     type PrepareView
   } from '#lib/software/prepare.ts';
   import { formatClock, formatDayClock } from '#lib/core/time.ts';
-  import { imageCounts } from '#lib/software/campaign-images.ts';
+  import { upgradeCounts } from '#lib/software/campaign-images.ts';
+  import type { CatalogImage } from '#lib/software/images.ts';
   import { HELD_KINDS, HELD_KIND_LABEL, heldCounts, heldKind, type HeldKind } from '#lib/software/device-state.ts';
   import { campaignDeviceHref } from '#lib/software/links.ts';
   import { nameMatcher } from '#lib/software/selection.ts';
@@ -126,6 +127,11 @@
       schedulesError = value.error;
     }
   );
+  let catalog = $state.raw<CatalogImage[]>([]);
+  onLoaded(
+    () => data.catalog,
+    (value) => (catalog = value)
+  );
 
   // Another campaign starts over, its form and filters too.
   let shownName: string | null = null;
@@ -172,6 +178,11 @@
     new Map<string, DeviceStatusRow>((campaign?.deviceStatus ?? []).map((r) => [r.device, r]))
   );
   let held = $derived(heldCounts(campaign?.deviceStatus ?? []));
+  // The image pills: the members by hardware model and the release they
+  // upgrade to; each pill's tip names the image.
+  let upgrades = $derived(
+    campaign ? upgradeCounts(campaign.devices, campaign.images, (n) => rowsByName.get(n)?.model ?? '', catalog) : []
+  );
 
   // Members that ran the target already take no cell in the timeline: they
   // have nothing to install, and are listed under the plan instead.
@@ -662,10 +673,10 @@
         {@attach watchPills}
       >
         <div class="pills-track">
-          {#each imageCounts(campaign.images) as [image, n] (image)}
-            <span class="pill image-pill">
-              <span class="mono">{image || 'no image'}</span>
-              <span class="n tn">{n.toLocaleString()}</span>
+          {#each upgrades as u (`${u.model}\0${u.version || u.images[0]}`)}
+            <span class="pill image-pill" title={u.images.map((i) => i || 'no image').join(', ')}>
+              <span class="mono">{u.model || 'unknown model'} → {u.version || u.images[0] || 'no image'}</span>
+              <span class="n tn">{u.count.toLocaleString()}</span>
             </span>
           {/each}
         </div>
