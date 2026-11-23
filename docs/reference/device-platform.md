@@ -202,7 +202,7 @@ so a probe that reads two subtrees sends two gets.
 | Probe | Applies when the device lists | Reads | Model | Serial number | Last boot |
 | --- | --- | --- | --- | --- | --- |
 | `ios-xe` | `Cisco-IOS-XE-device-hardware-oper` | one get: inventory, version banner and boot time | chassis part number | chassis entry | `boot-time` of `device-system-data` |
-| `ios-xe-cli` | `stratoweave-iosxe-cli`, from the IOS XE CLI adapter | one get: `show version` | the word after `cisco` on the processor line | `Processor board ID` | not read |
+| `ios-xe-cli` | `stratoweave-iosxe-cli`, from the IOS XE CLI adapter | one get: `show version` | the word after `cisco` on the processor line | `Processor board ID` | `<hostname> uptime is` before StratoWeave's clock |
 | `ios-xr` | `Cisco-IOS-XR-install-oper` | three gets: `install/version`, the rack inventory, `system-time` | `chassis-pid`, else the rack's model | the rack with the lowest name | `uptime` before the clock of `system-time` |
 | `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information`, `get-system-uptime-information` | `product-model` | `serial-number` of system information | `junos:seconds` of `system-booted-time` |
 | `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis | `last-booted` of `system/information` |
@@ -248,6 +248,13 @@ It gives the release as the banner spells it, `17.15.6` where `show version`
 says `Cisco IOS XE Software, Version 17.15.06`, so the release stays the same
 when `ios-xe` takes over. The model and the serial number of a C1111 are the
 same in both.
+
+`show version` gives the router's uptime to the minute, as `<hostname> uptime
+is 3 hours, 59 minutes`, and not the device's clock. The last boot is that
+uptime before StratoWeave's clock when the reply comes, with a tolerance of 60
+seconds plus `REPLY_DELAY`. A year in the uptime counts 365 days. The next
+line, `Uptime for this control processor is`, counts from an earlier start
+and is not read.
 
 ### IOS XR
 
