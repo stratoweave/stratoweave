@@ -4,14 +4,17 @@ It applies to a device that lists Cisco-IOS-XR-install-oper. A get of
 install/version, which 'show version' prints from, reads the release label
 and, where there is one, the chassis product id. A get of the rack
 inventory, which 'show inventory' prints from, reads the rack's model and
-serial number. The device type's schema must have the pruned YANG in
+serial number. A get of system-time reads the clock and the uptime, which
+give the last boot. The device type's schema must have the pruned YANG in
 adapters.platform_iosxr_yang, or the real modules.
 
 An XRd has a chassis-pid but no inventory, so it has no serial number. An
 XRv 9000 has no chassis-pid, so its model comes from the inventory. A device
-without the inventory still gets the release and the chassis-pid.
+without the inventory still gets the release and the chassis-pid, and one
+without system-time gets them without a last boot.
 """
 
+import time
 import yang.gdata as ygdata
 
 import device as swdev
@@ -20,6 +23,11 @@ from adapters.adapter import ModCap, NotConnectedError
 
 OS = "ios-xr"
 MODULE = "Cisco-IOS-XR-install-oper"
+# The clock and the uptime count whole seconds and are read at slightly
+# different moments, so two reads of the same boot can give last boots a
+# second or two apart.
+ROUNDING = 2
+UTC = "UTC"
 
 
 def version_filter() -> ygdata.FNode:
@@ -36,10 +44,55 @@ def inventory_filter() -> ygdata.FNode:
                                                    bag.serial_number]).filt!
 
 
-def platform(version_root: ?ygdata.Node, inventory_root: ?ygdata.Node) -> ?swdev.Platform:
-    """Return the platform in the replies to the two gets, or None when they
-    have neither a release nor a model. inventory_root is None when the
-    inventory get failed.
+def time_filter() -> ygdata.FNode:
+    """Select the clock, its time zone and the uptime."""
+    st = xroper.subs.system_time
+    c = st.clock
+    return st.subscribe(select=[c.year, c.month, c.day, c.hour, c.minute, c.second,
+                                c.time_zone, st.uptime.uptime]).filt!
+
+
+def _utc_clock(year: ?u64, month: ?u64, day: ?u64, hour: ?u64, minute: ?u64, second: ?u64,
+               time_zone: ?str) -> ?int:
+    """Return the clock in seconds since the epoch, or None when it is not in
+    UTC or a field is missing or out of range. The fields show the time in
+    the clock's time zone, and only UTC says what that time is in UTC."""
+    if time_zone is not None and time_zone.strip() == UTC \
+       and year is not None and month is not None and day is not None \
+       and hour is not None and minute is not None and second is not None:
+        if month >= 1 and month <= 12 and day >= 1 and day <= 31 \
+           and hour <= 23 and minute <= 59 and second <= 60:
+            return swdev.utc_seconds(int(year), int(month), int(day),
+                                     int(hour), int(minute), int(second))
+    return None
+
+
+def last_boot(time_root: ?ygdata.Node, now: int) -> (boot: ?int, tolerance: int):
+    """Return the last boot in a reply to the system-time get, and its
+    tolerance, as swdev.Platform has them. now is our clock when the reply
+    came.
+
+    The last boot is the uptime before the device's clock in the reply when
+    that clock is in UTC, else before now. Our clock adds the time the reply
+    took to the tolerance. A reply without an uptime gives no last boot.
+    """
+    st = xroper.root.from_gdata(time_root).system_time
+    up = st.uptime.uptime
+    if up is not None:
+        c = st.clock
+        clock = _utc_clock(c.year, c.month, c.day, c.hour, c.minute, c.second, c.time_zone)
+        if clock is not None:
+            return (boot=clock - int(up), tolerance=ROUNDING)
+        return (boot=now - int(up), tolerance=ROUNDING + swdev.REPLY_DELAY)
+    return (boot=None, tolerance=0)
+
+
+def platform(version_root: ?ygdata.Node, inventory_root: ?ygdata.Node,
+             time_root: ?ygdata.Node, now: int) -> ?swdev.Platform:
+    """Return the platform in the replies to the three gets, or None when
+    they have neither a release nor a model. inventory_root and time_root
+    are None when their get failed. now is our clock when the system-time
+    reply came, as last_boot() takes it.
 
     The inventory's model and serial number come from the rack with the
     lowest name, rack 0 in a single-rack system. The chassis-pid, when the
@@ -61,11 +114,12 @@ def platform(version_root: ?ygdata.Node, inventory_root: ?ygdata.Node) -> ?swdev
         model = rack_model
     if version is None and model is None:
         return None
-    return swdev.Platform(OS, version, model, serial)
+    boot = last_boot(time_root, now)
+    return swdev.Platform(OS, version, model, serial, boot.boot, boot.tolerance)
 
 
 class IosXrProbe(swdev.PlatformProbe):
-    """The IOS XR probe. Two gets per read."""
+    """The IOS XR probe. Three gets per read."""
     def __init__(self):
         self.name = OS
 
@@ -77,21 +131,31 @@ class IosXrProbe(swdev.PlatformProbe):
 
 
 actor _IosXrRead(dev: swdev.DeviceMgr, done: action(?swdev.Platform, ?Exception) -> None):
-    """One read: install/version, then the inventory."""
+    """One read: install/version, then the inventory, then system-time."""
     var version_root: ?ygdata.Node = None
+    var inventory_root: ?ygdata.Node = None
 
-    def on_inventory(root: ?ygdata.Node, err: ?Exception) -> None:
+    def on_time(root: ?ygdata.Node, err: ?Exception) -> None:
         if isinstance(err, NotConnectedError):
             done(None, err)
             return
         try:
-            p = platform(version_root, root if err is None else None)
+            p = platform(version_root, inventory_root, root if err is None else None,
+                         time.time().unix_s())
             if p is not None:
                 done(p, None)
             else:
                 done(None, ValueError("the replies have no platform values"))
         except Exception as e:
             done(None, e)
+
+    def on_inventory(root: ?ygdata.Node, err: ?Exception) -> None:
+        if isinstance(err, NotConnectedError):
+            done(None, err)
+            return
+        if err is None:
+            inventory_root = root
+        dev.get(on_time, time_filter())
 
     def on_version(root: ?ygdata.Node, err: ?Exception) -> None:
         if err is not None:

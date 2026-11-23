@@ -190,8 +190,9 @@ For a probe that needs an RPC or more than one read, subclass
 to `dev`: that call would wait for `read` to end. A reply from `dev` must go
 to an action, and a nested function in a class method is not one. So `read`
 starts an actor that sends the requests and receives the replies, one step
-after the other. The IOS XR probe's `_IosXrRead` and the SR Linux probe's
-`_SrLinuxRead` send two gets, the Junos probe's `_JunosRead` three RPCs.
+after the other. The IOS XR probe's `_IosXrRead` sends three gets, the SR
+Linux probe's `_SrLinuxRead` two, and the Junos probe's `_JunosRead` three
+RPCs.
 
 Give each get one subtree. Some devices take only one subtree in a filter,
 so a probe that reads two subtrees sends two gets.
@@ -202,7 +203,7 @@ so a probe that reads two subtrees sends two gets.
 | --- | --- | --- | --- | --- | --- |
 | `ios-xe` | `Cisco-IOS-XE-device-hardware-oper` | one get: inventory, version banner and boot time | chassis part number | chassis entry | `boot-time` of `device-system-data` |
 | `ios-xe-cli` | `stratoweave-iosxe-cli`, from the IOS XE CLI adapter | one get: `show version` | the word after `cisco` on the processor line | `Processor board ID` | not read |
-| `ios-xr` | `Cisco-IOS-XR-install-oper` | two gets: `install/version`, the rack inventory | `chassis-pid`, else the rack's model | the rack with the lowest name | not read |
+| `ios-xr` | `Cisco-IOS-XR-install-oper` | three gets: `install/version`, the rack inventory, `system-time` | `chassis-pid`, else the rack's model | the rack with the lowest name | `uptime` before the clock of `system-time` |
 | `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information`, `get-system-uptime-information` | `product-model` | `serial-number` of system information | `junos:seconds` of `system-booted-time` |
 | `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis | `last-booted` of `system/information` |
 | `sros` | `nokia-state` | one get: `/state/system`, `/state/chassis` and `/state/cpm` | `system/platform` | router chassis with the lowest number | `software-last-boot-time` of the active CPM |
@@ -261,6 +262,16 @@ its model and serial number.
   serial number come from the inventory.
 - The inventory get is optional: when it fails, the probe still answers from
   `install/version`.
+
+`system-time` in `Cisco-IOS-XR-shellutil-oper` holds the clock, as `show
+clock` prints it, and the uptime in seconds. The last boot is the uptime
+before the clock when the clock's `time-zone` is `UTC`. The clock shows the
+time in its time zone, and the zone's name does not say its offset, so in
+another time zone the probe subtracts the uptime from StratoWeave's clock
+when the reply comes. The clock and the uptime count whole seconds, so the
+last boot's tolerance is 2 seconds, plus `REPLY_DELAY` on StratoWeave's
+clock. The `system-time` get is optional too: when it fails, the probe
+answers without a last boot.
 
 ### Junos
 

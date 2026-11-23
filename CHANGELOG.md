@@ -268,10 +268,13 @@
   seconds since the Unix epoch by the device's clock. The IOS XE probe reads
   it from `boot-time` and the SR Linux probe from `last-booted`. The IOS XE
   mock boots when it starts and at each reload of an upgrade. [#841]
-- The Junos, SR OS and ArcOS platform probes read the last boot too: Junos
-  from `system-booted-time` of `get-system-uptime-information`, SR OS from
-  `software-last-boot-time` of the active CPM, ArcOS from `boot-time` in
-  `system/state`.
+- The IOS XR, Junos, SR OS and ArcOS platform probes read the last boot
+  too: Junos from `system-booted-time` of `get-system-uptime-information`,
+  SR OS from `software-last-boot-time` of the active CPM, ArcOS from
+  `boot-time` in `system/state`. IOS XR tells only its uptime, which the
+  probe subtracts from the device's clock in the same reply, or from
+  StratoWeave's clock when the device's clock is not in UTC. A new read of
+  the same boot keeps the published last boot.
 - Fixed a NETCONF resync or checked edit that never finished when the device
   configuration does not match the schema, like a value outside a range. The
   resync now fails with the decode error. A checked edit fails with it before
