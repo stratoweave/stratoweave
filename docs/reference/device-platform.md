@@ -191,7 +191,7 @@ to `dev`: that call would wait for `read` to end. A reply from `dev` must go
 to an action, and a nested function in a class method is not one. So `read`
 starts an actor that sends the requests and receives the replies, one step
 after the other. The IOS XR probe's `_IosXrRead` and the SR Linux probe's
-`_SrLinuxRead` send two gets, the Junos probe's `_JunosRead` two RPCs.
+`_SrLinuxRead` send two gets, the Junos probe's `_JunosRead` three RPCs.
 
 Give each get one subtree. Some devices take only one subtree in a filter,
 so a probe that reads two subtrees sends two gets.
@@ -203,7 +203,7 @@ so a probe that reads two subtrees sends two gets.
 | `ios-xe` | `Cisco-IOS-XE-device-hardware-oper` | one get: inventory, version banner and boot time | chassis part number | chassis entry | `boot-time` of `device-system-data` |
 | `ios-xe-cli` | `stratoweave-iosxe-cli`, from the IOS XE CLI adapter | one get: `show version` | the word after `cisco` on the processor line | `Processor board ID` | not read |
 | `ios-xr` | `Cisco-IOS-XR-install-oper` | two gets: `install/version`, the rack inventory | `chassis-pid`, else the rack's model | the rack with the lowest name | not read |
-| `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information` | `product-model` | `serial-number` of system information | not read |
+| `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information`, `get-system-uptime-information` | `product-model` | `serial-number` of system information | `junos:seconds` of `system-booted-time` |
 | `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis | `last-booted` of `system/information` |
 | `sros` | `nokia-state` | one get: `/state/system` and `/state/chassis` | `system/platform` | router chassis with the lowest number | not read |
 | `arcos` | `arcos-openconfig-system-augments` | one get: `system/version/state` | `platform` | `serial-number` | not read |
@@ -277,6 +277,11 @@ no modules but has the Junos capability in its hello.
 - The serial number comes from `get-system-information`. When that RPC
   fails, the probe still answers, without a serial number. A cRPD has no
   serial number and leaves `os-version` empty.
+- The last boot comes from `get-system-uptime-information`, which `show
+  system uptime` calls: the `junos:seconds` attribute of the `date-time` in
+  `system-booted-time`. It counts from the epoch, whatever time zone the
+  device prints the date in. When that RPC fails, the probe still answers,
+  without a last boot.
 
 ### SR Linux
 

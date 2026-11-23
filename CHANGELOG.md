@@ -266,9 +266,10 @@
   like ArcOS 8.2.1A, got no schema at all. [#837]
 - The device platform has `last-boot`: when the device last booted, in
   seconds since the Unix epoch by the device's clock. The IOS XE probe reads
-  it from `boot-time` and the SR Linux probe from `last-booted`; the other
-  probes leave it out. The IOS XE mock boots when it starts and at each
-  reload of an upgrade. [#841]
+  it from `boot-time` and the SR Linux probe from `last-booted`. The IOS XE
+  mock boots when it starts and at each reload of an upgrade. [#841]
+- The Junos platform probe reads the last boot too, from
+  `system-booted-time` of `get-system-uptime-information`.
 - Fixed a NETCONF resync or checked edit that never finished when the device
   configuration does not match the schema, like a value outside a range. The
   resync now fails with the decode error. A checked edit fails with it before
