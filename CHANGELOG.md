@@ -883,12 +883,12 @@
   or before a pause, the member is done at that end, or at a later boot.
   A member whose device does not tell is done at its answer, as before.
   [#842]
-- The device page of the web UI shows the device's log under its upgrade
-  runs, newest first, read from its flotilla: filtered by level and text,
-  following new messages while Live is on, and older ones a page at a time.
-  The record control in the log's header sets the level the device logs at,
-  `debug/log-level`. The top sends a fleet device's log request on to the
-  device's flotilla.
+- The web UI shows a device's log on its page and on a campaign's page of
+  it, under the checks: newest first, read from its flotilla, filtered by
+  level and text, following new messages while Live is on, and older ones a
+  page at a time. The log's header shows the level the device logs at,
+  which its settings set (`debug/log-level`). The top sends a fleet
+  device's log request on to the device's flotilla.
 
 ### Dependencies
 

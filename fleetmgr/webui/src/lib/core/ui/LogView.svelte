@@ -22,6 +22,7 @@
   } from '#lib/core/log.ts';
   import { createPoller } from '#lib/core/polling/poller.ts';
   import { dayLabel, sameLocalDay } from '#lib/core/time.ts';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
 
   interface Props {
     load: (query: LogQuery) => Promise<LogPage>;
@@ -334,7 +335,7 @@
   </div>
 
   {#if error}
-    <div class="error-state status">{error}</div>
+    <LoadError message={error} onretry={reload} />
   {/if}
 
   <div class="rows">
@@ -356,7 +357,7 @@
           <li class="day" aria-hidden="true">{day}</li>
         {/if}
         {#if 'gap' in row}
-          <li class="gap">More messages came at once than Live reads; the ones in between are not shown.</li>
+          <li class="gap" title="More came at once than Live reads">Messages skipped</li>
         {:else}
           {@const e = row.entry}
           {@const open = expanded.has(row.id)}
@@ -365,11 +366,12 @@
           <li class="entry tone-{logTone(e.level)}" class:open>
             <button class="line" type="button" aria-expanded={open} onclick={() => toggle(row.id)}>
               <time class="time" datetime={e.time ?? undefined} title={e.time ?? ''}>{clock(ms)}</time>
-              <span class="level">{(e.level ?? '').toUpperCase()}</span>
+              <span class="level">{e.level ?? ''}</span>
               <span class="text">
                 {#if e.msg}<span class="msg">{@render highlighted(e.msg)}</span>{/if}
+                <!-- A space, not only a margin, between the parts: a copied line keeps them apart. -->
                 {#each data as [key, value] (key)}
-                  <span class="pair"><span class="key">{key}=</span>{@render highlighted(short(logValue(value)))}</span>
+                  {' '}<span class="pair"><span class="key">{key}=</span>{@render highlighted(short(logValue(value)))}</span>
                 {/each}
               </span>
               <span class="source">{logSource(e)}</span>
@@ -413,8 +415,8 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 10px 12px;
-    padding: 10px 12px;
+    gap: 10px var(--sw-space-3);
+    padding: 10px var(--sw-space-3);
     border-bottom: 1px solid var(--sw-border-subtle);
     border-radius: var(--sw-radius-md) var(--sw-radius-md) 0 0;
     background: var(--sw-bg-card);
@@ -506,11 +508,11 @@
   .search {
     flex: 1;
     min-width: 10rem;
-    max-width: 320px;
+    max-width: 20rem;
   }
 
   .live {
-    gap: 8px;
+    gap: var(--sw-space-2);
     margin-left: auto;
   }
 
@@ -550,8 +552,8 @@
     background: var(--sw-bg-input);
   }
 
-  .frame > .error-state {
-    margin: 12px;
+  .frame :global(.load-error) {
+    margin: var(--sw-space-3);
   }
 
   .rows {
@@ -561,7 +563,7 @@
   .log {
     max-height: min(62vh, 560px);
     margin: 0;
-    padding: 4px 0;
+    padding: var(--sw-space-1) 0;
     overflow-y: auto;
     list-style: none;
     /* follow() keeps the place of someone reading lower down itself. */
@@ -582,10 +584,10 @@
 
   .line {
     display: grid;
-    grid-template-columns: 12ch 6ch minmax(0, 1fr) auto;
-    gap: 0 12px;
+    grid-template-columns: 12ch 7ch minmax(0, 1fr) auto;
+    gap: 0 var(--sw-space-3);
     width: 100%;
-    padding: 3px 12px;
+    padding: 3px var(--sw-space-3);
     border: none;
     background: none;
     color: var(--sw-text-secondary);
@@ -645,7 +647,7 @@
 
   .msg {
     color: var(--sw-text-primary);
-    margin-right: 8px;
+    margin-right: var(--sw-space-2);
   }
 
   .tone-debug .msg {
@@ -656,7 +658,6 @@
   .pair {
     display: inline-block;
     max-width: 100%;
-    margin-right: 8px;
     vertical-align: top;
   }
 
@@ -678,9 +679,9 @@
   .detail {
     display: grid;
     grid-template-columns: max-content minmax(0, 1fr);
-    gap: 4px 16px;
+    gap: var(--sw-space-1) var(--sw-space-4);
     margin: 0;
-    padding: 8px 12px 12px calc(12ch + 24px);
+    padding: var(--sw-space-2) var(--sw-space-3) var(--sw-space-3) calc(12ch + 2 * var(--sw-space-3));
     background: var(--sw-bg-hover);
   }
 
@@ -702,7 +703,7 @@
 
   .day,
   .gap {
-    padding: 6px 12px;
+    padding: 6px var(--sw-space-3);
     color: var(--sw-text-muted);
     font-family: var(--sw-font-sans);
     font-size: var(--sw-text-xs);
@@ -724,11 +725,11 @@
 
   .unseen {
     position: absolute;
-    top: 8px;
+    top: var(--sw-space-2);
     left: 50%;
     z-index: 1;
     transform: translateX(-50%);
-    padding: 4px 12px;
+    padding: var(--sw-space-1) var(--sw-space-3);
     border: 1px solid var(--sw-accent-glow-strong);
     border-radius: var(--sw-radius-pill);
     background: var(--sw-bg-elevated);
@@ -741,7 +742,7 @@
 
   .note {
     margin: 0;
-    padding: 20px;
+    padding: var(--sw-space-5);
     color: var(--sw-text-muted);
     font-size: var(--sw-text-sm);
     text-align: center;
@@ -750,11 +751,11 @@
   .more {
     display: flex;
     justify-content: center;
-    margin-top: 12px;
+    margin-top: var(--sw-space-3);
   }
 
   .end {
-    margin: 12px 0 0;
+    margin: var(--sw-space-3) 0 0;
     color: var(--sw-text-muted);
     font-size: var(--sw-text-xs);
     text-align: center;
@@ -788,7 +789,7 @@
     .detail {
       grid-template-columns: minmax(0, 1fr);
       gap: 0;
-      padding-left: 12px;
+      padding-left: var(--sw-space-3);
     }
 
     .detail dd {

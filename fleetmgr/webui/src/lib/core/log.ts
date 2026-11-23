@@ -43,7 +43,7 @@ export type LogLevel = (typeof LOG_LEVELS)[number];
 
 export const LEVEL_LABEL: Record<LogLevel, string> = {
   error: 'Error',
-  warning: 'Warn',
+  warning: 'Warning',
   info: 'Info',
   debug: 'Debug',
   trace: 'Trace'
@@ -72,7 +72,9 @@ export async function fetchDeviceLog(name: string, query: LogQuery, fetchFn: Fet
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok) {
     const error = (body as { error?: unknown } | null)?.error;
-    throw new Error(typeof error === 'string' ? error : `The log could not be read (HTTP ${response.status}).`);
+    throw new Error(
+      typeof error === 'string' ? `${error} (${response.status})` : `The log could not be read (${response.status}).`
+    );
   }
   const page = body as Partial<LogPage> | null;
   return {
