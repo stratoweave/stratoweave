@@ -770,6 +770,10 @@
   show no model or version until the page is loaded again. [#754]
 - Fixed the campaign plan timeline drawing a crowded window past its end.
   Its columns grow taller instead. [#761]
+- Fixed a tall last column in plan timeline windows whose devices start
+  until the window closes. Every start in the window's last few pixels
+  went to that column; the starts are now spread over the window's
+  columns.
 - The campaign page shows why members wait. Its progress bar splits the
   members that it upgraded from those that were up to date already, and
   the members that wait into held, not answered and waiting, and says what
