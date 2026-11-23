@@ -3,6 +3,7 @@
   import { invalidate } from '$app/navigation';
 
   import ConnectionDot from '#lib/software/ConnectionDot.svelte';
+  import DevicePicture from '#lib/software/DevicePicture.svelte';
   import HeldText from '#lib/software/HeldText.svelte';
   import JobProgress from '#lib/software/JobProgress.svelte';
   import StageChain from '#lib/software/StageChain.svelte';
@@ -124,22 +125,25 @@
   {@const text = note(row)}
   {@const progress = jobProgress(row)}
   <div class="page-header">
-    <div>
-      <h1>{data.deviceName}</h1>
-      <p class="summary">
-        <!-- A member the fleet does not have gets nothing from the campaign. -->
-        {#if device === null}
-          Not in the fleet.
-        {:else}
-          <ConnectionDot connection={device.connection} text />
-          {#if device.model}
-            · model <span class="mono">{device.model}</span>
+    <div class="ident">
+      <DevicePicture />
+      <div>
+        <h1>{data.deviceName}</h1>
+        <p class="summary">
+          <!-- A member the fleet does not have gets nothing from the campaign. -->
+          {#if device === null}
+            Not in the fleet.
+          {:else}
+            <ConnectionDot connection={device.connection} text />
+            {#if device.model}
+              · model <span class="mono">{device.model}</span>
+            {/if}
+            {#if device.version}
+              · version <span class="mono">{device.version}</span>
+            {/if}
           {/if}
-          {#if device.version}
-            · version <span class="mono">{device.version}</span>
-          {/if}
-        {/if}
-      </p>
+        </p>
+      </div>
     </div>
     <div class="head-end">
       <StatusPill status={row.status} raw={row.raw} />
@@ -217,6 +221,17 @@
 <style>
   .summary {
     color: var(--sw-text-muted);
+  }
+
+  /* The device's picture beside its name, as its page had it. */
+  .ident {
+    display: flex;
+    align-items: center;
+    gap: var(--sw-space-5);
+  }
+
+  .ident > div {
+    min-width: 0;
   }
 
   /* The status and the page's actions, right of the title. */
@@ -379,6 +394,10 @@
   }
 
   @media (max-width: 720px) {
+    .ident > :global(.device-picture) {
+      display: none;
+    }
+
     .run {
       padding: 20px 16px;
     }

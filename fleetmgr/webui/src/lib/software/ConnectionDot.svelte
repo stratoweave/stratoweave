@@ -23,14 +23,17 @@
 </span>
 
 <style>
+  /* The words set the baseline, so they sit on the line of the text around
+     them; the dot centres on them. */
   .connection {
     display: inline-flex;
-    align-items: center;
+    align-items: baseline;
     gap: 6px;
   }
 
   .dot {
     flex: none;
+    align-self: center;
     width: 8px;
     height: 8px;
     border-radius: 50%;
