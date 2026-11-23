@@ -2,6 +2,8 @@
 // which sits next to RESTCONF. The output format follows the Accept header,
 // and the content parameter picks config, operational state or both.
 
+import { RestconfError } from '#lib/core/restconf/client.ts';
+
 type Fetch = typeof fetch;
 
 export type LayerContent = 'config' | 'nonconfig' | 'all';
@@ -54,9 +56,9 @@ export async function fetchLayer(
   const response = await fetchFn(`/layer/${index}?content=${content}`, {
     headers: { accept: ACCEPT[format] }
   });
+  // Its failures read as the RESTCONF reads' do, in an operator's words.
   if (!response.ok) {
-    const message = (await response.text()) || response.statusText;
-    throw new Error(`Layer ${index} ${response.status}: ${message}`);
+    throw new RestconfError(response.status, (await response.text()) || response.statusText);
   }
   return response.text();
 }

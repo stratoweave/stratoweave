@@ -6,6 +6,7 @@
   import { restconfPatchJson } from '#lib/core/restconf/client.ts';
   import { takeNotice } from '#lib/core/notice.ts';
   import FileDrop from '#lib/core/ui/FileDrop.svelte';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import ImageDrive from '#lib/software/ImageDrive.svelte';
   import { addImageFiles } from '#lib/software/image-files.ts';
   import { buildTree } from '#lib/software/image-tree.ts';
@@ -15,6 +16,8 @@
 
   let { data }: PageProps = $props();
 
+  const uid = $props.id();
+  const URL_BASE_TIP = 'Devices fetch an image from this URL followed by its file path.';
   let dragging = $state(false);
   let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
   let drive: ReturnType<typeof ImageDrive> | undefined = $state();
@@ -28,6 +31,17 @@
   // Where devices fetch the images from, as typed here until saved.
   let urlBase = $state(untrack(() => data.urlBase));
   let savingUrlBase = $state(false);
+  // Its password shows as dots while the field is not being edited. Only
+  // typing changes urlBase, so the dots are never saved.
+  let editingUrlBase = $state(false);
+
+  /** scp://admin:••••@host:/images/ for scp://admin:secret@host:/images/. */
+  function maskPassword(url: string): string {
+    const m = /^((?:[a-z][a-z0-9+.-]*:\/\/)?)([^/]*)@/i.exec(url);
+    const colon = m ? m[2].indexOf(':') : -1;
+    if (!m || colon < 0 || colon === m[2].length - 1) return url;
+    return `${m[1]}${m[2].slice(0, colon)}:••••@${url.slice(m[0].length)}`;
+  }
 
   async function saveUrlBase(): Promise<void> {
     try {
@@ -60,10 +74,6 @@
 <div class="page-header">
   <div>
     <h1>Images</h1>
-    <p>
-      Software images, kept in folders, with the OS each runs and the hardware models it is for. Drop image files
-      anywhere on this page to upload them into the folder you are in.
-    </p>
   </div>
   <div class="page-actions">
     <button
@@ -95,23 +105,28 @@
 </div>
 
 {#if data.loadError}
-  <div class="error-state status">{data.loadError}</div>
+  <LoadError message={data.loadError} />
 {:else}
   {#if data.filesError}
-    <div class="error-state status">{data.filesError}</div>
+    <LoadError message={data.filesError} />
   {/if}
 
   <section class="card url-base">
-    <label class="field url-field">
-      <span class="field__label">Image URL base</span>
+    <div class="field url-field">
+      <label class="field__label" for={`${uid}-url-base`} title={URL_BASE_TIP}>Image URL base</label>
       <input
+        id={`${uid}-url-base`}
         class="input mono"
         placeholder="e.g. scp://user:password@host:/images/"
-        value={urlBase}
+        title={URL_BASE_TIP}
+        aria-describedby={`${uid}-url-base-tip`}
+        value={editingUrlBase ? urlBase : maskPassword(urlBase)}
+        onfocus={() => (editingUrlBase = true)}
+        onblur={() => (editingUrlBase = false)}
         oninput={(e) => (urlBase = e.currentTarget.value)}
       />
-      <small class="field__meta">A device fetches an image from this followed by the path of its file.</small>
-    </label>
+      <span id={`${uid}-url-base-tip`} class="sr-only">{URL_BASE_TIP}</span>
+    </div>
     <button
       class="btn btn-secondary"
       type="button"
@@ -129,6 +144,7 @@
       folder={data.folder}
       {tree}
       inUse={data.inUse}
+      filesFailed={!!data.filesError}
       {dragging}
       onstatus={(s) => (statusMessage = s)}
     />
@@ -136,9 +152,10 @@
 {/if}
 
 <style>
+  /* The button level with the input, below the field's label. */
   .url-base {
     display: flex;
-    align-items: center;
+    align-items: flex-end;
     gap: 12px;
     margin-bottom: 16px;
   }
@@ -146,9 +163,5 @@
   .url-field {
     flex: 1;
     max-width: 640px;
-  }
-
-  .url-field .field__meta {
-    margin-top: 4px;
   }
 </style>

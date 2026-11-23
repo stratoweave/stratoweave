@@ -13,18 +13,15 @@
   let typed = $state.raw<TypedImage | null>(null);
 </script>
 
-{#if data.loadError}
-  <div class="error-state status">{data.loadError}</div>
-{/if}
-
 {#if files.length > 0}
-  <AddImagesForm {files} {typed} folder={data.folder} images={data.images} />
+  <AddImagesForm {files} {typed} folder={data.folder} images={data.images} loadError={data.loadError} />
 {:else}
   <CatalogImageForm
     image={null}
     images={data.images}
     folder={data.folder}
     file={data.file}
+    loadError={data.loadError}
     onfiles={(next, held) => {
       typed = held;
       files = next;

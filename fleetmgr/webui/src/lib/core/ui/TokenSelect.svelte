@@ -195,6 +195,7 @@
     border-radius: var(--sw-radius-xs);
     padding: 3px 8px;
     font-family: var(--sw-font-mono);
+    font-variant-ligatures: none;
     font-size: var(--sw-text-xs);
     color: var(--sw-text-secondary);
     cursor: pointer;
@@ -251,7 +252,7 @@
   /* Touch screens get targets a finger can hit, as app.css gives chips. */
   @media (pointer: coarse) {
     .tok {
-      min-height: 32px;
+      min-height: 36px;
     }
   }
 </style>

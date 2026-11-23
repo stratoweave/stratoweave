@@ -15,24 +15,29 @@
 
   let { label = '', value = '', min, error = '', help = '', disabled = false, onchange }: Props = $props();
 
+  const uid = $props.id();
   let metaText = $derived(error || help || '\u00A0');
 </script>
 
-<label class="field">
-  <span class="field__label">{label}</span>
+<!-- The label holds only the field's name; the help or error under the
+     input describes it. -->
+<div class="field">
+  <label class="field__label" for={`${uid}-input`}>{label}</label>
   <input
+    id={`${uid}-input`}
     type="datetime-local"
     class="input mono"
     class:empty={!value}
     class:has-error={!!error}
     aria-invalid={error ? 'true' : undefined}
+    aria-describedby={error || help ? `${uid}-meta` : undefined}
     {value}
     {min}
     {disabled}
     oninput={(event) => onchange?.(event.currentTarget.value)}
   />
-  <small class:field__meta--error={!!error} class="field__meta">{metaText}</small>
-</label>
+  <small id={`${uid}-meta`} class:field__meta--error={!!error} class="field__meta">{metaText}</small>
+</div>
 
 <style>
   /* The empty mask (dd/mm/yyyy, --:--) reads as a placeholder. */
@@ -62,7 +67,7 @@
     margin-left: 6px;
     padding: 2px;
     border-radius: var(--sw-radius-xs);
-    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 16 16' fill='none' stroke='%237d8cac' stroke-width='1.5' stroke-linecap='round'%3E%3Crect x='2' y='3' width='12' height='11' rx='2'/%3E%3Cpath d='M2 6.5h12M5.5 1.5v3M10.5 1.5v3'/%3E%3C/svg%3E") center / 14px 14px no-repeat;
+    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 16 16' fill='none' stroke='%238594b4' stroke-width='1.5' stroke-linecap='round'%3E%3Crect x='2' y='3' width='12' height='11' rx='2'/%3E%3Cpath d='M2 6.5h12M5.5 1.5v3M10.5 1.5v3'/%3E%3C/svg%3E") center / 14px 14px no-repeat;
     opacity: 1;
     cursor: pointer;
   }

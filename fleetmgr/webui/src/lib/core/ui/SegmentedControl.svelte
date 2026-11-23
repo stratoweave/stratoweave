@@ -6,7 +6,8 @@
     ariaLabel,
     onchange
   }: {
-    options: { value: T; label: string; disabled?: boolean }[];
+    /** title: what the option does, as its tooltip. */
+    options: { value: T; label: string; title?: string; disabled?: boolean }[];
     value: T;
     label?: string;
     ariaLabel?: string;
@@ -21,6 +22,7 @@
         class:active={value === option.value}
         aria-pressed={value === option.value}
         type="button"
+        title={option.title}
         disabled={option.disabled}
         onclick={() => onchange(option.value)}
       >{option.label}</button>
@@ -47,7 +49,7 @@
 
   .segmented-group__label {
     color: var(--sw-text-muted);
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     font-weight: 600;
   }
 
@@ -65,10 +67,10 @@
     border-radius: 6px;
     background: transparent;
     color: var(--sw-text-secondary);
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     font-weight: 500;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: all var(--sw-dur-fast) var(--sw-ease);
   }
 
   .segmented button:hover:not(:disabled) {

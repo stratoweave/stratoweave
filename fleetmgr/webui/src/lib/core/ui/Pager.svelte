@@ -19,11 +19,23 @@
 
 {#if pageCount > 1}
   <div class="pager">
-    <button class="btn btn-secondary btn-sm" type="button" disabled={page <= 1} onclick={() => onchange(page - 1)}>
+    <button
+      class="btn btn-secondary btn-sm"
+      type="button"
+      aria-label="Previous page"
+      disabled={page <= 1}
+      onclick={() => onchange(page - 1)}
+    >
       ‹
     </button>
-    <span>page {page} / {pageCount}</span>
-    <button class="btn btn-secondary btn-sm" type="button" disabled={page >= pageCount} onclick={() => onchange(page + 1)}>
+    <span>page {page.toLocaleString()} / {pageCount.toLocaleString()}</span>
+    <button
+      class="btn btn-secondary btn-sm"
+      type="button"
+      aria-label="Next page"
+      disabled={page >= pageCount}
+      onclick={() => onchange(page + 1)}
+    >
       ›
     </button>
   </div>
@@ -36,7 +48,7 @@
     gap: 10px;
     justify-content: flex-end;
     margin-top: 10px;
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-secondary);
   }
 </style>

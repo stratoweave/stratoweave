@@ -38,7 +38,7 @@ export type ImportShared = Pick<NewDeviceInput, 'type' | 'username' | 'password'
  * devices but not 10k. */
 export const IMPORT_BATCH = 5000;
 
-function validPort(text: string): boolean {
+export function validPort(text: string): boolean {
   const n = Number(text);
   return Number.isInteger(n) && n >= 1 && n <= 65535;
 }

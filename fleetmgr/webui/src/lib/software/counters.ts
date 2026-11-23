@@ -51,15 +51,16 @@ export async function fetchCounters(
   return parseStateNode(json)?.counters ?? null;
 }
 
-/** One campaign's counters and the alarm lines of its plan, all of them,
- * in one GET; null and none when it has no state yet or does not exist. */
-export async function fetchCountersAndAlarms(
+/** What the campaigns list shows of one campaign's state, in one GET: its
+ * counters, when it first ran, which tells a paused campaign from one never
+ * run, and all the alarm lines of its plan; null and none when it has no
+ * state yet or does not exist. */
+export async function fetchListState(
   name: string,
   fetchFn: typeof fetch = fetch
-): Promise<{ counters: CampaignCounters | null; alarms: string[] }> {
-  const json = await restconfGetOrNull<{ 'software:state'?: { plan?: { alarm?: string[] } } }>(
-    `${statePath(name)}?fields=${COUNTER_FIELDS};plan/alarm`,
-    fetchFn
+): Promise<{ counters: CampaignCounters | null; runSince: number | null; alarms: string[] }> {
+  const state = parseStateNode(
+    await restconfGetOrNull<unknown>(`${statePath(name)}?fields=${COUNTER_FIELDS};run-since;plan/alarm`, fetchFn)
   );
-  return { counters: parseStateNode(json)?.counters ?? null, alarms: json?.['software:state']?.plan?.alarm ?? [] };
+  return { counters: state?.counters ?? null, runSince: state?.runSince ?? null, alarms: state?.alarms ?? [] };
 }

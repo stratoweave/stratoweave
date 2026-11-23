@@ -10,6 +10,7 @@
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
   import FileDrop from '#lib/core/ui/FileDrop.svelte';
   import { focusFirstError } from '#lib/core/ui/focus.ts';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import TokenSelect from '#lib/core/ui/TokenSelect.svelte';
   import { folderHref, joinPath } from '#lib/software/image-tree.ts';
   import {
@@ -42,9 +43,12 @@
     images: CatalogImage[];
     /** The folder the files go into; '' for the top. */
     folder?: string;
+    /** Why `images` could not be read. An upload reads them again, so the
+     * form works without them; only its checks and suggestions miss them. */
+    loadError?: string;
   }
 
-  let { files, typed = null, images, folder = '' }: Props = $props();
+  let { files, typed = null, images, folder = '', loadError = '' }: Props = $props();
 
   type Upload =
     | { state: 'waiting' }
@@ -157,7 +161,7 @@
   });
   let invalidCount = $derived(errors.filter((e) => Object.keys(e).length > 0).length);
   let uploadLabel = $derived(
-    rows.length === 0 ? 'Upload images' : rows.length === 1 ? 'Upload 1 image' : `Upload ${rows.length} images`
+    rows.length === 0 ? 'Upload images' : rows.length === 1 ? 'Upload 1 image' : `Upload ${rows.length.toLocaleString()} images`
   );
 
   function percent(sent: number, size: number): number {
@@ -304,11 +308,14 @@
     running = null;
     saving = false;
     if (rows.length === 0) {
-      leaveNotice(added.length === 1 ? `Uploaded image ${added[0]}.` : `Uploaded ${added.length} images.`);
+      leaveNotice(added.length === 1 ? `Uploaded image ${added[0]}.` : `Uploaded ${added.length.toLocaleString()} images.`);
       // Not a preload made before the write (hovering Cancel makes one).
       await goto(back, { refreshAll: true });
     } else {
-      statusMessage = total === 1 ? 'The image was not added.' : `${rows.length} of ${total} images were not added.`;
+      statusMessage =
+        total === 1
+          ? 'The image was not added.'
+          : `${rows.length.toLocaleString()} of ${total.toLocaleString()} images ${rows.length === 1 ? 'was' : 'were'} not added.`;
     }
   }
 </script>
@@ -316,7 +323,7 @@
 <div class="page-header">
   <div>
     <h1>Add images</h1>
-    {#if folder}<p>Into the folder <span class="mono">{folder}</span>.</p>{/if}
+    {#if folder}<p>Into <span class="mono">{folder}</span></p>{/if}
   </div>
   <div class="page-actions">
     <FileDrop
@@ -340,11 +347,18 @@
   </div>
 </div>
 
-{#if filesMessage}
-  <div class="error-state status" role="alert">{filesMessage}</div>
-{/if}
-{#if statusMessage}
-  <div class="error-state status" role="alert">{statusMessage}</div>
+<!-- In place before any message, so that a screen reader reads each one. -->
+<div role="alert">
+  {#if filesMessage}
+    <div class="error-state status">{filesMessage}</div>
+  {/if}
+  {#if statusMessage}
+    <div class="error-state status">{statusMessage}</div>
+  {/if}
+</div>
+
+{#if loadError}
+  <LoadError message={loadError} />
 {/if}
 
 <section bind:this={card} class="card" class:dropping={dragging}>
@@ -358,7 +372,7 @@
       <p class="invalid-summary">
         {rows.length === 1
           ? 'This image needs changes before it can be added.'
-          : `${invalidCount} of ${rows.length} images need changes before they can be added.`}
+          : `${invalidCount.toLocaleString()} of ${rows.length.toLocaleString()} images ${invalidCount === 1 ? 'needs changes before it' : 'need changes before they'} can be added.`}
       </p>
     {/if}
     <datalist id={`${uid}-os`}>
@@ -686,10 +700,8 @@
       content: attr(data-label);
       display: block;
       margin-bottom: 4px;
-      font-size: var(--sw-text-2xs);
-      font-weight: 600;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
+      font-size: var(--sw-text-xs);
+      font-weight: 500;
       color: var(--sw-text-muted);
     }
 

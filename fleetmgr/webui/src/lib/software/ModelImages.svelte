@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { imagesFor, targetSplit, type ModelGroup } from '#lib/software/campaign-images.ts';
+  import { imagesFor, targetSplit, type ModelGroup, type TargetSplit } from '#lib/software/campaign-images.ts';
   import type { CatalogImage } from '#lib/software/images.ts';
 
   interface Props {
@@ -18,6 +18,9 @@
 
   const uid = $props.id();
 
+  /** The models whose devices are listed under their row. */
+  let shown = $state<Record<string, boolean>>({});
+
   let rows = $derived(
     groups.map((g) => {
       const choices = imagesFor(g.model, images);
@@ -30,6 +33,15 @@
 
   function devicesText(n: number): string {
     return n === 1 ? '1 device' : `${n.toLocaleString()} devices`;
+  }
+
+  /** The names behind each count of the split column, in its order. */
+  function splitNames(s: TargetSplit): [string, string[]][] {
+    return [
+      ['Need it', s.need],
+      ['Already on it', s.onTarget],
+      ['Newer', s.newer]
+    ];
   }
 </script>
 
@@ -47,9 +59,20 @@
     <tbody>
       {#each rows as row, index (row.model)}
         {@const id = `${uid}-${index}`}
-        <tr>
+        {@const open = shown[row.model] === true}
+        <tr class:open>
           <td class="mono model">{row.model}</td>
-          <td class="tn right" title={row.devices.map((d) => d.name).join(', ')}>{row.devices.length.toLocaleString()}</td>
+          <td class="tn right">
+            <button
+              class="fold count"
+              type="button"
+              aria-expanded={open}
+              aria-label={`${devicesText(row.devices.length)} of model ${row.model}`}
+              onclick={() => (shown = { ...shown, [row.model]: !open })}
+            >
+              {row.devices.length.toLocaleString()}
+            </button>
+          </td>
           <td class="image-cell">
             {#if row.choices.length === 0}
               <span class="missing">No image lists this model.</span>
@@ -83,17 +106,36 @@
             {:else}
               {@const s = row.split}
               {#if s.need.length > 0}
-                <span title={s.need.join(', ')}>{s.need.length.toLocaleString()} need it</span>
+                <span>{s.need.length.toLocaleString()} need it</span>
               {/if}
               {#if s.onTarget.length > 0}
-                <span class="on" title={s.onTarget.join(', ')}>{s.onTarget.length.toLocaleString()} already on it</span>
+                <span class="on">{s.onTarget.length.toLocaleString()} already on it</span>
               {/if}
               {#if s.newer.length > 0}
-                <span class="newer" title={s.newer.join(', ')}>{s.newer.length.toLocaleString()} newer</span>
+                <span class="newer">{s.newer.length.toLocaleString()} newer</span>
               {/if}
             {/if}
           </td>
         </tr>
+        {#if open}
+          <!-- Which devices the counts cover, split as against the image. -->
+          <tr class="names-row">
+            <td colspan="5">
+              {#if row.split === null}
+                <p class="mono names">{row.devices.map((d) => d.name).join(', ')}</p>
+              {:else}
+                {#each splitNames(row.split) as [label, names] (label)}
+                  {#if names.length > 0}
+                    <p class="names">
+                      <span class="names-label">{label}</span>
+                      <span class="mono">{names.join(', ')}</span>
+                    </p>
+                  {/if}
+                {/each}
+              {/if}
+            </td>
+          </tr>
+        {/if}
       {/each}
     </tbody>
   </table>
@@ -148,6 +190,32 @@
 
   .right {
     text-align: right;
+  }
+
+  /* The count opens the list of its devices. */
+  .count {
+    min-height: 24px;
+    font-size: inherit;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+
+  tr.open td {
+    border-bottom-color: transparent;
+  }
+
+  .names-row td {
+    padding-top: 0;
+  }
+
+  .names-row .names {
+    margin: 0 0 4px;
+  }
+
+  .names-label {
+    margin-right: 8px;
+    font-family: var(--sw-font-sans);
+    color: var(--sw-text-secondary);
   }
 
   .model {

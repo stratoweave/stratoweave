@@ -56,7 +56,8 @@
       />
       <DriveIcon kind="folder" />
       <span class="name" class:mono={c.path !== ''}>{c.path ? baseName(c.path) : 'Images'}</span>
-      {#if c.why}<small id={`${uid}-${c.path}`} class="why">{c.why}</small>{/if}
+      <!-- Hidden from the label's name; the radio reads it as its description. -->
+      {#if c.why}<small id={`${uid}-${c.path}`} class="why" aria-hidden="true">{c.why}</small>{/if}
     </label>
   {/each}
 </div>

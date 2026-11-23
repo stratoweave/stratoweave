@@ -9,7 +9,7 @@
 // change, colours when statuses change, and the clock only moves the
 // marker.
 
-import { CELL_COLOR, cellKind, gutter } from './cells';
+import { cellKind, gutter, type CellKind } from './cells';
 import {
   deviceDuration,
   deviceStart,
@@ -454,36 +454,26 @@ export function pickZoom(zooms: number[], readable: number, fit: (zoom: number) 
   return best.zoom;
 }
 
-export interface Rect {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-  fill: string;
-}
-
-/** Cells of one window as rects, vertical runs of one colour collapsed;
- * the row gutter pattern re-cuts them into cells. */
-export function cellRects(
-  layout: WindowCells,
+/** Cells as one SVG path per kind, a square per cell, so a grid of any size
+ * is a few nodes. */
+export function cellPaths(
+  grids: { cells: WindowCells; gy: number }[],
   rows: Map<string, DeviceStatusRow>,
-  oy: number,
   size: number,
   pitch: number
-): Rect[] {
-  const out: Rect[] = [];
-  for (const col of layout.cols) {
-    let run: Rect | null = null;
-    for (let row = 0; row < col.count; row++) {
-      const fill = CELL_COLOR[cellKind(rows.get(layout.devices[col.first + row].name))];
-      if (run !== null && run.fill === fill) {
-        run.h += pitch;
-        continue;
+): Partial<Record<CellKind, string>> {
+  const parts: Partial<Record<CellKind, string[]>> = {};
+  for (const { cells, gy } of grids) {
+    for (const col of cells.cols) {
+      for (let row = 0; row < col.count; row++) {
+        const kind = cellKind(rows.get(cells.devices[col.first + row].name));
+        const y = gy + row * pitch;
+        (parts[kind] ??= []).push(`M${col.x} ${y}h${size}v${size}h${-size}z`);
       }
-      run = { x: col.x, y: oy + row * pitch, w: size, h: size, fill };
-      out.push(run);
     }
   }
+  const out: Partial<Record<CellKind, string>> = {};
+  for (const [kind, d] of Object.entries(parts) as [CellKind, string[]][]) out[kind] = d.join('');
   return out;
 }
 

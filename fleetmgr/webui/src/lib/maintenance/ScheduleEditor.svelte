@@ -1,8 +1,9 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
-  import { goto } from '$app/navigation';
+  import { tick, untrack } from 'svelte';
+  import { beforeNavigate, goto } from '$app/navigation';
 
   import { errorText } from '#lib/core/errors.ts';
+  import { leaveNotice } from '#lib/core/notice.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
   import FieldText from '#lib/core/ui/FieldText.svelte';
   import Section from '#lib/core/ui/Section.svelte';
@@ -17,7 +18,9 @@
   import { HORIZON_DAYS, WEEKDAYS, occurrences } from '#lib/maintenance/occurrences.ts';
   import { scheduleColors } from '#lib/maintenance/palette.ts';
   import {
+    campaignsText,
     draftFromSchedule,
+    draftKey,
     draftToSchedule,
     emptyDraft,
     newWindowDraft,
@@ -27,6 +30,7 @@
     ruleText,
     scheduleCreatePatch,
     scheduleToJson,
+    usageChangeText,
     validateScheduleDraft,
     type ScheduleDraft,
     type ScheduleUsage,
@@ -54,12 +58,40 @@
   let { schedule, existingNames, usage, now }: Props = $props();
 
   const isNew = untrack(() => schedule === null);
-  let draft = $state<ScheduleDraft>(untrack(() => (schedule ? draftFromSchedule(schedule) : emptyDraft())));
+  const loaded = untrack(() => (schedule ? draftFromSchedule(schedule) : emptyDraft()));
+  let draft = $state<ScheduleDraft>(loaded);
+  // Whether there is anything to save, or to lose by leaving.
+  const loadedKey = draftKey(loaded);
+  let dirty = $derived(draftKey(draft) !== loadedKey);
   let touched = $state(false);
   let saving = $state(false);
   let deleting = $state(false);
+  let confirmSave = $state(false);
   let confirmDelete = $state(false);
   let statusMessage = $state<string>('');
+  // Where the operator asked to go with the changes unsaved.
+  let leaveTo = $state<URL | null>(null);
+  let leaving = false;
+  // The rule the calendar added or changed last, for a screen reader.
+  let calendarMessage = $state('');
+  let rulesEl: HTMLElement | null = $state(null);
+  let addRuleButton: HTMLButtonElement | null = $state(null);
+
+  // Leaving drops the changes, so it is asked first. A reload or a closed
+  // tab gets the browser's own question.
+  beforeNavigate(({ cancel, to, willUnload }) => {
+    if (!dirty || leaving) return;
+    cancel();
+    if (!willUnload && to) leaveTo = to.url;
+  });
+
+  function leave(): void {
+    const to = leaveTo;
+    leaveTo = null;
+    if (!to) return;
+    leaving = true;
+    void goto(to);
+  }
 
   let validation = $derived(validateScheduleDraft(draft, existingNames, isNew));
   let errors = $derived(touched ? validation.errors : ({} as Record<string, string>));
@@ -74,13 +106,11 @@
   let upcoming = $derived(upcomingAll.slice(0, 8));
 
   let usageText = $derived.by(() => {
-    if (isNew) {
-      return 'Created in one write. Devices bind to a schedule by name on their inventory entry and campaigns name one as their default; both re-plan whenever the schedule changes.';
-    }
-    const devices = `${usage.boundDevices} bound device${usage.boundDevices === 1 ? '' : 's'}`;
+    if (isNew) return '';
+    const devices = `${usage.boundDevices.toLocaleString()} bound device${usage.boundDevices === 1 ? '' : 's'}`;
     const campaigns =
-      usage.defaultOf.length > 0 ? `default of ${usage.defaultOf.join(', ')}` : 'default of no campaign';
-    return `${devices} · ${campaigns}. Saving replaces the schedule; everything that references it re-plans.`;
+      usage.defaultOf.length > 0 ? `default for ${usage.defaultOf.join(', ')}` : 'not a campaign default';
+    return `${devices} · ${campaigns}`;
   });
 
   function rulePreview(w: WindowDraft): string {
@@ -114,6 +144,7 @@
     if (!row) return;
     patchWindow(row.id, { at: formatTimeOfDay(to.at), duration: formatDuration(to.duration), days: [...to.days] });
     touched = true;
+    void showRule(row.id, 'changed');
   }
 
   function addRuleFromCalendar(rule: MaintenanceWindow): void {
@@ -124,24 +155,62 @@
     );
     if (same) {
       patchWindow(same.id, { days: WEEKDAYS.filter((d) => same.days.includes(d) || rule.days.includes(d)) });
+      void showRule(same.id, 'changed');
     } else {
       const row = newWindowDraft({ at: formatTimeOfDay(rule.at), duration: formatDuration(rule.duration), days: [...rule.days] });
       draft = { ...draft, windows: [...draft.windows, row] };
+      void showRule(row.id, 'added');
     }
     touched = true;
   }
 
-  function removeRule(id: number): void {
-    draft = { ...draft, windows: draft.windows.filter((w) => w.id !== id) };
+  // On a phone the form sits above the calendar, out of view: the row the
+  // calendar added or changed lights up, and a screen reader hears which.
+  async function showRule(id: number, what: 'added' | 'changed'): Promise<void> {
+    const text = `Rule ${draft.windows.findIndex((w) => w.id === id) + 1} ${what}`;
+    // Emptied first, so that the same text twice is read twice.
+    calendarMessage = '';
+    await tick();
+    calendarMessage = text;
+    rulesEl
+      ?.querySelector(`[data-rule="${id}"]`)
+      ?.animate([{ backgroundColor: 'var(--sw-accent-glow-strong)' }, { backgroundColor: 'transparent' }], {
+        duration: 1600,
+        easing: 'ease-out'
+      });
   }
 
-  async function handleSave(): Promise<void> {
+  async function removeRule(id: number): Promise<void> {
+    const index = draft.windows.findIndex((w) => w.id === id);
+    draft = { ...draft, windows: draft.windows.filter((w) => w.id !== id) };
+    // The button is gone: focus goes on to the rule that moved up into its
+    // place, or to Add a rule after the last one.
+    await tick();
+    const next = draft.windows[index];
+    const field = next ? rulesEl?.querySelector<HTMLElement>(`[data-rule="${next.id}"] input`) : null;
+    (field ?? addRuleButton)?.focus();
+  }
+
+  // Every campaign and device on the schedule re-plans into the changed
+  // windows, so a save is asked first.
+  let saveUsers = $derived(isNew ? '' : usageChangeText(usage));
+
+  function handleSave(): void {
     touched = true;
     if (!validation.ok) {
       // The banner also names problems scrolled out of view.
       statusMessage = `Not saved: ${[...new Set(Object.values(validation.errors))].join(' ')}`;
       return;
     }
+    if (saveUsers) {
+      confirmSave = true;
+      return;
+    }
+    void save();
+  }
+
+  async function save(): Promise<void> {
+    confirmSave = false;
     // An existing entry keeps its name exactly as stored.
     const saved = { ...draftToSchedule(draft), ...(schedule ? { name: schedule.name } : {}) };
     try {
@@ -157,6 +226,8 @@
           wrapListEntryBody(SCHEDULE_LIST_ROOT, scheduleToJson(saved))
         );
       }
+      leaveNotice(`${isNew ? 'Created' : 'Saved'} schedule ${saved.name}.`);
+      leaving = true;
       // Not a preload made before the write (hovering Cancel makes one).
       await goto('/schedules', { refreshAll: true });
     } catch (saveError) {
@@ -173,6 +244,8 @@
       deleting = true;
       statusMessage = '';
       await restconfDelete(getListEntryPath(SCHEDULE_LIST_ROOT, schedule.name));
+      leaveNotice(`Deleted schedule ${schedule.name}.`);
+      leaving = true;
       await goto('/schedules', { refreshAll: true });
     } catch (deleteError) {
       statusMessage = errorText(deleteError, 'Failed to delete the schedule.');
@@ -184,8 +257,10 @@
   let deleteMessage = $derived.by(() => {
     if (!schedule) return '';
     const refs: string[] = [];
-    if (usage.boundDevices > 0) refs.push(`${usage.boundDevices} device(s) are bound to it`);
-    if (usage.defaultOf.length > 0) refs.push(`${usage.defaultOf.join(', ')} default(s) to it`);
+    const c = usage.defaultOf.length;
+    if (c > 0) refs.push(`${campaignsText(usage.defaultOf)} default${c === 1 ? 's' : ''} to it`);
+    const n = usage.boundDevices;
+    if (n > 0) refs.push(`${n.toLocaleString()} device${n === 1 ? ' is' : 's are'} bound to it`);
     const tail =
       refs.length > 0
         ? ` ${refs.join(' and ')}; the references stay behind and those devices plan into no window until they are re-pointed.`
@@ -199,7 +274,7 @@
     <h1 title={`YANG: /maintenance:schedules/schedule${isNew ? '' : `=${schedule?.name}`}`}>
       {isNew ? 'New schedule' : schedule?.name}
     </h1>
-    <p>{usageText}</p>
+    {#if usageText}<p>{usageText}</p>{/if}
   </div>
   <div class="page-actions">
     {#if !isNew}
@@ -212,16 +287,27 @@
         Delete
       </button>
     {/if}
+    {#if dirty}
+      <span class="unsaved">Unsaved changes</span>
+    {/if}
     <a class="btn btn-secondary" href="/schedules">Cancel</a>
-    <button class="btn btn-primary" type="button" disabled={saving || deleting} onclick={handleSave}>
+    <button
+      class="btn btn-primary"
+      type="button"
+      disabled={saving || deleting || (!isNew && !dirty)}
+      onclick={handleSave}
+    >
       {saving ? 'Saving…' : isNew ? 'Create schedule' : 'Save schedule'}
     </button>
   </div>
 </div>
 
-{#if statusMessage}
-  <div class="error-state status">{statusMessage}</div>
-{/if}
+<!-- In place before any message, so that a screen reader reads each one. -->
+<div role="alert">
+  {#if statusMessage}
+    <div class="error-state status">{statusMessage}</div>
+  {/if}
+</div>
 
 <div class="editor">
   <section class="card">
@@ -234,7 +320,7 @@
           error={errors['name']}
           mono={true}
           disabled={!isNew}
-          placeholder="e.g., europe"
+          placeholder="e.g. europe"
           onchange={(v) => (draft = { ...draft, name: v })}
           ontouch={() => (touched = true)}
         />
@@ -244,70 +330,76 @@
           error={errors['utc-offset']}
           mono={true}
           placeholder="+01:00"
-          help="no daylight saving"
+          help="No daylight saving"
           onchange={(v) => (draft = { ...draft, utcOffset: v })}
           ontouch={() => (touched = true)}
         />
       </div>
     </Section>
     <Section title="Windows">
-      {#each draft.windows as w, index (w.id)}
-        <div class="rule">
-          <div class="rule-head">
-            <span class="kick">Rule {index + 1}</span>
-            <span class="rule-preview mono">{rulePreview(w)}</span>
-            <button
-              class="btn btn-secondary btn-sm btn-danger-ghost"
-              type="button"
-              aria-label={`Remove rule ${index + 1}`}
-              onclick={() => removeRule(w.id)}
-            >
-              Remove
-            </button>
-          </div>
-          <div class="rule-fields">
-            <FieldText
-              label="Opens at"
-              value={w.at}
-              error={errors[`window.${w.id}.at`]}
-              mono={true}
-              placeholder="22:00"
-              onchange={(v) => patchWindow(w.id, { at: v })}
-              ontouch={() => (touched = true)}
-            />
-            <FieldText
-              label="Duration"
-              value={w.duration}
-              error={errors[`window.${w.id}.duration`]}
-              mono={true}
-              placeholder="4h"
-              onchange={(v) => patchWindow(w.id, { duration: v })}
-              ontouch={() => (touched = true)}
-            />
-          </div>
-          <div class="field" role="group" aria-label={`Rule ${index + 1} weekdays`}>
-            <span class="field__label">
-              Weekdays
-              <span class="days-hint">{w.days.length === 0 ? 'none picked: every day' : ''}</span>
-            </span>
-            <div class="days">
-              {#each WEEKDAYS as day (day)}
+      {#if draft.windows.length > 0}
+        <div class="rules" bind:this={rulesEl}>
+          {#each draft.windows as w, index (w.id)}
+            <div class="rule" data-rule={w.id}>
+              <div class="rule-head">
+                <span class="kick">Rule {index + 1}</span>
+                <span class="rule-preview mono">{rulePreview(w)}</span>
                 <button
-                  class="day-toggle"
-                  class:on={w.days.includes(day)}
+                  class="btn btn-secondary btn-sm btn-danger-ghost"
                   type="button"
-                  aria-pressed={w.days.includes(day)}
-                  onclick={() => toggleDay(w, day)}
+                  aria-label={`Remove rule ${index + 1}`}
+                  onclick={() => removeRule(w.id)}
                 >
-                  {day}
+                  Remove
                 </button>
-              {/each}
+              </div>
+              <div class="rule-fields">
+                <FieldText
+                  label="Opens at"
+                  value={w.at}
+                  error={errors[`window.${w.id}.at`]}
+                  mono={true}
+                  placeholder="22:00"
+                  onchange={(v) => patchWindow(w.id, { at: v })}
+                  ontouch={() => (touched = true)}
+                />
+                <FieldText
+                  label="Duration"
+                  value={w.duration}
+                  error={errors[`window.${w.id}.duration`]}
+                  mono={true}
+                  placeholder="4h"
+                  onchange={(v) => patchWindow(w.id, { duration: v })}
+                  ontouch={() => (touched = true)}
+                />
+              </div>
+              <div class="field" role="group" aria-label={`Rule ${index + 1} weekdays`}>
+                <span class="field__label">
+                  Weekdays
+                  <span class="days-hint">{w.days.length === 0 ? 'Every day' : ''}</span>
+                </span>
+                <div class="days">
+                  {#each WEEKDAYS as day (day)}
+                    <button
+                      class="day-toggle"
+                      class:on={w.days.includes(day)}
+                      type="button"
+                      aria-pressed={w.days.includes(day)}
+                      onclick={() => toggleDay(w, day)}
+                    >
+                      {day[0].toUpperCase() + day.slice(1)}
+                    </button>
+                  {/each}
+                </div>
+              </div>
             </div>
-          </div>
+          {/each}
         </div>
-      {/each}
+      {/if}
       <div class="rule-actions">
-        <button class="btn btn-secondary btn-sm" type="button" onclick={addRule}>Add a rule</button>
+        <button class="btn btn-secondary btn-sm" type="button" bind:this={addRuleButton} onclick={addRule}>
+          Add a rule
+        </button>
         {#each validation.warnings as warning (warning)}
           <span class="warning">{warning}</span>
         {/each}
@@ -318,7 +410,11 @@
   <section class="card">
     <div class="grids-head">
       <h2 class="panel-title">Next seven days</h2>
-      <span class="hint">drag to move or resize, across a day to add · your local time</span>
+      <!-- A touch has to be held before it drags: a swipe scrolls. -->
+      <span class="hint">
+        <span class="drag-fine">Drag</span><span class="drag-coarse">Hold, then drag</span> to add, move or resize
+        windows · local time
+      </span>
     </div>
     <WeekCalendar
       schedules={[previewSchedule]}
@@ -329,7 +425,8 @@
       onrulechange={changeRuleFromCalendar}
       onrulecreate={addRuleFromCalendar}
     />
-    <h2 class="panel-title upcoming-title">Windows the planner would use</h2>
+    <p class="sr-only" role="status">{calendarMessage}</p>
+    <h2 class="panel-title upcoming-title">Upcoming windows</h2>
     {#if upcoming.length === 0}
       <p class="hint">None within the planner's {HORIZON_DAYS} days.</p>
     {:else}
@@ -356,11 +453,21 @@
         </table>
       </div>
       <p class="hint">
-        {upcomingAll.length} occurrence{upcomingAll.length === 1 ? '' : 's'} within the planner's {HORIZON_DAYS} days{upcomingAll.length > upcoming.length ? `, ${upcoming.length} shown` : ''}.
+        {upcomingAll.length.toLocaleString()} window{upcomingAll.length === 1 ? '' : 's'} in the planner's {HORIZON_DAYS}-day horizon{upcomingAll.length > upcoming.length ? `, first ${upcoming.length.toLocaleString()} shown` : ''}.
       </p>
     {/if}
   </section>
 </div>
+
+<ConfirmDialog
+  open={confirmSave}
+  title="Save schedule"
+  message={`Save ${schedule?.name}? ${saveUsers}`}
+  confirmLabel="Save"
+  confirmClass="btn-primary"
+  oncancel={() => (confirmSave = false)}
+  onconfirm={save}
+/>
 
 <ConfirmDialog
   open={confirmDelete}
@@ -370,6 +477,17 @@
   confirmClass="btn-danger"
   oncancel={() => (confirmDelete = false)}
   onconfirm={handleDelete}
+/>
+
+<ConfirmDialog
+  open={leaveTo !== null}
+  title="Discard unsaved changes?"
+  message={isNew ? 'The new schedule is not created yet.' : `The changes to ${schedule?.name} are not saved.`}
+  confirmLabel="Discard"
+  cancelLabel="Keep editing"
+  confirmClass="btn-danger"
+  oncancel={() => (leaveTo = null)}
+  onconfirm={leave}
 />
 
 <style>
@@ -392,13 +510,44 @@
     gap: 12px;
   }
 
+  .unsaved {
+    align-self: center;
+    font-size: var(--sw-text-xs);
+    color: var(--sw-text-muted);
+  }
+
+  /* A phone's actions start at the left: the note goes above them rather
+     than push Save onto a line of its own. */
+  @media (max-width: 720px) {
+    .unsaved {
+      order: -1;
+      flex-basis: 100%;
+    }
+  }
+
+  /* The rules part with a line, not a box in the card. Each reaches 10px
+     past the fields, room for the light after a calendar edit; the
+     negative margins keep the fields in line with the ones above. */
+  .rules {
+    display: grid;
+    margin: -12px -10px;
+  }
+
   .rule {
+    position: relative;
     display: grid;
     gap: 10px;
-    padding: 12px 14px;
-    border: 1px solid var(--sw-border-subtle);
-    border-radius: var(--sw-radius-md);
-    background: var(--sw-bg-elevated);
+    padding: 12px 10px;
+    border-radius: var(--sw-radius-sm);
+  }
+
+  .rule + .rule::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 10px;
+    right: 10px;
+    border-top: 1px solid var(--sw-border-subtle);
   }
 
   .rule-head {
@@ -443,7 +592,6 @@
     border: 1px solid var(--sw-border-default);
     background: var(--sw-bg-input);
     color: var(--sw-text-muted);
-    font-family: var(--sw-font-mono);
     font-size: var(--sw-text-xs);
     cursor: pointer;
   }
@@ -481,7 +629,7 @@
 
   .panel-title {
     margin: 0;
-    font-size: 14px;
+    font-size: var(--sw-text-md);
   }
 
   .upcoming-title {
@@ -493,5 +641,19 @@
     font-size: var(--sw-text-xs);
     color: var(--sw-text-muted);
     margin: 8px 0 0;
+  }
+
+  .drag-coarse {
+    display: none;
+  }
+
+  @media (pointer: coarse) {
+    .drag-fine {
+      display: none;
+    }
+
+    .drag-coarse {
+      display: inline;
+    }
   }
 </style>
