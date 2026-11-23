@@ -205,7 +205,7 @@ so a probe that reads two subtrees sends two gets.
 | `ios-xr` | `Cisco-IOS-XR-install-oper` | two gets: `install/version`, the rack inventory | `chassis-pid`, else the rack's model | the rack with the lowest name | not read |
 | `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information`, `get-system-uptime-information` | `product-model` | `serial-number` of system information | `junos:seconds` of `system-booted-time` |
 | `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis | `last-booted` of `system/information` |
-| `sros` | `nokia-state` | one get: `/state/system` and `/state/chassis` | `system/platform` | router chassis with the lowest number | not read |
+| `sros` | `nokia-state` | one get: `/state/system`, `/state/chassis` and `/state/cpm` | `system/platform` | router chassis with the lowest number | `software-last-boot-time` of the active CPM |
 | `arcos` | `arcos-openconfig-system-augments` | one get: `system/version/state` and `system/state/boot-time` | `platform` | `serial-number` | `boot-time` of `system/state` |
 
 Each probe but Junos reads through YANG that its module ships pruned in
@@ -294,6 +294,12 @@ The probe applies to a model-driven or mixed mode SR OS, which serves
 `nokia-state`. The version number starts with the image type: `B-25.10.R7`
 on an SR-SIM gives `25.10.R7`, `C-23.10.R1` on a 7950 XRS vSIM `23.10.R1`. A system of two chassis, like a 7950 XRS-40, lists both;
 the serial number comes from the router chassis with the lowest number.
+
+The last boot is when the software of the active CPM, the one that
+`system/active-cpm-slot` names, last booted: the `software-last-boot-time`
+of its `cpm` entry. A standby CPM can have booted at another time.
+`system/up-time` counts from when the management part of the system last
+started, which need not be a boot, so the probe does not read it.
 
 ### ArcOS
 
