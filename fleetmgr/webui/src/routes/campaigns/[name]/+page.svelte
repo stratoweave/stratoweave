@@ -48,21 +48,19 @@
     KNOWN_STATUSES,
     STATUS_LABEL,
     adminStatePatch,
+    deviceStart,
     isFinalStatus,
     joinState,
     modeLabel,
     type CampaignPlan,
     type DeviceStatusRow,
     type KnownStatus,
-    type PlanWindow,
     type Schedule
   } from '#lib/software/model.ts';
   import type { PageProps } from './$types';
 
   const PAGE_SIZE = 100;
   const FAILED_LIMIT = 200;
-  /** Next windows the run dialog names one by one. */
-  const NEXT_LISTED = 3;
 
   let { data }: PageProps = $props();
 
@@ -95,7 +93,6 @@
   let planningEdit = $state<PlanningDraft | null>(null);
   let planningSaving = $state(false);
   let planningMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
-  let planningFields: ReturnType<typeof PlanningFields> | undefined = $state();
 
   /** Unix seconds, ticking, for the timeline's marker. */
   let now = $state(Date.now() / 1000);
@@ -448,71 +445,34 @@
     }
   } as const;
 
-  /** What Run starts, for its dialog: the windows open now and the ones
-   * after, each with the members it has left to upgrade. */
-  let preflight = $derived.by(() => {
-    if (confirmAction !== 'run' || !savedPlanning) return null;
-    const left = (name: string) => !isFinalStatus(rowsByName.get(name)?.status ?? 'unknown');
-    const windows = (timelinePlan?.windows ?? [])
-      .filter((w) => w.end === null || w.end > now)
-      .map((w) => ({ w, n: w.devices.filter((d) => left(d.name)).length }))
-      .filter(({ n }) => n > 0);
-    const open = windows.filter(({ w }) => w.start <= now);
-    const openDevices = open.reduce((sum, { n }) => sum + n, 0);
-    const p = savedPlanning;
-    const atOnce =
-      p.deadline !== null
-        ? "at the deadline's pace"
-        : openDevices <= p.targetConcurrency
-          ? 'all at once'
-          : `${p.targetConcurrency.toLocaleString()} at once`;
-    const next = windows.filter(({ w }) => w.start > now);
-    const later = next.slice(NEXT_LISTED);
-    return {
-      total: windows.reduce((sum, { n }) => sum + n, 0),
-      open: open.length === 0 ? '' : `${open.map(({ w, n }) => `${openText(w)}, ${devicesText(n)}`).join(' · ')}, ${atOnce}`,
-      next: next.slice(0, NEXT_LISTED).map(({ w, n }) => `${nextText(w)}: ${devicesText(n)}`),
-      later:
-        later.length === 0
-          ? ''
-          : `${later.length.toLocaleString()} more ${later.length === 1 ? 'window' : 'windows'}: ${devicesText(later.reduce((sum, { n }) => sum + n, 0))}`
-    };
+  /** When Run starts the first upgrade, for its dialog: the earliest
+   * planned start of a member still to upgrade; null when none is left. */
+  let firstStart = $derived.by(() => {
+    if (confirmAction !== 'run') return null;
+    let first: number | null = null;
+    for (const w of timelinePlan?.windows ?? []) {
+      if (w.end !== null && w.end <= now) continue;
+      for (const d of w.devices) {
+        if (isFinalStatus(rowsByName.get(d.name)?.status ?? 'unknown')) continue;
+        const t = deviceStart(d);
+        if (first === null || t < first) first = t;
+      }
+    }
+    return first;
   });
-
-  // Without a schedule a campaign runs through one window of its own,
-  // open from launch, or from the end of its notice, to its deadline.
-
-  /** An open window: its schedule and when it closes. */
-  function openText(w: PlanWindow): string {
-    const until = w.end === null ? '' : ` until ${formatClock(w.end)}`;
-    return `${w.schedule || 'No schedule'}${until}`;
-  }
-
-  /** A window still to open: its schedule and when it opens. */
-  function nextText(w: PlanWindow): string {
-    return w.schedule ? `${w.schedule} opens ${formatClock(w.start)}` : `From ${formatClock(w.start)}`;
-  }
 
   let confirmMessage = $derived.by(() => {
     const c = campaign;
     if (!c || !confirmAction) return '';
     if (confirmAction === 'run') {
-      if (!preflight || preflight.total === 0) return 'Run the campaign? No device in a window needs an upgrade.';
-      return `Start upgrading ${devicesText(preflight.total)}?`;
+      if (firstStart === null) return 'Run the campaign? No device in a window needs an upgrade.';
+      if (firstStart <= now) return 'Run the campaign? The first upgrade starts at once.';
+      return `Run the campaign? The first upgrade starts ${opensText(firstStart)}.`;
     }
     if (confirmAction === 'plan')
       return 'Pause the campaign? Devices upgrading now stop before their install and go on when it runs again. Devices past their install finish.';
     return `Delete campaign ${c.name}? Its targets are withdrawn from the devices.`;
   });
-
-  /** From the run dialog: the failure budget field, in the fold opened. */
-  async function setBudget(): Promise<void> {
-    confirmAction = null;
-    paceOpen = true;
-    // The dialog has closed and given focus back to Run by then.
-    await tick();
-    planningFields?.focusBudget();
-  }
 
   // What the announcer compares between polls.
   let facts = $derived.by((): LiveFacts | null => {
@@ -818,7 +778,6 @@
       {:else if paceOpen}
         <div class="pace-body">
           <PlanningFields
-            bind:this={planningFields}
             {schedules}
             draft={planningForm}
             errors={planningErrors}
@@ -1001,49 +960,10 @@
 
 {/if}
 
-{#snippet runDetails()}
-  {#if preflight && campaign && savedPlanning}
-    <dl class="preflight">
-      <dt>Open now</dt>
-      <dd>{preflight.open || 'No window'}</dd>
-      {#if preflight.next.length > 0}
-        <dt>Next</dt>
-        <dd>
-          {#each preflight.next as line, i (i)}
-            <span class="line">{line}</span>
-          {/each}
-          {#if preflight.later}
-            <span class="line">{preflight.later}</span>
-          {/if}
-        </dd>
-      {/if}
-      <dt>Pace</dt>
-      <dd>{capitalized(paceText(savedPlanning))}</dd>
-      <dt>Failure budget</dt>
-      <dd>
-        {#if campaign.failureBudget === null}
-          None · <button class="link" type="button" onclick={setBudget}>Set one</button>
-        {:else}
-          {campaign.failureBudget}%{budget !== null ? `, ${devicesText(budget.allowed)}` : ''}
-        {/if}
-      </dd>
-      {#if onTarget.length > 0}
-        <dt>On target</dt>
-        <dd>{devicesText(onTarget.length)}, nothing to install</dd>
-      {/if}
-      {#if (campaign.plan?.unplaced.length ?? 0) > 0}
-        <dt>In no window</dt>
-        <dd>{devicesText(campaign.plan?.unplaced.length ?? 0)}, they do not start</dd>
-      {/if}
-    </dl>
-  {/if}
-{/snippet}
-
 <ConfirmDialog
   open={confirmAction !== null}
   title={confirmAction ? CONFIRMS[confirmAction].title : ''}
   message={confirmMessage}
-  details={confirmAction === 'run' ? runDetails : undefined}
   confirmLabel={confirmAction ? CONFIRMS[confirmAction].confirmLabel : ''}
   confirmClass={confirmAction ? CONFIRMS[confirmAction].confirmClass : 'btn-primary'}
   oncancel={() => (confirmAction = null)}
@@ -1361,34 +1281,6 @@
   .search {
     width: auto;
     margin-left: auto;
-  }
-
-  /* The run dialog's checks: a label column and what it says. */
-  .preflight {
-    display: grid;
-    grid-template-columns: max-content minmax(0, 1fr);
-    gap: 6px 16px;
-    margin: 0;
-    font-size: var(--sw-text-sm);
-  }
-
-  .preflight dt {
-    color: var(--sw-text-muted);
-  }
-
-  .preflight dd {
-    margin: 0;
-    color: var(--sw-text-primary);
-  }
-
-  .preflight .line {
-    display: block;
-  }
-
-  .preflight .link {
-    padding: 2px 4px;
-    margin: -2px -4px;
-    color: var(--sw-accent-bright);
   }
 
   @media (max-width: 720px) {

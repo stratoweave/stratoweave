@@ -54,13 +54,6 @@
     return `${value} (default)`;
   }
 
-  let budgetField: HTMLElement | undefined = $state();
-
-  /** Focus the failure budget, as the run dialog's Set one does. */
-  export function focusBudget(): void {
-    budgetField?.querySelector('input')?.focus();
-  }
-
   let perHour = $derived(installSeconds ? perHourText(draft, installSeconds) : '');
 
   let deadlineHint = $derived.by(() => {
@@ -174,7 +167,7 @@
       tooltip="Uses only windows that open this long after the campaign first runs."
       onchange={(v) => patch({ notificationPeriod: v })}
     />
-    <div class="slot" bind:this={budgetField}>
+    <div class="slot">
       <FieldText
         label="Failure budget (%)"
         value={draft.failureBudget}
