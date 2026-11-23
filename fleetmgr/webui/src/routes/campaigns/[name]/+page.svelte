@@ -181,6 +181,29 @@
       .map((r) => r.device)
       .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
   );
+  // Their notice can be dismissed; this browser keeps it away per campaign
+  // until their count changes. The summary still counts them.
+  const ON_TARGET_STORE = 'fleetmgr.plan.on-target-dismissed.';
+  let onTargetDismissed = $derived(storedOnTargetDismissed(data.name));
+
+  function storedOnTargetDismissed(name: string): number | null {
+    try {
+      const n = localStorage.getItem(ON_TARGET_STORE + name);
+      return n === null ? null : Number(n);
+    } catch {
+      return null;
+    }
+  }
+
+  function dismissOnTarget(): void {
+    onTargetDismissed = onTarget.length;
+    try {
+      localStorage.setItem(ON_TARGET_STORE + data.name, String(onTarget.length));
+    } catch {
+      // Without storage it stays dismissed while the page is open.
+    }
+  }
+
   let timelinePlan = $derived.by((): CampaignPlan | null => {
     const plan = campaign?.plan ?? null;
     if (plan === null || onTarget.length === 0) return plan;
@@ -717,17 +740,20 @@
           {/each}
         </ul>
       {/if}
-      {#if onTarget.length > 0}
+      {#if onTarget.length > 0 && onTarget.length !== onTargetDismissed}
         <div class="on-target">
-          <button
-            class="fold names-fold"
-            type="button"
-            aria-expanded={onTargetOpen}
-            onclick={() => (onTargetOpen = !onTargetOpen)}
-          >
-            {onTarget.length === 1 ? '1 device already runs' : `${onTarget.length.toLocaleString()} devices already run`} the
-            target: no upgrade
-          </button>
+          <div class="on-target-head">
+            <button
+              class="fold names-fold"
+              type="button"
+              aria-expanded={onTargetOpen}
+              onclick={() => (onTargetOpen = !onTargetOpen)}
+            >
+              {onTarget.length === 1 ? '1 device already runs' : `${onTarget.length.toLocaleString()} devices already run`}
+              the target: no upgrade
+            </button>
+            <button class="dismiss" type="button" aria-label="Dismiss" title="Dismiss" onclick={dismissOnTarget}>×</button>
+          </div>
           {#if onTargetOpen}
             <ul class="names">
               {#each onTarget as name (name)}
@@ -1248,6 +1274,30 @@
     background: var(--sw-warning-dim);
     color: var(--sw-warning);
     font-size: var(--sw-text-sm);
+  }
+
+  .on-target-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .dismiss {
+    flex: none;
+    padding: 2px 7px;
+    background: none;
+    border: none;
+    border-radius: var(--sw-radius-sm);
+    color: inherit;
+    font: inherit;
+    font-size: var(--sw-text-lg);
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .dismiss:hover {
+    background: rgb(var(--sw-success-rgb) / 0.15);
   }
 
   .names-fold {
