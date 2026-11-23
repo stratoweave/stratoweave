@@ -1,5 +1,9 @@
 import file
+import http_router
 import logging
+import net
+import std.http
+import std.json
 import testing
 
 import device as swdev
@@ -209,3 +213,49 @@ actor _test_no_file(t: testing.EnvT):
             testing.error("no end")
         await async fs.rmtree(tmp)
         t.success()
+
+
+actor _test_escaped_name(t: testing.EnvT):
+    """The name in the path is looked up and routed without its percent
+    escapes, and a bad escape is refused."""
+    router = http_router.Router()
+    var asked: list[str] = []
+    steps = [("/device/edge%20router/log-entries", 404, "No device named edge router"),
+             ("/device/edge%zzrouter/log-entries", 400, "Invalid device name")]
+    var current = 0
+
+    proc def _remote(name: str) -> ?(str, int):
+        asked.append(name)
+        return None
+
+    def _send():
+        router.serve(std.http.Request("GET", steps[current].0, b"1.1", {}, b""), _on_response)
+
+    # Runs in the DeviceLogApi actor's turn: check and send the next request.
+    def _on_response(status: int, headers: dict[str, str], data: bytes):
+        path, want_status, want_error = steps[current]
+        body = data.decode()
+        try:
+            testing.assertEqual(status, want_status, path)
+            testing.assertIn(want_error, str(std.json.decode(body)["error"]), path)
+        except Exception as e:
+            t.failure(e)
+            return
+        current += 1
+        if current < len(steps):
+            _send()
+            return
+        try:
+            testing.assertEqual(asked, ["edge router"], "the name the flotilla is chosen by")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    proc def __startup__():
+        fc = file.FileCap(t.env.cap)
+        device_logs = swlogs.DeviceLogs(fc, "logs", "text", 0, 0, logging.INFO)
+        connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(t.env.cap)))
+        api = swdevlog.DeviceLogApi(device_logs, swdev.DeviceRegistry(log_handler=logging.Handler(None)),
+                                    connect_cap, _remote)
+        swdevlog.install(router, api)
+        _send()

@@ -174,7 +174,8 @@ Supported diff renderings inside the JSON payload:
 ### `GET /device/<name>/log-entries`
 Returns messages from the device's log file, `devices/<name>.log` in the log
 directory, as JSON. The file is read when the request comes, so a log that
-nobody reads costs nothing.
+nobody reads costs nothing. Percent-encode a name that has characters a path
+cannot hold, such as `edge%20router`.
 
 Query parameters:
 
