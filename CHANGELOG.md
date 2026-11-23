@@ -599,9 +599,8 @@
   whether its image is prepared, preparing or failed to prepare, and a
   window that has not opened says how many of its members are ready. The
   Prepare chip in front of the bar hides all of it, and the plan's prepare
-  alarms with it. The summary counts the prepared members, the device list
-  has a Prepare column and a prepare failed filter, and Schedule and pace
-  turns Prepare ahead on or off.
+  alarms with it. The device list has a Prepare column and a prepare
+  failed filter, and Schedule and pace turns Prepare ahead on or off.
 - The new-campaign wizard sets the campaign's `notification-period`, as
   Notice in days, as the campaign page does.
 - A campaign releases a member only once the member's status answers the

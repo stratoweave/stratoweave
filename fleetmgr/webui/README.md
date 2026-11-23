@@ -301,8 +301,7 @@ the timeline, a waiting member's cell shows its prepare once it has
 started, and a window that has not opened says how many of its members
 that prepare ahead are ready. The Prepare chip in front of the bar hides
 the bar, the cells' prepare colours and the plan's prepare alarms; the
-browser keeps the choice. The summary counts the prepared members while
-prepares are left, and the device list gets a Prepare column and a
+browser keeps the choice. The device list gets a Prepare column and a
 prepare failed filter.
 
 Sharding is internal: the top places each device on a flotilla by its

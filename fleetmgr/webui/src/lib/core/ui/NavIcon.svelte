@@ -10,7 +10,11 @@
     | 'refresh'
     | 'copy'
     | 'download'
-    | 'check';
+    | 'check'
+    | 'pace'
+    | 'shield'
+    | 'bell'
+    | 'play';
 </script>
 
 <script lang="ts">
@@ -61,5 +65,15 @@
     <path d="M12 4v11m-5-5 5 5 5-5M5 20h14" />
   {:else if name === 'check'}
     <path d="m5 12.5 4.5 4.5L19 7.5" />
+  {:else if name === 'pace'}
+    <path d="M4 17a8 8 0 1 1 16 0" />
+    <path d="m12 17 4-5" />
+  {:else if name === 'shield'}
+    <path d="M12 3 5 6v5.5c0 4.2 3 7.8 7 9.5 4-1.7 7-5.3 7-9.5V6z" />
+  {:else if name === 'bell'}
+    <path d="M6 16v-5a6 6 0 0 1 12 0v5l1.5 2h-15z" />
+    <path d="M10 20.5a2 2 0 0 0 4 0" />
+  {:else if name === 'play'}
+    <path d="M8 5v14l11-7z" />
   {/if}
 </svg>

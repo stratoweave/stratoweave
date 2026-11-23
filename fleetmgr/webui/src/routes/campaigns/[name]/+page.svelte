@@ -6,7 +6,9 @@
   import { onLoaded } from '#lib/core/loading.svelte.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
   import LoadError from '#lib/core/ui/LoadError.svelte';
+  import NavIcon, { type NavIconName } from '#lib/core/ui/NavIcon.svelte';
   import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
+  import AdminStatePill from '#lib/software/AdminStatePill.svelte';
   import CampaignGroups from '#lib/software/CampaignGroups.svelte';
   import CampaignProgress from '#lib/software/CampaignProgress.svelte';
   import DeviceStatusTable from '#lib/software/DeviceStatusTable.svelte';
@@ -32,7 +34,6 @@
     isPrepareAlarm,
     prepareTally,
     prepareViews,
-    preparesLeft,
     type PrepareView
   } from '#lib/software/prepare.ts';
   import { formatClock, formatDayClock } from '#lib/core/time.ts';
@@ -264,13 +265,44 @@
       : null
   );
 
-  /** The stored pace and limits, as the header's one line says them. */
-  let limitsText = $derived.by(() => {
-    if (!savedPlanning) return '';
-    const budgetPart =
-      savedPlanning.failureBudget === null ? 'no failure budget' : `failure budget ${savedPlanning.failureBudget}%`;
-    return [capitalized(paceText(savedPlanning)), budgetPart, noticeText].join(' · ');
+  /** The stored pace and limits, and when the campaign first ran, as the
+   * header's icons say them; each tip has the whole of it. */
+  let limits = $derived.by((): { icon: NavIconName; text: string; tip: string }[] => {
+    if (!campaign || !savedPlanning) return [];
+    const p = savedPlanning;
+    const out: { icon: NavIconName; text: string; tip: string }[] = [];
+    const pace =
+      p.deadline !== null
+        ? `Deadline ${formatClock(p.deadline)}`
+        : p.maxConcurrency > p.targetConcurrency
+          ? `${p.targetConcurrency.toLocaleString()} to ${p.maxConcurrency.toLocaleString()} at once`
+          : `${p.targetConcurrency.toLocaleString()} at once`;
+    out.push({ icon: 'pace', text: pace, tip: capitalized(paceText(p)) });
+    if (p.failureBudget === null) {
+      out.push({ icon: 'shield', text: 'No failure budget', tip: 'Failures do not hold the campaign' });
+    } else {
+      const may = budget === null ? '' : `: ${budget.allowed.toLocaleString()} devices may fail`;
+      out.push({ icon: 'shield', text: `Failure budget ${p.failureBudget}%`, tip: `Failure budget ${p.failureBudget}%${may}` });
+    }
+    if (campaign.notificationPeriod > 0) {
+      const n = campaign.notificationPeriod;
+      out.push({ icon: 'bell', text: `${n.toLocaleString()} day${n === 1 ? '' : 's'} notice`, tip: capitalized(noticeText) });
+    }
+    if (campaign.runSince !== null) {
+      out.push({
+        icon: 'play',
+        text: `Since ${formatClock(campaign.runSince, now)}`,
+        tip: `First ran ${formatClock(campaign.runSince, 0)}`
+      });
+    }
+    return out;
   });
+
+  /** When the next window opens: the day and clock within a week, else the
+   * date. */
+  function opensText(t: number): string {
+    return t - now < 6 * 86400 ? formatDayClock(t, now) : formatClock(t, now);
+  }
 
   function capitalized(text: string): string {
     return text.charAt(0).toUpperCase() + text.slice(1);
@@ -337,36 +369,34 @@
   let paged = $derived(paginate(filteredRows, page, PAGE_SIZE));
 
   // No "done" claim anywhere: status is not latched, it tracks live device
-  // state. A campaign in plan that has run is paused.
+  // state. The pill by the name says whether it runs, is planned or is
+  // paused; this line says what goes on.
   let summary = $derived.by(() => {
     const c = campaign;
     if (!c) return '';
     if (c.adminState === 'plan') {
-      const head = c.runSince === null ? 'Planned' : 'Paused';
       const plan = c.plan;
       if (plan !== null && (plan.windows.length > 0 || plan.unplaced.length > 0 || plan.done.length > 0)) {
         const placed = c.devices.length - plan.unplaced.length - plan.done.length;
         const windows = `${plan.windows.length} window${plan.windows.length === 1 ? '' : 's'}`;
         const missing = plan.unplaced.length > 0 ? `, ${plan.unplaced.length.toLocaleString()} in no window yet` : '';
         const done = plan.done.length > 0 ? `, ${plan.done.length.toLocaleString()} already done` : '';
-        return `${head}: ${placed.toLocaleString()} of ${c.devices.length.toLocaleString()} placed in ${windows}${missing}${done}.`;
+        return `${placed.toLocaleString()} of ${c.devices.length.toLocaleString()} placed in ${windows}${missing}${done}.`;
       }
-      return `${head}.`;
+      return '';
     }
-    if (counters === null) return 'Running: no state reported yet.';
-    if (counters.inProgress > 0)
-      return `Running: ${counters.inProgress.toLocaleString()} of ${counters.total.toLocaleString()} installing.`;
-    if (preparesLeft(prepared)) {
-      const next = c.plan?.windows.find((w) => w.start > Date.now() / 1000);
-      const opens = next ? ` The next window opens ${formatDayClock(next.start)}.` : '';
-      return `Running: preparing ahead, ${prepared.prepared.toLocaleString()} of ${prepared.waiting.toLocaleString()} prepared.${opens}`;
-    }
+    if (counters === null) return 'No state reported yet.';
+    // The progress bar counts the members that install.
+    if (counters.inProgress > 0) return '';
     if (counters.total > 0 && counters.remainder === 0) {
       const upgraded = counters.succeeded - counters.upToDate;
       const already = counters.upToDate > 0 ? `, ${counters.upToDate.toLocaleString()} already up to date` : '';
       return `No work outstanding: ${upgraded.toLocaleString()} upgraded${already}, ${counters.failed.toLocaleString()} failed.`;
     }
-    return 'Running.';
+    const windows = c.plan?.windows ?? [];
+    if (windows.some((w) => now >= w.start && (w.end === null || now < w.end))) return '';
+    const next = windows.find((w) => w.start > now);
+    return next ? `Next window opens ${opensText(next.start)}.` : '';
   });
 
   const CONFIRMS = {
@@ -553,11 +583,19 @@
   {/if}
   <div class="page-header">
     <div>
-      <h1>{campaign.name}</h1>
-      <p class="summary">{summary}</p>
-      <p class="meta">{limitsText}</p>
-      {#if campaign.runSince !== null}
-        <p class="meta">First ran {formatClock(campaign.runSince)}.</p>
+      <div class="title">
+        <h1>{campaign.name}</h1>
+        <AdminStatePill state={campaign.adminState} runSince={campaign.runSince} />
+      </div>
+      {#if summary}
+        <p class="summary">{summary}</p>
+      {/if}
+      {#if limits.length > 0}
+        <ul class="limits">
+          {#each limits as l (l.icon)}
+            <li title={l.tip}><NavIcon name={l.icon} size={14} />{l.text}</li>
+          {/each}
+        </ul>
       {/if}
     </div>
     <div class="page-actions">
@@ -993,10 +1031,38 @@
 />
 
 <style>
+  .title {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+  }
+
   .summary {
     margin: 4px 0 0;
     color: var(--sw-text-secondary);
     font-size: var(--sw-text-md);
+  }
+
+  .limits {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 16px;
+    margin: 8px 0 0;
+    padding: 0;
+    list-style: none;
+    font-size: var(--sw-text-xs);
+    color: var(--sw-text-secondary);
+  }
+
+  .limits li {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .limits :global(svg) {
+    color: var(--sw-text-muted);
   }
 
   /* One line; more images than fit scroll sideways, and fade out at the
@@ -1053,12 +1119,6 @@
 
   .status-foot .rate {
     margin: 0;
-  }
-
-  .meta {
-    margin: 2px 0 0;
-    font-size: var(--sw-text-xs);
-    color: var(--sw-text-muted);
   }
 
   .held-foot {
