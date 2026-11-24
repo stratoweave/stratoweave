@@ -5,7 +5,9 @@ and device replies arrive as messages, and every device request has a timeout,
 so a slow device never stops the editor.
 
 `show <path>` reads configuration and state with a NETCONF get, and `request`
-sends an RPC, or an action inside an action element.
+sends an RPC, or an action inside an action element. `monitor notifications`
+subscribes to event notifications, and each one prints above the prompt as
+it arrives.
 
 `configure` starts a candidate configuration from the running configuration,
 if there is none with changes yet. The candidate lives in the session: it
@@ -25,6 +27,7 @@ import logging
 import yang.schema as yschema
 import yang.gdata as ygdata
 
+import adapters.adapter as swadapter
 import adapters.netconf as swna
 import device as swdev
 import netconf
@@ -39,6 +42,9 @@ import cli.command as command
 import cli.lineedit as lineedit
 import cli.path as cpath
 
+
+# The owner name of the CLI's notification subscriptions on the DeviceMgr.
+NOTIF_OWNER = "ncurl-cli"
 
 # Terminal sequences that turn bracketed paste on and off.
 BRACKETED_PASTE_ON = "\x1b[?2004h"
@@ -111,6 +117,8 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
     var esc_gen = 0
     var req_id = 0
     var pending: ?command.Command = None
+    var notif_specs: set[swadapter.NotifSpec] = set()
+    var notif_warning: ?str = None
 
     def out(text: str):
         print(text, end="", flush=True)
@@ -125,6 +133,9 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
     def finish(code: int):
         if not done:
             done = True
+            d = dev
+            if d is not None and len(notif_specs) > 0:
+                d.remove_notif_subscriptions(NOTIF_OWNER)
             if interactive:
                 out(BRACKETED_PASTE_OFF)
             env.exit(code)
@@ -176,7 +187,8 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
                 handle_key(pending_keys.pop(0))
         elif len(lines) > 0:
             execute(lines.pop(0))
-        elif len(oneshot) > 0:
+        elif len(oneshot) > 0 and len(notif_specs) == 0:
+            # A one-shot monitor runs until it is interrupted.
             finish(1 if failed else 0)
 
     def enter_config():
@@ -244,6 +256,12 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
         if n == "request":
             call(cmd)
             return
+        if n == "monitor notifications":
+            monitor_notifications(cmd)
+        elif n == "monitor stop":
+            monitor_stop(cmd)
+        elif n == "monitor list":
+            monitor_list()
         if n == "configure":
             enter_config()
         elif n == "exit" and c.mode == "op":
@@ -376,6 +394,111 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
                 fail("cannot decode the reply: {x}")
                 show_text(xml.encode_nodes(r.children, True))
         prompt()
+
+    def show_event(text: str, message: bool=False):
+        """Print text that arrives on its own, such as a notification, above the prompt and the line being typed.
+
+        Without a terminal, a message goes to stderr and a notification to
+        stdout.
+        """
+        if interactive and ready and not busy and not done:
+            out(editor.hide() + text + "\n" + editor.render())
+        elif interactive:
+            out(text + "\n")
+        else:
+            print(text, err=message)
+
+    def declare_notifs():
+        """Subscribe to the notifications in notif_specs, or to none when it is empty."""
+        d = dev
+        if d is not None:
+            if len(notif_specs) > 0:
+                d.declare_notif_subscriptions(NOTIF_OWNER, on_notif, notif_specs, on_notif_synced)
+            else:
+                d.remove_notif_subscriptions(NOTIF_OWNER)
+
+    def monitor_notifications(cmd: command.Command):
+        """Add the command's notifications, or all notifications, to the ones the CLI shows."""
+        specs = set(notif_specs)
+        if len(cmd.args) == 0:
+            specs.add(swadapter.NotifSpec())
+        for a in cmd.args:
+            n = a[0].node
+            specs.add(swadapter.NotifSpec(ygdata.Id(n.namespace, n.name)))
+        notif_specs = specs
+        declare_notifs()
+
+    def monitor_stop(cmd: command.Command):
+        """Stop showing the command's notifications, or all notifications.
+
+        While the CLI shows all notifications, a name does not stop one of
+        them, and the CLI says so.
+        """
+        if len(cmd.args) == 0:
+            notif_specs = set()
+        else:
+            drop = set(["{a[0].node.namespace} {a[0].node.name}" for a in cmd.args])
+            specs = set()
+            wildcard = False
+            for sp in notif_specs:
+                nm = sp.name
+                if nm is not None:
+                    if "{nm.q} {nm.name}" not in drop:
+                        specs.add(sp)
+                else:
+                    wildcard = True
+                    specs.add(sp)
+            if wildcard:
+                say("warning: the CLI shows all notifications; monitor stop without names stops them")
+            elif len(specs) == len(notif_specs):
+                say("warning: the CLI does not show these notifications")
+            if len(specs) == len(notif_specs):
+                return
+            notif_specs = specs
+        declare_notifs()
+
+    def monitor_list():
+        """Print the notifications the CLI shows and the device channels they come on."""
+        s = schema
+        d = dev
+        if len(notif_specs) == 0:
+            show_text("No notifications are shown")
+            return
+        names = []
+        for sp in notif_specs:
+            nm = sp.name
+            if nm is not None:
+                if s is not None:
+                    names.append(command.notification_name(s, nm))
+            else:
+                names.append("all notifications")
+        rows = sorted(names)
+        if d is not None:
+            for c in d.notif_status():
+                rows.append("channel " + c.description())
+        show_text("\n".join(rows))
+
+    def on_notif(ev: ?swadapter.NotifEvent, err: ?Exception):
+        # An event or warning can still arrive after monitor stop.
+        if done or len(notif_specs) == 0:
+            return
+        if err is not None:
+            # A channel that stays down reports the same error at each retry.
+            w = str(err)
+            if w != notif_warning:
+                notif_warning = w
+                show_event("warning: {w}; notifications can be missing until the channel recovers", True)
+            return
+        s = schema
+        if ev is not None and s is not None and swadapter.notif_want_matches(notif_specs, ev.name):
+            notif_warning = None
+            show_event(command.event_text(s, ev.name, ev.event_time, ev.payload, ev.raw))
+
+    def on_notif_synced(owner: str):
+        d = dev
+        if d is not None and not done and len(notif_specs) > 0:
+            notif_warning = None
+            show_event("Listening for notifications on " + ", ".join([c.description() for c in d.notif_status()]), True)
 
     def device_error(e: Exception) -> str:
         """Return the messages of the errors in a device reply, or the exception text."""
