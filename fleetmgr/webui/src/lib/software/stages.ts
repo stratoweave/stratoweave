@@ -34,14 +34,14 @@ export function alreadyOnTarget(row: DeviceStatusRow): boolean {
 }
 
 /** How the prepare ahead of a member that waits for its window stands:
- * done, running (also while the device tries it again), or null when it
- * has not started or failed. A prepare job left from another intent does
- * not count. */
+ * done, running, or null when it has not started, failed, or waits to be
+ * tried again: nothing runs then, also after a run that waited stopped
+ * before its install. A prepare job left from another intent does not
+ * count. */
 function preparedAhead(row: DeviceStatusRow): 'done' | 'running' | null {
   const job = row.prepare;
   const current = !job.release || !row.targetRelease || job.release === row.targetRelease;
   if (row.status !== 'upgrade-needed' || !current) return null;
-  if (job.state === 'retrying') return 'running';
   return job.state === 'done' || job.state === 'running' ? job.state : null;
 }
 
@@ -72,12 +72,18 @@ export function stageView(row: DeviceStatusRow): StageView {
   }
 }
 
+/** Whether the device's run waits to try its prepare again, after the
+ * prepare failed for a transient reason. */
+export function runWaits(row: DeviceStatusRow): boolean {
+  return row.status === 'in-progress' && row.stage === 'prepare' && row.prepare.state === 'retrying';
+}
+
 /** What the device does in the step that runs, as its job says: the
- * transfer of the prepare, the step of the install, or after the install
- * when the commit window ends. A device that waits for its window may
- * prepare ahead of it. A prepare job for an earlier prepare-attempt than
- * prepareAttempt, the member's, says that an ask to prepare again is on
- * its way. Empty when its job says nothing. */
+ * transfer of the prepare, the wait of a run to prepare again, the step of
+ * the install, or after the install when the commit window ends. A device
+ * that waits for its window may prepare ahead of it. A prepare job for an
+ * earlier prepare-attempt than prepareAttempt, the member's, says that an
+ * ask to prepare again is on its way. Empty when its job says nothing. */
 export function jobDetail(row: DeviceStatusRow, prepareAttempt = 0): string {
   const { status, stage, prepare, install } = row;
   if (status === 'upgrade-needed') {
@@ -88,6 +94,7 @@ export function jobDetail(row: DeviceStatusRow, prepareAttempt = 0): string {
     return prepare.state === 'done' ? 'prepared' : '';
   }
   if (status !== 'in-progress') return '';
+  if (runWaits(row)) return prepare.message ? `waiting to prepare again: ${prepare.message}` : 'waiting to prepare again';
   if (stage === 'prepare' && prepare.state === 'running') return prepare.message;
   if (stage === 'install' && install.state === 'running') return install.message;
   if ((stage === 'postcheck' || stage === 'commit') && install.state === 'done') return install.message;
@@ -107,8 +114,9 @@ export function jobProgress(row: DeviceStatusRow): number | null {
 export function stageDetail(row: DeviceStatusRow): string {
   const view = stageView(row);
   const doing = jobDetail(row);
-  // A waiting member's job says how its prepare ahead stands.
-  if (row.status === 'upgrade-needed') return doing;
+  // A waiting member's job says how its prepare ahead stands, and a run
+  // that waits says so instead of the step that runs.
+  if (row.status === 'upgrade-needed' || runWaits(row)) return doing;
   const running = view.steps.find((s) => s.state === 'running');
   if (running) return `${STEP_LABEL[running.step]} running${doing ? ` · ${doing}` : ''}`;
   if (doing) return doing;
