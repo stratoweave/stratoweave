@@ -2,9 +2,11 @@
 
 In operational mode the commands are `configure`, `show configuration [path]
 [| display set|xml|json]`, `show <path> [| display xml|json]`, `request <rpc
-or path to an action> [input] [| display xml]`, `exit` and `quit`. `show
-<path>` reads configuration and state from the device, and `request` makes
-the device run an RPC or action. In configuration mode they are `set`,
+or path to an action> [input] [| display xml]`, `monitor notifications
+[name ...]`, `monitor stop [name ...]`, `monitor list`, `exit` and `quit`.
+`show <path>` reads configuration and state from the device, `request` makes
+the device run an RPC or action, and `monitor` shows event notifications as
+they arrive. In configuration mode they are `set`,
 `delete`, `edit`, `up [N]`, `top [command]`, `show [path] [| compare |
 display set|xml|json]`, `rollback [0]`, `run <command>` and `exit
 [configuration-mode]`. Keywords take a unique prefix, so `sh conf` is `show
@@ -30,6 +32,7 @@ import cli.render as render
 _OP = [
     ("configure", "Enter configuration mode"),
     ("exit", "Exit the CLI"),
+    ("monitor", "Show event notifications as they arrive"),
     ("quit", "Exit the CLI"),
     ("request", "Make the device run an RPC or action"),
     ("show", "Show information"),
@@ -50,6 +53,12 @@ _CONFIG = [
 
 _SHOW = [
     ("configuration", "Show the running configuration"),
+]
+
+_MONITOR = [
+    ("list", "Show the notifications that the CLI shows"),
+    ("notifications", "Show event notifications as they arrive"),
+    ("stop", "Stop showing notifications"),
 ]
 
 _EXIT = [
@@ -144,14 +153,16 @@ class Command(object):
     """A parsed command.
 
     name is the command: "configure", "exit", "exit configuration-mode",
-    "show configuration", "show data", "request", "show", "set", "delete",
-    "edit", "up", "top", "rollback", "run", or "" for an empty line. path is
+    "show configuration", "show data", "request", "monitor notifications",
+    "monitor stop", "monitor list", "show", "set", "delete", "edit", "up",
+    "top", "rollback", "run", or "" for an empty line. path is
     relative to the edit level edit, and view is the view it was resolved in;
     the paths of show data and request start at the schema root. display is
     the format a `| display` pipe asks for, and compare is True for `|
     compare`. count is the number of levels for up. sub is the command that
     top or run runs. args holds the input paths of a request, each from the
-    input of the RPC or action.
+    input of the RPC or action, and the notifications of monitor, each a path
+    of one step.
     """
     name: str
     path: ?cpath.PathResult
@@ -336,6 +347,74 @@ def _path(ctx: Context, toks: list[cpath.Token], i: int, name: str, node: yschem
     if len(pipes) == 0:
         return _fail("syntax error.", p)
     return _pipe(cmd, pipes, toks, p, displays)
+
+
+def _monitor(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
+    """Parse `monitor` from word i: `notifications [name ...]`, `stop [name ...]` or `list`."""
+    if i >= len(toks):
+        return _fail("missing argument.", i, items=_words(_MONITOR))
+    w = _match_word(_MONITOR, toks[i])
+    word = w.word
+    if word is None:
+        return _fail(w.error, i, w.matches)
+    if word == "list":
+        return _done(Command("monitor list"), toks, i + 1)
+    names = []
+    j = i + 1
+    while j < len(toks):
+        r = cpath.complete(ctx.root, ctx.root, None, toks[j:], view="notification", stop=True)
+        res = r.path
+        if res.error is not None:
+            return _fail(res.error, j + res.error_at, res.matches, r.items)
+        if res.used == 0:
+            return _fail("syntax error.", j)
+        names.append(res.steps)
+        j += res.used
+    items = cpath.complete(ctx.root, ctx.root, None, [], view="notification").items
+    return _Walk(Command("monitor stop" if word == "stop" else "monitor notifications", args=names), [ENTER] + items)
+
+
+def notification(root: yschema.DRoot, name: ygdata.Id) -> ?yschema.DNode:
+    """Return the top-level notification with a name, or None when the schema does not have it."""
+    for c in root.children:
+        if isinstance(c, yschema.DNotification) and c.name == name.name and c.namespace == name.q:
+            return c
+    return None
+
+
+def notification_name(root: yschema.DRoot, name: ygdata.Id) -> str:
+    """Return a notification name as module:name, or with its namespace when the schema does not have it."""
+    n = notification(root, name)
+    if n is not None:
+        return "{n.module}:{n.name}"
+    return "{name.name} ({name.q})"
+
+
+def event_text(root: yschema.DRoot, name: ygdata.Id, event_time: str, payload: ?ygdata.Node, raw: xml.Node) -> str:
+    """Return how the CLI shows an event notification.
+
+    The first line has the event time and the notification name. The data
+    follows, indented, in curly-brace format. Elements that the schema does
+    not describe as data, such as anyxml or a module the CLI does not have,
+    follow as XML.
+    """
+    parts = []
+    extra = raw.children
+    n = notification(root, name)
+    if n is not None:
+        if payload is not None:
+            parts.append(render.curly(cpath.Position("inner", n, payload), "data"))
+        known = set([c.name for c in cpath.candidates(n, "data")])
+        extra = [c for c in raw.children if c.tag not in known]
+    if len(extra) > 0:
+        parts.append(xml.encode_nodes(extra, True))
+    lines = ["{event_time}  {notification_name(root, name)}"]
+    for part in parts:
+        for l in part.split("\n"):
+            # A device that indents its XML leaves white space lines.
+            if l.strip() != "":
+                lines.append(render.INDENT + l.rstrip())
+    return "\n".join(lines)
 
 
 def _show_op(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
@@ -539,6 +618,8 @@ def _walk(ctx: Context, toks: list[cpath.Token], i: int, exclude: set[str]=set()
             return _done(Command("configure"), toks, i + 1)
         if word == "request":
             return _request(ctx, toks, i + 1)
+        if word == "monitor":
+            return _monitor(ctx, toks, i + 1)
         return _show_op(ctx, toks, i + 1)
     if word == "set":
         return _path(ctx, toks, i + 1, "set", ctx.here, ctx.here_data, ctx.edit, [], values=True, need_path=True)

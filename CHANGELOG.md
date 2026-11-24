@@ -298,10 +298,13 @@
   `| display json`. `show <path>` reads configuration and state data from
   the device, and `request` makes the device run an RPC, or the action at a
   path, with its input, as in `request interfaces ge-0/0/0 clear-counters`.
-  `configure` starts configuration mode on a candidate kept in the CLI, with
-  `set`, `delete`, `edit`, `up`, `top`, `rollback`, `run`, `show` and
-  `show | compare`. With a command as arguments, it runs that command and
-  exits. Without a terminal, it reads commands line by line from stdin.
+  `monitor notifications` subscribes to event notifications and prints each
+  one above the prompt as it arrives; `monitor list` shows them and
+  `monitor stop` ends them. `configure` starts configuration mode on a
+  candidate kept in the CLI, with `set`, `delete`, `edit`, `up`, `top`,
+  `rollback`, `run`, `show` and `show | compare`. With a command as
+  arguments, it runs that command and exits. Without a terminal, it reads
+  commands line by line from stdin.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
