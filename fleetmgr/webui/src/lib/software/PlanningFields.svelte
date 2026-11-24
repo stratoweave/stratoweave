@@ -11,22 +11,38 @@
     type Schedule
   } from './model';
   import { perHourText, type PaceBy, type PlanningDraft } from './planning-form';
+  import PrepareFields from './PrepareFields.svelte';
   import { formatDuration, toLocalInput } from '#lib/core/time.ts';
 
   interface Props {
     schedules: Schedule[];
     draft: PlanningDraft;
     /** By field: deadline, target-concurrency, max-concurrency,
-     * notification-period, failure-budget, close-margin, stagger. */
+     * notification-period, failure-budget, close-margin, stagger,
+     * prepare-max-bandwidth. */
     errors: Record<string, string>;
     disabled?: boolean;
     /** Mean install time in seconds, from the plan; without it the devices
      * at once are not shown as devices per hour. */
     installSeconds?: number | null;
+    /** Whether the members prepare between windows, and the cap of their
+     * bandwidth in bits/s, as the plan has them for a campaign that sets
+     * neither; null without a plan, or for the one the campaign sets. */
+    betweenNow?: boolean | null;
+    capNow?: number | null;
     onchange: (next: PlanningDraft) => void;
   }
 
-  let { schedules, draft, errors, disabled = false, installSeconds = null, onchange }: Props = $props();
+  let {
+    schedules,
+    draft,
+    errors,
+    disabled = false,
+    installSeconds = null,
+    betweenNow = null,
+    capNow = null,
+    onchange
+  }: Props = $props();
 
   const uid = $props.id();
 
@@ -189,6 +205,27 @@
     />
     <span class="ahead-name">Prepare ahead</span>
   </label>
+  {#if draft.allowStaging}
+    <PrepareFields
+      settings={{
+        first: draft.prepareFirst,
+        between: draft.prepareBetween,
+        during: draft.prepareDuring,
+        maxBandwidth: draft.prepareMaxBandwidth
+      }}
+      error={errors['prepare-max-bandwidth']}
+      {disabled}
+      {betweenNow}
+      {capNow}
+      onchange={(next) =>
+        patch({
+          prepareFirst: next.first,
+          prepareBetween: next.between,
+          prepareDuring: next.during,
+          prepareMaxBandwidth: next.maxBandwidth
+        })}
+    />
+  {/if}
 </div>
 
 <style>

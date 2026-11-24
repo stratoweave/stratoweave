@@ -1817,8 +1817,15 @@ def _test_campaign_close_margin_reaches_the_controller():
 def _test_campaign_prepare_reaches_the_controller():
     """The campaign's allow-staging sets whether the controller lets members
     prepare, and each member's prepare estimate goes with it: 2 s for a
-    mock of 8 s, and 1 s for a mock with no duration. The same controller
-    is configured in turn, so turning allow-staging off reaches it too."""
+    mock of 8 s, and 1 s for a mock with no duration. So does the size of
+    each member's image. prepare-before-first-window,
+    prepare-between-windows and prepare-during-windows say when the members
+    may prepare: by default before the first window, between windows by
+    the plan's choice (None), and not during windows. The cap of their
+    bandwidth is the campaign's prepare-max-bandwidth, or else the image
+    list's, 1 Gbit/s by default, and at most the largest int. The same
+    controller is configured in turn, so a setting that goes back reaches
+    it too."""
     names = ["cpe-1", "cpe-2"]
     linked = _with_nightly(_flat_inventory(names, 8))
     cpe3 = linked.fleet.device.create("cpe-3", type="iosxe",
@@ -1826,13 +1833,49 @@ def _test_campaign_prepare_reaches_the_controller():
     cpe3.mock.enabled = True
     campaign = _paced_campaign(names + ["cpe-3"])
     ctl = fctl.Controller()
-    # (allow-staging, whether the controller lets members prepare)
-    cases: list[(bool, bool)] = [(True, True), (False, False), (True, True)]
+    # (case, allow-staging, prepare-before-first-window,
+    # prepare-between-windows, prepare-during-windows, the campaign's
+    # prepare-max-bandwidth and the image list's, None for none set; the
+    # controller's prepare, before the first window, between windows,
+    # during windows and cap)
+    cases: list[(str, bool, ?bool, ?bool, ?bool, ?int, ?int, bool, bool, ?bool, bool, int)] = [
+        ("defaults", True, None, None, None, None, None, True, True, None, False, 1000000000),
+        ("all set", True, False, True, True, 5000000, None, True, False, True, True, 5000000),
+        ("between off, the image list's cap", True, None, False, None, None, 2000000, True,
+         True, False, False, 2000000),
+        ("allow-staging off", False, None, None, None, None, None, False, True, None, False,
+         1000000000),
+    ]
     for case in cases:
-        campaign.allow_staging = case.0
+        label = case.0
+        campaign.allow_staging = case.1
+        before = case.2
+        campaign.prepare_before_first_window = before if before is not None else True
+        campaign.prepare_between_windows = case.3
+        during = case.4
+        campaign.prepare_during_windows = during if during is not None else False
+        cap = case.5
+        campaign.prepare_max_bandwidth = u64(cap) if cap is not None else None
+        fleet_cap = case.6
+        linked.images.prepare_max_bandwidth = u64(fleet_cap) if fleet_cap is not None \
+            else u64(1000000000)
         cfs.configure_campaign(ctl, campaign, linked, 0)
-        testing.assertEqual(ctl.prepare, case.1, str(case.0))
-        testing.assertEqual(ctl.prepare_est, {"cpe-1": 2, "cpe-2": 2, "cpe-3": 1}, str(case.0))
+        testing.assertEqual((ctl.prepare, ctl.prepare_first, str(ctl.prepare_between),
+                             ctl.prepare_during, ctl.prepare_cap),
+                            (case.7, case.8, str(case.9), case.10, case.11), label)
+        testing.assertEqual(ctl.prepare_est, {"cpe-1": 2, "cpe-2": 2, "cpe-3": 1}, label)
+        testing.assertEqual(ctl.prepare_size,
+                            {"cpe-1": IMAGE_SIZE, "cpe-2": IMAGE_SIZE, "cpe-3": IMAGE_SIZE},
+                            label)
+    # The largest cap that the YANG takes, the campaign's or the image
+    # list's.
+    largest = u64(cfs.INT_MAX) * u64(2) + u64(1)
+    for own in [True, False]:
+        campaign.allow_staging = True
+        campaign.prepare_max_bandwidth = largest if own else None
+        linked.images.prepare_max_bandwidth = u64(1000000000) if own else largest
+        cfs.configure_campaign(ctl, campaign, linked, 0)
+        testing.assertEqual(ctl.prepare_cap, cfs.INT_MAX, "the largest cap, own: {own}")
 
 
 def _test_campaign_stagger_reaches_the_controller():
@@ -5619,8 +5662,13 @@ proc def _test_campaign_in_plan_shows_prepares_and_writes_none(t: testing.AsyncT
     t.timeout(6.0)
     """The campaign soon in plan with allow-staging, once its members have
     answered: the plan shows when each member would prepare in a run that
-    starts now, 30 minutes apart and one at a time. The campaign lets no
-    member prepare, and no member counts as preparing or prepared."""
+    starts now, 30 minutes apart and one at a time. It shows that the
+    members may prepare before the first window, not between windows, as
+    all fit before it, and not during windows, and the cap of 1 Gbit/s.
+    Each prepare takes 1 s and copies the image of 962330352 bytes, so the
+    bandwidth goes to 7698642816 bit/s at each prepare-start and back to 0
+    a second later, and that is the peak. The campaign lets no member
+    prepare, and no member counts as preparing or prepared."""
     names = ["cpe-1", "cpe-2", "cpe-3"]
     now = time.time().unix_s()
     soon = _soon(names, "plan", True, now)
@@ -5655,13 +5703,32 @@ actor TestCampaignInPlanShowsPreparesAndWritesNoneActor(t: testing.AsyncT, names
         order = _by_start(starts)
         first = starts.get_def("cpe-1", 0)
         gaps = [starts.get_def("cpe-2", 0) - first, starts.get_def("cpe-3", 0) - first]
+        pl = o.state.plan
+        bw = IMAGE_SIZE * 8
+        # Each step from the prepare-start of its prepare.
+        steps: list[(int, int)] = []
+        for e in pl.prepare_bandwidth:
+            k = len(steps) // 2
+            base = starts.get_def(order[k], 0) if k < len(order) else 0
+            level = e.bandwidth
+            steps.append((int(e.time) - base, int(level) if level is not None else -1))
         got = ("order {order}, first {first - now}, gaps {gaps}, "
-               + "concurrency {o.state.plan.prepare_concurrency}, "
+               + "concurrency {pl.prepare_concurrency}, "
+               + "before {pl.prepare_before_first_window}, "
+               + "between {pl.prepare_between_windows}, during {pl.prepare_during_windows}, "
+               + "max {pl.prepare_max_bandwidth}, peak {pl.prepare_peak_bandwidth}, "
+               + "steps {steps}, "
                + "preparing {o.state.preparing}, prepared {o.state.prepared}, "
                + "{outputs} output(s), let prepare {staged}")
         if order != names or first < now or first > now + 2 \
            or gaps[0] < 1795 or gaps[0] > 1800 or gaps[1] < 3590 or gaps[1] > 3600 \
-           or o.state.plan.prepare_concurrency != u64(1) \
+           or pl.prepare_concurrency != u64(1) \
+           or str(pl.prepare_before_first_window) != "True" \
+           or str(pl.prepare_between_windows) != "False" \
+           or str(pl.prepare_during_windows) != "False" \
+           or pl.prepare_max_bandwidth != u64(1000000000) \
+           or pl.prepare_peak_bandwidth != u64(bw) \
+           or steps != [(0, bw), (1, 0), (0, bw), (1, 0), (0, bw), (1, 0)] \
            or o.state.preparing != u64(0) or o.state.prepared != u64(0) \
            or outputs == 0 or len(staged) > 0:
             t.failure(ValueError(got))

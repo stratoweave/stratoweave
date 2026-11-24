@@ -246,9 +246,7 @@ shorter, that closes after the edit keeps its members on their day, in the
 order of their promises; a larger move can put them on the day before or
 after. A member that keeps a promise but that the plan can start in no
 window stays in its promised window in the plan, and the plan's alarm says
-that it will miss it. A hold of `failure-budget` keeps the turns to
-prepare: when it ends before the next member's `prepare-start`, the
-`prepare-start`s stay.
+that it will miss it.
 
 A new version of a member's image, or another image with another version,
 gives the member a new target release. A waiting member keeps its window.
@@ -356,37 +354,84 @@ fleetmgr keep it, and deleting the campaign clears it. Before the first run,
 the plan counts from now. A window that opens earlier is left out, also when
 it closes later, and a campaign without a schedule opens its window at the
 end of the period. The prepares spread over the period, because the first
-window that the campaign uses is their deadline. A member added later gets
-no notice of its own: it gets the first window that the campaign uses.
-Raising `notification-period` during a run takes windows away: the members
-released in them keep them, and the others get the next window that is
-left.
+window that the campaign uses is their deadline when they fit before it. A
+member added later gets no notice of its own: it gets the first window that
+the campaign uses. Raising `notification-period` during a run takes windows
+away: the members released in them keep them, and the others get the next
+window that is left.
 
 With `allow-staging`, a campaign in `run` lets each member that needs the
 upgrade, and that the plan gives a window, prepare once before its window:
 the device copies its image, with no outage, while the campaign's veto
-holds the install. The first member prepares as soon as the campaign runs.
-The others follow, as far apart as their deadlines allow. In a campaign
-of thousands of members, the members whose turns fall in the same few
-seconds, up to 30, start together. A member's deadline is the opening of
-the next window of its schedule that the campaign uses, less `close-margin`
-percent of its expected prepare time: 195 s at the IOS XE estimate of 130 s
-and the default 150. Members whose window opens first go first. No member
-prepares while such a window is open. In `plan` nothing is copied: the
-plan shows each member's `prepare-start` in the run as it would go on
-now, or before the first run in a run that starts now, and
-`prepare-concurrency`, the most copies at once. There is no cap on that
-number. `device-status` shows each member's `prepare`, and `preparing` and
+holds the install. The first member prepares as soon as the settings below
+let it. The others follow, as far apart as their deadlines and the
+bandwidth cap allow. In a campaign of thousands of members, the members
+whose turns fall in the same few seconds, up to 30, start together.
+
+Three settings say when the members may prepare. With
+`prepare-before-first-window`, on by default, a member prepares before the
+campaign's first window opens, by its opening less `close-margin` percent
+of its expected prepare time: 195 s at the IOS XE estimate of 130 s and
+the default 150. Once the first window opens, it stays the campaign's
+first window, also after it closes. The members of the earliest windows go
+first; with `prepare-during-windows`, a member with a longer expected
+prepare time can go before them. Without `prepare-before-first-window`, a
+member promised the first window cannot prepare, and the plan's alarm
+names it. A member that does not fit before the first window under the cap
+prepares between windows, by the opening of its own window less that
+margin. Absent, `prepare-between-windows` is on, and `state/plan` shows
+whether a member prepares between windows: one that does not fit before
+the first window, or one that was let before it and had not begun when it
+opened. Set to false, no member prepares between windows, nor in the time
+before each close that the longest expected prepare time needs at
+`close-margin`, and without `prepare-during-windows` the plan's alarm
+names the members that do not fit before the first window. With
+`prepare-during-windows`, off by default, the members may also prepare
+while a window is open, each still before its own window. Without it, no
+member prepares while any window of the campaign is open, a window that
+still holds a member in flight included, nor in the time before each
+opening that the longest expected prepare time needs at `close-margin`, so
+no copy is planned to run into a window.
+
+A prepare uses the size of its image divided by its expected prepare time,
+and none when its image has no size. `prepare-max-bandwidth` caps the sum
+over the prepares that run, in bits per second. Without it, the campaign
+takes `prepare-max-bandwidth` of the image list: what the image server
+gives to prepares, 1 Gbit/s by default. Each campaign keeps under its own
+cap. The turns stay evenly spread, and a turn that the cap holds comes
+later; a prepare that alone uses more than the cap runs alone.
+`state/plan` has the settings in effect, the cap, the bandwidth over time
+in `prepare-bandwidth`, and its peak.
+
+The turns stay put. A member that waits to prepare keeps its
+`prepare-start` when other members join, leave, go down or answer late: a
+new member takes the middle of the widest time between two turns that the
+cap allows. Only a turn that passed, as after a pause or a hold of
+`failure-budget`, one that a moved window puts after the member's
+deadline, or one that the cap no longer allows, moves. Of the members
+whose turns passed, one goes at once when that leaves the widest gap, and
+the others take new turns between the turns kept. Changing a setting or
+the cap during a run gives the waiting members new turns.
+
+In `plan` nothing is copied: the plan shows each member's `prepare-start`
+in the run as it would go on now, or before the first run in a run that
+starts now, and `prepare-concurrency`, the most copies at once.
+`device-status` shows each member's `prepare`, and `preparing` and
 `prepared` count the members that wait for their release. The plan's
 alarms name the members that cannot prepare before their window opens and
 the members that wait for their window after a failed prepare. A failed
 prepare is not tried again. Turning `allow-staging` off, or setting the
-campaign to `plan`, stops the prepares; a copy that runs finishes. A pause
-keeps each member's `prepare-start`: a member that prepared is not let
-prepare again, and one that was let and has not prepared is let again when
-the campaign runs again. A new target release lets a member prepare again
-once it answers the new target. The upgrade in the window still copies the
-image again, so windows are not shorter yet.
+campaign to `plan`, stops the prepares; a copy that runs finishes. A
+member that was let and has not prepared stops being let when a window
+opens in which it may not prepare, a window closes while
+`prepare-between-windows` is false, the campaign pauses or a hold of
+`failure-budget` begins, and is let again, with its first `prepare-start`,
+once it may prepare: after the window closes, when the campaign runs
+again, or when the hold ends. Its prepare counts from then. After its
+deadline it is not let again, and the alarm names it. A member that
+prepared is not let prepare again. A new target release lets a member
+prepare again once it answers the new target. The upgrade in the window
+still copies the image again, so windows are not shorter.
 
 ## Web UI
 

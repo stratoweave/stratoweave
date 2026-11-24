@@ -783,6 +783,8 @@
             errors={planningErrors}
             disabled={planningSaving}
             installSeconds={planInstallSeconds(campaign.plan)}
+            betweenNow={campaign.prepareBetween === null ? (campaign.plan?.prepareBetween ?? null) : null}
+            capNow={campaign.prepareMaxBandwidth === null ? (campaign.plan?.prepareMaxBandwidth ?? null) : null}
             onchange={(next) => {
               planningEdit = next;
               planningMessage = null;

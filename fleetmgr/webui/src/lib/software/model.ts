@@ -149,6 +149,12 @@ interface PlanJson {
   window?: PlanWindowJson[];
   alarm?: string[];
   'prepare-concurrency'?: number | string;
+  /** Whether the members may prepare between windows: as set, or as the
+   * plan decides when the campaign leaves it out. */
+  'prepare-between-windows'?: boolean;
+  /** The cap of the prepares' bandwidth in bits/s, the campaign's or the
+   * image list's. */
+  'prepare-max-bandwidth'?: number | string;
 }
 
 /** Counters are optional and do not sum to total: pending, unknown and
@@ -171,6 +177,13 @@ interface CampaignStateJson {
 export interface CampaignJson {
   name: string;
   'allow-staging'?: boolean;
+  'prepare-before-first-window'?: boolean;
+  /** Absent: the plan decides. */
+  'prepare-between-windows'?: boolean;
+  'prepare-during-windows'?: boolean;
+  /** Bits/s, a uint64, so a string in RFC 7951 JSON; absent for the image
+   * list's. */
+  'prepare-max-bandwidth'?: number | string;
   device?: CampaignMemberJson[];
   'admin-state'?: AdminState;
   'default-schedule'?: string;
@@ -539,6 +552,12 @@ export interface CampaignPlan {
   /** The most members that prepare at once in the plan; null when none
    * prepares ahead. */
   prepareConcurrency: number | null;
+  /** Whether the members may prepare between windows, as the plan has it;
+   * null without prepare ahead. */
+  prepareBetween: boolean | null;
+  /** The cap of the prepares' bandwidth in bits/s that the plan keeps
+   * under; null without prepare ahead. */
+  prepareMaxBandwidth: number | null;
   /** The planner's alarms, which also name the members that need a window
    * and have none (unplaced). */
   alarms: string[];
@@ -553,6 +572,13 @@ export interface Campaign {
   name: string;
   /** Whether members prepare their image ahead of their window. */
   allowStaging: boolean;
+  /** When they may: before the first window, between windows (null: as
+   * the plan decides) and during windows. */
+  prepareFirst: boolean;
+  prepareBetween: boolean | null;
+  prepareDuring: boolean;
+  /** Bits/s; null for the image list's. */
+  prepareMaxBandwidth: number | null;
   devices: string[];
   /** The image of each member, in the order of devices. */
   images: string[];
@@ -610,6 +636,8 @@ export interface StateParts {
   runSince: number | null;
   windows: PlanWindow[];
   prepareConcurrency: number | null;
+  prepareBetween: boolean | null;
+  prepareMaxBandwidth: number | null;
   alarms: string[];
   placed: Set<string>;
   rows: Map<string, DeviceStatusRow>;
@@ -733,6 +761,9 @@ function parseStateParts(state: CampaignStateJson): StateParts {
     runSince: state['run-since'] == null ? null : num(state['run-since']),
     windows,
     prepareConcurrency: state.plan?.['prepare-concurrency'] == null ? null : num(state.plan['prepare-concurrency']),
+    prepareBetween: state.plan?.['prepare-between-windows'] ?? null,
+    prepareMaxBandwidth:
+      state.plan?.['prepare-max-bandwidth'] == null ? null : num(state.plan['prepare-max-bandwidth']),
     alarms: state.plan?.alarm ?? [],
     placed: new Set(windows.flatMap((w) => w.devices.map((d) => d.name))),
     rows
@@ -759,6 +790,8 @@ export function joinState(parts: StateParts | null, members: string[]): Campaign
         : {
             windows: parts.windows,
             prepareConcurrency: parts.prepareConcurrency,
+            prepareBetween: parts.prepareBetween,
+            prepareMaxBandwidth: parts.prepareMaxBandwidth,
             alarms: parts.alarms,
             unplaced: members.filter((m) => !parts.placed.has(m) && !done(m)).sort(byName),
             done: members.filter((m) => !parts.placed.has(m) && done(m)).sort(byName)
@@ -771,6 +804,10 @@ function parseCampaignConfig(entry: CampaignJson): CampaignConfig {
   return {
     name: entry.name,
     allowStaging: entry['allow-staging'] === true,
+    prepareFirst: entry['prepare-before-first-window'] !== false,
+    prepareBetween: entry['prepare-between-windows'] ?? null,
+    prepareDuring: entry['prepare-during-windows'] === true,
+    prepareMaxBandwidth: entry['prepare-max-bandwidth'] == null ? null : num(entry['prepare-max-bandwidth']),
     devices: (entry.device ?? []).map((m) => m.name),
     images: (entry.device ?? []).map((m) => m.image ?? ''),
     adminState: entry['admin-state'] === 'run' ? 'run' : 'plan',
@@ -933,6 +970,14 @@ export interface NewCampaign {
   /** Each member with the image it installs. */
   devices: { name: string; image: string }[];
   allowStaging?: boolean;
+  /** Only with allowStaging; absent leaves the model defaults: before
+   * the first window, between windows as the plan decides, not during
+   * windows, and the image list's cap. */
+  prepareFirst?: boolean;
+  prepareBetween?: boolean | null;
+  prepareDuring?: boolean;
+  /** Bits/s. */
+  prepareMaxBandwidth?: number | null;
   /** Days; 0 or absent leaves the model default, no notice. */
   notificationPeriod?: number;
 }
@@ -944,7 +989,13 @@ export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
     device: input.devices.map((d) => ({ name: d.name, image: d.image })),
     'admin-state': 'plan'
   };
-  if (input.allowStaging) entry['allow-staging'] = true;
+  if (input.allowStaging) {
+    entry['allow-staging'] = true;
+    if (input.prepareFirst === false) entry['prepare-before-first-window'] = false;
+    if (input.prepareBetween != null) entry['prepare-between-windows'] = input.prepareBetween;
+    if (input.prepareDuring) entry['prepare-during-windows'] = true;
+    if (input.prepareMaxBandwidth != null) entry['prepare-max-bandwidth'] = String(input.prepareMaxBandwidth);
+  }
   if (input.notificationPeriod) entry['notification-period'] = input.notificationPeriod;
   return { 'software:software': { 'upgrade-campaign': [entry] } };
 }

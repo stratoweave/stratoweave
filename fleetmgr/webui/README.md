@@ -50,8 +50,11 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   unticks that; the newer ones get a downgrade warning and are left out
   only on request. Plan: Create sends one PATCH with
   `admin-state: plan`, the notice in days as `notification-period` when it
-  is more than 0, and `allow-staging` when Prepare ahead is ticked, and
-  opens the campaign page, which shows the plan and sets schedule and pace.
+  is more than 0, and `allow-staging` when Prepare ahead is ticked, with
+  `prepare-before-first-window`, `prepare-between-windows`,
+  `prepare-during-windows` and `prepare-max-bandwidth` when they differ
+  from their defaults, and opens the campaign page, which shows the plan
+  and sets schedule and pace.
 - The image list's `url-base`, set on the images page, is where devices
   fetch images from: url-base followed by the image name.
 - Each fleet device entry carries config-false `state/platform`: `os`,
@@ -76,13 +79,18 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `notification-period` (days, default 0), `failure-budget` (a
   decimal64 percent, sent as a string; absent for none), `close-margin`
   (percent, default 150) and `stagger` (percent, default 25). The campaign page sets them. A change PATCHes the leaves;
-  clearing the default schedule, the deadline or the failure budget PUTs the entry back
+  clearing the default schedule, the deadline, the failure budget or Max
+  bandwidth, or setting Between windows to Automatic, PUTs the entry back
   without the leaf and without `state`, since DELETE on a leaf returns
   500. The controller keeps the devices it has already released, so a
   running campaign can be edited too. With a plan, the campaign page also
   shows the devices at once as devices per hour, from the plan's install
   estimates. Prepare ahead, in the same form, sets `allow-staging`; a merge
-  sets it true or false.
+  sets it true or false. While it is ticked, the form also sets
+  `prepare-before-first-window` and `prepare-during-windows`, merged true
+  or false, `prepare-between-windows` and `prepare-max-bandwidth`, in
+  Mbit/s in the form and bits/s as a string in the leaf; unticked, a save
+  leaves them as they are.
 - Progress is config-false `state` under each campaign, merged into GET
   responses; each `device-status` row also carries `version`, `model`,
   `stage`, `reason`, the `precheck` and `postcheck` verdicts, the `attempt`
@@ -103,6 +111,9 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   times on the wall clock with a marker for now. With `allow-staging`,
   each plan `device` that prepares ahead also has `prepare-start`, and the
   plan has `prepare-concurrency`, the most members that prepare at once.
+  For a campaign that leaves them to the plan and the image list, the form
+  shows the plan's `prepare-between-windows` next to an automatic Between
+  windows, and its `prepare-max-bandwidth` in an empty Max bandwidth.
 - Reads of the fleet and of the campaigns ask with the RFC 8040 `fields`
   parameter for only what the page shows; `src/lib/software/model.ts` has
   one constant per selection. The fleet list (`data/fleetmgr:fleet`

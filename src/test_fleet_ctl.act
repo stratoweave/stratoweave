@@ -26,13 +26,19 @@ def configured(windows: list[(str, int, int)], devs: list[(str, int, str)], targ
                priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
                close_margin: int=fleet_ctl.CLOSE_MARGIN, stagger: int=0,
                prepare: bool=False, prepare_s: int=100,
-               failure_budget: int=-1, hold_failed: ?set[str]=None) -> Controller:
+               failure_budget: int=-1, hold_failed: ?set[str]=None, image: int=0,
+               first: bool=True, between: ?bool=None, during: bool=False,
+               cap: int=-1) -> Controller:
     """A controller before its first run, every device answered that it
-    needs the upgrade. Each device's prepare takes prepare_s seconds."""
+    needs the upgrade. Each device's prepare takes prepare_s seconds and
+    copies an image of image bytes. first, between and during say when the
+    members may prepare, and cap is the cap of their bandwidth, in bits
+    per second."""
     c = Controller()
     c.configure(windows, devs, target, maxc, must_place, debounce, estimate, groups, priority,
                 separation, close_margin, stagger, prepare, {d.0: prepare_s for d in devs},
-                failure_budget, hold_failed)
+                failure_budget, hold_failed, {d.0: image for d in devs}, first, between,
+                during, cap)
     sim.answer_all(c, 0)
     return c
 
@@ -48,12 +54,14 @@ def controller(windows: list[(str, int, int)], devs: list[(str, int, str)], targ
                priority: dict[str, int]={}, separation: dict[str, (bool, int)]={},
                rung: int=1, close_margin: int=fleet_ctl.CLOSE_MARGIN,
                stagger: int=0, prepare: bool=False, prepare_s: int=100,
-               failure_budget: int=-1, hold_failed: ?set[str]=None) -> Controller:
+               failure_budget: int=-1, hold_failed: ?set[str]=None, image: int=0,
+               first: bool=True, between: ?bool=None, during: bool=False,
+               cap: int=-1) -> Controller:
     """A controller at the start of a run, every device answered that it
-    needs the upgrade. Each device's prepare takes prepare_s seconds."""
+    needs the upgrade, as configured() configures it."""
     c = configured(windows, devs, target, maxc, must_place, debounce, estimate, groups, priority,
                    separation, close_margin, stagger, prepare, prepare_s, failure_budget,
-                   hold_failed)
+                   hold_failed, image, first, between, during, cap)
     c.start(rung)
     return c
 
@@ -377,7 +385,21 @@ def reconfigure(c: Controller, devs: list[(str, int, str)], failure_budget: int)
     budget failure_budget."""
     c.configure(c.current, devs, c.target, c.maxc, c.must_place, c.debounce, c.estimate_s,
                 c.groups, c.priority, c.separation, c.close_margin, c.stagger, c.prepare,
-                c.prepare_est, failure_budget)
+                c.prepare_est, failure_budget, prepare_size=c.prepare_size,
+                prepare_first=c.prepare_first, prepare_between=c.prepare_between,
+                prepare_during=c.prepare_during, prepare_cap=c.prepare_cap)
+
+
+def under_cap(c: Controller, p: fleet_ctl.Prepares, t: int) -> None:
+    """Check that the bandwidth of the prepares p of c at t stays at or
+    under the cap of c, or that one prepare runs alone where it is
+    over."""
+    if c.prepare_cap < 0 or p.peak <= c.prepare_cap:
+        return
+    alone = 0
+    for name in c.prepare_est.keys():
+        alone = fleet_ctl.imax(alone, c.prepare_bw(name))
+    testing.assertTrue(p.peak <= alone, "bandwidth {p.peak} over the cap at {t}")
 
 
 def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
@@ -388,7 +410,8 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
                        statuses: list[(int, str, ?str)]=[], pauses: list[(int, int)]=[],
                        stop_flights: bool=False,
                        edits: list[(int, list[(str, int, int)], list[(str, int, str)])]=[],
-                       decided: ?list[(int, list[str])]=None) -> int:
+                       decided: ?list[(int, list[str])]=None,
+                       late_names: ?set[str]=None) -> int:
     """Run c the way the campaign actor does, each decision late seconds
     after its time, next to a copy of it that plans at every decision.
     Each decision of c starts the same devices, wakes at the same time and
@@ -415,28 +438,35 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
     devices), in the order of their times: both take each at its time,
     and a decision comes then.
 
-    pauses holds pauses, as (start, end), in order. At the start, after
-    the events then, both stop; with stop_flights, each device in flight
-    then stops before its install, reports upgrade-needed and never ends.
-    Until the end they decide nothing, and the events in the pause come
-    at their times. At each event in the pause and at its end, a copy of
-    each that starts and stops letting prepare the members that may no
-    longer prepare, as a campaign in plan shows it, plans the same and
-    has the same prepares. At the end both start again, stop letting
-    prepare the members that may no longer prepare, and decide: c's
-    decision has the plan and the prepares of that copy, and the run
-    carries on (Paused.kept(), Paused.promises_kept()). A pause of no time
-    that takes no device back decides as no pause. Each pause comes before
-    the run ends.
+    pauses holds pauses, as (start, end), in order. At the start, after the
+    events then, both stop; with stop_flights, each device in flight then
+    stops before its install, reports upgrade-needed and never ends. Until
+    the end they decide nothing, and the events in the pause come at their
+    times. At each event in the pause and at its end, a copy of each that
+    goes on then (carried_on), as a campaign in plan shows it, plans the
+    same and has the same prepares. At the end both start again, stop
+    letting prepare the members that may no longer prepare, let again the
+    ones that may, and decide: c's decision has the plan and the prepares of
+    that copy, and the run carries on (Paused.kept(),
+    Paused.promises_kept()). A pause of no time that takes no device back
+    decides as no pause. Each pause comes before the run ends.
 
     With prepare, the time a member was let prepare never changes, each
-    member is let by its deadline, and a decision lets each member at
-    the start that the decision before it showed, when the decisions are
-    on time, and in between only prepare reports came, no window opened
-    or closed, and the later decision starts no device.
+    member is let, and let again, at a free instant (Controller.free_at)
+    and by its latest deadline, and a decision lets each member at the
+    start that the decision before it showed, when the decisions are on
+    time, and in between only prepare reports came, no window opened or
+    closed, and the later decision starts no device. A member whose
+    prepare is done or failed is not let. Without a cap, a member that
+    waits to prepare keeps the turn that the decision before gave it,
+    unless that turn passed (it is before the start of the decision's
+    debounce slot), is after the member's latest deadline, or is no longer
+    free. A pause keeps the turns. The bandwidth of the prepares stays at
+    or under the cap, or one prepare runs alone.
 
     decided, when given, gets each decision of c, as (time, the devices it
-    starts).
+    starts). late_names, when given, gets each member that the prepares of
+    a decision of c say cannot prepare before its window opens.
 
     Return how many decisions of c took the last plan again."""
     d = c.copy()
@@ -455,6 +485,10 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
     # decision showed.
     let_at: dict[str, int] = {}
     shown: dict[str, int] = {}
+    # The members let prepare after the last decision, and the turns it
+    # gave the members that wait to prepare.
+    was_let: set[str] = set()
+    turns_before: dict[str, int] = {}
     last_t = -1
     paused: ?Paused = None
     again = 0
@@ -559,8 +593,10 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
             shown_prepares = qx
             c.start()
             c.revoke_prepares(t)
+            c.let_again(t)
             d.start()
             d.revoke_prepares(t)
+            d.let_again(t)
             pz.kept(c, t)
             resumed = pz
             paused = None
@@ -619,13 +655,40 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
                     testing.assertEqual(at, let_at[name], "{name} let again at {t}")
                 else:
                     let_at[name] = at
-                    dl = c.prepare_deadline(name, at)
-                    testing.assertTrue(dl is not None and at * fleet_ctl.MICRO <= dl,
-                                       "{name} let at {at}, after its deadline")
                     if calm and name in shown:
                         testing.assertEqual(at, shown[name], "{name} let as shown, at {t}")
             testing.assertEqual([n for n in let_at.keys() if n not in c.prepare_at], [],
                                 "let prepare at {t}")
+            # Each member let now, for the first time or again, may be let
+            # at t; none has prepared.
+            for name in sorted(list(c.allowed)):
+                st = c.prepare_state.get(name)
+                testing.assertTrue(st != "done" and st != "failed",
+                                   "{name} let at {t} after its prepare ended")
+                if name not in was_let:
+                    dl = c.prepare_deadline(name, t)
+                    testing.assertTrue(dl is not None and t * fleet_ctl.MICRO <= dl,
+                                       "{name} let at {t}, after its deadline")
+                    testing.assertTrue(c.free_at(t, t * fleet_ctl.MICRO),
+                                       "{name} let at {t}, in a time without prepares")
+            # Without a cap, the turns that the decision before gave stay,
+            # unless they passed, are after their deadline, or are no
+            # longer free.
+            if c.prepare_cap < 0:
+                for name, o in turns_before.items():
+                    turn = c.prep_turn[c.known(name)]
+                    if turn >= 0 and o >= c.slot(t) * fleet_ctl.MICRO:
+                        dl = c.prepare_deadline(name, t)
+                        if dl is not None and o <= dl and c.free_at(t, o):
+                            testing.assertEqual(turn, o, "{name}'s turn at {t}")
+            under_cap(c, s.prepares, t)
+            turns_before = {c.name_of(k): c.prep_turn[k] for k in range(c.size)
+                            if c.prep_turn[k] >= 0}
+            was_let = fleet_ctl.copy_set(c.allowed)
+            ln = late_names
+            if ln is not None:
+                for name in c.turns(t).1:
+                    ln.add(name)
             shown = s.prepares.starts
             for name in sorted(c.prepare_at.keys()):
                 if name not in let:
@@ -672,14 +735,23 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
 
 def edit(c: Controller, windows: list[(str, int, int)], devs: list[(str, int, str)]) -> None:
     """Configure c again as it is, with the windows windows and the devices
-    devs, each new device with a prepare of 100 s."""
+    devs, each new device with a prepare of 100 s and an image of the size
+    of the first device's, or 0."""
     est = {name: s for name, s in c.prepare_est.items()}
+    size = {name: s for name, s in c.prepare_size.items()}
+    image = 0
+    for v in c.prepare_size.values():
+        image = v
+        break
     for dv in devs:
         if dv.0 not in est:
             est[dv.0] = 100
+        if dv.0 not in size:
+            size[dv.0] = image
     c.configure(windows, devs, c.target, c.maxc, c.must_place, c.debounce, c.estimate_s,
                 c.groups, c.priority, c.separation, c.close_margin, c.stagger, c.prepare, est,
-                c.failure_budget, c.hold_failed)
+                c.failure_budget, c.hold_failed, size, c.prepare_first, c.prepare_between,
+                c.prepare_during, c.prepare_cap)
 
 
 class Paused(object):
@@ -693,6 +765,7 @@ class Paused(object):
     done: dict[str, int]
     failed: set[str]
     let: dict[str, int]
+    turns: list[int]
     kept_state: (int, int, int, int, int)
     # The windows promised to the waiting devices, and the order of their
     # promises; the devices taken back when the run goes on.
@@ -708,6 +781,7 @@ class Paused(object):
         self.done = c.done_times()
         self.failed = c.failed_devices()
         self.let = {name: at for name, at in c.prepare_at.items()}
+        self.turns = c.prep_turn.copy()
         self.kept_state = (c.rung, c.c, c.observed_s, c.slow_s, c.prep_last)
         self.promised = {}
         self.seqs = {}
@@ -724,8 +798,9 @@ class Paused(object):
         which were in flight without a report and are promised the window
         they were released in; the devices done keep their done time and
         their failure, the waiting devices their promises and their order,
-        the members let prepare their time, and the ramp, the
-        concurrency, the pace, the slow time and the last turn stay."""
+        the members let prepare their time, the members that wait to
+        prepare their turns, and the ramp, the concurrency, the pace, the
+        slow time and the last turn stay."""
         times = c.release_times()
         self.back = sorted([n for n in self.times.keys() if n not in times])
         for name in self.back:
@@ -739,6 +814,7 @@ class Paused(object):
         testing.assertEqual((c.done_times(), c.failed_devices()), (self.done, self.failed),
                             "done at {t}")
         testing.assertEqual(c.prepare_at, self.let, "let prepare at {t}")
+        testing.assertEqual(c.prep_turn[:len(self.turns)], self.turns, "turns at {t}")
         testing.assertEqual((c.rung, c.c, c.observed_s, c.slow_s, c.prep_last), self.kept_state,
                             "ramp, concurrency, pace, slow time and turn at {t}")
         for name, w in self.promised.items():
@@ -1573,12 +1649,12 @@ def _test_a_pause_keeps_the_run():
     it, misses its window. A failure keeps holding its group and counts
     against the budget, and d9 waits an hour from d8's success, not from
     R. The members let prepare that have not prepared are let again,
-    until their window opens, and one that reports no prepare yet counts
+    until their deadline, and one that reports no prepare yet counts
     as preparing from R. The plan of a copy that goes on at R, as a
     campaign in plan shows it, is the plan and the prepares of the run at
-    R. The turns
-    to prepare stay when the run goes on before the next turn; after it,
-    the next member goes at once and the rest spread from R."""
+    R. The turns to prepare stay when the run goes on before the next
+    turn; after it, the next member goes at once and the rest keep their
+    turns."""
     no_failing: list[str] = []
     none: dict[str, int] = {}
     # (case, (hold, budget, failing), (P, R), the reports in the pause as
@@ -1621,12 +1697,14 @@ def _test_a_pause_keeps_the_run():
         ("d6 no prepare report, at d7's turn", (False, -1, no_failing), (14299, 16683),
          [(14299, "d6", "no prepare")], [], [], [], ["d6"],
          (none, none, {"d7": 16683, "d8": 19066, "d9": 21450}, 2)),
+        ("d6 no prepare report, after its deadline", (False, -1, no_failing), (14299, 21500),
+         [(14299, "d6", "no prepare")], [], [], [], [], (none, none, none, -1)),
         ("d6 no prepare report, in its window", (False, -1, no_failing), (14299, 21700),
-         [(14299, "d6", "no prepare")], [], ["d0"], [], [], (none, none, none, 0)),
+         [(14299, "d6", "no prepare")], [], ["d0"], [], [], (none, none, none, 1)),
         ("shorter than a turn", (False, -1, no_failing), (10000, 11000), [], [], [], [], [],
          (none, none, {"d5": 11916, "d6": 14299, "d7": 16683, "d8": 19066, "d9": 21450}, -1)),
         ("longer than a turn", (False, -1, no_failing), (10000, 13000), [], [], [], [], [],
-         (none, none, {"d5": 13000, "d6": 15112, "d7": 17225, "d8": 19337, "d9": 21450}, -1)),
+         (none, none, {"d5": 13000, "d6": 14299, "d7": 16683, "d8": 19066, "d9": 21450}, -1)),
     ]
     wins = daily("w", 6 * HOUR, HOUR, 3)
     for case in cases:
@@ -1649,6 +1727,7 @@ def _test_a_pause_keeps_the_run():
         shown_prepares = x.prepares(r)
         c.start()
         c.revoke_prepares(r)
+        c.let_again(r)
         testing.assertEqual((c.rung, c.c, c.observed_s, c.slow_s, c.prep_last), kept, label)
         testing.assertEqual(c.prepare_at, let, label)
         testing.assertEqual(sorted(list(c.allowed)), case.7, label)
@@ -1670,8 +1749,9 @@ def _test_a_pause_keeps_the_run():
         s = c.decide(r)
         testing.assertEqual((s.plan.c, s.plan.starts, s.plan.held, s.plan.alarms),
                             (shown.c, shown.starts, shown.held, shown.alarms), label)
-        testing.assertEqual((s.prepares.starts, s.prepares.c),
-                            (shown_prepares.starts, shown_prepares.c), label)
+        testing.assertEqual((s.prepares.starts, s.prepares.c, s.prepares.alarms),
+                            (shown_prepares.starts, shown_prepares.c, shown_prepares.alarms),
+                            label)
         testing.assertEqual(s.started, case.5, label)
         testing.assertEqual(s.plan.alarms, case.6, label)
         testing.assertEqual([n for n in released if n in s.plan.starts or n in s.plan.held], [],
@@ -1682,16 +1762,39 @@ def _test_a_pause_keeps_the_run():
             testing.assertEqual(c.gate(c.known(name)), at, "{label}: {name}")
 
 
+def _test_a_let_member_past_its_deadline_is_named():
+    """PAUSED stops at 14299, when d6 is let prepare, and d6 reports no
+    prepare in the pause. When the run goes on by the deadline at 21450,
+    d6 is let again. After it, d6 is not let again, and the prepares name
+    it with the waiting members of the first window that cannot prepare
+    before it opens. d9, promised the window of the next day, prepares
+    between the windows."""
+    # (case, R, d6 let at R, the prepare alarms at R)
+    cases: list[(str, int, bool, list[str])] = [
+        ("by its deadline", 21450, True, []),
+        ("after its deadline", 21500, False,
+         ["3 device(s) cannot prepare before their window opens: d6, d7, d8"]),
+    ]
+    for case in cases:
+        c = paused(False, -1, [], 14299)
+        c.report_prepare("d6", None)
+        c.start()
+        c.revoke_prepares(case.1)
+        c.let_again(case.1)
+        s = c.decide(case.1)
+        testing.assertEqual(("d6" in c.allowed, s.prepares.alarms), (case.2, case.3), case.0)
+
+
 def carries_on(c: Controller, pause: int, resume: int, label: str) -> None:
-    """Run c on the expected durations until pause, each device that
-    starts reporting in-progress, and each member let prepare its
-    prepare, and stop it there. The devices in flight whose upgrade ends
-    by resume report then, in the pause; the others are still in flight
-    at resume. A copy of c that starts at resume and stops letting
-    prepare the members that may no longer prepare, as a campaign in plan
-    shows it, plans what the run decides when it starts at resume: the
-    same plan and prepares. When that plan has no alarm, each device that
-    the run starts from resume on starts where and when it said."""
+    """Run c on the expected durations until pause, each device that starts
+    reporting in-progress, and each member let prepare its prepare, and stop
+    it there. The devices in flight whose upgrade ends by resume report
+    then, in the pause; the others are still in flight at resume. A copy of
+    c that starts at resume, stops letting prepare the members that may no
+    longer prepare and lets again the ones that may, as a campaign in plan
+    shows it, plans what the run decides when it starts at resume: the same
+    plan and prepares. When that plan has no alarm, each device that the run
+    starts from resume on starts where and when it said."""
     sim.drive(c, 0, {}, pause, prepare_reports=True, in_progress=True)
     c.stop()
     times = c.release_times()
@@ -1707,6 +1810,7 @@ def carries_on(c: Controller, pause: int, resume: int, label: str) -> None:
     q = x.prepares(resume)
     c.start()
     c.revoke_prepares(resume)
+    c.let_again(resume)
     ds = sim.drive(c, resume, {}, 30 * DAY, inflight=inflight, in_progress=True)
     s = ds[0]
     testing.assertEqual((s.plan.c, s.plan.starts, s.plan.held, s.plan.why, s.plan.alarms),
@@ -2237,7 +2341,8 @@ def limits(c: Controller, target: int, maxc: int) -> None:
     concurrency maxc."""
     c.configure(c.current, c.devices, target, maxc, c.must_place, c.debounce, c.estimate_s,
                 c.groups, c.priority, c.separation, c.close_margin, c.stagger, c.prepare,
-                c.prepare_est, c.failure_budget, c.hold_failed)
+                c.prepare_est, c.failure_budget, c.hold_failed, c.prepare_size, c.prepare_first,
+                c.prepare_between, c.prepare_during, c.prepare_cap)
 
 
 def where(c: Controller, name: str) -> ?(str, int, int):
@@ -5504,29 +5609,77 @@ def _test_prepare_turns():
         testing.assertEqual(p.alarms, case.9, case.0)
 
 
-def _test_prepares_spread_over_the_whole_time():
-    """a0 and a1 wait for a window that opens at 10150, and b0 and b1 for
-    one that opens at 20150: their deadlines are 10000 and 20000. The
-    turns are as far apart as both deadlines allow, so they cover the
-    whole time to the last deadline: a1 goes a third of the way to 20000,
-    not at 10000."""
-    c = controller([("a", 10150, fleet_ctl.OPEN_END), ("b", 20150, fleet_ctl.OPEN_END)],
-                   devices("a", 2, 600, "a") + devices("b", 2, 600, "b"), 2, 10, prepare=True)
-    c.plan(0)
-    testing.assertEqual(c.prepares(0).starts, {"a0": 0, "a1": 6666, "b0": 13333, "b1": 20000})
+def settings_windows() -> list[(str, int, int)]:
+    """The windows of SETTINGS: a from 10150 to 12000, b from 20150 to
+    22000 and c from 30150 to 32000."""
+    return [("a", 10150, 12000), ("b", 20150, 22000), ("c", 30150, 32000)]
+
+
+def settings_devices() -> list[(str, int, str)]:
+    """The devices of SETTINGS: a0 on schedule a, b0 and b1 on b, and c0
+    and c1 on c, each of 600 s."""
+    return devices("a", 1, 600, "a") + devices("b", 2, 600, "b") + devices("c", 2, 600, "c")
+
+
+def _test_when_the_members_prepare():
+    """SETTINGS at the decision at 9800, at the start of a run: each
+    member prepares for 100 s and copies an image of 1250 bytes, 100
+    bit/s. Before the first window, every member's deadline is 10000,
+    the opening of a less 150 percent of 100 s. With the defaults and a
+    cap of 100 bit/s, one prepare runs at a time: a0, b0 and b1 fit
+    before the first window, each when the one before it ends, and c0 and
+    c1 prepare between windows, spread to their deadline at 30000, the
+    first at the end of the free time before b's window. The free time
+    has no window and not the 150 s before each opening. So the plan
+    turns prepare between windows on. Without a cap, all five fit before
+    the first window, spread 50 s apart, and two prepares run at once.
+    With prepare between windows off, c0 and c1 cannot prepare in time.
+    Without prepare before the first window, a0 cannot prepare before its
+    window, and the others spread from the close of a's window to their
+    own. With prepare during windows on and between windows off, c0 and
+    c1 prepare while a's window is open and b's, each done 150 s before the
+    window closes, the last at its deadline in b's window."""
+    # (case, before the first window, between windows, during windows,
+    # the cap, the starts, between windows in the prepares, the alarms,
+    # the peak)
+    cases: list[(str, bool, ?bool, bool, int, dict[str, int], bool, list[str], int)] = [
+        ("defaults", True, None, False, 100,
+         {"a0": 9800, "b0": 9900, "b1": 10000, "c0": 20000, "c1": 30000}, True, [], 100),
+        ("no cap", True, None, False, -1,
+         {"a0": 9800, "b0": 9850, "b1": 9900, "c0": 9950, "c1": 10000}, False, [], 200),
+        ("between on, no cap", True, True, False, -1,
+         {"a0": 9800, "b0": 9850, "b1": 9900, "c0": 9950, "c1": 10000}, True, [], 200),
+        ("between off", True, False, False, 100,
+         {"a0": 9800, "b0": 9900, "b1": 10000}, False,
+         ["2 device(s) cannot prepare before their window opens: c0, c1"], 100),
+        ("not before the first window", False, None, False, 100,
+         {"b0": 12000, "b1": 17333, "c0": 24666, "c1": 30000}, True,
+         ["1 device(s) cannot prepare before their window opens: a0"], 100),
+        ("during, not between", True, False, True, 100,
+         {"a0": 9800, "b0": 9900, "b1": 10000, "c0": 11775, "c1": 21850}, False, [], 100),
+    ]
+    for case in cases:
+        c = controller(settings_windows(), settings_devices(), 1, 1, prepare=True, image=1250,
+                       first=case.1, between=case.2, during=case.3, cap=case.4)
+        c.plan(9800)
+        p = c.prepares(9800)
+        testing.assertEqual((p.starts, p.between, p.alarms, p.peak),
+                            (case.5, case.6, case.7, case.8), case.0)
 
 
 def _test_prepares_follow_the_promises():
     """ONE, but d0 has not answered: the plan at 0 promises it no window,
-    and d1 goes first. d0 answers at 1000. The plan at 1000 promises it
-    the window after the others, and it takes the last turn."""
+    and d1 goes first; d2, d3 and d4 follow at 3333, 6666 and 10000. d0
+    answers at 1000. The plan at 1000 promises it the window after the
+    others. The others keep their turns, and d0 takes the middle of the
+    widest time between two turns, the latest one of two as wide: 8333."""
     c = one()
     c.report("d0", None, 0)
     c.decide(0)
     testing.assertEqual(sorted(list(c.allowed)), ["d1"])
     c.report("d0", "upgrade-needed", 1000)
     testing.assertEqual(c.decide(1000).prepares.starts,
-                        {"d1": 0, "d2": 2500, "d3": 5000, "d4": 7500, "d0": 10000})
+                        {"d1": 0, "d2": 3333, "d3": 6666, "d4": 10000, "d0": 8333})
 
 
 def _test_prepare_concurrency():
@@ -5591,8 +5744,10 @@ def _test_decisions_let_members_at_their_turns():
 
 def _test_a_late_answer_joins_the_spread():
     """ONE, but d4 has not answered: d0 to d3 share the time to 10000. d0
-    goes at 0 and d1 at 3333. d4 answers at 4000 and joins the turns: the
-    members left share the time from d1's turn."""
+    goes at 0 and d1 at 3333. d4 answers at 4000 and joins the turns: d2
+    and d3 keep theirs, and d4 takes the middle of the widest time between
+    two turns that is still ahead, 6666 to 10000, rather than the time
+    from d1's turn to d2's, which now cuts short."""
     c = one()
     c.report("d4", None, 0)
     testing.assertEqual(c.decide(0).prepares.starts,
@@ -5600,19 +5755,19 @@ def _test_a_late_answer_joins_the_spread():
     c.decide(3333)
     c.report("d4", "upgrade-needed", 4000)
     testing.assertEqual(c.decide(4000).prepares.starts,
-                        {"d0": 0, "d1": 3333, "d2": 5555, "d3": 7777, "d4": 10000})
+                        {"d0": 0, "d1": 3333, "d2": 6666, "d3": 10000, "d4": 8333})
 
 
-def _test_a_late_decision_spreads_the_rest_from_then():
+def _test_a_late_decision_lets_the_late_member_now_and_keeps_the_rest():
     """ONE: d0 goes at 0. The next decision comes at 3000, after the
-    debounce slot of d1's turn at 2500. It lets d1 now, and the members
-    left share the time from now: no two members go at once to catch up.
-    With a debounce of 30 s, a decision at 2519 is in the slot of d1's
-    turn, which starts at 2490: it lets d1, and the turns after it stay as
-    they were."""
+    debounce slot of d1's turn at 2500. It lets d1 now, which leaves the
+    widest gaps, and the members left keep their turns: no two members go
+    at once to catch up. With a debounce of 30 s, a decision at 2519 is in
+    the slot of d1's turn, which starts at 2490: it lets d1, and the turns
+    after it stay as they were."""
     # (the debounce, the late decision, the starts after it)
     cases: list[(int, int, dict[str, int])] = [
-        (0, 3000, {"d0": 0, "d1": 3000, "d2": 5333, "d3": 7666, "d4": 10000}),
+        (0, 3000, {"d0": 0, "d1": 3000, "d2": 5000, "d3": 7500, "d4": 10000}),
         (30, 2519, {"d0": 0, "d1": 2519, "d2": 4980, "d3": 7500, "d4": 9990}),
     ]
     for case in cases:
@@ -5622,11 +5777,11 @@ def _test_a_late_decision_spreads_the_rest_from_then():
 
 
 def _test_a_member_that_comes_to_wait_after_the_turns_goes_at_once():
-    """a0 and a1 wait for a window that opens at 10150, and b0, which has
+    """a0 and a1 wait for a window from 10150 to 12000, and b0, which has
     not answered, for one that opens at 20150. a0 goes at 0 and a1 at
-    10000, the last turn. b0 answers at 12000 and goes at once: the
-    spread before it ended."""
-    c = controller([("a", 10150, fleet_ctl.OPEN_END), ("b", 20150, fleet_ctl.OPEN_END)],
+    10000, the last turn. b0 answers at 12000, after the first window,
+    and goes at once, between windows: the spread before it ended."""
+    c = controller([("a", 10150, 12000), ("b", 20150, fleet_ctl.OPEN_END)],
                    devices("a", 2, 600, "a") + devices("b", 1, 600, "b"), 2, 10, prepare=True)
     c.report("b0", None, 0)
     c.decide(0)
@@ -5640,33 +5795,96 @@ def _test_a_member_that_comes_to_wait_after_the_turns_goes_at_once():
 def prepare_campaign(windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
                      maxc: int, estimate: int, groups: dict[str, list[str]],
                      priority: dict[str, int], stagger: int, answers: list[(int, str)],
-                     prepare: bool) -> Controller:
+                     prepare: bool, mode: str="first") -> Controller:
     """A controller at the start of a run with a debounce of 1 s, prepare
     on or off and each prepare 100 s. The devices in answers have not
-    answered yet."""
+    answered yet. mode says when the members may prepare: "first", the
+    default settings; "between", not before the first window and between
+    windows; "cap", the default settings with an image of 1250 bytes, 100
+    bit/s, and a cap of 100 bit/s, so one prepare runs at a time; and
+    "during", as "cap" but not between windows and during windows."""
+    testing.assertTrue(mode in ["first", "between", "cap", "during"], "no mode {mode}")
+    image = 0
+    first = True
+    between: ?bool = None
+    during = False
+    cap = -1
+    if mode == "between":
+        first = False
+        between = True
+    elif mode == "cap" or mode == "during":
+        image = 1250
+        cap = 100
+    if mode == "during":
+        between = False
+        during = True
     c = controller(windows, devs, target, maxc, False, 1, estimate, groups, priority,
-                   stagger=stagger, prepare=prepare)
+                   stagger=stagger, prepare=prepare, image=image, first=first, between=between,
+                   during=during, cap=cap)
     for a in answers:
         c.lost(a.1)
     return c
 
 
-def _test_prepares_do_not_change_the_releases():
-    """Prepares change no release decision. Each campaign runs once with
-    prepare off, and once with prepare on and every member let prepare
-    reporting its prepare: the devices start in the same windows at the
-    same times. The members let prepare are the ones that start in a
-    window that opens after the run starts, and each is let by its
-    deadline. Next to a copy that plans at every decision, each decision
-    with prepare on starts and lets prepare as a new plan would, and some
-    decisions take the last plan again."""
+def five_windows() -> list[(str, int, int)]:
+    """The windows of FIVE: five of 1850 s on schedule w, 20000 s apart,
+    the first at 9150."""
+    return [("w", 9150 + 20000 * j, 11000 + 20000 * j) for j in range(5)]
+
+
+def five(between: bool, debounce: int=0) -> Controller:
+    """FIVE: d0 to d9 of 600 s on five_windows(), one at a time, at the
+    start of a run, with prepare on. Two members fit in each window:
+    d0 and d1 in the first, d2 and d3 in the second, and on. Each prepare
+    takes 100 s and the close margin is 150 percent, so a member's
+    deadline is 150 s before an opening, and so is the start of each time
+    without prepares before a window. With between, the members prepare
+    between windows only, not before the first window."""
+    return controller(five_windows(), devices("d", 10, 600, "w"), 1, 1, debounce=debounce,
+                      prepare=True, first=not between, between=True if between else None)
+
+
+def two_windows() -> list[(str, int, int)]:
+    """The windows of TWO: (49150, 51000) and (69150, 71000) on schedule
+    w."""
+    return [("w", 49150, 51000), ("w", 69150, 71000)]
+
+
+def two(cap: bool, debounce: int=0) -> Controller:
+    """TWO: d0 to d3 of 600 s on two_windows(), one at a time, at the start
+    of a run, with prepare on: d0 and d1 in the first window, d2 and d3 in
+    the second. Each prepare takes 100 s at a close margin of 150 percent:
+    the deadlines are 49000 and 69000. With cap, each copies an image of
+    125000 bytes, 10 kbit/s, under a cap of 10 kbit/s, so one prepare runs
+    at a time; else there is no cap."""
+    return controller(two_windows(), devices("d", 4, 600, "w"), 1, 1, debounce=debounce,
+                      prepare=True, image=125000 if cap else 0, cap=10000 if cap else -1)
+
+
+def interleaved_windows() -> list[(str, int, int)]:
+    """The windows of INTERLEAVED: three of 1850 s on schedule a, 20000 s
+    apart from 9150, and three on schedule b, 10000 s after each of
+    a's."""
+    return [("a", 9150 + 20000 * j, 11000 + 20000 * j) for j in range(3)] \
+        + [("b", 19150 + 20000 * j, 21000 + 20000 * j) for j in range(3)]
+
+
+def interleaved_devices() -> list[(str, int, str)]:
+    """The devices of INTERLEAVED: a0 to a5 on schedule a and b0 to b5 on
+    schedule b, of 600 s: two fit in each window, one at a time."""
+    return devices("a", 6, 600, "a") + devices("b", 6, 600, "b")
+
+
+def prepare_cases() -> list[(str, list[(str, int, int)], list[(str, int, str)], int, int, int,
+                             dict[str, list[str]], dict[str, int], int, list[(int, str)])]:
+    """The campaigns of the prepare checks, as (case, windows, devices,
+    target, max, estimate, groups, priorities, stagger, the devices that
+    answer later, as (time, name)): the plan-is-the-run campaigns with
+    prepare, FIVE, TWO, and INTERLEAVED."""
     groups, priority = pairs(40)
     no_groups: dict[str, list[str]] = {}
     no_priority: dict[str, int] = {}
-    # (case, windows, devices, target, max, estimate, groups, priorities,
-    # stagger, the devices that answer later, as (time, name))
-    cases: list[(str, list[(str, int, int)], list[(str, int, str)], int, int, int,
-                 dict[str, list[str]], dict[str, int], int, list[(int, str)])] = [
+    return [
         ("uniform", daily("day", 0, HOUR, 9), devices("d", 100, 600, "day"), 10, 10, 600,
          no_groups, no_priority, 0, []),
         ("two schedules", [("night", 0, HOUR), ("weekend", 2 * HOUR, 3 * HOUR)],
@@ -5678,30 +5896,306 @@ def _test_prepares_do_not_change_the_releases():
          no_groups, no_priority, 0, late_answers()),
         ("pairs", daily("day", 0, HOUR, 9), devices("d", 40, 600, "day"), 10, 10, 600,
          groups, priority, 0, []),
+        ("FIVE", five_windows(), devices("d", 10, 600, "w"), 1, 1, 600, no_groups, no_priority,
+         0, []),
+        ("TWO", two_windows(), devices("d", 4, 600, "w"), 1, 1, 600, no_groups, no_priority, 0,
+         []),
+        ("INTERLEAVED", interleaved_windows(), interleaved_devices(), 1, 1, 600, no_groups,
+         no_priority, 0, []),
     ]
-    for case in cases:
+
+
+def releases_kept(mode: str) -> None:
+    """Prepares change no release decision. Each campaign of
+    prepare_cases() runs with prepare off, and with prepare in the mode of
+    prepare_campaign(), every member let prepare reporting its prepare:
+    the devices start in the same windows at the same times. The members
+    let prepare start in a window that opens after the run starts, and
+    each is let by the deadline it had then. With the default settings,
+    every such member is let."""
+    for case in prepare_cases():
         runs: list[dict[str, ((str, int, int), int)]] = []
-        for prepare in [False, True]:
+        for m in ["off", mode]:
+            label = "{case.0}, {m}"
+            prepare = m != "off"
             c = prepare_campaign(case.1, case.2, case.3, case.4, case.5, case.6, case.7, case.8,
-                                 case.9, prepare)
-            sim.drive(c, 0, {}, 30 * DAY, answers=case.9, prepare_reports=prepare)
+                                 case.9, prepare, mode)
+            dls: dict[str, int] = {}
+            sim.drive(c, 0, {}, 30 * DAY, answers=case.9, prepare_reports=prepare, deadlines=dls)
             runs.append(sim.started(c))
+            testing.assertEqual(runs[-1], runs[0], label)
             if prepare:
                 later = sorted([n for n, st in runs[0].items() if st.0.1 > 0])
-                testing.assertTrue(len(later) > 0, "{case.0}: no member starts later")
-                testing.assertEqual(sorted(c.prepare_at.keys()), later, case.0)
+                testing.assertTrue(len(later) > 0, "{label}: no member starts later")
+                testing.assertEqual([n for n in c.prepare_at.keys() if n not in later], [],
+                                    label)
+                if m == "first":
+                    testing.assertEqual(sorted(c.prepare_at.keys()), later, label)
                 for name, at in c.prepare_at.items():
-                    d = c.prepare_deadline(name, at)
-                    if d is not None:
-                        testing.assertTrue(at * fleet_ctl.MICRO <= d,
-                                           "{case.0}: {name} let at {at}, after its deadline")
-                    else:
-                        testing.assertTrue(False, "{case.0}: {name} let at {at} without a deadline")
-        testing.assertEqual(runs[1], runs[0], case.0)
-        c = prepare_campaign(case.1, case.2, case.3, case.4, case.5, case.6, case.7, case.8,
-                             case.9, True)
-        again = same_as_a_new_plan(c, {}, 9 * DAY, answers=case.9, prepare=True)
-        testing.assertTrue(again > 0, "{case.0}: {again} decisions took the plan again")
+                    d = dls[name]
+                    testing.assertTrue(d >= 0 and at * fleet_ctl.MICRO <= d,
+                                       "{label}: {name} let at {at}, after its deadline {d}")
+
+
+def decides_as_a_new_plan(mode: str, names: list[str]) -> None:
+    """Each campaign of prepare_cases() in names, in the order of
+    prepare_cases(), runs with prepare in the mode of prepare_campaign()
+    next to a copy that plans at every decision: each decision starts and
+    lets prepare as a new plan would (same_as_a_new_plan), and in the
+    larger campaigns some decisions take the last plan again."""
+    ran: list[str] = []
+    for case in prepare_cases():
+        if case.0 in names:
+            ran.append(case.0)
+            c = prepare_campaign(case.1, case.2, case.3, case.4, case.5, case.6, case.7, case.8,
+                                 case.9, True, mode)
+            again = same_as_a_new_plan(c, {}, 9 * DAY, answers=case.9, prepare=True)
+            if len(case.2) >= 20:
+                testing.assertTrue(again > 0,
+                                   "{case.0}, {mode}: {again} decisions took the plan again")
+    testing.assertEqual(ran, names, "the campaigns")
+
+
+def _test_prepares_before_the_first_window_do_not_change_the_releases():
+    """releases_kept() with the default settings."""
+    releases_kept("first")
+
+
+def _test_prepares_between_windows_do_not_change_the_releases():
+    """releases_kept() before each member's own window between windows
+    only."""
+    releases_kept("between")
+
+
+def _test_prepares_under_a_cap_do_not_change_the_releases():
+    """releases_kept() with the default settings under a cap."""
+    releases_kept("cap")
+
+
+def _test_prepares_during_windows_do_not_change_the_releases():
+    """releases_kept() under a cap, during windows and not between
+    windows."""
+    releases_kept("during")
+
+
+def _test_a_decision_with_prepares_before_the_first_window_decides_as_a_new_plan():
+    """decides_as_a_new_plan() with the default settings, for each campaign
+    but stagger."""
+    decides_as_a_new_plan("first", ["uniform", "two schedules", "late answers", "pairs", "FIVE",
+                                    "TWO", "INTERLEAVED"])
+
+
+def _test_a_decision_with_prepares_before_the_first_window_decides_as_a_new_plan_at_a_stagger():
+    """decides_as_a_new_plan() with the default settings, for stagger."""
+    decides_as_a_new_plan("first", ["stagger"])
+
+
+def _test_a_decision_with_prepares_between_windows_decides_as_a_new_plan():
+    """decides_as_a_new_plan() before each member's own window between
+    windows only, for each campaign but stagger."""
+    decides_as_a_new_plan("between", ["uniform", "two schedules", "late answers", "pairs", "FIVE",
+                                      "TWO", "INTERLEAVED"])
+
+
+def _test_a_decision_with_prepares_between_windows_decides_as_a_new_plan_at_a_stagger():
+    """decides_as_a_new_plan() before each member's own window between
+    windows only, for stagger."""
+    decides_as_a_new_plan("between", ["stagger"])
+
+
+def _test_a_decision_with_prepares_under_a_cap_decides_as_a_new_plan():
+    """decides_as_a_new_plan() with the default settings under a cap, for
+    each campaign but stagger."""
+    decides_as_a_new_plan("cap", ["uniform", "two schedules", "late answers", "pairs", "FIVE",
+                                  "TWO", "INTERLEAVED"])
+
+
+def _test_a_decision_with_prepares_under_a_cap_decides_as_a_new_plan_at_a_stagger():
+    """decides_as_a_new_plan() with the default settings under a cap, for
+    stagger."""
+    decides_as_a_new_plan("cap", ["stagger"])
+
+
+def _test_a_decision_with_prepares_during_windows_decides_as_a_new_plan():
+    """decides_as_a_new_plan() under a cap, during windows and not between
+    windows, for each campaign but stagger."""
+    decides_as_a_new_plan("during", ["uniform", "two schedules", "late answers", "pairs", "FIVE",
+                                     "TWO", "INTERLEAVED"])
+
+
+def _test_a_decision_with_prepares_during_windows_decides_as_a_new_plan_at_a_stagger():
+    """decides_as_a_new_plan() under a cap, during windows and not between
+    windows, for stagger."""
+    decides_as_a_new_plan("during", ["stagger"])
+
+
+def prepare_events(case: (str, list[(str, int, int)], list[(str, int, str)], int, int, int,
+                          dict[str, list[str]], dict[str, int], int, list[(int, str)]),
+                   mode: str, late: int, event: str) -> None:
+    """Run the campaign case of prepare_cases() next to a copy that plans
+    at every decision, with prepare in the mode of prepare_campaign(), each
+    decision late seconds late, with the event: "" for none; "down" for
+    the last member down from 100 until mid, the middle of the time
+    between the close of the first window and the next opening; "status"
+    for the member before it up to date at 100 and waiting again at mid;
+    "budget" for the first member failing its upgrade at a budget of zero,
+    until a budget of one at mid; and "pause" for a pause from the first
+    close to mid."""
+    first = sorted([(w.1, w.2) for w in case.1])[0]
+    nxt = first.1 + DAY
+    for w in case.1:
+        if w.1 > first.1 and w.1 < nxt:
+            nxt = w.1
+    mid = (first.1 + nxt) // 2
+    c = prepare_campaign(case.1, case.2, case.3, case.4, case.5, case.6, case.7, case.8, case.9,
+                         True, mode)
+    lives: list[(int, str, bool)] = []
+    statuses: list[(int, str, ?str)] = []
+    budgets: list[(int, int)] = []
+    failing: list[str] = []
+    pauses: list[(int, int)] = []
+    if event == "down":
+        lives = [(100, case.2[-1].0, False), (mid, case.2[-1].0, True)]
+    elif event == "status":
+        statuses = [(100, case.2[-2].0, "up-to-date"), (mid, case.2[-2].0, "upgrade-needed")]
+    elif event == "budget":
+        reconfigure(c, c.devices, 0)
+        failing = [case.2[0].0]
+        budgets = [(mid, 1)]
+    elif event == "pause":
+        pauses = [(first.1, mid)]
+    same_as_a_new_plan(c, {}, 9 * DAY, late, answers=case.9, prepare=True, lives=lives,
+                       statuses=statuses, budgets=budgets, failing=failing, pauses=pauses)
+
+
+def prepares_keep_their_turns(name: str, mode: str, lates: list[int]=[0, 5]) -> None:
+    """The checks of same_as_a_new_plan() with prepare, for the campaign
+    name of prepare_cases() in the mode of prepare_campaign(), with the
+    decisions late by each number of seconds in lates, by default on time
+    and 5 s late, and with a member that goes down and up, a member whose
+    status goes final and back, a hold of the failure budget, and a pause
+    (prepare_events()): each let is at a free instant and by its deadline,
+    a member let keeps the time it was first let, one that prepared is not
+    let again, a turn stays unless it passed, its deadline moved before
+    it, it is no longer free or the cap holds it, and the bandwidth stays
+    under the cap. To keep the test short, the campaigns of 100 members
+    run with no event, and late only in the mode "cap"."""
+    ran = False
+    for case in prepare_cases():
+        if case.0 == name:
+            ran = True
+            big = len(case.2) >= 100
+            for late in lates:
+                if late == 0 or mode == "cap" or not big:
+                    prepare_events(case, mode, late, "")
+            if not big:
+                for event in ["down", "status", "budget", "pause"]:
+                    prepare_events(case, mode, 0, event)
+    testing.assertTrue(ran, "no campaign {name}")
+
+
+def _test_prepares_keep_their_turns_uniform_before_the_first_window():
+    prepares_keep_their_turns("uniform", "first")
+
+
+def _test_prepares_keep_their_turns_uniform_between_windows():
+    prepares_keep_their_turns("uniform", "between")
+
+
+def _test_prepares_keep_their_turns_uniform_under_a_cap():
+    prepares_keep_their_turns("uniform", "cap")
+
+
+def _test_prepares_keep_their_turns_two_schedules_before_the_first_window():
+    prepares_keep_their_turns("two schedules", "first")
+
+
+def _test_prepares_keep_their_turns_two_schedules_between_windows():
+    prepares_keep_their_turns("two schedules", "between")
+
+
+def _test_prepares_keep_their_turns_two_schedules_under_a_cap():
+    prepares_keep_their_turns("two schedules", "cap")
+
+
+def _test_prepares_keep_their_turns_at_a_stagger_before_the_first_window():
+    prepares_keep_their_turns("stagger", "first")
+
+
+def _test_prepares_keep_their_turns_at_a_stagger_between_windows():
+    prepares_keep_their_turns("stagger", "between")
+
+
+def _test_prepares_keep_their_turns_at_a_stagger_under_a_cap_when_the_decisions_are_on_time():
+    """prepares_keep_their_turns() for stagger under a cap, with the
+    decisions on time."""
+    prepares_keep_their_turns("stagger", "cap", [0])
+
+
+def _test_prepares_keep_their_turns_at_a_stagger_under_a_cap_when_the_decisions_are_late():
+    """prepares_keep_their_turns() for stagger under a cap, with the
+    decisions 5 s late."""
+    prepares_keep_their_turns("stagger", "cap", [5])
+
+
+def _test_prepares_keep_their_turns_with_late_answers_before_the_first_window():
+    prepares_keep_their_turns("late answers", "first")
+
+
+def _test_prepares_keep_their_turns_with_late_answers_between_windows():
+    prepares_keep_their_turns("late answers", "between")
+
+
+def _test_prepares_keep_their_turns_with_late_answers_under_a_cap():
+    prepares_keep_their_turns("late answers", "cap")
+
+
+def _test_prepares_keep_their_turns_pairs_before_the_first_window():
+    prepares_keep_their_turns("pairs", "first")
+
+
+def _test_prepares_keep_their_turns_pairs_between_windows():
+    prepares_keep_their_turns("pairs", "between")
+
+
+def _test_prepares_keep_their_turns_pairs_under_a_cap():
+    prepares_keep_their_turns("pairs", "cap")
+
+
+def _test_prepares_keep_their_turns_five_before_the_first_window():
+    prepares_keep_their_turns("FIVE", "first")
+
+
+def _test_prepares_keep_their_turns_five_between_windows():
+    prepares_keep_their_turns("FIVE", "between")
+
+
+def _test_prepares_keep_their_turns_five_under_a_cap():
+    prepares_keep_their_turns("FIVE", "cap")
+
+
+def _test_prepares_keep_their_turns_two_before_the_first_window():
+    prepares_keep_their_turns("TWO", "first")
+
+
+def _test_prepares_keep_their_turns_two_between_windows():
+    prepares_keep_their_turns("TWO", "between")
+
+
+def _test_prepares_keep_their_turns_two_under_a_cap():
+    prepares_keep_their_turns("TWO", "cap")
+
+
+def _test_prepares_keep_their_turns_interleaved_before_the_first_window():
+    prepares_keep_their_turns("INTERLEAVED", "first")
+
+
+def _test_prepares_keep_their_turns_interleaved_between_windows():
+    prepares_keep_their_turns("INTERLEAVED", "between")
+
+
+def _test_prepares_keep_their_turns_interleaved_under_a_cap():
+    prepares_keep_their_turns("INTERLEAVED", "cap")
 
 
 def _test_the_prepares_are_the_plan():
@@ -5784,17 +6278,19 @@ def _test_revokes():
             testing.assertEqual((sorted(list(c.released_devices())), len(c.allowed)), (["d0"], 0), case.0)
 
 
-def _test_once():
-    """A member is let prepare once. ONE: d0 is let at 0 and reports its
-    prepare done, so it is let no more. When that report goes, as after a
-    flotilla restart, d0 gets no new turn. A pause keeps the time it was
-    let: when the run goes on, it is let again with that time while it
-    reports no prepare, and not while it reports its prepare done. After
-    the decision at 200, d0 has no turn left in any case."""
+def _test_a_member_is_let_again_until_it_prepares():
+    """A member gets one turn to prepare, and is let again while it has not
+    prepared. ONE: d0 is let at 0 and reports its prepare done, so it is
+    let no more. When that report goes, as after a flotilla restart, d0 is
+    let again at the next decision, with the time it was first let, and
+    gets no new turn. A pause keeps that time: when the run goes on, it is
+    let again while it reports no prepare, and not while it reports its
+    prepare done. After the decision at 200, d0 has no turn left in any
+    case."""
     # (case, whether d0's report goes, whether the run pauses and goes on,
     # whether d0 is let at 200)
     cases: list[(str, bool, bool, bool)] = [
-        ("report gone", True, False, False),
+        ("report gone", True, False, True),
         ("report gone, pause", True, True, True),
         ("pause", False, True, False),
     ]
@@ -5916,6 +6412,890 @@ def _test_copy_keeps_the_prepares():
     testing.assertEqual(sorted(list(r.allowed)), ["d1"])
     testing.assertEqual(len(c.allowed), 0)
     testing.assertEqual(c.prepare_at, {"d0": 0})
+
+
+#############################################################################
+# When the members prepare: the free time, the cap and the turns kept
+#############################################################################
+
+class NotAt(fleet_ctl.Fit):
+    """A fit that lets a member take any place but the places in places."""
+    places: list[int]
+
+    def __init__(self, places: list[int]):
+        self.places = places
+
+    mut def fits(self, j: int, pos: int) -> bool:
+        return pos not in self.places
+
+
+def _test_free_time():
+    """The free time between blackouts. Blackouts at 9000 to 11000 and
+    29000 to 31000 leave 0 to 9000, 11000 to 29000 and 31000 to the end.
+    Blackouts that overlap merge, and ones that only touch leave a free
+    instant between them. An origin inside a blackout starts at its end.
+    Inside a blackout, the free time before is the free time to its start.
+    The instant of a free value is the end of a stretch when the value
+    falls there, and the end of the blackout when it is asked from inside
+    one. Both ends of a blackout are free."""
+    end = fleet_ctl.OPEN_END * fleet_ctl.MICRO
+    two_b = [(9000, 11000), (29000, 31000)]
+    # (case, blackouts, origin, the stretches)
+    cases: list[(str, list[(int, int)], int, list[(int, int)])] = [
+        ("two", two_b, 0, [(0, 9000), (11000, 29000), (31000, end)]),
+        ("overlap", [(9000, 11000), (10000, 12000)], 0, [(0, 9000), (12000, end)]),
+        ("touch", [(9000, 11000), (11000, 12000)], 0, [(0, 9000), (11000, 11000), (12000, end)]),
+        ("origin inside", two_b, 10000, [(11000, 29000), (31000, end)]),
+        ("origin at a start", two_b, 9000, [(9000, 9000), (11000, 29000), (31000, end)]),
+        ("never ends", [(9000, end)], 0, [(0, 9000)]),
+    ]
+    for case in cases:
+        testing.assertEqual(fleet_ctl.FreeTime(case.1, case.2).spans, case.3, case.0)
+    f = fleet_ctl.FreeTime(two_b, 0)
+    # (x, the free time before it, whether it is free, the end of the
+    # blackout it lies inside or -1)
+    points: list[(int, int, bool, int)] = [
+        (0, 0, True, -1),
+        (5000, 5000, True, -1),
+        (9000, 9000, True, -1),
+        (10000, 9000, False, 11000),
+        (11000, 9000, True, -1),
+        (20000, 18000, True, -1),
+        (30000, 27000, False, 31000),
+        (40000, 36000, True, -1),
+    ]
+    for pt in points:
+        testing.assertEqual((f.before(pt.0), f.is_free(pt.0), f.inside(pt.0)),
+                            (pt.1, pt.2, pt.3), str(pt.0))
+    # (free value, lo, the instant)
+    instants: list[(int, int, int)] = [
+        (5000, 0, 5000),
+        (9000, 0, 9000),
+        (9000, 10000, 11000),
+        (9001, 0, 11001),
+        (18000, 0, 20000),
+        (27000, 0, 29000),
+        (5000, 20000, 20000),
+    ]
+    for x in instants:
+        testing.assertEqual(f.instant(x.0, x.1), x.2, "{x.0} from {x.1}")
+    testing.assertEqual(fleet_ctl.FreeTime([(9000, end)], 0).instant(9001, 0), end, "none left")
+
+
+def _test_place_turns():
+    """place_turns() puts each member without a turn where it leaves the
+    widest gap, and moves no turn. A stretch is cut at the member's
+    deadline, and one that ends at or before now is none. A new member
+    goes to the middle, or now when the middle has passed; a due member
+    goes now in the stretch that holds now. On a tie, the latest stretch
+    wins. A member that would go now right before a turn takes a wider
+    gap later, so two prepares do not bunch. Of several due members, one
+    goes now and the others spread after it. A place that fit rejects is
+    passed for the widest place left, and a member that fit lets take no
+    place has none."""
+    # (case, anchor, now, points, members as (deadline, due), the turns)
+    cases: list[(str, int, int, list[int], list[(int, bool)], list[int])] = [
+        ("plain", 0, 0, [30, 100], [(100, False)], [65]),
+        ("tie goes to the latest", 0, 0, [50, 100], [(100, False)], [75]),
+        ("cut by the deadline", 0, 0, [80], [(60, False)], [30]),
+        ("new, middle in the past", 0, 70, [100], [(100, False)], [70]),
+        ("due goes now", 0, 30, [100], [(100, True)], [30]),
+        ("due, too close to the next turn", 0, 45, [50, 100], [(100, True)], [75]),
+        ("past stretch skipped", 0, 70, [60, 100], [(100, False)], [80]),
+        ("no bunching before a kept turn", 0, 29, [30, 50, 70, 90, 100], [(100, False)], [80]),
+        ("no time left", 0, 100, [], [(100, False)], [100]),
+        ("two new members", 0, 0, [100], [(100, False), (100, False)], [50, 75]),
+        ("three due before a turn", 0, 80, [100], [(100, True), (100, True), (100, True)],
+         [80, 90, 95]),
+        ("three due, no turn ahead", 0, 90, [], [(100, True), (100, True), (100, True)],
+         [90, 95, 97]),
+        ("due, the last turn let now", 80, 80, [100], [(100, True)], [90]),
+    ]
+    for case in cases:
+        testing.assertEqual(fleet_ctl.place_turns(case.3, case.1, case.2, case.4), case.5, case.0)
+    # (case, now, points, members, the places that fit rejects, the turns)
+    rejected: list[(str, int, list[int], list[(int, bool)], list[int], list[int])] = [
+        ("the widest rejected", 0, [30, 100], [(100, False)], [65], [15]),
+        ("every place rejected", 0, [100], [(100, False)], [50, 100], [-1]),
+        ("no stretch, now rejected", 100, [], [(100, False)], [100], [-1]),
+        ("two members, the widest rejected", 0, [20, 100], [(100, False), (100, False)], [60],
+         [10, 15]),
+    ]
+    for case in rejected:
+        testing.assertEqual(fleet_ctl.place_turns(case.2, 0, case.1, case.3, NotAt(case.4)),
+                            case.5, case.0)
+
+
+def _test_sweep():
+    """Sweep at a cap of 100, with prepares from 0 to 50 at 60 and from 0
+    to 80 at 30: the bandwidth at instants that only move later. A
+    prepare fits while the prepares that run and it stay at or under the
+    cap, or when no other prepare runs. A prepare that ends at an instant
+    runs no more then. undo() takes back the prepares that ended since
+    mark(), so an earlier instant can be asked again."""
+    s = fleet_ctl.Sweep(100, [(0, 50, 60), (0, 80, 30)])
+    # (the instant, the bandwidth, whether it fits, the next end)
+    cases: list[(int, int, bool, int)] = [
+        (10, 10, True, 50),
+        (10, 11, False, 50),
+        (50, 70, True, 80),
+        (50, 71, False, 80),
+        (80, 150, True, -1),
+    ]
+    for case in cases:
+        testing.assertEqual((s.fits(case.0, case.1), s.next_end()), (case.2, case.3),
+                            "{case.0}, {case.1}")
+    m = fleet_ctl.Sweep(100, [(0, 50, 60)])
+    m.mark()
+    testing.assertEqual(m.fits(60, 60), True, "after the end")
+    m.undo()
+    testing.assertEqual(m.fits(10, 60), False, "taken back")
+    testing.assertEqual(fleet_ctl.Sweep(-1, [(0, 50, 60)]).fits(10, 1000), True, "no cap")
+
+
+def _test_load():
+    """Load at a cap of 100, with prepares from 0 to 100 at 60 and from 150
+    to 250 at 60: the bandwidth over time. A prepare fits when the
+    bandwidth stays at or under the cap at its start and at the start of
+    each prepare that starts while it runs, or where no other prepare
+    runs. A prepare taken counts for the next."""
+    ld = fleet_ctl.Load(100, [(0, 100, 60), (150, 250, 60)])
+    # (start, end, bandwidth, whether it fits)
+    cases: list[(int, int, int, bool)] = [
+        (100, 150, 100, True),
+        (50, 120, 40, True),
+        (50, 120, 41, False),
+        (120, 200, 40, True),
+        (120, 200, 41, False),
+        (300, 400, 500, True),
+        (200, 300, 500, False),
+    ]
+    for case in cases:
+        testing.assertEqual(ld.fits(case.0, case.1, case.2), case.3,
+                            "{case.0} to {case.1} at {case.2}")
+    ld.add(100, 150, 100)
+    testing.assertEqual(ld.fits(120, 130, 1), False, "taken")
+    testing.assertEqual(fleet_ctl.Load(-1, [(0, 100, 60)]).fits(0, 100, 1000), True, "no cap")
+
+
+def _test_the_bandwidth_of_the_prepares():
+    """The bandwidth of the prepares over time and its peak. ONE with an
+    image of 1250 bytes, 100 bit/s for 100 s: the turns are 2500 s apart,
+    so the bandwidth is 100 bit/s for 100 s from each turn, and 0 between.
+    When d4 reports its own prepare running at 0, without a turn of this
+    run, it runs from 0 too, so the bandwidth is 200 bit/s until 100, and
+    d0 to d3 share the time to the deadline. Without an image size, the
+    prepares use no bandwidth, and there are no steps."""
+    # (case, the image, whether d4 reports its prepare running, the
+    # steps, the peak)
+    cases: list[(str, int, bool, list[(int, int)], int)] = [
+        ("ONE", 1250, False,
+         [(0, 100), (100, 0), (2500, 100), (2600, 0), (5000, 100), (5100, 0), (7500, 100),
+          (7600, 0), (10000, 100), (10100, 0)], 100),
+        ("d4 runs", 1250, True,
+         [(0, 200), (100, 0), (3333, 100), (3433, 0), (6666, 100), (6766, 0), (10000, 100),
+          (10100, 0)], 200),
+        ("no image size", 0, False, [], 0),
+    ]
+    for case in cases:
+        c = controller([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
+                       prepare=True, image=case.1)
+        if case.2:
+            c.report_prepare("d4", "running")
+        c.plan(0)
+        p = c.prepares(0)
+        testing.assertEqual((p.steps, p.peak), (case.3, case.4), case.0)
+
+
+def _test_coarse_steps_keep_the_peak():
+    """coarse() gives a list of steps unchanged when it has at most most
+    steps. A longer list becomes one step per equal stretch of time, with
+    the highest level in the stretch, and a last step with the last level.
+    A short spike keeps its level. Two stretches with the same level give
+    one step."""
+    # (case, the steps, most, the result)
+    cases: list[(str, list[(int, int)], int, list[(int, int)])] = [
+        ("short", [(0, 5), (10, 0)], 3, [(0, 5), (10, 0)]),
+        ("longer", [(0, 5), (1, 0), (2, 7), (3, 0), (4, 3), (5, 0)], 3,
+         [(0, 7), (3, 3), (6, 0)]),
+        ("spike", [(0, 1), (5, 9), (6, 1), (10, 0), (20, 2), (30, 0)], 3,
+         [(0, 9), (16, 2), (32, 0)]),
+        ("same level", [(0, 4), (1, 0), (2, 4), (3, 0)], 3, [(0, 4), (4, 0)]),
+    ]
+    for case in cases:
+        testing.assertEqual(fleet_ctl.coarse(case.1, case.2), case.3, case.0)
+
+
+def _test_the_cap_spreads_the_turns_evenly():
+    """30 members of 600 s wait for a window that opens at 1150 and never
+    closes, each prepare 100 s with an image of 1250 bytes, 100 bit/s. At
+    a cap of 200 bit/s two prepares fit at once, so a turn every 50 s keeps
+    the bandwidth under the cap, and 21 members fit by the deadline at
+    1000: the turns are 50 s apart from 0 to 1000, not two at once and then
+    a gap. The other 9 cannot prepare before their window, the first one.
+    Without a cap, every member has a turn, 1000/29 s apart, and three
+    prepares run at once. So it is with the largest cap, here with an
+    image of 12 bytes, 1 bit/s."""
+    # (the cap, the size of the image, the first four starts, how many
+    # members have a start, the alarms, the peak)
+    cases: list[(int, int, list[int], int, list[str], int)] = [
+        (200, 1250, [0, 50, 100, 150], 21,
+         ["9 device(s) cannot prepare before their window opens: d21, d22, d23, d24, d25 and "
+          + "4 more"], 200),
+        (-1, 1250, [0, 34, 68, 103], 30, [], 300),
+        (9223372036854775807, 12, [0, 34, 68, 103], 30, [], 3),
+    ]
+    for case in cases:
+        c = controller([("w", 1150, fleet_ctl.OPEN_END)], devices("d", 30, 600, "w"), 2, 10,
+                       prepare=True, image=case.1, cap=case.0)
+        c.plan(0)
+        p = c.prepares(0)
+        starts = sorted(p.starts.values())
+        testing.assertEqual((starts[:4], len(starts), p.alarms, p.peak),
+                            (case.2, case.3, case.4, case.5), str(case.0))
+
+
+def _test_members_the_spread_leaves_take_places_among_the_turns():
+    """a0 to a9 and b0 to b9 of 600 s wait for a window that opens at 1150
+    and never closes, each prepare 100 s, at a cap of 250 bit/s: an a
+    copies an image of 2500 bytes, 200 bit/s, so it runs alone, and a b one
+    of 625 bytes, 50 bit/s. The spread gives a0 to a9 a turn every 100 s,
+    as the cap holds them, and b0 the deadline, 1000, so it leaves b1 to b9
+    without a turn. They take places among the turns where the cap lets
+    them, by the middles of the widest times between two turns, latest
+    first, each next to one a: b1 at 950 and b9 at 150. No member is named
+    as one that cannot prepare in time."""
+    devs = devices("a", 10, 600, "w") + devices("b", 10, 600, "w")
+    sizes = {d.0: 2500 if d.0.startswith("a") else 625 for d in devs}
+    c = Controller()
+    c.configure([("w", 1150, fleet_ctl.OPEN_END)], devs, 2, 10, False, 0, 600, {}, {}, {},
+                fleet_ctl.CLOSE_MARGIN, 0, True, {d.0: 100 for d in devs}, -1, None, sizes, True,
+                None, False, 250)
+    sim.answer_all(c, 0)
+    c.start(1)
+    p = c.decide(0).prepares
+    want = {"a{i}": 100 * i for i in range(10)}
+    want["b0"] = 1000
+    for i in range(1, 10):
+        want["b{i}"] = 1050 - 100 * i
+    testing.assertEqual((p.starts, p.alarms, p.peak), (want, [], 250))
+
+
+def _test_during_windows_a_member_prepares_while_another_window_is_open():
+    """TWO, where the members prepare only during windows: not before the
+    first window and not between windows. d0 and d1 cannot prepare before
+    their window, the first. d2 and d3 prepare while the first window is
+    open: d2 at its opening, 49150, and d3 at 50850, so that its prepare is
+    done 150 s before the window closes. d2 stays let while the first
+    window, of its own schedule, is open, as its own window is the second.
+    Neither has begun when the first window closes at 51000: the decision
+    at 50850 wakes then, and they stop being let, as no member prepares
+    between windows. They are not let again before their own window."""
+    c = controller(two_windows(), devices("d", 4, 600, "w"), 1, 1, prepare=True, first=False,
+                   between=False, during=True)
+    s = c.decide(0)
+    testing.assertEqual((s.prepares.starts, s.prepares.alarms),
+                        ({"d2": 49150, "d3": 50850},
+                         ["2 device(s) cannot prepare before their window opens: d0, d1"]), "0")
+    # (the time of the decision, the members let then)
+    times: list[(int, list[str])] = [(49150, ["d2"]), (49200, ["d2"]), (50850, ["d2", "d3"]),
+                                     (51000, []), (60000, [])]
+    for e in times:
+        w = c.decide(e.0).wake
+        testing.assertEqual(sorted(list(c.allowed)), e.1, str(e.0))
+        if e.0 == 50850:
+            testing.assertEqual(w, 51000, "the wake at 50850")
+
+
+def _test_without_between_windows_a_close_stops_the_prepares():
+    """Schedule a has a window from 49150 to 51000, and its only member a0
+    is up to date. d0 and d1 wait for w's window at 69150, and may prepare
+    only during windows: not before the first window and not between
+    windows. They prepare while a's window is open: d0 at its opening and
+    d1 at 50850, so that its prepare is done 150 s before the window
+    closes. The decision that lets d1 wakes at the close, 51000, as nothing
+    else wakes it then, and neither is let after it: they have not begun,
+    and no member prepares between windows."""
+    wins = [("a", 49150, 51000), ("w", 69150, 71000)]
+    c = controller(wins, devices("a", 1, 600, "a") + devices("d", 2, 600, "w"), 1, 1,
+                   prepare=True, first=False, between=False, during=True)
+    c.report("a0", "up-to-date", 0)
+    testing.assertEqual(c.decide(0).prepares.starts, {"d0": 49150, "d1": 50850}, "0")
+    # (the time of the decision, the members let then, the wake)
+    times: list[(int, list[str], int)] = [(49150, ["d0"], 50850), (50850, ["d0", "d1"], 51000),
+                                          (51000, [], 69150)]
+    for e in times:
+        w = c.decide(e.0).wake
+        testing.assertEqual((sorted(list(c.allowed)), w), (e.1, e.2), str(e.0))
+
+
+def _test_the_first_window_stays_when_it_closes():
+    """Schedule a has windows from 10150 to 12000 and from 30150 to 32000,
+    and its only member a0 is up to date, so no member is released in
+    them. b0 to b2 wait for b's window at 50150, each prepare 100 s, three
+    at a time. The
+    run decides at 9850, and at 13000 the schedules no longer give a's
+    first window, as it has closed. The campaign's first window is still
+    the one that opened at 10150. Without prepare before the first window,
+    b0 to b2 spread over the time between the windows from 12000: b0 is let
+    then, and b1 and b2 keep their turns at 30000 and 50000. With prepare
+    between windows off and a cap that lets one prepare run at a time, b0
+    and b1 prepare before the first window, and b2 cannot prepare in time;
+    after a's window closes, it still cannot."""
+    wins = [("a", 10150, 12000), ("a", 30150, 32000), ("b", 50150, 52000)]
+    devs = devices("a", 1, 600, "a") + devices("b", 3, 600, "b")
+    # (case, before the first window, between windows, the cap, the
+    # decisions before 13000, the starts at 13000, the alarms then)
+    cases: list[(str, bool, ?bool, int, list[int], dict[str, int], list[str])] = [
+        ("not before the first window", False, None, -1, [9850, 12000],
+         {"b0": 12000, "b1": 30000, "b2": 50000}, []),
+        ("not between windows", True, False, 100, [9850, 9950],
+         {"b0": 9850, "b1": 9950},
+         ["1 device(s) cannot prepare before their window opens: b2"]),
+    ]
+    for case in cases:
+        label = case.0
+        c = controller(wins, devs, 3, 3, prepare=True, image=1250, first=case.1, between=case.2,
+                       cap=case.3)
+        c.report("a0", "up-to-date", 0)
+        for t in case.4:
+            c.decide(t)
+            for name in c.allowed:
+                c.report_prepare(name, "done")
+        edit(c, wins[1:], devs)
+        s = c.decide(13000)
+        testing.assertEqual((c.first_open(), s.prepares.starts, s.prepares.alarms),
+                            (10150, case.5, case.6), label)
+
+
+def _test_the_members_of_the_earliest_window_prepare_first():
+    """a0 waits for a's window at 10150 and prepares for 100 s, and b0 for
+    b's window at 20150 and prepares for 300 s, each at 100 bit/s under a
+    cap of 100 bit/s, so one prepare runs at a time. The tail before the
+    first window is 450 s, so both deadlines before the first window count
+    from 9700. At 9500 there is time for both: a0 goes first, as its window
+    is the earlier, and b0 at 9700. Without prepare during windows, so a
+    member of a later window never takes the turn of a member of an
+    earlier one. With prepare during windows, there is no tail, and b0 goes
+    first by its earlier deadline, 9700, and a0 at its own, 10000."""
+    wins = [("a", 10150, 12000), ("b", 20150, 22000)]
+    devs = [("a0", 600, "a"), ("b0", 600, "b")]
+    # (case, during windows, the starts)
+    cases: list[(str, bool, dict[str, int])] = [
+        ("defaults", False, {"a0": 9500, "b0": 9700}),
+        ("during", True, {"b0": 9500, "a0": 10000}),
+    ]
+    for case in cases:
+        c = Controller()
+        c.configure(wins, devs, 1, 1, False, 0, 600, {}, {}, {}, fleet_ctl.CLOSE_MARGIN, 0, True,
+                    {"a0": 100, "b0": 300}, -1, None, {"a0": 1250, "b0": 3750}, True, None,
+                    case.1, 100)
+        sim.answer_all(c, 0)
+        c.start()
+        p = c.decide(9500).prepares
+        testing.assertEqual((p.starts, p.alarms), (case.2, []), case.0)
+
+
+def _test_the_plan_counts_the_members_that_wait_to_be_let_again():
+    """TWO with d0 to d2 and a cap that lets one prepare run at a time, at
+    10 kbit/s, and x, which has not answered and waits for a window of its
+    own schedule at 79150. d0 and d1 are let at their turns and prepare.
+    d2 is let at its turn, 49000, and has not begun when the first window
+    opens at 49150, which stops letting it. At 50000 the prepares count d2
+    from 51000, when the window closes and the run lets it again, so the
+    plan says that the members prepare between windows. x answers at
+    50000 and takes its turn when d2's prepare ends, and the run lets each
+    member when the plan said. Once d2 has prepared, the plan still says
+    that the members prepared between windows."""
+    wins = two_windows() + [("v", 79150, 81000)]
+    # (case, whether x answers at 50000, the starts at 50000, the steps of
+    # the bandwidth then, when the run lets each member after 50000)
+    cases: list[(str, bool, dict[str, int], list[(int, int)], dict[str, int])] = [
+        ("no x", False, {"d0": 0, "d1": 24500, "d2": 49000}, [(51000, 10000), (51100, 0)],
+         {"d2": 51000}),
+        ("x", True, {"d0": 0, "d1": 24500, "d2": 49000, "x": 51100},
+         [(51000, 10000), (51200, 0)], {"d2": 51000, "x": 51100}),
+    ]
+    for case in cases:
+        label = case.0
+        c = controller(wins, devices("d", 3, 600, "w") + [("x", 600, "v")], 1, 1, prepare=True,
+                       image=125000, cap=10000)
+        c.lost("x")
+        for t in [0, 24500, 49000, 49150]:
+            c.decide(t)
+            for name in ["d0", "d1"]:
+                if name in c.allowed:
+                    c.report_prepare(name, "done")
+        if case.1:
+            c.report("x", "upgrade-needed", 50000)
+        s = c.decide(50000)
+        p = s.prepares
+        testing.assertEqual((p.starts, p.runs, p.c, p.steps, p.between),
+                            (case.2, {"d2": 51000}, 1, case.3, True), label)
+        # Each member let after 50000 begins its prepare then, and it is
+        # done 100 s later.
+        lets: dict[str, int] = {}
+        ends: list[(int, str)] = []
+        t = 50000
+        while True:
+            nxt = s.wake if s.wake > t else -1
+            for e in ends:
+                if e.0 > t and (nxt < 0 or e.0 < nxt):
+                    nxt = e.0
+            if nxt < 0 or nxt > 70000:
+                break
+            t = nxt
+            for e in ends:
+                if e.0 == t:
+                    c.report_prepare(e.1, "done")
+            s = c.decide(t)
+            for name in sorted(list(c.allowed)):
+                if name not in lets:
+                    lets[name] = t
+                    c.report_prepare(name, "running")
+                    ends.append((t + 100, name))
+        testing.assertEqual((lets, c.prepares(70000).between), (case.4, True), label)
+
+
+def _test_a_member_let_again_counts_from_then():
+    """ONE with an image of 1250 bytes, 100 bit/s. d0 is let at 0 and has
+    not begun when the run pauses at 10. The run goes on at 500 and lets
+    d0 again; d0 reports its prepare running at 510. Its prepare counts
+    from 500, when it was let again, to 600, not from 0, when it was first
+    let: the plan at 520 has it, and its prepare-start stays 0."""
+    c = controller([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
+                   prepare=True, image=1250, cap=100)
+    c.decide(0)
+    c.stop()
+    c.decide(10)
+    c.start()
+    c.decide(500)
+    c.report_prepare("d0", "running")
+    p = c.decide(520).prepares
+    testing.assertEqual((p.starts["d0"], p.runs, p.c, p.steps[:2]),
+                        (0, {"d0": 500}, 1, [(500, 100), (600, 0)]))
+
+
+def _test_a_new_member_takes_a_place_that_the_cap_allows():
+    """ONE with a prepare of 1500 s and an image of 18750 bytes, 100 bit/s,
+    and x, which has not answered: the deadline is 7900, so d0 to d4 have
+    their turns at 0, 1975, 3950, 5925 and 7900, each prepare alone. x
+    answers at 100. Without a cap, and at a cap of 200 bit/s, it takes the
+    middle of the latest of the widest times between two turns, 6912,
+    where two prepares run at once at times. At a cap of 100 bit/s, no
+    place before its deadline lets x prepare alone, so it cannot prepare in
+    time. The others keep their turns."""
+    turns = {"d0": 0, "d1": 1975, "d2": 3950, "d3": 5925, "d4": 7900}
+    with_x = {"d0": 0, "d1": 1975, "d2": 3950, "d3": 5925, "d4": 7900, "x": 6912}
+    # (the cap, the starts after x answers, the alarms)
+    cases: list[(int, dict[str, int], list[str])] = [
+        (-1, with_x, []),
+        (200, with_x, []),
+        (100, turns, ["1 device(s) cannot prepare before their window opens: x"]),
+    ]
+    for case in cases:
+        c = controller([("w", 10150, fleet_ctl.OPEN_END)],
+                       devices("d", 5, 600, "w") + [("x", 600, "w")], 2, 10, prepare=True,
+                       prepare_s=1500, image=18750, cap=case.0)
+        c.report("x", None, 0)
+        testing.assertEqual(c.decide(0).prepares.starts, turns, "{case.0} at 0")
+        c.report("x", "upgrade-needed", 100)
+        s = c.decide(100)
+        testing.assertEqual((s.prepares.starts, s.prepares.alarms), (case.1, case.2),
+                            str(case.0))
+
+
+def _test_a_member_is_let_again_when_the_cap_allows():
+    """ONE with an image of 1250 bytes, 100 bit/s. d0 is let at 0 and does
+    not begin. The run pauses at 10, and goes on at 20, when d4 reports its
+    own prepare running, which counts from 20 as it was not let in this
+    run. At a cap of 100 bit/s, one prepare at a time, d0 is not let again
+    while d4's prepare runs: the decision at 20 wakes when it is expected
+    to end, at 120. d4 reports its prepare done then, and d0 is let again.
+    Without a cap, d0 is let again at 20, and the decision wakes at d1's
+    turn."""
+    # (the cap, whether d0 is let at 20, the wake)
+    cases: list[(int, bool, int)] = [
+        (100, False, 120),
+        (-1, True, 2500),
+    ]
+    for case in cases:
+        c = controller([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
+                       prepare=True, image=1250, cap=case.0)
+        c.decide(0)
+        c.stop()
+        c.report_prepare("d4", "running")
+        c.start()
+        c.revoke_prepares(20)
+        c.let_again(20)
+        s = c.decide(20)
+        testing.assertEqual(("d0" in c.allowed, s.wake), (case.1, case.2), str(case.0))
+        c.report_prepare("d4", "done")
+        c.decide(120)
+        testing.assertEqual(("d0" in c.allowed, c.prepare_at.get("d0")), (True, 0), str(case.0))
+
+
+def _test_a_change_of_the_settings_or_the_cap_spreads_the_turns_again():
+    """TWO: the decision at 0 lets d0, and d1 to d3 have their turns at
+    16333, 32666 and 49000, before the first window. At 100, prepare before
+    the first window goes off: d1, promised the first window, cannot
+    prepare in time, and d2 and d3 get new turns between the windows,
+    spread from d0's turn over the free time from the close of the first
+    window to their deadline: 60000 and 69000. At 200 it goes on again, and
+    the turns spread as before. ONE with x, which answers at 100 and takes
+    8750 between the turns of d3 and d4: a cap that comes at 200 gives the
+    waiting members new turns, spread from d0's, with x last."""
+    c = two(False)
+    c.decide(0)
+    # (the time of the change, before the first window, the starts then,
+    # the alarms then)
+    cases: list[(int, bool, dict[str, int], list[str])] = [
+        (100, False, {"d0": 0, "d2": 60000, "d3": 69000},
+         ["1 device(s) cannot prepare before their window opens: d1"]),
+        (200, True, {"d0": 0, "d1": 16333, "d2": 32666, "d3": 49000}, []),
+    ]
+    for case in cases:
+        c.configure(c.current, c.devices, c.target, c.maxc, c.must_place, c.debounce,
+                    c.estimate_s, c.groups, c.priority, c.separation, c.close_margin, c.stagger,
+                    c.prepare, c.prepare_est, c.failure_budget, c.hold_failed, c.prepare_size,
+                    case.1, c.prepare_between, c.prepare_during, c.prepare_cap)
+        s = c.decide(case.0)
+        testing.assertEqual((s.prepares.starts, s.prepares.alarms), (case.2, case.3),
+                            str(case.0))
+    o = controller([("w", 10150, fleet_ctl.OPEN_END)],
+                   devices("d", 5, 600, "w") + [("x", 600, "w")], 2, 10, prepare=True,
+                   image=1250)
+    o.report("x", None, 0)
+    o.decide(0)
+    o.report("x", "upgrade-needed", 100)
+    testing.assertEqual(o.decide(100).prepares.starts,
+                        {"d0": 0, "d1": 2500, "d2": 5000, "d3": 7500, "d4": 10000, "x": 8750},
+                        "x answers")
+    o.configure(o.current, o.devices, o.target, o.maxc, o.must_place, o.debounce, o.estimate_s,
+                o.groups, o.priority, o.separation, o.close_margin, o.stagger, o.prepare,
+                o.prepare_est, o.failure_budget, o.hold_failed, o.prepare_size, True, None, False,
+                1000)
+    testing.assertEqual(o.decide(200).prepares.starts,
+                        {"d0": 0, "d1": 2000, "d2": 4000, "d3": 6000, "d4": 8000, "x": 10000},
+                        "a cap comes")
+
+
+def _test_a_retried_member_takes_a_new_turn():
+    """ONE: the decision at 0 lets d0, and gives d1 to d4 their turns at
+    2500, 5000, 7500 and 10000. At 100, d2 and d3 get a new retry, or a new
+    target, and answer again. Each is a new member to prepare and takes
+    its place among the turns kept, d2 in the middle of 2500 to 10000 and
+    d3 in the latest of the two widest times left; neither keeps its old
+    turn."""
+    for case in ["retry", "new target"]:
+        c = one()
+        c.decide(0)
+        if case == "retry":
+            c.drop({"d2", "d3"})
+        else:
+            c.retarget({"d2", "d3"})
+            c.report("d2", None, 100)
+            c.report("d3", None, 100)
+        c.report("d2", "upgrade-needed", 100)
+        c.report("d3", "upgrade-needed", 100)
+        testing.assertEqual(c.decide(100).prepares.starts,
+                            {"d0": 0, "d1": 2500, "d2": 6250, "d3": 8125, "d4": 10000}, case)
+
+
+def _test_waiting_turns_stay_when_members_join_or_leave():
+    """ONE: the decision at 0 lets d0, and gives d1 to d4 their turns at
+    2500, 5000, 7500 and 10000. d2 leaves at 100: its answer goes, it goes
+    down, it answers up-to-date, it leaves the campaign, or it reports a
+    prepare of its own. The others keep their turns. When d2's answer
+    comes back at 200, it takes its old place, 5000, the middle of the
+    widest time; at 6000, after d1 went at 2500, it goes at once, which
+    leaves a wider gap than 8750. When d1 leaves at 100 and d5 joins at
+    4900, d5 goes at 8750, not at once 100 s before d2. FIVE, where the
+    members prepare between windows only: d5 leaves at 100 and d10 joins at
+    200 for the third window. d10 takes 41285, the middle of the free time
+    from d4's turn to its deadline, the widest free time between turns
+    before it, and every other start stays."""
+    four = {"d0": 0, "d1": 2500, "d3": 7500, "d4": 10000}
+    # (case, the starts at 100, the next decision and the starts then, or
+    # -1 for none)
+    cases: list[(str, dict[str, int], int, dict[str, int])] = [
+        ("answer gone", four, -1, {}),
+        ("down", four, -1, {}),
+        ("up to date", four, -1, {}),
+        ("removed", four, -1, {}),
+        ("own prepare", four, -1, {}),
+        ("answer back at 200", four, 200,
+         {"d0": 0, "d1": 2500, "d2": 5000, "d3": 7500, "d4": 10000}),
+        ("answer back at 6000", four, 6000,
+         {"d0": 0, "d1": 2500, "d2": 6000, "d3": 7500, "d4": 10000}),
+    ]
+    for case in cases:
+        label = case.0
+        c = one()
+        c.decide(0)
+        if case.0 == "down":
+            c.set_live("d2", False)
+        elif case.0 == "up to date":
+            c.report("d2", "up-to-date", 100)
+        elif case.0 == "removed":
+            edit(c, c.current, [d for d in c.devices if d.0 != "d2"])
+            c.drop({"d2"})
+        elif case.0 == "own prepare":
+            c.report_prepare("d2", "running")
+        else:
+            c.report("d2", None, 100)
+        testing.assertEqual(c.decide(100).prepares.starts, case.1, label)
+        if case.2 >= 0:
+            if case.2 > 2500:
+                c.decide(2500)
+            c.report("d2", "upgrade-needed", case.2)
+            testing.assertEqual(c.decide(case.2).prepares.starts, case.3, label)
+
+    c = one()
+    c.decide(0)
+    c.report("d1", None, 100)
+    c.decide(100)
+    edit(c, c.current, c.devices + [("d5", 600, "w")])
+    c.report("d5", "upgrade-needed", 4900)
+    testing.assertEqual(c.decide(4900).prepares.starts,
+                        {"d0": 0, "d2": 5000, "d3": 7500, "d4": 10000, "d5": 8750}, "d5 joins")
+
+    f = five(True)
+    before = f.decide(0).prepares.starts
+    edit(f, f.current, [d for d in f.devices if d.0 != "d5"])
+    f.drop({"d5"})
+    f.decide(100)
+    edit(f, f.current, f.devices + [("d10", 600, "w")])
+    f.report("d10", "upgrade-needed", 200)
+    s = f.decide(200)
+    testing.assertEqual(f.promised_window("d10"), five_windows()[2], "FIVE: d10's window")
+    want = {n: at for n, at in before.items() if n != "d5"}
+    want["d10"] = 41285
+    testing.assertEqual(s.prepares.starts, want, "FIVE: d10 joins")
+
+
+def _test_a_member_let_before_a_window_is_let_again_after_it():
+    """TWO. d2 is let prepare at its turn, 32666, before the first window,
+    which then opens at 49150 and closes at 51000. A member that has not
+    begun its prepare, or prepares, when a window opens is let no more: no
+    prepare runs into an upgrade. When the window closes, it is let again
+    between the windows, with the time it was first let, as its deadline for
+    its own window is ahead. One that prepared is not. d2 loses its answer
+    at 48000 and answers again at 49050, in the time without prepares before
+    the first opening, so it is let again only at the close."""
+    # (case, whether a cap lets one prepare run at a time, d2's prepare
+    # report after its let, or "" for none,
+    # whether d2's answer goes and comes back, whether it is let at 49050,
+    # at 49150 and at 51000)
+    cases: list[(str, bool, str, bool, (bool, bool, bool))] = [
+        ("no prepare", False, "", False, (True, False, True)),
+        ("running", False, "running", False, (True, False, True)),
+        ("done", False, "done", False, (False, False, False)),
+        ("answer gone and back", False, "", True, (False, False, True)),
+    ]
+    for case in cases:
+        label = case.0
+        c = two(case.1)
+        times = [0, 16333, 32666, 48000, 49000, 49050, 49150, 49750, 50350, 51000]
+        allowed: dict[int, bool] = {}
+        for t in times:
+            if t == 48000 and case.3:
+                c.report("d2", None, t)
+            elif t == 49050 and case.3:
+                c.report("d2", "upgrade-needed", t)
+            elif t == 49750:
+                c.report("d0", "succeeded", t)
+            elif t == 50350:
+                c.report("d1", "succeeded", t)
+            c.decide(t)
+            if t == 32666:
+                testing.assertEqual(c.prepare_at.get("d2"), 32666, label)
+                st = case.2
+                if st != "":
+                    c.report_prepare("d2", st)
+            allowed[t] = "d2" in c.allowed
+        testing.assertEqual((allowed[49050], allowed[49150], allowed[51000]), case.4, label)
+        testing.assertEqual(c.prepare_at.get("d2"), 32666, label)
+
+
+def _test_a_moved_promise_moves_the_deadline():
+    """TWO. A member's latest deadline follows its promise. d1 goes down at
+    100, while the first window is promised to it, and loses its turn. The
+    window closes at 51000 with d1 held, so its promise moves to the second
+    window, and the plan names it. It comes back up at 52000, when no turn
+    is left, and goes at once, between the windows. An edit at 100 that
+    moves the second window an hour earlier moves no turn: every member
+    still prepares before the first window."""
+    earlier = [("w", 49150, 51000), ("w", 69150 - HOUR, 71000 - HOUR)]
+    # (case, the event, the decisions, the starts after the last one,
+    # whether the plan at 51000 names d1)
+    cases: list[(str, str, list[int], dict[str, int], bool)] = [
+        ("d1 down", "down", [0, 100, 16333, 32666, 49000, 49150, 49750, 51000, 52000],
+         {"d0": 0, "d2": 32666, "d3": 49000, "d1": 52000}, True),
+        ("window 2 earlier", "edit", [0, 100],
+         {"d0": 0, "d1": 16333, "d2": 32666, "d3": 49000}, False),
+    ]
+    for case in cases:
+        label = case.0
+        c = two(False)
+        named = False
+        last = fleet_ctl.Prepares({}, 0, [])
+        for t in case.2:
+            if t == 100 and case.1 == "down":
+                c.set_live("d1", False)
+            elif t == 100:
+                edit(c, earlier, c.devices)
+            elif t == 49750:
+                c.report("d0", "succeeded", t)
+            elif t == 52000:
+                c.set_live("d1", True)
+            s = c.decide(t)
+            last = s.prepares
+            if t == 51000:
+                for alarm in s.plan.alarms:
+                    if "lost their promised window" in alarm and "d1" in alarm:
+                        named = True
+        testing.assertEqual(last.starts, case.3, label)
+        testing.assertEqual(named, case.4, label)
+
+
+def _test_a_window_with_a_member_in_flight_keeps_the_prepares_out():
+    """TWO: d0 to d3 are let at their turns, and d0 starts when the first
+    window opens at 49150, which stops letting the others. An edit at 49200
+    takes the first window out of the schedules: d1's promise moves to the
+    second window, and d0 still upgrades in the first. While the first
+    window holds d0, no member prepares, so d1 is not let again; once d0 is
+    done at 49750, it is, between the windows."""
+    c = two(False)
+    for t in [0, 16333, 32666, 49000, 49150]:
+        c.decide(t)
+    testing.assertEqual((sorted(list(c.allowed)), sorted(list(c.released_devices()))),
+                        ([], ["d0"]))
+    edit(c, two_windows()[1:], c.devices)
+    c.decide(49200)
+    testing.assertEqual((c.promised_window("d1"), "d1" in c.allowed),
+                        (two_windows()[1], False), "49200")
+    c.report("d0", "succeeded", 49750)
+    c.decide(49750)
+    testing.assertEqual((c.is_released("d1"), "d1" in c.allowed, c.prepare_at.get("d1")),
+                        (False, True, 16333), "49750")
+
+
+def run_on(c: Controller, t0: int, until: int, failing: list[str]) -> list[(int, set[str])]:
+    """Run c from t0 until until, at the decisions it wakes for, each
+    device that starts succeeding at its expected end, or failing for the
+    devices in failing, and nothing else reported. Return the members let
+    prepare after each decision."""
+    out: list[(int, set[str])] = []
+    flying: list[(int, str)] = []
+    t = t0
+    while t <= until:
+        still: list[(int, str)] = []
+        for f in flying:
+            if f.0 <= t:
+                c.report(f.1, "failed" if f.1 in failing else "succeeded", f.0)
+            else:
+                still.append(f)
+        flying = still
+        s = c.decide(t)
+        out.append((t, fleet_ctl.copy_set(c.allowed)))
+        for name in s.started:
+            flying.append((t + c.est[name], name))
+        nxt = s.wake
+        for f in flying:
+            if nxt < 0 or f.0 < nxt:
+                nxt = f.0
+        if s.finished or nxt < 0:
+            break
+        t = nxt
+    return out
+
+
+def _test_a_prepared_member_keeps_its_window_and_start():
+    """TWO: d2 is let at 32666 and has prepared by 32766. Then d0 leaves the
+    campaign, a new member d4 joins and answers, the target rises, the run
+    pauses and goes on, or d0 fails. d2 keeps the second window and its
+    prepare-start of 32666, is never let again, and starts in the second
+    window."""
+    events = ["d0 leaves", "d4 joins", "target raised", "pause", "d0 fails"]
+    for event in events:
+        c = two(False)
+        for t in [0, 16333, 32666]:
+            c.decide(t)
+        testing.assertEqual(c.prepare_at.get("d2"), 32666, event)
+        c.report_prepare("d2", "running")
+        c.report_prepare("d2", "done")
+        c.decide(32766)
+        t0 = 33000
+        if event == "d0 leaves":
+            edit(c, c.current, [d for d in c.devices if d.0 != "d0"])
+            c.drop({"d0"})
+        elif event == "d4 joins":
+            edit(c, c.current, c.devices + [("d4", 600, "w")])
+            c.report("d4", "upgrade-needed", t0)
+        elif event == "target raised":
+            limits(c, 2, 2)
+        elif event == "pause":
+            c.stop()
+            t0 = 34000
+            c.start()
+            c.revoke_prepares(t0)
+            c.let_again(t0)
+        failing: list[str] = []
+        if event == "d0 fails":
+            failing = ["d0"]
+        lets = run_on(c, t0, 3 * DAY, failing)
+        for e in lets:
+            testing.assertEqual("d2" in e.1, False, "{event}: d2 let at {e.0}")
+        testing.assertEqual((c.prepare_at.get("d2"), c.release_windows().get("d2")),
+                            (32666, two_windows()[1]), event)
+
+
+def _test_no_prepare_while_a_window_is_open():
+    """Every member reports its prepare, with the decisions on time and 5 s
+    late (same_as_a_new_plan, which also checks that each let is at a free
+    instant and by its deadline), with the default settings and between
+    windows only. FIVE, TWO, INTERLEAVED, FIVE with d9 answering during the
+    first window, and FIVE with d5 down at its turn until the second
+    window. Each member that starts in a window was let by 150 s before it
+    opened, or its prepares named it as one that cannot prepare in time.
+    The devices start where and when they start with prepare off."""
+    # (case, windows, devices, the devices that answer later, as (time,
+    # name), the changes of up and down)
+    cases: list[(str, list[(str, int, int)], list[(str, int, str)], list[(int, str)],
+                 list[(int, str, bool)])] = [
+        ("FIVE", five_windows(), devices("d", 10, 600, "w"), [], []),
+        ("TWO", two_windows(), devices("d", 4, 600, "w"), [], []),
+        ("INTERLEAVED", interleaved_windows(), interleaved_devices(), [], []),
+        ("FIVE, d9 answers in window 1", five_windows(), devices("d", 10, 600, "w"),
+         [(10000, "d9")], []),
+        ("FIVE, d5 down until window 2", five_windows(), devices("d", 10, 600, "w"), [],
+         [(100, "d5", False), (30000, "d5", True)]),
+    ]
+    for case in cases:
+        for between in [False, True]:
+            for late in [0, 5]:
+                label = "{case.0}, {late} s late, between windows only {between}"
+                runs: list[dict[str, ((str, int, int), int)]] = []
+                for prepare in [False, True]:
+                    c = controller(case.1, case.2, 1, 1, False, 1, 600, prepare=prepare,
+                                   first=not between)
+                    for a in case.3:
+                        c.lost(a.1)
+                    named: set[str] = set()
+                    same_as_a_new_plan(c, {}, 2 * DAY, late, answers=case.3, prepare=prepare,
+                                       lives=case.4, late_names=named)
+                    runs.append(sim.started(c))
+                    if prepare:
+                        for name, w in c.release_windows().items():
+                            at = c.prepare_at.get(name)
+                            if at is not None:
+                                testing.assertTrue(at <= w.1 - 150 or name in named,
+                                                   "{label}: {name} let at {at} for {w.1}")
+                            else:
+                                testing.assertTrue(name in named or w.1 == 0,
+                                                   "{label}: {name} not let for {w.1}")
+                testing.assertEqual(runs[1], runs[0], label)
 
 
 #############################################################################
@@ -6203,45 +7583,58 @@ def _test_decisions_over_the_failure_budget_decide_as_a_new_plan():
 
 
 def _test_no_member_prepares_while_more_members_failed_than_the_budget():
-    """ONE with a budget of zero: the decision at 0 lets d0 prepare. d4
-    reports failed at 50, as when it left the campaign and joined it again
-    with the same attempt, so more members failed than the budget: d0 is
-    let no more, no member has a turn, and the prepares show only d0's
-    from 0. The hold keeps d0's turn. When the budget rises to one at
-    2500, the turns go on from d0's: d1, d2 and d3 share the time to their
-    deadline at 10000, so d1 goes at 3333. d0 has had its turn in this
-    run."""
-    c = controller([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
-                   prepare=True, failure_budget=0)
-    c.decide(0)
-    testing.assertEqual(sorted(list(c.allowed)), ["d0"])
-    c.report("d4", "failed", 50)
-    s = c.decide(100)
-    tr = c.turns(100)
-    testing.assertEqual((len(c.allowed), len(tr.0), len(tr.1)), (0, 0, 0))
-    testing.assertEqual(s.prepares.starts, {"d0": 0})
-    reconfigure(c, c.devices, 1)
-    s = c.decide(2500)
-    testing.assertEqual((len(c.allowed), s.wake), (0, 3333))
-    testing.assertEqual(s.prepares.starts, {"d0": 0, "d1": 3333, "d2": 6666, "d3": 10000})
-    c.decide(3333)
-    testing.assertEqual(sorted(list(c.allowed)), ["d1"])
+    """ONE with a budget of zero: the decision at 0 lets d0 prepare, and
+    gives d1 to d4 their turns at 2500, 5000, 7500 and 10000. d4 reports
+    failed at 50, from an earlier run, so more members failed than the
+    budget: d0 is let no more, no member has a turn, and the prepares show
+    only d0's from 0. The hold keeps the turns. When the budget rises to
+    one at 2500, d1 is let at its turn, and d2 and d3 keep theirs; d4 has
+    failed and waits to prepare no more. d0 keeps the time it was first
+    let, and is let again unless it prepared: its device may not have
+    begun before the hold."""
+    # (case, d0's prepare before the hold, the members let at 2500)
+    cases: list[(str, ?str, list[str])] = [
+        ("d0 has not begun", None, ["d0", "d1"]),
+        ("d0 prepares", "running", ["d0", "d1"]),
+        ("d0 prepared", "done", ["d1"]),
+    ]
+    for case in cases:
+        label = case.0
+        c = controller([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
+                       prepare=True, failure_budget=0)
+        c.decide(0)
+        testing.assertEqual(sorted(list(c.allowed)), ["d0"], label)
+        c.report_prepare("d0", case.1)
+        c.report("d4", "failed", 50)
+        s = c.decide(100)
+        tr = c.turns(100)
+        testing.assertEqual((len(c.allowed), len(tr.0), len(tr.1)), (0, 0, 0), label)
+        testing.assertEqual(s.prepares.starts, {"d0": 0}, label)
+        reconfigure(c, c.devices, 1)
+        s = c.decide(2500)
+        testing.assertEqual((sorted(list(c.allowed)), s.wake), (case.2, 5000), label)
+        testing.assertEqual(s.prepares.starts, {"d0": 0, "d1": 2500, "d2": 5000, "d3": 7500},
+                            label)
+        testing.assertEqual(c.prepare_at, {"d0": 0, "d1": 2500}, label)
 
 
 def _test_a_short_budget_hold_keeps_the_turns():
     """ONE with a budget of zero, and x, which has not answered: d0 goes
     at 0, and d1 to d4 have their turns 2500 s apart. x reports failed at
-    1000, as when it left the campaign and joined it again with the same
-    attempt, so more members failed than the budget: no member is let, and
-    no member has a turn. When x's status goes, the hold ends. A hold that
-    ends before d1's turn keeps the turns. One that ends after it lets d1
-    at once and spreads the rest from then."""
+    1000, from an earlier run, so more members failed than the budget: no
+    member is let, and no member has a turn. When x's status goes, the
+    hold ends. A hold that ends before d1's turn keeps the turns. One that
+    ends after it lets d1 at once, and the others keep their turns. One
+    that ends after d3's turn lets d1 at once and spreads d2 and d3 after
+    it, before d4's turn."""
     # (case, the end of the hold, the decision's wake, the starts after it)
     cases: list[(str, int, int, dict[str, int])] = [
         ("ends before d1's turn", 2000, 2500,
          {"d0": 0, "d1": 2500, "d2": 5000, "d3": 7500, "d4": 10000}),
-        ("ends after d1's turn", 3000, 5333,
-         {"d0": 0, "d1": 3000, "d2": 5333, "d3": 7666, "d4": 10000}),
+        ("ends after d1's turn", 3000, 5000,
+         {"d0": 0, "d1": 3000, "d2": 5000, "d3": 7500, "d4": 10000}),
+        ("ends after d3's turn", 8000, 9000,
+         {"d0": 0, "d1": 8000, "d2": 9000, "d3": 9500, "d4": 10000}),
     ]
     for case in cases:
         c = controller([("w", 10150, fleet_ctl.OPEN_END)],

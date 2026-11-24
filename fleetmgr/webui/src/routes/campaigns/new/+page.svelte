@@ -12,7 +12,14 @@
   import { memberImages, modelGroups, targetCounts, withPreselected } from '#lib/software/campaign-images.ts';
   import { DATA_ROOT, campaignCreatePatch, validateNewCampaign, type Device } from '#lib/software/model.ts';
   import ModelImages from '#lib/software/ModelImages.svelte';
-  import { NOTICE_ERROR, noticeDays } from '#lib/software/planning-form.ts';
+  import {
+    BANDWIDTH_ERROR,
+    NOTICE_ERROR,
+    bandwidthBits,
+    noticeDays,
+    type BetweenWindows
+  } from '#lib/software/planning-form.ts';
+  import PrepareFields from '#lib/software/PrepareFields.svelte';
   import SelectionBuilder from '#lib/software/SelectionBuilder.svelte';
   import { campaignOwners, emptySelection, type Selection } from '#lib/software/selection.ts';
   import type { PageProps } from './$types';
@@ -38,6 +45,14 @@
   let picks = $state<Record<string, string>>({});
   let name = $state('');
   let allowStaging = $state(false);
+  // When the members may prepare, and the cap of their bandwidth in Mbit/s
+  // as typed: the model's defaults to start with.
+  let prepare = $state<{ first: boolean; between: BetweenWindows; during: boolean; maxBandwidth: string }>({
+    first: true,
+    between: 'auto',
+    during: false,
+    maxBandwidth: ''
+  });
   // A device that runs its image already has nothing to install; one on a
   // newer release would be downgraded, which can be what is wanted.
   let leaveOnTarget = $state(true);
@@ -67,6 +82,9 @@
       ...validateNewCampaign({ name, devices: members }, campaigns.map((c) => c.name)).errors
     };
     if (noticeDays(notice) === null) out['notification-period'] = NOTICE_ERROR;
+    if (allowStaging && bandwidthBits(prepare.maxBandwidth) === undefined) {
+      out['prepare-max-bandwidth'] = BANDWIDTH_ERROR;
+    }
     return out;
   });
 
@@ -105,6 +123,10 @@
           name: campaign,
           devices: members,
           allowStaging,
+          prepareFirst: prepare.first,
+          prepareBetween: prepare.between === 'auto' ? null : prepare.between === 'on',
+          prepareDuring: prepare.during,
+          prepareMaxBandwidth: bandwidthBits(prepare.maxBandwidth) ?? null,
           notificationPeriod: noticeDays(notice) ?? 0
         })
       );
@@ -226,6 +248,15 @@
           <input type="checkbox" bind:checked={allowStaging} />
           <span>Prepare ahead</span>
         </label>
+        {#if allowStaging}
+          <div class="prepare">
+            <PrepareFields
+              settings={prepare}
+              error={touched ? errors['prepare-max-bandwidth'] : ''}
+              onchange={(next) => (prepare = next)}
+            />
+          </div>
+        {/if}
       </div>
       <div>
         <!-- In place before any message, so that a screen reader reads it. -->
@@ -264,6 +295,10 @@
   .name {
     grid-column: 1 / -1;
     max-width: 420px;
+  }
+
+  .prepare {
+    grid-column: 1 / -1;
   }
 
   .ahead {
