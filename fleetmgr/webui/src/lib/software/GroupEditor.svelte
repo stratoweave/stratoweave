@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, tick } from 'svelte';
   import { flip } from 'svelte/animate';
   import { goto, invalidate } from '$app/navigation';
 
@@ -12,6 +12,8 @@
   import TokenSelect from '#lib/core/ui/TokenSelect.svelte';
   import { formatDuration } from '#lib/core/time.ts';
   import {
+    FAILURE_TEXT,
+    SEPARATION_TEXT,
     addMembersPatch,
     byUpgradeOrder,
     devicesText,
@@ -34,13 +36,14 @@
   } from '#lib/software/model.ts';
 
   const PAGE_SIZE = 100;
-  const SEPARATIONS: { value: SeparationPolicy; label: string }[] = [
-    { value: 'spread', label: 'spread' },
-    { value: 'pack', label: 'pack' }
+  // What each option does, as its tooltip.
+  const SEPARATIONS: { value: SeparationPolicy; label: string; title: string }[] = [
+    { value: 'spread', label: 'spread', title: SEPARATION_TEXT.spread },
+    { value: 'pack', label: 'pack', title: SEPARATION_TEXT.pack }
   ];
-  const FAILURES: { value: FailurePolicy; label: string }[] = [
-    { value: 'continue', label: 'continue' },
-    { value: 'hold', label: 'hold' }
+  const FAILURES: { value: FailurePolicy; label: string; title: string }[] = [
+    { value: 'continue', label: 'continue', title: FAILURE_TEXT.continue },
+    { value: 'hold', label: 'hold', title: FAILURE_TEXT.hold }
   ];
 
   interface Props {
@@ -129,17 +132,30 @@
     const target = removeTarget;
     removeTarget = null;
     if (!target) return;
+    const index = paged.rows.findIndex((d) => d.name === target.name);
     try {
       busy = true;
       statusMessage = null;
       await removeFromGroup(target.name, name);
       statusMessage = { type: 'success', text: `Removed ${target.name}.` };
       await invalidate('data:group');
+      await focusRow(index);
     } catch (error) {
       statusMessage = { type: 'error', text: errorText(error, `Failed to remove ${target.name}.`) };
     } finally {
       busy = false;
     }
+  }
+
+  /** Focus the device link of the row that took the place of row index,
+   * or of the row before it; with no row left, the add field. The removed
+   * member's Remove, which had focus, went with its row. */
+  async function focusRow(index: number): Promise<void> {
+    await tick();
+    const links = tbody?.querySelectorAll<HTMLElement>('.device-name') ?? [];
+    const next = links[Math.min(index, links.length - 1)];
+    if (next) next.focus();
+    else document.getElementById(`${uid}-add`)?.focus();
   }
 
   const DRAG_PX = 4;
@@ -218,15 +234,35 @@
 
   /** The arrow keys on a grip move its row up or down by one. */
   function onGripKey(event: KeyboardEvent, member: Device): void {
-    if (busy || (event.key !== 'ArrowUp' && event.key !== 'ArrowDown')) return;
+    if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
     event.preventDefault();
+    if (busy) return;
     const order = members.map((d) => d.name);
     const k = order.indexOf(member.name);
     const to = event.key === 'ArrowUp' ? k - 1 : k + 1;
     if (to < 0 || to >= order.length) return;
     order.splice(k, 1);
     order.splice(to, 0, member.name);
+    follow(member.name, order, '.grip');
     void reorder(member.name, order);
+  }
+
+  // The field a key moved a member from. Moving its row takes focus from
+  // the field, so the field gets it back once the row is in its place.
+  let keyMoved: { name: string; field: '.grip' | '.prio' } | null = null;
+
+  /** Keeps the field of member `name` in view as it moves to its place in
+   * `order`, on another page if that is where it goes. */
+  function follow(name: string, order: string[], field: '.grip' | '.prio'): void {
+    keyMoved = { name, field };
+    page = Math.floor(order.indexOf(name) / PAGE_SIZE) + 1;
+  }
+
+  async function refocus(): Promise<void> {
+    const moved = keyMoved;
+    if (!moved) return;
+    await tick();
+    tbody?.querySelector<HTMLElement>(`tr[data-member="${CSS.escape(moved.name)}"] ${moved.field}`)?.focus();
   }
 
   // A device has one priority for all its groups: a new order that moves
@@ -235,7 +271,8 @@
   let reorderMessage = $derived.by(() => {
     if (!confirmReorder) return '';
     const { changes, groups } = confirmReorder;
-    const names = groups.length > 5 ? `${groups.slice(0, 5).join(', ')} and ${groups.length - 5} more` : groups.join(', ');
+    const names =
+      groups.length > 5 ? `${groups.slice(0, 5).join(', ')} and ${(groups.length - 5).toLocaleString()} more` : groups.join(', ');
     const what = changes.size === 1 ? `The new priority of ${[...changes.keys()][0]} also changes` : 'The new priorities also change';
     return `${what} the order in ${names}.`;
   });
@@ -260,8 +297,9 @@
     drafts = new Map([...drafts].filter(([d]) => !gone.has(d)));
   }
 
-  /** Enter or leaving the field saves a typed priority that is valid. */
-  function commitPriority(member: Device): void {
+  /** Enter (`byKey`) or leaving the field saves a typed priority that is
+   * valid. */
+  function commitPriority(member: Device, byKey: boolean): void {
     const text = drafts.get(member.name);
     if (text === undefined || busy || confirmReorder !== null) return;
     const p = parsePriority(text);
@@ -271,7 +309,9 @@
       return;
     }
     const moved = members.map((d) => (d.name === member.name ? { ...d, priority: p } : d));
-    void applyPriorities(new Map([[member.name, p]]), moved.sort(byUpgradeOrder).map((d) => d.name));
+    const order = moved.sort(byUpgradeOrder).map((d) => d.name);
+    if (byKey) follow(member.name, order, '.prio');
+    void applyPriorities(new Map([[member.name, p]]), order);
   }
 
   /** Saves new priorities, after a question when they change the order of
@@ -283,6 +323,7 @@
       confirmReorder = { changes, groups };
       return;
     }
+    void refocus();
     await savePriorities(changes);
   }
 
@@ -300,6 +341,9 @@
     } finally {
       busy = false;
       pendingOrder = null;
+      // A failed save moves the row back.
+      void refocus();
+      keyMoved = null;
     }
   }
 
@@ -307,11 +351,14 @@
     if (confirmReorder) dropDrafts(confirmReorder.changes.keys());
     confirmReorder = null;
     pendingOrder = null;
+    void refocus();
+    keyMoved = null;
   }
 
   async function confirmReorderSave(): Promise<void> {
     const c = confirmReorder;
     confirmReorder = null;
+    void refocus();
     if (c) await savePriorities(c.changes);
   }
 
@@ -391,7 +438,7 @@
       statusMessage = {
         type: 'error',
         text: current
-          ? `Removed ${done} of ${devicesText(names.length)}; ${current} failed: ${reason}`
+          ? `Removed ${done.toLocaleString()} of ${devicesText(names.length)}; ${current} failed: ${reason}`
           : `Failed to delete the entry: ${reason}`
       };
       await invalidate('data:group');
@@ -402,9 +449,11 @@
   }
 
   let deleteMessage = $derived(
-    members.length > 0
+    members.length > 1
       ? `Delete ${name}? Its ${devicesText(members.length)} leave the group, one write each.`
-      : `Delete ${name}?`
+      : members.length === 1
+        ? `Delete ${name}? Its device leaves the group.`
+        : `Delete ${name}?`
   );
 </script>
 
@@ -428,13 +477,21 @@
 
 {#if progress}
   <div class="success-banner status">
-    Removing the group from {Math.min(progress.done + 1, progress.total)} of {devicesText(progress.total)}…
-  </div>
-{:else if statusMessage}
-  <div class={statusMessage.type === 'error' ? 'error-state status' : 'success-banner status'}>
-    {statusMessage.text}
+    Removing the group from {Math.min(progress.done + 1, progress.total).toLocaleString()} of {devicesText(progress.total)}…
   </div>
 {/if}
+
+<!-- In place before any message, so that a screen reader reads each one. -->
+<div role="status">
+  {#if statusMessage?.type === 'success'}
+    <div class="success-banner status">{statusMessage.text}</div>
+  {/if}
+</div>
+<div role="alert">
+  {#if statusMessage?.type === 'error'}
+    <div class="error-state status">{statusMessage.text}</div>
+  {/if}
+</div>
 
 <section class="card">
   <h2 class="panel-title">Members</h2>
@@ -450,7 +507,12 @@
             {/if}
             <th class="right">#</th>
             <th>Device</th>
-            <th class="right" title="Lower goes first. Type a value or drag a row.">Priority</th>
+            <th
+              class="right"
+              title="Lower priority goes first; equal priorities go in order of device name. Type a value or drag a row."
+            >
+              Priority
+            </th>
             <th class="col-platform">Model</th>
             <th class="col-platform">Version</th>
             <th>Campaigns</th>
@@ -467,12 +529,14 @@
             >
               {#if canMove}
                 <td class="col-grip">
+                  <!-- Not disabled while busy: that would take focus from
+                       the grip whose arrow key started the save. -->
                   <button
                     class="grip"
                     type="button"
                     aria-label={`Move ${member.name}`}
                     title="Drag to change the upgrade order, or use the arrow keys"
-                    disabled={busy}
+                    aria-disabled={busy ? 'true' : undefined}
                     onpointerdown={(e) => onGripDown(e, member)}
                     onkeydown={(e) => onGripKey(e, member)}
                   >
@@ -489,6 +553,7 @@
                 <a class="device-name" href={`/devices/${encodeURIComponent(member.name)}`}>{member.name}</a>
               </td>
               <td class="tn right">
+                <!-- Read-only while busy, not disabled, for the same reason. -->
                 <input
                   class="input compact mono prio"
                   class:has-error={drafts.has(member.name) && parsePriority(drafts.get(member.name) ?? '') === null}
@@ -497,16 +562,17 @@
                   aria-label={`Priority of ${member.name}`}
                   title="0 to 65535, lower goes first"
                   value={drafts.get(member.name) ?? String(member.priority)}
-                  disabled={busy}
+                  readonly={busy}
+                  aria-disabled={busy ? 'true' : undefined}
                   oninput={(e) => setDraft(member.name, e.currentTarget.value)}
                   onkeydown={(e) => {
-                    if (e.key === 'Enter') commitPriority(member);
+                    if (e.key === 'Enter') commitPriority(member, true);
                     if (e.key === 'Escape') {
                       setDraft(member.name, null);
                       e.currentTarget.value = String(member.priority);
                     }
                   }}
-                  onblur={() => commitPriority(member)}
+                  onblur={() => commitPriority(member, false)}
                 />
               </td>
               <td class="col-platform">
@@ -581,7 +647,7 @@
           ariaLabel="Separation policy"
           onchange={pickSeparation}
         />
-        <label class="dim" for={`${uid}-min`}>Min separation</label>
+        <label class="inline-label" for={`${uid}-min`}>Min separation</label>
         <input
           id={`${uid}-min`}
           class="input compact mono min"
@@ -602,8 +668,10 @@
       {/if}
     </div>
     <span class="policy-label">On failure</span>
-    <div class="policy-row">
-      <SegmentedControl options={FAILURES} value={failurePolicy} ariaLabel="Failure policy" onchange={pickFailure} />
+    <div>
+      <div class="policy-row">
+        <SegmentedControl options={FAILURES} value={failurePolicy} ariaLabel="Failure policy" onchange={pickFailure} />
+      </div>
     </div>
   </div>
   <div class="policy-actions">
@@ -615,9 +683,13 @@
     >
       Save
     </button>
-    {#if policyMessage}
-      <span class={policyMessage.type === 'error' ? 'save-error' : 'save-ok'}>{policyMessage.text}</span>
-    {/if}
+    <!-- In place before any message, so that a screen reader reads each one. -->
+    <span role="status">
+      {#if policyMessage?.type === 'success'}<span class="save-ok">{policyMessage.text}</span>{/if}
+    </span>
+    <span role="alert">
+      {#if policyMessage?.type === 'error'}<span class="save-error">{policyMessage.text}</span>{/if}
+    </span>
   </div>
 </section>
 
@@ -697,13 +769,13 @@
     touch-action: none;
   }
 
-  .grip:hover:not(:disabled),
+  .grip:hover:not([aria-disabled='true']),
   .grip:focus-visible {
     color: var(--sw-accent-bright);
     background: var(--sw-bg-elevated);
   }
 
-  .grip:disabled {
+  .grip[aria-disabled='true'] {
     cursor: default;
     opacity: 0.5;
   }
@@ -788,6 +860,14 @@
     gap: 10px;
   }
 
+  /* A second label inside a policy row, styled as the row's own. */
+  .inline-label {
+    margin-left: 10px;
+    font-size: var(--sw-text-sm);
+    font-weight: 500;
+    color: var(--sw-text-label);
+  }
+
   .min {
     width: 8rem;
   }
@@ -807,12 +887,12 @@
   }
 
   .save-ok {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-secondary);
   }
 
   .save-error {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-danger-text);
   }
 

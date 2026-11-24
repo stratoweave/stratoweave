@@ -4,16 +4,14 @@
 // failed member does to the others. A group exists while a device names it
 // or it has an entry.
 
-import { restconfPatchJson, rewriteListEntry } from '#lib/core/restconf/client.ts';
+import { rewriteListEntry } from '#lib/core/restconf/client.ts';
 import { formatDuration, parseDuration } from '#lib/core/time.ts';
 import type { ValidationResult } from '#lib/core/validation/types.ts';
 import {
-  DATA_ROOT,
   DEFAULT_PRIORITY,
   FLEET_DEVICE_LIST_ROOT,
   type CampaignPlan,
   type Device,
-  type DeviceJson,
   type DeviceStatusRow,
   type FailurePolicy,
   type FleetPatchJson,
@@ -27,7 +25,7 @@ import { holderOf } from '#lib/software/device-state.ts';
 import { nameMatcher } from '#lib/software/selection.ts';
 
 /** The ranges of redundancy-priority (uint16) and min-separation (uint32). */
-const MAX_PRIORITY = 65535;
+export const MAX_PRIORITY = 65535;
 const MAX_SEPARATION = 4294967295;
 
 /** Names a field suggests at most: a datalist of 30k names freezes the page. */
@@ -61,6 +59,17 @@ export function groupMembers(devices: Device[]): Map<string, Device[]> {
 export function defaultPolicy(name: string): GroupPolicy {
   return { name, separationPolicy: 'spread', minSeparation: 0, failurePolicy: 'continue' };
 }
+
+/** What each policy does, in one line from its YANG description. */
+export const SEPARATION_TEXT: Record<SeparationPolicy, string> = {
+  spread: 'Later members move to later windows of the campaign, as far apart as its windows allow.',
+  pack: 'Each member starts as soon as the member before it is done.'
+};
+
+export const FAILURE_TEXT: Record<FailurePolicy, string> = {
+  continue: 'A member that failed or rolled back holds the others only until it is done and up again.',
+  hold: 'While a member is failed, the others wait for an operator.'
+};
 
 /** "pack, 1m · holds on failure". */
 export function policyText(p: GroupPolicy): string {
@@ -311,29 +320,23 @@ export interface Membership {
   priority: number;
 }
 
-/** Saves what changed from `before` to `after` on device `name`. Adding
- * groups and a new priority is one PATCH; leaving a group rewrites the
- * entry, keeping any group added there since it was read. */
-export async function saveMembership(name: string, before: Membership, after: Membership): Promise<void> {
+/** A device entry with what changed from `before` to `after`. The groups
+ * left and joined go against the groups the entry has, so that a group
+ * joined there since `before` was read stays. */
+export function applyMembership(
+  entry: Record<string, unknown>,
+  before: Membership,
+  after: Membership
+): Record<string, unknown> {
   const added = after.groups.filter((g) => !before.groups.includes(g));
   const removed = new Set(before.groups.filter((g) => !after.groups.includes(g)));
-  const priorityChanged = after.priority !== before.priority;
-  if (removed.size === 0) {
-    const entry: DeviceJson = { name };
-    if (added.length > 0) entry['redundancy-group'] = added;
-    if (priorityChanged) entry['redundancy-priority'] = after.priority;
-    await restconfPatchJson(DATA_ROOT, { 'fleetmgr:fleet': { device: [entry] } });
-    return;
-  }
-  await rewriteListEntry(FLEET_DEVICE_LIST_ROOT, name, (entry) => {
-    const stored = (entry['redundancy-group'] as string[] | undefined) ?? [];
-    const groups = [...stored.filter((g) => !removed.has(g)), ...added.filter((g) => !stored.includes(g))];
-    const rest = { ...entry };
-    if (groups.length > 0) rest['redundancy-group'] = groups;
-    else delete rest['redundancy-group'];
-    if (priorityChanged) rest['redundancy-priority'] = after.priority;
-    return rest;
-  });
+  const stored = (entry['redundancy-group'] as string[] | undefined) ?? [];
+  const groups = [...stored.filter((g) => !removed.has(g)), ...added.filter((g) => !stored.includes(g))];
+  const next = { ...entry };
+  if (groups.length > 0) next['redundancy-group'] = groups;
+  else delete next['redundancy-group'];
+  if (after.priority !== before.priority) next['redundancy-priority'] = after.priority;
+  return next;
 }
 
 /** Room left before or after a member moved to an end of the order. */

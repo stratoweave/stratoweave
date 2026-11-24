@@ -27,6 +27,9 @@ export interface Selection {
 export interface ExclusionRow {
   n: number;
   what: string;
+  /** Which ones, the first few: the owning campaigns, or the names. */
+  detail: string;
+  /** Where the model says so, for those who know it; '' for nowhere. */
   path: string;
 }
 
@@ -167,6 +170,7 @@ export function expandSelection(
     excluded.push({
       n: ownedOut,
       what: 'owned by another campaign',
+      detail: firstFew([...ownedBy], 2),
       path: [...ownedBy].slice(0, 2).map((o) => `software/upgrade-campaign = ${o}`).join(' · ')
     });
   }
@@ -174,7 +178,8 @@ export function expandSelection(
     excluded.push({
       n: unknown.length,
       what: 'not in the inventory',
-      path: unknown.slice(0, 3).join(', ')
+      detail: firstFew(unknown, 3),
+      path: ''
     });
   }
 
@@ -186,6 +191,12 @@ export function expandSelection(
     excluded,
     sample: selected.slice(0, 6)
   };
+}
+
+/** The first n names, and how many more there are. */
+function firstFew(names: string[], n: number): string {
+  const more = names.length - n;
+  return names.slice(0, n).join(', ') + (more > 0 ? ` and ${more.toLocaleString()} more` : '');
 }
 
 /** device name -> owning campaign, from every campaign's member list. */

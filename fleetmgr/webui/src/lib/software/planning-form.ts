@@ -1,7 +1,8 @@
 // A campaign's schedule, pace and limits: the default schedule, the
-// deadline, how many devices upgrade at the same time, the days of notice
-// its members get before their window, its failure budget, its close
-// margin and its stagger, as the campaign page edits them.
+// deadline, how many devices upgrade at the same time, whether they
+// prepare ahead, the days of notice its members get before their window,
+// its failure budget, its close margin and its stagger, as the campaign
+// page edits them.
 //
 // The pace comes from a deadline or from a number of devices at once, not
 // both. The model takes both, with target-concurrency as a floor under the
@@ -22,7 +23,7 @@ import {
   type CampaignJson,
   type CampaignPlan
 } from './model';
-import { formatDuration, toLocalInput } from '#lib/core/time.ts';
+import { formatClock, formatDuration, toLocalInput } from '#lib/core/time.ts';
 
 export type PaceBy = 'deadline' | 'concurrency';
 
@@ -42,6 +43,7 @@ export interface PlanningDraft {
   /** Percents as typed; '' for the model default. */
   closeMargin: string;
   stagger: string;
+  allowStaging: boolean;
 }
 
 export interface Planning {
@@ -57,10 +59,22 @@ export interface Planning {
   /** Percents. */
   closeMargin: number;
   stagger: number;
+  /** Members copy their image before their window. */
+  allowStaging: boolean;
 }
 
 const UINT32_MAX = 4294967295;
 const UINT16_MAX = 65535;
+
+export const NOTICE_ERROR = `A whole number of days, 0 to ${UINT16_MAX}.`;
+
+/** Notice as typed -> whole days; '' is 0, no notice. null when it does
+ * not parse or does not fit the model's uint16. */
+export function noticeDays(text: string): number | null {
+  const t = text.trim();
+  if (!t) return 0;
+  return /^\d+$/.test(t) && Number(t) <= UINT16_MAX ? Number(t) : null;
+}
 
 export function planningOf(c: Campaign): Planning {
   return {
@@ -71,7 +85,8 @@ export function planningOf(c: Campaign): Planning {
     notificationPeriod: c.notificationPeriod,
     failureBudget: c.failureBudget,
     closeMargin: c.closeMargin,
-    stagger: c.stagger
+    stagger: c.stagger,
+    allowStaging: c.allowStaging
   };
 }
 
@@ -89,7 +104,8 @@ export function planningDraft(p: Planning): PlanningDraft {
     notificationPeriod: p.notificationPeriod === 0 ? '' : String(p.notificationPeriod),
     failureBudget: p.failureBudget === null ? '' : String(p.failureBudget),
     closeMargin: p.closeMargin === DEFAULT_CLOSE_MARGIN ? '' : String(p.closeMargin),
-    stagger: p.stagger === DEFAULT_STAGGER ? '' : String(p.stagger)
+    stagger: p.stagger === DEFAULT_STAGGER ? '' : String(p.stagger),
+    allowStaging: p.allowStaging
   };
 }
 
@@ -122,10 +138,7 @@ export function validatePlanningDraft(
       errors[key] = 'A whole number of devices, 1 or more.';
     }
   }
-  const days = draft.notificationPeriod.trim();
-  if (days && (!/^\d+$/.test(days) || Number(days) > UINT16_MAX)) {
-    errors['notification-period'] = `A whole number of days, 0 to ${UINT16_MAX}.`;
-  }
+  if (noticeDays(draft.notificationPeriod) === null) errors['notification-period'] = NOTICE_ERROR;
   const budget = draft.failureBudget.trim();
   if (budget && (!/^\d+(\.\d{1,2})?$/.test(budget) || Number(budget) > 100)) {
     errors['failure-budget'] = 'A percent from 0 to 100, with at most two decimals.';
@@ -153,7 +166,8 @@ export function planningFromDraft(draft: PlanningDraft): Planning {
     notificationPeriod: draft.notificationPeriod.trim() ? Number(draft.notificationPeriod) : 0,
     failureBudget: draft.failureBudget.trim() ? Number(draft.failureBudget) : null,
     closeMargin: draft.closeMargin.trim() ? Number(draft.closeMargin) : DEFAULT_CLOSE_MARGIN,
-    stagger: draft.stagger.trim() ? Number(draft.stagger) : DEFAULT_STAGGER
+    stagger: draft.stagger.trim() ? Number(draft.stagger) : DEFAULT_STAGGER,
+    allowStaging: draft.allowStaging
   };
 }
 
@@ -189,6 +203,20 @@ export function perHourText(draft: PlanningDraft, installSeconds: number): strin
   return `${head}, up to ${hourly(max).toLocaleString()} per hour at ${max.toLocaleString()} when a window falls behind.`;
 }
 
+/** The stored pace in a few words: "10 at once, up to 50", or the
+ * deadline with the most at once it may take. */
+export function paceText(p: Planning): string {
+  const target = p.targetConcurrency.toLocaleString();
+  const max = p.maxConcurrency.toLocaleString();
+  if (p.deadline !== null) {
+    // Pacing by the deadline stores 1; a campaign set up elsewhere may
+    // keep a higher floor.
+    const floor = p.targetConcurrency > 1 ? `, at least ${target} at once` : '';
+    return `deadline ${formatClock(p.deadline)}${floor}, up to ${max} at once`;
+  }
+  return p.maxConcurrency > p.targetConcurrency ? `${target} at once, up to ${max}` : `${target} at once`;
+}
+
 type RemovableLeaf = 'default-schedule' | 'deadline' | 'failure-budget';
 
 /** The leaves a save sets and the ones it removes. */
@@ -215,6 +243,8 @@ export function planningChanges(saved: Planning, next: Planning): { set: Partial
   }
   if (next.closeMargin !== saved.closeMargin) set['close-margin'] = next.closeMargin;
   if (next.stagger !== saved.stagger) set.stagger = next.stagger;
+  // false merges as well as true: the leaf defaults to false.
+  if (next.allowStaging !== saved.allowStaging) set['allow-staging'] = next.allowStaging;
   return { set, remove };
 }
 

@@ -33,6 +33,16 @@ export function alreadyOnTarget(row: DeviceStatusRow): boolean {
   return row.status === 'up-to-date' && row.stage !== 'commit';
 }
 
+/** How the prepare ahead of a member that waits for its window stands:
+ * done, running, or null when it has not started or failed. A prepare
+ * job left from another intent does not count. */
+function preparedAhead(row: DeviceStatusRow): 'done' | 'running' | null {
+  const job = row.prepare;
+  const current = !job.release || !row.targetRelease || job.release === row.targetRelease;
+  if (row.status !== 'upgrade-needed' || !current) return null;
+  return job.state === 'done' || job.state === 'running' ? job.state : null;
+}
+
 export function stageView(row: DeviceStatusRow): StageView {
   const { status, stage } = row;
   switch (status) {
@@ -50,6 +60,10 @@ export function stageView(row: DeviceStatusRow): StageView {
       if (stage === 'rollback') return chain(rolledBackFrom(row), 'failed', now);
       if (stage !== null) return chain(STEPS.indexOf(stage), now);
       return chain(0, 'todo');
+    }
+    case 'upgrade-needed': {
+      const ahead = preparedAhead(row);
+      return ahead === 'done' ? chain(1, 'todo') : chain(0, ahead ?? 'todo');
     }
     default:
       return chain(0, 'todo');
@@ -87,6 +101,8 @@ export function jobProgress(row: DeviceStatusRow): number | null {
 export function stageDetail(row: DeviceStatusRow): string {
   const view = stageView(row);
   const doing = jobDetail(row);
+  // A waiting member's job says how its prepare ahead stands.
+  if (row.status === 'upgrade-needed') return doing;
   const running = view.steps.find((s) => s.state === 'running');
   if (running) return `${STEP_LABEL[running.step]} running${doing ? ` · ${doing}` : ''}`;
   if (doing) return doing;

@@ -1,16 +1,35 @@
 import { errorText } from '#lib/core/errors.ts';
 import { nextSeq } from '#lib/core/polling/poller.ts';
-import { restconfGetJson } from '#lib/core/restconf/client.ts';
+import { restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import { fetchCampaignEntry } from '#lib/software/counters.ts';
-import { SCHEDULES_ROOT, parseSchedules, type CampaignConfig, type Schedule, type StateParts } from '#lib/software/model.ts';
+import type { CatalogImage } from '#lib/software/images.ts';
+import {
+  IMAGES_ROOT,
+  SCHEDULES_ROOT,
+  parseImages,
+  parseSchedules,
+  type CampaignConfig,
+  type Schedule,
+  type StateParts
+} from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
 
-async function loadSchedules(fetch: typeof globalThis.fetch): Promise<Schedule[]> {
-  // The campaign renders without them; a failure only blanks the
-  // default-schedule windows line.
+async function loadSchedules(fetch: typeof globalThis.fetch): Promise<{ schedules: Schedule[]; error: string }> {
+  // The campaign renders without them; only its schedule field needs them.
+  // None at all is a 404.
   try {
-    return parseSchedules(await restconfGetJson<unknown>(SCHEDULES_ROOT, fetch));
+    return { schedules: parseSchedules(await restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch)), error: '' };
+  } catch (error) {
+    return { schedules: [], error: errorText(error, 'Failed to load the schedules.') };
+  }
+}
+
+/** The image catalog, for the releases the members upgrade to. Without it
+ * the page reads them from the image names. */
+async function loadCatalog(fetch: typeof globalThis.fetch): Promise<CatalogImage[]> {
+  try {
+    return parseImages(await restconfGetOrNull<unknown>(IMAGES_ROOT, fetch));
   } catch {
     return [];
   }
@@ -35,5 +54,6 @@ export const load: PageLoad = ({ fetch, depends, params }) => {
   depends('data:campaign');
   const seq = nextSeq();
   const schedules = loadSchedules(fetch);
-  return { name: params.name, seq, entry: loadEntry(params.name, fetch), schedules };
+  const catalog = loadCatalog(fetch);
+  return { name: params.name, seq, entry: loadEntry(params.name, fetch), schedules, catalog };
 };

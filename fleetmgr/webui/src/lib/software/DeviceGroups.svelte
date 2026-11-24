@@ -1,18 +1,14 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  // The fields of a device's redundancy groups and its priority in them,
+  // with where it comes in each group's upgrade order.
+  import { untrack } from 'svelte';
 
   import { errorText } from '#lib/core/errors.ts';
   import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
+  import FieldText from '#lib/core/ui/FieldText.svelte';
   import TokenSelect from '#lib/core/ui/TokenSelect.svelte';
-  import {
-    around,
-    byUpgradeOrder,
-    devicesText,
-    groupMembers,
-    parsePriority,
-    saveMembership,
-    suggestNames
-  } from '#lib/software/groups.ts';
+  import type { MembershipDraft, SectionFields } from '#lib/software/device-config.ts';
+  import { around, byUpgradeOrder, devicesText, groupMembers, suggestNames } from '#lib/software/groups.ts';
   import {
     FLEET_LIST,
     REDUNDANCY_GROUPS_ROOT,
@@ -21,42 +17,27 @@
     type Device
   } from '#lib/software/model.ts';
 
-  interface Props {
+  interface Props extends SectionFields<MembershipDraft> {
     /** As the page polls it. */
     device: Device;
-    /** Reads the device again; resolves once the page shows the new read. */
-    reload: () => Promise<void>;
   }
 
-  let { device, reload }: Props = $props();
+  let { device, draft, set, errors, touch, disabled }: Props = $props();
 
   const uid = $props.id();
   // More groups than this pick from suggestions instead of toggles.
   const TOGGLE_MAX = 16;
+  const TIP = {
+    groups: "The redundancy groups the device is in. A group's members upgrade one after another.",
+    priority: 'Where the device comes in the upgrade order of each of its groups: lower goes first.'
+  };
 
   // The other devices and the group entries, for the suggestions and the
-  // order. Read on mount and after a save, not on every poll of the page:
-  // at 100k devices the fleet list is 14 MB.
+  // order. Read on mount and when the device's groups change, not on every
+  // poll of the page: at 100k devices the fleet list is 14 MB.
   let fleet = $state.raw<Device[]>([]);
   let entryNames = $state.raw<string[]>([]);
   let readError = $state('');
-
-  // null follows the device as polled; an edit holds until it is saved.
-  let picked = $state<string[] | null>(null);
-  let priorityText = $state<string | null>(null);
-  let draft = $state('');
-  let saving = $state(false);
-  let message = $state<{ type: 'success' | 'error'; text: string } | null>(null);
-
-  let groups = $derived(picked ?? device.groups);
-  let typedPriority = $derived(priorityText ?? String(device.priority));
-  let priority = $derived(parsePriority(typedPriority));
-  let changed = $derived(
-    !!draft.trim() ||
-      priority !== device.priority ||
-      groups.length !== device.groups.length ||
-      groups.some((g) => !device.groups.includes(g))
-  );
 
   let members = $derived(groupMembers(fleet));
   // Every group with how many devices it has, this device as polled.
@@ -71,9 +52,10 @@
   let many = $derived(allOptions.length > TOGGLE_MAX);
   let options = $derived.by(() => {
     if (!many) return allOptions;
-    const shown = new Set(suggestNames(allOptions.map((o) => o.value), draft, new Set(groups)));
+    const shown = new Set(suggestNames(allOptions.map((o) => o.value), draft.typed, new Set(draft.groups)));
     return allOptions.filter((o) => shown.has(o.value));
   });
+  let stored = $derived(device.groups.join('\n'));
 
   /** The members of group in upgrade order, this device as polled. */
   function orderOf(group: string): Device[] {
@@ -95,130 +77,89 @@
     }
   }
 
-  onMount(() => {
-    void readContext();
+  $effect(() => {
+    void stored;
+    untrack(() => void readContext());
   });
-
-  async function save(): Promise<void> {
-    // A name typed but not added yet counts.
-    const typed = draft.trim();
-    const next = typed && !groups.includes(typed) ? [...groups, typed] : groups;
-    if (priority === null) return;
-    try {
-      saving = true;
-      message = null;
-      await saveMembership(
-        device.name,
-        { groups: device.groups, priority: device.priority },
-        { groups: next, priority }
-      );
-      // The edit shows until the read after the write is in.
-      await reload();
-      picked = null;
-      priorityText = null;
-      draft = '';
-      message = { type: 'success', text: 'Saved.' };
-      void readContext();
-    } catch (saveError) {
-      message = { type: 'error', text: errorText(saveError, 'Failed to save the groups.') };
-    } finally {
-      saving = false;
-    }
-  }
 </script>
 
-<section class="card">
-  <h2 class="panel-title" title="YANG: /fleet/device/redundancy-group">Redundancy groups</h2>
+<div class="field groups">
+  <label class="field__label" for={`${uid}-groups`} title={TIP.groups}>Groups</label>
   <TokenSelect
+    id={`${uid}-groups`}
     {options}
-    selected={groups}
+    selected={draft.groups}
     label="Redundancy groups"
     placeholder="add group"
     suggest={many}
+    compact={true}
     countLabel={devicesText}
-    bind:draft
-    onchange={(next) => (picked = next)}
+    describedby={`${uid}-groups-tip`}
+    bind:draft={() => draft.typed, (typed) => set({ ...draft, typed })}
+    onchange={(groups) => set({ ...draft, groups })}
   />
-  <div class="save-row">
-    <label class="dim" for={`${uid}-priority`}>Priority</label>
-    <input
-      id={`${uid}-priority`}
-      class="input compact mono priority"
-      class:has-error={priority === null}
-      inputmode="numeric"
-      aria-invalid={priority === null ? 'true' : undefined}
-      value={typedPriority}
-      disabled={saving}
-      oninput={(e) => (priorityText = e.currentTarget.value)}
-    />
-    <button class="btn btn-primary" type="button" disabled={saving || !changed || priority === null} onclick={save}>
-      {saving ? 'Saving…' : 'Save'}
-    </button>
-    {#if priority === null}
-      <span class="save-error">0 to 65535, lower goes first.</span>
-    {:else if message}
-      <span class={message.type === 'error' ? 'save-error' : 'save-ok'}>{message.text}</span>
-    {/if}
+  <span id={`${uid}-groups-tip`} class="sr-only">{TIP.groups}</span>
+</div>
+<FieldText
+  label="Priority"
+  value={draft.priority}
+  error={errors['priority']}
+  mono={true}
+  tooltip={TIP.priority}
+  {disabled}
+  onchange={(priority) => set({ ...draft, priority })}
+  ontouch={touch}
+/>
+{#if readError}
+  <p class="read-error">{readError}</p>
+{:else if device.groups.length > 0}
+  <!-- Without the other devices the order would show this one alone. -->
+  <div class="orders">
+    {#each device.groups as group (group)}
+      {@const order = orderOf(group)}
+      {@const k = order.findIndex((d) => d.name === device.name)}
+      {@const part = around(order, k)}
+      <div class="order">
+        <span class="mono"><a class="group-name" href={`/groups/${encodeURIComponent(group)}`}>{group}</a>:</span>
+        <span class="names mono">
+          {#if part.before}<span>… →</span>{/if}
+          {#each part.items as member, i (member.name)}
+            {#if i > 0}<span>→</span>{/if}
+            {#if member.name === device.name}
+              <strong>{member.name}</strong>
+            {:else}
+              <a class="member" href={`/devices/${encodeURIComponent(member.name)}`}>{member.name}</a>
+            {/if}
+          {/each}
+          {#if part.after}<span>→ …</span>{/if}
+        </span>
+        {#if part.before || part.after}
+          <span class="tn">{(k + 1).toLocaleString()} of {order.length.toLocaleString()}</span>
+        {/if}
+      </div>
+    {/each}
   </div>
-  {#if readError}
-    <p class="save-error">{readError}</p>
-  {/if}
-  {#if device.groups.length > 0}
-    <div class="orders">
-      {#each device.groups as group (group)}
-        {@const order = orderOf(group)}
-        {@const k = order.findIndex((d) => d.name === device.name)}
-        {@const part = around(order, k)}
-        <div class="order">
-          <a class="group-name mono" href={`/groups/${encodeURIComponent(group)}`}>{group}</a>
-          <span class="names mono">
-            {#if part.before}<span class="dim">… →</span>{/if}
-            {#each part.items as member, i (member.name)}
-              {#if i > 0}<span class="dim">→</span>{/if}
-              {#if member.name === device.name}
-                <strong>{member.name}</strong>
-              {:else}
-                <a class="member" href={`/devices/${encodeURIComponent(member.name)}`}>{member.name}</a>
-              {/if}
-            {/each}
-            {#if part.after}<span class="dim">→ …</span>{/if}
-          </span>
-          {#if part.before || part.after}
-            <span class="dim tn">{k + 1} of {order.length}</span>
-          {/if}
-        </div>
-      {/each}
-    </div>
-  {/if}
-</section>
+{/if}
 
 <style>
-  .save-row {
-    display: flex;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 10px;
-    margin-top: 12px;
+  .groups {
+    grid-column: span 2;
   }
 
-  .priority {
-    width: 6rem;
-  }
-
+  /* The upgrade order, as a note under the fields. */
   .orders {
+    grid-column: 1 / -1;
     display: grid;
-    gap: 6px;
-    margin-top: 16px;
-    padding-top: 12px;
-    border-top: 1px solid var(--sw-border-subtle);
+    gap: 2px;
+    font-size: var(--sw-text-xs);
+    color: var(--sw-text-muted);
   }
 
   .order {
     display: flex;
     align-items: baseline;
     flex-wrap: wrap;
-    gap: 6px 14px;
-    font-size: var(--sw-text-sm);
+    gap: 2px 6px;
   }
 
   .names {
@@ -229,35 +170,31 @@
 
   .group-name,
   .member {
-    color: var(--sw-accent-bright);
+    color: var(--sw-text-secondary);
     text-decoration: none;
-  }
-
-  .group-name {
-    min-width: 8rem;
-    font-weight: 600;
   }
 
   .group-name:hover,
   .member:hover {
-    color: var(--sw-accent);
+    color: var(--sw-accent-bright);
+    text-decoration: underline;
   }
 
-  .dim {
-    color: var(--sw-text-muted);
+  strong {
+    font-weight: 600;
+    color: var(--sw-text-primary);
   }
 
-  .save-ok {
-    font-size: 12px;
-    color: var(--sw-text-secondary);
-  }
-
-  .save-error {
-    font-size: 12px;
+  .read-error {
+    grid-column: 1 / -1;
+    margin: 0;
+    font-size: var(--sw-text-xs);
     color: var(--sw-danger-text);
   }
 
-  p.save-error {
-    margin: 8px 0 0;
+  @media (max-width: 720px) {
+    .groups {
+      grid-column: 1 / -1;
+    }
   }
 </style>

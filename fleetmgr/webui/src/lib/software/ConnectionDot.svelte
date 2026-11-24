@@ -13,19 +13,27 @@
 </script>
 
 <span class="connection {CONNECTION_TONE[state]}" title={CONNECTION_TEXT[state]}>
-  <span class="dot" role="img" aria-label={text ? undefined : CONNECTION_TEXT[state]}></span>
-  {#if text}<span class="text">{CONNECTION_TEXT[state]}</span>{/if}
+  {#if text}
+    <!-- The words say it, so a screen reader skips the dot. -->
+    <span class="dot" aria-hidden="true"></span>
+    <span class="text">{CONNECTION_TEXT[state]}</span>
+  {:else}
+    <span class="dot" role="img" aria-label={CONNECTION_TEXT[state]}></span>
+  {/if}
 </span>
 
 <style>
+  /* The words set the baseline, so they sit on the line of the text around
+     them; the dot centres on them. */
   .connection {
     display: inline-flex;
-    align-items: center;
+    align-items: baseline;
     gap: 6px;
   }
 
   .dot {
     flex: none;
+    align-self: center;
     width: 8px;
     height: 8px;
     border-radius: 50%;

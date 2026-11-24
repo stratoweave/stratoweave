@@ -20,7 +20,6 @@ import { nextSeq } from '#lib/core/polling/poller.ts';
 import { withSignal } from '#lib/core/restconf/client.ts';
 import { FAST_ENTRY_LIMIT, fetchCampaignEntry, fetchCampaignState, fetchCounters } from './counters';
 import type { CampaignConfig, CampaignCounters, StateParts } from './model';
-import { RateTracker } from './rate';
 
 export const FAST_MS = 1500;
 export const SLOW_MS = 12_000;
@@ -35,10 +34,6 @@ export interface LiveView {
   /** null while the campaign has published no state. */
   state: StateParts | null;
   counters: CampaignCounters | null;
-  /** Devices finished per minute and the ms left, measured since the page
-   * opened. */
-  rate: number | null;
-  eta: number | null;
 }
 
 interface Stamped<T> {
@@ -71,9 +66,6 @@ export class CampaignLive {
   private slowGap = SLOW_MS;
   private lastFailed: number | null = null;
   private failedMoved = false;
-  private tracker = new RateTracker();
-  private rate: number | null = null;
-  private eta: number | null = null;
   private disposed = false;
 
   constructor(
@@ -150,9 +142,7 @@ export class CampaignLive {
       config: this.config.value,
       seq: Math.max(this.config.seq, this.state.seq, this.counters.seq),
       state: this.state.value,
-      counters,
-      rate: this.rate,
-      eta: this.eta
+      counters
     };
   }
 
@@ -168,9 +158,6 @@ export class CampaignLive {
     this.slowGap = SLOW_MS;
     this.lastFailed = null;
     this.failedMoved = false;
-    this.tracker.reset();
-    this.rate = null;
-    this.eta = null;
   }
 
   private abortReads(): void {
@@ -269,18 +256,98 @@ export class CampaignLive {
     return true;
   }
 
-  /** Failure tracking and the rate, from counters newer than any before. */
+  /** Failure tracking, from counters newer than any before. */
   private observe(c: CampaignCounters): void {
     if (this.lastFailed !== null && c.failed !== this.lastFailed) this.failedMoved = true;
     this.lastFailed = c.failed;
-    if (this.config.value?.adminState !== 'run') return;
-    this.tracker.push(c.succeeded + c.failed, this.clock());
-    this.rate = this.tracker.ratePerMin();
-    const remaining = c.total - c.succeeded - c.failed;
-    this.eta = remaining > 0 ? this.tracker.etaMs(remaining) : null;
   }
 
   private emit(): void {
     if (!this.disposed) this.onchange(this.view());
+  }
+}
+
+/** What a screen reader is told of the campaign as polled: the changes in
+ * these, and nothing else. */
+export interface LiveFacts {
+  /** running, planned or paused. */
+  mode: string;
+  failed: number;
+  overBudget: boolean;
+  /** Running with no device in flight or left to go. */
+  idle: boolean;
+  /** What to say when it goes idle. */
+  idleText: string;
+}
+
+export const ANNOUNCE_GAP_MS = 15_000;
+
+/** The changes worth announcing from one reading to a later one. */
+export function liveChanges(from: LiveFacts, to: LiveFacts): string[] {
+  const lines: string[] = [];
+  if (to.mode !== from.mode) lines.push(`Campaign ${to.mode}.`);
+  if (to.failed > from.failed) {
+    const more = to.failed - from.failed;
+    lines.push(
+      `${more.toLocaleString()} more ${more === 1 ? 'device' : 'devices'} failed, ${to.failed.toLocaleString()} in all.`
+    );
+  }
+  if (to.overBudget && !from.overBudget) lines.push('Failure budget exceeded: no more devices start.');
+  if (to.idle && !from.idle) lines.push(to.idleText);
+  return lines;
+}
+
+/** Says the polled changes at most once every gap, each time all that
+ * changed since it last spoke: a burst of failures is one announcement,
+ * and a change undone in between is none. */
+export class Announcer {
+  /** The facts as last told, or as first read. */
+  private told: LiveFacts | null = null;
+  private latest: LiveFacts | null = null;
+  private spokeAt = -Infinity;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(
+    private readonly say: (text: string) => void,
+    private readonly gap: number = ANNOUNCE_GAP_MS,
+    private readonly clock: () => number = Date.now
+  ) {}
+
+  /** The facts as now shown. The first ones after a reset say nothing. */
+  update(facts: LiveFacts): void {
+    this.latest = facts;
+    if (this.told === null) {
+      this.told = facts;
+      return;
+    }
+    if (this.timer !== null) return;
+    // Fewer failures, or work again, are not told, but count from here.
+    if (liveChanges(this.told, facts).length === 0) {
+      this.told = facts;
+      return;
+    }
+    this.timer = setTimeout(() => this.speak(), Math.max(0, this.spokeAt + this.gap - this.clock()));
+  }
+
+  /** Another campaign: its first facts say nothing. */
+  reset(): void {
+    this.dispose();
+    this.told = null;
+    this.latest = null;
+  }
+
+  dispose(): void {
+    if (this.timer !== null) clearTimeout(this.timer);
+    this.timer = null;
+  }
+
+  private speak(): void {
+    this.timer = null;
+    if (this.told === null || this.latest === null) return;
+    const lines = liveChanges(this.told, this.latest);
+    this.told = this.latest;
+    if (lines.length === 0) return;
+    this.spokeAt = this.clock();
+    this.say(lines.join(' '));
   }
 }

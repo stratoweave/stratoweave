@@ -1,9 +1,11 @@
 <script lang="ts">
-  import { onDestroy, untrack } from 'svelte';
+  import { onDestroy, tick, untrack } from 'svelte';
 
   import { errorText } from '#lib/core/errors.ts';
+  import { takeNotice } from '#lib/core/notice.ts';
   import { onLoaded } from '#lib/core/loading.svelte.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
   import FieldFile from '#lib/core/ui/FieldFile.svelte';
   import FieldText from '#lib/core/ui/FieldText.svelte';
@@ -51,9 +53,16 @@
   let importCliPort = $state('');
   let touched = $state(false);
   let saving = $state(false);
-  let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
+  // What the page we came from did, such as a device page's delete.
+  const notice = takeNotice();
+  let statusMessage = $state<{ type: 'success' | 'error'; text: string } | null>(
+    notice ? { type: 'success', text: notice } : null
+  );
   let deleteTarget = $state<Device | null>(null);
   let deleting = $state(false);
+  let table: HTMLTableElement | null = $state(null);
+  let filterInput: HTMLInputElement | null = $state(null);
+  let addButton: HTMLButtonElement | null = $state(null);
 
   let filterText = $state(untrack(() => data.nameFilter));
   let filterType = $state('');
@@ -111,6 +120,18 @@
   });
   let paged = $derived(paginate(filtered, page, PAGE_SIZE));
   let visible = $derived(paged.rows);
+
+  // The button goes with the empty result; focus stays in the filters.
+  async function clearFilters(): Promise<void> {
+    filterText = '';
+    filterType = '';
+    filterModel = '';
+    filterSchedule = '';
+    filterGroup = '';
+    page = 1;
+    await tick();
+    filterInput?.focus();
+  }
 
   // The selection is by name and survives filter and page changes; the bar
   // says how many selected devices the filter hides.
@@ -236,13 +257,13 @@
         clearSelection();
         bindChoice = '';
       } else {
-        bindError = `Stopped after unbinding ${done} of ${devicesText(names.length)}.`;
+        bindError = `Stopped after unbinding ${done.toLocaleString()} of ${devicesText(names.length)}.`;
       }
     } catch (writeError) {
       const reason = errorText(writeError, 'the write failed');
       bindError = plan.schedule
         ? `Nothing bound: ${reason}`
-        : `Unbound ${done} of ${devicesText(names.length)}; ${current} failed: ${reason}`;
+        : `Unbound ${done.toLocaleString()} of ${devicesText(names.length)}; ${current} failed: ${reason}`;
     } finally {
       applying = false;
       progress = null;
@@ -322,17 +343,20 @@
       if (result.errors.length > 0) {
         statusMessage = {
           type: 'error',
-          text: `Import not started: ${result.errors.slice(0, 5).join('; ')}${result.errors.length > 5 ? ` (+${result.errors.length - 5} more)` : ''}`
+          text: `Import not started: ${result.errors.slice(0, 5).join('; ')}${result.errors.length > 5 ? ` (+${(result.errors.length - 5).toLocaleString()} more)` : ''}`
         };
         return;
       }
       if (result.inputs.length === 0) {
+        const existing = result.skippedExisting.length;
         statusMessage = {
           type: 'error',
           text:
-            result.skippedExisting.length > 0
-              ? `Nothing to import: all ${result.skippedExisting.length} names already exist.`
-              : 'Nothing to import.'
+            existing === 1
+              ? 'Nothing to import: the name already exists.'
+              : existing > 1
+                ? `Nothing to import: all ${existing.toLocaleString()} names already exist.`
+                : 'Nothing to import.'
         };
         return;
       }
@@ -343,8 +367,8 @@
         devices = [...devices, ...parseFleet(body).devices];
       }
       const skipped =
-        result.skippedExisting.length > 0 ? `, ${result.skippedExisting.length} already existed` : '';
-      statusMessage = { type: 'success', text: `Imported ${entries.length} devices${skipped}.` };
+        result.skippedExisting.length > 0 ? `, ${result.skippedExisting.length.toLocaleString()} already existed` : '';
+      statusMessage = { type: 'success', text: `Imported ${devicesText(entries.length)}${skipped}.` };
       importText = '';
       importPassword = '';
       importKey = null;
@@ -362,11 +386,14 @@
   async function handleDelete(): Promise<void> {
     const target = deleteTarget;
     if (!target) return;
+    const index = visible.findIndex((d) => d.name === target.name);
+    let removed = false;
     try {
       deleting = true;
       statusMessage = null;
       await restconfDelete(getListEntryPath(FLEET_DEVICE_LIST_ROOT, target.name));
       devices = devices.filter((d) => d.name !== target.name);
+      removed = true;
       statusMessage = { type: 'success', text: `Removed device ${target.name}.` };
     } catch (deleteError) {
       statusMessage = {
@@ -377,43 +404,63 @@
       deleting = false;
       deleteTarget = null;
     }
+    if (removed) await focusRow(index);
+  }
+
+  /** Focus the device link of the row that took the place of row index,
+   * or of the row before it; with no row left, the name filter. The
+   * dialog gives focus back to its opener, and that row's Remove is gone. */
+  async function focusRow(index: number): Promise<void> {
+    await tick();
+    const links = table?.querySelectorAll<HTMLElement>('.device-name') ?? [];
+    const next = links[Math.min(index, links.length - 1)];
+    if (next) next.focus();
+    else if (filterInput?.isConnected) filterInput.focus();
+    else addButton?.focus();
   }
 </script>
 
 <div class="page-header">
   <div>
     <h1>Devices</h1>
-    <p>
-      The fleet inventory. Lab deploys usually onboard devices over RESTCONF.
-    </p>
   </div>
+  <!-- Both check the names against the list, so they need it. -->
   <div class="page-actions">
-    <button class="btn btn-secondary" type="button" onclick={openImport} disabled={loading || saving || applying}>
+    <button
+      class="btn btn-secondary"
+      type="button"
+      onclick={openImport}
+      disabled={loading || !!fleet?.loadError || saving || applying}
+    >
       Import
     </button>
-    <button class="btn btn-primary" type="button" onclick={openNew} disabled={loading || saving || applying}>
+    <button
+      bind:this={addButton}
+      class="btn btn-primary"
+      type="button"
+      onclick={openNew}
+      disabled={loading || !!fleet?.loadError || saving || applying}
+    >
       Add device
     </button>
   </div>
 </div>
 
-{#if fleet?.loadError}
-  <div class="error-state status">{fleet.loadError}</div>
-{/if}
-
-{#if statusMessage}
-  <div class={statusMessage.type === 'error' ? 'error-state status' : 'success-banner status'}>
-    {statusMessage.text}
-  </div>
-{/if}
+<!-- In place before any message, so that a screen reader reads each one. -->
+<div role="status">
+  {#if statusMessage?.type === 'success'}
+    <div class="success-banner status">{statusMessage.text}</div>
+  {/if}
+</div>
+<div role="alert">
+  {#if statusMessage?.type === 'error'}
+    <div class="error-state status">{statusMessage.text}</div>
+  {/if}
+</div>
 
 {#if draft}
   <section class="card editor-card">
-    <Section
-      title="Add device"
-      description="An address makes it a real endpoint; mock entries need none."
-      yangPath="fleetmgr:fleet/device"
-    >
+    <Section title="Add device" yangPath="fleetmgr:fleet/device">
       <div class="grid-2">
         <FieldText
           label="Name"
@@ -421,7 +468,7 @@
           value={draft.name}
           error={errors['name']}
           yangType="string"
-          placeholder="e.g., ce1"
+          placeholder="e.g. ce1"
           onchange={(value) => patch({ name: value })}
           ontouch={() => (touched = true)}
         />
@@ -443,6 +490,7 @@
           yangType="inet:host"
           mono={true}
           placeholder="hostname or IP"
+          help="Leave empty for a mock device."
           onchange={(value) => patch({ address: value })}
           ontouch={() => (touched = true)}
         />
@@ -511,7 +559,7 @@
   <section class="card editor-card">
     <Section
       title="Import devices"
-      description="One device per line: name[,address[,port]]. Lines starting with # are ignored; existing names are skipped."
+      description="One device per line: name[,address[,port]]. Lines starting with # and existing names are skipped."
       yangPath="fleetmgr:fleet/device"
     >
       <div class="grid-2">
@@ -555,12 +603,15 @@
           }}
         />
       </div>
-      <textarea
-        class="input mono"
-        rows="10"
-        placeholder="ce1,192.0.2.11&#10;ce2,192.0.2.12,830&#10;mock-001"
-        bind:value={importText}
-      ></textarea>
+      <label class="field">
+        <span class="field__label">Devices, one per line</span>
+        <textarea
+          class="input mono"
+          rows="10"
+          placeholder="ce1,192.0.2.11&#10;ce2,192.0.2.12,830&#10;mock-001"
+          bind:value={importText}
+        ></textarea>
+      </label>
       <div class="editor-actions">
         <button class="btn btn-secondary" type="button" onclick={closeEditor} disabled={saving}>
           Cancel
@@ -574,17 +625,21 @@
 {/if}
 
 <section class="card">
-  {#if loading}
+  {#if fleet?.loadError}
+    <LoadError message={fleet.loadError} />
+  {:else if loading}
     <div class="empty-state" aria-busy="true">Loading devices…</div>
   {:else if devices.length === 0}
     <div class="empty-state">No devices yet. Add or import some, or seed the fleet from a lab deploy.</div>
   {:else}
     <div class="filter-row">
       <input
+        bind:this={filterInput}
         class="input compact mono filter-input"
         type="text"
-        aria-label="Filter by name"
-        placeholder="filter by name (glob with * and ?)"
+        aria-label="Filter by name or glob"
+        placeholder="Filter by name or glob"
+        title="Matches part of a name, or a glob with * and ?"
         bind:value={filterText}
         oninput={() => (page = 1)}
       />
@@ -619,107 +674,116 @@
           {/each}
         </select>
       {/if}
-      <span class="filter-count">{filtered.length} of {devices.length}</span>
+      <span class="filter-count" role="status">
+        {filtered.length.toLocaleString()} of {devices.length.toLocaleString()}
+      </span>
     </div>
-    <div class="table-wrap">
-      <table class="dense">
-        <thead>
-          <tr>
-            <th class="col-check">
-              <input
-                type="checkbox"
-                aria-label="Select the devices on this page"
-                checked={pageAllChosen}
-                indeterminate={pageChosen > 0 && !pageAllChosen}
-                disabled={applying || visible.length === 0}
-                onchange={togglePage}
-              />
-            </th>
-            <th>Device</th>
-            <th class="col-type">Type</th>
-            <th class="col-platform">Model</th>
-            <th class="col-platform">Version</th>
-            <th class="col-platform">Serial number</th>
-            <th class="col-address">Address</th>
-            <th>Schedule</th>
-            {#if hasGroups}
-              <th class="col-groups">Groups</th>
-            {/if}
-            <th class="col-action"><span class="sr-only">Actions</span></th>
-          </tr>
-        </thead>
-        <tbody>
-          {#each visible as device (device.name)}
-            <tr class:chosen={selected.has(device.name)}>
-              <td class="col-check">
-                <!-- preventDefault on a shift mousedown keeps the browser from selecting text. -->
+    {#if filtered.length === 0}
+      <div class="empty-state no-match">
+        No devices match these filters.
+        <button class="btn btn-secondary btn-sm" type="button" onclick={clearFilters}>Clear filters</button>
+      </div>
+    {:else}
+      <div class="table-wrap">
+        <table bind:this={table} class="dense">
+          <thead>
+            <tr>
+              <th class="col-check">
                 <input
                   type="checkbox"
-                  aria-label={`Select ${device.name}`}
-                  checked={selected.has(device.name)}
-                  disabled={applying}
-                  onmousedown={(e) => e.shiftKey && e.preventDefault()}
-                  onclick={(e) => toggleRow(device, e.shiftKey)}
+                  aria-label="Select the devices on this page"
+                  checked={pageAllChosen}
+                  indeterminate={pageChosen > 0 && !pageAllChosen}
+                  disabled={applying || visible.length === 0}
+                  onchange={togglePage}
                 />
-              </td>
-              <td>
-                <span class="name-cell">
-                  <ConnectionDot connection={device.connection} />
-                  <a class="device-name" href={`/devices/${encodeURIComponent(device.name)}`}>{device.name}</a>
-                </span>
-              </td>
-              <td class="col-type">{device.type}</td>
-              <td class="col-platform">
-                {#if device.model}
-                  <span class="pill mono">{device.model}</span>
-                {:else}
-                  <span class="dim">—</span>
-                {/if}
-              </td>
-              <td class="mono col-platform">{device.version || '—'}</td>
-              <td class="mono col-platform">{device.serialNumber || '—'}</td>
-              <td class="mono col-address">{device.address || '—'}</td>
-              <td>
-                {#if !device.schedule}
-                  <span class="dim" title="No binding: each campaign's default schedule applies">—</span>
-                {:else if knownSchedules.has(device.schedule)}
-                  <a class="schedule-name mono" href={`/schedules/${encodeURIComponent(device.schedule)}`}>
-                    <span class="swatch" style:background={colors.get(device.schedule) ?? SCHEDULE_COLOR_OTHER}></span>
-                    {device.schedule}
-                  </a>
-                {:else}
-                  <span class="mono missing" title="No schedule by this name: the device is placed in no window">
-                    {device.schedule} (missing)
-                  </span>
-                {/if}
-              </td>
+              </th>
+              <th>Device</th>
+              <th class="col-type">Type</th>
+              <th class="col-platform">Model</th>
+              <th class="col-platform">Version</th>
+              <th class="col-platform">Serial number</th>
+              <th class="col-address">Address</th>
+              <th>Schedule</th>
               {#if hasGroups}
-                <td class="col-groups">
-                  {#each device.groups as group, i (group)}
-                    {#if i > 0}<span class="dim">, </span>{/if}
-                    <a class="group-name mono" href={`/groups/${encodeURIComponent(group)}`}>{group}</a>
+                <th class="col-groups">Groups</th>
+              {/if}
+              <th class="col-action"><span class="sr-only">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {#each visible as device (device.name)}
+              <tr class:chosen={selected.has(device.name)}>
+                <td class="col-check">
+                  <!-- preventDefault on a shift mousedown keeps the browser from selecting text. -->
+                  <input
+                    type="checkbox"
+                    aria-label={`Select ${device.name}`}
+                    checked={selected.has(device.name)}
+                    disabled={applying}
+                    onmousedown={(e) => e.shiftKey && e.preventDefault()}
+                    onclick={(e) => toggleRow(device, e.shiftKey)}
+                  />
+                </td>
+                <td>
+                  <span class="name-cell">
+                    <ConnectionDot connection={device.connection} />
+                    <a class="device-name" href={`/devices/${encodeURIComponent(device.name)}`}>{device.name}</a>
+                  </span>
+                </td>
+                <td class="col-type">{device.type}</td>
+                <td class="col-platform">
+                  {#if device.model}
+                    <span class="pill mono">{device.model}</span>
                   {:else}
                     <span class="dim">—</span>
-                  {/each}
+                  {/if}
                 </td>
-              {/if}
-              <td class="col-action">
-                <button
-                  class="btn btn-ghost btn-sm row-remove on-row"
-                  type="button"
-                  aria-label={`Remove ${device.name}`}
-                  disabled={saving || deleting || applying}
-                  onclick={() => (deleteTarget = device)}
-                >
-                  Remove
-                </button>
-              </td>
-            </tr>
-          {/each}
-        </tbody>
-      </table>
-    </div>
-    <Pager page={paged.page} pageCount={paged.pageCount} onchange={(p) => (page = p)} />
+                <td class="mono col-platform">{device.version || '—'}</td>
+                <td class="mono col-platform">{device.serialNumber || '—'}</td>
+                <td class="mono col-address">{device.address || '—'}</td>
+                <td>
+                  {#if !device.schedule}
+                    <span class="dim" title="No binding: each campaign's default schedule applies">—</span>
+                  {:else if knownSchedules.has(device.schedule)}
+                    <a class="schedule-name mono" href={`/schedules/${encodeURIComponent(device.schedule)}`}>
+                      <span class="swatch" style:background={colors.get(device.schedule) ?? SCHEDULE_COLOR_OTHER}></span>
+                      {device.schedule}
+                    </a>
+                  {:else}
+                    <span class="mono missing" title="No schedule by this name: the device is placed in no window">
+                      {device.schedule} (missing)
+                    </span>
+                  {/if}
+                </td>
+                {#if hasGroups}
+                  <td class="col-groups">
+                    {#each device.groups as group, i (group)}
+                      {#if i > 0}<span class="dim">, </span>{/if}
+                      <a class="group-name mono" href={`/groups/${encodeURIComponent(group)}`}>{group}</a>
+                    {:else}
+                      <span class="dim">—</span>
+                    {/each}
+                  </td>
+                {/if}
+                <td class="col-action">
+                  <button
+                    class="btn btn-ghost btn-sm row-remove on-row"
+                    type="button"
+                    aria-label={`Remove ${device.name}`}
+                    disabled={saving || deleting || applying}
+                    onclick={() => (deleteTarget = device)}
+                  >
+                    Remove
+                  </button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      </div>
+      <Pager page={paged.page} pageCount={paged.pageCount} onchange={(p) => (page = p)} />
+    {/if}
     {#if chosen.length > 0}
       <div class="selection-bar">
         <span class="tn"><strong>{chosen.length.toLocaleString()}</strong> selected</span>
@@ -768,9 +832,8 @@
             {applying ? 'Applying…' : 'Apply'}
           </button>
         {/if}
-        {#if bindError}
-          <div class="bar-error">{bindError}</div>
-        {/if}
+        <!-- In place before an error, so that a screen reader reads it. -->
+        <div class="bar-error" role="alert">{bindError}</div>
       </div>
     {/if}
   {/if}
@@ -816,8 +879,21 @@
   }
 
   .filter-count {
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     color: var(--sw-text-muted);
+  }
+
+  .no-match {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+  }
+
+  /* In the card, as the loading and empty states are. */
+  .card > :global(.load-error) {
+    margin-bottom: 0;
   }
 
   .name-cell {
@@ -912,7 +988,13 @@
     border-radius: var(--sw-radius-md);
     background: var(--sw-bg-elevated);
     box-shadow: var(--sw-shadow-sticky);
-    font-size: 13px;
+    font-size: var(--sw-text-sm);
+  }
+
+  /* A row that gets focus scrolls into view above the bar, not under it:
+     the bar's height and the scroller's padding below it, and some room. */
+  :global(.app-content:has(.selection-bar)) {
+    scroll-padding-bottom: 104px;
   }
 
   .spacer {
@@ -937,6 +1019,11 @@
     flex-basis: 100%;
     font-size: var(--sw-text-xs);
     color: var(--sw-danger-text);
+  }
+
+  /* Empty, it stays in place for the next error but takes no room. */
+  .bar-error:empty {
+    position: absolute;
   }
 
   .link-button:disabled {
@@ -971,13 +1058,19 @@
       max-width: none;
     }
 
+    /* Two filters to a row; four in one leave no room for their labels. */
     .filter-row .select {
-      flex: 1;
+      flex: 1 1 calc(50% - 5px);
       width: auto;
     }
 
     .device-name {
       white-space: nowrap;
+    }
+
+    /* The bar takes three rows here. */
+    :global(.app-content:has(.selection-bar)) {
+      scroll-padding-bottom: 160px;
     }
   }
 </style>

@@ -2,6 +2,7 @@
   import { errorText } from '#lib/core/errors.ts';
   import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import Pager, { paginate } from '#lib/core/ui/Pager.svelte';
   import { formatClock } from '#lib/core/time.ts';
   import {
@@ -16,6 +17,7 @@
     type GroupState
   } from '#lib/software/groups.ts';
   import { heldText } from '#lib/software/device-state.ts';
+  import { campaignDeviceHref } from '#lib/software/links.ts';
   import {
     FLEET_LIST,
     REDUNDANCY_GROUPS_ROOT,
@@ -32,6 +34,8 @@
   import { stageDetail } from '#lib/software/stages.ts';
 
   interface Props {
+    /** The campaign: a member opens as it shows it. */
+    campaign: string;
     /** The campaign's members. */
     members: string[];
     rows: DeviceStatusRow[];
@@ -42,7 +46,7 @@
     onwrote: () => void;
   }
 
-  let { members, rows, plan, version, onwrote }: Props = $props();
+  let { campaign, members, rows, plan, version, onwrote }: Props = $props();
 
   const PAGE_SIZE = 100;
   const TONE: Record<GroupState, string> = {
@@ -187,21 +191,26 @@
   <section class="card">
     <h2 class="fold-heading">
       <button class="fold" type="button" aria-expanded={open} onclick={() => (open = !open)}>
-        Redundancy groups ({groups.length.toLocaleString()})
+        Redundancy groups{readError ? '' : ` (${groups.length.toLocaleString()})`}
       </button>
-      {#if !open && counts.get('held')}
+      {#if !open && !readError && counts.get('held')}
         <span class="pill warning"><span class="dot"></span>{counts.get('held')} held</span>
       {/if}
     </h2>
+    <!-- In place before any message, so that a screen reader reads each one. -->
+    <div class="message" role="status">
+      {#if open && message?.type === 'success'}
+        <div class="success-banner status">{message.text}</div>
+      {/if}
+    </div>
+    <div class="message" role="alert">
+      {#if open && message?.type === 'error'}
+        <div class="error-state status">{message.text}</div>
+      {/if}
+    </div>
     {#if readError}
-      <div class="error-state status">{readError}</div>
-    {/if}
-    {#if open && message}
-      <div class={message.type === 'error' ? 'error-state status' : 'success-banner status'} role="status">
-        {message.text}
-      </div>
-    {/if}
-    {#if open && groups.length > 0}
+      <LoadError message={readError} />
+    {:else if open && groups.length > 0}
       <div class="filter-row">
         <button
           class="chip"
@@ -235,7 +244,8 @@
           class="input compact mono search"
           type="text"
           aria-label="Find group"
-          placeholder="find group (glob with * and ?)"
+          placeholder="Find group"
+          title="Matches part of a name, or a glob with * and ?"
           bind:value={searchText}
           oninput={() => (page = 1)}
         />
@@ -264,7 +274,7 @@
                       {#if i > 0}<span class="arrow" aria-hidden="true">→</span>{/if}
                       <span class={`member ${m.state}`} title={memberTitle(m, group)}>
                         <span class="dot"></span>
-                        <a class="name" href={`/devices/${encodeURIComponent(m.device.name)}`}>{m.device.name}</a>
+                        <a class="name" href={campaignDeviceHref(campaign, m.device.name)}>{m.device.name}</a>
                         <span class="detail">{memberText(m)}</span>
                       </span>
                     {/each}
@@ -318,6 +328,12 @@
     font-size: inherit;
   }
 
+  /* Under the heading, like the rows below it. */
+  .message > div,
+  .card > :global(.load-error) {
+    margin: 12px 0 0;
+  }
+
   .filter-row {
     display: flex;
     align-items: center;
@@ -343,6 +359,7 @@
 
   .name {
     font-family: var(--sw-font-mono);
+    font-variant-ligatures: none;
     color: var(--sw-accent-bright);
     text-decoration: none;
   }

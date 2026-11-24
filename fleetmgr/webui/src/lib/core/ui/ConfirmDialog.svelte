@@ -12,6 +12,9 @@
     confirmDisabled?: boolean;
     oncancel?: () => void;
     onconfirm?: () => void;
+    /** Text under the message, such as a list of what the action does;
+     * the dialog's description reads it with the message. */
+    details?: Snippet;
     /** Fields under the message; Enter in one confirms. The element with
      * data-autofocus gets focus, and a text field its text selected: all
      * of it, or as many characters as its data-select says. */
@@ -28,6 +31,7 @@
     confirmDisabled = false,
     oncancel,
     onconfirm,
+    details,
     children
   }: Props = $props();
 
@@ -79,7 +83,7 @@
   bind:this={dialog}
   class="confirm-dialog"
   aria-labelledby="{id}-title"
-  aria-describedby={message ? `${id}-message` : undefined}
+  aria-describedby={[message ? `${id}-message` : '', details ? `${id}-details` : ''].join(' ').trim() || undefined}
   oncancel={handleCancel}
   onclick={handleBackdropClick}
 >
@@ -88,6 +92,9 @@
       <h2 id="{id}-title">{title}</h2>
       {#if message}
         <p id="{id}-message">{message}</p>
+      {/if}
+      {#if details}
+        <div id="{id}-details">{@render details()}</div>
       {/if}
       {@render children?.()}
     </div>
@@ -144,7 +151,7 @@
 
   .confirm-dialog__body h2 {
     margin: 0;
-    font-size: 1.05rem;
+    font-size: var(--sw-text-lg);
     color: var(--sw-text-primary);
   }
 

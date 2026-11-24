@@ -16,6 +16,7 @@
   import FieldText from '#lib/core/ui/FieldText.svelte';
   import FileDrop from '#lib/core/ui/FileDrop.svelte';
   import { focusFirstError } from '#lib/core/ui/focus.ts';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import TokenSelect from '#lib/core/ui/TokenSelect.svelte';
   import { deleteImage } from '#lib/software/delete-image.ts';
   import { baseName, folderHref, joinPath, parentOf } from '#lib/software/image-tree.ts';
@@ -64,9 +65,12 @@
     /** For a new image, a file already in the image folder: the image gets
      * it, and starts with its file name as its name. */
     file?: string;
+    /** Why `images` could not be read. A save reads them again, so the
+     * form works without them; only its checks and suggestions miss them. */
+    loadError?: string;
   }
 
-  let { image, images, onfiles, folder = '', file = '' }: Props = $props();
+  let { image, images, onfiles, folder = '', file = '', loadError = '' }: Props = $props();
 
   const uid = $props.id();
   const isNew = untrack(() => image === null);
@@ -255,8 +259,15 @@
   </div>
 </div>
 
-{#if statusMessage}
-  <div class="error-state status" role="alert">{statusMessage}</div>
+<!-- In place before any message, so that a screen reader reads each one. -->
+<div role="alert">
+  {#if statusMessage}
+    <div class="error-state status">{statusMessage}</div>
+  {/if}
+</div>
+
+{#if loadError}
+  <LoadError message={loadError} />
 {/if}
 
 <section bind:this={form} class="card form">

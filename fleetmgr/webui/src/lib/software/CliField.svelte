@@ -35,6 +35,7 @@
       class:has-error={!!error}
       aria-label="CLI port"
       aria-invalid={error ? 'true' : undefined}
+      aria-describedby={error ? `${uid}-meta` : undefined}
       placeholder="22"
       value={port}
       disabled={disabled || !cli}

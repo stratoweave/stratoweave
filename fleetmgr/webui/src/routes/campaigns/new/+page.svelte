@@ -1,15 +1,18 @@
 <script lang="ts">
+  import { tick } from 'svelte';
   import { goto } from '$app/navigation';
 
   import { errorText } from '#lib/core/errors.ts';
   import { onLoaded } from '#lib/core/loading.svelte.ts';
   import { restconfPatchJson } from '#lib/core/restconf/client.ts';
   import FieldText from '#lib/core/ui/FieldText.svelte';
+  import LoadError from '#lib/core/ui/LoadError.svelte';
   import Section from '#lib/core/ui/Section.svelte';
   import Steps from '#lib/core/ui/Steps.svelte';
   import { memberImages, modelGroups, targetCounts, withPreselected } from '#lib/software/campaign-images.ts';
   import { DATA_ROOT, campaignCreatePatch, validateNewCampaign, type Device } from '#lib/software/model.ts';
   import ModelImages from '#lib/software/ModelImages.svelte';
+  import { NOTICE_ERROR, noticeDays } from '#lib/software/planning-form.ts';
   import SelectionBuilder from '#lib/software/SelectionBuilder.svelte';
   import { campaignOwners, emptySelection, type Selection } from '#lib/software/selection.ts';
   import type { PageProps } from './$types';
@@ -26,6 +29,8 @@
   const STEPS = ['Devices', 'Images', 'Plan'];
 
   let step = $state(1);
+  /** The first card of the step shown. */
+  let stepCard: HTMLElement | undefined = $state();
   // Held here, so that Back to the devices finds the filters as they were.
   let selection = $state<Selection>(emptySelection());
   let selected = $state<string[]>([]);
@@ -37,6 +42,8 @@
   // newer release would be downgraded, which can be what is wanted.
   let leaveOnTarget = $state(true);
   let leaveNewer = $state(false);
+  /** Days of notice as typed; '' for none. */
+  let notice = $state('');
 
   let devicesTouched = $state(false);
   let touched = $state(false);
@@ -55,19 +62,34 @@
   );
   /** Every grouped device is left out: the campaign would have none. */
   let allLeftOut = $derived(grouped.groups.length > 0 && members.length === 0);
-  let errors = $derived(
-    validateNewCampaign({ name, devices: members }, campaigns.map((c) => c.name)).errors
-  );
+  let errors = $derived.by((): Record<string, string> => {
+    const out: Record<string, string> = {
+      ...validateNewCampaign({ name, devices: members }, campaigns.map((c) => c.name)).errors
+    };
+    if (noticeDays(notice) === null) out['notification-period'] = NOTICE_ERROR;
+    return out;
+  });
 
   function devicesText(n: number): string {
     return n === 1 ? '1 device' : `${n.toLocaleString()} devices`;
+  }
+
+  /** Next and Back replace the card that had focus: focus goes to the
+   * new step's heading instead of falling back to the page. */
+  async function show(next: number): Promise<void> {
+    step = next;
+    await tick();
+    const heading = stepCard?.querySelector<HTMLElement>('h2');
+    if (!heading) return;
+    heading.tabIndex = -1;
+    heading.focus();
   }
 
   function toImages(): void {
     devicesTouched = true;
     if (selected.length === 0) return;
     picks = withPreselected(grouped.groups, picks, images);
-    step = 2;
+    void show(2);
   }
 
   async function create(): Promise<void> {
@@ -77,7 +99,15 @@
       creating = true;
       createError = '';
       const campaign = name.trim();
-      await restconfPatchJson(DATA_ROOT, campaignCreatePatch({ name: campaign, devices: members, allowStaging }));
+      await restconfPatchJson(
+        DATA_ROOT,
+        campaignCreatePatch({
+          name: campaign,
+          devices: members,
+          allowStaging,
+          notificationPeriod: noticeDays(notice) ?? 0
+        })
+      );
       await goto(`/campaigns/${encodeURIComponent(campaign)}`, { refreshAll: true });
     } catch (error) {
       createError = errorText(error, 'Failed to create the campaign.');
@@ -95,15 +125,13 @@
 
 <Steps steps={STEPS} current={step} />
 
-{#if createError || inventory?.loadError}
-  <div class="error-state status">{createError || inventory?.loadError}</div>
-{/if}
-
 {#if step === 1}
-  <section class="card">
+  <section class="card" bind:this={stepCard}>
     <Section title="Devices">
       {#if inventory === null}
         <div class="empty-state" aria-busy="true">Loading devices…</div>
+      {:else if inventory.loadError}
+        <LoadError message={inventory.loadError} />
       {:else if devices.length === 0}
         <div class="empty-state">No devices in the inventory.</div>
       {:else}
@@ -118,14 +146,19 @@
       {/if}
       <div class="editor-actions">
         <a class="btn btn-secondary" href="/campaigns">Cancel</a>
-        <button class="btn btn-primary" type="button" onclick={toImages} disabled={inventory === null}>
+        <button
+          class="btn btn-primary"
+          type="button"
+          onclick={toImages}
+          disabled={inventory === null || !!inventory.loadError}
+        >
           Next: images ({devicesText(selected.length)})
         </button>
       </div>
     </Section>
   </section>
 {:else}
-  <section class="card">
+  <section class="card" bind:this={stepCard}>
     <Section title="Images" yangPath="software:software/upgrade-campaign/device/image">
       {#if grouped.groups.length === 0}
         <div class="empty-state">None of the selected devices has reported a model.</div>
@@ -160,9 +193,6 @@
                 <span>Leave out the {devicesText(counts.newer)} on a newer release</span>
               </label>
             {/if}
-            <p class="hint">
-              From the release each device last reported. Each device checks again when the campaign reads it.
-            </p>
           </div>
         {/if}
       {/if}
@@ -171,27 +201,45 @@
 
   <section class="card">
     <Section title="Campaign" yangPath="software:software/upgrade-campaign">
-      <div class="name">
+      <div class="fields">
+        <div class="name">
+          <FieldText
+            label="Name"
+            required={true}
+            value={name}
+            error={touched ? errors['name'] : ''}
+            yangType="string"
+            placeholder="e.g. xe-1718-emea"
+            onchange={(v) => (name = v)}
+            ontouch={() => (touched = true)}
+          />
+        </div>
         <FieldText
-          label="Name"
-          required={true}
-          value={name}
-          error={touched ? errors['name'] : ''}
-          yangType="string"
-          placeholder="e.g., xe-1718-emea"
-          onchange={(v) => (name = v)}
-          ontouch={() => (touched = true)}
+          label="Notice (days)"
+          value={notice}
+          error={errors['notification-period']}
+          yangType="uint16, days"
+          placeholder="0"
+          onchange={(v) => (notice = v)}
         />
+        <label class="check ahead">
+          <input type="checkbox" bind:checked={allowStaging} />
+          <span>Prepare ahead</span>
+        </label>
       </div>
-      <label class="staging">
-        <input type="checkbox" bind:checked={allowStaging} />
-        <span>Allow staging the image before the impacting step</span>
-      </label>
-      <div class="editor-actions">
-        <button class="btn btn-secondary" type="button" onclick={() => (step = 1)}>Back</button>
-        <button class="btn btn-primary" type="button" onclick={create} disabled={creating}>
-          {creating ? 'Creating…' : `Create plan (${devicesText(members.length)})`}
-        </button>
+      <div>
+        <!-- In place before any message, so that a screen reader reads it. -->
+        <div role="alert">
+          {#if createError}
+            <div class="error-state status">{createError}</div>
+          {/if}
+        </div>
+        <div class="editor-actions">
+          <button class="btn btn-secondary" type="button" onclick={() => void show(1)}>Back</button>
+          <button class="btn btn-primary" type="button" onclick={create} disabled={creating}>
+            {creating ? 'Creating…' : `Create plan (${devicesText(members.length)})`}
+          </button>
+        </div>
       </div>
       {#if touched && allLeftOut}
         <p class="field__meta field__meta--error all-left-out">
@@ -203,8 +251,36 @@
 {/if}
 
 <style>
+  /* The name has a row of its own. The notice takes a number's width; the
+     box beside it sits level with its input, above the line the field keeps
+     for a message. */
+  .fields {
+    display: grid;
+    grid-template-columns: 220px auto;
+    justify-content: start;
+    gap: 0 24px;
+  }
+
   .name {
+    grid-column: 1 / -1;
     max-width: 420px;
+  }
+
+  .ahead {
+    align-self: end;
+    /* An input's padding and border, so as tall as one. */
+    padding-block: 10px;
+    margin-bottom: calc(1rem + 6px);
+  }
+
+  @media (max-width: 560px) {
+    .fields {
+      grid-template-columns: 1fr;
+    }
+
+    .ahead {
+      padding-block: 0;
+    }
   }
 
   .target-checks {
@@ -227,22 +303,8 @@
     color: var(--sw-warning);
   }
 
-  .hint {
-    margin: 0;
-    font-size: var(--sw-text-xs);
-    color: var(--sw-text-muted);
-  }
-
   .all-left-out {
     text-align: right;
-  }
-
-  .staging {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: var(--sw-text-sm);
-    cursor: pointer;
   }
 
   .editor-actions {

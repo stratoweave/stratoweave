@@ -1,7 +1,7 @@
 import { errorText } from '#lib/core/errors.ts';
 import { nextSeq } from '#lib/core/polling/poller.ts';
 import { restconfGetOrNull } from '#lib/core/restconf/client.ts';
-import { fetchCountersAndAlarms } from '#lib/software/counters.ts';
+import { fetchListState } from '#lib/software/counters.ts';
 import { CAMPAIGN_LIST, parseCampaigns, type Campaign } from '#lib/software/model.ts';
 
 import type { PageLoad } from './$types';
@@ -13,8 +13,8 @@ async function withState(
   campaign: Campaign,
   fetch: typeof globalThis.fetch
 ): Promise<{ campaign: Campaign; alarms: string[] }> {
-  const { counters, alarms } = await fetchCountersAndAlarms(campaign.name, fetch);
-  return { campaign: { ...campaign, counters }, alarms };
+  const { counters, runSince, alarms } = await fetchListState(campaign.name, fetch);
+  return { campaign: { ...campaign, counters, runSince }, alarms };
 }
 
 export const load: PageLoad = async ({ fetch, depends }) => {

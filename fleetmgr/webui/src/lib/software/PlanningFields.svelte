@@ -37,8 +37,8 @@
 
   let scheduleOptions = $derived.by(() => {
     const options = [
-      { value: '', label: 'none — one always-open window when no member is bound' },
-      ...schedules.map((s) => ({ value: s.name, label: `${s.name} — ${scheduleRulesText(s)}` }))
+      { value: '', label: 'None (always open)' },
+      ...schedules.map((s) => ({ value: s.name, label: `${s.name} · ${scheduleRulesText(s)}` }))
     ];
     if (draft.defaultSchedule && !schedules.some((s) => s.name === draft.defaultSchedule)) {
       options.push({ value: draft.defaultSchedule, label: `${draft.defaultSchedule} (missing)` });
@@ -47,6 +47,12 @@
   });
 
   let minDeadline = toLocalInput(Date.now() / 1000);
+
+  // A field left empty takes the model's default, which its placeholder
+  // names as such, so it does not read as a value set.
+  function byDefault(value: number | string): string {
+    return `${value} (default)`;
+  }
 
   let perHour = $derived(installSeconds ? perHourText(draft, installSeconds) : '');
 
@@ -77,12 +83,13 @@
       <span class="field__label" id="{uid}-pace">Pace by</span>
       <div class="pace" role="radiogroup" aria-labelledby="{uid}-pace">
         {#each PACES as pace (pace.value)}
-          <label class:active={draft.paceBy === pace.value} class:disabled>
+          <label class:active={draft.paceBy === pace.value} class:disabled title={pace.help}>
             <input
               type="radio"
               name="{uid}-pace"
               value={pace.value}
               checked={draft.paceBy === pace.value}
+              aria-describedby="{uid}-pace-{pace.value}"
               {disabled}
               onchange={() => patch({ paceBy: pace.value })}
             />
@@ -90,7 +97,9 @@
           </label>
         {/each}
       </div>
-      <small class="field__meta">{PACES.find((p) => p.value === draft.paceBy)?.help}</small>
+      {#each PACES as pace (pace.value)}
+        <span id="{uid}-pace-{pace.value}" class="sr-only">{pace.help}</span>
+      {/each}
     </div>
     {#if draft.paceBy === 'deadline'}
       <FieldDateTime
@@ -109,8 +118,8 @@
         error={errors['target-concurrency']}
         mono={true}
         {disabled}
-        placeholder={`${DEFAULT_TARGET_CONCURRENCY}`}
-        help="Devices upgrading at the same time."
+        placeholder={byDefault(DEFAULT_TARGET_CONCURRENCY)}
+        tooltip={perHour}
         onchange={(v) => patch({ targetConcurrency: v })}
       />
     {/if}
@@ -120,14 +129,11 @@
       error={errors['max-concurrency']}
       mono={true}
       {disabled}
-      placeholder={`${DEFAULT_MAX_CONCURRENCY}`}
-      help="Only when a window or the deadline falls behind."
+      placeholder={byDefault(DEFAULT_MAX_CONCURRENCY)}
+      tooltip={`Only when a window or the deadline falls behind.${draft.paceBy === 'deadline' && perHour ? ` ${perHour}` : ''}`}
       onchange={(v) => patch({ maxConcurrency: v })}
     />
   </div>
-  {#if perHour}
-    <p class="per-hour">{perHour}</p>
-  {/if}
   <div class="row limits">
     <FieldText
       label="Close margin (%)"
@@ -135,8 +141,8 @@
       error={errors['close-margin']}
       mono={true}
       {disabled}
-      placeholder={`${DEFAULT_CLOSE_MARGIN}`}
-      help="A device starts only while this share of a slow upgrade is left in its window."
+      placeholder={byDefault(DEFAULT_CLOSE_MARGIN)}
+      tooltip="A device starts only while this share of a slow upgrade is left in its window."
       onchange={(v) => patch({ closeMargin: v })}
     />
     <FieldText
@@ -145,8 +151,8 @@
       error={errors['stagger']}
       mono={true}
       {disabled}
-      placeholder={`${DEFAULT_STAGGER}`}
-      help="Spreads a round of starts over this share of an upgrade; 0 starts them at once."
+      placeholder={byDefault(DEFAULT_STAGGER)}
+      tooltip="Spreads a round of starts over this share of an upgrade; 0 starts them at once."
       onchange={(v) => patch({ stagger: v })}
     />
   </div>
@@ -157,21 +163,32 @@
       error={errors['notification-period']}
       mono={true}
       {disabled}
-      placeholder="0"
-      help="Uses only windows that open this long after the campaign first runs."
+      placeholder={byDefault(0)}
+      tooltip="Uses only windows that open this long after the campaign first runs."
       onchange={(v) => patch({ notificationPeriod: v })}
     />
-    <FieldText
-      label="Failure budget (%)"
-      value={draft.failureBudget}
-      error={errors['failure-budget']}
-      mono={true}
-      {disabled}
-      placeholder="none"
-      help="No more devices start once more than this share of the members have failed."
-      onchange={(v) => patch({ failureBudget: v })}
-    />
+    <div class="slot">
+      <FieldText
+        label="Failure budget (%)"
+        value={draft.failureBudget}
+        error={errors['failure-budget']}
+        mono={true}
+        {disabled}
+        placeholder={byDefault('none')}
+        tooltip="No new starts once more than this share of the members have failed."
+        onchange={(v) => patch({ failureBudget: v })}
+      />
+    </div>
   </div>
+  <label class="ahead" class:disabled>
+    <input
+      type="checkbox"
+      checked={draft.allowStaging}
+      {disabled}
+      onchange={(e) => patch({ allowStaging: e.currentTarget.checked })}
+    />
+    <span class="ahead-name">Prepare ahead</span>
+  </label>
 </div>
 
 <style>
@@ -190,10 +207,28 @@
     margin-top: 8px;
   }
 
-  .per-hour {
-    margin: 0;
-    font-size: 12px;
-    color: var(--sw-text-secondary);
+  /* Holds a field for a reference to it, not a box of its own. */
+  .slot {
+    display: contents;
+  }
+
+  .ahead {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 12px;
+    cursor: pointer;
+  }
+
+  .ahead-name {
+    font-size: var(--sw-text-sm);
+    font-weight: 500;
+    color: var(--sw-text-primary);
+  }
+
+  .ahead.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   /* Two radios drawn as one segmented control, as tall as an input. */
@@ -202,7 +237,7 @@
     gap: 3px;
     padding: 3px;
     background: var(--sw-bg-input);
-    border: 1px solid var(--sw-border-default);
+    border: 1px solid var(--sw-border-control);
     border-radius: var(--sw-radius-md);
   }
 
@@ -213,7 +248,7 @@
     border: 1px solid transparent;
     border-radius: calc(var(--sw-radius-md) - 2px);
     color: var(--sw-text-secondary);
-    font-size: 13px;
+    font-size: var(--sw-text-sm);
     text-align: center;
     white-space: nowrap;
     cursor: pointer;

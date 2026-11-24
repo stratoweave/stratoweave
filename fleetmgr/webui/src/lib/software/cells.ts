@@ -2,6 +2,7 @@
 // shares for the states it has in common.
 
 import type { DeviceStatusRow } from './model';
+import type { PrepareState, PrepareView } from './prepare';
 
 /** What a cell shows of its device: its status, or why the campaign holds
  * it when it waits. */
@@ -16,14 +17,20 @@ export type CellKind =
   | 'held'
   | 'down';
 
+/** Each kind's cell fill. The design tokens go by var(), so they follow
+ * app.css and must be set through CSS, not an SVG presentation attribute;
+ * the rest are the cells' own. Waiting and not answered stay dim: most
+ * members wait before a run, and brighter they would read as one heavy
+ * block. */
 export const CELL_COLOR: Record<CellKind, string> = {
-  upgraded: '#16a34a',
+  upgraded: 'var(--sw-success)',
   // Done like upgraded, but dimmer: the device was on the target release
   // already.
-  'up-to-date': '#166534',
-  'in-progress': '#22d3ee',
-  failed: '#ef4444',
-  'rolled-back': '#991b1b',
+  'up-to-date': '#15803d',
+  'in-progress': 'var(--sw-accent)',
+  failed: 'var(--sw-danger)',
+  // Dimmer than failed.
+  'rolled-back': '#c53030',
   // A device that needs the upgrade and waits for its turn.
   waiting: '#1d2c49',
   // A device that has not said whether it needs the upgrade.
@@ -36,7 +43,7 @@ export const CELL_COLOR: Record<CellKind, string> = {
 
 export const CELL_LABEL: Record<CellKind, string> = {
   upgraded: 'upgraded',
-  'up-to-date': 'already up to date',
+  'up-to-date': 'up to date',
   'in-progress': 'in progress',
   failed: 'failed',
   'rolled-back': 'rolled back',
@@ -74,10 +81,54 @@ export function cellKind(row: DeviceStatusRow | undefined): CellKind {
   }
 }
 
-/** The gutter between cells; also the grid background. */
-export const CELL_BG = '#0f1a30';
-
 /** Gutter width for a cell size: 1 px up to 8 px cells, then an eighth. */
 export function gutter(size: number): number {
   return Math.max(1, Math.round(size / 8));
+}
+
+// Preparing ahead, in a violet the rest of the page does not use. Its
+// states differ by lightness, so they read without hue: scheduled sits
+// near the waiting navy, released dims once the window run takes over,
+// prepared clears 3:1 against the grid and preparing is the lightest.
+// Amber is a failed prepare: a warning only, as the device copies its
+// image in its window instead.
+export const PREPARE_COLOR: Record<PrepareState, string> = {
+  scheduled: '#262b52',
+  preparing: '#ddd6fe',
+  prepared: '#7b6fd6',
+  failed: '#f59e0b',
+  released: '#463f86'
+};
+
+/** What a waiting member's cell shows instead when it prepares ahead and
+ * its prepare has started: whether its image is ready for its window. */
+export type ReadyKind = 'prepared' | 'preparing' | 'prepare-failed';
+
+export const READY_COLOR: Record<ReadyKind, string> = {
+  prepared: PREPARE_COLOR.prepared,
+  preparing: PREPARE_COLOR.preparing,
+  'prepare-failed': PREPARE_COLOR.failed
+};
+
+export const READY_LABEL: Record<ReadyKind, string> = {
+  prepared: 'ready: image prepared',
+  preparing: 'preparing',
+  'prepare-failed': 'prepare failed, copies in its window'
+};
+
+/** The legend's order, after the cell kinds. */
+export const READY_KINDS = Object.keys(READY_COLOR) as ReadyKind[];
+
+/** A prepare's ready kind; null before it starts and once the member's
+ * window run has. */
+export function readyKind(view: PrepareView | undefined): ReadyKind | null {
+  switch (view?.state) {
+    case 'prepared':
+    case 'preparing':
+      return view.state;
+    case 'failed':
+      return 'prepare-failed';
+    default:
+      return null;
+  }
 }

@@ -99,7 +99,7 @@
 
 <div class="code" style={`${minHeight ? `min-height: ${minHeight};` : ''}${maxHeight ? `max-height: ${maxHeight};` : ''}`}>
   <div class="code__toolbar">
-    <span class="code__meta">{lines.length} line{lines.length === 1 ? '' : 's'}</span>
+    <span class="code__meta">{lines.length.toLocaleString()} line{lines.length === 1 ? '' : 's'}</span>
     <button class="code__tool" type="button" onclick={copy} title={`Copy ${label.toLowerCase()} to clipboard`}>
       <NavIcon name={copyResult === 'copied' ? 'check' : 'copy'} size={14} />
       {copyResult === 'copied' ? 'Copied' : copyResult === 'failed' ? 'Copy failed' : 'Copy'}
@@ -111,7 +111,9 @@
     {/if}
   </div>
 
-  <div class="code__scroll">
+  <!-- Focusable, so Safari scrolls it by keyboard too. -->
+  <!-- svelte-ignore a11y_no_noninteractive_tabindex -->
+  <div class="code__scroll" tabindex="0" role="region" aria-label={label}>
     {#if lines.length === 0}
       <div class="code__empty">Empty</div>
     {:else}
@@ -151,7 +153,8 @@
   .code__meta {
     margin-right: auto;
     font-family: var(--sw-font-mono);
-    font-size: 11px;
+    font-variant-ligatures: none;
+    font-size: var(--sw-text-2xs);
     color: var(--sw-text-muted);
     font-variant-numeric: tabular-nums;
   }
@@ -165,7 +168,7 @@
     border-radius: var(--sw-radius-sm);
     background: transparent;
     color: var(--sw-text-secondary);
-    font-size: 12px;
+    font-size: var(--sw-text-xs);
     cursor: pointer;
     transition: background var(--sw-dur-fast), color var(--sw-dur-fast);
   }
@@ -183,11 +186,17 @@
     scrollbar-width: thin;
   }
 
+  /* Inside the box, which clips what is drawn outside it. */
+  .code__scroll:focus-visible {
+    outline-offset: -2px;
+  }
+
   .code__body {
     min-width: max-content;
     padding: 10px 0;
     font-family: var(--sw-font-mono);
-    font-size: 12.5px;
+    font-variant-ligatures: none;
+    font-size: var(--sw-text-xs);
     line-height: 1.6;
     tab-size: 2;
   }
@@ -214,7 +223,6 @@
     padding-right: 12px;
     text-align: right;
     color: var(--sw-text-muted);
-    opacity: 0.6;
     user-select: none;
     font-variant-numeric: tabular-nums;
   }
@@ -228,6 +236,6 @@
     padding: 24px;
     text-align: center;
     color: var(--sw-text-muted);
-    font-size: 13px;
+    font-size: var(--sw-text-sm);
   }
 </style>
