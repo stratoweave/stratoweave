@@ -4,14 +4,28 @@ PlanTimeline.svelte), with one braille dot for each device.
 
 The input is the layout that Controller.layout() gives: one entry for each
 window that has devices, as (schedule, start, end, devices), and each
-device as (name, start, estimated duration). The output is lines of text
+device as (name, start, estimated duration). When members prepare, the
+input also has each prepare as (name, prepare-start, expected prepare
+time), and the size of each member's image. The output is lines of text
 for a terminal of any width.
 
-The axis covers the spans of the windows, merged. An idle gap that is
-longer than one and a half breaks becomes a break: the axis line shows
-"╱╱" and the label row shows the length of the gap. The label row shows
-the clock at the ticks. A day row is above it when the plan covers more
-than one local day. On the axis line, "┬" is a tick and "▼" is now.
+The axis covers the spans of the windows and the time in which each
+prepare runs, merged. An idle gap that is longer than one and a half
+breaks becomes a break: the axis line shows "╱╱" and the label row shows
+the length of the gap. The label row shows the clock at the ticks. A day
+row is above it when the plan covers more than one local day. On the axis
+line, "┬" is a tick and "▼" is now.
+
+When members prepare, two lanes are between the axis and the bands. The
+prepare lane has one dot for each member that prepares, in the dot column
+of its prepare-start, in columns as the dots of the devices are, and the
+label "prepare". Above it, the bandwidth line has a bar in each dot
+column that fills from the bottom: the bandwidth of the dot column, at
+the scale of the peak, in eighths of two text rows. The label of the
+bandwidth line is the peak. A prepare runs from its prepare-start for its
+expected prepare time, and uses the size of its image divided by its
+expected prepare time. The bandwidth of a dot column is the most that the
+sum of the prepares that run gets to in the time of the dot column.
 
 Windows that overlap go in lanes, one above the other. Each window has a
 band with its schedule, its times and its device count. Under the band is
@@ -28,8 +42,10 @@ text.
 
 Under the drawing, one line for each window gives the exact times: when
 the window opens and closes, its device count, the first start, the last
-start and the last expected end (start plus estimated duration). The times
-are HH:MM, or HH:MM:SS when one of them is not on a whole minute.
+start and the last expected end (start plus estimated duration). A line
+for the prepares is above them, with the same times for the prepares.
+The times are HH:MM, or HH:MM:SS when one of them is not on a whole
+minute.
 """
 
 import fleet_ctl
@@ -59,6 +75,10 @@ MIN_TICK = 14
 # The most dots in a dot column. The next device spills into the next
 # dot column. 24 dots are 6 rows of text.
 CAP = 24
+
+# The text rows of the bandwidth line. A text row has four dot rows, so a
+# bar has eight steps.
+BAR_ROWS = 2
 
 # The tick steps in seconds, least first.
 TICK_STEPS = [60, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400]
@@ -237,64 +257,74 @@ def merge(spans: list[(int, int)]) -> list[(int, int)]:
 
 
 class Axis(object):
-    """The merged spans of the windows on a line of dot columns, d dot
-    columns per hour. segs holds each span as (start, end, x, x_end), with
-    x and x_end in dot columns. cut is True for each span that comes after
-    a break. breaks holds each gap that became a break as (from, to, x). A
-    break starts at a character and is BREAK_W dot columns wide. width is
-    the width of the line in dot columns, with the padding."""
+    """The merged spans on a line of dot columns, d dot columns per hour.
+    segs holds each span as (start, end, x, x_end), with x and x_end in
+    dot columns. cut is True for each span that comes after a break. run
+    holds for each span the first span after the break before it, or the
+    first span: from the start of that span, the spans and the gaps
+    between them are at the scale. breaks holds each gap that became a
+    break as (from, to, x). A break starts at a character and is BREAK_W
+    dot columns wide. width is the width of the line in dot columns, with
+    the padding."""
     d: int
     segs: list[(int, int, int, int)]
     cut: list[bool]
+    run: list[int]
     breaks: list[(int, int, int)]
     width: int
 
     def __init__(self, spans: list[(int, int)], d: int):
         segs: list[(int, int, int, int)] = []
         cut: list[bool] = []
+        run: list[int] = []
         breaks: list[(int, int, int)] = []
         x = PAD
+        first = 0
         for i in range(len(spans)):
             s = spans[i]
             broken = False
             if i > 0:
                 prev = spans[i - 1]
                 gap = (s.0 - prev.1) * d // HOUR
-                if gap <= BREAK_MIN:
-                    x += gap
-                else:
+                if gap > BREAK_MIN:
                     x += x % 2
                     breaks.append((prev.1, s.0, x))
                     x += BREAK_W
                     broken = True
-            x_end = x + (s.1 - s.0) * d // HOUR
-            segs.append((s.0, s.1, x, x_end))
+                    first = i
+            start = spans[first].0
+            at = x if first == i else segs[first].2
+            x_end = at + (s.1 - start) * d // HOUR
+            segs.append((s.0, s.1, at + (s.0 - start) * d // HOUR, x_end))
             cut.append(broken)
+            run.append(first)
             x = x_end
         self.d = d
         self.segs = segs
         self.cut = cut
+        self.run = run
         self.breaks = breaks
         self.width = x + PAD
 
     def x_of(self, t: int) -> int:
-        """Return the dot column of the time t. In a span, and before the
-        first span or after the last, it is at the scale. In a gap, the
-        gap's dot columns divide the gap evenly."""
+        """Return the dot column of the time t. In a span, in a gap that is
+        not a break, and after the last span, it is at the scale from the
+        start of the first span of its run. In a break, the break's dot
+        columns divide the gap evenly. Before the first span, it is at the
+        scale."""
         first = self.segs[0]
         if t <= first.0:
             return first.2 - ((first.0 - t) * self.d + HOUR - 1) // HOUR
         n = len(self.segs)
-        for i in range(n):
-            s = self.segs[i]
-            if t <= s.1:
-                return s.2 + (t - s.0) * self.d // HOUR
-            if i + 1 < n:
-                nx = self.segs[i + 1]
-                if t < nx.0:
-                    return s.3 + (t - s.1) * (nx.2 - s.3) // (nx.0 - s.1)
-        last = self.segs[n - 1]
-        return last.3 + (t - last.1) * self.d // HOUR
+        i = 0
+        while i + 1 < n and self.segs[i + 1].0 <= t:
+            i += 1
+        s = self.segs[i]
+        if t > s.1 and i + 1 < n and self.cut[i + 1]:
+            nx = self.segs[i + 1]
+            return s.3 + (t - s.1) * (nx.2 - s.3) // (nx.0 - s.1)
+        b = self.segs[self.run[i]]
+        return b.2 + (t - b.0) * self.d // HOUR
 
 
 class Placed(object):
@@ -360,21 +390,20 @@ class Cells(object):
         self.displaced = displaced
 
 
-def layout_cells(p: Placed, cap: int) -> Cells:
-    """Return the dot columns of the window p with columns of cap dots at
-    most (layoutCells() of the web). A column opens at the dot column of a
-    device's start and takes each later device in the same dot column. A
-    full column spills into the next dot column. A device that starts
-    after the last dot column of the window goes in the last dot
-    column."""
-    max_x = p.x_end - 1
+def layout_cells(xs: list[int], min_x: int, max_x: int, cap: int) -> Cells:
+    """Return the dot columns of the dots at the dot columns xs, in the
+    order that the dots fill, with columns of cap dots at most
+    (layoutCells() of the web). A column opens at the dot column of a
+    dot and takes each later dot in the same dot column. A full column
+    spills into the next dot column. A dot before min_x goes in min_x, and
+    a dot after max_x goes in max_x."""
     cols: list[(int, int, int)] = []
     displaced = 0
     cx = 0
     first = 0
     count = 0
-    for i in range(len(p.xs)):
-        wanted = imax(p.x, imin(max_x, p.xs[i]))
+    for i in range(len(xs)):
+        wanted = imax(min_x, imin(max_x, xs[i]))
         if i == 0 or wanted > cx or count >= cap:
             nx = wanted
             if i > 0:
@@ -386,7 +415,7 @@ def layout_cells(p: Placed, cap: int) -> Cells:
         if cx != wanted:
             displaced += 1
         count += 1
-    if len(p.xs) > 0:
+    if len(xs) > 0:
         cols.append((cx, first, count))
     return Cells(cols, displaced)
 
@@ -397,16 +426,16 @@ def fit_cells(p: Placed) -> Cells:
     columns are the least number of dots taller that keeps all of them in
     the window (fitCells() of the web)."""
     last_x = imax(p.x, p.x_end - 1)
-    c = layout_cells(p, CAP)
+    c = layout_cells(p.xs, p.x, p.x_end - 1, CAP)
     n = len(c.cols)
     if n == 0 or c.cols[n - 1].0 <= last_x:
         return c
     lo = CAP
     hi = len(p.xs)
-    best = layout_cells(p, hi)
+    best = layout_cells(p.xs, p.x, p.x_end - 1, hi)
     while hi - lo > 1:
         mid = (lo + hi) // 2
-        m = layout_cells(p, mid)
+        m = layout_cells(p.xs, p.x, p.x_end - 1, mid)
         if m.cols[len(m.cols) - 1].0 <= last_x:
             hi = mid
             best = m
@@ -424,7 +453,7 @@ def pick_scale(wins: list[Window], spans: list[(int, int)]) -> int:
     for d in SCALES:
         n = 0
         for p in place(wins, Axis(spans, d)):
-            n += layout_cells(p, CAP).displaced
+            n += layout_cells(p.xs, p.x, p.x_end - 1, CAP).displaced
         if n == 0:
             return d
         if fewest < 0 or n < fewest:
@@ -444,28 +473,37 @@ def tick_step(d: int) -> int:
 
 def axis_ticks(axis: Axis, step: int, off: int) -> list[(int, int)]:
     """Return the ticks as (time, span): the multiples of step on the local
-    clock in each span, and the index of the span. A tick less than
+    clock from the start of each run of spans to its end, and the index of
+    the last span that starts at the tick or before it. A tick less than
     MIN_TICK dot columns after the tick before it is left out."""
     out: list[(int, int)] = []
     last = 0
-    for i in range(len(axis.segs)):
-        seg = axis.segs[i]
-        t = fdiv(seg.0 + off + step - 1, step) * step - off
-        while t <= seg.1:
+    n = len(axis.segs)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and not axis.cut[j + 1]:
+            j += 1
+        k = i
+        t = fdiv(axis.segs[i].0 + off + step - 1, step) * step - off
+        while t <= axis.segs[j].1:
+            while k < j and axis.segs[k + 1].0 <= t:
+                k += 1
             x = axis.x_of(t)
             if len(out) == 0 or x - last >= MIN_TICK:
-                out.append((t, i))
+                out.append((t, k))
                 last = x
             t += step
+        i = j + 1
     return out
 
 
-def multi_day(wins: list[Window], off: int) -> bool:
-    """Return True when the windows cover more than one local day."""
+def multi_day(spans: list[(int, int)], off: int) -> bool:
+    """Return True when the spans cover more than one local day."""
     days: set[int] = set()
-    for w in wins:
-        days.add(local_day(w.a, off))
-        days.add(local_day(w.b - 1, off))
+    for s in spans:
+        days.add(local_day(s.0, off))
+        days.add(local_day(s.1 - 1, off))
     return len(days) > 1
 
 
@@ -487,12 +525,13 @@ def joined(row: list[str]) -> str:
     return "".join(row).rstrip()
 
 
-def axis_rows(axis: Axis, wins: list[Window], off: int, now: ?int, chars: int) -> list[str]:
+def axis_rows(axis: Axis, spans: list[(int, int)], off: int, now: ?int,
+              chars: int) -> list[str]:
     """Return the rows of the axis: the day row when the plan covers more
     than one local day, the label row, and the axis line.
 
     A break label is in the middle of its break. A tick label is centered
-    on its tick, but stays in its span on a side where a break is. A tick
+    on its tick, but stays between the breaks before and after it. A tick
     label that is not one character at least from a label before it is
     left out. A day label is above the first tick of its day, where that
     tick's label starts, as the web timeline puts it. The labels can go
@@ -513,19 +552,22 @@ def axis_rows(axis: Axis, wins: list[Window], off: int, now: ?int, chars: int) -
         for k in range(at, at + len(text)):
             taken.add(k)
     n = len(axis.segs)
-    several = multi_day(wins, off)
+    several = multi_day(spans, off)
     used = -1
     day = -1
     for tick in axis_ticks(axis, tick_step(axis.d), off):
-        seg = axis.segs[tick.1]
         c = axis.x_of(tick.0) // 2
         put(line, c, "┬")
         text = clock(tick.0, off, False)
         at = c - len(text) // 2
-        if tick.1 + 1 < n and axis.cut[tick.1 + 1]:
-            at = imin(at, seg.3 // 2 - len(text) + 1)
-        if axis.cut[tick.1]:
-            at = imax(at, seg.2 // 2)
+        nxt = tick.1 + 1
+        while nxt < n and not axis.cut[nxt]:
+            nxt += 1
+        if nxt < n:
+            at = imin(at, axis.segs[nxt - 1].3 // 2 - len(text) + 1)
+        r = axis.run[tick.1]
+        if axis.cut[r]:
+            at = imax(at, axis.segs[r].2 // 2)
         at = imax(0, at)
         free = True
         for k in range(at - 1, at + len(text) + 1):
@@ -624,7 +666,126 @@ def lane_rows(placed: list[Placed], off: int, chars: int) -> list[str]:
     return out
 
 
-def has_seconds(wins: list[Window], off: int) -> bool:
+def prepares_of(prepares: list[(str, int, int)], sizes: dict[str, int],
+                runs: dict[str, int]) -> list[(int, str, int, int, int)]:
+    """Return the prepares by prepare-start, then by name, as
+    (prepare-start, name, expected prepare time, bandwidth, the second
+    from which it runs). The expected prepare time is 1 s at least. The
+    bandwidth is in bits per second: the size of the member's image in
+    sizes, in bytes, as bits, divided by the expected prepare time. A
+    member that is not in sizes uses no bandwidth. A prepare runs from the
+    second in runs, below 0 when it does not run, and else from its
+    prepare-start."""
+    out: list[(int, str, int, int, int)] = []
+    for p in prepares:
+        est = imax(1, p.2)
+        out.append((p.1, p.0, est, sizes.get_def(p.0, 0) * 8 // est, runs.get_def(p.0, p.1)))
+    return sorted(out)
+
+
+def prepare_spans(preps: list[(int, str, int, int, int)]) -> list[(int, int)]:
+    """Return the time in which each prepare that runs runs, as (start,
+    end)."""
+    return [(p.4, p.4 + p.2) for p in preps if p.4 >= 0]
+
+
+def bandwidth(preps: list[(int, str, int, int, int)], axis: Axis) -> list[int]:
+    """Return the bandwidth of each dot column of the axis, in bits per
+    second: the most that the sum of the bandwidths of the prepares that
+    run gets to in the time of the dot column."""
+    changes: list[(int, int)] = []
+    for p in preps:
+        if p.4 >= 0:
+            changes.append((p.4, p.3))
+            changes.append((p.4 + p.2, -p.3))
+    changes = sorted(changes)
+    cols = [0 for _x in range(axis.width)]
+    v = 0
+    i = 0
+    n = len(changes)
+    while i < n:
+        t = changes[i].0
+        while i < n and changes[i].0 == t:
+            v += changes[i].1
+            i += 1
+        if v > 0 and i < n:
+            # The sum is v from t to the second before the next change.
+            x0 = axis.x_of(t)
+            for x in range(x0, imax(x0, axis.x_of(changes[i].0 - 1)) + 1):
+                if x >= 0 and x < len(cols):
+                    cols[x] = imax(cols[x], v)
+    return cols
+
+
+def rate(bps: int) -> str:
+    """Return the bandwidth bps, in bits per second, as text in the first
+    unit of bit/s, kbit/s, Mbit/s, Gbit/s and Tbit/s in which it is below
+    1000 when rounded: "850 kbit/s", "12 Mbit/s" or "1.2 Gbit/s". It is
+    rounded to a whole number, or to one decimal when it is below 10 in a
+    unit larger than bit/s."""
+    units = ["bit/s", "kbit/s", "Mbit/s", "Gbit/s", "Tbit/s"]
+    u = 1
+    i = 0
+    while i + 1 < len(units) and (bps + u // 2) // u >= 1000:
+        u *= 1000
+        i += 1
+    tenths = (bps * 10 + u // 2) // u
+    if i > 0 and tenths < 100:
+        return str(tenths // 10) + "." + str(tenths % 10) + " " + units[i]
+    return str((bps + u // 2) // u) + " " + units[i]
+
+
+def prepare_rows(preps: list[(int, str, int, int, int)], axis: Axis) -> list[str]:
+    """Return the rows of the prepares: the bandwidth line, BAR_ROWS text
+    rows, when a prepare uses bandwidth, and the prepare lane. A bar has a
+    step for each dot row, and its height is the bandwidth of its dot
+    column divided by the peak, rounded, one step at least. The prepare
+    lane has the dots of the members, as the dots of the devices hang
+    from a band, from the first prepare-start on, with no end. The label
+    of each lane is two characters after the end of the longer lane."""
+    cols = bandwidth(preps, axis)
+    peak = 0
+    last = 0
+    for x in range(len(cols)):
+        if cols[x] > 0:
+            peak = imax(peak, cols[x])
+            last = x // 2
+    xs = [axis.x_of(p.0) for p in preps]
+    cells = layout_cells(xs, xs[0], xs[len(xs) - 1] + len(xs), CAP)
+    dots = 0
+    for col in cells.cols:
+        dots = imax(dots, col.2)
+        last = imax(last, col.0 // 2)
+    at = last + 3
+    top = rate(peak) + " peak"
+    wide = at + imax(len(top), len("prepare"))
+    out: list[str] = []
+    if peak > 0:
+        steps = BAR_ROWS * 4
+        bars = [[0 for _c in range(wide)] for _r in range(BAR_ROWS)]
+        for x in range(len(cols)):
+            if cols[x] > 0:
+                h = imax(1, (cols[x] * steps * 2 + peak) // (peak * 2))
+                for r in range(steps - h, steps):
+                    bars[r // 4][x // 2] = bars[r // 4][x // 2] | DOT_BITS[r % 4][x % 2]
+        for r in range(BAR_ROWS):
+            row = [chr(0x2800 + v) if v > 0 else " " for v in bars[r]]
+            if r == 0:
+                put(row, at, top)
+            out.append(joined(row))
+    grid = [[0 for _c in range(wide)] for _r in range((dots + 3) // 4)]
+    for col in cells.cols:
+        for r in range(col.2):
+            grid[r // 4][col.0 // 2] = grid[r // 4][col.0 // 2] | DOT_BITS[r % 4][col.0 % 2]
+    for r in range(len(grid)):
+        row = [chr(0x2800 + v) if v > 0 else " " for v in grid[r]]
+        if r == 0:
+            put(row, at, "prepare")
+        out.append(joined(row))
+    return out
+
+
+def has_seconds(wins: list[Window], preps: list[(int, str, int, int, int)], off: int) -> bool:
     """Return True when a time of the window lines is not on a whole
     minute."""
     times: list[int] = []
@@ -635,26 +796,44 @@ def has_seconds(wins: list[Window], off: int) -> bool:
             times.append(w.end)
         times.extend(w.starts)
         times.append(w.last_end())
+    for p in preps:
+        times.append(p.0)
+    for sp in prepare_spans(preps):
+        times.append(sp.0)
+        times.append(sp.1)
     for t in times:
         if t + off - fdiv(t + off, 60) * 60 != 0:
             return True
     return False
 
 
-def window_lines(wins: list[Window], off: int) -> list[str]:
-    """Return one line for each window, by start, with
-    the columns aligned: the schedule, the day when the plan covers more
-    than one local day, when the window opens and closes, the device
-    count, the first start, the last start, and the last expected end.
-    The times are HH:MM, or HH:MM:SS when one of them is not on a whole
-    minute. A time on a later local day than the window's day has "+N"
-    after it, N days later."""
-    seconds = has_seconds(wins, off)
-    several = multi_day(wins, off)
-    digits = 0
+def window_lines(wins: list[Window], preps: list[(int, str, int, int, int)],
+                 spans: list[(int, int)], off: int) -> list[str]:
+    """Return one line for the prepares, when members prepare, and one
+    line for each window, by start, with the columns aligned: the
+    schedule, or "prepare", the day when the plan covers more than one
+    local day, when the window opens and closes, the device count, the
+    first start, the last start, and the last expected end. For the
+    prepares, these are the prepare-starts and the ends of the prepares,
+    and the column of the opening and the closing is empty; when no
+    prepare runs, the end is the last prepare-start. The times are
+    HH:MM, or HH:MM:SS when one of them is not on a whole minute. A time
+    on a later local day than the day of the line has "+N" after it, N
+    days later."""
+    seconds = has_seconds(wins, preps, off)
+    several = multi_day(spans, off)
+    digits = len(str(len(preps)))
     for w in wins:
         digits = imax(digits, len(str(len(w.names))))
-    rows: list[list[str]] = []
+    # Each line as (name, day, opens and closes, count, first, last, end).
+    lines: list[(str, int, str, int, int, int, int)] = []
+    if len(preps) > 0:
+        end = preps[len(preps) - 1].0
+        for sp in prepare_spans(preps):
+            end = imax(end, sp.1)
+        first = preps[0].0
+        lines.append(("prepare", local_day(first, off), "", len(preps), first,
+                      preps[len(preps) - 1].0, end))
     for w in wins:
         day = local_day(w.a, off)
         opens = "launch"
@@ -664,17 +843,21 @@ def window_lines(wins: list[Window], off: int) -> list[str]:
         if not never_closes(w.end):
             closes = at_day(w.end, off, seconds, day)
         n = len(w.names)
+        lines.append((w.name(), day, opens + " → " + closes, n, w.starts[0], w.starts[n - 1],
+                      w.last_end()))
+    rows: list[list[str]] = []
+    for e in lines:
         word = "devices"
-        if n == 1:
+        if e.3 == 1:
             word = "device"
-        row = [w.name()]
+        row = [e.0]
         if several:
-            row.append(day_label(day))
-        row.append(opens + " → " + closes)
-        row.append(str(n).rjust(digits) + " " + word)
-        row.append("first " + at_day(w.starts[0], off, seconds, day))
-        row.append("last " + at_day(w.starts[n - 1], off, seconds, day))
-        row.append("ends " + at_day(w.last_end(), off, seconds, day))
+            row.append(day_label(e.1))
+        row.append(e.2)
+        row.append(str(e.3).rjust(digits) + " " + word)
+        row.append("first " + at_day(e.4, off, seconds, e.1))
+        row.append("last " + at_day(e.5, off, seconds, e.1))
+        row.append("ends " + at_day(e.6, off, seconds, e.1))
         rows.append(row)
     widths = [0 for _c in range(len(rows[0]))]
     for row in rows:
@@ -696,21 +879,32 @@ def at_day(t: int, off: int, seconds: bool, day: int) -> str:
     return text
 
 
-def render(layout: list[(str, int, int, list[(str, int, int)])], off: int, now: ?int) -> str:
+def render(layout: list[(str, int, int, list[(str, int, int)])], off: int, now: ?int,
+           prepares: list[(str, int, int)]=[], sizes: dict[str, int]={},
+           runs: dict[str, int]={}) -> str:
     """Return the plan timeline of the layout as lines of text: the axis,
-    the lanes and the window lines. off is the UTC offset of the clock in
-    seconds. now is the time of the "▼" marker. When now is None, there
-    is no marker."""
+    the prepare lanes, the lanes of the windows and the window lines. off
+    is the UTC offset of the clock in seconds. now is the time of the "▼"
+    marker. When now is None, there is no marker. prepares has each
+    member that prepares as (name, prepare-start, expected prepare time
+    in seconds), and sizes the size of each member's image in bytes. A
+    prepare runs from its prepare-start, or from the second that runs has
+    for it, and not at all when that is below 0: its bandwidth and its end
+    count from then. With no prepares, there are no prepare lanes."""
     wins = windows_of(layout)
     if len(wins) == 0:
         return "no window has devices\n"
-    spans = merge([(w.a, w.b) for w in wins])
+    preps = prepares_of(prepares, sizes, runs)
+    spans = merge([(w.a, w.b) for w in wins] + prepare_spans(preps)
+                  + [(p.0, p.0) for p in preps])
     axis = Axis(spans, pick_scale(wins, spans))
     placed = place(wins, axis)
     chars = (axis.width + 1) // 2
     lines: list[str] = []
-    lines.extend(axis_rows(axis, wins, off, now, chars))
+    lines.extend(axis_rows(axis, spans, off, now, chars))
+    if len(preps) > 0:
+        lines.extend(prepare_rows(preps, axis))
     lines.extend(lane_rows(placed, off, chars))
     lines.append("")
-    lines.extend(window_lines(wins, off))
+    lines.extend(window_lines(wins, preps, spans, off))
     return "\n".join(lines) + "\n"
