@@ -812,6 +812,20 @@
   deadline; its prepare counts from then. Before, only a pause let it
   again, also after its deadline, and a hold left it out for the rest of
   the run. After its deadline, the alarm names it.
+- A prepare of a campaign member that fails for a transient reason, such as
+  a device that is not connected or a connection that drops, is `retrying`:
+  while `allow-staging` is on, the device's software manager tries it again
+  after a minute, then twice as long each time up to 5 minutes, and at once
+  when the device connects or is let again. The campaign lets the member
+  prepare until its window opens, and counts its prepare from now. Any other
+  failure needs a person: a new `prepare-attempt` of the member prepares it
+  again, at once as `prepare-max-bandwidth` allows and outside the times in
+  which no member may prepare, and the member keeps its `prepare-start`. The
+  device's software has the same `prepare-attempt`, and its prepare job says
+  which one it ran for. A member let that has not begun its prepare a
+  debounce after it was let, or that retries it, is named in the alarm
+  "N device(s) cannot prepare before their window opens" once its deadline
+  has passed. Before, a failed prepare was never tried again.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead

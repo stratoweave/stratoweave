@@ -4916,6 +4916,281 @@ actor _test_campaign_lets_a_member_prepare_again_after_a_pause(t: testing.AsyncT
         _PrepareThroughPause(t, False)
 
 
+def _prepare_attempts(out: gdata.Node) -> dict[str, u64]:
+    """Return the prepare attempt that out, the output of a campaign,
+    writes for each device that has one."""
+    attempts: dict[str, u64] = {}
+    for flotilla in y_1.root.from_gdata(out).rfs:
+        for dev in flotilla.device:
+            r = dev.software.prepare_attempt
+            if r is not None:
+                attempts[dev.name] = r
+    return attempts
+
+
+def _asked(names: list[str], name: str, now: int) -> (InputCampaign, y_0.root):
+    """The campaign soon of _soon in run with allow-staging, where the
+    member name has its prepare attempt 1."""
+    asked = _soon(names, "run", True, now)
+    member = asked.0.device.get(name)
+    if member is not None:
+        member.prepare_attempt = u64(1)
+    return asked
+
+
+proc def _FailedPrepareAgain(t: testing.AsyncT, restarted: bool):
+    """Run the campaign soon over cpe-1 to cpe-3 with allow-staging. cpe-1
+    is let prepare at once. Without restarted, its prepare fails. With
+    restarted, it prepares, and cpe-2 reports a failed prepare from the
+    start, as after a restart of fleetmgr, and gets no turn. The campaign
+    does not let the member that failed prepare, and the plan names it in
+    the alarm of the failed prepares. An operator then raises its
+    prepare-attempt. Pass t when the output at once lets the member
+    prepare, with prepare-attempt 1, and the plan keeps its prepare-start,
+    or gives it one when it had none."""
+    t.timeout(6.0)
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    failing = "cpe-2" if restarted else "cpe-1"
+    now = time.time().unix_s()
+    soon = _soon(names, "run", True, now)
+    asked = _asked(names, failing, now)
+    FailedPrepareAgainActor(t=t, restarted=restarted, names=names, failing=failing, soon=soon,
+                            asked=asked)
+
+
+actor FailedPrepareAgainActor(t: testing.AsyncT, restarted: bool, names, failing, soon, asked):
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var stage = 0
+    var staged: list[str] = []
+    var staged_ok = False
+    var first: ?u64 = None
+    var done = False
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def failed_prepare() -> y1_oper.stratoweave_rfs__rfs__device__state:
+        return _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "failed", "17.18.03a")
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        staged = _staged(out)
+        cc = controller
+        if stage == 0 and staged == ["cpe-1"] and cc is not None:
+            stage = 1
+            # cpe-1's prepare fails, or with restarted is done, so that it
+            # leaves the cap free.
+            cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+                      failed_prepare() if not restarted else
+                      _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "done", "17.18.03a"),
+                      None)
+        elif stage == 2:
+            if failing in staged and _prepare_attempts(out).get(failing) == u64(1):
+                staged_ok = True
+            else:
+                fail("after the ask: let prepare {staged}, prepare attempts "
+                     + "{_prepare_attempts(out)}")
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        alarm = "1 device(s) failed to prepare and copy the image in their window: {failing}"
+        start = _plan_row(o, failing).3
+        cc = controller
+        if stage == 1 and alarm in o.state.plan.alarm and failing not in staged \
+           and cc is not None:
+            first = start
+            stage = 2
+            cc.on_conf(asked.0, asked.1.to_gdata())
+        elif stage == 2 and staged_ok:
+            if alarm in o.state.plan.alarm:
+                fail("the failed prepare is still named")
+            elif start is None or (first is not None and start != first):
+                fail("{failing} prepares at {start}, not {first}")
+            else:
+                done = True
+                t.success()
+
+    def timeout() -> None:
+        fail("at stage {stage}, {failing} was not let prepare again: let prepare {staged}")
+
+    proc def __startup__():
+        ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), on_output, self.on_oper, None)
+        controller = ctl
+        ctl.on_conf(soon.0, soon.1.to_gdata())
+        for name in names:
+            if restarted and name == failing:
+                ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name), failed_prepare(),
+                           None)
+            else:
+                ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                           _tagged("upgrade-needed", "soon", "17.18.03a"), None)
+        ctl.on_subscriptions_synced()
+        after 5.0: timeout()
+
+
+actor _test_campaign_lets_a_failed_member_prepare_again(t: testing.AsyncT):
+    """A member let prepare whose prepare fails is let prepare again at
+    once when its prepare-attempt changes, with the same prepare-start."""
+
+    proc def __startup__():
+        _FailedPrepareAgain(t, False)
+
+
+actor _test_campaign_lets_a_member_that_failed_before_a_restart_prepare(t: testing.AsyncT):
+    """A member that reports a failed prepare from the start, as after a
+    restart of fleetmgr, gets no turn. It is let prepare at once when its
+    prepare-attempt changes."""
+
+    proc def __startup__():
+        _FailedPrepareAgain(t, True)
+
+
+proc def _test_campaign_keeps_the_let_of_a_retrying_member(t: testing.AsyncT):
+    """Run the campaign soon over cpe-1 to cpe-3 with allow-staging. cpe-1
+    is let prepare at once, and its prepare is retrying: it failed for a
+    transient reason, and its device tries it again. The campaign keeps
+    letting it prepare."""
+    t.timeout(6.0)
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    soon = _soon(names, "run", True, time.time().unix_s())
+    RetryingMemberActor(t=t, names=names, soon=soon)
+
+
+actor RetryingMemberActor(t: testing.AsyncT, names, soon):
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var staged: list[str] = []
+    var reported = False
+    var done = False
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        staged = _staged(out)
+        cc = controller
+        if not reported and staged == ["cpe-1"] and cc is not None:
+            reported = True
+            cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+                      _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "retrying",
+                                      "17.18.03a"), None)
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None or not reported:
+            return
+        r = oper!.state.device_status.get("cpe-1")
+        if r is not None and r.prepare.state == "retrying":
+            if staged != ["cpe-1"]:
+                fail("cpe-1 retries its prepare, and the campaign lets {staged} prepare")
+            else:
+                done = True
+                t.success()
+
+    def timeout() -> None:
+        fail("no plan showed cpe-1 retrying its prepare: let prepare {staged}")
+
+    proc def __startup__():
+        ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), on_output, self.on_oper, None)
+        controller = ctl
+        ctl.on_conf(soon.0, soon.1.to_gdata())
+        for name in names:
+            ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                       _tagged("upgrade-needed", "soon", "17.18.03a"), None)
+        ctl.on_subscriptions_synced()
+        after 5.0: timeout()
+
+
+proc def _test_campaign_counts_a_prepare_that_runs_again_from_its_report(t: testing.AsyncT):
+    """Run the campaign soon over cpe-1 to cpe-3 with allow-staging, where
+    each member upgrades in 92 s, so that it prepares in 30 s. cpe-1 is let
+    prepare at once, and its prepare is retrying. 1.5 s later its device
+    reports the prepare running again. Pass t when the plan counts that
+    prepare from the report, and not from when cpe-1 was let: the prepare
+    bandwidth of the plan has its first step at the report."""
+    t.timeout(6.0)
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    soon = _soon(names, "run", True, time.time().unix_s())
+    for name in names:
+        dev = soon.1.fleet.device.get(name)
+        if dev is not None:
+            dev.mock.software.upgrade_duration = u64(92)
+    RunsAgainActor(t=t, names=names, soon=soon)
+
+
+actor RunsAgainActor(t: testing.AsyncT, names, soon):
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var stage = 0
+    var sent_at = 0
+    var done = False
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def report(state: str) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+                      _tagged_prepare("upgrade-needed", "soon", "17.18.03a", state, "17.18.03a"),
+                      None)
+
+    def runs_again() -> None:
+        stage = 3
+        sent_at = time.time().unix_s()
+        report("running")
+
+    def on_output(out: gdata.Node) -> None:
+        if not done and stage == 0 and _staged(out) == ["cpe-1"]:
+            stage = 1
+            report("retrying")
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        o = oper!
+        r = o.state.device_status.get("cpe-1")
+        st = r.prepare.state if r is not None else None
+        if stage == 1 and st == "retrying":
+            stage = 2
+            after 1.5: runs_again()
+        elif stage == 3 and st == "running":
+            first: ?u64 = None
+            for e in o.state.plan.prepare_bandwidth:
+                bw = e.bandwidth
+                if first is None and bw is not None and bw > u64(0):
+                    first = e.time
+            f = -1
+            if first is not None:
+                f = int(first)
+            if f < sent_at or f > sent_at + 5:
+                fail("cpe-1's prepare counts from {first}, not from its report at {sent_at}")
+            else:
+                done = True
+                t.success()
+
+    def timeout() -> None:
+        fail("at stage {stage}, no plan showed cpe-1's prepare running again")
+
+    proc def __startup__():
+        ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), on_output, self.on_oper, None)
+        controller = ctl
+        ctl.on_conf(soon.0, soon.1.to_gdata())
+        for name in names:
+            ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                       _tagged("upgrade-needed", "soon", "17.18.03a"), None)
+        ctl.on_subscriptions_synced()
+        after 5.0: timeout()
+
+
 proc def _NewImage(t: testing.AsyncT, released: bool):
     """A campaign over cpe-1 alone, and a new version of its image. When
     released is False, the campaign is soon, with allow-staging: cpe-1 is

@@ -6225,16 +6225,17 @@ def _test_prepare_reports_keep_the_quiet_time():
 
 def _test_revokes():
     """ONE: the decision at 0 lets d0 prepare. d0 stays let while its
-    prepare runs. It stops being let when its prepare is done or failed,
-    when it no longer answers that it needs the upgrade, when prepare goes
-    off, when the run stops, when it leaves the campaign, or when its
-    window opens. It is let once: it gets no later turn, and only leaving
+    prepare runs or is retrying. It stops being let when its prepare is
+    done or failed, when it no longer answers that it needs the upgrade,
+    when prepare goes off, when the run stops, when it leaves the campaign,
+    or when its window opens. It is let once: it gets no later turn, and only leaving
     the campaign forgets that it was let. When the window opens, d1, let
     at 2500, stops being let too, though only d0 starts."""
     # (the event, the next decision, or -1 for none, whether d0 is still
     # let)
     cases: list[(str, int, bool)] = [
         ("prepare running", 5, True),
+        ("prepare retrying", 100, True),
         ("prepare done", 100, False),
         ("prepare failed", 100, False),
         ("lost answer", 100, False),
@@ -6250,6 +6251,8 @@ def _test_revokes():
         testing.assertEqual(sorted(list(c.allowed)), ["d0"], case.0)
         if case.0 == "prepare running":
             c.report_prepare("d0", "running")
+        elif case.0 == "prepare retrying":
+            c.report_prepare("d0", "retrying")
         elif case.0 == "prepare done":
             c.report_prepare("d0", "done")
         elif case.0 == "prepare failed":
@@ -6393,25 +6396,347 @@ def _test_the_plan_before_a_run_shows_a_run_started_now():
 
 def _test_copy_keeps_the_prepares():
     """ONE: d0 is let at 0 and reports its prepare done, and d2 reports
-    its prepare running, so no member is let at 1. A copy shows the same
-    prepares, and a decision on the copy does not change who the original
-    lets prepare."""
+    its prepare running, so no member is let at 1. Then an operator asks
+    d3 to prepare again. A copy shows the same prepares and the same ask,
+    and a decision on the copy, which lets d1 and d3, does not change who
+    the original lets prepare or asks to prepare again."""
     c = one()
     c.decide(0)
     c.report_prepare("d0", "done")
     c.report_prepare("d2", "running")
     c.decide(1)
     testing.assertEqual(len(c.allowed), 0)
+    c.retry_prepare("d3", 1)
     r = c.copy()
+    testing.assertEqual(r.prepare_now, {"d3": 1})
     a = c.prepares(1)
     b = r.prepares(1)
     testing.assertEqual(b.starts, a.starts)
     testing.assertEqual(b.c, a.c)
     testing.assertEqual(b.alarms, a.alarms)
     r.decide(3333)
-    testing.assertEqual(sorted(list(r.allowed)), ["d1"])
-    testing.assertEqual(len(c.allowed), 0)
+    testing.assertEqual((sorted(list(r.allowed)), r.prepare_now), (["d1", "d3"], {}))
+    testing.assertEqual((len(c.allowed), c.prepare_now), (0, {"d3": 1}))
     testing.assertEqual(c.prepare_at, {"d0": 0})
+
+
+def _test_a_retrying_prepare_counts_from_now_while_let():
+    """ONE: d0 is let at 0, and its prepare is retrying: it failed for a
+    transient reason, and its device tries it again. While d0 is let, its
+    prepare counts from each second that the plan looks at, for its
+    expected prepare time, as its device can try it at any second. When it
+    reports its prepare running at 6000, it counts from then."""
+    c = one()
+    c.decide(0)
+    c.report_prepare("d0", "retrying")
+    # (the second, the span of d0's prepare at it)
+    cases: list[(int, (int, int))] = [
+        (100, (100, 200)),
+        (5000, (5000, 5100)),
+    ]
+    for case in cases:
+        testing.assertEqual([(e.0 // fleet_ctl.MICRO, e.1 // fleet_ctl.MICRO)
+                             for e in c.running_spans(case.0)], [case.1], str(case.0))
+    c.report_prepare("d0", "running", 6000)
+    testing.assertEqual(c.prepare_from.get("d0"), 6000)
+    testing.assertEqual([(e.0 // fleet_ctl.MICRO, e.1 // fleet_ctl.MICRO)
+                         for e in c.running_spans(6050)], [(6000, 6100)])
+
+
+def _test_a_retrying_member_is_let_again():
+    """ONE, and x, which has not answered, with a failure budget of zero.
+    d0 is let at 0, and its prepare is retrying. The run pauses, or x
+    reports failed at 1000, so that more members have failed than the
+    budget: d0 is let no more. When the run goes on, or x's status goes and
+    the hold ends, d0 is let again at 2000, with the second it was first
+    let, and its prepare counts from 2000. d0 that goes down stays let."""
+    # (case, whether d0 is let after the event, whether it is let at 2000,
+    # the second its prepare counts from, or -1 for its first let)
+    cases: list[(str, bool, bool, int)] = [
+        ("pause", False, True, 2000),
+        ("budget hold", False, True, 2000),
+        ("down", True, True, -1),
+    ]
+    for case in cases:
+        c = controller([("w", 10150, fleet_ctl.OPEN_END)],
+                       devices("d", 5, 600, "w") + [("x", 600, "w")], 2, 10, prepare=True,
+                       failure_budget=0)
+        c.report("x", None, 0)
+        c.decide(0)
+        c.report_prepare("d0", "retrying")
+        if case.0 == "pause":
+            c.stop()
+        elif case.0 == "budget hold":
+            c.report("x", "failed", 1000)
+            c.decide(1000)
+        else:
+            c.set_live("d0", False)
+            c.decide(1000)
+        kept = "d0" in c.allowed
+        if case.0 == "pause":
+            c.start()
+        elif case.0 == "budget hold":
+            c.lost("x")
+        c.decide(2000)
+        testing.assertEqual((kept, "d0" in c.allowed, c.prepare_at.get("d0"),
+                             c.prepare_from.get_def("d0", -1)),
+                            (case.1, case.2, 0, case.3), case.0)
+
+
+def let_until(c: Controller, until: int, idle: str) -> None:
+    """Run the prepares of c from 0 to the last decision before the second
+    until: a decision at 0 and at each wake. Each member let reports its
+    prepare done at once, but idle, which reports no prepare."""
+    t = 0
+    while t < until:
+        s = c.decide(t)
+        for name in c.order:
+            if name in c.allowed and name != idle and name not in c.prepare_state:
+                c.report_prepare(name, "done")
+        if s.wake < 0:
+            break
+        t = s.wake
+
+
+def _test_a_let_member_past_its_deadline_is_late():
+    """ONE with a debounce of 30 s. The members are let at their turns, d4
+    at 9990, and d0 to d3 prepare. The deadline of d4 is 10000. A member
+    let that reports no prepare is late once its deadline has passed and a
+    debounce has passed since it was let; one that reports its prepare
+    retrying, once its deadline has passed. A late member stays let, and
+    the prepares name it with the members that cannot prepare before their
+    window opens."""
+    named = ["1 device(s) cannot prepare before their window opens: d4"]
+    # (case, d4's prepare report, or "" for none, the second, and the
+    # prepare alarms at it)
+    cases: list[(str, str, int, list[str])] = [
+        ("no report, at the deadline", "", 10000, []),
+        ("no report, a second after the deadline", "", 10001, []),
+        ("no report, a debounce after the let", "", 10020, named),
+        ("retrying, a second after the deadline", "retrying", 10001, named),
+        ("running", "running", 10020, []),
+    ]
+    for case in cases:
+        c = one(30)
+        let_until(c, 9991, "d4")
+        testing.assertEqual(c.prepare_at.get("d4"), 9990, case.0)
+        if case.1 != "":
+            c.report_prepare("d4", case.1)
+        s = c.decide(case.2)
+        testing.assertEqual(("d4" in c.allowed, s.prepares.alarms), (True, case.3), case.0)
+
+
+def _test_a_let_member_wakes_at_its_deadline():
+    """ONE with a debounce of 30 s: d4 is let at 9990, and its deadline is
+    10000. A decision after that wakes at the first second at which d4 is
+    late, when that is before the window opens at 10150: a debounce after
+    its let when it reports no prepare, and a second after its deadline
+    when its prepare is retrying. With its prepare running, it wakes when
+    the window opens."""
+    # (d4's prepare report, or "" for none, and the wake)
+    cases: list[(str, int)] = [
+        ("", 10020),
+        ("retrying", 10001),
+        ("running", 10150),
+    ]
+    for case in cases:
+        c = one(30)
+        let_until(c, 9991, "d4")
+        if case.0 != "":
+            c.report_prepare("d4", case.0)
+        testing.assertEqual(c.decide(9995).wake, case.1, case.0)
+
+
+def _test_prepare_again_lets_at_once():
+    """An operator asks a member to prepare again (retry_prepare()). It is
+    let at once, as soon as the cap lets it, also after its deadline, and
+    it keeps the second it was first let. One that was never let in the
+    run, as after a restart, is let first then. It is not let while it is
+    down, also when it was let before, in a pause, or inside a time without
+    prepares: then when it comes up, when the run goes on, or at the end of
+    that time. Nor once the window promised to it has opened: it stays
+    asked until it is released. An ask that cannot be let before the window
+    opens is late. An ask whose prepare the device reports failed, as when
+    the operator sets the prepare attempt of a failed prepare again, is no
+    longer asked and is not planned. ONE, with prepare during windows on
+    for the case after the deadline, as otherwise the time before an
+    opening is a time without prepares, and an image of 1250 bytes, 100
+    bit/s, and a cap of 100 bit/s for the cap case. TWO for the
+    time without prepares: d2, promised the second window, prepared at its
+    turn, 32666, and is asked at 49100, in the time before the first window
+    opens."""
+    # (case, the member asked, the second of the check, whether it is let
+    # then, the second it was first let, or -1 for none, whether it is still
+    # asked, and the prepare alarms then)
+    cases: list[(str, str, int, bool, int, bool, list[str])] = [
+        ("failed, before its deadline", "d0", 3000, True, 0, False, []),
+        ("failed, after its deadline", "d0", 10050, True, 0, False, []),
+        ("never let, failed after a restart", "d1", 500, True, 500, False, []),
+        ("asked while let", "d0", 100, True, 0, False, []),
+        ("cap full", "d1", 100, True, 100, False, []),
+        ("inside a time without prepares", "d2", 51000, True, 32666, False, []),
+        ("promised window open", "d4", 10200, False, -1, True, []),
+        ("down", "d1", 200, True, 200, False, []),
+        ("down, let before", "d0", 200, True, 0, False, []),
+        ("the prepare of the ask failed", "d0", 3000, False, 0, False,
+         ["1 device(s) failed to prepare and copy the image in their window: d0"]),
+        ("in a pause", "d1", 200, True, 200, False, []),
+        ("cannot fit before the window opens", "d1", 10050, False, 2500, True,
+         ["1 device(s) cannot prepare before their window opens: d1"]),
+    ]
+    for case in cases:
+        label = case.0
+        name = case.1
+        c = one()
+        if label == "failed, after its deadline":
+            c = controller([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
+                           prepare=True, during=True)
+        elif label == "cap full":
+            c = controller([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
+                           prepare=True, image=1250, cap=100)
+        elif label == "inside a time without prepares":
+            c = two(False)
+        elif label == "cannot fit before the window opens":
+            c = controller([("w", 10150, fleet_ctl.OPEN_END)], devices("d", 5, 600, "w"), 2, 10,
+                           prepare=True)
+        t = case.2
+        if label == "failed, before its deadline" or label == "failed, after its deadline":
+            c.decide(0)
+            c.report_prepare(name, "failed")
+            let_until(c, t, "")
+            testing.assertEqual(name in c.allowed, False, label)
+        elif label == "never let, failed after a restart":
+            c.report_prepare(name, "failed")
+            c.decide(0)
+            testing.assertEqual((name in c.allowed, name in c.prepares(0).starts), (False, False),
+                                "{label}: no turn")
+        elif label == "asked while let":
+            c.decide(0)
+        elif label == "cap full":
+            c.decide(0)
+            c.report_prepare("d0", "running")
+            c.retry_prepare(name, 10)
+            s = c.decide(10)
+            testing.assertEqual((name in c.allowed, s.wake), (False, 100), "{label}: at 10")
+        elif label == "inside a time without prepares":
+            sim.drive(c, 0, {}, 49099, prepare_reports=True)
+            c.report_prepare(name, None)
+            c.retry_prepare(name, 49100)
+            c.decide(49100)
+            testing.assertEqual((name in c.allowed, name in c.prepare_now), (False, True),
+                                "{label}: at 49100")
+            sim.drive(c, 49150, {}, 50999)
+        elif label == "promised window open":
+            c.decide(0)
+            c.decide(10150)
+        elif label == "down":
+            c.decide(0)
+            c.set_live(name, False)
+            c.retry_prepare(name, 100)
+            c.decide(100)
+            testing.assertEqual((name in c.allowed, name in c.prepare_now), (False, True),
+                                "{label}: at 100")
+            c.set_live(name, True)
+        elif label == "down, let before":
+            c.decide(0)
+            c.report_prepare(name, "failed")
+            c.decide(50)
+            c.set_live(name, False)
+            c.report_prepare(name, None)
+            c.retry_prepare(name, 100)
+            c.decide(100)
+            testing.assertEqual((name in c.allowed, name in c.prepare_now), (False, True),
+                                "{label}: at 100")
+            c.set_live(name, True)
+        elif label == "the prepare of the ask failed":
+            c.decide(0)
+            c.report_prepare(name, "failed")
+            let_until(c, t, "")
+            c.retry_prepare(name, t)
+            testing.assertEqual([e.1 for e in c.turns(t).2], [], "{label}: not planned")
+        elif label == "in a pause":
+            c.decide(0)
+            c.stop()
+            c.retry_prepare(name, 100)
+            c.let_again(100)
+            testing.assertEqual((name in c.allowed, name in c.prepare_now), (False, True),
+                                "{label}: at 100")
+            c.start()
+        elif label == "cannot fit before the window opens":
+            let_until(c, 10001, "")
+        if label != "cap full" and label != "inside a time without prepares" \
+           and label != "down" and label != "in a pause" and label != "down, let before" \
+           and label != "the prepare of the ask failed":
+            c.report_prepare(name, None)
+            c.retry_prepare(name, t)
+        s = c.decide(t)
+        testing.assertEqual((name in c.allowed, c.prepare_at.get_def(name, -1),
+                             name in c.prepare_now, s.prepares.alarms),
+                            (case.3, case.4, case.5, case.6), label)
+        if label != "asked while let" and case.3:
+            testing.assertEqual(c.prepare_from.get(name), t, "{label}: counts from then")
+        if label == "promised window open":
+            flying = [(10150 + 600, n) for n in c.order if c.is_released(n)]
+            sim.drive(c, t, {}, t + 10000, inflight=flying)
+            testing.assertEqual((c.is_released(name), name in c.prepare_now), (True, False),
+                                "{label}: released")
+
+
+def _test_a_first_turn_follows_the_prepare_report():
+    """ONE, as after a restart of fleetmgr: d1 reports its prepare before
+    the first decision, so the run has not let it. With no prepare, or its
+    prepare retrying, it gets a turn and is let at it. With its prepare
+    running, done or failed, it gets none."""
+    # (d1's prepare report, or "" for none, whether it gets a turn)
+    cases: list[(str, bool)] = [
+        ("", True),
+        ("retrying", True),
+        ("running", False),
+        ("done", False),
+        ("failed", False),
+    ]
+    for case in cases:
+        c = one()
+        if case.0 != "":
+            c.report_prepare("d1", case.0)
+        c.decide(0)
+        turn = c.prepares(0).starts.get("d1")
+        testing.assertEqual(turn is not None, case.1, case.0)
+        if turn is not None:
+            c.decide(turn)
+            testing.assertTrue("d1" in c.allowed, case.0)
+
+
+def _test_a_waiting_member_wakes_at_the_end_of_a_time_without_prepares():
+    """TWO, where d0, d1 and d3 prepared, so no turn is left. At 49100, in
+    the time without prepares before the first window opens, from 49000 to
+    51000, the prepares wake at its end for d2, which waits to be let: d2
+    was let at its turn, 32666, its prepare is retrying, and a pause let it
+    no more; or d2 reports a failed prepare from the start, as after a
+    restart, and an operator asks it to prepare again at 49100."""
+    # (case, the wake of the prepares at 49100)
+    cases: list[(str, int)] = [
+        ("retrying, let no more", 51000),
+        ("asked, never let", 51000),
+    ]
+    for case in cases:
+        c = two(False)
+        if case.0 == "retrying, let no more":
+            let_until(c, 32667, "d2")
+            testing.assertEqual(c.prepare_at.get("d2"), 32666, case.0)
+            c.report_prepare("d3", "done")
+            c.report_prepare("d2", "retrying")
+            c.stop()
+            c.start()
+        else:
+            for name in ["d0", "d1", "d3"]:
+                c.report_prepare(name, "done")
+            c.report_prepare("d2", "failed")
+            c.decide(0)
+            c.report_prepare("d2", None)
+            c.retry_prepare("d2", 49100)
+        wake = c.take_prepares(49100)
+        testing.assertEqual(("d2" in c.allowed, wake), (False, case.1), case.0)
 
 
 #############################################################################
@@ -7077,10 +7402,11 @@ def _test_waiting_turns_stay_when_members_join_or_leave():
 def _test_a_member_let_before_a_window_is_let_again_after_it():
     """TWO. d2 is let prepare at its turn, 32666, before the first window,
     which then opens at 49150 and closes at 51000. A member that has not
-    begun its prepare, or prepares, when a window opens is let no more: no
-    prepare runs into an upgrade. When the window closes, it is let again
-    between the windows, with the time it was first let, as its deadline for
-    its own window is ahead. One that prepared is not. d2 loses its answer
+    begun its prepare, prepares, or tries its prepare again, when a window
+    opens is let no more: no prepare runs into an upgrade. When the window
+    closes, it is let again between the windows, with the time it was first
+    let, as its deadline for its own window is ahead. One that prepared is
+    not. d2 loses its answer
     at 48000 and answers again at 49050, in the time without prepares before
     the first opening, so it is let again only at the close."""
     # (case, whether a cap lets one prepare run at a time, d2's prepare
@@ -7090,6 +7416,7 @@ def _test_a_member_let_before_a_window_is_let_again_after_it():
     cases: list[(str, bool, str, bool, (bool, bool, bool))] = [
         ("no prepare", False, "", False, (True, False, True)),
         ("running", False, "running", False, (True, False, True)),
+        ("retrying", False, "retrying", False, (True, False, True)),
         ("done", False, "done", False, (False, False, False)),
         ("answer gone and back", False, "", True, (False, False, True)),
     ]
