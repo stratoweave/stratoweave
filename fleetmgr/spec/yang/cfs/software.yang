@@ -19,6 +19,39 @@ module software {
     prefix sw-img;
   }
 
+  grouping campaign-result {
+    description
+      "The result of a member that a campaign has freed, as device-status
+       shows it: its final status, and when it was done and freed.";
+    leaf status {
+      type enumeration {
+        enum succeeded;
+        enum up-to-date;
+        enum failed;
+        enum rolled-back;
+        enum not-started;
+      }
+    }
+    leaf stage {
+      type string;
+    }
+    leaf reason {
+      type string;
+    }
+    leaf finished {
+      description "When the member was done, as seconds since the Unix epoch.";
+      type uint64;
+      units "seconds";
+    }
+    leaf freed {
+      description
+        "When the campaign freed the member, as seconds since the Unix
+         epoch.";
+      type uint64;
+      units "seconds";
+    }
+  }
+
   grouping plan-layout {
     list window {
       description
@@ -196,16 +229,26 @@ module software {
       list device {
         key name;
         description
-          "Devices this campaign upgrades. A device in the fleet is in one
-           campaign at most, also while the campaign is in plan or after it
-           is done: an edit that names it in a second campaign fails. Delete
-           the campaign, or remove the device from it, to free the device.
-           A device that is not in the fleet gets nothing from a campaign,
-           so two campaigns can name it; the edit that adds it to the fleet
-           then fails until only one campaign names it. A device that is
+          "Devices this campaign upgrades. The campaign acquires each member
+           that is in the fleet, in plan and in run: it writes the member's
+           software intent and the campaign's veto. One campaign at most
+           acquires a device: an edit that makes a second campaign acquire
+           it fails. A complete campaign frees its members: it keeps each
+           member's result and writes nothing more to their devices, so
+           another campaign can acquire them; see completed in state. Only a
+           new attempt acquires a freed member again, and adding a member to
+           a complete campaign acquires that member; such an edit fails while
+           another campaign has acquired the device. To move an acquired
+           device, remove it from its campaign, or delete the campaign, and
+           add it to the other campaign in a later edit: a move in one edit
+           fails. A freed device can move in one edit. A device that is not
+           in the fleet gets nothing from a campaign, so two campaigns can
+           name it; the edit that adds it to the fleet then fails while two
+           campaigns that have not freed it name it. A device that is
            removed and added again is a new member, and its device keeps
            the final status of its attempt: a member that failed counts as
-           failed until it has a new attempt.";
+           failed until it has a new attempt, and a freed member added
+           again is done at once.";
         leaf name {
           sw:link inventory;
           type leafref {
@@ -252,12 +295,12 @@ module software {
       }
       leaf admin-state {
         description
-          "plan: every member in the fleet gets the campaign's name, its
-           attempt and the veto campaign:NAME, which holds its install, and the
-           target release and image URL of its image when the image is in
-           the image list and has a version. Each member reads the release
-           it runs and answers up-to-date or upgrade-needed. Nothing is
-           installed.
+          "plan: every member in the fleet that the campaign has not freed
+           gets the campaign's name, its attempt and the veto campaign:NAME,
+           which holds its install, and the target release and image URL of
+           its image when the image is in the image list and has a version.
+           Each member reads the release it runs and answers up-to-date or
+           upgrade-needed. Nothing is installed.
            A member in flight when the campaign goes from run to plan stops
            before its install; a member past its install finishes. Going
            from run to plan pauses the run, and the plan shows what the run
@@ -278,7 +321,11 @@ module software {
            was released in, before the members promised that window after
            it. A waiting member whose promised window closed in the pause
            waits in the next window of its schedule, in its place in the
-           order of the promises.";
+           order of the promises.
+           When every member is done, the campaign is complete and frees its
+           members; see completed in state. Only run completes a campaign.
+           admin-state changes nothing for the members that the campaign has
+           freed.";
         type enumeration {
           enum plan;
           enum run;
@@ -340,7 +387,9 @@ module software {
           key device;
           description
             "Each member as the last edit of the campaign or of its linked
-             input took it.";
+             input took it, with its result once the campaign has freed it:
+             what device-status shows for it. The result stands while the
+             member keeps its attempt.";
           leaf device {
             type string;
           }
@@ -362,6 +411,38 @@ module software {
             type boolean;
             default "false";
           }
+          uses campaign-result;
+        }
+        leaf request {
+          description
+            "The number of the last request in dynstate whose results the
+             transform took. The transform takes a request once: one with
+             this number or a lower one changes nothing.";
+          type uint64;
+        }
+      }
+      container dynstate {
+        sw:dynstate;
+        description
+          "What the campaign's actor asked its transform to keep last: the
+           results of all the members that it has freed. A value configured
+           here has no effect.";
+        leaf request {
+          description
+            "The number of the request: each request of the actor has a
+             higher number than the last one that memory took.";
+          type uint64;
+        }
+        list result {
+          key device;
+          leaf device {
+            type string;
+          }
+          leaf attempt {
+            description "The attempt of the member that the result is for.";
+            type uint32;
+          }
+          uses campaign-result;
         }
       }
       leaf target-concurrency {
@@ -435,10 +516,11 @@ module software {
            for this campaign's intent is failed, rolled-back or
            not-started, and while its rollback failed, also when its
            status is lost, until its device reports another final status,
-           it gets a new attempt, or it leaves the campaign. When more
-           members have failed than the budget, no more members start or
-           prepare, and the plan gives an alarm. Without a budget, any
-           number of members may fail.";
+           it gets a new attempt, or it leaves the campaign. A member that
+           the campaign has freed has failed while its result is failed,
+           rolled-back or not-started. When more members have failed than
+           the budget, no more members start or prepare, and the plan gives
+           an alarm. Without a budget, any number of members may fail.";
         type decimal64 {
           fraction-digits 2;
           range "0..100";
@@ -456,35 +538,54 @@ module software {
           type uint64;
           units "seconds";
         }
+        leaf completed {
+          description
+            "When the campaign was complete, as seconds since the Unix epoch:
+             the latest freed of its members. A campaign in run is complete
+             when every member is done: its status for the campaign's intent
+             is final, also when it failed, and it is not in flight. The
+             campaign then frees its members. Each member that is not done
+             keeps the campaign incomplete. A member that cannot start, such
+             as one held by the failure budget, one that is not in the fleet
+             or one with no window before the deadline, keeps it incomplete
+             until an operator removes the member or lifts what holds it.
+             Absent while a member has no result, and in a campaign without
+             members.";
+          type uint64;
+          units "seconds";
+        }
         leaf total {
           type uint32;
         }
         leaf in-progress {
           description
-            "Counts only the statuses that are for this campaign's intent:
-             the device reports them for its name and the member's target
-             release.";
+            "Counts the statuses of device-status: those for this campaign's
+             intent, which the device reports for its name and the member's
+             target release, and the results of the freed members.";
           type uint32;
         }
         leaf succeeded {
           description
-            "Counts only the statuses that are for this campaign's intent:
-             the device reports them for its name and the member's target
-             release. Includes up-to-date.";
+            "Counts the statuses of device-status: those for this campaign's
+             intent, which the device reports for its name and the member's
+             target release, and the results of the freed members. Includes
+             up-to-date.";
           type uint32;
         }
         leaf up-to-date {
           description
-            "Members whose status for this campaign's intent is up-to-date:
-             they ran the target release before the campaign upgraded them.
-             succeeded counts them too.";
+            "Members whose status for this campaign's intent, or whose result
+             when the campaign has freed them, is up-to-date: they ran the
+             target release before the campaign upgraded them. succeeded
+             counts them too.";
           type uint32;
         }
         leaf failed {
           description
-            "Counts only the statuses that are for this campaign's intent:
-             the device reports them for its name and the member's target
-             release. Includes rolled-back and not-started.";
+            "Counts the statuses of device-status: those for this campaign's
+             intent, which the device reports for its name and the member's
+             target release, and the results of the freed members. Includes
+             rolled-back and not-started.";
           type uint32;
         }
         leaf preparing {
@@ -526,7 +627,9 @@ module software {
              but that the plan starts in no window shows in the window
              promised to it too, and the alarm that it will miss that
              window names it. With allow-staging, each member's
-             prepare-start says when it prepares.";
+             prepare-start says when it prepares. After a restart of
+             fleetmgr, a member that the campaign has freed is in no
+             window.";
           uses plan-layout;
           leaf prepare-concurrency {
             description
@@ -606,7 +709,10 @@ module software {
              is pending when the device has not answered that attempt. Of
              the statuses, only upgrade-needed and the final ones answer the
              campaign's target; a member that shows unknown or pending has
-             not answered, and the plan holds it.";
+             not answered, and the plan holds it. A member that the campaign
+             has freed shows its result: attempt, status, stage and reason,
+             with freed and finished. It shows nothing that its device
+             reports.";
           leaf device {
             type string;
           }
@@ -616,6 +722,20 @@ module software {
             type uint32;
           }
           uses fleetmgr-types:attempt-status;
+          leaf freed {
+            description
+              "When the campaign freed the device, as seconds since the Unix
+               epoch. Absent while the campaign has not freed it.";
+            type uint64;
+            units "seconds";
+          }
+          leaf finished {
+            description
+              "When a freed member was done, as seconds since the Unix
+               epoch.";
+            type uint64;
+            units "seconds";
+          }
           uses fleetmgr-types:vetoes;
           leaf version {
             description "Release the device runs, from its platform.";
