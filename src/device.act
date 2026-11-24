@@ -211,6 +211,7 @@ JOB_INSTALL = "install"
 JOB_RUNNING = "running"
 JOB_DONE = "done"
 JOB_FAILED = "failed"
+JOB_RETRYING = "retrying"
 
 # state/stage. The check rounds use their kind, "precheck" or "postcheck".
 STAGE_PREPARE = "prepare"
@@ -236,6 +237,11 @@ PLATFORM_RETRY_MAX = 300.0
 # that subtracts an uptime from our clock adds it to the tolerance of its
 # last boot.
 REPLY_DELAY = 30
+
+# Seconds before a prepare that failed for a transient reason is tried
+# again; each wait is twice the one before, up to PREPARE_RETRY_MAX.
+PREPARE_RETRY_FIRST = 60.0
+PREPARE_RETRY_MAX = 300.0
 
 DIGITS = "0123456789"
 
@@ -336,8 +342,13 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
       tried again when the device connects, or after a while. Without one
       the run goes on, as a failed read is no proof of being up to date.
     * A prepare is never a precondition; a run prepares again. Under a veto,
-      `allow_staging` lets the manager prepare the target once per attempt,
-      ahead of the install. The result goes in job[prepare], never in the
+      `allow_staging` lets the manager prepare the target once for each
+      attempt and prepare-attempt, ahead of the install. A prepare ahead
+      that fails with a TransientError is retrying: the manager tries it
+      again while allow_staging is on, after PREPARE_RETRY_FIRST, then twice
+      as long each time up to PREPARE_RETRY_MAX, and at once when the device
+      connects or allow_staging is set. Any other failed prepare waits for a
+      new prepare-attempt. The result goes in job[prepare], never in the
       status: a failed prepare leaves the status upgrade-needed.
     * Every pre-check must pass for install to proceed. A failing pre-check,
       or one that does not answer within PRECHECK_TIMEOUT, ends the run failed
@@ -373,6 +384,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     var upgrade_campaign: ?str = None
     # Any change of attempt makes a new intent, so the device is read again.
     var attempt: u64 = 0
+    # The prepare attempt of the intent: a new value prepares again.
+    var prepare_attempt: u64 = 0
     var allow_staging: bool = False
     var vetoes: dict[str, str] = {}
 
@@ -396,6 +409,13 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
     var read_retry_first: float = PLATFORM_RETRY_FIRST
     var read_retry: float = PLATFORM_RETRY_FIRST
     var read_gen: int = 0
+    # A prepare ahead that failed for a transient reason is tried again
+    # after prep_retry seconds. prep_gen drops a retry timer that a later
+    # try or intent made stale.
+    var prep_retry_first: float = PREPARE_RETRY_FIRST
+    var prep_retry_max: float = PREPARE_RETRY_MAX
+    var prep_retry: float = PREPARE_RETRY_FIRST
+    var prep_gen: int = 0
     # Set when the state changed without a status change and is not out yet.
     var unpublished: bool = False
 
@@ -428,18 +448,26 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         _reconcile()
 
     def set_config(campaign: ?str, target: ?str, staging: bool, veto: dict[str, str],
-                   new_attempt: u64=0) -> None:
+                   new_attempt: u64=0, new_prepare_attempt: u64=0) -> None:
         """Software config from DeviceMetaConfig.software: the campaign whose
         intent this is, the target release name, whether staging may run ahead
-        of the window, the current vetoes keyed by holder, and the attempt of
-        the intent. Acts only when one of them changed."""
+        of the window, the current vetoes keyed by holder, and the attempt and
+        the prepare attempt of the intent. Acts only when one of them changed.
+        A new campaign, target, attempt or prepare attempt starts the wait
+        before a prepare ahead is tried again over."""
         if campaign == upgrade_campaign and target == target_release \
-           and staging == allow_staging and veto == vetoes and new_attempt == attempt:
+           and staging == allow_staging and veto == vetoes and new_attempt == attempt \
+           and new_prepare_attempt == prepare_attempt:
             return
+        if campaign != upgrade_campaign or target != target_release or new_attempt != attempt \
+           or new_prepare_attempt != prepare_attempt:
+            prep_gen += 1
+            prep_retry = prep_retry_first
         upgrade_campaign = campaign
         target_release = target
         allow_staging = staging
         attempt = new_attempt
+        prepare_attempt = new_prepare_attempt
         if veto != vetoes:
             vetoes = veto
             _show_vetoes()
@@ -457,7 +485,8 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     def on_connect() -> None:
         """Called by DeviceMgr when an adapter of the device connects: a read
-        under a veto that could not reach the device runs again."""
+        under a veto that could not reach the device runs again, and so does
+        a prepare ahead that is retrying."""
         _reconcile()
 
     #### check registration #################################################
@@ -521,6 +550,18 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         again."""
         read_retry_first = secs
         read_retry = secs
+
+    def set_prepare_retry(first: float, most: float) -> None:
+        """Test hook: the first and the longest wait before a prepare ahead
+        that is retrying runs again."""
+        prep_retry_first = first
+        prep_retry_max = most
+        prep_retry = first
+
+    def get_prepare_retry() -> float:
+        """Test hook: the wait before the next try of a prepare ahead that
+        fails for a transient reason."""
+        return prep_retry
 
     #### introspection ######################################################
 
@@ -656,7 +697,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             if s is not None and s in ST_FINAL:
                 return
             if s == ST_UPGRADE_NEEDED and len(vetoes) > 0:
-                if allow_staging and not _prepared(found):
+                if allow_staging and _may_prepare_ahead(found):
                     _start()
                     _prepare_ahead()
                 return
@@ -670,14 +711,24 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         run_target = target_release
         run_attempt = attempt
 
-    def _prepared(e: SoftwareAttempt) -> bool:
-        """True when the prepare job of the attempt runs or has a result."""
-        return e.job.get(JOB_PREPARE) is not None
+    def _may_prepare_ahead(e: SoftwareAttempt) -> bool:
+        """True when the attempt may prepare ahead: it has no prepare job,
+        its prepare job ran for another prepare attempt, or that job is
+        retrying."""
+        job = e.job.get(JOB_PREPARE)
+        if job is not None:
+            ran = job.prepare_attempt
+            if (ran if ran is not None else u64(0)) != prepare_attempt:
+                return True
+            return job.state == JOB_RETRYING
+        return True
 
     def _job_start(name: str, release: str) -> None:
-        """Publish the job name as running for release."""
+        """Publish the job name as running for release. The prepare job
+        records the prepare attempt that it runs for."""
         jobs = _answer().job
         job = jobs.get(name)
+        ran: ?u64 = prepare_attempt if name == JOB_PREPARE else None
         if job is not None:
             job.state = JOB_RUNNING
             job.release = release
@@ -685,17 +736,26 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
             job.ended = None
             job.progress = None
             job.message = None
+            job.prepare_attempt = ran
         else:
-            jobs.create(name, state=JOB_RUNNING, release=release, started=_now())
+            jobs.create(name, state=JOB_RUNNING, release=release, started=_now(),
+                        prepare_attempt=ran)
         _publish()
 
-    def _job_end(name: str, err: ?Exception) -> None:
-        """Publish the end of the job name: done, or failed with the error."""
+    def _job_end(name: str, err: ?Exception, retry: bool=False) -> None:
+        """Publish the end of the job name: done, or with the error retrying
+        when retry is set and the error is transient, and else failed."""
         job = _answer().job.get(name)
         if job is not None:
-            job.state = JOB_FAILED if err is not None else JOB_DONE
+            if err is not None:
+                job.state = JOB_FAILED
+                if retry and is_transient(err):
+                    job.state = JOB_RETRYING
+                job.message = error_text(err)
+            else:
+                job.state = JOB_DONE
+                job.message = None
             job.ended = _now()
-            job.message = error_text(err!) if err is not None else None
             _publish()
 
     def _job_note(name: str, message: ?str) -> None:
@@ -751,7 +811,9 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
 
     def _prepare_ahead() -> None:
         """Prepare the target while a veto holds the install: copy the image to
-        the device ahead of the window. The status stays upgrade-needed."""
+        the device ahead of the window. The status stays upgrade-needed. A
+        retry that is due drops."""
+        prep_gen += 1
         t = run_target!
         _log.info("software: preparing ahead of the install",
                   {"device": name, "target": t})
@@ -759,11 +821,68 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         adapter.prepare(_on_ahead_done, t)
 
     def _on_ahead_done(err: ?Exception) -> None:
+        """End the prepare ahead. A try that ended after its intent changed
+        is not tried again: the change reconciles, and its wait starts
+        over."""
+        current = _prepares_the_intent()
+        _job_end(JOB_PREPARE, err, current)
         if err is not None:
-            _log.warning("software: prepare ahead of the install failed",
-                         {"device": name, "error": str(err)})
-        _job_end(JOB_PREPARE, err)
+            if is_transient(err) and not current:
+                _log.info("software: prepare ahead failed for a transient reason after the intent changed",
+                          {"device": name, "error": str(err)})
+            elif is_transient(err):
+                _log.info("software: prepare ahead failed for a transient reason, trying again",
+                          {"device": name, "error": str(err), "retry_in": prep_retry})
+                _arm_prepare_retry()
+            else:
+                _log.warning("software: prepare ahead of the install failed",
+                             {"device": name, "error": str(err)})
+        else:
+            prep_retry = prep_retry_first
         _done()
+
+    def _prepares_the_intent() -> bool:
+        """True when the prepare under way is for the configured campaign,
+        target, attempt and prepare attempt."""
+        if run_campaign != upgrade_campaign or run_target != target_release \
+           or run_attempt != attempt:
+            return False
+        e = _attempt()
+        if e is not None:
+            job = e.job.get(JOB_PREPARE)
+            if job is not None:
+                ran = job.prepare_attempt
+                return (ran if ran is not None else u64(0)) == prepare_attempt
+        return False
+
+    def _arm_prepare_retry() -> None:
+        """Try the prepare ahead again after prep_retry, and double the
+        wait."""
+        prep_gen += 1
+        g = prep_gen
+        wait = prep_retry
+        prep_retry = min([prep_retry * 2.0, prep_retry_max])
+        after now wait: _retry_prepare(g)
+
+    def _retry_prepare(g: int) -> None:
+        """Try the prepare ahead of the configured attempt again while it is
+        retrying. While the manager is busy, wait as long again without
+        doubling the wait: a read or run that ends without a change of the
+        intent does not reconcile. While the manager may not prepare ahead,
+        the chain waits the same way, and a let reconciles through
+        set_config. The chain ends when the job is no longer retrying."""
+        if g != prep_gen:
+            return
+        found = _configured()
+        if found is not None:
+            job = found.job.get(JOB_PREPARE)
+            if job is not None and job.state == JOB_RETRYING:
+                if busy or not allow_staging or len(vetoes) == 0:
+                    prep_gen += 1
+                    g2 = prep_gen
+                    after now prep_retry: _retry_prepare(g2)
+                else:
+                    _reconcile()
 
     def _retry_read(gen: int) -> None:
         if gen == read_gen:
@@ -817,7 +936,7 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
                       {"device": name, "release": running, "target": t})
             _set_reason(None)
             _record(ST_UPGRADE_NEEDED)
-            if allow_staging and not _prepared(_answer()):
+            if allow_staging and _may_prepare_ahead(_answer()):
                 _prepare_ahead()
             else:
                 _done()
@@ -2503,7 +2622,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
                     r = v.reason
                     sw_vetoes[v.holder] = r if r is not None else ""
                 swmgr.set_config(sw.upgrade_campaign, sw.target_release, sw.allow_staging, sw_vetoes,
-                                 sw.attempt)
+                                 sw.attempt, sw.prepare_attempt)
 
                 if need_new_adapter:
                     new_adapter = _build_adapter(device_type, new_dmc, effective_mock, _log_handler,
