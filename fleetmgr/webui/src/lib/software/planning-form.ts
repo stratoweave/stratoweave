@@ -1,8 +1,8 @@
 // A campaign's schedule, pace and limits: the default schedule, the
 // deadline, how many devices upgrade at the same time, whether they
-// prepare ahead, the days of notice its members get before their window,
-// its failure budget, its close margin and its stagger, as the campaign
-// page edits them.
+// prepare ahead, when and at what bandwidth, the days of notice its
+// members get before their window, its failure budget, its close margin
+// and its stagger, as the campaign page edits them.
 //
 // The pace comes from a deadline or from a number of devices at once, not
 // both. The model takes both, with target-concurrency as a floor under the
@@ -27,6 +27,9 @@ import { formatClock, formatDuration, toLocalInput } from '#lib/core/time.ts';
 
 export type PaceBy = 'deadline' | 'concurrency';
 
+/** Prepare between windows: as the plan decides, or set on or off. */
+export type BetweenWindows = 'auto' | 'on' | 'off';
+
 export interface PlanningDraft {
   /** Schedule name; '' for none. */
   defaultSchedule: string;
@@ -44,6 +47,11 @@ export interface PlanningDraft {
   closeMargin: string;
   stagger: string;
   allowStaging: boolean;
+  prepareFirst: boolean;
+  prepareBetween: BetweenWindows;
+  prepareDuring: boolean;
+  /** Mbit/s as typed; '' for the image list's. */
+  prepareMaxBandwidth: string;
 }
 
 export interface Planning {
@@ -61,12 +69,53 @@ export interface Planning {
   stagger: number;
   /** Members copy their image before their window. */
   allowStaging: boolean;
+  /** When they may: before the first window, between windows (null: as
+   * the plan decides) and during windows. */
+  prepareFirst: boolean;
+  prepareBetween: boolean | null;
+  prepareDuring: boolean;
+  /** Bits/s; null for the image list's. */
+  prepareMaxBandwidth: number | null;
 }
 
 const UINT32_MAX = 4294967295;
 const UINT16_MAX = 65535;
 
 export const NOTICE_ERROR = `A whole number of days, 0 to ${UINT16_MAX}.`;
+
+export const BANDWIDTH_ERROR = 'A bandwidth in Mbit/s above 0, with at most six decimals.';
+
+/** Mbit/s as typed -> bits/s; '' is null, the image list's. undefined when
+ * it does not parse or is not above 0. */
+export function bandwidthBits(text: string): number | null | undefined {
+  const t = text.trim();
+  if (!t) return null;
+  if (!/^\d+(\.\d{1,6})?$/.test(t)) return undefined;
+  const bits = Math.round(Number(t) * 1e6);
+  return bits >= 1 && Number.isSafeInteger(bits) ? bits : undefined;
+}
+
+/** Bits/s as Mbit/s for an input, without trailing zeros. */
+export function bandwidthInput(bits: number): string {
+  return String(bits / 1e6);
+}
+
+/** Bits/s as text, as "1 Gbit/s" or "62.5 Mbit/s". */
+export function bandwidthText(bits: number): string {
+  const units: [number, string][] = [
+    [1e9, 'Gbit/s'],
+    [1e6, 'Mbit/s'],
+    [1e3, 'kbit/s']
+  ];
+  for (const [scale, unit] of units) {
+    if (bits >= scale) return `${Number((bits / scale).toFixed(1)).toLocaleString()} ${unit}`;
+  }
+  return `${bits.toLocaleString()} bit/s`;
+}
+
+function betweenOf(value: boolean | null): BetweenWindows {
+  return value === null ? 'auto' : value ? 'on' : 'off';
+}
 
 /** Notice as typed -> whole days; '' is 0, no notice. null when it does
  * not parse or does not fit the model's uint16. */
@@ -86,7 +135,11 @@ export function planningOf(c: Campaign): Planning {
     failureBudget: c.failureBudget,
     closeMargin: c.closeMargin,
     stagger: c.stagger,
-    allowStaging: c.allowStaging
+    allowStaging: c.allowStaging,
+    prepareFirst: c.prepareFirst,
+    prepareBetween: c.prepareBetween,
+    prepareDuring: c.prepareDuring,
+    prepareMaxBandwidth: c.prepareMaxBandwidth
   };
 }
 
@@ -105,13 +158,18 @@ export function planningDraft(p: Planning): PlanningDraft {
     failureBudget: p.failureBudget === null ? '' : String(p.failureBudget),
     closeMargin: p.closeMargin === DEFAULT_CLOSE_MARGIN ? '' : String(p.closeMargin),
     stagger: p.stagger === DEFAULT_STAGGER ? '' : String(p.stagger),
-    allowStaging: p.allowStaging
+    allowStaging: p.allowStaging,
+    prepareFirst: p.prepareFirst,
+    prepareBetween: betweenOf(p.prepareBetween),
+    prepareDuring: p.prepareDuring,
+    prepareMaxBandwidth: p.prepareMaxBandwidth === null ? '' : bandwidthInput(p.prepareMaxBandwidth)
   };
 }
 
 /** Errors by field: deadline, target-concurrency, max-concurrency,
- * notification-period, failure-budget, close-margin, stagger; only the
- * pace field in use is checked. A deadline must lie ahead of `now`,
+ * notification-period, failure-budget, close-margin, stagger,
+ * prepare-max-bandwidth; only the pace field in use is checked, and the
+ * bandwidth only with prepare ahead. A deadline must lie ahead of `now`,
  * unless it is the one `saved` already holds. */
 export function validatePlanningDraft(
   draft: PlanningDraft,
@@ -151,6 +209,9 @@ export function validatePlanningDraft(
   if (stagger && (!/^\d+$/.test(stagger) || Number(stagger) > 100)) {
     errors['stagger'] = 'A whole percent, 0 to 100.';
   }
+  if (draft.allowStaging && bandwidthBits(draft.prepareMaxBandwidth) === undefined) {
+    errors['prepare-max-bandwidth'] = BANDWIDTH_ERROR;
+  }
   return errors;
 }
 
@@ -167,7 +228,11 @@ export function planningFromDraft(draft: PlanningDraft): Planning {
     failureBudget: draft.failureBudget.trim() ? Number(draft.failureBudget) : null,
     closeMargin: draft.closeMargin.trim() ? Number(draft.closeMargin) : DEFAULT_CLOSE_MARGIN,
     stagger: draft.stagger.trim() ? Number(draft.stagger) : DEFAULT_STAGGER,
-    allowStaging: draft.allowStaging
+    allowStaging: draft.allowStaging,
+    prepareFirst: draft.prepareFirst,
+    prepareBetween: draft.prepareBetween === 'auto' ? null : draft.prepareBetween === 'on',
+    prepareDuring: draft.prepareDuring,
+    prepareMaxBandwidth: bandwidthBits(draft.prepareMaxBandwidth) ?? null
   };
 }
 
@@ -217,7 +282,12 @@ export function paceText(p: Planning): string {
   return p.maxConcurrency > p.targetConcurrency ? `${target} at once, up to ${max}` : `${target} at once`;
 }
 
-type RemovableLeaf = 'default-schedule' | 'deadline' | 'failure-budget';
+type RemovableLeaf =
+  | 'default-schedule'
+  | 'deadline'
+  | 'failure-budget'
+  | 'prepare-between-windows'
+  | 'prepare-max-bandwidth';
 
 /** The leaves a save sets and the ones it removes. */
 export function planningChanges(saved: Planning, next: Planning): { set: Partial<CampaignJson>; remove: RemovableLeaf[] } {
@@ -245,6 +315,20 @@ export function planningChanges(saved: Planning, next: Planning): { set: Partial
   if (next.stagger !== saved.stagger) set.stagger = next.stagger;
   // false merges as well as true: the leaf defaults to false.
   if (next.allowStaging !== saved.allowStaging) set['allow-staging'] = next.allowStaging;
+  // The prepare settings show only with prepare ahead; without it, they
+  // stay as the campaign has them.
+  if (!next.allowStaging) return { set, remove };
+  if (next.prepareFirst !== saved.prepareFirst) set['prepare-before-first-window'] = next.prepareFirst;
+  if (next.prepareBetween !== saved.prepareBetween) {
+    if (next.prepareBetween !== null) set['prepare-between-windows'] = next.prepareBetween;
+    else remove.push('prepare-between-windows');
+  }
+  if (next.prepareDuring !== saved.prepareDuring) set['prepare-during-windows'] = next.prepareDuring;
+  if (next.prepareMaxBandwidth !== saved.prepareMaxBandwidth) {
+    // uint64 is a string in RFC 7951 JSON.
+    if (next.prepareMaxBandwidth !== null) set['prepare-max-bandwidth'] = String(next.prepareMaxBandwidth);
+    else remove.push('prepare-max-bandwidth');
+  }
   return { set, remove };
 }
 

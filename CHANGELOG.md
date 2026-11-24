@@ -629,6 +629,11 @@
   failed filter, and Schedule and pace turns Prepare ahead on or off.
 - The new-campaign wizard sets the campaign's `notification-period`, as
   Notice in days, as the campaign page does.
+- The new-campaign wizard and the campaign page's Schedule and pace set when
+  the members prepare, under Prepare ahead: before the first window, between
+  windows and during windows, and the campaign's Max bandwidth in Mbit/s,
+  empty for the image list's. Between windows is automatic, and says whether
+  the plan has it on now, until it is set on or off; Automatic puts it back.
 - A campaign releases a member only once the member's status answers the
   campaign's target: `upgrade-needed`, or a final status. Until then the
   plan holds the member in its window, with the alarm "N device(s) have not
