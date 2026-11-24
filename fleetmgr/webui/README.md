@@ -288,8 +288,11 @@ the live status as the run passes them. Below it, each device's run is a
 chain of its steps, prepare, pre-check, install, post-check and commit: the
 step running now pulses, a failed step is red with a cross, and a rollback
 shows as ↺ after it; the device's `reason` says why the run stopped. A
+run whose prepare failed for a transient reason waits at prepare, and its
+detail says that it waits to prepare again, with the device's message. A
 device that waits for its window shows prepare running while it prepares
-its target ahead, and done once it has. Next to
+its target ahead, and done once it has; while its prepare waits to be
+tried again, the step does not pulse. Next to
 the chain, the message of the device's `prepare` or `install` says what the
 device does now, as `add: extract`, with a bar while the prepare transfers
 the image, and after the install when the commit window ends. The UI

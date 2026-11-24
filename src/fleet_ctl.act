@@ -962,11 +962,16 @@ class Controller(object):
     reports in-progress during a run still upgrades from before a
     restart. The run takes a waiting one in flight at once, in the first
     window of its schedule that has not closed, so it holds a slot and its
-    redundancy groups until it is done. resumed has both: the campaign
-    keeps holding them, so they stop if they have not reached their
-    install, and their upgrades give no pace sample. When such a device
-    reports upgrade-needed, it stopped before its install, and it waits
-    again (take_back).
+    redundancy groups until it is done. A device in flight whose run waits
+    to try its prepare again, after the prepare failed for a transient
+    reason, keeps its slot while a try that starts now fits its window
+    (last_fit()); after that, the campaign holds it too, and also a run
+    that tried again after that (stop_waiting_runs()). resumed has all of
+    them: the campaign keeps holding them, so they stop if they have not
+    reached their install, and their upgrades give no pace sample.
+    Neither does the upgrade of a device whose run waited in its flight.
+    When such a device reports upgrade-needed, it stopped before its
+    install, and it waits again (take_back).
 
     drop() forgets the devices that left the campaign, and the members
     that the campaign gives a new attempt. A device that joins again, or
@@ -1345,9 +1350,15 @@ class Controller(object):
     # reports came, NO_TIME when its latest report is not in-progress.
     progress: list[int]
     # Per device number: whether it is a released device that still
-    # upgraded from before a pause or a restart, which the run keeps
-    # holding.
+    # upgraded from before a pause or a restart, or whose run waited to
+    # prepare again past its last start (stop_waiting_runs()), which the
+    # run keeps holding.
     resumed: list[bool]
+    # Per device number whose run waited to try its prepare again since
+    # its latest release: NO_TIME while it waits, and else the time of the
+    # report that it tried again after its latest wait. Such a device
+    # gives no pace sample.
+    run_waits: dict[int, int]
     # Per device number: whether it is done and its upgrade failed or
     # rolled back; whether its latest final report is a failed rollback,
     # which only a later final report, a new attempt or a removal clears, also
@@ -1525,6 +1536,7 @@ class Controller(object):
         self.prep_turn = []
         self.progress = []
         self.resumed = []
+        self.run_waits = {}
         self.failed = []
         self.rollback_failed = []
         self.vetoed = []
@@ -2039,6 +2051,7 @@ class Controller(object):
             if k < 0:
                 continue
             self.prep_turn[k] = -1
+            self.run_waits.pop(k)
             if self.released[k]:
                 end = self.done_at[k]
                 if end == NO_TIME and self.reported[k]:
@@ -2391,6 +2404,26 @@ class Controller(object):
             self.prepare_now[name] = t
         self.prep_turn[k] = -1
 
+    def report_prepare_wait(self, name: str, waits: bool, at: int) -> None:
+        """Take whether the latest report of the device name, which came at
+        time at, says that its run waits: to try its prepare again, after the
+        prepare failed for a transient reason, or for its device, which could
+        not be read. The run waits until a report in-progress says that it
+        tried again, at the time of that report. A report of another status,
+        or none, does not end the wait: the device can still start the run
+        once it can. A decision holds the run again when it waits, or tried
+        again, past the last second at which a try fits its window
+        (stop_waiting_runs()). A device whose run waited in its flight gives
+        no pace sample for that flight."""
+        k = self.known(name)
+        if k < 0:
+            return
+        if waits:
+            self.run_waits[k] = NO_TIME
+        elif self.progress[k] != NO_TIME and k in self.run_waits \
+             and self.run_waits[k] == NO_TIME:
+            self.run_waits[k] = at
+
     def report_last_boot(self, name: str, at: ?int) -> None:
         """Take when the device name last booted, by its clock, or None when
         it does not tell. A boot before 0 counts as 0, as the controller has
@@ -2484,7 +2517,9 @@ class Controller(object):
         """Forget the status and the prepare state of every device. A member
         that was done without a release waits again. A device whose
         rollback failed keeps its final status, and a member whose rollback
-        failed still counts against the failure budget (lost_n())."""
+        failed still counts against the failure budget (lost_n()). A run
+        that waits to try its prepare again still waits
+        (report_prepare_wait())."""
         n = self.size
         for k in range(n):
             if not self.rollback_failed[k]:
@@ -2856,6 +2891,13 @@ class Controller(object):
         margin left before end: its slow time times close_margin percent."""
         return end == OPEN_END or (end - t) * 100 >= self.slow(k) * self.close_margin
 
+    def last_fit(self, k: int, end: int) -> int:
+        """The last second at which the device with number k, started then,
+        fits before end (fits()); OPEN_END when end is OPEN_END."""
+        if end == OPEN_END:
+            return OPEN_END
+        return end - (self.slow(k) * self.close_margin + 99) // 100
+
     def late_at(self, k: int) -> int:
         """The time after which the released device with number k is late
         when it has no final report: a fifth of its upgrade after its
@@ -2887,6 +2929,7 @@ class Controller(object):
         self.released_in[k] = i
         self.released_est[k] = self.est_n(k)
         self.due[k] = t + self.duration(k)
+        self.run_waits.pop(k)
         member = self.is_member(k)
         if member:
             if not self.flying[k]:
@@ -3087,8 +3130,10 @@ class Controller(object):
             # ends when it was expected to leaves the pace as it is. An
             # upgrade that ran through a pause or from before a restart
             # (resumed) is no fair sample of the pace: the campaign's veto
-            # came back, and it may have stopped and started again.
-            if not self.resumed[k] and (not self.released[k] or end != self.due[k]):
+            # came back, and it may have stopped and started again. Neither
+            # is one that waited to prepare again: its time is the wait's.
+            if not self.resumed[k] and k not in self.run_waits \
+               and (not self.released[k] or end != self.due[k]):
                 est = self.released_est[k] if self.released[k] else self.estimate_s
                 took = imax(1, imax(1, end - at) * self.estimate_s // est)
                 n = len(self.took_s)
@@ -3448,6 +3493,7 @@ class Controller(object):
         c.prep_turn = self.prep_turn.copy()
         c.progress = self.progress.copy()
         c.resumed = self.resumed.copy()
+        c.run_waits = {k: v for k, v in self.run_waits.items()}
         c.failed = self.failed.copy()
         c.rollback_failed = self.rollback_failed.copy()
         c.vetoed = self.vetoed.copy()
@@ -3942,7 +3988,10 @@ class Controller(object):
         from t, and only starts the devices it starts now. Then it lets
         members prepare whose turn has come (take_prepares). The decision
         also wakes when a member in flight that is down passes its expected
-        end."""
+        end. After the step, it holds again the runs that wait to prepare
+        again and no longer fit their window, by the slow time after the
+        reports that count now (stop_waiting_runs()), and it wakes when the
+        next one no longer fits. That changes no plan."""
         last = self.last_plan
         down = self.down_end()
         if last is not None and self.quiet_from <= t and t < self.quiet_until \
@@ -3954,11 +4003,36 @@ class Controller(object):
         else:
             p = self.plan(t)
         started, wake, finished = self.step(t, p.c)
+        wake = earliest(wake, self.stop_waiting_runs(t))
         taken = self.take_turns(t)
         wake = earliest(wake, taken.0)
         wake = earliest(wake, self.down_end())
         self.wake_at = wake
         return Step(started, wake, finished, p, self.prepares_of(t, taken.1))
+
+    def stop_waiting_runs(self, t: int) -> int:
+        """Hold again each device in flight whose run waits to try its
+        prepare again at time t, or tried it again after its latest wait,
+        past the last second at which a try fits before its window closes
+        (last_fit()). It is then resumed, so the campaign puts its veto
+        back, and its device stops the run before the install. When it
+        reports upgrade-needed, it waits again (take_back). Return the
+        first second at which a waiting run no longer fits, -1 for none."""
+        wake = -1
+        for k, tried in self.run_waits.items():
+            if not self.flying[k] or self.resumed[k] or self.reported[k]:
+                continue
+            last = self.last_fit(k, self.windows[self.released_in[k]].2)
+            if last == OPEN_END:
+                continue
+            start = tried
+            if tried == NO_TIME:
+                start = t
+            if start > last:
+                self.resumed[k] = True
+            elif tried == NO_TIME:
+                wake = earliest(wake, last + 1)
+        return wake
 
     def down_end(self) -> int:
         """The first second in which a member in flight without a report
@@ -4985,12 +5059,14 @@ class Controller(object):
 
     def resumed_devices(self) -> set[str]:
         """The released devices that still upgraded from before a pause or
-        a restart, which the run keeps holding."""
+        a restart, or whose run waited to prepare again past its last
+        start, which the run keeps holding."""
         return {self.name_of(k) for k in range(self.size) if self.resumed[k]}
 
     def upgrading(self) -> set[str]:
         """The devices in flight that run an upgrade: not the ones that
-        still upgrade from before a pause or a restart, and not the ones
+        still upgrade from before a pause or a restart, not the ones whose
+        run waited to prepare again past its last start, and not the ones
         whose final report has not counted yet."""
         return {self.name_of(k) for k in range(self.size)
                 if self.flying[k] and not self.resumed[k] and not self.reported[k]}

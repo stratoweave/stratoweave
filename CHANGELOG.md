@@ -829,6 +829,20 @@
   debounce after it was let, or that retries it, is named in the alarm
   "N device(s) cannot prepare before their window opens" once its deadline
   has passed. Before, a failed prepare was never tried again.
+- A window run of a campaign member whose prepare fails for a transient
+  reason, such as a connection that drops during the copy, no longer fails.
+  It waits, `in-progress` at the stage `prepare`, and the device's software
+  manager tries the prepare again as it tries a prepare ahead that is
+  `retrying`, and at once when the device connects or the intent changes.
+  The wait does not count against the failure budget, and the upgrade gives
+  no sample of the pace. Once a try that starts then no longer fits the
+  window with its `close-margin`, the campaign puts its veto back: the
+  device stops the run before the install, and the member waits for its next
+  window. An install that fails still fails the run. Before, the run failed
+  and counted against the failure budget. A member released while its device
+  is not connected, so that its run reports `unknown`, waits the same way:
+  past the last start that fits its window, the campaign puts its veto back.
+  Before, its device could start the run when it connected after the window.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
