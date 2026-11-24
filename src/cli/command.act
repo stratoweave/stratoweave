@@ -1,8 +1,11 @@
 """Commands of the CLI.
 
 In operational mode the commands are `configure`, `show configuration [path]
-[| display set|xml|json]`, `exit` and `quit`. In configuration mode they are
-`set`, `delete`, `edit`, `up [N]`, `top [command]`, `show [path] [| compare |
+[| display set|xml|json]`, `show <path> [| display xml|json]`, `request <rpc
+or path to an action> [input] [| display xml]`, `exit` and `quit`. `show
+<path>` reads configuration and state from the device, and `request` makes
+the device run an RPC or action. In configuration mode they are `set`,
+`delete`, `edit`, `up [N]`, `top [command]`, `show [path] [| compare |
 display set|xml|json]`, `rollback [0]`, `run <command>` and `exit
 [configuration-mode]`. Keywords take a unique prefix, so `sh conf` is `show
 configuration`.
@@ -11,8 +14,12 @@ One walk over the words serves both parsing and completion. It returns the
 command or an error, and what can follow the words.
 """
 
+import std.xml as xml
 import yang.schema as yschema
 import yang.gdata as ygdata
+import yang.xml as yxml
+
+import netconf
 
 import cli.candidate as candidate
 import cli.hints as hints
@@ -24,6 +31,7 @@ _OP = [
     ("configure", "Enter configuration mode"),
     ("exit", "Exit the CLI"),
     ("quit", "Exit the CLI"),
+    ("request", "Make the device run an RPC or action"),
     ("show", "Show information"),
 ]
 
@@ -67,6 +75,15 @@ _DISPLAY = [
     ("xml", "Show the configuration as XML"),
 ]
 
+_DISPLAY_DATA = [
+    ("json", "Show the data as JSON"),
+    ("xml", "Show the data as XML"),
+]
+
+_DISPLAY_REPLY = [
+    ("xml", "Show the reply as XML"),
+]
+
 ENTER = cpath.Completion("<[Enter]>", " ", "Execute this command", insert=False)
 PIPE = cpath.Completion("|", " ", "Pipe through a command", insert=False)
 
@@ -76,7 +93,8 @@ class Context(object):
 
     mode is "op" or "config". data is the configuration that paths complete
     against and that show prints: the running configuration in operational
-    mode, the candidate in configuration mode. base is the running
+    mode, the candidate in configuration mode. For show data, it is the data
+    that the device sent. base is the running
     configuration the candidate started from, and running is the newest copy
     of the running configuration. All three are trees at the schema root.
     root_path holds the containers above the start node of CLI paths. edit is
@@ -126,31 +144,41 @@ class Command(object):
     """A parsed command.
 
     name is the command: "configure", "exit", "exit configuration-mode",
-    "show configuration", "show", "set", "delete", "edit", "up", "top",
-    "rollback", "run", or "" for an empty line. path is relative to the edit
-    level edit. display is the format a `| display` pipe asks for, and compare
-    is True for `| compare`. count is the number of levels for up. sub is the
-    command that top or run runs.
+    "show configuration", "show data", "request", "show", "set", "delete",
+    "edit", "up", "top", "rollback", "run", or "" for an empty line. path is
+    relative to the edit level edit, and view is the view it was resolved in;
+    the paths of show data and request start at the schema root. display is
+    the format a `| display` pipe asks for, and compare is True for `|
+    compare`. count is the number of levels for up. sub is the command that
+    top or run runs. args holds the input paths of a request, each from the
+    input of the RPC or action.
     """
     name: str
     path: ?cpath.PathResult
     edit: list[cpath.Step]
+    view: str
     display: str
     compare: bool
     count: int
     sub: ?Command
+    args: list[list[cpath.Step]]
 
-    def __init__(self, name: str, path: ?cpath.PathResult=None, edit: list[cpath.Step]=[], count: int=1, sub: ?Command=None):
+    def __init__(self, name: str, path: ?cpath.PathResult=None, edit: list[cpath.Step]=[], count: int=1, sub: ?Command=None, view: str="config", args: list[list[cpath.Step]]=[]):
         self.name = name
         self.path = path
         self.edit = edit
+        self.view = view
         self.display = ""
         self.compare = False
         self.count = count
         self.sub = sub
+        self.args = args
 
     def steps(self) -> list[cpath.Step]:
-        """Return the path from the start node: the edit level and then the command's path."""
+        """Return the path from the start node: the edit level and then the command's path.
+
+        The paths of show data and request start at the schema root.
+        """
         p = self.path
         if p is not None:
             return self.edit + p.steps
@@ -264,8 +292,8 @@ def _sub(name: str, sub: _Walk) -> _Walk:
     return sub
 
 
-def _pipe(cmd: Command, pipes: list[(str, str)], toks: list[cpath.Token], p: int) -> _Walk:
-    """Parse the pipe that starts at word p."""
+def _pipe(cmd: Command, pipes: list[(str, str)], toks: list[cpath.Token], p: int, displays: list[(str, str)]=_DISPLAY) -> _Walk:
+    """Parse the pipe that starts at word p, with the formats in displays."""
     if p + 1 >= len(toks):
         return _fail("missing argument.", p + 1, items=_words(pipes))
     w = _match_word(pipes, toks[p + 1])
@@ -275,8 +303,8 @@ def _pipe(cmd: Command, pipes: list[(str, str)], toks: list[cpath.Token], p: int
         cmd.compare = True
         return _done(cmd, toks, p + 2)
     if p + 2 >= len(toks):
-        return _fail("missing argument.", p + 2, items=_words(_DISPLAY))
-    f = _match_word(_DISPLAY, toks[p + 2])
+        return _fail("missing argument.", p + 2, items=_words(displays))
+    f = _match_word(displays, toks[p + 2])
     fw = f.word
     if fw is not None:
         cmd.display = fw
@@ -284,26 +312,186 @@ def _pipe(cmd: Command, pipes: list[(str, str)], toks: list[cpath.Token], p: int
     return _fail(f.error, p + 2, f.matches)
 
 
-def _path(ctx: Context, toks: list[cpath.Token], i: int, name: str, node: yschema.DNode, data: ?ygdata.Node, edit: list[cpath.Step], pipes: list[(str, str)], values: bool=False, optional: bool=False, need_path: bool=False) -> _Walk:
-    """Parse a path from word i, then an optional pipe."""
-    p = len(toks)
+def _pipe_at(toks: list[cpath.Token], i: int) -> int:
+    """Return the index of the first pipe word from word i, or the number of words."""
     for j in range(i, len(toks)):
         if toks[j].is_pipe():
-            p = j
-            break
-    r = cpath.complete(ctx.root, node, data, toks[i:p], values, optional)
+            return j
+    return len(toks)
+
+
+def _path(ctx: Context, toks: list[cpath.Token], i: int, name: str, node: yschema.DNode, data: ?ygdata.Node, edit: list[cpath.Step], pipes: list[(str, str)], values: bool=False, optional: bool=False, need_path: bool=False, view: str="config", displays: list[(str, str)]=_DISPLAY) -> _Walk:
+    """Parse a path in a view from word i, then an optional pipe."""
+    p = _pipe_at(toks, i)
+    r = cpath.complete(ctx.root, node, data, toks[i:p], values, optional, view)
     res = r.path
     err = res.error
     if need_path and p == i:
         return _fail("missing argument.", i, items=r.items)
     if err is not None:
         return _fail(err, i + res.error_at, res.matches, r.items)
-    cmd = Command(name, res, edit)
+    cmd = Command(name, res, edit, view=view)
     if p == len(toks):
         return _Walk(cmd, [ENTER] + r.items + ([PIPE] if len(pipes) > 0 else []))
     if len(pipes) == 0:
         return _fail("syntax error.", p)
-    return _pipe(cmd, pipes, toks, p)
+    return _pipe(cmd, pipes, toks, p, displays)
+
+
+def _show_op(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
+    """Parse operational mode show from word i: `configuration [path]`, or a path to configuration and state.
+
+    The word configuration wins over a top-level node of the same name. A
+    word that is a prefix of configuration and also of a top-level node is
+    ambiguous, unless it names that node exactly.
+    """
+    if i >= len(toks):
+        r = cpath.complete(ctx.root, ctx.root, ctx.data, [], view="data")
+        return _fail("missing argument.", i, items=_words(_SHOW) + [c for c in r.items if c.value != "configuration"])
+    t = toks[i]
+    b = _match_word(_SHOW, t)
+    bw = b.word
+    if bw is not None and t.text != bw and cpath.is_keyword(ctx.root, t, "data"):
+        # A top-level node named exactly wins over a prefix of configuration.
+        bw = None
+    if bw is not None:
+        names = []
+        if t.text != bw:
+            for c in cpath.candidates(ctx.root, "data"):
+                if hints.has_keyword(c) and c.name.startswith(t.text) and c.name != bw:
+                    names.append(c.name)
+        if len(names) == 0:
+            return _path(ctx, toks, i + 1, "show configuration", ctx.start, ctx.start_data, [], _PIPE_OP)
+        return _fail("'{t.text}' is ambiguous.", i, sorted([bw] + names))
+    return _path(ctx, toks, i, "show data", ctx.root, ctx.data, [], _PIPE_OP, need_path=True, view="data", displays=_DISPLAY_DATA)
+
+
+def _key(prefix: str, n: yschema.DNode) -> str:
+    """Return the schema path of a node below a schema path, as the input checks use it."""
+    k = "{n.namespace} {n.name}"
+    return prefix + "/" + k if prefix != "" else k
+
+
+def _given(args: list[list[cpath.Step]]) -> set[str]:
+    """Return the schema paths of the input nodes that the input paths give, with the containers and list entries on the way."""
+    res = set()
+    for a in args:
+        k = ""
+        for st in a:
+            k = _key(k, st.node)
+            res.add(k)
+    return res
+
+
+def _missing_input(node: yschema.DNode, prefix: str, given: set[str]) -> bool:
+    """Return True when a mandatory leaf below an input node is not given.
+
+    The leaves of a container count when the container has no presence or is
+    given. The leaves of a list count when an entry is given.
+    """
+    for c in cpath.candidates(node, "data"):
+        k = _key(prefix, c)
+        if isinstance(c, yschema.DLeaf):
+            if c.mandatory and k not in given:
+                return True
+        elif isinstance(c, yschema.DContainer):
+            if (not c.presence or k in given) and _missing_input(c, k, given):
+                return True
+        elif isinstance(c, yschema.DList):
+            if k in given and _missing_input(c, k, given):
+                return True
+    return False
+
+
+def _levels(steps: list[cpath.Step]) -> list[cpath.Step]:
+    """Return the containers and list entries at the start of an input path, without the leaf at its end."""
+    res = []
+    for s in steps:
+        if isinstance(s.node, yschema.DContainer) or s.is_entry():
+            res.append(s)
+        else:
+            break
+    return res
+
+
+def _input_path(root: yschema.DRoot, inp: yschema.DNode, levels: list[cpath.Step], toks: list[cpath.Token]) -> (level: int, res: cpath.CompletionResult):
+    """Walk an input path from the deepest of levels that takes its first word.
+
+    A level where the first word is the exact name of a child wins, the
+    innermost first. Otherwise the walk tries the innermost level and then
+    each level above it, up to the input itself, and takes the first that
+    accepts a prefix or a value. level is the number of levels the path
+    starts below.
+    """
+    if len(toks) > 0:
+        for e in range(len(levels), -1, -1):
+            n = cpath.descend(inp, None, levels[:e]).node
+            if cpath.is_keyword(n, toks[0], "data"):
+                return (level=e, res=cpath.complete(root, n, None, toks, values=True, view="data", stop=True))
+    k = len(levels)
+    while k > 0:
+        a = cpath.complete(root, cpath.descend(inp, None, levels[:k]).node, None, toks, values=True, view="data", stop=True)
+        if a.path.error is None or a.path.error_at > 0:
+            return (level=k, res=a)
+        k -= 1
+    return (level=0, res=cpath.complete(root, inp, None, toks, values=True, view="data", stop=True))
+
+
+def _input_items(root: yschema.DRoot, inp: yschema.DNode, levels: list[cpath.Step]) -> list[cpath.Completion]:
+    """Return what can follow an input path: the children at its innermost level, then at each level above it."""
+    res = []
+    seen = set()
+    for k in range(len(levels), -1, -1):
+        for c in cpath.complete(root, cpath.descend(inp, None, levels[:k]).node, None, [], values=True, view="data").items:
+            if c.text not in seen:
+                seen.add(c.text)
+                res.append(c)
+    return res
+
+
+def _request(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
+    """Parse `request` from word i: an RPC, or a path to an action, then input paths and an optional pipe.
+
+    An input path starts in the container where the one before it ended, or
+    in a container above that, up to the input of the RPC or action. So
+    `request ping host h options ttl 5 df count 3` gives four input paths.
+    """
+    p = _pipe_at(toks, i)
+    r = cpath.complete(ctx.root, ctx.root, ctx.data, toks[i:p], view="request", stop=True)
+    res = r.path
+    if res.pos.kind != "call":
+        if res.error is not None:
+            return _fail(res.error, i + res.error_at, res.matches, r.items)
+        return _fail("missing argument.", i + res.used, items=r.items)
+    inp = cpath.call_part(res.pos.node, "input")
+    args = []
+    levels: list[cpath.Step] = []
+    j = i + res.used
+    while j < p:
+        if inp is not None:
+            w = _input_path(ctx.root, inp, levels, toks[j:p])
+            ar = w.res.path
+            if ar.error is not None:
+                return _fail(ar.error, j + ar.error_at, ar.matches, w.res.items)
+            if ar.used == 0:
+                return _fail("syntax error.", j)
+            steps = levels[:w.level] + ar.steps
+            args.append(steps)
+            levels = _levels(steps)
+            j += ar.used
+        else:
+            return _fail("syntax error.", j)
+    items = []
+    missing = False
+    if inp is not None:
+        items = _input_items(ctx.root, inp, levels)
+        missing = _missing_input(inp, "", _given(args))
+    if missing:
+        return _fail("missing argument.", p, items=items)
+    cmd = Command("request", res, view="request", args=args)
+    if p == len(toks):
+        return _Walk(cmd, [ENTER] + items + [PIPE])
+    return _pipe(cmd, _PIPE_OP, toks, p, _DISPLAY_REPLY)
 
 
 def _edit(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
@@ -349,12 +537,9 @@ def _walk(ctx: Context, toks: list[cpath.Token], i: int, exclude: set[str]=set()
             return _done(Command("exit"), toks, i + 1)
         if word == "configure":
             return _done(Command("configure"), toks, i + 1)
-        if i + 1 >= len(toks):
-            return _fail("missing argument.", i + 1, items=_words(_SHOW))
-        s = _match_word(_SHOW, toks[i + 1])
-        if s.word is None:
-            return _fail(s.error, i + 1, s.matches)
-        return _path(ctx, toks, i + 2, "show configuration", ctx.start, ctx.start_data, [], _PIPE_OP)
+        if word == "request":
+            return _request(ctx, toks, i + 1)
+        return _show_op(ctx, toks, i + 1)
     if word == "set":
         return _path(ctx, toks, i + 1, "set", ctx.here, ctx.here_data, ctx.edit, [], values=True, need_path=True)
     if word == "delete":
@@ -487,15 +672,23 @@ def help_text(items: list[cpath.Completion]) -> str:
 
 
 def output(ctx: Context, cmd: Command) -> str:
-    """Return the output of a show configuration or show command.
+    """Return the output of a show configuration, show data or show command.
 
-    In operational mode it shows ctx.data, the running configuration. In
-    configuration mode it shows the candidate, or compares it with base.
+    In operational mode it shows ctx.data: the running configuration, or for
+    show data the data the device sent. In configuration mode it shows the
+    candidate, or compares it with base.
     """
     pres = cmd.path
     d = ctx.data
     if pres is not None and d is not None:
         steps = cmd.steps()
+        if cmd.view == "data":
+            if cmd.display == "xml" or cmd.display == "json":
+                sub = render.prune([], steps, d)
+                if sub is not None:
+                    return sub.to_xmlstr(pretty=True) if cmd.display == "xml" else sub.to_yang_jsonstr(pretty=True)
+                return ""
+            return render.curly(pres.pos, "data")
         if cmd.compare:
             return "\n".join(_compare(ctx, steps, pres.pos))
         if cmd.display == "set":
@@ -576,14 +769,122 @@ def refresh(ctx: Context, cmd: Command) -> Command:
     """Return the command with its path resolved again against the context's data."""
     p = cmd.path
     if p is not None:
-        h = cpath.descend(ctx.start, ctx.start_data, cmd.edit)
-        words = cpath.path_tokens(h.node, p.steps)
-        res = cpath.resolve(ctx.root, h.node, h.data, cpath.tokenize(" ".join(words)).items)
-        c = Command(cmd.name, res, cmd.edit, cmd.count, cmd.sub)
+        start: yschema.DNode = ctx.root
+        data = ctx.data
+        if cmd.view == "config":
+            h = cpath.descend(ctx.start, ctx.start_data, cmd.edit)
+            start = h.node
+            data = h.data
+        words = cpath.path_tokens(start, p.steps, cmd.view)
+        res = cpath.resolve(ctx.root, start, data, cpath.tokenize(" ".join(words)).items, view=cmd.view)
+        c = Command(cmd.name, res, cmd.edit, cmd.count, cmd.sub, cmd.view, cmd.args)
         c.display = cmd.display
         c.compare = cmd.compare
         return c
     return cmd
+
+
+def subtree_filter(steps: list[cpath.Step]) -> ygdata.FNode:
+    """Return the subtree filter that selects the data at the end of a path from the schema root.
+
+    A list entry on the path matches its key values.
+    """
+    inner: list[ygdata.FNode] = []
+    for k in range(len(steps) - 1, -1, -1):
+        s = steps[k]
+        n = s.node
+        kids = []
+        if isinstance(n, yschema.DList) and len(s.keys) > 0:
+            kl = hints.key_leaves(n)
+            for j in range(len(s.keys)):
+                kids.append(ygdata.FNode(ygdata.Id(kl[j].namespace, kl[j].name), value_match=s.keys[j]))
+        inner = [ygdata.FNode(ygdata.Id(n.namespace, n.name), children=kids + inner)]
+    return ygdata.FNode(children=inner)
+
+
+def _schema_order(inp: yschema.DNode, steps: list[cpath.Step]) -> list[int]:
+    """Return the position of each node of an input path among the schema children of its parent."""
+    res = []
+    parent = inp
+    for st in steps:
+        idx = 0
+        if isinstance(parent, yschema.DNodeInner):
+            for j in range(len(parent.children)):
+                c = parent.children[j]
+                if c.name == st.node.name and c.namespace == st.node.namespace:
+                    idx = j
+                    break
+        res.append(idx)
+        parent = st.node
+    return res
+
+
+def _before(a: list[int], b: list[int]) -> bool:
+    """Return True when schema position a comes before b."""
+    for j in range(min([len(a), len(b)])):
+        if a[j] != b[j]:
+            return a[j] < b[j]
+    return len(a) < len(b)
+
+
+def _in_schema_order(inp: yschema.DNode, args: list[list[cpath.Step]]) -> list[list[cpath.Step]]:
+    """Return the input paths in schema order, which RFC 7950 asks for in RPC and action input.
+
+    Paths at the same position keep the order the user gave them in.
+    """
+    keyed = [(_schema_order(inp, a), a) for a in args]
+    res = []
+    for ka in keyed:
+        j = len(res)
+        while j > 0 and _before(ka.0, res[j - 1].0):
+            j -= 1
+        res.insert(j, ka)
+    return [a for _, a in res]
+
+
+def request_xml(root: yschema.DRoot, cmd: Command) -> xml.Node:
+    """Return the XML that a request command sends: the RPC element, or the action element around the data path.
+
+    The input shows in schema order.
+    """
+    res = cmd.path
+    if res is not None:
+        steps = res.steps
+        if len(steps) > 0:
+            tree = candidate.with_path(root, ygdata.Container({}), steps)
+            args = cmd.args
+            inp = cpath.call_part(steps[-1].node, "input")
+            if inp is not None:
+                args = _in_schema_order(inp, args)
+            for a in args:
+                tree = candidate.with_path(root, tree, steps + a)
+            elems = tree.to_xml()
+            if isinstance(steps[-1].node, yschema.DAction):
+                return xml.Node("action", nsdefs=[(None, netconf.NS_YANG_ACTION)], children=elems)
+            return elems[0]
+    raise ValueError("no RPC or action")
+
+
+def reply_text(root: yschema.DRoot, cmd: Command, reply: xml.Node) -> str:
+    """Return what a request command shows for the device's reply.
+
+    With `| display xml` it is the XML inside the reply. Otherwise it is the
+    output in curly-brace format, and nothing for an ok reply. Output that the
+    output schema does not describe, such as anyxml, shows as the XML inside
+    the reply. Raise an exception when the output does not fit the schema.
+    """
+    if cmd.display != "xml" and netconf.is_ok_reply(reply):
+        return ""
+    res = cmd.path
+    if cmd.display != "xml" and res is not None and len(res.steps) > 0:
+        o = cpath.call_part(res.steps[-1].node, "output")
+        if o is not None:
+            path = ["{s.node.module}:{s.node.name}" for s in res.steps] + ["output"]
+            d = yxml.from_xml(root, reply, loose=True, root_path=path)
+            text = render.curly(cpath.Position("inner", o, d), "data")
+            if text != "":
+                return text
+    return xml.encode_nodes(reply.children, True)
 
 
 def _compare(ctx: Context, steps: list[cpath.Step], pos: cpath.Position) -> list[str]:
