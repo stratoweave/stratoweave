@@ -91,10 +91,12 @@ export function gutter(size: number): number {
 // near the waiting navy, released dims once the window run takes over,
 // prepared clears 3:1 against the grid and preparing is the lightest.
 // Amber is a failed prepare: a warning only, as the device copies its
-// image in its window instead.
+// image in its window instead. A lighter amber is a prepare that failed for
+// a transient reason and that the device tries again.
 export const PREPARE_COLOR: Record<PrepareState, string> = {
   scheduled: '#262b52',
   preparing: '#ddd6fe',
+  retrying: '#fcd34d',
   prepared: '#7b6fd6',
   failed: '#f59e0b',
   released: '#463f86'
@@ -102,17 +104,19 @@ export const PREPARE_COLOR: Record<PrepareState, string> = {
 
 /** What a waiting member's cell shows instead when it prepares ahead and
  * its prepare has started: whether its image is ready for its window. */
-export type ReadyKind = 'prepared' | 'preparing' | 'prepare-failed';
+export type ReadyKind = 'prepared' | 'preparing' | 'prepare-retrying' | 'prepare-failed';
 
 export const READY_COLOR: Record<ReadyKind, string> = {
   prepared: PREPARE_COLOR.prepared,
   preparing: PREPARE_COLOR.preparing,
+  'prepare-retrying': PREPARE_COLOR.retrying,
   'prepare-failed': PREPARE_COLOR.failed
 };
 
 export const READY_LABEL: Record<ReadyKind, string> = {
   prepared: 'ready: image prepared',
   preparing: 'preparing',
+  'prepare-retrying': 'prepare retrying',
   'prepare-failed': 'prepare failed, copies in its window'
 };
 
@@ -126,6 +130,8 @@ export function readyKind(view: PrepareView | undefined): ReadyKind | null {
     case 'prepared':
     case 'preparing':
       return view.state;
+    case 'retrying':
+      return 'prepare-retrying';
     case 'failed':
       return 'prepare-failed';
     default:

@@ -2,6 +2,7 @@
   import { onMount } from 'svelte';
   import { invalidate } from '$app/navigation';
 
+  import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
   import ConnectionDot from '#lib/software/ConnectionDot.svelte';
   import DeviceLog from '#lib/software/DeviceLog.svelte';
   import DevicePicture from '#lib/software/DevicePicture.svelte';
@@ -9,16 +10,20 @@
   import JobProgress from '#lib/software/JobProgress.svelte';
   import StageChain from '#lib/software/StageChain.svelte';
   import StatusPill from '#lib/software/StatusPill.svelte';
+  import { errorText } from '#lib/core/errors.ts';
   import { onLoaded } from '#lib/core/loading.svelte.ts';
   import LoadError from '#lib/core/ui/LoadError.svelte';
   import { createPoller } from '#lib/core/polling/poller.ts';
+  import { dropReadCache, restconfPatchJson } from '#lib/core/restconf/client.ts';
   import { formatClock } from '#lib/core/time.ts';
   import { pendingText } from '#lib/software/device-state.ts';
   import { campaignHref, deviceHref } from '#lib/software/links.ts';
   import {
+    DATA_ROOT,
     STEP_LABEL,
     isFinalStatus,
     modeLabel,
+    prepareAgainPatch,
     type CheckResult,
     type DeviceCampaign,
     type DeviceStatusRow,
@@ -45,6 +50,43 @@
     poller.start();
     return () => poller.stop();
   });
+
+  /** Whether an operator may ask the member to prepare again: the campaign
+   * prepares ahead, the member waits for its window, and the prepare of its
+   * prepare-attempt failed or is retrying. */
+  function mayPrepareAgain(campaign: DeviceCampaign): boolean {
+    const job = campaign.row.prepare;
+    return (
+      campaign.allowStaging &&
+      campaign.row.status === 'upgrade-needed' &&
+      (job.state === 'failed' || job.state === 'retrying') &&
+      job.prepareAttempt >= campaign.prepareAttempt
+    );
+  }
+
+  let confirmPrepare = $state(false);
+  let busy = $state(false);
+  let actionError = $state('');
+
+  /** Raise the member's prepare-attempt: the campaign lets it prepare again
+   * at once, as its bandwidth cap allows. */
+  async function prepareAgain(): Promise<void> {
+    confirmPrepare = false;
+    const campaign = campaignLoad?.campaign;
+    if (!campaign) return;
+    try {
+      busy = true;
+      actionError = '';
+      await restconfPatchJson(DATA_ROOT, prepareAgainPatch(campaign.name, data.deviceName, campaign.prepareAttempt));
+      // The next read must see the new prepare-attempt.
+      dropReadCache();
+      await invalidate('data:campaign-device');
+    } catch (error) {
+      actionError = errorText(error, 'The action failed.');
+    } finally {
+      busy = false;
+    }
+  }
 
   /** This device's start in the plan, real once released, else the
    * planner's estimate; "no window yet" when the plan has the campaign but
@@ -74,8 +116,8 @@
 
   /** What neither the chain nor the check rows show: what the device does
    * now, or what stopped it. */
-  function note(row: DeviceStatusRow): string {
-    const doing = jobDetail(row);
+  function note(row: DeviceStatusRow, prepareAttempt: number): string {
+    const doing = jobDetail(row, prepareAttempt);
     if (doing) return doing;
     const view = stageView(row);
     if (view.steps[0].state === 'skipped') return 'already on the target release';
@@ -123,7 +165,7 @@
   {@const device = deviceLoad.device}
   {@const campaign = campaignLoad.campaign}
   {@const row = campaign.row}
-  {@const text = note(row)}
+  {@const text = note(row, campaign.prepareAttempt)}
   {@const progress = jobProgress(row)}
   <div class="page-header">
     <div class="ident">
@@ -150,11 +192,29 @@
       <StatusPill status={row.status} raw={row.raw} />
       {#if device !== null}
         <div class="page-actions">
+          {#if mayPrepareAgain(campaign)}
+            <button class="btn btn-secondary" type="button" disabled={busy} onclick={() => (confirmPrepare = true)}>
+              Prepare again
+            </button>
+          {/if}
           <a class="btn btn-secondary" href={deviceHref(device.name)}>Device settings</a>
         </div>
       {/if}
     </div>
   </div>
+  {#if actionError}
+    <div class="error-state" role="alert">{actionError}</div>
+  {/if}
+
+  <ConfirmDialog
+    open={confirmPrepare}
+    title="Prepare again"
+    message={`Prepare ${data.deviceName} again? ${campaign.name} lets it copy its image at once, as its bandwidth cap allows, until its window opens, but not in a time in which no member may prepare.`}
+    confirmLabel="Prepare again"
+    confirmClass="btn-primary"
+    oncancel={() => (confirmPrepare = false)}
+    onconfirm={prepareAgain}
+  />
 
   <section class="card run">
     <div class="facts">

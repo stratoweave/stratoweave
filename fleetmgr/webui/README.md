@@ -90,7 +90,8 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   `prepare-before-first-window` and `prepare-during-windows`, merged true
   or false, `prepare-between-windows` and `prepare-max-bandwidth`, in
   Mbit/s in the form and bits/s as a string in the leaf; unticked, a save
-  leaves them as they are.
+  leaves them as they are. Prepare again, on a member's page, merges the
+  member's `prepare-attempt` one higher, as the page last read it.
 - Progress is config-false `state` under each campaign, merged into GET
   responses; each `device-status` row also carries `version`, `model`,
   `stage`, `reason`, the `precheck` and `postcheck` verdicts, the `attempt`
@@ -301,19 +302,25 @@ live device state. Pause merges `admin-state: plan`: members that upgrade
 stop before their install and go on when the campaign runs again.
 
 With `allow-staging` (Prepare ahead), members copy their image before
-their window. A member's prepare is scheduled, preparing, prepared or
-failed from its `prepare` job while it waits for its window, and only
-when the job is for its `target-release`; a member without a report yet
-is scheduled. A failed prepare is a warning: the device copies its image
-in its window. Once the member's window run starts, that run fills the
-same `prepare` entry, so the member only counts as released. A bar over
-the timeline counts the prepared, preparing and failed members; its
-tooltip adds when the last prepare starts and names the failed ones. On
-the timeline, a waiting member's cell shows its prepare once it has
-started, and a window that has not opened says how many of its members
-that prepare ahead are ready. The Prepare chip in front of the bar hides
-the bar, the cells' prepare colours and the plan's prepare alarms; the
-browser keeps the choice. The device list gets a Prepare column and a
+their window. A member's prepare is scheduled, preparing, retrying,
+prepared or failed from its `prepare` job while it waits for its window,
+and only when the job is for its `target-release` and its
+`prepare-attempt`; a member without a report yet, or whose job is for an
+earlier `prepare-attempt`, is scheduled. Retrying is a prepare that failed
+for a transient reason and that the device tries again. A failed prepare
+is a warning: the device copies its image in its window. When a waiting
+member's prepare failed or retries, its page has Prepare again, which
+raises its `prepare-attempt` so that the campaign lets it prepare again.
+Until its device prepares for that `prepare-attempt`, the page says that
+it waits to prepare again. Once the member's window run starts, that run
+fills the same `prepare` entry, so the member only counts as released. A
+bar over the timeline counts the prepared, preparing, retrying and failed
+members; its tooltip adds when the last prepare starts and names the
+failed ones. On the timeline, a waiting member's cell shows its prepare
+once it has started, and a window that has not opened says how many of its
+members that prepare ahead are ready. The Prepare chip in front of the bar
+hides the bar, the cells' prepare colours and the plan's prepare alarms;
+the browser keeps the choice. The device list gets a Prepare column and a
 prepare failed filter.
 
 Sharding is internal: the top places each device on a flotilla by its

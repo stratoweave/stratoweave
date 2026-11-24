@@ -7,7 +7,7 @@
 
 import type { CampaignPlan, DeviceStatusRow, KnownStatus } from './model';
 
-export type PrepareState = 'scheduled' | 'preparing' | 'prepared' | 'failed' | 'released';
+export type PrepareState = 'scheduled' | 'preparing' | 'retrying' | 'prepared' | 'failed' | 'released';
 
 export interface PrepareView {
   state: PrepareState;
@@ -15,7 +15,7 @@ export interface PrepareView {
   start: number;
   /** Percent of the image copied while it prepares; null otherwise. */
   progress: number | null;
-  /** Why the prepare failed; '' otherwise. */
+  /** Why the prepare failed, or why it is retrying; '' otherwise. */
   message: string;
 }
 
@@ -24,9 +24,15 @@ const RELEASED = new Set<KnownStatus>(['in-progress', 'succeeded', 'failed', 'ro
 
 /** The prepare of each member that has a prepare-start, from the plan and
  * the member's row. A prepare job counts only when it is for the member's
- * target release: a job left from another intent says nothing about this
- * one. A member that has not reported its prepare yet is scheduled. */
-export function prepareViews(plan: CampaignPlan | null, rows: DeviceStatusRow[]): Map<string, PrepareView> {
+ * target release and its prepare-attempt, in prepareAttempts (absent is
+ * 0): a job left from another intent says nothing about this one, and one
+ * from an earlier prepare-attempt is an ask to prepare again on its way. A
+ * member that has not reported its prepare yet is scheduled. */
+export function prepareViews(
+  plan: CampaignPlan | null,
+  rows: DeviceStatusRow[],
+  prepareAttempts: Map<string, number> = new Map()
+): Map<string, PrepareView> {
   const out = new Map<string, PrepareView>();
   if (plan === null) return out;
   const byName = new Map(rows.map((r) => [r.device, r]));
@@ -39,14 +45,16 @@ export function prepareViews(plan: CampaignPlan | null, rows: DeviceStatusRow[])
         view.state = 'released';
       } else if (row && row.status === 'upgrade-needed') {
         const job = row.prepare;
-        const current = !job.release || !row.targetRelease || job.release === row.targetRelease;
+        const current =
+          (!job.release || !row.targetRelease || job.release === row.targetRelease) &&
+          job.prepareAttempt >= (prepareAttempts.get(d.name) ?? 0);
         if (current && job.state === 'running') {
           view.state = 'preparing';
           view.progress = job.progress;
         } else if (current && job.state === 'done') {
           view.state = 'prepared';
-        } else if (current && job.state === 'failed') {
-          view.state = 'failed';
+        } else if (current && (job.state === 'failed' || job.state === 'retrying')) {
+          view.state = job.state;
           view.message = job.message;
         }
       }
@@ -61,6 +69,8 @@ export interface PrepareTally {
   waiting: number;
   scheduled: number;
   preparing: number;
+  /** Failed for a transient reason, and tried again. */
+  retrying: number;
   prepared: number;
   failed: number;
   released: number;
@@ -74,6 +84,7 @@ export function prepareTally(views: Map<string, PrepareView>): PrepareTally {
     waiting: 0,
     scheduled: 0,
     preparing: 0,
+    retrying: 0,
     prepared: 0,
     failed: 0,
     released: 0,
@@ -97,7 +108,7 @@ export function isPrepareAlarm(alarm: string): boolean {
   return / device\(s\) (cannot prepare before|failed to prepare)/.test(alarm);
 }
 
-/** Whether any prepare is still to start or running. */
+/** Whether any prepare is still to start, running or retrying. */
 export function preparesLeft(t: PrepareTally): boolean {
-  return t.scheduled + t.preparing > 0;
+  return t.scheduled + t.preparing + t.retrying > 0;
 }
