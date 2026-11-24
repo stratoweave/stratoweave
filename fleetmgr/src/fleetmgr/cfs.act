@@ -643,12 +643,13 @@ def veto_holder(campaign: str) -> str:
 def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_entry,
                    i: y_0.software__software__upgrade_campaign_entry,
                    image: ?y_0.stratoweave_images__images__image_entry, attempt: u64,
-                   url_base: ?str, held: bool, prepare: bool) -> None:
+                   prepare_attempt: u64, url_base: ?str, held: bool, prepare: bool) -> None:
     """Write the software intent of campaign i for one device to its
     flotilla. The intent is the campaign's name, the release of the
-    device's image, the member's attempt, the URL to fetch the image from,
-    url_base followed by the image's file, and the image's checksums and
-    size. Without an image, only the name and the attempt are written.
+    device's image, the member's attempt and prepare attempt, the URL to
+    fetch the image from, url_base followed by the image's file, and the
+    image's checksums and size. Without an image, only the name, the
+    attempt and the prepare attempt are written.
     When held is true, the campaign's veto is written
     too: the device reads the release it runs, but does not install the
     target. When held and prepare are true, allow-staging is written as
@@ -657,6 +658,7 @@ def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_
     software = o.rfs.create(flotilla_of(fleet_device.name)).device.create(fleet_device.name).software
     software.upgrade_campaign = i.name
     software.attempt = attempt
+    software.prepare_attempt = prepare_attempt
     if image is not None:
         software.target_release = image.version
         if url_base is not None and url_base != "":
@@ -712,6 +714,11 @@ def member_attempts(i: y_0.software__software__upgrade_campaign_entry) -> dict[s
     return {member.name: member.attempt for member in i.device}
 
 
+def member_prepare_attempts(i: y_0.software__software__upgrade_campaign_entry) -> dict[str, u64]:
+    """Return the prepare attempt that campaign i writes for each member."""
+    return {member.name: member.prepare_attempt for member in i.device}
+
+
 def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory: y_0.root,
                     unheld: set[str], allowed: set[str], names: ?set[str]) -> y_1_loose.root:
     """Return the software intent of campaign i for its members, or only for
@@ -749,7 +756,7 @@ def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory
             if staging and member.name in allowed:
                 prepare = True
             route_software(o, fleet_device, i, member_image(inventory, member.image),
-                           member.attempt, url_base, held, prepare)
+                           member.attempt, member.prepare_attempt, url_base, held, prepare)
     return o
 
 
@@ -875,17 +882,22 @@ def counted_attempt(campaign: str, target: ?str, attempt: u64, tag_campaign: ?st
     return None
 
 
-def prepare_for(campaign: str, target: ?str, attempt: u64, tag_campaign: ?str,
-                tag_target: ?str, prepares: list[(u64, ?str, ?str)]) -> ?str:
+def prepare_for(campaign: str, target: ?str, attempt: u64, prepare_attempt: u64,
+                tag_campaign: ?str, tag_target: ?str,
+                prepares: list[(u64, ?str, ?str, ?u64)]) -> ?str:
     """Return the state of the prepare of the attempt attempt of a member of
     the campaign with the target release target, when the prepare copies or
-    copied the target. prepares has the number, and the release and state
-    of the prepare, of each attempt that the device reports for tag_campaign
-    and tag_target. Return None otherwise."""
+    copied the target for the prepare attempt prepare_attempt. prepares has
+    the number, and the release, state and prepare attempt of the prepare,
+    of each attempt that the device reports for tag_campaign and
+    tag_target. A prepare without a prepare attempt is for 0. Return None
+    otherwise."""
     if target is None or tag_campaign != campaign or tag_target != target:
         return None
     for a in prepares:
-        if a.0 == attempt and a.1 == target:
+        ran = a.3
+        if a.0 == attempt and a.1 == target \
+           and (ran if ran is not None else u64(0)) == prepare_attempt:
             return a.2
     return None
 
@@ -1018,7 +1030,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     again, with its prepare-start, once it may prepare again: when such a
     window closes, when the campaign runs again, or when its answer comes
     back. A prepare counts only when it is the prepare of the member's
-    attempt and copies the member's target release.
+    attempt and prepare-attempt, and copies the member's target release.
 
     The actor takes run-since from the campaign's memory, gives the
     controller the windows that the notification period lets the campaign
@@ -1033,6 +1045,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                            attempts: list[(number: u64, status: ?str, stage: ?str,
                                            reason: ?str,
                                            prepare: (state: ?str, release: ?str,
+                                                     prepare_attempt: ?u64,
                                                      started: ?str, ended: ?str,
                                                      message: ?str, progress: ?u64),
                                            install: (state: ?str, release: ?str,
@@ -1080,6 +1093,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var member_info: ?CampaignMembers = None
     var targets: dict[str, str] = {}
     var attempts: dict[str, u64] = {}
+    var prepare_attempts: dict[str, u64] = {}
     var output: ygdata.Node = _empty_output()
     var unheld: set[str] = set()
     var allowed: set[str] = set()
@@ -1109,15 +1123,16 @@ actor UpgradeCampaignTransform(path: ttt.Path,
 
     def own_prepare(name: str) -> ?str:
         """Return the state of the prepare of the device name when it is the
-        prepare of the member's attempt and copies the member's target, and
-        None otherwise."""
+        prepare of the member's attempt and prepare attempt and copies the
+        member's target, and None otherwise."""
         observed = latest.get(name)
         current = campaign
         if observed is not None and current is not None:
             return prepare_for(current.name, targets.get(name), attempts.get_def(name, 0),
+                               prepare_attempts.get_def(name, 0),
                                observed.upgrade_campaign, observed.target_release,
-                               [(a.number, a.prepare.release, a.prepare.state)
-                                for a in observed.attempts])
+                               [(a.number, a.prepare.release, a.prepare.state,
+                                 a.prepare.prepare_attempt) for a in observed.attempts])
         return None
 
     def report(name: str, at: int) -> None:
@@ -1186,6 +1201,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 ds.reason = a.reason
                 ds.prepare.state = a.prepare.state
                 ds.prepare.release = a.prepare.release
+                ds.prepare.prepare_attempt = a.prepare.prepare_attempt
                 ds.prepare.started = a.prepare.started
                 ds.prepare.ended = a.prepare.ended
                 ds.prepare.message = a.prepare.message
@@ -1378,7 +1394,8 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                     post = a.postcheck
                     attempts_seen.append(
                         (number=a.number, status=a.status, stage=a.stage, reason=a.reason,
-                         prepare=(state=prep.state, release=prep.release, started=prep.started,
+                         prepare=(state=prep.state, release=prep.release,
+                                  prepare_attempt=prep.prepare_attempt, started=prep.started,
                                   ended=prep.ended, message=prep.message,
                                   progress=prep.progress),
                          install=(state=inst.state, release=inst.release, started=inst.started,
@@ -1572,6 +1589,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         running = run_now
         targets = new_targets
         attempts = new_attempts
+        prepare_attempts = member_prepare_attempts(conf)
         # A new image makes the answers and the prepares for the old target
         # stale, and no device reports that. So report every member again.
         for name in members:

@@ -934,6 +934,30 @@ def _test_campaign_config_per_member():
                                         label)
 
 
+def _test_campaign_writes_the_prepare_attempt():
+    """Each member in the fleet gets its prepare attempt, also a member in
+    flight, which has no veto: cpe-1 asks for its second prepare attempt,
+    cpe-2 is in flight with its first, and cpe-3 keeps the default."""
+    inventory = _flat_inventory(["cpe-1", "cpe-2", "cpe-3"])
+    campaign = InputCampaign(name="paced", admin_state="run", allow_staging=True)
+    # (member, its prepare attempt)
+    members: list[(str, int)] = [("cpe-1", 2), ("cpe-2", 1), ("cpe-3", 0)]
+    for m in members:
+        member = campaign.device.create(m.0, image=IMAGE)
+        if m.1 > 0:
+            member.prepare_attempt = u64(m.1)
+    testing.assertEqual(cfs.member_prepare_attempts(campaign),
+                        {"cpe-1": u64(2), "cpe-2": u64(1), "cpe-3": u64(0)})
+    o = cfs.campaign_config(campaign, inventory, {"cpe-2"}, set(), None).to_gdata()
+    testing.assertEqual(_vetoed(o, "paced"),
+                        (["cpe-1", "cpe-3"], ["cpe-2"], ["cpe-1", "cpe-2", "cpe-3"], []))
+    written: dict[str, ?u64] = {}
+    for flotilla in y_1.root.from_gdata(o).rfs:
+        for dev in flotilla.device:
+            written[dev.name] = dev.software.prepare_attempt
+    testing.assertEqual(written, {"cpe-1": u64(2), "cpe-2": u64(1), "cpe-3": u64(0)})
+
+
 def _test_intent_patch():
     """The patch of a decision changes the veto and allow-staging of the
     members that went in flight or left it, and of the members let prepare
@@ -970,30 +994,42 @@ def _test_intent_patch():
 def _test_prepare_for():
     """A prepare counts for the campaign only when the device reports it for
     the campaign's name and the member's target release, in the member's
-    attempt, and the prepare copies or copied that release."""
-    # (case, the device's campaign and target, the member's target and
-    # attempt, (attempt, release, state) of each prepare, and the state for
-    # the campaign)
-    cases: list[(str, ?str, ?str, ?str, u64, list[(u64, ?str, ?str)], ?str)] = [
-        ("same", "paced", "17.18.03a", "17.18.03a", 0, [(0, "17.18.03a", "done")], "done"),
-        ("running", "paced", "17.18.03a", "17.18.03a", 0, [(0, "17.18.03a", "running")],
+    attempt, for the member's prepare attempt, and the prepare copies or
+    copied that release. A prepare without a prepare attempt is for 0."""
+    # (case, the device's campaign and target, the member's target, attempt
+    # and prepare attempt, (attempt, release, state, prepare attempt) of
+    # each prepare, and the state for the campaign)
+    cases: list[(str, ?str, ?str, ?str, u64, u64, list[(u64, ?str, ?str, ?u64)], ?str)] = [
+        ("same", "paced", "17.18.03a", "17.18.03a", 0, 0, [(0, "17.18.03a", "done", 0)],
+         "done"),
+        ("running", "paced", "17.18.03a", "17.18.03a", 0, 0, [(0, "17.18.03a", "running", 0)],
          "running"),
-        ("other campaign", "other", "17.18.03a", "17.18.03a", 0, [(0, "17.18.03a", "done")],
+        ("other campaign", "other", "17.18.03a", "17.18.03a", 0, 0,
+         [(0, "17.18.03a", "done", 0)], None),
+        ("other device target", "paced", "17.18.02", "17.18.03a", 0, 0,
+         [(0, "17.18.03a", "done", 0)], None),
+        ("earlier attempt only", "paced", "17.18.03a", "17.18.03a", 1, 0,
+         [(0, "17.18.03a", "done", 0)], None),
+        ("the member's attempt", "paced", "17.18.03a", "17.18.03a", 1, 0,
+         [(0, "17.18.03a", "failed", 0), (1, "17.18.03a", "done", 0)], "done"),
+        ("other release", "paced", "17.18.03a", "17.18.03a", 0, 0, [(0, "17.18.02", "done", 0)],
          None),
-        ("other device target", "paced", "17.18.02", "17.18.03a", 0,
-         [(0, "17.18.03a", "done")], None),
-        ("earlier attempt only", "paced", "17.18.03a", "17.18.03a", 1,
-         [(0, "17.18.03a", "done")], None),
-        ("the member's attempt", "paced", "17.18.03a", "17.18.03a", 1,
-         [(0, "17.18.03a", "failed"), (1, "17.18.03a", "done")], "done"),
-        ("other release", "paced", "17.18.03a", "17.18.03a", 0, [(0, "17.18.02", "done")], None),
-        ("no prepare", "paced", "17.18.03a", "17.18.03a", 0, [(0, None, None)], None),
-        ("no attempt", "paced", "17.18.03a", "17.18.03a", 0, [], None),
-        ("member without a target", "paced", None, None, 0, [(0, "17.18.03a", "done")], None),
+        ("no prepare", "paced", "17.18.03a", "17.18.03a", 0, 0, [(0, None, None, None)], None),
+        ("no attempt", "paced", "17.18.03a", "17.18.03a", 0, 0, [], None),
+        ("member without a target", "paced", None, None, 0, 0, [(0, "17.18.03a", "done", 0)],
+         None),
+        ("no prepare attempt", "paced", "17.18.03a", "17.18.03a", 0, 0,
+         [(0, "17.18.03a", "done", None)], "done"),
+        ("the member's prepare attempt", "paced", "17.18.03a", "17.18.03a", 0, 1,
+         [(0, "17.18.03a", "done", 1)], "done"),
+        ("earlier prepare attempt", "paced", "17.18.03a", "17.18.03a", 0, 1,
+         [(0, "17.18.03a", "failed", 0)], None),
+        ("later prepare attempt", "paced", "17.18.03a", "17.18.03a", 0, 0,
+         [(0, "17.18.03a", "done", 1)], None),
     ]
     for case in cases:
-        testing.assertEqual(cfs.prepare_for("paced", case.3, case.4, case.1, case.2, case.5),
-                            case.6, case.0)
+        testing.assertEqual(cfs.prepare_for("paced", case.3, case.4, case.5, case.1, case.2,
+                                            case.6), case.7, case.0)
 
 
 def _test_counted_attempt():
@@ -5327,6 +5363,94 @@ def _soon(names: list[str], admin_state: str, allow_staging: bool,
 def _soon_state(event: str) -> str:
     """The admin-state that _PrepareTurn starts the campaign in."""
     return "plan" if event == "plan to run" else "run"
+
+
+proc def _CountsItsPrepareAttempt(t: testing.AsyncT, reported: ?u64, counts: bool):
+    """Run the campaign soon over cpe-1 to cpe-3 with allow-staging, where
+    cpe-1 has its prepare attempt 1. cpe-1 is let prepare at once, and its
+    device reports its prepare done for the prepare attempt reported. Pass
+    t when the plan that shows that prepare counts cpe-1 as prepared and
+    lets it prepare no more, with counts, and else does not count it and
+    lets it prepare. The device status shows the prepare attempt that the
+    device reports."""
+    t.timeout(6.0)
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    soon = _soon(names, "run", True, time.time().unix_s())
+    member = soon.0.device.get("cpe-1")
+    if member is not None:
+        member.prepare_attempt = u64(1)
+    CountsItsPrepareAttemptActor(t=t, reported=reported, counts=counts, names=names, soon=soon)
+
+
+actor CountsItsPrepareAttemptActor(t: testing.AsyncT, reported: ?u64, counts: bool, names, soon):
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var staged: list[str] = []
+    var sent = False
+    var done = False
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        staged = _staged(out)
+        cc = controller
+        if not sent and staged == ["cpe-1"] and cc is not None:
+            sent = True
+            s, a = _attempt_state("upgrade-needed", "soon", "17.18.03a", u64(0), None, None)
+            a.prepare.state = "done"
+            a.prepare.release = "17.18.03a"
+            a.prepare.prepare_attempt = reported
+            cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), s, None)
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None or not sent:
+            return
+        o = oper!
+        r = o.state.device_status.get("cpe-1")
+        if r is not None and r.prepare.state == "done":
+            ran = r.prepare.prepare_attempt
+            want_prepared = u64(1) if counts else u64(0)
+            want_staged: list[str] = [] if counts else ["cpe-1"]
+            if o.state.prepared != want_prepared or ran != reported or staged != want_staged:
+                fail("cpe-1's prepare done for {reported}: prepared {o.state.prepared}, "
+                     + "prepare attempt {ran}, let prepare {staged}")
+            else:
+                done = True
+                t.success()
+
+    def timeout() -> None:
+        fail("no plan showed cpe-1's prepare done: let prepare {staged}")
+
+    proc def __startup__():
+        ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), on_output, self.on_oper, None)
+        controller = ctl
+        ctl.on_conf(soon.0, soon.1.to_gdata())
+        for name in names:
+            ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                       _tagged("upgrade-needed", "soon", "17.18.03a"), None)
+        ctl.on_subscriptions_synced()
+        after 5.0: timeout()
+
+
+actor _test_campaign_counts_the_prepare_of_the_member_prepare_attempt(t: testing.AsyncT):
+    """A member with prepare attempt 1 whose device reports its prepare
+    done for 1 counts as prepared, and is let prepare no more."""
+
+    proc def __startup__():
+        _CountsItsPrepareAttempt(t, u64(1), True)
+
+
+actor _test_campaign_does_not_count_the_prepare_of_an_earlier_prepare_attempt(t: testing.AsyncT):
+    """A member with prepare attempt 1 whose device reports its prepare
+    done without a prepare attempt, which counts as 0, does not count as
+    prepared, and stays let prepare."""
+
+    proc def __startup__():
+        _CountsItsPrepareAttempt(t, None, False)
 
 
 proc def _PrepareTurn(t: testing.AsyncT, event: str):
