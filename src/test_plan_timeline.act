@@ -19,6 +19,10 @@ NOV17 = 1794873600
 # An image of 1 GB, in bytes.
 GB = 1000000000
 
+# The cap of the bandwidth of the prepares that a campaign gets by default,
+# 1 Gbit/s, in bits per second.
+GBIT = 1000000000
+
 
 def rounds(prefix: str, first: int, every: int, per: int, n: int,
            est: int) -> list[(str, int, int)]:
@@ -984,44 +988,53 @@ def _test_edit_promised_nowhere() -> str:
 #############################################################################
 
 def stage(c: fleet_ctl.Controller, windows: list[(str, int, int)], devs: list[(str, int, str)],
-          target: int, maxc: int, prep: int, budget: int) -> None:
+          target: int, maxc: int, prep: int, budget: int, image: int=GB,
+          between: ?bool=None, during: bool=False) -> None:
     """Configure c with the windows and devices, with prepare on. The
-    times of the windows count from NOV17. Each device takes 600 s, and
-    its expected prepare time is prep seconds. The debounce is 0 s, there
-    are no redundancy groups, the close margin is the default, there is
-    no stagger, and the failure budget is budget, below 0 for none."""
+    times of the windows count from NOV17. Each device takes 600 s, its
+    expected prepare time is prep seconds, and it copies an image of image
+    bytes. The debounce is 0 s, there are no redundancy groups, the close
+    margin is the default, there is no stagger, and the failure budget is
+    budget, below 0 for none. The members may prepare before the first
+    window, between windows as between says, None for automatic, and
+    during windows as during says, and the cap of their bandwidth is the
+    default of a campaign, 1 Gbit/s."""
     c.configure([(w.0, NOV17 + w.1, NOV17 + w.2) for w in windows], devs, target, maxc, False,
                 0, 600, {}, {}, {}, fleet_ctl.CLOSE_MARGIN, 0, True, {d.0: prep for d in devs},
-                budget, None)
+                budget, None, {d.0: image for d in devs}, True, between, during, GBIT)
 
 
 def staging(windows: list[(str, int, int)], devs: list[(str, int, str)], target: int,
-            maxc: int, prep: int) -> fleet_ctl.Controller:
+            maxc: int, prep: int, image: int=GB, between: ?bool=None,
+            during: bool=False) -> fleet_ctl.Controller:
     """Return a controller of the windows and devices with prepare on, as
     stage() configures it, without a failure budget. Every device answers
     that it needs the upgrade, and the run starts with the ramp at 1."""
     c = fleet_ctl.Controller()
-    stage(c, windows, devs, target, maxc, prep, -1)
+    stage(c, windows, devs, target, maxc, prep, -1, image, between, during)
     for d in devs:
         c.report(d.0, "upgrade-needed", 0)
     c.start(1)
     return c
 
 
-def staged(label: str, c: fleet_ctl.Controller, t: int, image: int=GB) -> str:
+def staged(label: str, c: fleet_ctl.Controller, t: int) -> str:
     """Return a panel of the plan of c at t, as panel() does, with the
     prepares of the plan at t. The label gives the concurrency of the
     plan and the concurrency of the prepares, the most devices that
-    prepare at once. The drawing has the prepares, each device with an
-    image of image bytes. Under it are the alarms of the plan and of the
-    prepares. The plan is made on a copy of c, so c does not change."""
+    prepare at once, and when the members may prepare between windows, that
+    they do. The drawing has the prepares, each with the size of its
+    image, from the second the plan counts it from. Under it are the
+    alarms of the plan and of the prepares. The
+    plan is made on a copy of c, so c does not change."""
     x = c.copy()
     p = x.plan(t)
     q = x.prepares(t)
     prepares = [(name, at, x.prepare_est.get_def(name, 1)) for name, at in q.starts.items()]
-    sizes = {name: image for name in x.est.keys()}
+    between = ", between windows" if q.between else ""
     out = "{label}: the plan runs at concurrency {p.c}, and the prepares at concurrency " \
-        + "{q.c}\n\n" + plan_timeline.render(x.layout(p), 0, t, prepares, sizes)
+        + "{q.c}{between}\n\n" + plan_timeline.render(x.layout(p), 0, t, prepares, x.prepare_size,
+                                                        q.runs)
     for a in p.alarms + q.alarms:
         out += "alarm: {a}\n"
     return out
@@ -1033,14 +1046,14 @@ def _test_prepare_before_the_first_window() -> str:
     18, and 50 devices of 600 s. Target 4, max 8, and the ramp from 1. Each
     device prepares for 400 s and copies an image of 1 GB, 20 Mbit/s. The
     run starts at 22:00 on Mon 16. The plan promises Tue 17 to 41 devices
-    and Wed 18 to 9. Every device prepares before the next window of its
-    schedule, so the 9 devices of Wed 18 also prepare before Tue 17. Each
-    device has the same deadline, 00:50: the opening of Tue 17 less 150
-    percent of 400 s. The turns are spread evenly from 22:00 to the
-    deadline, one every 208 s, and the last turn is at the deadline. Up to
-    two prepares run at a time, and in each dot column but the last the
-    bandwidth gets to its peak, 40 Mbit/s. The last prepare ends at
-    00:56:40."""
+    and Wed 18 to 9. Every device prepares before the first window of the
+    campaign, as all fit there under the cap of 1 Gbit/s, so the 9 devices
+    of Wed 18 also prepare before Tue 17. Each device has the same
+    deadline, 00:50: the opening of Tue 17 less 150 percent of 400 s. The
+    turns are spread evenly from 22:00 to the deadline, one every 208 s,
+    and the last turn is at the deadline. Up to two prepares run at a
+    time, and in each dot column but the last the bandwidth gets to its
+    peak, 40 Mbit/s. The last prepare ends at 00:56:40."""
     wins = daily("night", HOUR, 2 * HOUR, 2)
     c = staging(wins, devices("d", 50, 600, "night"), 4, 8, 400)
     return staged("Mon 22:00, the run starts", c, NOV17 - 2 * HOUR)
@@ -1051,16 +1064,18 @@ def _test_prepare_after_a_late_start() -> str:
     first window. The schedule night has a window from 01:00 to 03:00 on
     Tue 17 and on Wed 18, and 50 devices of 600 s. Target 4, max 8, and
     the ramp from 1. Each device prepares for 400 s and copies an image of
-    1 GB. The run starts at 00:55 on Tue 17, after the deadline of 00:50,
-    so no device prepares, and the prepares give an alarm for all 50. The
-    plan has no prepare-starts, so the drawing has no prepare lanes. The
-    41 devices of Tue 17 start in its window. The window closes at 03:00,
-    and the 9 devices promised Wed 18 wait to prepare before it, by 00:50
-    on Wed 18. The decision at 03:00 lets the first of them prepare. At
-    03:05 the plan spreads the turns of the other 8 evenly from 03:00,
-    one every 2h44m, and the last turn is at the deadline. Each prepare
-    runs alone, at 20 Mbit/s, and each gap of 2h37m between two prepares
-    becomes a break."""
+    1 GB, 20 Mbit/s. The run starts at 00:55 on Tue 17, after the
+    deadline of 00:50, so no device fits before the first window, and the
+    plan turns prepare between windows on. The 41 devices of Tue 17 cannot
+    prepare before their window, and the prepares give an alarm for them.
+    The 9 devices promised Wed 18 prepare between the windows, by 00:50
+    on Wed 18. No device prepares while the window of Tue 17 is open, so
+    the first turn is at its close, 03:00, and the turns of the other 8
+    are spread evenly from there, one every 2h44m, and the last turn is at
+    the deadline. Each prepare runs alone, at 20 Mbit/s, and each gap of
+    2h37m between two prepares becomes a break. The decision at 03:00 lets
+    the first of them prepare. At 03:05 its device has not begun, so the
+    plan counts its prepare from then, and the other turns stay."""
     wins = daily("night", HOUR, 2 * HOUR, 2)
     c = staging(wins, devices("d", 50, 600, "night"), 4, 8, 400)
     t0 = NOV17 + 55 * 60
@@ -1071,20 +1086,18 @@ def _test_prepare_after_a_late_start() -> str:
 
 
 def _test_prepare_in_another_window() -> str:
-    """Devices of two schedules that prepare, the devices of the later
-    schedule while the window of the other is open. The schedule early has
-    a window from 01:00 to 03:00 on Tue 17 and on Wed 18, and the schedule
-    late from 05:00 to 07:00. Each has 20 devices of 600 s. Target 4, max
-    8, and the ramp from 1. Each device prepares for 400 s and copies an
-    image of 1 GB, 20 Mbit/s. The run starts at 00:00 on Tue 17. Each
-    device prepares before the next window of its own schedule: the
-    devices of early by 00:50, and the devices of late by 04:50. The turns
-    go by deadline. The 20 devices of early get turns about 158 s apart
-    from 00:00 to 00:50, and up to three prepares run at a time: the peak
-    is 60 Mbit/s. The 20 devices of late get turns 12 minutes apart from
-    01:02 to 04:50, also while the window of early is open from 01:00 to
-    03:00, and their prepares run alone, at 20 Mbit/s, a third of the
-    peak."""
+    """Devices of two schedules that prepare before the first window of the
+    campaign. The schedule early has a window from 01:00 to 03:00 on Tue
+    17 and on Wed 18, and the schedule late from 05:00 to 07:00. Each has
+    20 devices of 600 s. Target 4, max 8, and the ramp from 1. Each device
+    prepares for 400 s and copies an image of 1 GB, 20 Mbit/s. The run
+    starts at 00:00 on Tue 17. Every device prepares before the first
+    window of the campaign, the window of early at 01:00, so no device of
+    late prepares while the window of early is open. Each device has the
+    deadline 00:50, and the turns go by the window promised to each
+    device: the 20 devices of early first. The turns are spread evenly
+    from 00:00 to the deadline, one every 77 s, and up to six prepares run
+    at a time: the peak is 120 Mbit/s, under the cap of 1 Gbit/s."""
     wins = daily("early", HOUR, 2 * HOUR, 2) + daily("late", 5 * HOUR, 2 * HOUR, 2)
     devs = devices("e", 20, 600, "early") + devices("l", 20, 600, "late")
     c = staging(wins, devs, 4, 8, 400)
@@ -1158,17 +1171,50 @@ def _test_prepare_over_several_nights() -> str:
     and 160 devices of 600 s. Target 4, max 4, and the ramp from 1. Each
     device prepares for 400 s and copies an image of 4 GB, 80 Mbit/s. The
     run starts at 00:00 on Tue 17. The plan promises Tue 17 to 41 devices,
-    Wed 18 and Thu 19 to 44 each, and Fri 20 to 31. Every device prepares
-    before the next window of its schedule, so the 119 devices of the
-    later nights also prepare before Tue 17, and no device prepares
-    between the nights. Each device has the same deadline, 00:50, and the
-    turns are spread evenly from 00:00 to the deadline, about one every
-    19 s. Up to 22 prepares run at once: from the second dot column to the
-    last turn, the bandwidth is at its peak, 1.8 Gbit/s. The last prepare
-    ends at 00:56:40."""
+    Wed 18 and Thu 19 to 44 each, and Fri 20 to 31. Before the first
+    window, each device has the deadline 00:50, but the cap of 1 Gbit/s
+    lets only 12 prepares run at once: one turn every 33 s, so 90 devices
+    fit before Tue 17, the devices of Tue 17 and Wed 18, and 5 of Thu 19.
+    Up to 12 prepares run at once, and the bandwidth gets to 960 Mbit/s.
+    The plan turns prepare between windows on, and the other 70 devices
+    prepare between the nights, each by the opening of its own night less
+    150 percent of 400 s. Their turns are spread evenly from 03:55 on Tue
+    17 to 00:50 on Fri 20, about one every 56 minutes, outside the
+    windows and the 10 minutes before each opening. Each of them runs
+    alone, at 80 Mbit/s. The last prepare ends at 00:56:40 on Fri 20."""
     wins = daily("night", HOUR, 2 * HOUR, 4)
-    c = staging(wins, devices("d", 160, 600, "night"), 4, 4, 400)
-    return staged("00:00, the run starts", c, NOV17, 4 * GB)
+    c = staging(wins, devices("d", 160, 600, "night"), 4, 4, 400, 4 * GB)
+    return staged("00:00, the run starts", c, NOV17)
+
+
+def _test_prepare_over_several_nights_not_between_windows() -> str:
+    """The campaign over several nights of prepare_over_several_nights,
+    with prepare between windows off. The cap of 1 Gbit/s lets only 12
+    prepares run at once, so 90 devices fit before Tue 17: the devices of
+    Tue 17 and Wed 18, and 5 of Thu 19. The other 70 may not prepare
+    between the nights, so they cannot prepare in time, and the prepares
+    give an alarm for them."""
+    wins = daily("night", HOUR, 2 * HOUR, 4)
+    c = staging(wins, devices("d", 160, 600, "night"), 4, 4, 400, 4 * GB, False)
+    return staged("00:00, the run starts", c, NOV17)
+
+
+def _test_prepare_over_several_nights_during_windows() -> str:
+    """The campaign over several nights of prepare_over_several_nights,
+    with prepare between windows off and prepare during windows on. With
+    prepare during windows, no time before an opening is a time without
+    prepares, so two more turns fit before Tue 17 opens, at 00:54:18 and
+    00:59:10, and their prepares run into the window: 92 devices prepare
+    before it. The other 68 prepare while the windows of the nights before
+    their own are open, about one turn every 5 minutes: 22 devices in the
+    window of Tue 17, and 23 in each of Wed 18 and Thu 19. No device
+    prepares between the nights, nor in the 10 minutes before each window
+    closes, so the deadline of the devices of Fri 20, 00:50 on Fri 20,
+    counts from 02:50 on Thu 19, and the last turn is then: its prepare is
+    done before the window closes."""
+    wins = daily("night", HOUR, 2 * HOUR, 4)
+    c = staging(wins, devices("d", 160, 600, "night"), 4, 4, 400, 4 * GB, False, True)
+    return staged("00:00, the run starts", c, NOV17)
 
 
 def _test_prepare_after_a_change() -> str:
@@ -1182,14 +1228,12 @@ def _test_prepare_after_a_change() -> str:
     every 58m20s, so each prepare runs alone. At 20:30 d0 and d1 have
     prepared, and d2 to d6 wait. In each panel after the first, one member
     changes at 20:30: d8 joins and answers that it needs the upgrade, d3
-    leaves, or d7 answers that it needs the upgrade. Today each change
-    spreads the turns of all the waiting members again from the turn of
-    d1. After d8 joins or d7 answers, six members wait: each of d2 to d6
-    moves earlier, d6 from 00:50 to 00:01:23, and the new member takes the
-    last turn, at the deadline. After d3 leaves, four members wait: d2
-    moves later, d4 and d5 move earlier, and only d6 keeps its turn, at
-    the deadline. The line under each panel gives the prepare-start of
-    each member that waits."""
+    leaves, or d7 answers that it needs the upgrade. Each waiting member
+    keeps its turn. A new member takes the middle of the widest time
+    between two turns, the latest of two as wide: 00:20:50, between d5 and
+    d6. After d3 leaves, the time from d2 to d4 is long enough to become a
+    break. The line under each panel gives the prepare-start of each
+    member that waits."""
     wins = daily("night", HOUR, 2 * HOUR, 2)
     devs = devices("d", 8, 600, "night")
     c = fleet_ctl.Controller()
@@ -1229,9 +1273,12 @@ def _test_prepare_not_begun_when_the_window_opens() -> str:
     prepare. At 00:55 the run still lets d22 prepare. The window of Tue 17
     opens at 01:00, and the run stops letting d22 prepare. At 03:05, after
     the window closes, d22 waits for Wed 18, and its deadline is 00:50 on
-    Wed 18. Today the run does not let d22 prepare again: no member is let
-    prepare, the prepares give no alarm, and the drawing still shows the
-    prepare-start of d22 at 00:50 on Tue 17."""
+    Wed 18. The run lets d22 prepare again, between the windows, so the
+    prepares run at concurrency 1, and the plan says that the members
+    prepare between windows. d22 keeps the prepare-start it was first let
+    at, and the drawing has its dot at 00:50 on Tue 17. As its device has
+    not begun, its prepare counts from the time of each panel: from 00:55,
+    and from 03:05."""
     wins = daily("night", HOUR, 2 * HOUR, 2)
     c = staging(wins, devices("d", 23, 600, "night"), 2, 2, 400)
     t = NOV17 + 55 * 60
@@ -1248,19 +1295,19 @@ def _test_prepare_not_begun_when_a_hold_begins() -> str:
     03:00 on Tue 17 and on Wed 18, and 23 devices of 600 s. Target 2, max
     2, the ramp from 1, and the failure budget 0. Each device prepares for
     400 s and copies an image of 1 GB, 20 Mbit/s. The run starts at 01:00
-    on Tue 17, when the window opens, so no device prepares before it. Tue
-    17 starts d0 to d20, d19 and d20 last at 02:40, and d20 takes 40
-    minutes. Wed 18 is promised to d21 and d22, and after the window
-    closes they wait to prepare by 00:50 on Wed 18: the decision at 03:00
-    lets d21 prepare, and d22 has its turn at 00:50 on Wed 18. d21 does
-    not begin: its device reports no prepare. At 03:20 d20 fails, more
-    than the failure budget, and the run holds: no device starts, no
-    member is let prepare and no member waits to prepare, so the drawing
-    has only the prepare-start of d21. At 04:00 the failure budget goes
-    from 0 to 1, the hold ends, and d22 has its turn at 00:50 on Wed 18
-    again. Today the run does not let d21 prepare again: no member is let
-    prepare, and the drawing still shows the prepare-start of d21 at
-    03:00."""
+    on Tue 17, when the window opens, so no device prepares before it, and
+    the members prepare between windows. Tue 17 starts d0 to d20, d19 and
+    d20 last at 02:40, and d20 takes 40 minutes. Wed 18 is promised to d21
+    and d22, and after the window closes they wait to prepare by 00:50 on
+    Wed 18: the decision at 03:00 lets d21 prepare, and d22 has its turn at
+    00:50 on Wed 18. d21 does not begin: its device reports no prepare. At
+    03:20 d20 fails, more than the failure budget, and the run holds: no
+    device starts, no member is let prepare and no member waits to
+    prepare, so the drawing has only the prepare-start of d21, and no
+    prepare runs. At 04:00 the failure budget goes from 0 to 1, the hold
+    ends, and d22 has its turn at 00:50 on Wed 18 again. The run lets d21
+    prepare again: the drawing has its dot at its first prepare-start,
+    03:00, and its prepare from 04:00, as at 03:05 from 03:05."""
     wins = daily("night", HOUR, 2 * HOUR, 2)
     devs = devices("d", 23, 600, "night")
     c = fleet_ctl.Controller()

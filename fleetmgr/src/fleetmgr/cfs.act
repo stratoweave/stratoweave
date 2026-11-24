@@ -349,6 +349,12 @@ def estimated_duration(i: y_0.software__software__upgrade_campaign_entry,
 # Unix epoch, far beyond any campaign.
 OPEN_END = 4102444800
 
+# The largest int.
+INT_MAX = 9223372036854775807
+
+# The most entries that a campaign's plan publishes in prepare-bandwidth.
+BANDWIDTH_STEPS = 1000
+
 def campaign_debounce_s(devices: int) -> int:
     """The debounce between a report and the decision it leads to, in
     whole seconds: a second per thousand devices, at least one and up to
@@ -421,8 +427,9 @@ class CampaignMembers(object):
     devices as (name, estimated duration, schedule) by name, the schedules
     they are bound to, their redundancy groups, priorities and the groups'
     separation, the groups that hold on a failure, the campaign's
-    estimated duration, and each member's expected prepare time. When no
-    member is bound to a schedule, every member is in the synthetic
+    estimated duration, each member's expected prepare time, and the size
+    of each member's image, in bytes, for the members whose image has one.
+    When no member is bound to a schedule, every member is in the synthetic
     schedule "default"."""
     devices: list[(str, int, str)]
     referenced: list[str]
@@ -432,11 +439,12 @@ class CampaignMembers(object):
     hold_failed: set[str]
     estimate: int
     prepare_est: dict[str, int]
+    prepare_size: dict[str, int]
 
     def __init__(self, devices: list[(str, int, str)], referenced: list[str],
                  groups: dict[str, list[str]], priority: dict[str, int],
                  separation: dict[str, (bool, int)], hold_failed: set[str], estimate: int,
-                 prepare_est: dict[str, int]):
+                 prepare_est: dict[str, int], prepare_size: dict[str, int]):
         self.devices = devices
         self.referenced = referenced
         self.groups = groups
@@ -445,6 +453,7 @@ class CampaignMembers(object):
         self.hold_failed = hold_failed
         self.estimate = estimate
         self.prepare_est = prepare_est
+        self.prepare_size = prepare_size
 
 
 def campaign_members(i: y_0.software__software__upgrade_campaign_entry,
@@ -459,6 +468,7 @@ def campaign_members(i: y_0.software__software__upgrade_campaign_entry,
     default: ?str = i.default_schedule
 
     members = sorted([member.name for member in i.device])
+    image_of = {member.name: member.image for member in i.device}
     schedule_of: dict[str, ?str] = {}
     referenced: list[str] = []
     groups: dict[str, list[str]] = {}
@@ -482,6 +492,7 @@ def campaign_members(i: y_0.software__software__upgrade_campaign_entry,
     synthetic = len(referenced) == 0
     devices: list[(str, int, str)] = []
     prepare_est: dict[str, int] = {}
+    prepare_size: dict[str, int] = {}
     for name in members:
         sname = "default"
         if not synthetic:
@@ -490,6 +501,13 @@ def campaign_members(i: y_0.software__software__upgrade_campaign_entry,
         dev = inventory.fleet.device.get(name)
         devices.append((name, device_estimate(dev), sname))
         prepare_est[name] = device_prepare_estimate(dev)
+        iname = image_of.get(name)
+        if iname is not None:
+            image = inventory.images.image.get(iname)
+            if image is not None:
+                size = image.size
+                if size is not None:
+                    prepare_size[name] = int(size)
 
     separation: dict[str, (bool, int)] = {}
     hold_failed: set[str] = set()
@@ -502,7 +520,7 @@ def campaign_members(i: y_0.software__software__upgrade_campaign_entry,
         else:
             separation[g] = (True, 0)
     return CampaignMembers(devices, referenced, groups, priority, separation, hold_failed,
-                           estimated_duration(i, inventory), prepare_est)
+                           estimated_duration(i, inventory), prepare_est, prepare_size)
 
 
 def failure_budget_devices(percent: ?Decimal, members: int) -> int:
@@ -534,7 +552,10 @@ def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_
     before it when the planner sees every window before it. So do the
     campaign's allow-staging, each member's expected prepare time, the
     campaign's failure budget, in devices of the members the campaign has
-    now, and the redundancy groups that hold on a failure."""
+    now, the redundancy groups that hold on a failure, the size of each
+    member's image, when the members may prepare, and the cap of their
+    bandwidth: the campaign's prepare-max-bandwidth, or else that of the
+    image list."""
     m = members if members is not None else campaign_members(i, inventory)
     deadline = 0
     dl = i.deadline
@@ -568,7 +589,22 @@ def configure_campaign(ctl: fctl.Controller, i: y_0.software__software__upgrade_
                   must_place, campaign_debounce_s(len(m.devices)), m.estimate, m.groups,
                   m.priority, m.separation, int(i.close_margin), int(i.stagger),
                   i.allow_staging, m.prepare_est,
-                  failure_budget_devices(i.failure_budget, len(m.devices)), m.hold_failed)
+                  failure_budget_devices(i.failure_budget, len(m.devices)), m.hold_failed,
+                  m.prepare_size, i.prepare_before_first_window, i.prepare_between_windows,
+                  i.prepare_during_windows, prepare_cap(i, inventory))
+
+
+def prepare_cap(i: y_0.software__software__upgrade_campaign_entry, inventory: y_0.root) -> int:
+    """Return the cap of the bandwidth of the prepares of campaign i, in bits
+    per second: its prepare-max-bandwidth, or else that of the image
+    list, at most the largest int."""
+    cap = inventory.images.prepare_max_bandwidth
+    own = i.prepare_max_bandwidth
+    if own is not None:
+        cap = own
+    if cap > u64(INT_MAX):
+        return INT_MAX
+    return int(cap)
 
 
 class RedundancyGroups(base.RedundancyGroups):
@@ -977,11 +1013,12 @@ actor UpgradeCampaignTransform(path: ttt.Path,
 
     With allow-staging, in run, the actor writes allow-staging for each
     member from its turn to prepare until its prepare ends, it is released,
-    a window of its schedule opens, or the campaign is set to plan, as the
-    controller says. When the campaign runs again, each member let that has
-    not prepared is let again, with its prepare-start. A prepare counts
-    only when it is the prepare of the member's attempt and copies the
-    member's target release.
+    a window opens in which it may not prepare, or the campaign is set to
+    plan, as the controller says. A member let that has not prepared is let
+    again, with its prepare-start, once it may prepare again: when such a
+    window closes, when the campaign runs again, or when its answer comes
+    back. A prepare counts only when it is the prepare of the member's
+    attempt and copies the member's target release.
 
     The actor takes run-since from the campaign's memory, gives the
     controller the windows that the notification period lets the campaign
@@ -1229,6 +1266,17 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                     pd.prepare_start = u64(prepare_start)
         if plan_prepares.c > 0:
             st.plan.prepare_concurrency = u64(plan_prepares.c)
+        current = campaign
+        if current is not None and current.allow_staging:
+            st.plan.prepare_before_first_window = shown.prepare_first
+            st.plan.prepare_between_windows = plan_prepares.between
+            st.plan.prepare_during_windows = shown.prepare_during
+            if shown.prepare_cap >= 0:
+                st.plan.prepare_max_bandwidth = u64(shown.prepare_cap)
+        if plan_prepares.peak > 0:
+            st.plan.prepare_peak_bandwidth = u64(plan_prepares.peak)
+        for step in fctl.coarse(plan_prepares.steps, BANDWIDTH_STEPS):
+            st.plan.prepare_bandwidth.create(u64(step.0), bandwidth=u64(step.1))
         for alarm in plan_alarms + plan_prepares.alarms + member_alarms:
             st.plan.alarm.append(alarm)
         update_oper(oper)
@@ -1531,8 +1579,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
                 report(name, now)
             ctl.set_vetoed(name, foreign_veto(name))
         # Stop letting prepare the members that may no longer prepare, such
-        # as a member whose answer the new image made stale.
+        # as a member whose answer the new image made stale, and let again
+        # the members let before that may prepare now, as after a pause.
         ctl.revoke_prepares(now)
+        ctl.let_again(now)
         # In plan every member is held.
         unheld = unheld_now() if run_now else set()
         allowed = fctl.copy_set(ctl.allowed)

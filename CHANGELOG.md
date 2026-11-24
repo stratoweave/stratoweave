@@ -457,6 +457,10 @@
 - Fixed the software messages of a device's log naming the job, `prepare`
   or `install`, as the device in their `device` field once its adapter
   had reported a step.
+- `/images/prepare-max-bandwidth` is the bandwidth that the image server
+  gives to prepares: the most that the members of one software campaign
+  use together to copy their images, when the campaign sets none. It is 1
+  Gbit/s by default.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -766,6 +770,43 @@
   hold of the failure budget that ends before the next member's
   `prepare-start` keeps the `prepare-start`s; before, the turns started over
   when the hold ended.
+- A campaign with `allow-staging` has three settings that say when its
+  members may prepare: `prepare-before-first-window`, on by default,
+  `prepare-between-windows`, automatic when absent, and
+  `prepare-during-windows`, off by default. By default each member prepares
+  before the campaign's first window opens, also a member of a later window
+  or of another schedule; before, each member prepared before the next
+  window of its own schedule, so the members of a later schedule prepared
+  while the window of an earlier one was open. The campaign's first window
+  stays the first once it opens, also after it closes. The new
+  `prepare-max-bandwidth` caps the bandwidth that the members use together
+  to prepare, each the size of its image divided by its expected prepare
+  time, and none for an image without a size. Without it, the campaign
+  takes `prepare-max-bandwidth` of the image list. The turns stay evenly
+  spread, and a turn that the cap holds comes later. A member that does not
+  fit before the first window under the cap prepares between windows, by
+  the opening of its own window. Absent, `prepare-between-windows` is on,
+  and the plan says whether a member prepares there. Set to false, no
+  member prepares between windows, and without `prepare-during-windows` the
+  plan's alarm names the members that do not fit. With
+  `prepare-during-windows`, the members may also prepare while a window is
+  open; without it, no member prepares while any window of the campaign is
+  open, nor in the time before each opening that the longest prepare needs.
+  The plan has the settings in effect, the cap, the bandwidth over time in
+  `prepare-bandwidth`, and its peak in `prepare-peak-bandwidth`.
+- The prepare turns of a campaign stay put. A member that waits to prepare
+  keeps its `prepare-start` when other members join, leave, go down or
+  answer late; a new member takes the middle of the widest time between two
+  turns. A turn that passed, as after a pause or a hold of the failure
+  budget, one that a moved window puts after the member's deadline, and one
+  that the cap no longer allows move, and a change of a setting or of the
+  cap gives the waiting members new turns. Before, every change spread all
+  waiting turns again. A member that was let prepare and has not prepared
+  when a window opens, or when a hold of the failure budget begins, is let
+  again, with its first `prepare-start`, once it may prepare and by its
+  deadline; its prepare counts from then. Before, only a pause let it
+  again, also after its deadline, and a hold left it out for the rest of
+  the run. After its deadline, the alarm names it.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
