@@ -1,0 +1,235 @@
+"""Tests for operational mode: show of configuration and state data, and request of RPCs and actions."""
+
+import testing
+import std.xml as xml
+
+import cli.command as command
+import cli.fixture as fixture
+
+
+def _texts(r: command.Reply) -> list[str]:
+    return [c.text for c in r.items]
+
+
+def _test_parse_op():
+    ctx = fixture.context()
+    # (name, line, command, display, error, column)
+    cases = [
+        ("show configuration", "show configuration", "show configuration", "", None, 0),
+        ("configuration prefix", "show confi", "show configuration", "", None, 0),
+        ("exact top-level name", "show conf", "show data", "", None, 0),
+        ("prefix of both", "show co", "", "", "'co' is ambiguous.", 5),
+        ("state container", "show state", "show data", "", None, 0),
+        ("state leaf", "show state uptime", "show data", "", None, 0),
+        ("state below an entry", "show interfaces ge-0/0/0 counters", "show data", "", None, 0),
+        ("configuration leaf", "show interfaces ge-0/0/0 mtu", "show data", "", None, 0),
+        ("state entry", "show sessions session 7", "show data", "", None, 0),
+        ("list without keys", "show sessions event", "show data", "", None, 0),
+        ("display json", "show state | display json", "show data", "json", None, 0),
+        ("ambiguous top-level node", "show s", "", "", "'s' is ambiguous.", 5),
+        ("no display set for data", "show state | display set", "", "", "syntax error.", 21),
+        ("pipe without path", "show | display xml", "", "", "missing argument.", 5),
+        ("entry of a list without keys", "show sessions event boot", "", "", "syntax error.", 20),
+        ("rpc", "request reload", "request", "", None, 0),
+        ("rpc input", "request ping host h count 3", "request", "", None, 0),
+        ("rpc nested input", "request ping host h options ttl 5 options df", "request", "", None, 0),
+        ("input in the same container", "request ping options ttl 5 df host h count 3", "request", "", None, 0),
+        ("input not in any level", "request ping options ttl 5 delay 2", "", "", "syntax error.", 27),
+        ("rpc prefixes", "req pi ho h", "request", "", None, 0),
+        ("mandatory input", "request ping count 3", "", "", "missing argument.", 20),
+        ("mandatory input in a container", "request ping host h source", "", "", "missing argument.", 26),
+        ("mandatory input in a container given", "request ping host h source address a", "request", "", None, 0),
+        ("input after a presence container", "request ping host h record count 3", "request", "", None, 0),
+        ("input list without keys", "request ping host h pattern", "", "", "syntax error.", 20),
+        ("bad input", "request ping host h foo", "", "", "syntax error.", 20),
+        ("input to an rpc without input", "request reload now", "", "", "syntax error.", 15),
+        ("action", "request interfaces ge-0/0/0 clear-counters", "request", "", None, 0),
+        ("action input", "request interfaces ge-0/0/0 bounce delay 5", "request", "", None, 0),
+        ("action in a state list", "request sessions session 7 kill", "request", "", None, 0),
+        ("path without action", "request interfaces ge-0/0/0", "", "", "missing argument.", 27),
+        ("node without actions", "request system", "", "", "syntax error.", 8),
+        ("reply as xml", "request current-time | display xml", "request", "xml", None, 0),
+        ("request alone", "request", "", "", "missing argument.", 7),
+    ]
+    for name, line, cmd, display, err, col in cases:
+        r = command.parse(ctx, line)
+        testing.assertEqual(r.error, err, "error {name}")
+        if err is None:
+            c = r.cmd
+            if c is not None:
+                testing.assertEqual(c.name, cmd, "command {name}")
+                testing.assertEqual(c.display, display, "display {name}")
+            else:
+                testing.error("no command for {name}")
+        else:
+            testing.assertEqual(r.column, col, "column {name}")
+
+
+def _test_complete_op():
+    ctx = fixture.context()
+    cases = [
+        ("commands", "", ["configure", "exit", "quit", "request", "show"]),
+        ("show", "show ", ["configuration", "system", "interfaces", "routing", "snmp", "state", "sessions", "conf"]),
+        ("keys quoted in the data view", "show interfaces ", ["<[Enter]>", "traceoptions", "<name>", "ge-0/0/0", "\"lo0\"", "\"trace\"", "lo0-address", "|"]),
+        ("entry with state", "show interfaces ge-0/0/0 ", ["<[Enter]>", "description", "mtu", "type", "enabled", "speed", "unit", "counters", "|"]),
+        ("state container", "show sessions ", ["<[Enter]>", "session", "event", "|"]),
+        ("state keys", "show sessions session ", ["<[Enter]>", "<id>", "|"]),
+        ("list without keys", "show sessions event ", ["<[Enter]>", "|"]),
+        ("data display", "show state | display ", ["json", "xml"]),
+        ("request", "request ", ["interfaces", "sessions", "ping", "reload", "current-time", "get-log"]),
+        ("request keys", "request interfaces ", ["<name>", "ge-0/0/0", "lo0", "trace"]),
+        ("actions", "request interfaces ge-0/0/0 ", ["clear-counters", "bounce"]),
+        ("rpc input", "request ping ", ["host", "count", "options", "record", "source"]),
+        ("after input", "request ping host h ", ["<[Enter]>", "host", "count", "options", "record", "source", "|"]),
+        ("input value", "request ping count ", ["<count>"]),
+        ("nested input", "request ping options ", ["ttl", "df", "count-limit"]),
+        ("after nested input", "request ping host h options ttl 5 ", ["<[Enter]>", "ttl", "df", "count-limit", "host", "count", "options", "record", "source", "|"]),
+        ("after a presence container", "request ping host h record ", ["<[Enter]>", "hops", "host", "count", "options", "record", "source", "|"]),
+        ("no input", "request reload ", ["<[Enter]>", "|"]),
+        ("reply display", "request current-time | display ", ["xml"]),
+    ]
+    for name, line, texts in cases:
+        r = command.complete(ctx, line)
+        testing.assertEqual(r.error, None, "no error {name}")
+        testing.assertEqual(_texts(r), texts, "completions {name}")
+
+
+def _test_subtree_filter():
+    ctx = fixture.context()
+    cases = [
+        ("container", "show state", "<state xmlns=\"urn:demo\"/>"),
+        ("leaf", "show state uptime", "<state xmlns=\"urn:demo\"><uptime/></state>"),
+        ("entry", "show interfaces ge-0/0/0", "<interfaces xmlns=\"urn:demo\"><interface><name>ge-0/0/0</name></interface></interfaces>"),
+        ("augmented state", "show interfaces ge-0/0/0 counters", "<interfaces xmlns=\"urn:demo\"><interface><name>ge-0/0/0</name><counters xmlns=\"urn:demo-ops\"/></interface></interfaces>"),
+        ("two keys", "show routing route 10.0.0.0/8 192.0.2.1 metric", "<routing xmlns=\"urn:demo\"><route><prefix>10.0.0.0/8</prefix><next-hop>192.0.2.1</next-hop><metric/></route></routing>"),
+        ("whole list", "show sessions session", "<sessions xmlns=\"urn:demo-ops\"><session/></sessions>"),
+    ]
+    for name, line, want in cases:
+        c = command.parse(ctx, line).cmd
+        if c is not None:
+            p = c.path
+            if p is not None:
+                testing.assertEqual(command.subtree_filter(p.steps).to_filter_xmlstr(), want, "filter {name}")
+                continue
+        testing.error("no path for {name}")
+
+
+SESSIONS = r"""session 7 {
+    user admin;
+}
+event {
+    text boot;
+}
+event {
+    text login;
+}"""
+
+ENTRY = r"""mtu 9000;
+counters {
+    in-octets 1000;
+    out-octets 2000;
+}"""
+
+
+def _test_show_data():
+    # As in the session: parse against the running configuration, then show
+    # the data that the device sends.
+    ctx = fixture.context()
+    st = fixture.state_context()
+    cases = [
+        ("leaf", "show state uptime", "uptime 42;"),
+        ("augmented state", "show interfaces ge-0/0/0 counters", "in-octets 1000;\nout-octets 2000;"),
+        ("entry", "show interfaces ge-0/0/0", ENTRY),
+        ("quoted key", "show interfaces \"lo0\"", "mtu 1500;"),
+        ("state lists", "show sessions", SESSIONS),
+        ("list without keys", "show sessions event", "event {{\n    text boot;\n}}\nevent {{\n    text login;\n}}"),
+        ("state entry", "show sessions session 7 user", "user admin;"),
+        ("xml", "show state | display xml", "<state xmlns=\"urn:demo\">\n  <uptime>42</uptime>\n</state>"),
+    ]
+    for name, line, want in cases:
+        c = command.parse(ctx, line).cmd
+        if c is not None:
+            testing.assertEqual(command.output(st, command.refresh(st, c)), want, "show {name}")
+        else:
+            testing.error("no command for {name}")
+
+
+ACTION = "<action xmlns=\"urn:ietf:params:xml:ns:yang:1\">"
+
+
+def _test_request_xml():
+    ctx = fixture.context()
+    cases = [
+        ("no input", "request reload", "<reload xmlns=\"urn:demo-ops\"/>"),
+        ("input", "request ping host h count 3", "<ping xmlns=\"urn:demo-ops\"><host>h</host><count>3</count></ping>"),
+        ("nested input", "request ping host h options ttl 5 options df", "<ping xmlns=\"urn:demo-ops\"><host>h</host><options><ttl>5</ttl><df/></options></ping>"),
+        ("schema order", "request ping options ttl 5 df host h count 3", "<ping xmlns=\"urn:demo-ops\"><host>h</host><count>3</count><options><ttl>5</ttl><df/></options></ping>"),
+        ("exact name at an outer level", "request ping host h options ttl 5 count 3", "<ping xmlns=\"urn:demo-ops\"><host>h</host><count>3</count><options><ttl>5</ttl></options></ping>"),
+        ("prefix at the inner level", "request ping host h options ttl 5 count-l 3", "<ping xmlns=\"urn:demo-ops\"><host>h</host><options><ttl>5</ttl><count-limit>3</count-limit></options></ping>"),
+        ("presence container", "request ping host h record count 3", "<ping xmlns=\"urn:demo-ops\"><host>h</host><count>3</count><record/></ping>"),
+        ("into a presence container", "request ping record hops 2 host h", "<ping xmlns=\"urn:demo-ops\"><host>h</host><record><hops>2</hops></record></ping>"),
+        ("action", "request interfaces ge-0/0/0 clear-counters", ACTION + "<interfaces xmlns=\"urn:demo\"><interface><name>ge-0/0/0</name><clear-counters xmlns=\"urn:demo-ops\"/></interface></interfaces></action>"),
+        ("action input", "request interfaces ge-0/0/0 bounce delay 5", ACTION + "<interfaces xmlns=\"urn:demo\"><interface><name>ge-0/0/0</name><bounce xmlns=\"urn:demo-ops\"><delay>5</delay></bounce></interface></interfaces></action>"),
+        ("action in a state list", "request sessions session 7 kill", ACTION + "<sessions xmlns=\"urn:demo-ops\"><session><id>7</id><kill/></session></sessions></action>"),
+    ]
+    for name, line, want in cases:
+        c = command.parse(ctx, line).cmd
+        if c is not None:
+            testing.assertEqual(xml.encode(command.request_xml(ctx.root, c)), want, "request {name}")
+        else:
+            testing.error("no command for {name}")
+
+
+NC = "urn:ietf:params:xml:ns:netconf:base:1.0"
+
+PING = r"""sent 3;
+received 2;
+probe 1 {
+    time 1.5;
+}"""
+
+
+def _test_reply_text():
+    ctx = fixture.context()
+    cases = [
+        ("output", "request ping host h", "<rpc-reply xmlns=\"{NC}\"><sent xmlns=\"urn:demo-ops\">3</sent><received xmlns=\"urn:demo-ops\">2</received><probe xmlns=\"urn:demo-ops\"><seq>1</seq><time>1.5</time></probe></rpc-reply>", PING),
+        ("ok", "request reload", "<rpc-reply xmlns=\"{NC}\"><ok/></rpc-reply>", ""),
+        ("action output", "request interfaces ge-0/0/0 bounce", "<rpc-reply xmlns=\"{NC}\"><result xmlns=\"urn:demo-ops\">done</result></rpc-reply>", "result done;"),
+        ("xml", "request current-time | display xml", "<rpc-reply xmlns=\"{NC}\"><time xmlns=\"urn:demo-ops\">12:00</time></rpc-reply>", "<time xmlns=\"urn:demo-ops\">12:00</time>"),
+        ("anyxml output", "request get-log", "<rpc-reply xmlns=\"{NC}\"><log xmlns=\"urn:demo-ops\"><line>up</line></log></rpc-reply>", "<log xmlns=\"urn:demo-ops\">\n  <line>up</line>\n</log>"),
+        ("output without an output schema", "request reload", "<rpc-reply xmlns=\"{NC}\"><when xmlns=\"urn:demo-ops\">now</when></rpc-reply>", "<when xmlns=\"urn:demo-ops\">now</when>"),
+    ]
+    for name, line, reply, want in cases:
+        c = command.parse(ctx, line).cmd
+        if c is not None:
+            testing.assertEqual(command.reply_text(ctx.root, c, xml.decode(reply)), want, "reply {name}")
+        else:
+            testing.error("no command for {name}")
+    c = command.parse(ctx, "request ping host h").cmd
+    if c is not None:
+        raised = False
+        try:
+            command.reply_text(ctx.root, c, xml.decode("<rpc-reply xmlns=\"{NC}\"><sent xmlns=\"urn:demo-ops\">x</sent></rpc-reply>"))
+        except Exception:
+            raised = True
+        testing.assertTrue(raised, "an output that does not fit the schema raises")
+
+
+def _test_config_mode_sees_configuration():
+    op = fixture.context()
+    ctx = command.Context(op.root, op.data, "config")
+    # (name, line, error, column)
+    cases = [
+        ("state", "set interfaces ge-0/0/0 counters in-octets 5", "syntax error.", 24),
+        ("action", "set interfaces ge-0/0/0 bounce", "syntax error.", 24),
+        ("state container", "set state uptime 1", "syntax error.", 4),
+        ("run show data", "run show state", None, 0),
+        ("run request", "run request reload", None, 0),
+    ]
+    for name, line, err, col in cases:
+        r = command.parse(ctx, line)
+        testing.assertEqual(r.error, err, "error {name}")
+        if err is not None:
+            testing.assertEqual(r.column, col, "column {name}")
+    r = command.complete(ctx, "set interfaces ge-0/0/0 ")
+    testing.assertEqual(_texts(r), ["<[Enter]>", "description", "mtu", "type", "enabled", "speed", "unit"], "configuration completion has no state or actions")

@@ -286,11 +286,13 @@
   `cli-drop-node-name` and `cli-no-keyword` statements in it.
   `show configuration` prints the running configuration in curly braces, or
   in other formats with `| display set`, `| display xml` and
-  `| display json`. `configure` starts configuration mode on a candidate
-  kept in the CLI, with `set`, `delete`, `edit`, `up`, `top`, `rollback`,
-  `run`, `show` and `show | compare`. With a command as arguments, it runs
-  that command and exits. Without a terminal, it reads commands line by line
-  from stdin.
+  `| display json`. `show <path>` reads configuration and state data from
+  the device, and `request` makes the device run an RPC, or the action at a
+  path, with its input, as in `request interfaces ge-0/0/0 clear-counters`.
+  `configure` starts configuration mode on a candidate kept in the CLI, with
+  `set`, `delete`, `edit`, `up`, `top`, `rollback`, `run`, `show` and
+  `show | compare`. With a command as arguments, it runs that command and
+  exits. Without a terminal, it reads commands line by line from stdin.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with

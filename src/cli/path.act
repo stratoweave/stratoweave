@@ -7,6 +7,10 @@ first key value and a leaf is its value alone.
 
 At each node an exact keyword wins, then a unique keyword prefix, then a value
 for a nokeyword list or leaf. A quoted token is always a value.
+
+A view says which schema children a path walks: "config" walks the
+configuration, "data" also the state, and "request" the RPCs and the actions
+with the containers and lists above them.
 """
 
 import yang.schema as yschema
@@ -247,10 +251,12 @@ class Position(object):
     """Where a path walk stopped.
 
     kind is "inner" (at a container, list entry or the start node), "keys" (at
-    a list, waiting for key values), "value" (at a leaf, waiting for its value)
-    or "end" (after a leaf). data is the data node at the position: a
-    container or list entry, the list at a keys position, or the leaf. parent
-    is the inner node above a list or leaf position.
+    a list, waiting for key values), "value" (at a leaf, waiting for its
+    value), "end" (after a leaf) or "call" (at an RPC or action). A list
+    without keys stays at "keys", since its entries have no path. data is the
+    data node at the position: a container or list entry, the list at a keys
+    position, or the leaf, and None at a call. parent is the inner node above
+    a list, leaf, RPC or action.
     """
     kind: str
     node: yschema.DNode
@@ -289,21 +295,51 @@ class PathResult(object):
         self.matches = matches
 
 
-def candidates(node: yschema.DNode) -> list[yschema.DNode]:
-    """Return the schema children a path can continue with, keys excluded."""
+def has_action(node: yschema.DNode) -> bool:
+    """Return True when a container or list has an action below it."""
+    if isinstance(node, yschema.DNodeInner):
+        for c in node.children:
+            if isinstance(c, yschema.DAction):
+                return True
+            if (isinstance(c, yschema.DContainer) or isinstance(c, yschema.DList)) and has_action(c):
+                return True
+    return False
+
+
+def candidates(node: yschema.DNode, view: str="config") -> list[yschema.DNode]:
+    """Return the schema children a path can continue with in a view, keys excluded."""
     res = []
-    for c in hints.config_children(node):
-        if isinstance(c, yschema.DLeaf) and c.is_key:
-            continue
-        res.append(c)
+    if isinstance(node, yschema.DNodeInner):
+        for c in node.children:
+            if isinstance(c, yschema.DLeaf) and c.is_key:
+                continue
+            if view == "request":
+                if isinstance(c, yschema.DRpc) or isinstance(c, yschema.DAction):
+                    res.append(c)
+                elif (isinstance(c, yschema.DContainer) or isinstance(c, yschema.DList)) and has_action(c):
+                    res.append(c)
+            elif isinstance(c, yschema.DContainer) or isinstance(c, yschema.DList) or isinstance(c, yschema.DLeaf) or isinstance(c, yschema.DLeafList):
+                if c.config or view == "data":
+                    res.append(c)
     return res
 
 
-def clashes(node: yschema.DNode) -> set[str]:
-    """Return the names that two or more keyword children of a node share."""
+def call_part(node: yschema.DNode, part: str) -> ?yschema.DNode:
+    """Return the "input" or "output" node of an RPC or action, or None when it has no parameters."""
+    if isinstance(node, yschema.DNodeInner):
+        for c in node.children:
+            if part == "input" and isinstance(c, yschema.DInput):
+                return c
+            if part == "output" and isinstance(c, yschema.DOutput):
+                return c
+    return None
+
+
+def clashes(node: yschema.DNode, view: str="config") -> set[str]:
+    """Return the names that two or more keyword children of a node share in a view."""
     seen = set()
     res = set()
-    for c in candidates(node):
+    for c in candidates(node, view):
         if hints.has_keyword(c):
             if c.name in seen:
                 res.add(c.name)
@@ -318,9 +354,9 @@ def keyword(c: yschema.DNode, clash: set[str]) -> str:
     return c.name
 
 
-def _reads_as_keyword(parent: yschema.DNode, text: str) -> bool:
+def _reads_as_keyword(parent: yschema.DNode, text: str, view: str) -> bool:
     prefixed = 0
-    for c in candidates(parent):
+    for c in candidates(parent, view):
         if hints.has_keyword(c):
             if c.name == text or "{c.prefix}:{c.name}" == text or "{c.module}:{c.name}" == text:
                 return True
@@ -329,10 +365,10 @@ def _reads_as_keyword(parent: yschema.DNode, text: str) -> bool:
     return prefixed == 1
 
 
-def value_text_at(parent: ?yschema.DNode, v: value) -> str:
-    """Return a value that stands without a keyword, quoted when it would read as a keyword."""
+def value_text_at(parent: ?yschema.DNode, v: value, view: str="config") -> str:
+    """Return a value that stands without a keyword, quoted when it would read as a keyword in a view."""
     s = ygdata.yang_str(v)
-    if parent is not None and _reads_as_keyword(parent, s):
+    if parent is not None and _reads_as_keyword(parent, s, view):
         return hints.quote(s, True)
     return hints.quote(s)
 
@@ -352,20 +388,39 @@ class _Match(object):
         self.error = error
 
 
-def _match_child(root: yschema.DRoot, node: yschema.DNode, t: Token, values: bool) -> _Match:
-    cands = candidates(node)
+def _split_name(text: str) -> (name: str, qual: ?str):
+    """Split `prefix:name` or `module:name` into the name and the qualifier."""
+    parts = text.split(":")
+    if len(parts) == 2:
+        return (name=parts[1], qual=parts[0])
+    return (name=text, qual=None)
+
+
+def _exact(cands: list[yschema.DNode], t: Token) -> list[yschema.DNode]:
+    """Return the keyword nodes that a token names exactly, as name, prefix:name or module:name."""
+    res = []
+    if not t.quoted:
+        sn = _split_name(t.text)
+        qual = sn.qual
+        for c in cands:
+            if hints.has_keyword(c) and c.name == sn.name and (qual is None or qual == c.prefix or qual == c.module):
+                res.append(c)
+    return res
+
+
+def is_keyword(node: yschema.DNode, t: Token, view: str="config") -> bool:
+    """Return True when a token names a keyword child of a node exactly, in a view."""
+    return len(_exact(candidates(node, view), t)) > 0
+
+
+def _match_child(root: yschema.DRoot, node: yschema.DNode, t: Token, values: bool, view: str) -> _Match:
+    cands = candidates(node, view)
     prefixed = []
     if not t.quoted:
-        name = t.text
-        qual: ?str = None
-        parts = t.text.split(":")
-        if len(parts) == 2:
-            qual = parts[0]
-            name = parts[1]
-        exact = []
-        for c in cands:
-            if hints.has_keyword(c) and c.name == name and (qual is None or qual == c.prefix or qual == c.module):
-                exact.append(c)
+        sn = _split_name(t.text)
+        name = sn.name
+        qual = sn.qual
+        exact = _exact(cands, t)
         if len(exact) == 1:
             return _Match("keyword", exact[0])
         if len(exact) > 1:
@@ -392,7 +447,7 @@ def _match_child(root: yschema.DRoot, node: yschema.DNode, t: Token, values: boo
             except ValueError as e:
                 value_error = e.error_message
     if len(prefixed) > 1:
-        clash = clashes(node)
+        clash = clashes(node, view)
         return _Match("ambiguous", matches=sorted([keyword(c, clash) for c in prefixed]))
     return _Match("none", error=value_error)
 
@@ -410,15 +465,19 @@ def _missing(pos: Position, values: bool, optional: bool) -> bool:
     return False
 
 
-def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, tokens: list[Token], values: bool=False, optional: bool=False) -> PathResult:
-    """Walk the schema from a start node along CLI tokens.
+def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, tokens: list[Token], values: bool=False, optional: bool=False, view: str="config", stop: bool=False) -> PathResult:
+    """Walk the schema from a start node along CLI tokens in a view.
 
     The walk stops at the first `|` token. With values=True a leaf takes a value
     and a leaf-list takes a value or `[ a b ]`; otherwise a leaf ends the path.
     With optional=True as well, as for delete, the path can end at any node
     but between the keys of a list, a leaf takes no value and a leaf-list
-    value is optional. The data node
-    follows the walk when given, so completion can offer the keys that exist.
+    value is optional. An RPC or action ends the path. With stop=True the walk
+    stops after a leaf or at an RPC or action, and used tells where, so the
+    caller can walk the next path from there. With values=True as well, it
+    also stops at a list entry or presence container when the next word is
+    not a child. The data node follows the walk when given, so completion can
+    offer the keys that exist.
     """
     steps = []
     pos = Position("inner", start, data)
@@ -427,8 +486,10 @@ def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, token
         t = tokens[i]
         if t.is_pipe():
             break
+        if stop and (pos.kind == "end" or pos.kind == "call"):
+            break
         if pos.kind == "inner":
-            m = _match_child(root, pos.node, t, values)
+            m = _match_child(root, pos.node, t, values, view)
             c = m.node
             if m.kind == "ambiguous":
                 return PathResult(steps, pos, i, "'{t.text}' is ambiguous.", i, m.matches)
@@ -440,8 +501,14 @@ def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, token
                     steps.append(Step(c))
                     pos = Position("inner", c, cd, parent=p)
                 elif m.kind == "keyword" and isinstance(c, yschema.DList):
+                    if values and len(c.key) == 0:
+                        # An entry of a list without keys has no path to set.
+                        return PathResult(steps, pos, i, "syntax error.", i)
                     steps.append(Step(c))
                     pos = Position("keys", c, cd, parent=p)
+                elif m.kind == "keyword" and (isinstance(c, yschema.DRpc) or isinstance(c, yschema.DAction)):
+                    steps.append(Step(c))
+                    pos = Position("call", c, None, parent=p)
                 elif m.kind == "key":
                     steps.append(Step(c))
                     pos = Position("keys", c, cd, [v] if v is not None else [], parent=p)
@@ -459,6 +526,10 @@ def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, token
                     steps.append(Step(c))
                     pos = Position("value" if values else "end", c, cd, parent=p)
             else:
+                if stop and values and i > 0 and not _missing(pos, values, optional):
+                    # The path can end here, and the caller walks the word
+                    # from here or from a level above.
+                    break
                 err = m.error
                 return PathResult(steps, pos, i, err if err is not None else "syntax error.", i)
             i += 1
@@ -466,6 +537,8 @@ def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, token
             n = pos.node
             if isinstance(n, yschema.DList):
                 kl = hints.key_leaves(n)
+                if len(kl) == 0:
+                    return PathResult(steps, pos, i, "syntax error.", i)
                 try:
                     v = parse_value(root, kl[len(pos.keys)], t.text)
                 except ValueError as e:
@@ -504,7 +577,7 @@ def resolve(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, token
 
         # A list position with all keys moves into the entry.
         n = pos.node
-        if pos.kind == "keys" and isinstance(n, yschema.DList) and len(pos.keys) == len(n.key):
+        if pos.kind == "keys" and isinstance(n, yschema.DList) and len(n.key) > 0 and len(pos.keys) == len(n.key):
             steps[-1].keys = pos.keys
             pos = Position("inner", n, list_entry(pos.data, pos.keys), parent=pos.parent)
 
@@ -525,10 +598,10 @@ def descend(node: yschema.DNode, data: ?ygdata.Node, steps: list[Step]) -> (node
     return (node=n, data=d)
 
 
-def path_tokens(start: yschema.DNode, steps: list[Step]) -> list[str]:
+def path_tokens(start: yschema.DNode, steps: list[Step], view: str="config") -> list[str]:
     """Return the canonical CLI tokens for a path from a start node, values included.
 
-    The tokens resolve back to the same path.
+    The tokens resolve back to the same path in the same view.
     """
     res = []
     parent = start
@@ -536,9 +609,9 @@ def path_tokens(start: yschema.DNode, steps: list[Step]) -> list[str]:
         n = s.node
         kw = hints.has_keyword(n)
         if kw:
-            res.append(keyword(n, clashes(parent)))
+            res.append(keyword(n, clashes(parent, view)))
         for j in range(len(s.keys)):
-            res.append(value_text(s.keys[j]) if kw or j > 0 else value_text_at(parent, s.keys[j]))
+            res.append(value_text(s.keys[j]) if kw or j > 0 else value_text_at(parent, s.keys[j], view))
         if not (isinstance(n, yschema.DLeaf) and isinstance(n.type, yschema.DTypeEmpty)):
             if len(s.values) > 1:
                 res.append("[")
@@ -546,7 +619,7 @@ def path_tokens(start: yschema.DNode, steps: list[Step]) -> list[str]:
                     res.append(value_text(v))
                 res.append("]")
             elif len(s.values) == 1:
-                res.append(value_text(s.values[0]) if kw else value_text_at(parent, s.values[0]))
+                res.append(value_text(s.values[0]) if kw else value_text_at(parent, s.values[0], view))
         parent = n
     return res
 
@@ -647,7 +720,7 @@ def _has_fixed_values(leaf: yschema.DNodeLeaf) -> bool:
     return isinstance(t, yschema.DTypeEnum) or isinstance(t, yschema.DTypeBoolean) or isinstance(t, yschema.DTypeIdentityref)
 
 
-def _value_items(root: yschema.DRoot, leaf: yschema.DNodeLeaf, existing: list[value], parent: ?yschema.DNode) -> list[Completion]:
+def _value_items(root: yschema.DRoot, leaf: yschema.DNodeLeaf, existing: list[value], parent: ?yschema.DNode, view: str) -> list[Completion]:
     """Return the placeholder, the type's own values and the existing values for a leaf.
 
     parent is the node where the value stands without a keyword, or None.
@@ -660,12 +733,12 @@ def _value_items(root: yschema.DRoot, leaf: yschema.DNodeLeaf, existing: list[va
     for v in _type_values(root, leaf.type):
         if v not in seen:
             seen.add(v)
-            res.append(Completion(value_text_at(parent, v), value=v))
+            res.append(Completion(value_text_at(parent, v, view), value=v))
     for v in existing:
         raw = ygdata.yang_str(v)
         if raw not in seen:
             seen.add(raw)
-            res.append(Completion(value_text_at(parent, v), value=raw))
+            res.append(Completion(value_text_at(parent, v, view), value=raw))
     return res
 
 
@@ -685,12 +758,12 @@ class CompletionResult(object):
         self.path = path
 
 
-def complete(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, tokens: list[Token], values: bool=False, optional: bool=False) -> CompletionResult:
-    """Return what can follow a list of complete tokens.
+def complete(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, tokens: list[Token], values: bool=False, optional: bool=False, view: str="config", stop: bool=False) -> CompletionResult:
+    """Return what can follow a list of complete tokens in a view.
 
     The caller filters the items by the word under the cursor.
     """
-    res = resolve(root, start, data, tokens, values, optional)
+    res = resolve(root, start, data, tokens, values, optional, view, stop)
     items = []
     pos = res.pos
     if res.error is not None and res.error != "missing argument.":
@@ -699,8 +772,10 @@ def complete(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, toke
         return CompletionResult([], False, res)
     n = pos.node
     if pos.kind == "inner":
-        clash = clashes(n)
-        for c in candidates(n):
+        clash = clashes(n, view)
+        for c in candidates(n, view):
+            if values and isinstance(c, yschema.DList) and len(c.key) == 0:
+                continue
             if hints.has_keyword(c):
                 items.append(Completion(keyword(c, clash), _marker(c), hints.summary(c.description), keyword=True))
             elif isinstance(c, yschema.DList):
@@ -712,7 +787,7 @@ def complete(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, toke
                         for v in _type_values(root, kl[0].type):
                             if v not in seen:
                                 seen.add(v)
-                                items.append(Completion(value_text_at(n, v), ">", help, value=v))
+                                items.append(Completion(value_text_at(n, v, view), ">", help, value=v))
                     else:
                         items.append(Completion("<{kl[0].name}>", ">", help if help != "" else _type_help(kl[0]), insert=False))
                     for e in list_entries(child_data(pos.data, c)):
@@ -721,10 +796,10 @@ def complete(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, toke
                             raw = ygdata.yang_str(ev[0])
                             if raw not in seen:
                                 seen.add(raw)
-                                items.append(Completion(value_text_at(n, ev[0]), ">", help, value=raw))
+                                items.append(Completion(value_text_at(n, ev[0], view), ">", help, value=raw))
             elif isinstance(c, yschema.DLeaf) and values:
-                items.extend(_value_items(root, c, [], n))
-    elif pos.kind == "keys" and isinstance(n, yschema.DList):
+                items.extend(_value_items(root, c, [], n, view))
+    elif pos.kind == "keys" and isinstance(n, yschema.DList) and len(n.key) > 0:
         kl = hints.key_leaves(n)
         k = len(pos.keys)
         given = key_str(pos.keys)
@@ -733,12 +808,12 @@ def complete(root: yschema.DRoot, start: yschema.DNode, data: ?ygdata.Node, toke
             ev = entry_keys(e, kl)
             if len(ev) == len(kl) and key_str(ev[:k]) == given:
                 existing.append(ev[k])
-        items.extend(_value_items(root, kl[k], existing, None))
+        items.extend(_value_items(root, kl[k], existing, None, view))
     elif pos.kind == "value" and isinstance(n, yschema.DNodeLeaf):
         existing = []
         d = pos.data
         if optional and isinstance(d, ygdata.LeafList):
             existing = [e.val for e in d.entries]
-        items.extend(_value_items(root, n, existing, None))
+        items.extend(_value_items(root, n, existing, None, view))
     can_end = res.error is None
     return CompletionResult(items, can_end, res)

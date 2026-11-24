@@ -4,6 +4,9 @@ The session owns the line editor and a DeviceMgr for the device. Key presses
 and device replies arrive as messages, and every device request has a timeout,
 so a slow device never stops the editor.
 
+`show <path>` reads configuration and state with a NETCONF get, and `request`
+sends an RPC, or an action inside an action element.
+
 `configure` starts a candidate configuration from the running configuration,
 if there is none with changes yet. The candidate lives in the session: it
 stays when the user leaves configuration mode, and goes when the CLI exits.
@@ -15,6 +18,7 @@ command given as arguments runs alone, and the CLI exits after it.
 """
 
 import std.argparse
+import std.xml as xml
 import file
 import logging
 
@@ -23,6 +27,7 @@ import yang.gdata as ygdata
 
 import adapters.netconf as swna
 import device as swdev
+import netconf
 import yang_dir as local_yang
 from device_meta_config import \
     stratoweave_rfs__device_entry as DeviceMetaConfig, \
@@ -104,7 +109,7 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
     var lines: list[str] = []
     var partial_line = b""
     var esc_gen = 0
-    var request = 0
+    var req_id = 0
     var pending: ?command.Command = None
 
     def out(text: str):
@@ -233,6 +238,12 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
             pending = cmd
             fetch()
             return
+        if n == "show data":
+            get(cmd)
+            return
+        if n == "request":
+            call(cmd)
+            return
         if n == "configure":
             enter_config()
         elif n == "exit" and c.mode == "op":
@@ -260,15 +271,15 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
         d = dev
         if d is not None:
             busy = True
-            request += 1
-            n = request
+            req_id += 1
+            n = req_id
             d.fetch_config(lambda data, e: self.on_fetch(n, data, e))
             after timeout: fetch_timeout(n)
 
     def fetch_timeout(n: int):
-        if busy and n == request:
+        if busy and n == req_id:
             busy = False
-            request += 1
+            req_id += 1
             if not ready:
                 fail("no configuration from {host}:{port} within {int(timeout)} seconds")
                 finish(1)
@@ -277,7 +288,7 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
             prompt()
 
     def on_fetch(n: int, data: ?ygdata.Node, e: ?Exception):
-        if not busy or n != request:
+        if not busy or n != req_id:
             return
         busy = False
         s = schema
@@ -299,14 +310,84 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
             ready = True
         prompt()
 
-    def show_running(c: command.Context, cmd: command.Command):
-        """Print a show configuration command against freshly read running configuration."""
-        text = command.output(c, command.refresh(c, cmd))
+    def show_text(text: str):
+        """Print the output of a command."""
         if text != "":
             if interactive:
                 out(text + "\n")
             else:
                 print(text)
+
+    def show_running(c: command.Context, cmd: command.Command):
+        """Print a show configuration command against freshly read running configuration."""
+        show_text(command.output(c, command.refresh(c, cmd)))
+
+    def get(cmd: command.Command):
+        """Read the data at the command's path from the device; on_get gets the reply."""
+        d = dev
+        res = cmd.path
+        if d is not None and res is not None:
+            busy = True
+            req_id += 1
+            n = req_id
+            d.get(lambda data, e: self.on_get(n, cmd, data, e), command.subtree_filter(res.steps))
+            after timeout: fetch_timeout(n)
+
+    def on_get(n: int, cmd: command.Command, data: ?ygdata.Node, e: ?Exception):
+        if not busy or n != req_id:
+            return
+        busy = False
+        s = schema
+        if e is not None:
+            fail("cannot read the data: {device_error(e)}")
+        elif s is not None:
+            c = command.Context(s, data)
+            show_text(command.output(c, command.refresh(c, cmd)))
+        prompt()
+
+    def call(cmd: command.Command):
+        """Send the RPC or action of a request command; on_call gets the reply."""
+        d = dev
+        s = schema
+        if d is not None and s is not None:
+            try:
+                x = command.request_xml(s, cmd)
+                busy = True
+                req_id += 1
+                n = req_id
+                d.rpc_xml(lambda r, e: self.on_call(n, cmd, r, e), x)
+                after timeout: fetch_timeout(n)
+                return
+            except Exception as e:
+                fail("cannot build the request: {e}")
+        prompt()
+
+    def on_call(n: int, cmd: command.Command, r: ?xml.Node, e: ?Exception):
+        if not busy or n != req_id:
+            return
+        busy = False
+        s = schema
+        if e is not None:
+            fail(device_error(e))
+        elif r is not None and s is not None:
+            try:
+                show_text(command.reply_text(s, cmd, r))
+            except Exception as x:
+                fail("cannot decode the reply: {x}")
+                show_text(xml.encode_nodes(r.children, True))
+        prompt()
+
+    def device_error(e: Exception) -> str:
+        """Return the messages of the errors in a device reply, or the exception text."""
+        if isinstance(e, netconf.NetconfError):
+            errs = e.rpc_error
+            if errs is not None and len(errs) > 0:
+                msgs = []
+                for x in errs:
+                    m = x.error_message
+                    msgs.append(m.strip() if m is not None else x.error_tag)
+                return "; ".join(msgs)
+        return str(e)
 
     def on_reconf(name: str):
         if schema is not None or done:
@@ -465,7 +546,7 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
             finish(1)
             return
         busy = False
-        request += 1
+        req_id += 1
         pending = None
         pending_keys = []
         prompt()
