@@ -68,8 +68,16 @@ check ──> already on target ──> up-to-date
 
 Rules:
 
-- An error in prepare or install ends with `failed`. A failed install does
-  not roll back.
+- An error in install ends with `failed`, and so does an error in prepare
+  that is not a `TransientError`. A failed install does not roll back.
+- A prepare that fails with a `TransientError`, such as on a device that is
+  not connected or a connection that drops, does not end the run. The run
+  waits, `in-progress` at the stage `prepare`, with its prepare `retrying`.
+  The manager tries the prepare again on the schedule of a prepare under a
+  veto that is `retrying`. It tries at once when the device connects or the
+  config changes, also when that happens while the try that fails runs. A
+  veto, a changed campaign, or a changed or removed target stops the
+  waiting run with `upgrade-needed`, as after the pre-checks.
 - A failed commit starts a rollback. A failed rollback ends with `failed`.
   It can leave the device on the release that the run installed,
   uncommitted, and a read would take that for the target. So the attempt

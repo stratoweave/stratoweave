@@ -815,30 +815,57 @@ actor _test_a_new_target_starts_the_attempts_over(t: testing.EnvT):
 
 
 
-actor _test_failed_install_is_reported(t: testing.EnvT):
-    """A device that refuses the install leaves the manager in failed."""
+proc def _test_failed_install_is_reported(t: testing.EnvT):
+    """A device that refuses the install leaves the manager in failed at
+    the stage install, with the install job failed and the adapter's error
+    as the reason. So does a transient error: only the prepare of a run
+    waits to try again."""
+    # (case, whether the error is transient)
+    cases: list[(str, bool)] = [("needs a person", False), ("transient", True)]
+    _FailedInstallActor(t=t, cases=cases)
+
+
+actor _FailedInstallActor(t: testing.EnvT, cases: list[(str, bool)]):
+    var left = len(cases)
+    var ended: list[bool] = [False for _c in cases]
 
     def noop_on_reconf(name: str) -> None:
         pass
 
-    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "install")
-    dev = swdev.DeviceMgr({}, t.env, "test-device", t.log_handler, noop_on_reconf, swdev.SchemaRegistry())
-
-    def on_state(oper: ?ygdata.Node) -> None:
-        status = _pub_status(oper)
-        if status == "failed":
-            testing.assertEqual("install", _pub_stage(oper), "the stage should be the failed step")
-            testing.assertEqual("mock: install failed", _pub_reason(oper),
-                                "the adapter's error should be the reason")
-            t.success()
-        elif status == "succeeded":
-            t.failure(ValueError("install failed but the manager reported success"))
-
-    proc def __startup__():
-        dev.set_update_oper(on_state)
+    def run(k: int, case: (str, bool)) -> None:
+        adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "install", transient=case.1)
+        dev = swdev.DeviceMgr({}, t.env, "test-device", t.log_handler, noop_on_reconf,
+                              swdev.SchemaRegistry())
         mgr = dev.get_swmgr()
+
+        def on_state(oper: ?ygdata.Node) -> None:
+            if ended[k]:
+                return
+            status = _pub_status(oper)
+            job = _pub_job(oper, "install")
+            last = False
+            if status == "failed" or status == "succeeded":
+                last = True
+            elif job is not None and job.startswith("retrying"):
+                last = True
+            if not last:
+                return
+            ended[k] = True
+            testing.assertEqual((_pub_status(oper), _pub_stage(oper), _pub_reason(oper)),
+                                ("failed", "install", "mock: install failed"), case.0)
+            testing.assertEqual(job, "failed / mock: install failed / None", case.0)
+            testing.assertEqual(adapter.calls(), ["check", "prepare", "install"], case.0)
+            left -= 1
+            if left == 0:
+                t.success()
+
+        dev.set_update_oper(on_state)
         mgr.set_adapter(adapter)
         mgr.set_config("camp-1", NEW, False, {})
+
+    proc def __startup__():
+        for k in range(len(cases)):
+            run(k, cases[k])
 
 
 
@@ -1466,34 +1493,42 @@ actor _PreparesAgainActor(t: testing.EnvT, veto: dict[str, str]):
         mgr.set_config("camp-1", NEW, True, veto)
 
 
-proc def _test_a_run_fails_when_its_prepare_fails(t: testing.EnvT):
-    """Without a veto, a run whose prepare fails ends failed at the stage
-    prepare, also when the failure is transient: only a prepare ahead is
-    tried again."""
-    # (case, whether the failure is transient)
-    cases: list[(str, bool)] = [("transient", True), ("needs a person", False)]
+proc def _test_a_run_whose_prepare_fails_waits_or_fails(t: testing.EnvT):
+    """Without a veto, a run whose prepare fails for a reason that needs a
+    person ends failed at the stage prepare. A run whose prepare fails for
+    a transient reason waits, in-progress at the stage prepare, with its
+    prepare retrying and no reason."""
+    # (case, whether the failure is transient, the status, the state of the
+    # prepare job)
+    cases: list[(str, bool, str, str)] = [
+        ("transient", True, "in-progress", "retrying"),
+        ("needs a person", False, "failed", "failed"),
+    ]
     _RunPrepareFailsActor(t=t, cases=cases)
 
 
-actor _RunPrepareFailsActor(t: testing.EnvT, cases: list[(str, bool)]):
+actor _RunPrepareFailsActor(t: testing.EnvT, cases: list[(str, bool, str, str)]):
     var left = len(cases)
     var ended: list[bool] = [False for _c in cases]
 
     def noop_on_reconf(name: str) -> None:
         pass
 
-    def run(k: int, case: (str, bool)) -> None:
+    def run(k: int, case: (str, bool, str, str)) -> None:
         adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "prepare", transient=case.1)
         dev = swdev.DeviceMgr({}, t.env, "test-device", t.log_handler, noop_on_reconf,
                               swdev.SchemaRegistry())
         mgr = dev.get_swmgr()
 
         def on_state(oper: ?ygdata.Node) -> None:
-            if _pub_status(oper) == "failed" and not ended[k]:
+            if _pub_prepare(oper).0 == case.3 and _pub_status(oper) == case.2 \
+               and not ended[k]:
                 ended[k] = True
                 testing.assertEqual(_pub_stage(oper), "prepare", case.0)
-                testing.assertEqual(_pub_prepare(oper), ("failed", NEW, "mock: prepare failed"),
+                testing.assertEqual(_pub_prepare(oper), (case.3, NEW, "mock: prepare failed"),
                                     case.0)
+                testing.assertEqual(_pub_reason(oper),
+                                    None if case.1 else "mock: prepare failed", case.0)
                 testing.assertEqual(adapter.calls(), ["check", "prepare"], case.0)
                 left -= 1
                 if left == 0:
@@ -1507,6 +1542,365 @@ actor _RunPrepareFailsActor(t: testing.EnvT, cases: list[(str, bool)]):
     proc def __startup__():
         for k in range(len(cases)):
             run(k, cases[k])
+
+
+proc def _test_a_run_waits_for_a_transient_prepare(t: testing.EnvT):
+    """A run without a veto whose prepare fails for a transient reason
+    waits, in-progress at the stage prepare with its prepare retrying, and
+    tries the prepare again: after the wait, when the device connects, and
+    for a new prepare attempt. The second try is done, and the run
+    installs and succeeds."""
+    # (what makes the manager try again, the first wait before a retry)
+    cases: list[(str, float)] = [
+        ("the wait", 0.05),
+        ("a connect", 3600.0),
+        ("a new prepare attempt", 3600.0),
+    ]
+    _RunWaitsActor(t=t, cases=cases)
+
+
+actor _RunWaitsActor(t: testing.EnvT, cases: list[(str, float)]):
+    var left = len(cases)
+    var waited: list[bool] = [False for _c in cases]
+    var ended: list[bool] = [False for _c in cases]
+
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    def run(k: int, case: (str, float)) -> None:
+        adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "prepare", fail_times=1,
+                                             transient=True)
+        dev = swdev.DeviceMgr({}, t.env, "test-device", t.log_handler, noop_on_reconf,
+                              swdev.SchemaRegistry())
+        mgr = dev.get_swmgr()
+
+        def on_state(oper: ?ygdata.Node) -> None:
+            if _pub_prepare(oper).0 == "retrying" and not waited[k]:
+                waited[k] = True
+                testing.assertEqual((_pub_status(oper), _pub_stage(oper), _pub_reason(oper)),
+                                    ("in-progress", "prepare", None), case.0)
+                if case.0 == "a connect":
+                    mgr.on_connect()
+                elif case.0 == "a new prepare attempt":
+                    mgr.set_config("camp-1", NEW, False, {}, 0, 1)
+            elif _pub_status(oper) == "succeeded" and not ended[k]:
+                ended[k] = True
+                testing.assertTrue(waited[k], "{case.0}: waited first")
+                testing.assertEqual(adapter.calls(),
+                                    ["check", "prepare", "prepare", "install", "commit", "check",
+                                     "cleanup"], case.0)
+                left -= 1
+                if left == 0:
+                    t.success()
+
+        dev.set_update_oper(on_state)
+        mgr.set_prepare_retry(case.1, case.1)
+        mgr.set_adapter(adapter)
+        mgr.set_config("camp-1", NEW, False, {})
+
+    proc def __startup__():
+        for k in range(len(cases)):
+            run(k, cases[k])
+
+
+proc def _test_a_run_tries_again_at_once_after_a_change_during_its_try(t: testing.EnvT):
+    """While the prepare of a run runs, the device connects or the prepare
+    attempt changes, and then the prepare fails for a transient reason.
+    The run does not wait: it tries the prepare again at once, and that
+    try is done, so the run installs and succeeds. When that try fails too,
+    the run waits. A connect during the read before the run does not make
+    a failure of the run's prepare try again at once: the run waits."""
+    # (case, how often the prepare fails, whether the run succeeds or
+    # waits after the last failure, the calls to the adapter then)
+    cases: list[(str, int, bool, list[str])] = [
+        ("a connect", 1, True,
+         ["check", "prepare", "prepare", "install", "commit", "check", "cleanup"]),
+        ("a new prepare attempt", 1, True,
+         ["check", "prepare", "prepare", "install", "commit", "check", "cleanup"]),
+        ("a connect, and two failures", 2, False, ["check", "prepare", "prepare"]),
+        ("a connect during the read", 1, False, ["check", "prepare"]),
+    ]
+    _TryAgainAtOnceActor(t=t, cases=cases)
+
+
+actor _TryAgainAtOnceActor(t: testing.EnvT, cases: list[(str, int, bool, list[str])]):
+    var left = len(cases)
+    var changed: list[bool] = [False for _c in cases]
+    var failures: list[int] = [0 for _c in cases]
+    var ended: list[bool] = [False for _c in cases]
+
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    def run(k: int, case: (str, int, bool, list[str])) -> None:
+        adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "prepare", fail_times=case.1,
+                                             transient=True)
+        dev = swdev.DeviceMgr({}, t.env, "test-device", t.log_handler, noop_on_reconf,
+                              swdev.SchemaRegistry())
+        mgr = dev.get_swmgr()
+        in_read = case.0 == "a connect during the read"
+
+        def on_state(oper: ?ygdata.Node) -> None:
+            if ended[k]:
+                return
+            job = _pub_prepare(oper).0
+            if job == "running" and not changed[k] and not in_read:
+                changed[k] = True
+                if case.0 == "a new prepare attempt":
+                    mgr.set_config("camp-1", NEW, False, {}, 0, 1)
+                else:
+                    mgr.on_connect()
+                adapter.hold_prepares(False)
+                adapter.end_prepare()
+                return
+            last = False
+            if job == "retrying" and not case.2:
+                failures[k] = failures[k] + 1
+                last = failures[k] == case.1
+            elif _pub_status(oper) == "succeeded" and case.2:
+                last = True
+            if last:
+                ended[k] = True
+                testing.assertEqual(adapter.calls(), case.3, case.0)
+                left -= 1
+                if left == 0:
+                    t.success()
+
+        dev.set_update_oper(on_state)
+        mgr.set_prepare_retry(3600.0, 3600.0)
+        adapter.hold_prepares(not in_read)
+        mgr.set_adapter(adapter)
+        mgr.set_config("camp-1", NEW, False, {})
+        if in_read:
+            mgr.on_connect()
+
+    proc def __startup__():
+        for k in range(len(cases)):
+            run(k, cases[k])
+
+
+proc def _test_a_waiting_run_stops_before_the_install(t: testing.EnvT):
+    """A run that waits to try its prepare again stops before the install
+    when a veto comes, its target changes or its target is withdrawn: it
+    does not try its prepare again, the attempt needs the upgrade, and the
+    reason says why. After a new target, the manager reads the device for
+    it. A run whose prepare fails after a veto came does not wait. A new
+    attempt does not stop the run: it tries its prepare again at once,
+    installs and succeeds. The calls are the first calls to the adapter,
+    three or more, as the manager goes on after the stop."""
+    # (what comes while the run waits, the status, the reason, the calls)
+    cases: list[(str, str, ?str, list[str])] = [
+        ("a veto", "upgrade-needed", "held by camp-1 before install", ["check", "prepare"]),
+        ("a veto while the prepare runs", "upgrade-needed", "held by camp-1 before install",
+         ["check", "prepare"]),
+        ("a new target", "upgrade-needed", "the intent changed before install",
+         ["check", "prepare", "check"]),
+        ("the target withdrawn", "upgrade-needed", "target release withdrawn before install",
+         ["check", "prepare"]),
+        ("a new attempt", "succeeded", None,
+         ["check", "prepare", "prepare", "install", "commit", "check", "cleanup"]),
+    ]
+    _WaitingRunStopsActor(t=t, cases=cases)
+
+
+actor _WaitingRunStopsActor(t: testing.EnvT, cases: list[(str, str, ?str, list[str])]):
+    var left = len(cases)
+    var waited: list[bool] = [False for _c in cases]
+    var ended: list[bool] = [False for _c in cases]
+
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    def run(k: int, case: (str, str, ?str, list[str])) -> None:
+        adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "prepare", fail_times=1,
+                                             transient=True)
+        dev = swdev.DeviceMgr({}, t.env, "test-device", t.log_handler, noop_on_reconf,
+                              swdev.SchemaRegistry())
+        mgr = dev.get_swmgr()
+
+        def on_state(oper: ?ygdata.Node) -> None:
+            job = _pub_prepare(oper).0
+            if case.0 == "a veto while the prepare runs" and job == "running" and not waited[k]:
+                waited[k] = True
+                mgr.set_config("camp-1", NEW, False, {"camp-1": "window closed"})
+                adapter.end_prepare()
+            elif case.0 != "a veto while the prepare runs" and job == "retrying" \
+                 and not waited[k]:
+                waited[k] = True
+                if case.0 == "a veto":
+                    mgr.set_config("camp-1", NEW, False, {"camp-1": "window closed"})
+                elif case.0 == "a new target":
+                    mgr.set_config("camp-1", OTHER, False, {})
+                elif case.0 == "the target withdrawn":
+                    mgr.set_config(None, None, False, {})
+                else:
+                    mgr.set_config("camp-1", NEW, False, {}, 1)
+            elif waited[k] and _pub_status(oper) == case.1 and not ended[k]:
+                ended[k] = True
+                testing.assertEqual(_pub_answers(oper), ("camp-1", NEW), case.0)
+                testing.assertEqual(_pub_reason(oper), case.2, case.0)
+                n = len(case.3) if len(case.3) > 3 else 3
+                testing.assertEqual(adapter.calls()[:n], case.3, case.0)
+                left -= 1
+                if left == 0:
+                    t.success()
+
+        dev.set_update_oper(on_state)
+        mgr.set_prepare_retry(3600.0, 3600.0)
+        adapter.hold_prepares(case.0 == "a veto while the prepare runs")
+        mgr.set_adapter(adapter)
+        mgr.set_config("camp-1", NEW, False, {})
+
+    proc def __startup__():
+        for k in range(len(cases)):
+            run(k, cases[k])
+
+
+proc def _test_a_stopped_run_waits_no_more(t: testing.EnvT):
+    """A run that waits to try its prepare again stops when a veto comes.
+    When the veto goes, the next run reads the device, prepares once and
+    installs, also when the device connects during its pre-checks."""
+    _StoppedRunActor(t=t)
+
+
+actor _StoppedRunActor(t: testing.EnvT):
+    var vetoed = False
+    var lifted = False
+
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "prepare", fail_times=1,
+                                         transient=True)
+    dev = swdev.DeviceMgr({}, t.env, "test-device", t.log_handler, noop_on_reconf,
+                          swdev.SchemaRegistry())
+
+    def precheck(done: action(bool, str) -> None) -> None:
+        dev.get_swmgr().on_connect()
+        done(True, "")
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        mgr = dev.get_swmgr()
+        status = _pub_status(oper)
+        if _pub_prepare(oper).0 == "retrying" and status == "in-progress" and not vetoed:
+            vetoed = True
+            mgr.set_config("camp-1", NEW, False, {"camp-1": "window closed"})
+        elif vetoed and status == "upgrade-needed" and not lifted:
+            lifted = True
+            mgr.set_config("camp-1", NEW, False, {})
+        elif status == "succeeded":
+            testing.assertEqual(adapter.calls(),
+                                ["check", "prepare", "check", "prepare", "install", "commit",
+                                 "check", "cleanup"], "one prepare in the next run")
+            t.success()
+
+    proc def __startup__():
+        dev.set_update_oper(on_state)
+        mgr = dev.get_swmgr()
+        mgr.add_precheck("connector", precheck)
+        mgr.set_prepare_retry(3600.0, 3600.0)
+        mgr.set_adapter(adapter)
+        mgr.set_config("camp-1", NEW, False, {})
+
+
+proc def _test_a_run_starts_its_prepare_wait_over(t: testing.EnvT):
+    """A prepare ahead fails for a transient reason twice, so that its wait
+    grows from 1000 s to the longest, 3000 s. The veto goes, and the run's
+    prepare fails for a transient reason too: the run starts the wait over,
+    so it waits 1000 s, and the wait after that is 2000 s. When the device
+    connects, the run tries its prepare again, and the prepare is done:
+    the wait starts over at 1000 s."""
+    _RunWaitStartsOverActor(t=t, veto={"camp-1": "waiting for its window"})
+
+
+actor _RunWaitStartsOverActor(t: testing.EnvT, veto: dict[str, str]):
+    var ahead_fails = 0
+    var last: ?(?str, ?str) = None
+    var waits: list[float] = []
+
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "prepare", fail_times=3,
+                                         transient=True)
+    dev = swdev.DeviceMgr({}, t.env, "test-device", t.log_handler, noop_on_reconf,
+                          swdev.SchemaRegistry())
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        now = (_pub_status(oper), _pub_prepare(oper).0)
+        if now == last:
+            return
+        last = now
+        mgr = dev.get_swmgr()
+        if now == ("upgrade-needed", "retrying"):
+            ahead_fails += 1
+            if ahead_fails == 1:
+                mgr.on_connect()
+            else:
+                waits.append(mgr.get_prepare_retry())
+                mgr.set_config("camp-1", NEW, True, {})
+        elif now == ("in-progress", "retrying"):
+            waits.append(mgr.get_prepare_retry())
+            mgr.on_connect()
+        elif now.0 == "succeeded":
+            waits.append(mgr.get_prepare_retry())
+            testing.assertEqual(waits, [3000.0, 2000.0, 1000.0],
+                                "the wait of the prepare ahead, after the run's try, and after "
+                                "the run's prepare is done")
+            t.success()
+
+    proc def __startup__():
+        dev.set_update_oper(on_state)
+        mgr = dev.get_swmgr()
+        mgr.set_prepare_retry(1000.0, 3000.0)
+        mgr.set_adapter(adapter)
+        mgr.set_config("camp-1", NEW, True, veto)
+
+
+proc def _test_a_run_starts_with_its_prepare_running(t: testing.EnvT):
+    """A prepare ahead fails for a transient reason, so its job is
+    retrying. When the veto goes, the run starts, and the first state of
+    the run is in-progress at the stage prepare with its prepare running:
+    no state says that the run waits to try its prepare again. The run
+    prepares once and succeeds."""
+    _RunStartActor(t=t)
+
+
+actor _RunStartActor(t: testing.EnvT):
+    var lifted = False
+    var first = ""
+
+    def noop_on_reconf(name: str) -> None:
+        pass
+
+    adapter = swmock.MockSoftwareAdapter(t.log_handler, OLD, "prepare", fail_times=1,
+                                         transient=True)
+    dev = swdev.DeviceMgr({}, t.env, "test-device", t.log_handler, noop_on_reconf,
+                          swdev.SchemaRegistry())
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        mgr = dev.get_swmgr()
+        status = _pub_status(oper)
+        job = _pub_prepare(oper).0
+        if status == "upgrade-needed" and job == "retrying" and not lifted:
+            lifted = True
+            mgr.set_config("camp-1", NEW, False, {})
+        elif status == "in-progress" and first == "":
+            first = "{status} at {_pub_stage(oper)}, prepare {job}"
+        elif status == "succeeded":
+            testing.assertEqual(first, "in-progress at prepare, prepare running",
+                                "the first state of the run")
+            testing.assertEqual(adapter.calls(),
+                                ["check", "prepare", "check", "prepare", "install", "commit",
+                                 "check", "cleanup"], "one prepare in the run")
+            t.success()
+
+    proc def __startup__():
+        dev.set_update_oper(on_state)
+        mgr = dev.get_swmgr()
+        mgr.set_prepare_retry(3600.0, 3600.0)
+        mgr.set_adapter(adapter)
+        mgr.set_config("camp-1", NEW, True, {"camp-1": "waiting for its window"})
 
 
 actor _test_the_prepare_of_a_run_is_reported_as_the_job(t: testing.EnvT):

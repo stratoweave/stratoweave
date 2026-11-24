@@ -316,14 +316,27 @@ starts when it is back up, in its window if the window still fits, so a
 dead flotilla holds only its own members. When the top connects to a
 flotilla again, its members are up at once, with the states they had
 before, until the flotilla sends new ones. A member that the campaign
-releases then fails if its device is not connected yet. A member that
-goes down while it upgrades, as in the reboot of its upgrade, keeps its
-slot, and the plan's alarm names it when it is still down after its
-expected end. When the window of a held member closes, the member gets
+releases then reports `unknown` while its device is not connected yet, and
+starts its run when the device connects. Its run waits as a run that waits
+to prepare again does: past the last start that fits its window, the
+campaign puts its veto back, and the member waits for its next window. A
+member that goes down while it upgrades, as in the reboot of its upgrade,
+keeps its slot, and the plan's alarm names it when it is still down after
+its expected end. When the window of a held member closes, the member gets
 the next window of its schedule, and the plan's alarm names it until it
 starts. Each held member's `device-status` says why in `held`, and
 `held-by` names the device or the flotilla that holds it. The state's
 `held` counts them.
+
+A member whose prepare fails in its window for a transient reason, such as
+a connection that drops during the copy, does not fail. Its run waits,
+`in-progress` at the stage `prepare`, and its device tries the prepare
+again, as it tries a prepare ahead that is `retrying`, below. The wait
+does not count against `failure-budget`, and the upgrade gives no sample
+of the expected pace. Once a try that starts then no longer has the time
+that `close-margin` asks for left in its window, the campaign puts its
+veto back: the run stops before its install, and the member waits for its
+next window. An install that fails still fails the run.
 
 The campaign also holds a member whose device has a veto of another
 holder than the campaign, for example a service health check that holds
