@@ -287,7 +287,8 @@ run, the next member of its redundancy groups waits the `min-separation`
 from the end of that upgrade, or from a later boot of its device, not from
 the answer. A member in flight gets
 the campaign's veto back: its run stops before the install, or, past the
-install, finishes and holds its slot until it ends.
+install, finishes and holds its slot until it ends. To prepare a member
+again without a new attempt, change its `prepare-attempt` instead.
 
 With `failure-budget`, a campaign stops its releases when too many members
 fail. The budget is a percent of the members the campaign has, rounded
@@ -419,19 +420,37 @@ starts now, and `prepare-concurrency`, the most copies at once.
 `device-status` shows each member's `prepare`, and `preparing` and
 `prepared` count the members that wait for their release. The plan's
 alarms name the members that cannot prepare before their window opens and
-the members that wait for their window after a failed prepare. A failed
-prepare is not tried again. Turning `allow-staging` off, or setting the
-campaign to `plan`, stops the prepares; a copy that runs finishes. A
-member that was let and has not prepared stops being let when a window
-opens in which it may not prepare, a window closes while
+the members that wait for their window after a failed prepare. A prepare
+that fails for a transient reason, such as a device that is not
+connected, is `retrying`: the device tries it again, after a minute, then
+twice as long each time up to 5 minutes, and at once when it connects or
+is let again. The member stays let until its window opens. Its prepare
+counts from now while it is retrying, and from when it runs again. A
+prepare that fails for any other reason needs a person: the member is not
+let again until its `prepare-attempt` changes. Turning `allow-staging`
+off, or setting the campaign to `plan`, stops the prepares; a copy that
+runs finishes. A member that was let and has not prepared stops being let
+when a window opens in which it may not prepare, a window closes while
 `prepare-between-windows` is false, the campaign pauses or a hold of
 `failure-budget` begins, and is let again, with its first `prepare-start`,
 once it may prepare: after the window closes, when the campaign runs
 again, or when the hold ends. Its prepare counts from then. After its
-deadline it is not let again, and the alarm names it. A member that
-prepared is not let prepare again. A new target release lets a member
-prepare again once it answers the new target. The upgrade in the window
-still copies the image again, so windows are not shorter.
+deadline it is not let again, and the alarm names it. A member let that
+has not begun its prepare a debounce after it was let, or that retries
+it, is named in the alarm once its deadline has passed, and stays let. A
+member that prepared is not let prepare again until its `prepare-attempt`
+changes, as below. A new target release lets a member prepare again once
+it answers the new target. The upgrade in the window still copies the
+image again, so windows are not shorter.
+
+To prepare a member again, as after a failed prepare, change its
+`prepare-attempt`, for example from 0 to 1. In `run`, the campaign lets
+it prepare at once, as soon as `prepare-max-bandwidth` allows, also after
+its deadline, and the member keeps its first `prepare-start`. It is not
+let while it is down, in a pause, inside a time in which no member may
+prepare, or once its window has opened: then the upgrade in the window
+copies the image. Without `prepare-during-windows`, all the time from its
+deadline to its window is a time in which no member may prepare.
 
 ## Web UI
 

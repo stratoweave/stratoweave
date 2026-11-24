@@ -29,8 +29,9 @@ export const FLEET_LIST = `${FLEET_ROOT}?fields=device(${DEVICE_FIELDS})`;
 /** The devices bound to a schedule, with the binding. Config only: the
  * state of 100k devices doubles the time of the read. */
 export const FLEET_SCHEDULES = `${FLEET_ROOT}?content=config&fields=device/schedule`;
-/** The campaigns with their admin state and default schedule only. */
-export const CAMPAIGN_SETTINGS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign(name;admin-state;default-schedule)`;
+/** The campaigns with their admin state, default schedule and
+ * allow-staging only. */
+export const CAMPAIGN_SETTINGS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign(name;admin-state;default-schedule;allow-staging)`;
 /** The campaigns that have devices, with the names of their devices only. */
 export const CAMPAIGN_MEMBERS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign/device/name`;
 /** The campaigns with their names and the images their devices use. */
@@ -72,6 +73,8 @@ export interface DeviceJson {
 interface CampaignMemberJson {
   name: string;
   image?: string;
+  /** A GET omits the default 0. */
+  'prepare-attempt'?: number;
 }
 
 /** A software upgrade check verdict, relayed from the device as strings. */
@@ -87,6 +90,8 @@ interface JobJson {
   state?: string;
   /** The release the job copies or installs. */
   release?: string;
+  /** For the prepare: the member's prepare-attempt that it ran for. */
+  'prepare-attempt'?: number;
   message?: string;
   progress?: number | string;
 }
@@ -418,8 +423,9 @@ export interface CheckResult {
   at: number | null;
 }
 
-/** null: the device has not run the job for its target. */
-export type JobState = 'running' | 'done' | 'failed' | null;
+/** null: the device has not run the job for its target. retrying: it
+ * failed for a transient reason, and the device tries it again. */
+export type JobState = 'running' | 'done' | 'retrying' | 'failed' | null;
 
 /** The prepare or the install of a device, as its software manager
  * reports it. */
@@ -427,6 +433,8 @@ export interface Job {
   state: JobState;
   /** The release it copies or installs; '' when not reported. */
   release: string;
+  /** For the prepare: the member's prepare-attempt that it ran for. */
+  prepareAttempt: number;
   /** While it runs, what the device does: "add: extract". When it failed,
    * why. After the install, when the commit window ends. '' for none. */
   message: string;
@@ -582,6 +590,8 @@ export interface Campaign {
   devices: string[];
   /** The image of each member, in the order of devices. */
   images: string[];
+  /** The prepare-attempt of each member, in the order of devices. */
+  prepareAttempts: number[];
   adminState: AdminState;
   /** Name of the shared schedule for members whose device has no binding
    * of its own; empty when the campaign runs through its one synthetic
@@ -617,6 +627,10 @@ export interface DeviceCampaign {
   defaultSchedule: string;
   /** The image the device installs; '' for none. */
   image: string;
+  /** Whether the campaign lets its members prepare ahead. */
+  allowStaging: boolean;
+  /** The member's prepare-attempt. */
+  prepareAttempt: number;
   row: DeviceStatusRow;
   /** See planStartOf. */
   start: number | 'unplaced' | null;
@@ -694,11 +708,14 @@ function parseCheck(json: CheckResultJson | undefined): CheckResult {
   return { verdict, detail: json?.detail ?? '', at: Number.isFinite(at) ? at / 1000 : null };
 }
 
+const JOB_STATES: readonly string[] = ['running', 'done', 'retrying', 'failed'];
+
 function parseJob(json: JobJson | undefined): Job {
-  const state = json?.state === 'running' || json?.state === 'done' || json?.state === 'failed' ? json.state : null;
+  const state = JOB_STATES.includes(json?.state ?? '') ? (json?.state as JobState) : null;
   return {
     state,
     release: json?.release ?? '',
+    prepareAttempt: num(json?.['prepare-attempt'] ?? 0),
     message: json?.message ?? '',
     progress: json?.progress == null ? null : num(json.progress)
   };
@@ -810,6 +827,7 @@ function parseCampaignConfig(entry: CampaignJson): CampaignConfig {
     prepareMaxBandwidth: entry['prepare-max-bandwidth'] == null ? null : num(entry['prepare-max-bandwidth']),
     devices: (entry.device ?? []).map((m) => m.name),
     images: (entry.device ?? []).map((m) => m.image ?? ''),
+    prepareAttempts: (entry.device ?? []).map((m) => num(m['prepare-attempt'] ?? 0)),
     adminState: entry['admin-state'] === 'run' ? 'run' : 'plan',
     defaultSchedule: entry['default-schedule'] ?? '',
     deadline: typeof entry.deadline === 'number' ? entry.deadline : null,
@@ -860,11 +878,12 @@ export function parseDeviceStatusEntry(json: unknown, device: string): DeviceSta
   return parseRow(rows?.[0] ?? { device });
 }
 
-/** The image in a GET of one campaign's device={device}: '' for none,
- * null when the device is not a member (404). */
-export function parseMemberImage(json: unknown): string | null {
+/** The image, '' for none, and the prepare-attempt in a GET of one
+ * campaign's device={device}; null when the device is not a member (404). */
+export function parseMember(json: unknown): { image: string; prepareAttempt: number } | null {
   const entries = (json as { 'software:device'?: CampaignMemberJson[] })?.['software:device'];
-  return entries && entries.length > 0 ? (entries[0].image ?? '') : null;
+  if (!entries || entries.length === 0) return null;
+  return { image: entries[0].image ?? '', prepareAttempt: num(entries[0]['prepare-attempt'] ?? 0) };
 }
 
 /** A campaign's state/plan with only what planStartOf reads. */
@@ -1004,6 +1023,16 @@ export function campaignCreatePatch(input: NewCampaign): SoftwarePatchJson {
  * leaves the rest of the campaign intact. */
 export function adminStatePatch(name: string, state: AdminState): SoftwarePatchJson {
   return { 'software:software': { 'upgrade-campaign': [{ name, 'admin-state': state }] } };
+}
+
+/** A PATCH merge that raises one member's prepare-attempt, which makes the
+ * campaign let it prepare again at once. */
+export function prepareAgainPatch(campaign: string, member: string, prepareAttempt: number): SoftwarePatchJson {
+  return {
+    'software:software': {
+      'upgrade-campaign': [{ name: campaign, device: [{ name: member, 'prepare-attempt': prepareAttempt + 1 }] }]
+    }
+  };
 }
 
 /** Every leaf, since a PUT replaces the whole entry. A file at the name

@@ -10,7 +10,9 @@ import yang.gdata as ygdata
 import yang.schema as yschema
 
 import device as swdev
+import device_oper as swdevoper
 import adapters.adapter as swadapt
+import adapters.software_mock as swmock
 import adapters.netconf as swna
 import netconf
 import ssh.pipe as sshpipe
@@ -703,6 +705,65 @@ actor _test_software_dmc_preserves_system_mock_adapterActor(t: testing.EnvT, sch
         start()
         after 2.0: fail("Timed out checking adapter preservation")
 
+
+
+proc def _failing_prepare(dev: swdev.DeviceMgr, dmc: DeviceMetaConfig,
+                          log_handler: logging.Handler, env: ?Env) -> swdev.SoftwareAdapter:
+    """A software adapter whose first prepare fails for a reason that is
+    not transient."""
+    return swmock.MockSoftwareAdapter(log_handler, "17.15.01a", "prepare", fail_times=1)
+
+
+proc def _test_software_dmc_gives_the_prepare_attempt(t: testing.EnvT):
+    """The software config of a DMC gives its prepare attempt to the
+    software manager. Under a veto with allow-staging, the first prepare
+    ahead fails for a reason that is not transient. A DMC with
+    prepare-attempt 1 then prepares again, and the job says that it ran
+    for 1."""
+    t.timeout(10.0)
+    schema = yang.compile([IETF_SYSTEM_YANG])
+    _SoftwareDmcPrepareAttemptActor(t=t, schema=schema)
+
+
+actor _SoftwareDmcPrepareAttemptActor(t: testing.EnvT, schema: yschema.DRoot):
+    var asked = False
+    var done = False
+
+    def noop_on_reconf(name: str):
+        pass
+
+    dev_types = {
+        "netconf": swdev.DeviceType(name="netconf", adapter_type=swna.NetconfAdapter,
+                                    src_dnode=schema, software_adapter_type=_failing_prepare)
+    }
+    dev = swdev.DeviceMgr(dev_types, None, "dev-prepare-attempt", t.log_handler, noop_on_reconf,
+                          swdev.SchemaRegistry())
+
+    def dmc(prepare_attempt: int) -> DeviceMetaConfig:
+        d = make_netconf_mock_dmc("dev-prepare-attempt")
+        d.software.upgrade_campaign = "camp-1"
+        d.software.target_release = "17.18.03a"
+        d.software.allow_staging = True
+        d.software.prepare_attempt = u64(prepare_attempt)
+        d.software.veto.create("camp-1", reason="waiting for its window")
+        return d
+
+    def on_state(oper: ?ygdata.Node) -> None:
+        if done or oper is None:
+            return
+        for e in swdevoper.stratoweave_rfs__device_entry.from_gdata(oper!).software.state.attempt:
+            job = e.job.get("prepare")
+            if job is not None:
+                if job.state == "failed" and not asked:
+                    asked = True
+                    dev.set_dmc(dmc(1))
+                elif job.state == "done" and job.prepare_attempt == u64(1):
+                    done = True
+                    t.success()
+
+    proc def __startup__():
+        dev.set_update_oper(on_state)
+        dev.set_dmc(dmc(0))
 
 
 proc def _test_get_yang_library_wrapper(t: testing.EnvT):

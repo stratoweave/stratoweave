@@ -8,13 +8,13 @@ for pretending -- like install delays -- is confined to a file that says so.
 import logging
 import std.random
 
-from adapters.adapter import NotConnectedError
+from adapters.adapter import NotConnectedError, TransientError
 from device import SoftwareAdapter
 
 
 actor MockSoftwareDriver(log_handler: logging.Handler, current: ?str, fail_job: ?str,
                          install_delay: ?(float, float), commit_window: ?int,
-                         auto_abort: bool, fail_times: int):
+                         auto_abort: bool, fail_times: int, transient: bool):
     """State behind MockSoftwareAdapter."""
     var cur: ?str = current
     var prev: ?str = current
@@ -22,6 +22,10 @@ actor MockSoftwareDriver(log_handler: logging.Handler, current: ?str, fail_job: 
     # How many more times fail_job fails; below 0 it always fails.
     var fails_left: int = fail_times
     var connected: bool = True
+    # While hold is set, each prepare waits for end_prepare(), in order.
+    var hold: bool = False
+    var held: list[action(?Exception) -> None] = []
+    var held_errors: list[?Exception] = []
 
     def _record(job: str) -> ?Exception:
         """Note the job, and fail it if this mock was told to."""
@@ -29,6 +33,8 @@ actor MockSoftwareDriver(log_handler: logging.Handler, current: ?str, fail_job: 
         if fail_job == job and fails_left != 0:
             if fails_left > 0:
                 fails_left -= 1
+            if transient:
+                return TransientError("mock: {job} failed")
             return ValueError("mock: {job} failed")
         return None
 
@@ -47,7 +53,27 @@ actor MockSoftwareDriver(log_handler: logging.Handler, current: ?str, fail_job: 
         connected = c
 
     def prepare(done: action(?Exception) -> None, release: str) -> None:
-        done(_record("prepare"))
+        if not connected:
+            calls.append("prepare")
+            done(NotConnectedError())
+            return
+        err = _record("prepare")
+        if hold:
+            held.append(done)
+            held_errors.append(err)
+            return
+        done(err)
+
+    def hold_prepares(h: bool) -> None:
+        hold = h
+
+    def end_prepare() -> None:
+        if len(held) > 0:
+            done = held[0]
+            err = held_errors[0]
+            del held[0]
+            del held_errors[0]
+            done(err)
 
     def _finish_install(done: action(?Exception) -> None, release: str) -> None:
         prev = cur
@@ -105,8 +131,11 @@ class MockSoftwareAdapter(SoftwareAdapter):
     time in that range, for demos and UIs where progress should be visible.
     commit_window mimics a platform abort timer. auto_abort makes commit a
     no-op that leaves the device on the old release. fail_times limits how
-    often fail_job fails, every time by default. set_connected(False) makes
-    the check fail as a device that is not connected does.
+    often fail_job fails, every time by default, and transient makes it
+    fail with a TransientError. set_connected(False) makes the check and
+    the prepare fail as on a device that is not connected.
+    hold_prepares(True) makes each prepare wait until end_prepare() ends
+    it, so that a test can act while a prepare runs.
     """
 
     @staticmethod
@@ -119,10 +148,11 @@ class MockSoftwareAdapter(SoftwareAdapter):
 
     def __init__(self, log_handler: logging.Handler, current: ?str=None,
                  fail_job: ?str=None, install_delay: ?(float, float)=None,
-                 commit_window: ?int=None, auto_abort: bool=False, fail_times: int=-1):
+                 commit_window: ?int=None, auto_abort: bool=False, fail_times: int=-1,
+                 transient: bool=False):
         self._log_handler = log_handler
         self._driver = MockSoftwareDriver(log_handler, current, fail_job, install_delay,
-                                          commit_window, auto_abort, fail_times)
+                                          commit_window, auto_abort, fail_times, transient)
 
     def check(self, done: action(?str, ?Exception) -> None) -> None:
         self._driver.check(done)
@@ -158,3 +188,12 @@ class MockSoftwareAdapter(SoftwareAdapter):
     def set_connected(self, connected: bool) -> None:
         """Whether the device answers the check or is not connected."""
         self._driver.set_connected(connected)
+
+    def hold_prepares(self, hold: bool) -> None:
+        """Whether a prepare waits for end_prepare() to end it."""
+        self._driver.hold_prepares(hold)
+
+    def end_prepare(self) -> None:
+        """End the prepare that has waited longest, as it would have
+        ended."""
+        self._driver.end_prepare()

@@ -1,9 +1,10 @@
 <script lang="ts">
   // Preparing ahead as one bar over the plan: of the members that prepare
-  // ahead, the prepared ones, the ones preparing and the failed ones; the
-  // rest of the track is still to start. Which member is which shows on
-  // the timeline's cells. The Prepare chip in front of it hides the bar and
-  // tells the page to hide its other prepare information too.
+  // ahead, the prepared ones, the ones preparing, the ones retrying and the
+  // failed ones; the rest of the track is still to start. Which member is
+  // which shows on the timeline's cells. The Prepare chip in front of it
+  // hides the bar and tells the page to hide its other prepare information
+  // too.
   import { PREPARE_COLOR } from '#lib/software/cells.ts';
   import { preparesLeft, prepareTally, type PrepareView } from '#lib/software/prepare.ts';
   import { formatDayClock } from '#lib/core/time.ts';
@@ -32,7 +33,7 @@
 
   /** The whole state in words, for the tooltip. */
   let detail = $derived.by(() => {
-    let text = `${got.toLocaleString()} of ${total.toLocaleString()} prepared, ${tally.preparing.toLocaleString()} preparing, ${tally.failed.toLocaleString()} failed`;
+    let text = `${got.toLocaleString()} of ${total.toLocaleString()} prepared, ${tally.preparing.toLocaleString()} preparing, ${tally.retrying.toLocaleString()} retrying, ${tally.failed.toLocaleString()} failed`;
     if (preparesLeft(tally) && tally.last !== null) text += `, last one starts ${formatDayClock(tally.last, now)}`;
     if (failed.length > 0) {
       text += `\nFailed: ${failed.slice(0, NAMED).join(', ')}${failed.length > NAMED ? ', ...' : ''}`;
@@ -54,7 +55,12 @@
       <span class="track" role="img" aria-label={detail} title={detail} style:background={PREPARE_COLOR.scheduled}>
         <span style:width={share(got)} style:background={PREPARE_COLOR.prepared}></span>
         <span style:width={share(tally.preparing)} style:background={PREPARE_COLOR.preparing}></span>
-        <!-- A few failures among thousands still show. -->
+        <!-- A few retries or failures among thousands still show. -->
+        <span
+          style:width={share(tally.retrying)}
+          style:min-width={tally.retrying > 0 ? '3px' : null}
+          style:background={PREPARE_COLOR.retrying}
+        ></span>
         <span
           style:width={share(tally.failed)}
           style:min-width={tally.failed > 0 ? '3px' : null}
@@ -62,7 +68,9 @@
         ></span>
       </span>
       <span class="count mono" title={detail}>
-        {got.toLocaleString()} / {total.toLocaleString()}{#if tally.failed > 0}{' · '}<span class="failed"
+        {got.toLocaleString()} / {total.toLocaleString()}{#if tally.retrying > 0}{' · '}<span class="warn"
+            >{tally.retrying.toLocaleString()} retrying</span
+          >{/if}{#if tally.failed > 0}{' · '}<span class="warn"
             >{tally.failed.toLocaleString()} failed</span
           >{/if}
       </span>
@@ -100,7 +108,7 @@
     white-space: nowrap;
   }
 
-  .failed {
+  .warn {
     color: var(--sw-warning);
   }
 </style>

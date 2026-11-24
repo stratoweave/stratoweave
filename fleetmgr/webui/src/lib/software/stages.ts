@@ -34,12 +34,14 @@ export function alreadyOnTarget(row: DeviceStatusRow): boolean {
 }
 
 /** How the prepare ahead of a member that waits for its window stands:
- * done, running, or null when it has not started or failed. A prepare
- * job left from another intent does not count. */
+ * done, running (also while the device tries it again), or null when it
+ * has not started or failed. A prepare job left from another intent does
+ * not count. */
 function preparedAhead(row: DeviceStatusRow): 'done' | 'running' | null {
   const job = row.prepare;
   const current = !job.release || !row.targetRelease || job.release === row.targetRelease;
   if (row.status !== 'upgrade-needed' || !current) return null;
+  if (job.state === 'retrying') return 'running';
   return job.state === 'done' || job.state === 'running' ? job.state : null;
 }
 
@@ -73,11 +75,15 @@ export function stageView(row: DeviceStatusRow): StageView {
 /** What the device does in the step that runs, as its job says: the
  * transfer of the prepare, the step of the install, or after the install
  * when the commit window ends. A device that waits for its window may
- * prepare ahead of it. Empty when its job says nothing. */
-export function jobDetail(row: DeviceStatusRow): string {
+ * prepare ahead of it. A prepare job for an earlier prepare-attempt than
+ * prepareAttempt, the member's, says that an ask to prepare again is on
+ * its way. Empty when its job says nothing. */
+export function jobDetail(row: DeviceStatusRow, prepareAttempt = 0): string {
   const { status, stage, prepare, install } = row;
   if (status === 'upgrade-needed') {
+    if (prepare.state !== null && prepare.prepareAttempt < prepareAttempt) return 'waits to prepare again';
     if (prepare.state === 'running') return prepare.message ? `preparing · ${prepare.message}` : 'preparing';
+    if (prepare.state === 'retrying') return `prepare retrying: ${prepare.message}`;
     if (prepare.state === 'failed') return `prepare failed: ${prepare.message}`;
     return prepare.state === 'done' ? 'prepared' : '';
   }

@@ -420,6 +420,8 @@
         return v.progress === null ? `preparing since ${when(v.start)}` : `preparing, ${v.progress}%`;
       case 'prepared':
         return 'image prepared';
+      case 'retrying':
+        return `prepare retrying${v.message ? `: ${v.message}` : ''}`;
       case 'failed':
         return `prepare failed${v.message ? `: ${v.message}` : ''}, copies its image in its window`;
       default:

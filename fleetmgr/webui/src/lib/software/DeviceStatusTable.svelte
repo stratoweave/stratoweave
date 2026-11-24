@@ -30,10 +30,13 @@
   }
 
   /** What the device's job says, less what the Prepare column already
-   * says: of a prepare there, only why it failed. */
+   * says: of a prepare there, only why it failed or why it is retrying. */
   function jobText(row: DeviceStatusRow): string {
     if (!inPrepareColumn(row)) return jobDetail(row);
-    return row.prepare.state === 'failed' ? row.prepare.message || 'prepare failed' : '';
+    const ahead = prepare?.get(row.device);
+    if (ahead?.state === 'failed') return ahead.message || 'prepare failed';
+    if (ahead?.state === 'retrying') return ahead.message || 'prepare retrying';
+    return '';
   }
 
   function detail(row: DeviceStatusRow): string {
@@ -75,7 +78,7 @@
                   <span class="mono percent">{ahead.progress}%</span>
                 </span>
               {:else}
-                <span class="tag" class:warn={ahead.state === 'failed'}>
+                <span class="tag" class:warn={ahead.state === 'failed' || ahead.state === 'retrying'}>
                   <span class="sq" style:background={PREPARE_COLOR[ahead.state]}></span>
                   {ahead.state === 'failed' ? 'failed, copies in window' : ahead.state}
                 </span>

@@ -33,7 +33,7 @@ import adapters.software_iosxe as swxe
 import adapters.software_iosxe_mock as swxemock
 import adapters.software_iosxe_oper as ixoper
 import adapters.software_iosxe_yang as swxe_yang
-from adapters.adapter import DeviceAdapter, NoAdapter
+from adapters.adapter import DeviceAdapter, NoAdapter, BusyError, NotConnectedError, TransientError
 from device_schema import DeviceSchema
 
 from device_meta_config import \
@@ -370,6 +370,38 @@ def _test_job_uuid_separates_two_attempts():
                            "the two stages are separate operations")
 
 
+def _test_job_error_keeps_a_transient_cause():
+    """A job that fails for a transient cause ends with a TransientError,
+    so that it can be tried again. Any other cause, and no cause, gives a
+    ValueError, which needs a person."""
+    # (case, the cause, whether the error is transient)
+    cases: list[(str, ?Exception, bool)] = [
+        ("not connected", NotConnectedError(), True),
+        ("connection closed", TransientError("SSH connection closed: eof"), True),
+        ("busy", BusyError("b"), True),
+        ("CLI error", xecli.CommandError("%Error opening"), False),
+        ("other error", ValueError("v"), False),
+        ("no cause", None, False),
+    ]
+    for case in cases:
+        err = swxe.job_error("download", "x", case.1)
+        testing.assertEqual(swdev.error_text(err), "download failed: x", case.0)
+        testing.assertEqual(isinstance(err, TransientError), case.2, case.0)
+        testing.assertEqual(isinstance(err, ValueError), not case.2, case.0)
+
+
+def _test_timeout_error_follows_the_last_poll():
+    """A job that does not finish in time is transient when the device did
+    not answer the last poll, and needs a person when it did."""
+    # (whether the device did not answer, whether the error is transient)
+    cases: list[(bool, bool)] = [(True, True), (False, False)]
+    for case in cases:
+        err = swxe.timeout_error("download", case.0)
+        testing.assertEqual(swdev.error_text(err), "download did not finish in time", str(case.0))
+        testing.assertEqual(isinstance(err, TransientError), case.1, str(case.0))
+        testing.assertEqual(isinstance(err, ValueError), not case.1, str(case.0))
+
+
 def _test_image_filename_and_paths():
     """Two conventions one stage apart: xcopy wants a bare filename, install
     wants the bootflash: prefix."""
@@ -564,6 +596,137 @@ actor _test_iosxe_staging_waits_for_adaptersActor(t: testing.EnvT, schema: ysche
         dev_ref = d
         after 0.01: start()
 
+
+
+proc def _test_iosxe_prepare_without_a_connected_adapter_is_transient(t: testing.EnvT):
+    """A prepare on a device whose only adapter never connects waits for
+    the adapter, and then ends with a TransientError: a later try can
+    succeed once the adapter connects."""
+    t.timeout(10.0)
+    schema = yang.compile(swxe_yang.models)
+    _UnconnectedPrepareActor(t=t, schema=schema, jobs=1)
+
+
+proc def _test_iosxe_a_second_job_is_busy(t: testing.EnvT):
+    """A job that comes while another job runs on the driver ends at once
+    with a BusyError."""
+    t.timeout(10.0)
+    schema = yang.compile(swxe_yang.models)
+    _UnconnectedPrepareActor(t=t, schema=schema, jobs=2)
+
+
+actor _UnconnectedPrepareActor(t: testing.EnvT, schema: yschema.DRoot, jobs: int):
+    """Give jobs prepares to the driver of a device whose only adapter
+    never connects, and check how the last one ends."""
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def check(err: ?Exception, busy: bool, text: str) -> None:
+        if finished:
+            return
+        finished = True
+        try:
+            if err is None:
+                raise ValueError("the prepare did not fail")
+            testing.assertEqual(swdev.error_text(err!), text)
+            if busy:
+                testing.assertTrue(isinstance(err!, BusyError), "a BusyError")
+            else:
+                testing.assertTrue(isinstance(err!, TransientError), "a TransientError")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def first_done(err: ?Exception) -> None:
+        if jobs == 1:
+            check(err, False, "download failed: no adapter that can transfer the image is connected")
+
+    def second_done(err: ?Exception) -> None:
+        check(err, True, "software job already running: stage")
+
+    dev_types = {
+        "iosxe": swdev.DeviceType(name="iosxe", adapter_type=_never_connects, src_dnode=schema),
+    }
+    d = swdev.DeviceMgr(dev_types, t.env, "d-unconnected", t.log_handler, on_reconf,
+                        swdev.SchemaRegistry())
+    proc def __startup__():
+        dmc = DeviceMetaConfig("d-unconnected", Credentials("admin", "admin"), type="iosxe",
+                               software=Software(image_url=IMAGE_URL))
+        d.set_dmc(dmc)
+        a = swxe.IosXeSoftwareAdapter(d, dmc, t.log_handler, t.env, 0.02, 0.02, 0.3)
+        a.prepare(first_done, NEW_REQUESTED)
+        if jobs == 2:
+            a.prepare(second_done, NEW_REQUESTED)
+
+
+proc def _test_iosxe_room_without_a_connected_remove_is_transient(t: testing.EnvT):
+    """A prepare that must make room on bootflash ends with a TransientError
+    while no adapter that can remove software is connected: a later try can
+    succeed once that adapter connects. The device lists bootflash over
+    NETCONF with too little room for the image, has no install RPC there,
+    and its other adapter never connects."""
+    t.timeout(10.0)
+    schema = yang.compile([swxe_yang.platform_software_oper])
+    _RoomWithoutRemoveActor(t=t, schema=schema)
+
+
+actor _RoomWithoutRemoveActor(t: testing.EnvT, schema: yschema.DRoot):
+    var finished = False
+
+    def on_reconf(n: str) -> None:
+        pass
+
+    def done(err: ?Exception) -> None:
+        if finished:
+            return
+        finished = True
+        try:
+            if err is None:
+                raise ValueError("the prepare did not fail")
+            testing.assertEqual(swdev.error_text(err!),
+                                "remove failed: no adapter that can remove software is connected")
+            testing.assertTrue(isinstance(err!, TransientError), "a TransientError")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def dmc() -> DeviceMetaConfig:
+        m = DeviceMetaConfig("d-room", Credentials("admin", "admin"), type="iosxe",
+                             software=Software(image_url=IMAGE_URL, image_size=u64(734643332)))
+        m.mock.enabled = True
+        m.extra_adapter.create("never")
+        return m
+
+    dev_types = {
+        "iosxe": swdev.DeviceType(name="iosxe", adapter_type=swna.NetconfAdapter, src_dnode=schema,
+                                  oper_src_dnode=schema),
+        "never": swdev.DeviceType(name="never", adapter_type=_never_connects, src_dnode=schema),
+    }
+    d = swdev.DeviceMgr(dev_types, t.env, "d-room", t.log_handler, on_reconf, swdev.SchemaRegistry())
+
+    def start() -> None:
+        if swxe.FILES_MODULE not in d.get_modules().0:
+            after 0.01: start()
+            return
+        a = d.get_adapter()
+        if isinstance(a, swna.NetconfAdapter):
+            ms = a.get_mock_server()
+            if ms is not None:
+                r = ixoper.root()
+                q = r.cisco_platform_software.q_filesystem.create()
+                q.partitions.create("bootflash:", total_size=u64(2818084), used_size=u64(2800000))
+                ms.set_oper_ds(r.to_gdata())
+                drv = swxe.IosXeSoftwareAdapter(d, dmc(), t.log_handler, t.env, 0.02, 0.02, 0.3)
+                drv.prepare(done, NEW_REQUESTED)
+                return
+        finished = True
+        t.failure(ValueError("no NETCONF mock server"))
+
+    proc def __startup__():
+        d.set_dmc(dmc())
+        after 0.01: start()
 
 
 actor _test_iosxe_upgrade_through_the_software_manager(t: testing.EnvT):

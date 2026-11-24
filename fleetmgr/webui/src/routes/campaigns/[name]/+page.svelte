@@ -246,7 +246,13 @@
     return `${days} notice${from}: windows from ${formatClock(noticeFrom)} on`;
   });
   // The members that prepare ahead, and where their prepares are.
-  let prepare = $derived(prepareViews(campaign?.plan ?? null, campaign?.deviceStatus ?? []));
+  let prepare = $derived(
+    prepareViews(
+      campaign?.plan ?? null,
+      campaign?.deviceStatus ?? [],
+      new Map((campaign?.devices ?? []).map((d, i) => [d, campaign?.prepareAttempts[i] ?? 0]))
+    )
+  );
   let prepared = $derived(prepareTally(prepare));
 
   // The Prepare chip over the plan: off, the plan shows nothing of preparing

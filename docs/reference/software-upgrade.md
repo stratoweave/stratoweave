@@ -31,16 +31,17 @@ Set under `stratoweave-rfs:device=<name>/software`:
 | `veto[holder]` | While any entry exists, no install starts. The manager still reads the device. An install already running goes on. |
 | `upgrade-campaign` | Campaign whose intent this is. The manager answers each attempt at `target-release` in this campaign as an entry of `state/attempt`. |
 | `attempt` | A number, 0 by default. A new value is a new attempt: the manager reads the device again, and runs a failed upgrade again. A run of another attempt that is under way finishes first. |
-| `allow-staging` | While a veto holds the install, prepare the target once per attempt: copy its image to the device ahead of the window. |
+| `prepare-attempt` | A number, 0 by default. A new value prepares the target again under a veto with `allow-staging`, also after a prepare that is done or failed. |
+| `allow-staging` | While a veto holds the install, prepare the target once for each `attempt` and `prepare-attempt`: copy its image to the device ahead of the window. |
 
 The manager acts when `target-release`, `upgrade-campaign`, `attempt`,
-`allow-staging` or a veto changes, when the device type changes, and when
-the device connects. A new `image-url` alone does not make it act. A status
-that ends a read or a run (`up-to-date`, `succeeded`, `failed`,
-`rolled-back` or `not-started`) stands for its attempt. A reconnect,
-another config change, a new device type, or `target-release` removed and
-set again does not run the attempt again. To run a failed upgrade again,
-change `attempt`.
+`prepare-attempt`, `allow-staging` or a veto changes, when the device type
+changes, and when the device connects. A new `image-url` alone does not make
+it act. A status that ends a read or a run (`up-to-date`, `succeeded`,
+`failed`, `rolled-back` or `not-started`) stands for its attempt. A
+reconnect, another config change, a new device type, or `target-release`
+removed and set again does not run the attempt again. To run a failed
+upgrade again, change `attempt`.
 
 ## Upgrade steps
 
@@ -56,7 +57,7 @@ check ──> already on target ──> up-to-date
 
 | Step | What happens |
 | --- | --- |
-| check | Read the running release. If it is the target, stop with `up-to-date`. If a veto holds the install, stop with `upgrade-needed`, and with `allow-staging` prepare the target once. If the read fails, go on, but see the rules. |
+| check | Read the running release. If it is the target, stop with `up-to-date`. If a veto holds the install, stop with `upgrade-needed`, and with `allow-staging` prepare the target once for each `attempt` and `prepare-attempt`. If the read fails, go on, but see the rules. |
 | prepare | Copy the image to the device. No outage. |
 | pre-checks | Ask every pre-check. A refusal, or no answer within 60 seconds, ends with `failed`. Nothing is activated. |
 | install | Activate the new release. The device reboots. The step ends when the device runs the target. |
@@ -136,7 +137,7 @@ Published under `stratoweave-rfs:device=<name>/software/state`:
 | `attempt/stage` | The step the attempt's run is in, or the step it ended in |
 | `attempt/reason` | Why the run failed or rolled back, why the release could not be read, or what held the install |
 | `attempt/precheck`, `attempt/postcheck` | `verdict` (`not-run`, `pass` or `fail`), `detail`, and `at`, the time of the verdict |
-| `attempt/job[prepare]` | The attempt's last prepare: `state` (`running`, `done` or `failed`), `release`, `started`, `ended` and, when it failed, `message`. While it runs, `message` says what the device does, as the adapter reports it, and an adapter that transfers the image sets `progress` in percent of `image-size` and `message` with the bytes |
+| `attempt/job[prepare]` | The attempt's last prepare: `state` (`running`, `done`, `retrying` or `failed`), `release`, `prepare-attempt`, which is the `prepare-attempt` that it ran for, `started`, `ended` and, when it failed, `message`. While it runs, `message` says what the device does, as the adapter reports it, and an adapter that transfers the image sets `progress` in percent of `image-size` and `message` with the bytes |
 | `attempt/job[install]` | The install of the attempt's run, with the same leaves. While it runs, `message` says what the device does, for example `add: extract` or `waiting for the device to boot`. After the install, until the run commits or rolls back, it says when the commit window ends, for example `commit window ends 23:07 UTC` |
 | `veto[holder]` | The vetoes of the configuration, with their `reason`, so that a campaign sees the vetoes of other holders |
 
@@ -151,10 +152,15 @@ attempt is a new entry, and the entries of the earlier attempts stay.
 Removing `target-release` keeps the state. State is not saved; after a
 restart it has no attempts.
 
-A prepare under a veto runs once per attempt, and again after a restart.
-Its result is only in the attempt's `job[prepare]`: a failed prepare leaves
-the status `upgrade-needed`, and is not run again, also not when
-`allow-staging` goes off and on. Turning `allow-staging` off does not stop a
+A prepare under a veto runs once for each `attempt` and `prepare-attempt`,
+and again after a restart. Its result is only in the attempt's
+`job[prepare]`: a failed prepare leaves the status `upgrade-needed`. A
+prepare that fails with a `TransientError`, such as on a device that is not
+connected, is `retrying`: while `allow-staging` is on, the manager tries it
+again after 60 seconds, then twice as long each time, up to 5 minutes, and
+at once when the device connects or `allow-staging` is set. Any other failed
+prepare is not run again, also not when `allow-staging` goes off and on,
+until `prepare-attempt` changes. Turning `allow-staging` off does not stop a
 prepare that runs. When the veto goes, the run prepares again, since the IOS
 XE adapter copies the image every time, and fills the same job entry.
 

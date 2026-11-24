@@ -1089,22 +1089,22 @@ class Controller(object):
     plan.
 
     With prepare on, a run lets members prepare: copy their image before
-    their window. A member waits to prepare while it is not released, it
-    is up, its latest report says that it needs the upgrade, it has a
-    promise, it was not let prepare before, it reports no prepare, and the
-    window promised to it has not opened. Three settings say when the
-    members may prepare: before the campaign's first window opens
-    (prepare_first), between windows (prepare_between) and during windows
-    (prepare_during). The campaign's first window is the first of its
-    windows; once it opens in the run, it stays the first window, also
-    after it closes (first_open()). A
-    member's deadline before the first window is the opening of that
-    window, less the close margin of its expected prepare time. With
-    prepare between or during windows, its latest deadline is the opening
-    of the window promised to it, less that margin; without them, its
-    deadline before the first window is its latest. A member whose latest
-    deadline has passed, or that the cap leaves no turn by it, cannot
-    prepare in time, and the prepares give an alarm for it.
+    their window. A member waits to prepare while it is not released, it is
+    up, its latest report says that it needs the upgrade, it has a promise,
+    it was not let prepare before, it reports no prepare or its prepare
+    retrying, and the window promised to it has not opened. Three settings
+    say when the members may prepare: before the campaign's first window
+    opens (prepare_first), between windows (prepare_between) and during
+    windows (prepare_during). The campaign's first window is the first of
+    its windows; once it opens in the run, it stays the first window, also
+    after it closes (first_open()). A member's deadline before the first
+    window is the opening of that window, less the close margin of its
+    expected prepare time. With prepare between or during windows, its
+    latest deadline is the opening of the window promised to it, less that
+    margin; without them, its deadline before the first window is its
+    latest. A member whose latest deadline has passed, or that the cap
+    leaves no turn by it, cannot prepare in time, and the prepares give an
+    alarm for it.
 
     The members prepare in the free time only (FreeTime): without
     prepare_first, not before the first window opens; with
@@ -1164,15 +1164,26 @@ class Controller(object):
     opens (without prepare_during any window, and with it the window
     promised to it), with prepare_between False a window closes, prepare
     goes off, the run pauses, or more members have failed than the failure
-    budget. A member let that reports no prepare, or its prepare running,
-    is let again with the time it was first let once it could be let at a
+    budget. A prepare that is retrying keeps its member let: it failed for
+    a transient reason, and its device tries it again. A member let that
+    reports no prepare, its prepare running or its prepare retrying, is
+    let again with the time it was first let once it could be let at a
     turn by its latest deadline and under the cap: after the window
     closes, the pause or the hold ends, or its answer comes back
     (let_again). Its prepare counts from the latest time it was let while
-    it reported no prepare, and while it waits to be let again, from the
-    second let_again will let it. Only drop() and retarget() forget
-    that a member was let. A member let that prepared is never let again,
-    and its prepare changes nothing in its window.
+    it reported no prepare or its prepare retrying, or from when its
+    prepare ran again after it was retrying, and while it waits to be let
+    again, from the second let_again will let it. A member let that
+    reports its prepare retrying, or no prepare a debounce after it was
+    let, is late once its latest deadline has passed (late_from()): it
+    stays let, and the prepares name it. A member that an operator asks to
+    prepare again (retry_prepare()) is let at once, as soon as the cap
+    lets it, also after its deadline, and keeps the time it was first
+    let; it is not let while it is down, inside a time without prepares,
+    or once the window promised to it has opened. Only drop() and
+    retarget() forget that a member was let. A member let whose prepare is
+    done or failed is let again only when an operator asks, and a prepare
+    changes nothing in its window.
     Prepares change no release decision: step(), plan() and the quiet time
     read nothing of them."""
     # Configuration.
@@ -1307,15 +1318,19 @@ class Controller(object):
     failing: list[bool]
     failures: int
     # The latest prepare state each member reports for the campaign's
-    # target: running, done or failed. It outlives a pause, as final_at
-    # does.
+    # target: running, done, retrying or failed. It outlives a pause, as
+    # final_at does.
     prepare_state: dict[str, str]
     # The members let prepare, with the second they were first let; the
     # members let again while they reported no prepare, with the second
-    # they were let again; and the members let prepare now.
+    # they were let again, or with the second their prepare ran again after
+    # it was retrying; and the members let prepare now.
     prepare_at: dict[str, int]
     prepare_from: dict[str, int]
     allowed: set[str]
+    # The members that an operator asked to prepare again, with the second
+    # of the first ask, until they are let (retry_prepare()).
+    prepare_now: dict[str, int]
     # The opening of the campaign's first window, in seconds, once the run
     # took it (keep_first()), or -1.
     first_at: int
@@ -1504,6 +1519,7 @@ class Controller(object):
         self.prepare_at = {}
         self.prepare_from = {}
         self.allowed = set()
+        self.prepare_now = {}
         self.first_at = -1
         self.prep_last = -1
         self.prep_turn = []
@@ -1940,28 +1956,30 @@ class Controller(object):
     def retarget(self, names: set[str]) -> None:
         """Take a new target release for the members in names, such as a new
         version of their image. Each forgets its prepare state, that it was
-        let prepare and its turn to prepare: a prepare of the old target is
-        no prepare of the new one. A member in flight whose final report has
-        not counted is done for the old target at that report. Any other
-        member in flight keeps its release: one that reports in-progress
-        still upgrades, and start() takes back one that did not start its
-        run after a pause. A member that is released and done waits again,
-        with no promise: its release, its done time and its failure go, so
-        the members after it in its redundancy groups wait for it again. It
-        keeps the end of its upgrade (ran_until, ran_end), so that the
-        min-separation of its groups still counts from then when the next
-        answer of its device is up-to-date, and never from before then. A
-        member whose rollback failed stays as it is, released or not, and
-        keeps its final status when its report goes (lost_n()): only a later
-        final report, a new attempt or a removal clears it. A waiting member
-        keeps its promise. A member with a final status waits again when
-        that status goes, as the reports for the new target say."""
+        let prepare, an ask to prepare again and its turn to prepare: a
+        prepare of the old target is no prepare of the new one. A member in
+        flight whose final report has not counted is done for the old target
+        at that report. Any other member in flight keeps its release: one
+        that reports in-progress still upgrades, and start() takes back one
+        that did not start its run after a pause. A member that is released
+        and done waits again, with no promise: its release, its done time
+        and its failure go, so the members after it in its redundancy groups
+        wait for it again. It keeps the end of its upgrade (ran_until,
+        ran_end), so that the min-separation of its groups still counts from
+        then when the next answer of its device is up-to-date, and never
+        from before then. A member whose rollback failed stays as it is,
+        released or not, and keeps its final status when its report goes
+        (lost_n()): only a later final report, a new attempt or a removal
+        clears it. A waiting member keeps its promise. A member with a final
+        status waits again when that status goes, as the reports for the new
+        target say."""
         if len(names) == 0:
             return
         for name in names:
             self.prepare_state.pop(name)
             self.prepare_at.pop(name)
             self.prepare_from.pop(name)
+            self.prepare_now.pop(name)
             self.allowed.discard(name)
             k = self.known(name)
             if k >= 0:
@@ -1994,8 +2012,8 @@ class Controller(object):
     def drop(self, names: set[str]) -> None:
         """Forget all that the run knows of the devices in names, which left
         the campaign or have a new attempt: their release, their reports
-        and answers, their prepares and turns to prepare, and whether they
-        are done or failed.
+        and answers, their prepares, asks to prepare again and turns to
+        prepare, and whether they are done or failed.
         configure() alone keeps this for a device that leaves, so that its
         report still counts. A device that joins the campaign again, or that
         has a new attempt, is then a new member: it waits until it answers,
@@ -2015,6 +2033,7 @@ class Controller(object):
             self.prepare_state.pop(name)
             self.prepare_at.pop(name)
             self.prepare_from.pop(name)
+            self.prepare_now.pop(name)
             self.allowed.discard(name)
             k = self.known(name)
             if k < 0:
@@ -2344,14 +2363,33 @@ class Controller(object):
         a failed rollback (take_failing())."""
         return self.failure_budget >= 0 and self.failures > self.failure_budget
 
-    def report_prepare(self, name: str, state: ?str) -> None:
+    def report_prepare(self, name: str, state: ?str, at: int=-1) -> None:
         """Take the latest prepare state of a member for the campaign's
-        target: running, done or failed, or None when it reports none. It
+        target: running, done, retrying or failed, or None when it reports
+        none. A retrying prepare failed for a transient reason, and its
+        device tries it again. When a retrying prepare reports running at
+        the second at, 0 or later, it counts from then (prepare_from). It
         changes no release decision, so the quiet time stays."""
         if state is not None:
+            if at >= 0 and state == "running" and self.prepare_state.get(name) == "retrying":
+                self.prepare_from[name] = at
             self.prepare_state[name] = state
         else:
             self.prepare_state.pop(name)
+
+    def retry_prepare(self, name: str, t: int) -> None:
+        """Take that an operator asked the member name at the second t to
+        prepare again. let_again() lets it at once, as soon as the cap lets
+        it and outside the times without prepares, also after its deadline,
+        and it keeps the second it was first let. The first ask counts until
+        it is let, and its turn goes. The caller reports the prepare of the
+        new ask first, so a prepare of an earlier one no longer counts."""
+        k = self.known(name)
+        if k < 0:
+            return
+        if name not in self.prepare_now:
+            self.prepare_now[name] = t
+        self.prep_turn[k] = -1
 
     def report_last_boot(self, name: str, at: ?int) -> None:
         """Take when the device name last booted, by its clock, or None when
@@ -3404,6 +3442,7 @@ class Controller(object):
         c.prepare_at = {k: v for k, v in self.prepare_at.items()}
         c.prepare_from = {k: v for k, v in self.prepare_from.items()}
         c.allowed = copy_set(self.allowed)
+        c.prepare_now = {k: v for k, v in self.prepare_now.items()}
         c.first_at = self.first_at
         c.prep_last = self.prep_last
         c.prep_turn = self.prep_turn.copy()
@@ -4008,6 +4047,18 @@ class Controller(object):
             return dl.2
         return None
 
+    def late_from(self, name: str, deadline: int) -> int:
+        """The first second at which the member name, let prepare, is late
+        for its latest deadline, given in microseconds: the second after
+        the deadline when it reports its prepare retrying, and when it
+        reports no prepare, also no sooner than a debounce after it was let
+        (prepare_from, or else prepare_at)."""
+        first = deadline // MICRO + 1
+        if self.prepare_state.get(name) == "retrying":
+            return first
+        let = self.prepare_from.get_def(name, self.prepare_at.get_def(name, 0))
+        return imax(first, let + imax(1, self.debounce))
+
     def prepare_gate(self) -> bool:
         """True when members may be let prepare: the run is on, prepare is
         on, and no more members have failed than the failure budget."""
@@ -4105,10 +4156,11 @@ class Controller(object):
     def may_keep(self, name: str, t: int, stopped: bool) -> bool:
         """True when the member name may stay let prepare at t: it is in the
         campaign and not released, its latest report says that it needs
-        the upgrade, its prepare is not done or failed, t does not stop
-        every member (stopped, as stops_all() says), and the window
-        promised to it has not opened, or without a promise the first
-        window of its schedule that has not closed is not open."""
+        the upgrade, its prepare is not done or failed (a retrying prepare
+        keeps it), t does not stop every member (stopped, as stops_all()
+        says), and the window promised to it has not opened, or without a
+        promise the first window of its schedule that has not closed is not
+        open."""
         k = self.known(name)
         if k < 0 or name not in self.est:
             return False
@@ -4128,9 +4180,10 @@ class Controller(object):
         that report their prepare running, each from the latest second it
         was let while it reported no prepare (prepare_from, or else
         prepare_at), or else from t, for its expected prepare time. A member
-        let prepare that reports no prepare yet counts from then and not
-        before t: its prepare has not begun. A prepare whose expected
-        prepare time has passed at t is left out."""
+        let prepare that reports no prepare yet, or its prepare retrying,
+        counts from then and not before t: its prepare has not begun, or
+        has to run again. A prepare whose expected prepare time has passed
+        at t is left out."""
         now = copy_set(self.allowed)
         for name, st in self.prepare_state.items():
             if st == "running" and not self.is_released(name):
@@ -4138,7 +4191,8 @@ class Controller(object):
         out: dict[str, int] = {}
         for name in now:
             let = self.prepare_from.get_def(name, self.prepare_at.get_def(name, t))
-            if name not in self.prepare_state:
+            st = self.prepare_state.get(name)
+            if st is None or st == "retrying":
                 let = imax(let, t)
             if let + self.prepare_est.get_def(name, 1) > t:
                 out[name] = let
@@ -4281,7 +4335,8 @@ class Controller(object):
         prepare is on, no more members have failed than the failure budget,
         it is not released, it is up, its latest report says that it needs
         the upgrade, it has a promise, it was not let prepare before, it
-        reports no prepare, and it has deadlines (prepare_deadlines).
+        reports no prepare or its prepare retrying, and it has deadlines
+        (prepare_deadlines).
 
         The turns lie on free time (FreeTime): the time outside the times
         without prepares (prepare_blackouts), where an automatic
@@ -4310,11 +4365,17 @@ class Controller(object):
         turn.
 
         A member let prepare before that is no longer let and reports no
-        prepare waits to be let again. let_again() lets it at the first free
-        second from t at which its prepare keeps the bandwidth at or under
-        the cap, after the members let before it; its prepare counts from
-        then, before the turns. It cannot prepare in time when that second
-        is after its latest deadline: let_again no longer lets it."""
+        prepare or its prepare retrying waits to be let again. So does a
+        member that is up, that an operator asked to prepare again
+        (prepare_now), and that does not report the prepare of the ask done
+        or failed, first, by the second it asked. let_again() lets each
+        at the first free second from t at which its prepare keeps the
+        bandwidth at or under the cap, after the members let before it; its
+        prepare counts from then, before the turns. It cannot prepare in
+        time when that second is after its latest deadline, or for a member
+        that was asked, at or after the opening of the window promised to
+        it: let_again no longer lets it. A member let prepare that is late
+        (late_from()) cannot prepare in time either."""
         late: list[(int, str)] = []
         out: list[(int, str, int)] = []
         if not self.prepare_gate():
@@ -4331,22 +4392,38 @@ class Controller(object):
         # window, promise order, place, latest deadline, name, number)
         members: list[(int, int, int, int, int, str, int)] = []
         # The members that wait to be let again, as (when first let, name,
-        # latest deadline, place).
+        # latest deadline, place), and the members that an operator asked to
+        # prepare again, as (when first asked, name, the last microsecond
+        # before the window promised to it opens, place).
         relets: list[(int, str, int, int)] = []
+        asked: list[(int, str, int, int)] = []
         for p in range(len(self.order_n)):
             k = self.order_n[p]
-            if self.released[k] or self.down[k] or not self.answered[k] \
-               or self.final_at[k] != NO_TIME or self.promise(k, t) < 0:
+            if self.released[k] or not self.answered[k] or self.final_at[k] != NO_TIME \
+               or self.promise(k, t) < 0:
                 continue
             name = self.name_of(k)
-            if name in self.prepare_state:
-                continue
+            st = self.prepare_state.get(name)
+            waiting = True
+            if st is not None and st != "retrying":
+                waiting = False
             dl = self.prepare_deadlines(k, t)
+            if name in self.allowed:
+                if waiting and dl.0 and t >= self.late_from(name, dl.2):
+                    late.append((p, name))
+                continue
+            if name in self.prepare_now:
+                if not self.down[k] and dl.0 and st != "done" and st != "failed":
+                    asked.append((self.prepare_now[name], name,
+                                  self.windows[self.promised[k]].1 * MICRO - 1, p))
+                continue
+            if self.down[k]:
+                continue
             if name in self.prepare_at:
-                if name not in self.allowed and dl.0:
+                if waiting and dl.0:
                     relets.append((self.prepare_at[name], name, dl.2, p))
                 continue
-            if not dl.0:
+            if not waiting or not dl.0:
                 continue
             if first > dl.2:
                 late.append((p, name))
@@ -4358,10 +4435,10 @@ class Controller(object):
         # takes them, at the first free second, from the second the one
         # before it is let again, at which the cap lets it.
         again: list[(int, str)] = []
-        if len(relets) > 0:
+        if len(relets) > 0 or len(asked) > 0:
             sweep = Sweep(self.prepare_cap, running)
             at = (first + MICRO - 1) // MICRO
-            for e in sorted(relets):
+            for e in sorted(asked) + sorted(relets):
                 name = e.1
                 est = self.prepare_est.get_def(name, 1)
                 bw = self.prepare_bw(name)
@@ -4494,20 +4571,21 @@ class Controller(object):
         anything. The members let prepare start when they were first let,
         and each waiting member at the second its turn lets it, and not
         before t. Each waiting member counts from that start for its
-        expected prepare time, with the prepares that run now
-        (running_from) and those of the members that wait to be let again,
-        each from the second let_again() lets it: the most of them at once,
-        and the bandwidth over time and its peak, the sum of the bandwidths
-        of the prepares that run. Each member let prepare that does not
-        count from its start has in runs the second it counts from, or -1
-        when its prepare does not count. The members may prepare
-        between windows when prepare_between is True, or, when it is None
-        (automatic), when a member was let prepare, or let again while it
-        reported no prepare, or waits to be let again or has a turn, at a
-        second after the campaign's first window opens and outside every
-        window. The failed prepares are those of the members that wait for
-        their release: not released, and their latest report says that they
-        need the upgrade."""
+        expected prepare time, with the prepares that run now (running_from)
+        and those of the members that wait to be let again, each from the
+        second let_again() lets it: the most of them at once, and the
+        bandwidth over time and its peak, the sum of the bandwidths of the
+        prepares that run. Each member let prepare that does not count from
+        its start has in runs the second it counts from, or -1 when its
+        prepare does not count. A member that an operator asked to prepare
+        again and that was never let starts at the second let_again() lets
+        it. The members may prepare between windows when prepare_between is
+        True, or, when it is None (automatic), when a member was let
+        prepare, or let again while it reported no prepare, or waits to be
+        let again or has a turn, at a second after the campaign's first
+        window opens and outside every window. The failed prepares are those
+        of the members that wait for their release: not released, and their
+        latest report says that they need the upgrade."""
         return self.prepares_of(t, self.turns(t))
 
     def prepares_of(self, t: int,
@@ -4519,6 +4597,9 @@ class Controller(object):
             starts[name] = at
         for e in tr.0:
             starts[e.1] = imax(t, e.2)
+        for e in tr.2:
+            if e.1 not in starts:
+                starts[e.1] = e.0
         # The second from which each prepare that runs now, or that waits to
         # be let again, counts, by member.
         counted = self.running_from(t)
@@ -4527,7 +4608,8 @@ class Controller(object):
         runs: dict[str, int] = {}
         for name, at in self.prepare_at.items():
             x = counted.get_def(name, -1)
-            if x != at and (x >= 0 or name not in self.prepare_state):
+            st = self.prepare_state.get(name)
+            if x != at and (x >= 0 or st is None or st == "retrying"):
                 runs[name] = x
         # Each prepare as (start, end, bandwidth), in microseconds.
         spans: list[(int, int, int)] = []
@@ -4627,31 +4709,64 @@ class Controller(object):
         self.allowed = keep
 
     def let_again(self, t: int) -> int:
-        """Let prepare again each member let prepare in the run that is no
-        longer let, and that reports no prepare or its prepare running,
-        when it could be let at a turn at t: the run is on, prepare is on,
-        no more members have failed than the failure budget, it may stay
-        let (may_keep), t is at or before its latest deadline, t lies inside
-        no time without prepares, and a member that reports no prepare
-        keeps the bandwidth at or under the cap with the prepares that run.
-        The members go in the order they were first let, and each keeps
-        that time; a member that reports no prepare counts from t
-        (prepare_from). So a member whose device had not begun its prepare
-        when a window opened or closed, the run paused or a hold of the
-        failure budget began, or whose answer or prepare report went and
-        came back, prepares when it may again. Return the first end of a
-        prepare that runs while the cap holds such a member, or -1."""
-        if len(self.prepare_at) == 0 or not self.prepare_gate() or self.blackout_end(t) >= 0:
+        """Let prepare each member that an operator asked to prepare again
+        (retry_prepare()), and let prepare again each member let prepare in
+        the run that is no longer let, and that reports no prepare, its
+        prepare running or its prepare retrying, when it could be let at a
+        turn at t: the run is on, prepare is on, no more members have failed
+        than the failure budget, it may stay let (may_keep), t is at or
+        before its latest deadline, t lies inside no time without prepares,
+        and a member that reports no prepare or its prepare retrying keeps
+        the bandwidth at or under the cap with the prepares that run.
+
+        First, a member that was asked is no longer asked when it is let
+        already, is released, has a final status, or reports the prepare of
+        the ask done or failed, also when no member may be let: its device
+        prepares once for each prepare attempt. The members that were asked
+        go first, by the second they asked, and also after their deadline,
+        but not while they are down. Each counts from t (prepare_from),
+        keeps the second it was first let, or is let first at t, and is no
+        longer asked. Then the members let before go in the order they were
+        first let, and each keeps that time; a member that reports no
+        prepare or its prepare retrying counts from t. So a member whose
+        device had not begun its prepare, or tries it again, when a window
+        opened or closed, the run paused or a hold of the failure budget
+        began, or whose answer or prepare report went and came back,
+        prepares when it may again. Return the first end of a prepare that
+        runs while the cap holds such a member, or -1."""
+        for name in list(self.prepare_now.keys()):
+            k = self.known(name)
+            st = self.prepare_state.get(name)
+            if k < 0 or self.released[k] or self.final_at[k] != NO_TIME or name in self.allowed \
+               or st == "done" or st == "failed":
+                self.prepare_now.pop(name)
+        if (len(self.prepare_at) == 0 and len(self.prepare_now) == 0) \
+           or not self.prepare_gate() or self.blackout_end(t) >= 0:
             return -1
         stopped = self.stops_all(t)
         sweep = Sweep(self.prepare_cap, self.running_spans(t))
         wake = -1
+        for e in sorted([(at, name) for name, at in self.prepare_now.items()]):
+            name = e.1
+            k = self.known(name)
+            if self.down[k] or not self.may_keep(name, t, stopped):
+                continue
+            bw = self.prepare_bw(name)
+            if not sweep.fits(t * MICRO, bw):
+                wake = earliest(wake, (sweep.next_end() + MICRO - 1) // MICRO)
+                continue
+            sweep.add((t + self.prepare_est.get_def(name, 1)) * MICRO, bw)
+            self.allowed.add(name)
+            if name not in self.prepare_at:
+                self.prepare_at[name] = t
+            self.prepare_from[name] = t
+            self.prepare_now.pop(name)
         for e in sorted([(at, name) for name, at in self.prepare_at.items()]):
             name = e.1
-            if name in self.allowed:
+            if name in self.allowed or name in self.prepare_now:
                 continue
             st = self.prepare_state.get(name)
-            if st is not None and st != "running":
+            if st == "done" or st == "failed":
                 continue
             if not self.may_keep(name, t, stopped):
                 continue
@@ -4659,7 +4774,7 @@ class Controller(object):
             dl = self.prepare_deadlines(k, t)
             if not dl.0 or t * MICRO > dl.2:
                 continue
-            if st is None:
+            if st is None or st == "retrying":
                 bw = self.prepare_bw(name)
                 if not sweep.fits(t * MICRO, bw):
                     wake = earliest(wake, (sweep.next_end() + MICRO - 1) // MICRO)
@@ -4692,9 +4807,11 @@ class Controller(object):
         left; while a member is let, also the next opening of a window of
         prepare_windows() without prepare_during, and its next close with
         prepare_between False; the end of the time without prepares that t
-        lies inside while a member waits to be let again; and the first end
-        of a prepare while the cap holds a member that waits to be let
-        again. It first keeps the campaign's first window (keep_first())."""
+        lies inside while a member waits to be let again or an operator
+        asked a member to prepare again; the first end of a prepare while
+        the cap holds such a member; and the first second at which a member
+        let prepare is late (late_from()). It first keeps the campaign's
+        first window (keep_first())."""
         self.keep_first(t)
         self.revoke_prepares(t)
         wake = self.let_again(t)
@@ -4726,13 +4843,23 @@ class Controller(object):
                         wake = earliest(wake, w.1)
             blocked = self.blackout_end(t)
             if blocked >= 0:
-                for name in self.prepare_at.keys():
+                for name in list(self.prepare_at.keys()) + list(self.prepare_now.keys()):
                     k = self.known(name)
                     st = self.prepare_state.get(name)
-                    if name not in self.allowed and (st is None or st == "running") \
-                       and k >= 0 and self.waits(k) and self.answered[k]:
+                    if name not in self.allowed and k >= 0 and self.waits(k) \
+                       and self.answered[k] \
+                       and (name in self.prepare_now or (st != "done" and st != "failed")):
                         wake = earliest(wake, blocked)
                         break
+            for name in self.allowed:
+                k = self.known(name)
+                st = self.prepare_state.get(name)
+                if k >= 0 and (st is None or st == "retrying"):
+                    dl = self.prepare_deadlines(k, t)
+                    if dl.0:
+                        late = self.late_from(name, dl.2)
+                        if late > t:
+                            wake = earliest(wake, late)
         if next_turn < 0 and not self.over_budget():
             self.prep_last = -1
         return (wake, (left, tr.1, tr.2))

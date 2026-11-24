@@ -5,7 +5,7 @@ import {
   CAMPAIGN_SETTINGS,
   parseCampaignConfigs,
   parseDeviceStatusEntry,
-  parseMemberImage,
+  parseMember,
   parseStateNode,
   planStartOf,
   planStartsPath,
@@ -19,7 +19,7 @@ import {
 // each plan.
 async function inCampaign(
   config: CampaignConfig,
-  image: string,
+  member: { image: string; prepareAttempt: number },
   device: string,
   fetch: typeof globalThis.fetch
 ): Promise<DeviceCampaign> {
@@ -34,7 +34,9 @@ async function inCampaign(
     adminState: config.adminState,
     runSince: parseStateNode(since)?.runSince ?? null,
     defaultSchedule: config.defaultSchedule,
-    image,
+    image: member.image,
+    allowStaging: config.allowStaging,
+    prepareAttempt: member.prepareAttempt,
     row: parseDeviceStatusEntry(status, device),
     start: planStartOf(plan, device)
   };
@@ -45,19 +47,19 @@ async function inCampaign(
 export async function loadCampaigns(name: string, fetch: typeof globalThis.fetch) {
   try {
     const configs = parseCampaignConfigs(await restconfGetCachedOrNull<unknown>(CAMPAIGN_SETTINGS, fetch));
-    const images = await Promise.all(
+    const members = await Promise.all(
       configs.map(async (c) => {
         const entry = getListEntryPath(CAMPAIGN_LIST_ROOT, c.name);
         const path = `${getListEntryPath(`${entry}/device`, name)}?content=config`;
-        return parseMemberImage(await restconfGetCachedOrNull<unknown>(path, fetch));
+        return parseMember(await restconfGetCachedOrNull<unknown>(path, fetch));
       })
     );
-    const memberOf: { config: CampaignConfig; image: string }[] = [];
+    const memberOf: { config: CampaignConfig; member: { image: string; prepareAttempt: number } }[] = [];
     configs.forEach((config, i) => {
-      const image = images[i];
-      if (image !== null) memberOf.push({ config, image });
+      const member = members[i];
+      if (member !== null) memberOf.push({ config, member });
     });
-    const campaigns = await Promise.all(memberOf.map((m) => inCampaign(m.config, m.image, name, fetch)));
+    const campaigns = await Promise.all(memberOf.map((m) => inCampaign(m.config, m.member, name, fetch)));
     return { campaigns, loadError: '' };
   } catch (loadError) {
     return { campaigns: [] as DeviceCampaign[], loadError: errorText(loadError, 'Failed to load the campaigns.') };
@@ -78,9 +80,9 @@ export async function loadDeviceCampaign(
     if (!config) return { campaign: null, exists: false, loadError: '' };
     const entry = getListEntryPath(CAMPAIGN_LIST_ROOT, campaign);
     const path = `${getListEntryPath(`${entry}/device`, device)}?content=config`;
-    const image = parseMemberImage(await restconfGetCachedOrNull<unknown>(path, fetch));
-    if (image === null) return { campaign: null, exists: true, loadError: '' };
-    return { campaign: await inCampaign(config, image, device, fetch), exists: true, loadError: '' };
+    const member = parseMember(await restconfGetCachedOrNull<unknown>(path, fetch));
+    if (member === null) return { campaign: null, exists: true, loadError: '' };
+    return { campaign: await inCampaign(config, member, device, fetch), exists: true, loadError: '' };
   } catch (loadError) {
     return { campaign: null, exists: false, loadError: errorText(loadError, 'Failed to load the campaign.') };
   }
