@@ -250,6 +250,11 @@ dev.debug.log_level = i.debug.log_level
 
 A new level applies without a reconnect.
 
+`GET /device/<name>/log-entries` reads the file over HTTP, filtered by level
+and text, and follows what the device writes; see the
+[HTTP inspection API](http-api.md). The Fleet
+Manager web UI shows it on the device page, where the level can be set too.
+
 ## RFS models still define the service-specific southbound data
 
 The built-in device list already comes from the StratoWeave RFS schema. Your

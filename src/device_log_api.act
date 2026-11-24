@@ -1,0 +1,432 @@
+"""The device log route, GET /device/<name>/log-entries: the newest messages
+in the log file of a device, older ones a page at a time, and the ones
+written since an earlier answer.
+
+The route reads the file when it is asked, so a log that nobody looks at
+costs nothing. A device that another StratoWeave system manages, like a
+fleet device on a flotilla, has its log file there, and the request goes on
+to that system's HTTP server.
+
+Query parameters:
+
+```text
+level   the levels to return, as error,warning,info,debug or trace, comma
+        separated; all without it
+q       only lines that hold this text, in any case
+limit   the most entries to return: 200 without it, at most 1000
+before  the start of an earlier answer: the entries before it
+after   the end of an earlier answer: the entries written since
+```
+
+The answer:
+
+```json
+{"entries": [...], "start": "<cursor>", "end": "<cursor>", "gap": false,
+ "level": "warning", "counts": {"error": 2, "warning": 1}}
+```
+
+entries are oldest first, each the object that the json log format writes
+for the line; see logs.parse_line. start asks for older entries, and is null
+when there are none. end asks for newer entries. gap is true when entries
+since after are missing: more than limit matched, or the files rotated past
+it. level is the level the device logs at. counts has, for each level, the
+lines with q that the answer read, whether level returns them or not, so
+together they count the messages in the time the entries span.
+
+A level takes in the levels the formatters write between it and the next:
+error has emerg, alert and crit too, info has notice and debug has verb.
+
+A cursor is the inode of a file and an offset in it. Rotation renames a
+file, so a cursor follows its lines to <name>.log.1 and on.
+"""
+
+import file
+import http_router
+import logging
+import net
+import std.http
+import std.json
+import std.uri
+
+import device as swdev
+import logs as swlogs
+
+
+DEFAULT_LIMIT = 200
+MAX_LIMIT = 1000
+# One request reads at most this many bytes of lines, then answers with what
+# it found and a start to go on from.
+MAX_SCAN = 33554432
+# Seconds to wait for the system that a request goes on to.
+FORWARD_TIMEOUT = 15.0
+
+
+def _reply(respond: proc(int, dict[str, str], bytes) -> None, status: int, body: dict[str, ?value]):
+    respond(status, {"Content-Type": "application/json"}, std.json.encode(body).encode())
+
+
+class _File(object):
+    """The log file of a device or one of its rotated files."""
+    path: str
+    ino: int
+    size: int
+
+    def __init__(self, path: str, ino: int, size: int):
+        self.path = path
+        self.ino = ino
+        self.size = size
+
+
+class _Moved(Exception):
+    """A file was rotated while it was read."""
+    pass
+
+
+def _cursor(f: _File, offset: int) -> str:
+    return f"{f.ino}:{offset}"
+
+
+def parse_cursor(text: str) -> (int, int):
+    """Return the inode and the offset of a cursor. Raise ValueError for text
+    that is not a cursor."""
+    parts = text.split(":")
+    if len(parts) == 2:
+        try:
+            ino = int(parts[0])
+            offset = int(parts[1])
+            if ino >= 0 and offset >= 0:
+                return (ino, offset)
+        except ValueError:
+            pass
+    raise ValueError(f"Invalid cursor '{text}'")
+
+
+def _find(files: list[_File], ino: int) -> int:
+    for i in range(len(files)):
+        if files[i].ino == ino:
+            return i
+    return -1
+
+
+def _complete(content: bytes, end: int) -> int:
+    """Return where the last whole line at or before end ends."""
+    return content.rfind(b"\n", 0, end) + 1
+
+
+def level_group(level: int) -> int:
+    """Return the level, of those a filter names, that takes in level."""
+    if level <= logging.ERR:
+        return logging.ERR
+    if level == logging.NOTICE:
+        return logging.INFO
+    if level == logging.VERBOSE:
+        return logging.DEBUG
+    return level
+
+
+def parse_levels(text: str) -> set[int]:
+    """Return the levels of a comma separated list of level names. Raise
+    ValueError for a name that is not a level, or off."""
+    levels: set[int] = set()
+    for name in text.split(","):
+        level = swlogs.parse_level(name.strip())
+        if level == logging.OFF:
+            raise ValueError("Invalid level 'off': name the levels to return")
+        levels.add(level_group(level))
+    return levels
+
+
+def match(raw: bytes, levels: ?set[int], text: str) -> (?int, ?dict[str, ?value]):
+    """Read a line that holds text, which must be in lower case. Return the
+    level it counts under, and its entry when levels is None or has that
+    level. A line without text gives neither. A line that is not a log line
+    counts under no level and is kept, with the line as its message."""
+    if len(raw) == 0:
+        return (None, None)
+    line = ""
+    try:
+        line = raw.decode()
+    except Exception:
+        return (None, None)
+    if text != "" and text not in line.lower():
+        return (None, None)
+    group: ?int = None
+    line_level = swlogs.line_level(line)
+    if line_level is not None:
+        g = level_group(line_level)
+        if levels is not None and g not in levels:
+            return (g, None)
+        group = g
+    entry = swlogs.parse_line(line)
+    if entry is None:
+        entry = {"time": None, "level": None, "logger": "", "actor": "", "actor_id": None, "msg": line}
+    return (group, entry)
+
+
+def _counts(counts: dict[int, int]) -> dict[str, ?value]:
+    return {swlogs.level_name(level): n for level, n in counts.items()}
+
+
+actor DeviceLogApi(device_logs: swlogs.DeviceLogs, devices: swdev.DeviceRegistry,
+                   connect_cap: ?net.TCPConnectCap=None,
+                   remote_device_http: ?proc(str) -> ?(str, int)=None,
+                   log_handler: ?logging.Handler=None):
+    """Answers the requests that install() forwards.
+
+    remote_device_http gives, for a device that is not in devices, the
+    address and HTTP port of the StratoWeave system that manages it, or
+    None. Requests about such a device go on to that system.
+    """
+    _log = logging.Logger(log_handler)
+    fs = file.FS(device_logs.cap)
+    rcap = file.ReadFileCap(device_logs.cap)
+
+    def _files(name: str) -> list[_File]:
+        """The log file of the device and the rotated ones that exist, newest
+        first."""
+        base = file.join_path([device_logs.dir, "devices", swlogs.device_file_name(name)])
+        files: list[_File] = []
+        for i in range(device_logs.rotate_keep + 1):
+            path = base if i == 0 else f"{base}.{i}"
+            try:
+                st = fs.stat(path)
+                files.append(_File(path, int(st.ino), int(st.size)))
+            except OSError:
+                pass
+        return files
+
+    def _read(f: _File) -> bytes:
+        """Read f. Raise _Moved when it was rotated since it was listed."""
+        data = b""
+        try:
+            rf = file.ReadFile(rcap, f.path)
+            try:
+                data = rf.read()
+            finally:
+                rf.close()
+            if int(fs.stat(f.path).ino) == f.ino:
+                return data
+        except OSError:
+            pass
+        raise _Moved("rotated while read")
+
+    def older(name: str, upto: ?(int, int), levels: ?set[int], text: str, limit: int) -> dict[str, ?value]:
+        """Return the newest entries, or with upto the newest before that
+        cursor."""
+        files = _files(name)
+        idx = 0
+        end: ?int = None
+        if upto is not None:
+            idx = _find(files, upto.0)
+            end = upto.1
+        found: list[dict[str, ?value]] = []
+        counts: dict[int, int] = {}
+        start: ?str = None
+        end_cursor = "0:0" if len(files) == 0 else ""
+        scanned = 0
+        while idx >= 0 and idx < len(files):
+            f = files[idx]
+            if end is not None and end == 0:
+                idx += 1
+                end = None
+                continue
+            content = _read(f)
+            limit_end = len(content)
+            if end is not None and end < limit_end:
+                limit_end = end
+            stop = _complete(content, limit_end)
+            if idx == 0 and upto is None:
+                end_cursor = _cursor(f, stop)
+            pos = stop
+            while pos > 0 and len(found) < limit:
+                begin = content.rfind(b"\n", 0, pos - 1) + 1
+                group, entry = match(content[begin:pos - 1], levels, text)
+                if group is not None:
+                    counts[group] = counts.get_def(group, 0) + 1
+                if entry is not None:
+                    found.append(entry)
+                pos = begin
+            scanned += stop - pos
+            if len(found) >= limit or scanned >= MAX_SCAN:
+                if pos > 0 or idx + 1 < len(files):
+                    start = _cursor(f, pos)
+                break
+            idx += 1
+            end = None
+        oldest_first = [found[i] for i in range(len(found) - 1, -1, -1)]
+        return {"entries": oldest_first, "start": start, "end": end_cursor if end_cursor != "" else None,
+                "gap": False, "counts": _counts(counts)}
+
+    def newer(name: str, since: (int, int), levels: ?set[int], text: str, limit: int) -> dict[str, ?value]:
+        """Return the entries written since the cursor since."""
+        files = _files(name)
+        if len(files) == 0:
+            return {"entries": [], "start": None, "end": "0:0", "gap": False, "counts": {}}
+        idx = _find(files, since.0)
+        offset = since.1
+        gap = False
+        if idx < 0:
+            # The cursor's file rotated away, or there was no file then.
+            gap = since.0 != 0
+            idx = 0
+            offset = 0
+        elif idx == 0 and offset == files[0].size:
+            return {"entries": [], "start": None, "end": _cursor(files[0], offset), "gap": False, "counts": {}}
+        found: list[dict[str, ?value]] = []
+        counts: dict[int, int] = {}
+        end_cursor = ""
+        i = idx
+        while i >= 0:
+            f = files[i]
+            content = _read(f)
+            stop = _complete(content, len(content))
+            pos = 0
+            if i == idx:
+                if offset <= stop:
+                    pos = offset
+                else:
+                    # The file was emptied and written again.
+                    gap = True
+            while pos < stop:
+                nl = content.find(b"\n", pos)
+                group, entry = match(content[pos:nl], levels, text)
+                if group is not None:
+                    counts[group] = counts.get_def(group, 0) + 1
+                if entry is not None:
+                    found.append(entry)
+                pos = nl + 1
+            if i == 0:
+                end_cursor = _cursor(f, stop)
+            i -= 1
+        if len(found) > limit:
+            found = found[len(found) - limit:]
+            gap = True
+        return {"entries": found, "start": None, "end": end_cursor, "gap": gap, "counts": _counts(counts)}
+
+    def entries(ctx: http_router.Context, respond: proc(int, dict[str, str], bytes) -> None):
+        # The router keeps the percent escapes of the path. A forwarded
+        # request goes on as it came, escapes and all.
+        name = ""
+        try:
+            name = std.uri.unquote(ctx.param("name"))
+        except ValueError as e:
+            _reply(respond, 400, {"error": f"Invalid device name: {e.error_message}"})
+            return
+        dev = devices.get(name)
+        if dev is not None:
+            _local(name, dev, ctx, respond)
+            return
+        remote = remote_device_http
+        cap = connect_cap
+        if remote is not None and cap is not None:
+            target = remote(name)
+            if target is not None:
+                _Forward(cap, target.0, target.1, ctx.raw_path, respond, _log)
+                return
+        _reply(respond, 404, {"error": f"No device named {name}"})
+
+    def _local(name: str, dev: swdev.DeviceMgr, ctx: http_router.Context,
+               respond: proc(int, dict[str, str], bytes) -> None):
+        if device_logs.dir == "":
+            _reply(respond, 404, {"error": "This system writes no log files: its log.dir setting is empty"})
+            return
+
+        levels: ?set[int] = None
+        text = ""
+        limit = DEFAULT_LIMIT
+        upto: ?(int, int) = None
+        since: ?(int, int) = None
+        try:
+            level_text = ctx.query_param("level")
+            if level_text != "":
+                levels = parse_levels(level_text)
+            text = ctx.query_param("q").lower()
+            limit_text = ctx.query_param("limit")
+            if limit_text != "":
+                limit = int(limit_text)
+                if limit < 1 or limit > MAX_LIMIT:
+                    raise ValueError(f"Invalid limit {limit_text}: use 1 to {MAX_LIMIT}")
+            before_text = ctx.query_param("before")
+            if before_text != "":
+                upto = parse_cursor(before_text)
+            after_text = ctx.query_param("after")
+            if after_text != "":
+                since = parse_cursor(after_text)
+        except ValueError as e:
+            _reply(respond, 400, {"error": e.error_message})
+            return
+        if upto is not None and since is not None:
+            _reply(respond, 400, {"error": "Give before or after, not both"})
+            return
+
+        # A rotation while the files are read moves the lines; read again.
+        for attempt in range(2):
+            try:
+                body: dict[str, ?value] = {}
+                if since is not None:
+                    body = newer(name, since, levels, text, limit)
+                else:
+                    body = older(name, upto, levels, text, limit)
+                body["level"] = swlogs.level_name(dev.get_log_level())
+                _reply(respond, 200, body)
+                return
+            except _Moved:
+                pass
+        _reply(respond, 503, {"error": "The log file rotated while it was read; ask again"})
+
+
+actor _Forward(cap: net.TCPConnectCap, host: str, port: int, path: str,
+               respond: proc(int, dict[str, str], bytes) -> None, log: logging.Logger):
+    """Send one GET of path on to the HTTP server at host and port, and its
+    answer back with respond."""
+    var answered = False
+    var sent = False
+
+    def _answer(status: int, headers: dict[str, str], body: bytes):
+        if not answered:
+            answered = True
+            respond(status, headers, body)
+
+    def _on_response(c: std.http.Client, r: std.http.Response):
+        headers: dict[str, str] = {}
+        for k, v in r.headers.items():
+            if k.lower() == "content-type":
+                headers["Content-Type"] = v
+        _answer(r.status, headers, r.body)
+        c.close()
+
+    def _on_connect(c: std.http.Client):
+        # The client connects again after a response that closes the
+        # connection; the request goes once.
+        if not sent:
+            sent = True
+            c.get(path, _on_response)
+
+    def _on_error(c: std.http.Client, error: str):
+        if not answered:
+            log.warning("Device log request not forwarded", {"host": host, "port": port, "error": error})
+            _reply(_answer, 502, {"error": f"No answer from {host} port {port}, which manages the device: {error}"})
+        c.close()
+
+    client = std.http.Client(cap, host, _on_connect, _on_error, scheme="http", port=port, compress=False)
+
+    def _timeout():
+        if not answered:
+            log.warning("Device log request timed out", {"host": host, "port": port})
+            _reply(_answer, 504, {"error": f"No answer from {host} port {port}, which manages the device"})
+            client.close()
+
+    proc def __startup__():
+        after FORWARD_TIMEOUT: _timeout()
+
+
+def install(router: http_router.Router, api: DeviceLogApi):
+    """Add GET /device/<name>/log-entries to router.
+
+    The handler only sends each request on to api, so the HTTP server does
+    not wait while a file is read.
+    """
+    def entries(ctx: http_router.Context, respond: proc(int, dict[str, str], bytes) -> None):
+        api.entries(ctx, respond)
+
+    router.get("/device/{{name}}/log-entries", entries)

@@ -18,6 +18,8 @@ file descriptor, and a file that logrotate moved away is created again on
 the next write. A file that reaches the rotation size is renamed to
 <name>.log.1, the previous <name>.log.1 to <name>.log.2 and so on.
 
+parse_line reads a line of either format back, for the device log route.
+
 The parts marked "TODO: upstream" belong in Acton's standard library. When
 they are there, this module keeps only the settings and the setup of a
 StratoWeave system.
@@ -226,6 +228,190 @@ def make_formatter(format: str) -> logging.Formatter:
     if format == "json":
         return JsonFormatter()
     return TextFormatter()
+
+
+def label_level(label: str) -> ?int:
+    """Return the level of a label that the formatters write, such as "WARN"
+    in a text line or "warn" in a JSON line."""
+    upper = label.upper()
+    for level, name in logging.lvl_names.items():
+        if name == upper:
+            return level
+    return None
+
+
+def line_level(line: str) -> ?int:
+    """Return the level of a line that TextFormatter or JsonFormatter wrote,
+    without reading the rest of the line."""
+    if line.startswith("{{"):
+        i = line.find("\"level\":\"")
+        if i < 0:
+            return None
+        start = i + 9
+        end = line.find("\"", start)
+        return label_level(line[start:end]) if end > start else None
+    sp = line.find(" ")
+    if sp < 1 or len(line) < sp + 8:
+        return None
+    return label_level(line[sp + 1:sp + 8].strip())
+
+
+_DIGITS = "0123456789"
+_KEY_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-"
+
+
+def _is_int(s: str) -> bool:
+    digits = s[1:] if s.startswith("-") else s
+    if digits == "":
+        return False
+    for c in digits:
+        if c not in _DIGITS:
+            return False
+    return True
+
+
+def _unescape(s: str) -> str:
+    """Undo _escape(s, True)."""
+    if "\\" not in s:
+        return s
+    parts: list[str] = []
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c != "\\" or i + 1 == len(s):
+            parts.append(c)
+            i += 1
+            continue
+        n = s[i + 1]
+        if n == "n":
+            parts.append("\n")
+        elif n == "r":
+            parts.append("\r")
+        elif n == "t":
+            parts.append("\t")
+        elif n == "x" and i + 3 < len(s):
+            hi = _HEX.find(s[i + 2])
+            lo = _HEX.find(s[i + 3])
+            if hi >= 0 and lo >= 0:
+                parts.append(chr(hi * 16 + lo))
+                i += 4
+                continue
+            parts.append(n)
+        else:
+            parts.append(n)
+        i += 2
+    return "".join(parts)
+
+
+def _parse_pairs(s: str, start: int) -> ?dict[str, ?value]:
+    """Read s from start as the " key=value" pairs that TextFormatter writes
+    after a message. Return None when that part of s is anything else."""
+    data: dict[str, ?value] = {}
+    n = len(s)
+    i = start
+    while i < n:
+        if s[i] != " ":
+            return None
+        i += 1
+        k = i
+        while i < n and s[i] in _KEY_CHARS:
+            i += 1
+        if i == k or i == n or s[i] != "=":
+            return None
+        key = s[k:i]
+        i += 1
+        if i < n and s[i] == "\"":
+            i += 1
+            v = i
+            while i < n and s[i] != "\"":
+                if s[i] == "\\":
+                    i += 1
+                i += 1
+            if i >= n:
+                return None
+            data[key] = _unescape(s[v:i])
+            i += 1
+        else:
+            v = i
+            while i < n and s[i] != " ":
+                if s[i] == "=" or s[i] == "\"":
+                    return None
+                i += 1
+            if i == v:
+                return None
+            data[key] = s[v:i]
+    return data
+
+
+def _split_message(body: str) -> (?str, ?dict[str, ?value]):
+    """Split what follows the actor in a text line into the message and the
+    data. The data starts at the first space from where the rest of the line
+    is all key=value pairs, so a message that ends in one, like "set a=b",
+    is read as data."""
+    if body == "":
+        return (None, None)
+    if not body.startswith(" "):
+        return (body, None)
+    i = 0
+    while i >= 0:
+        if i + 1 < len(body) and body[i + 1] in _KEY_CHARS:
+            data = _parse_pairs(body, i)
+            if data is not None:
+                return (body[1:i] if i > 0 else None, data)
+        i = body.find(" ", i + 1)
+    return (body[1:], None)
+
+
+def _parse_text(line: str) -> ?dict[str, ?value]:
+    sp = line.find(" ")
+    if sp < 1 or len(line) < sp + 8 or line[0] not in _DIGITS:
+        return None
+    label = line[sp + 1:sp + 8].strip()
+    if label_level(label) is None:
+        return None
+    rest = line[sp + 8:]
+    # The actor, <class>[<id>]:, follows the handler path and ": " when the
+    # message has a path.
+    j = rest.find("]:")
+    while j >= 0:
+        k = rest.rfind("[", 0, j)
+        if k >= 0 and _is_int(rest[k + 1:j]):
+            sep = rest.rfind(": ", 0, k)
+            begin = sep + 2 if sep >= 0 else 0
+            actor = rest[begin:k]
+            if " " not in actor:
+                msg, data = _split_message(rest[j + 2:])
+                entry: dict[str, ?value] = {
+                    "time": line[:sp],
+                    "level": label.lower(),
+                    "logger": rest[:sep] if sep >= 0 else "",
+                    "actor": actor,
+                    "actor_id": int(rest[k + 1:j]),
+                    "msg": msg,
+                }
+                if data is not None:
+                    entry["data"] = data
+                return entry
+        j = rest.find("]:", j + 1)
+    return None
+
+
+def parse_line(line: str) -> ?dict[str, ?value]:
+    """Read back a line that TextFormatter or JsonFormatter wrote, as the
+    object that JsonFormatter writes. Return None for any other line.
+
+    A text line gives every data value as a string, and its message as
+    written, with line breaks and control characters still escaped.
+    """
+    if line.startswith("{{"):
+        try:
+            obj = std.json.decode(line)
+            if isinstance(obj.get("time"), str) and isinstance(obj.get("level"), str):
+                return obj
+        except Exception:
+            pass
+        return None
+    return _parse_text(line)
 
 
 def _open_append(cap: file.FileCap, path: str) -> file.WriteFile:

@@ -3,6 +3,7 @@
   import { invalidate } from '$app/navigation';
 
   import ConnectionDot from '#lib/software/ConnectionDot.svelte';
+  import DeviceLog from '#lib/software/DeviceLog.svelte';
   import DevicePicture from '#lib/software/DevicePicture.svelte';
   import HeldText from '#lib/software/HeldText.svelte';
   import JobProgress from '#lib/software/JobProgress.svelte';
@@ -216,6 +217,12 @@
       </div>
     {/each}
   </section>
+
+  {#if device !== null}
+    {#key device.name}
+      <DeviceLog name={device.name} />
+    {/key}
+  {/if}
 {/if}
 
 <style>
