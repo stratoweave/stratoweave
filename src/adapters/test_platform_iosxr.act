@@ -15,6 +15,13 @@ import adapters.platform_iosxr_yang as xr_yang
 from adapters.adapter import ModCap
 
 
+# 2026-11-19T08:12:40Z
+BOOT = 1795075960
+# 4 days, 14 hours and 40 seconds after BOOT, when the device reads its clock.
+CLOCK = 1795472000
+UPTIME = 396040
+
+
 def _show(p: ?swdev.Platform) -> str:
     if p is not None:
         return "{p.os} {p.version} {p.model} {p.serial_number}"
@@ -34,6 +41,57 @@ def _racks(racks: list[(name: str, model: str, serial: str)]) -> ygdata.Node:
     for r in racks:
         entries += "<rack><name>{r.name}</name><attributes><inv-basic-bag><model-name>{r.model}</model-name><serial-number>{r.serial}</serial-number></inv-basic-bag></attributes></rack>"
     return _data("<inventory xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-invmgr-oper\"><racks>{entries}</racks></inventory>")
+
+
+def _time(clock: str, uptime: str) -> ygdata.Node:
+    """A reply to the system-time get with these clock fields and uptime."""
+    return _data("<system-time xmlns=\"http://cisco.com/ns/yang/Cisco-IOS-XR-shellutil-oper\"><clock>{clock}</clock><uptime><host-name>r1</host-name>{uptime}</uptime></system-time>")
+
+
+def _clock(hour: int, time_zone: str) -> str:
+    """The clock on 2026-11-23 at hour:13:20 in time_zone."""
+    return "<year>2026</year><month>11</month><day>23</day><hour>{hour}</hour><minute>13</minute><second>20</second><millisecond>123</millisecond><wday>1</wday><time-zone>{time_zone}</time-zone><time-source>ntp</time-source>"
+
+
+def _test_last_boot_from_reply():
+    """The uptime before the device's clock when the clock is in UTC, else
+    before our clock when the reply came, which adds the time the reply took
+    to the tolerance."""
+    up = "<uptime>{UPTIME}</uptime>"
+    ours = iosxr.ROUNDING + swdev.REPLY_DELAY
+    no_second = "<year>2026</year><month>11</month><day>23</day><hour>22</hour><minute>13</minute><time-zone>UTC</time-zone>"
+    month_13 = "<year>2026</year><month>13</month><day>23</day><hour>22</hour><minute>13</minute><second>20</second><time-zone>UTC</time-zone>"
+    cases: list[(label: str, reply: ?ygdata.Node, boot: ?int, tolerance: int)] = [
+        (label="utc clock", reply=_time(_clock(22, "UTC"), up), boot=BOOT, tolerance=iosxr.ROUNDING),
+        (label="other time zone", reply=_time(_clock(23, "CET"), up), boot=BOOT + 3, tolerance=ours),
+        (label="no time zone", reply=_time(_clock(22, ""), up), boot=BOOT + 3, tolerance=ours),
+        (label="no clock", reply=_time("", up), boot=BOOT + 3, tolerance=ours),
+        (label="clock without seconds", reply=_time(no_second, up), boot=BOOT + 3, tolerance=ours),
+        (label="month out of range", reply=_time(month_13, up), boot=BOOT + 3, tolerance=ours),
+        (label="no uptime", reply=_time(_clock(22, "UTC"), ""), boot=None, tolerance=0),
+        (label="get failed", reply=None, boot=None, tolerance=0),
+    ]
+    for c in cases:
+        # Our clock is 3 seconds after the device's when the reply comes.
+        got = iosxr.last_boot(c.reply, CLOCK + 3)
+        testing.assertEqual(c.boot, got.boot, "{c.label}: last boot")
+        testing.assertEqual(c.tolerance, got.tolerance, "{c.label}: tolerance")
+
+
+def _test_platform_has_the_last_boot():
+    version = _version("<label>24.4.2</label><chassis-pid>8201-32FH</chassis-pid>")
+    p = iosxr.platform(version, None, _time(_clock(22, "UTC"), "<uptime>{UPTIME}</uptime>"), CLOCK + 3)
+    if p is not None:
+        testing.assertEqual("ios-xr 24.4.2 8201-32FH None {BOOT} {iosxr.ROUNDING}",
+                            "{_show(p)} {p.last_boot} {p.last_boot_tolerance}", "platform")
+    else:
+        testing.error("no platform")
+
+
+def _test_time_filter_selects_the_clock_and_the_uptime():
+    reply = _time(_clock(22, "UTC"), "<uptime>{UPTIME}</uptime>")
+    got = ygdata.filter(reply, ygdata.FNode(children=[iosxr.time_filter()]))
+    testing.assertEqual(BOOT, iosxr.last_boot(got, 0).boot, "last boot")
 
 
 def _test_platform_from_replies():
@@ -69,12 +127,14 @@ def _test_platform_from_replies():
          want="ios-xr None NCS-5501 FOC2222R0AB"),
     ]
     for c in cases:
-        testing.assertEqual(c.want, _show(iosxr.platform(c.version, c.inventory)), c.label)
+        testing.assertEqual(c.want, _show(iosxr.platform(c.version, c.inventory, None, CLOCK)), c.label)
 
 
 def _test_platform_without_values():
-    testing.assertTrue(iosxr.platform(None, None) is None, "no replies")
-    testing.assertTrue(iosxr.platform(ygdata.Container({}), ygdata.Container({})) is None, "empty replies")
+    testing.assertTrue(iosxr.platform(None, None, None, CLOCK) is None, "no replies")
+    testing.assertTrue(iosxr.platform(ygdata.Container({}), ygdata.Container({}),
+                                      _time(_clock(22, "UTC"), "<uptime>{UPTIME}</uptime>"), CLOCK) is None,
+                       "replies with only a last boot")
 
 
 def _test_probe_applies_on_its_module():

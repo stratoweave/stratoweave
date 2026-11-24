@@ -5,7 +5,8 @@ capability, which a Junos from before YANG lists in place of modules. Junos
 serves no operational state in YANG for what it is, so the probe calls RPCs:
 get-software-information, which 'show version' prints, for the model and the
 release, then get-system-information, which 'show system information'
-prints, for the serial number.
+prints, for the serial number, then get-system-uptime-information, which
+'show system uptime' prints, for the last boot.
 
 Junos does not put an RPC's reply in the namespace of its YANG module, and
 runtime schema fetch skips the junos-rpc-* modules. So the probe sends the
@@ -13,8 +14,8 @@ RPCs with rpc_xml and reads the replies by element name. It needs nothing in
 the device type's schema.
 
 A cRPD has no serial number and leaves os-version empty. When
-get-system-information fails, the probe still answers from
-get-software-information.
+get-system-information or get-system-uptime-information fails, the probe
+still answers from get-software-information.
 """
 
 import std.xml as xml
@@ -54,10 +55,37 @@ def _text(n: ?xml.Node, tag: str) -> ?str:
     return None
 
 
-def platform(software: ?xml.Node, system: ?xml.Node) -> ?swdev.Platform:
-    """Return the platform in the replies to get-software-information and
-    get-system-information, or None when they have neither a model nor a
-    release. system is None when its RPC failed.
+def _seconds(n: xml.Node) -> ?int:
+    """The junos:seconds attribute of n, or None when n has none or it is not
+    a positive number."""
+    for name, value in n.attributes:
+        if name.split(":")[-1] == "seconds":
+            if value != "" and all([c in swdev.DIGITS for c in value]):
+                v = int(value)
+                if v > 0:
+                    return v
+            return None
+    return None
+
+
+def last_boot(uptime: ?xml.Node) -> ?int:
+    """Return the last boot in a reply to get-system-uptime-information, or
+    None when it has none. The date-time in system-booted-time prints the
+    boot in the device's time zone and gives it in junos:seconds, which count
+    from the epoch."""
+    booted = _find(uptime, "system-booted-time")
+    if booted is not None:
+        for c in booted.children:
+            if c.tag == "date-time":
+                return _seconds(c)
+    return None
+
+
+def platform(software: ?xml.Node, system: ?xml.Node, uptime: ?xml.Node) -> ?swdev.Platform:
+    """Return the platform in the replies to get-software-information,
+    get-system-information and get-system-uptime-information, or None when
+    they have neither a model nor a release. system and uptime are None when
+    their RPC failed.
 
     A device with two routing engines answers for each of them in a
     multi-routing-engine-item; the probe takes the first.
@@ -73,11 +101,11 @@ def platform(software: ?xml.Node, system: ?xml.Node) -> ?swdev.Platform:
     serial = _text(si, "serial-number")
     if model is None and version is None:
         return None
-    return swdev.Platform(OS, version, model, serial)
+    return swdev.Platform(OS, version, model, serial, last_boot(uptime))
 
 
 class JunosProbe(swdev.PlatformProbe):
-    """The Junos probe. Two RPCs per read."""
+    """The Junos probe. Three RPCs per read."""
     def __init__(self):
         self.name = OS
 
@@ -89,21 +117,31 @@ class JunosProbe(swdev.PlatformProbe):
 
 
 actor _JunosRead(dev: swdev.DeviceMgr, done: action(?swdev.Platform, ?Exception) -> None):
-    """One read: get-software-information, then get-system-information."""
+    """One read: get-software-information, then get-system-information, then
+    get-system-uptime-information."""
     var software: ?xml.Node = None
+    var system: ?xml.Node = None
 
-    def on_system(r: ?xml.Node, err: ?Exception) -> None:
+    def on_uptime(r: ?xml.Node, err: ?Exception) -> None:
         if isinstance(err, NotConnectedError):
             done(None, err)
             return
         try:
-            p = platform(software, r if err is None else None)
+            p = platform(software, system, r if err is None else None)
             if p is not None:
                 done(p, None)
             else:
                 done(None, ValueError("the replies have no platform values"))
         except Exception as e:
             done(None, e)
+
+    def on_system(r: ?xml.Node, err: ?Exception) -> None:
+        if isinstance(err, NotConnectedError):
+            done(None, err)
+            return
+        if err is None:
+            system = r
+        dev.rpc_xml(on_uptime, xml.Node("get-system-uptime-information"))
 
     def on_software(r: ?xml.Node, err: ?Exception) -> None:
         if err is not None:

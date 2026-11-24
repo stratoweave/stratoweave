@@ -30,7 +30,7 @@ persisted: after a restart it is empty until the device connects.
 | `version` | Release the device runs, as it reports it, for example `17.18.2`. |
 | `model` | Chassis model, for example `C8000V`. |
 | `serial-number` | Chassis serial number. |
-| `last-boot` | When the device last booted, in seconds since the Unix epoch by the device's clock. Absent when the probe does not read it. |
+| `last-boot` | When the device last booted, in seconds since the Unix epoch by the device's clock, or by StratoWeave's clock when the device reports only how long it has been up. Absent when the probe does not read it. |
 | `probe` | Name of the probe that read the values. |
 
 The version is the release as the device spells it, without what the device
@@ -146,8 +146,16 @@ class IosXeProbe(swdev.GetPlatformProbe):
 | `parse(root)` | The `Platform` in the reply, `None` when the reply has no values, or raises `PlatformMismatch`. |
 
 Set the fields the probe knows on `swdev.Platform(os, version, model,
-serial_number, last_boot)`; leave the others `None`. `swdev.epoch_seconds`
-gives the `last_boot` of a `yang:date-and-time`.
+serial_number, last_boot, last_boot_tolerance)`; leave the others `None`.
+`swdev.epoch_seconds` gives the `last_boot` of a `yang:date-and-time`.
+
+A probe that works the boot out from an uptime sets `last_boot_tolerance`:
+how much the uptime is rounded, in seconds, plus `swdev.REPLY_DELAY` when it
+subtracts the uptime from StratoWeave's clock. Each read of the same boot then
+gives a slightly different last boot. While a read gives one within its
+tolerance of the published one, `DeviceMgr` keeps the published one, so the
+value does not change on every read. A probe that reads the boot time leaves
+the tolerance at 0.
 
 ### The device type's schema
 
@@ -182,8 +190,9 @@ For a probe that needs an RPC or more than one read, subclass
 to `dev`: that call would wait for `read` to end. A reply from `dev` must go
 to an action, and a nested function in a class method is not one. So `read`
 starts an actor that sends the requests and receives the replies, one step
-after the other. The IOS XR probe's `_IosXrRead` and the SR Linux probe's
-`_SrLinuxRead` send two gets, the Junos probe's `_JunosRead` two RPCs.
+after the other. The IOS XR probe's `_IosXrRead` sends three gets, the SR
+Linux probe's `_SrLinuxRead` two, and the Junos probe's `_JunosRead` three
+RPCs.
 
 Give each get one subtree. Some devices take only one subtree in a filter,
 so a probe that reads two subtrees sends two gets.
@@ -193,12 +202,12 @@ so a probe that reads two subtrees sends two gets.
 | Probe | Applies when the device lists | Reads | Model | Serial number | Last boot |
 | --- | --- | --- | --- | --- | --- |
 | `ios-xe` | `Cisco-IOS-XE-device-hardware-oper` | one get: inventory, version banner and boot time | chassis part number | chassis entry | `boot-time` of `device-system-data` |
-| `ios-xe-cli` | `stratoweave-iosxe-cli`, from the IOS XE CLI adapter | one get: `show version` | the word after `cisco` on the processor line | `Processor board ID` | not read |
-| `ios-xr` | `Cisco-IOS-XR-install-oper` | two gets: `install/version`, the rack inventory | `chassis-pid`, else the rack's model | the rack with the lowest name | not read |
-| `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information` | `product-model` | `serial-number` of system information | not read |
+| `ios-xe-cli` | `stratoweave-iosxe-cli`, from the IOS XE CLI adapter | one get: `show version` | the word after `cisco` on the processor line | `Processor board ID` | `<hostname> uptime is` before StratoWeave's clock |
+| `ios-xr` | `Cisco-IOS-XR-install-oper` | three gets: `install/version`, the rack inventory, `system-time` | `chassis-pid`, else the rack's model | the rack with the lowest name | `uptime` before the clock of `system-time` |
+| `junos` | `junos-rpc-version`, or the capability `http://xml.juniper.net/netconf/junos/1.0` | RPCs `get-software-information`, `get-system-information`, `get-system-uptime-information` | `product-model` | `serial-number` of system information | `junos:seconds` of `system-booted-time` |
 | `srlinux` | `srl_nokia-system-info` and `srl_nokia-platform-chassis` | two gets: `system/information`, `platform/chassis` | chassis `type` | chassis | `last-booted` of `system/information` |
-| `sros` | `nokia-state` | one get: `/state/system` and `/state/chassis` | `system/platform` | router chassis with the lowest number | not read |
-| `arcos` | `arcos-openconfig-system-augments` | one get: `system/version/state` | `platform` | `serial-number` | not read |
+| `sros` | `nokia-state` | one get: `/state/system`, `/state/chassis` and `/state/cpm` | `system/platform` | router chassis with the lowest number | `software-last-boot-time` of the active CPM |
+| `arcos` | `arcos-openconfig-system-augments` | one get: `system/version/state` and `system/state/boot-time` | `platform` | `serial-number` | `boot-time` of `system/state` |
 
 Each probe but Junos reads through YANG that its module ships pruned in
 `platform_<os>_yang.act` (`software_iosxe_yang.act` for IOS XE), with the
@@ -240,6 +249,13 @@ says `Cisco IOS XE Software, Version 17.15.06`, so the release stays the same
 when `ios-xe` takes over. The model and the serial number of a C1111 are the
 same in both.
 
+`show version` gives the router's uptime to the minute, as `<hostname> uptime
+is 3 hours, 59 minutes`, and not the device's clock. The last boot is that
+uptime before StratoWeave's clock when the reply comes, with a tolerance of 60
+seconds plus `REPLY_DELAY`. A year in the uptime counts 365 days. The next
+line, `Uptime for this control processor is`, counts from an earlier start
+and is not read.
+
 ### IOS XR
 
 `install/version` holds what `show version` prints: the release `label` and,
@@ -253,6 +269,16 @@ its model and serial number.
   serial number come from the inventory.
 - The inventory get is optional: when it fails, the probe still answers from
   `install/version`.
+
+`system-time` in `Cisco-IOS-XR-shellutil-oper` holds the clock, as `show
+clock` prints it, and the uptime in seconds. The last boot is the uptime
+before the clock when the clock's `time-zone` is `UTC`. The clock shows the
+time in its time zone, and the zone's name does not say its offset, so in
+another time zone the probe subtracts the uptime from StratoWeave's clock
+when the reply comes. The clock and the uptime count whole seconds, so the
+last boot's tolerance is 2 seconds, plus `REPLY_DELAY` on StratoWeave's
+clock. The `system-time` get is optional too: when it fails, the probe
+answers without a last boot.
 
 ### Junos
 
@@ -269,6 +295,11 @@ no modules but has the Junos capability in its hello.
 - The serial number comes from `get-system-information`. When that RPC
   fails, the probe still answers, without a serial number. A cRPD has no
   serial number and leaves `os-version` empty.
+- The last boot comes from `get-system-uptime-information`, which `show
+  system uptime` calls: the `junos:seconds` attribute of the `date-time` in
+  `system-booted-time`. It counts from the epoch, whatever time zone the
+  device prints the date in. When that RPC fails, the probe still answers,
+  without a last boot.
 
 ### SR Linux
 
@@ -282,11 +313,21 @@ The probe applies to a model-driven or mixed mode SR OS, which serves
 on an SR-SIM gives `25.10.R7`, `C-23.10.R1` on a 7950 XRS vSIM `23.10.R1`. A system of two chassis, like a 7950 XRS-40, lists both;
 the serial number comes from the router chassis with the lowest number.
 
+The last boot is when the software of the active CPM, the one that
+`system/active-cpm-slot` names, last booted: the `software-last-boot-time`
+of its `cpm` entry. A standby CPM can have booted at another time.
+`system/up-time` counts from when the management part of the system last
+started, which need not be a boot, so the probe does not read it.
+
 ### ArcOS
 
 `system/version/state` holds what `show version` prints. On a container the
 platform is `Virtual` and there is no serial number. The OpenConfig chassis
 component has neither part nor serial number there.
+
+`boot-time` in `system/state` of `openconfig-system` counts nanoseconds since
+the epoch; the probe drops the fraction of a second. A `boot-time` of 0 gives
+no last boot.
 
 ## Testing
 
