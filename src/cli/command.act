@@ -3,10 +3,11 @@
 In operational mode the commands are `configure`, `show configuration [path]
 [| display set|xml|json]`, `show <path> [| display xml|json]`, `request <rpc
 or path to an action> [input] [| display xml]`, `monitor notifications
-[name ...]`, `monitor stop [name ...]`, `monitor list`, `exit` and `quit`.
-`show <path>` reads configuration and state from the device, `request` makes
-the device run an RPC or action, and `monitor` shows event notifications as
-they arrive. In configuration mode they are `set`,
+[name ...]`, `monitor <path> [period N | on-change] [pane N]`, `monitor stop
+[name ... | pane N]`, `monitor list`, `exit` and `quit`. `show <path>` reads
+configuration and state from the device, `request` makes the device run an
+RPC or action, and `monitor` shows event notifications as they arrive, or the
+data at a path in a pane above the CLI. In configuration mode they are `set`,
 `delete`, `edit`, `up [N]`, `top [command]`, `show [path] [| compare |
 display set|xml|json]`, `rollback [0]`, `run <command>` and `exit
 [configuration-mode]`. Keywords take a unique prefix, so `sh conf` is `show
@@ -25,6 +26,7 @@ import netconf
 
 import cli.candidate as candidate
 import cli.hints as hints
+import cli.pane as pane
 import cli.path as cpath
 import cli.render as render
 
@@ -56,10 +58,18 @@ _SHOW = [
 ]
 
 _MONITOR = [
-    ("list", "Show the notifications that the CLI shows"),
+    ("list", "Show the notifications and panes that the CLI shows"),
     ("notifications", "Show event notifications as they arrive"),
-    ("stop", "Stop showing notifications"),
+    ("stop", "Stop showing notifications, or close panes"),
 ]
+
+_MONITOR_OPTIONS = [
+    ("on-change", "Show each change as the device sends it"),
+    ("pane", "Show the data in this pane"),
+    ("period", "Show the data at this interval"),
+]
+
+PANE_WORD = cpath.Completion("pane", " ", "Close this pane", keyword=True)
 
 _EXIT = [
     ("configuration-mode", "Leave configuration mode"),
@@ -154,7 +164,8 @@ class Command(object):
 
     name is the command: "configure", "exit", "exit configuration-mode",
     "show configuration", "show data", "request", "monitor notifications",
-    "monitor stop", "monitor list", "show", "set", "delete", "edit", "up",
+    "monitor data", "monitor stop", "monitor stop pane", "monitor list",
+    "show", "set", "delete", "edit", "up",
     "top", "rollback", "run", or "" for an empty line. path is
     relative to the edit level edit, and view is the view it was resolved in;
     the paths of show data and request start at the schema root. display is
@@ -162,7 +173,9 @@ class Command(object):
     compare`. count is the number of levels for up. sub is the command that
     top or run runs. args holds the input paths of a request, each from the
     input of the RPC or action, and the notifications of monitor, each a path
-    of one step.
+    of one step. For monitor data, period is the seconds between updates,
+    on_change is True for an update at each change, and pane is the pane
+    number, 0 for the first free one. monitor stop pane takes pane too.
     """
     name: str
     path: ?cpath.PathResult
@@ -173,6 +186,9 @@ class Command(object):
     count: int
     sub: ?Command
     args: list[list[cpath.Step]]
+    period: int
+    on_change: bool
+    pane: int
 
     def __init__(self, name: str, path: ?cpath.PathResult=None, edit: list[cpath.Step]=[], count: int=1, sub: ?Command=None, view: str="config", args: list[list[cpath.Step]]=[]):
         self.name = name
@@ -184,6 +200,9 @@ class Command(object):
         self.count = count
         self.sub = sub
         self.args = args
+        self.period = 5
+        self.on_change = False
+        self.pane = 0
 
     def steps(self) -> list[cpath.Step]:
         """Return the path from the start node: the edit level and then the command's path.
@@ -349,16 +368,105 @@ def _path(ctx: Context, toks: list[cpath.Token], i: int, name: str, node: yschem
     return _pipe(cmd, pipes, toks, p, displays)
 
 
+def _number(toks: list[cpath.Token], j: int, low: int, high: int, what: str) -> (n: int, error: ?str):
+    """Parse the number at word j, from low to high."""
+    try:
+        n = int(toks[j].text)
+        if n >= low and n <= high:
+            return (n=n, error=None)
+    except ValueError:
+        pass
+    return (n=0, error="'{toks[j].text}' is not a {what}.")
+
+
+def _monitor_path(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
+    """Parse `monitor <path> [period N | on-change] [pane N]` from word i.
+
+    The options start at the first option word, or a prefix of one, that a
+    complete path comes before and that the path does not take. The data
+    shows every 5 seconds, in the first free pane, unless the options say
+    otherwise.
+    """
+    end = len(toks)
+    for k in range(i + 1, len(toks)):
+        t = toks[k]
+        if t.quoted or _match_word(_MONITOR_OPTIONS, t).word is None:
+            continue
+        # The words before form a path that can end, and the path does not
+        # take this word.
+        r0 = cpath.resolve(ctx.root, ctx.root, ctx.data, toks[i:k], view="data")
+        if r0.error is None and r0.used == k - i:
+            r1 = cpath.resolve(ctx.root, ctx.root, ctx.data, toks[i:k + 1], view="data")
+            if r1.error is not None and r1.error_at == k - i:
+                end = k
+                break
+    r = cpath.complete(ctx.root, ctx.root, ctx.data, toks[i:end], view="data")
+    res = r.path
+    if res.error is not None:
+        return _fail(res.error, i + res.error_at, res.matches, r.items)
+    if res.used < end - i:
+        # A pipe: panes show the curly-brace format only.
+        return _fail("syntax error.", i + res.used)
+    cmd = Command("monitor data", res, view="data")
+    used = set()
+    j = end
+    while j < len(toks):
+        w = _match_word([(o, h) for o, h in _MONITOR_OPTIONS if o not in used], toks[j])
+        word = ""
+        ww = w.word
+        if ww is not None:
+            word = ww
+        else:
+            return _fail(w.error, j, w.matches)
+        used.add(word)
+        if word == "on-change":
+            cmd.on_change = True
+            j += 1
+            continue
+        if j + 1 >= len(toks):
+            hint = cpath.Completion("<seconds>", " ", "Seconds between updates", insert=False) if word == "period" else cpath.Completion("<pane>", " ", "Pane number, 1 to {pane.MAX_PANES}", insert=False)
+            return _fail("missing argument.", j + 1, items=[hint])
+        if word == "period":
+            nr = _number(toks, j + 1, 1, 86400, "number of seconds")
+            if nr.error is not None:
+                return _fail(nr.error, j + 1)
+            cmd.period = nr.n
+            cmd.on_change = False
+        else:
+            nr = _number(toks, j + 1, 1, pane.MAX_PANES, "pane number")
+            if nr.error is not None:
+                return _fail(nr.error, j + 1)
+            cmd.pane = nr.n
+        j += 2
+    items = [ENTER] + (r.items if end == len(toks) else []) + _words([(o, h) for o, h in _MONITOR_OPTIONS if o not in used])
+    return _Walk(cmd, items)
+
+
 def _monitor(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
-    """Parse `monitor` from word i: `notifications [name ...]`, `stop [name ...]` or `list`."""
+    """Parse `monitor` from word i: `notifications [name ...]`, a path, `stop [name ... | pane N]` or `list`.
+
+    The built-in words win over a top-level node as in show.
+    """
     if i >= len(toks):
-        return _fail("missing argument.", i, items=_words(_MONITOR))
-    w = _match_word(_MONITOR, toks[i])
+        r = cpath.complete(ctx.root, ctx.root, ctx.data, [], view="data")
+        return _fail("missing argument.", i, items=_words(_MONITOR) + r.items)
+    w = _word_or_path(ctx, _MONITOR, toks[i])
+    if w.error is not None:
+        return _fail(w.error, i, w.matches)
     word = w.word
     if word is None:
-        return _fail(w.error, i, w.matches)
+        return _monitor_path(ctx, toks, i)
     if word == "list":
         return _done(Command("monitor list"), toks, i + 1)
+    if word == "stop" and i + 1 < len(toks) and _match_word([("pane", "")], toks[i + 1]).word is not None and not cpath.is_keyword(ctx.root, toks[i + 1], "notification"):
+        if i + 2 >= len(toks):
+            return _fail("missing argument.", i + 2, items=[cpath.Completion("<pane>", " ", "Pane number, 1 to {pane.MAX_PANES}", insert=False)])
+        nr = _number(toks, i + 2, 1, pane.MAX_PANES, "pane number")
+        if nr.error is not None:
+            return _fail(nr.error, i + 2)
+        c = Command("monitor stop pane")
+        c.pane = nr.n
+        return _done(c, toks, i + 3)
     names = []
     j = i + 1
     while j < len(toks):
@@ -371,6 +479,8 @@ def _monitor(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
         names.append(res.steps)
         j += res.used
     items = cpath.complete(ctx.root, ctx.root, None, [], view="notification").items
+    if word == "stop" and len(names) == 0:
+        items = items + [PANE_WORD]
     return _Walk(Command("monitor stop" if word == "stop" else "monitor notifications", args=names), [ENTER] + items)
 
 
@@ -417,6 +527,36 @@ def event_text(root: yschema.DRoot, name: ygdata.Id, event_time: str, payload: ?
     return "\n".join(lines)
 
 
+def _word_or_path(ctx: Context, words: list[(str, str)], t: cpath.Token) -> _Word:
+    """Match a word that is a built-in word, or the first word of a path from the schema root.
+
+    A built-in word named exactly wins, then a top-level node named exactly,
+    then a prefix of one built-in word. A prefix of a built-in word and of a
+    top-level node is ambiguous. word is None, and error too, when the word
+    starts a path.
+    """
+    b = _match_word(words, t)
+    bw = b.word
+    if bw is not None and t.text == bw:
+        return b
+    if cpath.is_keyword(ctx.root, t, "data"):
+        return _Word(None)
+    builtin: list[str] = []
+    if bw is not None:
+        builtin.append(bw)
+    else:
+        builtin.extend(b.matches)
+    if len(builtin) == 0:
+        return _Word(None)
+    names = []
+    for c in cpath.candidates(ctx.root, "data"):
+        if hints.has_keyword(c) and c.name.startswith(t.text) and c.name not in builtin:
+            names.append(c.name)
+    if len(names) == 0 and bw is not None:
+        return b
+    return _Word(None, "'{t.text}' is ambiguous.", sorted(builtin + names))
+
+
 def _show_op(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
     """Parse operational mode show from word i: `configuration [path]`, or a path to configuration and state.
 
@@ -427,23 +567,12 @@ def _show_op(ctx: Context, toks: list[cpath.Token], i: int) -> _Walk:
     if i >= len(toks):
         r = cpath.complete(ctx.root, ctx.root, ctx.data, [], view="data")
         return _fail("missing argument.", i, items=_words(_SHOW) + [c for c in r.items if c.value != "configuration"])
-    t = toks[i]
-    b = _match_word(_SHOW, t)
-    bw = b.word
-    if bw is not None and t.text != bw and cpath.is_keyword(ctx.root, t, "data"):
-        # A top-level node named exactly wins over a prefix of configuration.
-        bw = None
-    if bw is not None:
-        names = []
-        if t.text != bw:
-            for c in cpath.candidates(ctx.root, "data"):
-                if hints.has_keyword(c) and c.name.startswith(t.text) and c.name != bw:
-                    names.append(c.name)
-        if len(names) == 0:
-            return _path(ctx, toks, i + 1, "show configuration", ctx.start, ctx.start_data, [], _PIPE_OP)
-        return _fail("'{t.text}' is ambiguous.", i, sorted([bw] + names))
+    w = _word_or_path(ctx, _SHOW, toks[i])
+    if w.error is not None:
+        return _fail(w.error, i, w.matches)
+    if w.word is not None:
+        return _path(ctx, toks, i + 1, "show configuration", ctx.start, ctx.start_data, [], _PIPE_OP)
     return _path(ctx, toks, i, "show data", ctx.root, ctx.data, [], _PIPE_OP, need_path=True, view="data", displays=_DISPLAY_DATA)
-
 
 def _key(prefix: str, n: yschema.DNode) -> str:
     """Return the schema path of a node below a schema path, as the input checks use it."""

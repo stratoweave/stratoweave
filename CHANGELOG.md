@@ -299,8 +299,10 @@
   the device, and `request` makes the device run an RPC, or the action at a
   path, with its input, as in `request interfaces ge-0/0/0 clear-counters`.
   `monitor notifications` subscribes to event notifications and prints each
-  one above the prompt as it arrives; `monitor list` shows them and
-  `monitor stop` ends them. `configure` starts configuration mode on a
+  one above the prompt as it arrives; `monitor <path>` shows the data at a
+  path in a pane above the CLI, updated by the device with YANG-push,
+  periodic or on change. `monitor list` shows the notifications and panes,
+  and `monitor stop` ends them. `configure` starts configuration mode on a
   candidate kept in the CLI, with `set`, `delete`, `edit`, `up`, `top`,
   `rollback`, `run`, `show` and `show | compare`. With a command as
   arguments, it runs that command and exits. Without a terminal, it reads
