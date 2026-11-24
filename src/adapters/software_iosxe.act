@@ -43,7 +43,7 @@ import device as swdev
 import adapters.iosxe_cli_data as xecli_data
 import adapters.iosxe_cli_yang as xecli_yang
 import adapters.software_iosxe_oper as ixoper
-from adapters.adapter import NotConnectedError
+from adapters.adapter import BusyError, NotConnectedError, TransientError
 import adapters.software_iosxe_rpc as ixrpc
 
 from device_meta_config import stratoweave_rfs__device_entry as DeviceMetaConfig
@@ -804,6 +804,25 @@ def operation_name(phase: str) -> str:
     return "download" if phase == "stage" else phase
 
 
+def job_error(op: str, detail: str, cause: ?Exception) -> Exception:
+    """The error that ends a job in operation op: a TransientError when
+    its cause is one, else a ValueError, with the text
+    '{op} failed: {detail}'."""
+    text = "{op} failed: {detail}"
+    if cause is not None and isinstance(cause, TransientError):
+        return TransientError(text)
+    return ValueError(text)
+
+
+def timeout_error(op: str, unreachable: bool) -> Exception:
+    """'{op} did not finish in time': a TransientError when the device did
+    not answer the last poll, else a ValueError."""
+    text = "{op} did not finish in time"
+    if unreachable:
+        return TransientError(text)
+    return ValueError(text)
+
+
 def xcopy_input(uuid: str, url: str, filename: str) -> ixrpc.Cisco_IOS_XE_xcopy_rpc__xcopy__input:
     """Stage an image. `destination_path` must be a bare filename: the device
     prepends /bootflash itself, so passing a path doubles it and fails."""
@@ -877,6 +896,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     # Activate has run and the device is reloading, so poll the release now
     # instead of the operation record.
     var _activate_booting = False
+    # The last poll of the records of the phase got no answer.
+    var _unreachable = False
     # Monotonic seconds when activate was sent; the device timer runs from there.
     var _activated_at: ?int = None
     var _url = ""
@@ -917,11 +938,11 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         if d is not None:
             d!(err)
 
-    def _fail(detail: str) -> None:
+    def _fail(detail: str, cause: ?Exception=None) -> None:
         """End the job with an error naming the operation; the manager
-        publishes it as the run's reason."""
-        op = operation_name(_phase)
-        _finish(ValueError("{op} failed: {detail}"))
+        publishes it as the run's reason. The error is transient when its
+        cause is (job_error)."""
+        _finish(job_error(operation_name(_phase), detail, cause))
 
     def _busy() -> bool:
         return _phase != ""
@@ -1011,7 +1032,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def _start(phase: str, done: action(?Exception) -> None, release: str) -> bool:
         """Claim the driver for a job. False, after reporting, if one is running."""
         if _busy():
-            done(ValueError("software job already running: {_phase}"))
+            done(BusyError("software job already running: {_phase}"))
             return False
         _done = done
         _release = release
@@ -1029,6 +1050,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _allow_noop = True
         _want = None
         _activate_booting = False
+        _unreachable = False
 
     def _on_rpc(gen: int, period: float) -> action(?Exception) -> None:
         """Reply handler for an input-only RPC: start polling once accepted."""
@@ -1036,7 +1058,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail(swdev.error_text(err!))
+                _fail(swdev.error_text(err!), err)
                 return
             after now period: _poll(gen)
         return cb
@@ -1167,7 +1189,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail(swdev.error_text(err!))
+                _fail(swdev.error_text(err!), err)
             elif staged_file(root, _filename):
                 _verify(gen, True)
             else:
@@ -1198,7 +1220,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail(swdev.error_text(err!))
+                _fail(swdev.error_text(err!), err)
             else:
                 _transfer_with_room(root, True)
         dev.get(listed, bootflash_filter(upgrade_plan(_modules()).listing))
@@ -1217,7 +1239,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 if gen != _gen:
                     return
                 if err is not None:
-                    _fail(swdev.error_text(err!))
+                    _fail(swdev.error_text(err!), err)
                     return
                 _log.info("software: remove done")
                 _end_phase()
@@ -1225,7 +1247,10 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 remove=xecli_data.stratoweave_iosxe_cli__install__input__remove(inactive=True)))
             return
         if how != "netconf":
-            _fail("the device has no way to remove software: no {INSTALL_MODULE} and no CLI adapter")
+            if len(dev.get_unconnected_durations()) > 0:
+                _finish(NotConnectedError("remove failed: no adapter that can remove software is connected"))
+            else:
+                _fail("the device has no way to remove software: no {INSTALL_MODULE} and no CLI adapter")
             return
         # Nothing to remove completes as a no-op, which is fine.
         _log.info("software: removing inactive software", {"uuid": _uuid})
@@ -1280,7 +1305,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail(swdev.error_text(err!))
+                _fail(swdev.error_text(err!), err)
                 return
             got = staged_size(root, _filename)
             if got is not None and got == size:
@@ -1300,7 +1325,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail("verify: " + swdev.error_text(err!))
+                _fail("verify: " + swdev.error_text(err!), err)
                 return
             ok = out.verified if out is not None else None
             if ok is not None and ok:
@@ -1320,7 +1345,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail("verify: " + swdev.error_text(err!))
+                _fail("verify: " + swdev.error_text(err!), err)
                 return
             ok = out.verified if out is not None else None
             if ok is not None and ok:
@@ -1349,7 +1374,10 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             _transfer_cli()
             return
         if how != "netconf":
-            _fail("the device has no way to transfer the image: no {XCOPY_MODULE} and no CLI adapter")
+            if len(dev.get_unconnected_durations()) > 0:
+                _finish(NotConnectedError("download failed: no adapter that can transfer the image is connected"))
+            else:
+                _fail("the device has no way to transfer the image: no {XCOPY_MODULE} and no CLI adapter")
             return
         url = _url
         _expect_stage = STAGE_DOWNLOAD
@@ -1362,7 +1390,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 return
             if err is not None:
                 # The device may quote the source, credentials and all.
-                _fail(swdev.error_text(err!).replace(url, redact_url(url)))
+                _fail(swdev.error_text(err!).replace(url, redact_url(url)), err)
                 return
             after now poll_period: _poll(gen)
         _rpcs.xcopy(on_rpc, xcopy_input(_uuid, url, _filename))
@@ -1378,7 +1406,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 return
             _copying = False
             if err is not None:
-                _fail(swdev.error_text(err!).replace(url, redact_url(url)))
+                _fail(swdev.error_text(err!).replace(url, redact_url(url)), err)
                 return
             _log.info("software: image copied", {"file": _filename, "size": out.size if out is not None else None})
             _end_phase()
@@ -1466,7 +1494,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail("read the configuration change: " + swdev.error_text(err!))
+                _fail("read the configuration change: " + swdev.error_text(err!), err)
                 return
             why = unsaved_configuration(root)
             if why is not None:
@@ -1488,7 +1516,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail("write memory: " + swdev.error_text(err!))
+                _fail("write memory: " + swdev.error_text(err!), err)
             else:
                 _choose_install()
         _cli.write_memory(saved)
@@ -1504,7 +1532,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 if gen != _gen:
                     return
                 if err is not None:
-                    _fail(swdev.error_text(err!))
+                    _fail(swdev.error_text(err!), err)
                 elif not bundle_mode(root):
                     _add_unless_added()
                 elif xecli_yang.MODULE in _modules():
@@ -1523,7 +1551,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail(swdev.error_text(err!))
+                _fail(swdev.error_text(err!), err)
                 return
             image = bundle_image(root)
             if image is not None:
@@ -1552,14 +1580,14 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail("write memory: " + swdev.error_text(err!))
+                _fail("write memory: " + swdev.error_text(err!), err)
                 return
             _install_one_shot()
         def configured(err: ?Exception) -> None:
             if gen != _gen:
                 return
             if err is not None:
-                _fail("boot system: " + swdev.error_text(err!))
+                _fail("boot system: " + swdev.error_text(err!), err)
                 return
             _cli.write_memory(saved)
         _cli.configure(configured, xecli_data.stratoweave_iosxe_cli__configure__input(lines))
@@ -1577,7 +1605,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail(swdev.error_text(err!))
+                _fail(swdev.error_text(err!), err)
                 return
             _booting()
             after now reload_poll_period: _poll(gen)
@@ -1598,7 +1626,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail(swdev.error_text(err!))
+                _fail(swdev.error_text(err!), err)
                 return
             v = version_of(root, _release)
             pending = pending_other_version(root, _release)
@@ -1670,7 +1698,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 if gen != _gen:
                     return
                 if err is not None:
-                    _fail(swdev.error_text(err!))
+                    _fail(swdev.error_text(err!), err)
                     return
                 after now reload_poll_period: _poll(gen)
             _cli_install(aborted, xecli_data.stratoweave_iosxe_cli__install__input(abort=True))
@@ -1687,7 +1715,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 if gen != _gen:
                     return
                 if err is not None:
-                    _fail(swdev.error_text(err!))
+                    _fail(swdev.error_text(err!), err)
                     return
                 _log.info("software: add done", {"file": _filename})
                 _end_phase()
@@ -1706,7 +1734,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
-                _fail(swdev.error_text(err!))
+                _fail(swdev.error_text(err!), err)
                 return
             ver = added_version(root, _release)
             if ver is None:
@@ -1728,7 +1756,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 if gen != _gen:
                     return
                 if err is not None:
-                    _fail(swdev.error_text(err!))
+                    _fail(swdev.error_text(err!), err)
                     return
                 _booting()
                 after now reload_poll_period: _poll(gen)
@@ -1759,7 +1787,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 if gen != _gen:
                     return
                 if err is not None:
-                    _fail(swdev.error_text(err!))
+                    _fail(swdev.error_text(err!), err)
                     return
                 _finish(None)
             _cli_install(committed, xecli_data.stratoweave_iosxe_cli__install__input(commit=True))
@@ -1809,7 +1837,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 if gen != _gen:
                     return
                 if err is not None:
-                    _fail(swdev.error_text(err!))
+                    _fail(swdev.error_text(err!), err)
                     return
                 after now reload_poll_period: _poll(gen)
             _cli_install(aborted, xecli_data.stratoweave_iosxe_cli__install__input(abort=True))
@@ -1834,8 +1862,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _polls += 1
         limit = VERSION_MAX_POLLS if (_phase == "activate" or _phase == "abort") else MAX_POLLS
         if _polls > limit:
-            op = operation_name(_phase)
-            _finish(ValueError("{op} did not finish in time"))
+            _finish(timeout_error(operation_name(_phase), _unreachable))
             return
         if _phase == "abort":
             _poll_version(gen)
@@ -1878,7 +1905,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             if gen != _gen:
                 return
             if err is not None:
+                _unreachable = True
                 return
+            _unreachable = False
             # A transfer reports its bytes instead.
             if _phase != "stage":
                 _report_record_step(root)
