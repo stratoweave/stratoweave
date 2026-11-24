@@ -994,6 +994,11 @@
   devices already run the picked image and how many run a newer release.
   It leaves out the devices that run their image, unless told not to, and
   warns that the campaign would downgrade the newer ones. [#816]
+- The new campaign page leaves out only the devices that a campaign has
+  acquired, so a device that a complete campaign freed can join a new
+  campaign. The campaigns list shows when a campaign was complete, and a
+  device's page shows, for a campaign that freed it, when the device was
+  done and when it was freed, in place of its planned start.
 - The devices and device pages show whether each device can be reached.
   [#816]
 - The redundancy group pages set a group's `failure-policy` next to its

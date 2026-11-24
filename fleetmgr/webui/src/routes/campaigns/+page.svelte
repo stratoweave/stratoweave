@@ -7,6 +7,7 @@
   import CampaignProgress from '#lib/software/CampaignProgress.svelte';
   import { createPoller, nextSeq } from '#lib/core/polling/poller.ts';
   import { withSignal } from '#lib/core/restconf/client.ts';
+  import { formatClock } from '#lib/core/time.ts';
   import { fetchCounters } from '#lib/software/counters.ts';
   import type { Campaign, CampaignCounters } from '#lib/software/model.ts';
   import { progressOf } from '#lib/software/progress.ts';
@@ -132,6 +133,15 @@
                 <td class="plan-cell" data-label="Plan">
                   {#if campaign.counters !== null}
                     {@const alarms = data.alarms[campaign.name] ?? []}
+                    {@const completed = campaign.counters.completed}
+                    {#if completed !== null}
+                      <span
+                        class="pill success"
+                        title="Every device is done, and the campaign has freed them for other campaigns."
+                      >
+                        complete {formatClock(completed)}
+                      </span>
+                    {/if}
                     {#if alarms.length > 0}
                       {@const text = `${alarms.length} alarm${alarms.length === 1 ? '' : 's'}`}
                       <!-- The campaign's page lists the alarms. -->
@@ -144,7 +154,7 @@
                         <span class="dot"></span>
                         {text}
                       </a>
-                    {:else}
+                    {:else if completed === null}
                       <span class="dim">no alarms</span>
                     {/if}
                   {:else}

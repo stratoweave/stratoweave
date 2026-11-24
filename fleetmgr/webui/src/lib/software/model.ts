@@ -34,6 +34,10 @@ export const FLEET_SCHEDULES = `${FLEET_ROOT}?content=config&fields=device/sched
 export const CAMPAIGN_SETTINGS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign(name;admin-state;default-schedule;allow-staging)`;
 /** The campaigns that have devices, with the names of their devices only. */
 export const CAMPAIGN_MEMBERS = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign/device/name`;
+/** The campaigns with the names of their devices, and the devices that
+ * each has freed: a complete campaign frees its members, and another
+ * campaign can then take them. */
+export const CAMPAIGN_OWNERS = `${SOFTWARE_ROOT}?fields=upgrade-campaign(name;device/name;state/device-status(device;freed))`;
 /** The campaigns with their names and the images their devices use. */
 export const CAMPAIGN_IMAGES = `${SOFTWARE_ROOT}?content=config&fields=upgrade-campaign(name;device/image)`;
 /** Every campaign with its admin state and the names of its devices, not
@@ -117,6 +121,10 @@ interface DeviceStatusJson {
   install?: JobJson;
   precheck?: CheckResultJson;
   postcheck?: CheckResultJson;
+  /** When the campaign freed the device: it shows its result then. */
+  freed?: number | string;
+  /** When a freed member was done. */
+  finished?: number | string;
 }
 
 /** One recurrence rule of a schedule: a local time of day. */
@@ -169,6 +177,8 @@ interface PlanJson {
 interface CampaignStateJson {
   /** Seconds since the Unix epoch: when the campaign first went to run. */
   'run-since'?: number | string;
+  /** When the campaign was complete and freed its members. */
+  completed?: number | string;
   total?: number;
   'in-progress'?: number;
   succeeded?: number;
@@ -466,6 +476,12 @@ export interface DeviceStatusRow {
   /** The attempt its status is for: the one in progress, or else the
    * member's attempt. */
   attempt: number;
+  /** Seconds since the Unix epoch, when the campaign freed the device; it
+   * then shows its result and nothing that the device reports. null while
+   * the campaign has not freed it. */
+  freed: number | null;
+  /** Seconds since the Unix epoch, when a freed member was done. */
+  finished: number | null;
 }
 
 export interface CampaignCounters {
@@ -481,6 +497,9 @@ export interface CampaignCounters {
   /** total - (inProgress + succeeded + failed), floored at 0: members that
    * wait, upgrade-needed, pending or unknown. Not an error. */
   remainder: number;
+  /** Seconds since the Unix epoch, when the campaign was complete: every
+   * member done, and freed. null while it is not. */
+  completed: number | null;
 }
 
 /** YANG defaults; a GET omits leaves left at their default. */
@@ -697,7 +716,8 @@ function parseCounters(state: CampaignStateJson | undefined): CampaignCounters |
     succeeded: state.succeeded ?? 0,
     upToDate: state['up-to-date'] ?? 0,
     failed: state.failed ?? 0,
-    held: state.held ?? 0
+    held: state.held ?? 0,
+    completed: state.completed == null ? null : num(state.completed)
   });
 }
 
@@ -750,7 +770,9 @@ function parseRow(row: DeviceStatusJson): DeviceStatusRow {
     postcheck: parseCheck(row.postcheck),
     held: parseHeld(row.held),
     heldBy: row['held-by'] ?? '',
-    attempt: num(row.attempt)
+    attempt: num(row.attempt),
+    freed: row.freed == null ? null : num(row.freed),
+    finished: row.finished == null ? null : num(row.finished)
   };
 }
 

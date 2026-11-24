@@ -230,10 +230,24 @@
         <span class="fact-label">Image</span>
         <span class="mono">{campaign.image || '—'}</span>
       </span>
-      <span class="fact">
-        <span class="fact-label">Planned start</span>
-        <span class="mono">{plannedStart(campaign)}</span>
-      </span>
+      {#if row.freed !== null}
+        <span class="fact">
+          <span class="fact-label">Finished</span>
+          <span class="mono">{row.finished !== null ? formatClock(row.finished) : '—'}</span>
+        </span>
+        <span
+          class="fact"
+          title="The campaign is complete, and keeps this result: another campaign can take the device."
+        >
+          <span class="fact-label">Freed</span>
+          <span class="mono">{formatClock(row.freed)}</span>
+        </span>
+      {:else}
+        <span class="fact">
+          <span class="fact-label">Planned start</span>
+          <span class="mono">{plannedStart(campaign)}</span>
+        </span>
+      {/if}
     </div>
     <div class="track"><StageChain {row} large /></div>
     {#if progress !== null}

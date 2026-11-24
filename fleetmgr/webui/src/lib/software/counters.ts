@@ -14,7 +14,7 @@ import {
 // the RFC 8040 fields parameter and cost the same at any size.
 export const FAST_ENTRY_LIMIT = 600;
 
-const COUNTER_FIELDS = 'total;in-progress;succeeded;up-to-date;failed;held';
+const COUNTER_FIELDS = 'total;in-progress;succeeded;up-to-date;failed;held;completed';
 
 function entryPath(name: string): string {
   return getListEntryPath(CAMPAIGN_LIST_ROOT, name);
