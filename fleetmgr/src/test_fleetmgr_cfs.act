@@ -997,9 +997,10 @@ def _test_prepare_for():
 
 
 def _test_counted_attempt():
-    """Of the attempts that a device reports for the campaign's name and the
-    member's target release, the one in progress counts, and else the
-    member's attempt once the device has answered it."""
+    """Of the attempts that a device reports for the campaign's name, the one
+    in progress counts, whatever its target release, and else the member's
+    attempt once the device has answered it for the member's target
+    release."""
     # (case, the device's campaign and target, the member's target and
     # attempt, (attempt, status) of each attempt, and the attempt that counts)
     cases: list[(str, ?str, ?str, ?str, u64, list[(u64, ?str)], ?u64)] = [
@@ -1010,6 +1011,12 @@ def _test_counted_attempt():
         ("not answered", "paced", "17.18.03a", "17.18.03a", 1, [(0, "failed")], None),
         ("earlier attempt in progress", "paced", "17.18.03a", "17.18.03a", 1,
          [(0, "in-progress")], 0),
+        ("earlier attempt in progress for an earlier target", "paced", "17.18.02",
+         "17.18.03a", 1, [(0, "in-progress")], 0),
+        ("in progress for an earlier target", "paced", "17.18.02", "17.18.03a", 0,
+         [(0, "in-progress")], 0),
+        ("in progress in another campaign", "other", "17.18.03a", "17.18.03a", 0,
+         [(0, "in-progress")], None),
         ("earlier attempt upgrade needed", "paced", "17.18.03a", "17.18.03a", 1,
          [(0, "upgrade-needed")], None),
         ("new attempt answered", "paced", "17.18.03a", "17.18.03a", 1,
@@ -3109,8 +3116,8 @@ actor TestCampaignImageMoveKeepsAnswersActor(t: testing.AsyncT, names, conf, mov
 
 actor _test_campaign_counts_only_answers(t: testing.AsyncT):
     """The counters count only the statuses that answer the campaign: its
-    name and the member's target release. A status for another campaign
-    or another target shows as pending, without an attempt."""
+    name and the member's target release. A final status for another
+    campaign or another target shows as pending, without an attempt."""
     var done = False
     names = ["cpe-1", "cpe-2", "cpe-3"]
 
@@ -3494,38 +3501,40 @@ actor TestCampaignTriesAFailedMemberAgainWithANewAttemptActor(t: testing.AsyncT,
         after 6.0: timeout()
 
 
-
-proc def _test_campaign_holds_a_member_with_a_new_attempt_in_flight_until_its_run_ends(t: testing.AsyncT):
-    t.timeout(8.0)
-    """Run a campaign over cpe-1 and cpe-2, one at a time; both answer. The
-    member released first is tried again while its run is under way. The
-    campaign puts its veto back, and its run, which goes on for the old
-    attempt, keeps its slot, so the other member waits. When the old run ends
-    and the member answers the new attempt, the slot is free and the
+proc def _TriedAgainInFlight(t: testing.AsyncT, version: str):
+    """Run a campaign over cpe-1 and cpe-2, one at a time; both answer
+    17.18.03a. The member released first is tried again while its run is
+    under way, in one edit that also gives the image the version version.
+    The other member answers version. The campaign puts the veto of the
+    first member back, and its run, which goes on for the old attempt and
+    17.18.03a, keeps its slot, so the other member waits. When the old run
+    ends and the member answers the new attempt, the slot is free and the
     campaign releases a member."""
-    first = ""
+    t.timeout(8.0)
     both = ["cpe-1", "cpe-2"]
     linked = _flat_inventory(both).to_gdata()
+    edited = _with_version(_flat_inventory(both), version).to_gdata()
 
-    TestCampaignHoldsAMemberWithANewAttemptInFlightUntilItsRunEndsActor(t=t, _initial_first=first, both=both, linked=linked)
+    TriedAgainInFlightActor(t=t, version=version, both=both, linked=linked, edited=edited)
 
 
-actor TestCampaignHoldsAMemberWithANewAttemptInFlightUntilItsRunEndsActor(t: testing.AsyncT, _initial_first, both, linked):
+actor TriedAgainInFlightActor(t: testing.AsyncT, version: str, both, linked, edited):
     var controller: ?cfs.UpgradeCampaignTransform = None
     var stage = 0
     var done = False
-    var first = _initial_first
+    var first = ""
+    var other = ""
 
     def fail(message: str) -> None:
         if not done:
             done = True
             t.failure(ValueError(message))
 
-    def report(name: str, status: str, attempt: int) -> None:
+    def report(name: str, status: str, attempt: int, target: str) -> None:
         cc = controller
         if cc is not None:
             cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
-                      _tagged_attempt(status, attempt), None)
+                      _attempt_state(status, "now", target, u64(attempt), None, None).0, None)
 
     def on_output(out: gdata.Node) -> None:
         if done:
@@ -3534,11 +3543,13 @@ actor TestCampaignHoldsAMemberWithANewAttemptInFlightUntilItsRunEndsActor(t: tes
         if stage == 0:
             if len(free) == 1:
                 first = free[0]
+                other = "cpe-2" if first == "cpe-1" else "cpe-1"
                 stage = 1
-                report(first, "in-progress", 0)
+                report(first, "in-progress", 0, "17.18.03a")
                 cc = controller
                 if cc is not None:
-                    cc.on_conf(_with_attempt(both, first, 1), linked)
+                    cc.on_conf(_with_attempt(both, first, 1), edited)
+                report(other, "upgrade-needed", 0, version)
         elif stage == 1:
             if free != []:
                 fail("{first} tried again in flight: not vetoed {free}")
@@ -3554,8 +3565,8 @@ actor TestCampaignHoldsAMemberWithANewAttemptInFlightUntilItsRunEndsActor(t: tes
     def old_run_ends() -> None:
         if stage == 2 and not done:
             stage = 3
-            report(first, "failed", 0)
-            report(first, "upgrade-needed", 1)
+            report(first, "failed", 0, "17.18.03a")
+            report(first, "upgrade-needed", 1, version)
 
     def timeout() -> None:
         fail("at stage {stage}, no member was released after the old run ended")
@@ -3566,10 +3577,98 @@ actor TestCampaignHoldsAMemberWithANewAttemptInFlightUntilItsRunEndsActor(t: tes
         controller = ctl
         ctl.on_conf(_with_attempt(both, "cpe-1", 0), linked)
         for name in both:
-            report(name, "upgrade-needed", 0)
+            report(name, "upgrade-needed", 0, "17.18.03a")
         ctl.on_subscriptions_synced()
         after 7.0: timeout()
 
+
+proc def _test_campaign_holds_a_member_with_a_new_attempt_in_flight_until_its_run_ends(t: testing.AsyncT):
+    """A member tried again while its run is under way keeps its slot until
+    that run ends."""
+    _TriedAgainInFlight(t, "17.18.03a")
+
+
+proc def _test_campaign_holds_a_member_with_a_new_attempt_and_image_in_flight_until_its_run_ends(t: testing.AsyncT):
+    """A member tried again while its run is under way, in one edit that
+    also changes the version of its image, keeps its slot until the run of
+    the old target ends."""
+    _TriedAgainInFlight(t, "17.18.04")
+
+
+proc def _test_campaign_holds_a_member_with_a_new_image_in_flight_through_a_pause(t: testing.AsyncT):
+    """Run a campaign over cpe-1 and cpe-2, one at a time; both answer
+    17.18.03a. While the run of the member released first is under way, one
+    edit gives the image the version 17.18.04 and sets the campaign to plan,
+    and the next edit sets it to run again. The other member answers
+    17.18.04. The run of the first member goes on for 17.18.03a, and keeps
+    its slot through the pause, so the other member waits. When that run
+    ends and the member answers 17.18.04, the slot is free and the campaign
+    releases a member."""
+    t.timeout(8.0)
+    both = ["cpe-1", "cpe-2"]
+    linked = _flat_inventory(both).to_gdata()
+    edited = _with_version(_flat_inventory(both), "17.18.04").to_gdata()
+
+    NewImageThroughPauseActor(t=t, both=both, linked=linked, edited=edited)
+
+
+actor NewImageThroughPauseActor(t: testing.AsyncT, both, linked, edited):
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var stage = 0
+    var done = False
+    var first = ""
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def report(name: str, status: str, target: str) -> None:
+        cc = controller
+        if cc is not None:
+            cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                      _tagged(status, "now", target), None)
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "now")
+        if stage == 0:
+            if len(free) == 1:
+                first = free[0]
+                other = "cpe-2" if first == "cpe-1" else "cpe-1"
+                stage = 1
+                report(first, "in-progress", "17.18.03a")
+                cc = controller
+                if cc is not None:
+                    cc.on_conf(_now_campaign("plan", both), edited)
+                    report(other, "upgrade-needed", "17.18.04")
+                    cc.on_conf(_now_campaign("run", both), edited)
+                after 2.5: old_run_ends()
+        elif stage == 1 and free != []:
+            fail("while the old run of {first} is under way: not vetoed {free}")
+        elif stage == 2 and len(free) == 1:
+            done = True
+            t.success()
+
+    def old_run_ends() -> None:
+        if stage == 1 and not done:
+            stage = 2
+            report(first, "succeeded", "17.18.03a")
+            report(first, "upgrade-needed", "17.18.04")
+
+    def timeout() -> None:
+        fail("at stage {stage}, no member was released after the old run ended")
+
+    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, lambda o: None, None)
+
+    proc def __startup__():
+        controller = ctl
+        ctl.on_conf(_now_campaign("run", both), linked)
+        for name in both:
+            report(name, "upgrade-needed", "17.18.03a")
+        ctl.on_subscriptions_synced()
+        after 7.0: timeout()
 
 
 actor _test_campaign_counts_a_failed_member_that_joins_again_as_failed(t: testing.AsyncT):

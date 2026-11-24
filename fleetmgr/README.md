@@ -163,9 +163,10 @@ In `run`, the campaign removes the veto of a member when it releases the
 member in a window, and puts the veto back when the member is done.
 
 A member's `device-status` shows the attempt that counts for the member.
-Of the attempts that its device reports for the campaign's name and the
-member's target release, that is the one `in-progress`, because a run of
-an earlier attempt is still under way, and else the member's `attempt`.
+Of the attempts that its device reports for the campaign's name, that is
+the one `in-progress`, because a run of an earlier attempt or target
+release is still under way, and else the member's `attempt` for the
+member's target release.
 Its `attempt` says which one. A member whose device has not answered that
 attempt shows `pending`, and the counters do not count it. A member that
 runs its target release already answers `up-to-date`: `succeeded` counts
