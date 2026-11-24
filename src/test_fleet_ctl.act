@@ -2647,6 +2647,182 @@ def _test_a_finished_device_keeps_the_veto_at_the_resume():
         testing.assertEqual(sorted(list(c.upgrading())), case.4, case.0)
 
 
+def waiting_run(waits: bool) -> Controller:
+    """d0 and d1 of 600 s, one at a time, in a window from 0 to 7200 and
+    again a day later. d0 starts at 0 and reports in-progress, and when
+    waits is set, its run waits to try its prepare again. With the close
+    margin of 150 percent of 600 s, a try fits the window when it starts
+    by 6300."""
+    c = controller(daily("w", 0, 2 * HOUR, 2), devices("d", 2, 600, "w"), 1, 1)
+    c.decide(0)
+    c.report("d0", "in-progress", 0)
+    c.report_prepare_wait("d0", waits, 0)
+    return c
+
+
+def tried_again(c: Controller, at: int) -> None:
+    """d0 reports at time at that its run tried its prepare again: it is
+    in-progress, and does not wait."""
+    c.report("d0", "in-progress", at)
+    c.report_prepare_wait("d0", False, at)
+
+
+def _test_a_waiting_run_keeps_its_slot_while_a_try_fits():
+    """A run that waits to try its prepare again keeps its slot, and the
+    campaign lifts its veto, while a try that starts now fits its window:
+    until 6300. The decision then wakes at 6301. The decision at 6301
+    holds d0 again: upgrading() leaves it out, so the campaign puts the
+    veto back. A run that tried again by 6300 runs on. A run that tried
+    again after 6300 is held too, also when no decision saw it wait after
+    6300. When d0 has stopped before its install, it reports
+    upgrade-needed and waits again, promised its window. It starts in no
+    window that it does not fit, and once the window closes, it is
+    promised the next window, and starts there."""
+    # (case, when d0 reports that it tried again, -1 for no report, the
+    # decision, whether d0 is upgrading after it, whether the decision
+    # wakes at 6301)
+    cases: list[(str, int, int, bool, bool)] = [
+        ("waits, at its last start", -1, 6300, True, True),
+        ("waits, after its last start", -1, 6301, False, False),
+        ("tried again by its last start", 6300, 6301, True, False),
+        ("tried again after its last start", 6301, 6301, False, False),
+    ]
+    for case in cases:
+        c = waiting_run(True)
+        if case.1 >= 0:
+            tried_again(c, case.1)
+        s = c.decide(case.2)
+        testing.assertEqual("d0" in c.upgrading(), case.3, case.0)
+        testing.assertEqual(s.wake == 6301, case.4, case.0)
+    wins = daily("w", 0, 2 * HOUR, 2)
+    c = waiting_run(True)
+    c.decide(6301)
+    c.report("d0", "upgrade-needed", 6310)
+    c.report_prepare_wait("d0", False, 6310)
+    testing.assertEqual(c.is_released("d0"), False)
+    testing.assertEqual(c.promised_window("d0"), wins[0])
+    testing.assertEqual(c.decide(6320).started, [])
+    c.decide(7200)
+    testing.assertEqual(c.promised_window("d0"), wins[1])
+    testing.assertEqual(c.decide(DAY).started, ["d0"])
+
+
+def _test_a_run_waits_until_it_tries_again():
+    """d0's run waits to try its prepare again. A report of another status
+    than in-progress, or of no status, does not end the wait, and neither
+    does a loss of its status or of every status: its device may have lost
+    the run, and starts it again once it can. So the decision at 6301
+    holds d0 again. A report in-progress that does not wait ends the wait:
+    the run tried again by its last start, and runs on."""
+    # (case, whether the decision at 6301 holds d0)
+    cases: list[(str, bool)] = [
+        ("no other report", True),
+        ("unknown", True),
+        ("no status", True),
+        ("its status lost", True),
+        ("every status lost", True),
+        ("unknown, then in-progress", False),
+    ]
+    for case in cases:
+        c = waiting_run(True)
+        if case.0 == "unknown" or case.0 == "unknown, then in-progress":
+            c.report("d0", "unknown", 3000)
+            c.report_prepare_wait("d0", False, 3000)
+        elif case.0 == "no status":
+            c.report("d0", None, 3000)
+            c.report_prepare_wait("d0", False, 3000)
+        elif case.0 == "its status lost":
+            c.lost("d0")
+        elif case.0 == "every status lost":
+            c.lost_all()
+        if case.0 == "unknown, then in-progress":
+            tried_again(c, 4000)
+        c.decide(6301)
+        testing.assertEqual("d0" not in c.upgrading(), case.1, case.0)
+
+
+def _test_a_waiting_run_follows_the_slow_time_of_its_decision():
+    """d0 and d1 of 600 s start at 0 in a window that closes at 7200, and
+    the run of d0 waits to try its prepare again. With the close margin of
+    150 percent of the slow time of 600 s, a try of d0 fits when it starts
+    by 6300. d1 succeeds at 4800. The decision at 4800 counts that, so the
+    pace of the last two upgrades and the slow time become 2700 s, and a
+    try of d0 fits only when it starts by 3150. That decision holds d0
+    again."""
+    c = controller(daily("w", 0, 2 * HOUR, 2), devices("d", 2, 600, "w"), 2, 2, rung=2)
+    testing.assertEqual(sorted(c.decide(0).started), ["d0", "d1"])
+    c.report("d0", "in-progress", 0)
+    c.report_prepare_wait("d0", True, 0)
+    c.report("d1", "in-progress", 0)
+    c.report("d1", "succeeded", 4800)
+    c.decide(4800)
+    testing.assertEqual(c.slow_s, 2700)
+    testing.assertEqual("d0" in c.upgrading(), False)
+
+
+def _test_a_run_that_waited_is_no_pace_sample():
+    """d0 starts at 0, and succeeds 3000 s later, five times its estimate.
+    Its time is the observed pace, 3000 s. When its run waited to try its
+    prepare again in its flight, and then tried again, its time is no
+    sample of the pace, which stays at 600 s. A run that waited in an
+    earlier flight, which the campaign held again at 6301 and which
+    stopped before its install, does not count: d0 starts again a day
+    later, and its time is a sample."""
+    # (case, the observed pace after d0's success)
+    cases: list[(str, int)] = [
+        ("did not wait", 3000),
+        ("waited", 600),
+        ("waited in an earlier flight", 3000),
+    ]
+    for case in cases:
+        c = waiting_run(case.0 != "did not wait")
+        start = 0
+        if case.0 == "waited in an earlier flight":
+            c.decide(6301)
+            c.report("d0", "upgrade-needed", 6310)
+            c.report_prepare_wait("d0", False, 6310)
+            start = DAY
+            testing.assertEqual(c.decide(start).started, ["d0"], case.0)
+            c.report("d0", "in-progress", start)
+        c.report_prepare_wait("d0", False, start)
+        c.report("d0", "succeeded", start + 3000)
+        c.decide(start + 3000)
+        testing.assertEqual(c.observed_s, case.1, case.0)
+
+
+def _test_the_run_waits_through_a_copy_a_loss_and_a_drop():
+    """d0's run waits to try its prepare again. A copy keeps that it waits:
+    a decision on the copy at 6301 holds d0 again. That decision and a
+    drop() on the copy leave the original as it is. A loss of every status
+    keeps that d0 waits. A report that it tried again keeps that it
+    waited, with the time of that report. drop() forgets it."""
+    # (case, the devices whose run waited, with when they tried again)
+    cases: list[(str, list[(str, int)])] = [
+        ("copy", [("d0", fleet_ctl.NO_TIME)]),
+        ("lost all", [("d0", fleet_ctl.NO_TIME)]),
+        ("tried again", [("d0", 3000)]),
+        ("drop", []),
+    ]
+    for case in cases:
+        c = waiting_run(True)
+        if case.0 == "copy":
+            x = c.copy()
+            testing.assertEqual([(x.name_of(k), v) for k, v in x.run_waits.items()],
+                                case.1, case.0)
+            x.decide(6301)
+            testing.assertEqual(sorted(list(x.resumed_devices())), ["d0"], case.0)
+            x.drop({"d0"})
+            testing.assertEqual(sorted(list(c.resumed_devices())), [], case.0)
+        elif case.0 == "lost all":
+            c.lost_all()
+        elif case.0 == "tried again":
+            tried_again(c, 3000)
+        else:
+            c.drop({"d0"})
+        testing.assertEqual([(c.name_of(k), v) for k, v in c.run_waits.items()], case.1,
+                            case.0)
+
+
 def _test_a_new_attempt_in_a_pause_forgets_only_its_member():
     """PAUSED stops at 23000: d0, d1 and d2 are done, d3 and d4 are in
     flight, and d5 to d9 wait with promises. In the pause one member gets a

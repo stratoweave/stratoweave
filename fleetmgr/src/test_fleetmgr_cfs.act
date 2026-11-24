@@ -1089,6 +1089,26 @@ def _test_controller_status():
                             "{case.0} at {case.1}")
 
 
+def _test_waits_to_prepare():
+    """A member's run waits when its counted attempt is in-progress at the
+    stage prepare and its prepare is retrying, or when it is unknown."""
+    # (status, stage, prepare state, whether the run waits)
+    cases: list[(?str, ?str, ?str, bool)] = [
+        ("in-progress", "prepare", "retrying", True),
+        ("unknown", None, None, True),
+        ("unknown", "prepare", "retrying", True),
+        ("in-progress", "prepare", "running", False),
+        ("in-progress", "prepare", None, False),
+        ("in-progress", "precheck", "retrying", False),
+        ("upgrade-needed", None, "retrying", False),
+        ("failed", "prepare", "failed", False),
+        (None, None, None, False),
+    ]
+    for case in cases:
+        testing.assertEqual(cfs.waits_to_prepare(case.0, case.1, case.2), case.3,
+                            "{case.0} at {case.1}, prepare {case.2}")
+
+
 def _campaign_path(name: str) -> ttt.Path:
     """Return the path of one campaign entry, as TTT builds it."""
     software = ttt.PathElem(gdata.Id(y0_oper.NS_software, "software"), ttt.PathRoot("root"))
@@ -2829,6 +2849,111 @@ actor _test_campaign_veto_back_when_done(t: testing.AsyncT):
         ctl.on_subscriptions_synced()
         after float(cfs.campaign_debounce_s(1)) + 2.0: timeout()
 
+
+proc def _WaitingRun(t: testing.AsyncT, mode: str):
+    """Run the campaign late over cpe-1, whose window closes 8 s from now
+    and whose upgrade takes 4 s. With the close margin of 150 percent, a
+    try fits the window when it starts by 2 s from now. The campaign lifts
+    the veto of cpe-1, and its device reports its run in-progress at the
+    stage prepare. In the mode "waits", its prepare is retrying: the run
+    waits to try its prepare again. In the mode "status goes", the status
+    of cpe-1 goes right after that report. In the mode "tries again", its
+    prepare runs, and 3.5 s from now it is retrying and then running
+    again, before the campaign decides. In the mode "unknown", the device
+    of cpe-1 cannot be read and reports its run unknown. Pass t when the
+    campaign puts the veto back on cpe-1 within 7 s from now."""
+    t.timeout(10.0)
+    now = time.time().unix_s()
+    campaign = InputCampaign(name="late", admin_state="run", default_schedule="late",
+                             target_concurrency=u64(1), max_concurrency=u64(1))
+    campaign.device.create("cpe-1", image=IMAGE)
+    linked = _flat_inventory(["cpe-1"], 4)
+    linked.schedules.schedule.create("late").window.create(u64((now - 1) % 86400),
+                                                           duration=u64(9))
+    WaitingRunActor(t=t, mode=mode, campaign=campaign, linked=linked)
+
+
+proc def _test_campaign_puts_the_veto_back_on_a_run_that_waits_past_its_window(
+        t: testing.AsyncT):
+    _WaitingRun(t, "waits")
+
+
+proc def _test_campaign_keeps_the_wait_of_a_member_whose_status_goes(t: testing.AsyncT):
+    _WaitingRun(t, "status goes")
+
+
+proc def _test_campaign_puts_the_veto_back_on_a_run_that_tries_again_past_its_window(
+        t: testing.AsyncT):
+    _WaitingRun(t, "tries again")
+
+
+proc def _test_campaign_puts_the_veto_back_on_a_run_that_waits_for_its_device(
+        t: testing.AsyncT):
+    _WaitingRun(t, "unknown")
+
+
+def _in_prepare(prepare: str) -> y1_oper.stratoweave_rfs__rfs__device__state:
+    """The state of cpe-1 in the campaign late: in-progress at the stage
+    prepare, with its prepare in the state prepare."""
+    s, a = _attempt_state("in-progress", "late", "17.18.03a", 0, "prepare", None)
+    a.prepare.state = prepare
+    a.prepare.release = "17.18.03a"
+    return s
+
+
+actor WaitingRunActor(t: testing.AsyncT, mode: str, campaign, linked):
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var released = False
+    var done = False
+
+    keys = (rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1")
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        vetoed, free, targeted, unnamed = _vetoed(out, "late")
+        cc = controller
+        if not released and free == ["cpe-1"] and cc is not None:
+            released = True
+            if mode == "tries again":
+                cc.on_rfs(keys, _in_prepare("running"), None)
+            elif mode == "unknown":
+                cc.on_rfs(keys, _tagged("unknown", "late", "17.18.03a"), None)
+            else:
+                cc.on_rfs(keys, _in_prepare("retrying"), None)
+            if mode == "status goes":
+                cc.on_rfs(keys, None, None)
+        elif released and vetoed == ["cpe-1"]:
+            done = True
+            t.success()
+
+    def try_again() -> None:
+        cc = controller
+        if released and not done and cc is not None:
+            cc.on_rfs(keys, _in_prepare("retrying"), None)
+            cc.on_rfs(keys, _in_prepare("running"), None)
+
+    def check() -> None:
+        if not released:
+            fail("cpe-1 was not released")
+        else:
+            fail("{mode}: the run of cpe-1 is past its window, and cpe-1 did not get the veto back")
+
+    proc def __startup__():
+        ctl = cfs.UpgradeCampaignTransform(_campaign_path("late"), on_output, lambda o: None,
+                                           None)
+        controller = ctl
+        ctl.on_conf(campaign, linked.to_gdata())
+        ctl.on_rfs(keys, _tagged("upgrade-needed", "late", "17.18.03a"), None)
+        ctl.on_subscriptions_synced()
+        if mode == "tries again":
+            after 3.5: try_again()
+        after 7.0: check()
 
 
 proc def _test_campaign_holds_a_member_with_a_stale_status(t: testing.AsyncT):
