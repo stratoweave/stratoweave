@@ -7,10 +7,12 @@ plan, checks that the plan places everyone with no alarm once every member
 has answered, and that nothing starts, flips it to run, and then watches
 the rollout: the first release is small,
 releases arrive in several steps, devices in flight never exceed
-target-concurrency, and everyone succeeds with both upgrade checks passed.
-Every device then reports the new version and its model in the campaign
-and its platform on its fleet entry, one of them the model and serial
-number its mock is set to.
+target-concurrency, and everyone succeeds with both upgrade checks passed:
+a member shows both verdicts, or, once the complete campaign frees it, its
+result at stage commit, which a run reaches only after both checks
+passed. Every device then reports the new version, its model, and its
+platform on its fleet entry, one of them the model and serial number its
+mock is set to.
 
 Run from fleetmgr/:
     acton test --module test_fleetmgr_pacing --tag fleetmgr-system
@@ -92,32 +94,42 @@ actor PacingRollout(size: int, client: std.http.Client, done: action(?Exception)
                                         qv = post.get("verdict")
                                         if isinstance(pv, str) and isinstance(qv, str) and pv == "pass" and qv == "pass":
                                             checked += 1
+                                    elif "freed" in row and row.get("status") == "succeeded" \
+                                         and row.get("stage") == "commit":
+                                        # A freed member shows its result, without
+                                        # verdicts: a run commits only after its
+                                        # pre-check and post-check passed.
+                                        checked += 1
                         return (ip, ok, bad, placed, alarms, checked)
         return None
 
     def parse_rows(body: str) -> dict[str, str]:
-        """The version and model of each device-status row, by device,
-        "None" where it has none."""
+        """The version and model of each device of the fleet, from its
+        platform, by device, "None" where it has none. A complete campaign
+        shows only the results of its freed members, so the fleet has the
+        release that each device runs after the rollout."""
         found: dict[str, str] = {}
         data = std.json.decode(body)
         if isinstance(data, dict):
-            campaigns = data.get("software:upgrade-campaign")
-            if isinstance(campaigns, list) and len(campaigns) == 1:
-                campaign = campaigns[0]
-                if isinstance(campaign, dict):
-                    state = campaign.get("state")
-                    if isinstance(state, dict):
-                        rows = state.get("device-status")
-                        if isinstance(rows, list):
-                            for row in rows:
-                                if isinstance(row, dict):
-                                    d = row.get("device")
-                                    v = row.get("version")
-                                    m = row.get("model")
+            fleet = data.get("fleetmgr:fleet")
+            if isinstance(fleet, dict):
+                devices = fleet.get("device")
+                if isinstance(devices, list):
+                    for dev in devices:
+                        if isinstance(dev, dict):
+                            d = dev.get("name")
+                            state = dev.get("state")
+                            vs = "None"
+                            ms = "None"
+                            if isinstance(state, dict):
+                                platform = state.get("platform")
+                                if isinstance(platform, dict):
+                                    v = platform.get("version")
+                                    m = platform.get("model")
                                     vs = v if isinstance(v, str) else "None"
                                     ms = m if isinstance(m, str) else "None"
-                                    if isinstance(d, str):
-                                        found[d] = vs + " " + ms
+                            if isinstance(d, str):
+                                found[d] = vs + " " + ms
         return found
 
     def campaign_payload(admin: str) -> bytes:
@@ -161,7 +173,8 @@ actor PacingRollout(size: int, client: std.http.Client, done: action(?Exception)
                     done(ValueError("{n - parsed.5} device(s) succeeded without both checks passed"))
                 else:
                     print("pacing: ramped from {first}, {steps} release steps, peak in-flight {max_ip}, {ok} of {n} succeeded")
-                    client.get(path, versions_checked, {"Accept": "application/yang-data+json"})
+                    client.get("/restconf/data/fleetmgr:fleet", versions_checked,
+                               {"Accept": "application/yang-data+json"})
                 return
             polls += 1
             if polls > 360:
@@ -176,7 +189,7 @@ actor PacingRollout(size: int, client: std.http.Client, done: action(?Exception)
 
     def versions_checked(client: std.http.Client, response: std.http.Response) -> None:
         # The new version is read after the status is published, so it can
-        # reach the campaign a moment later.
+        # reach the fleet a moment later.
         if response.status != 200:
             done(test_scale.status_error(response, 200))
             return
@@ -192,10 +205,11 @@ actor PacingRollout(size: int, client: std.http.Client, done: action(?Exception)
             client.get("/restconf/data/fleetmgr:fleet", platforms_checked,
                        {"Accept": "application/yang-data+json"})
         elif version_tries >= 40:
-            done(ValueError("campaign versions and models after the rollout: {wrong}"))
+            done(ValueError("fleet versions and models after the rollout: {wrong}"))
         else:
             version_tries += 1
-            after 0.5: client.get(path, versions_checked, {"Accept": "application/yang-data+json"})
+            after 0.5: client.get("/restconf/data/fleetmgr:fleet", versions_checked,
+                                  {"Accept": "application/yang-data+json"})
 
     def platforms_checked(client: std.http.Client, response: std.http.Response) -> None:
         if response.status != 200:

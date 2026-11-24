@@ -617,6 +617,16 @@ def same_as_a_new_plan(c: Controller, dur_of: dict[str, int], until: int,
         testing.assertEqual(s.plan.held, n.plan.held, "held at {t}")
         testing.assertEqual(s.plan.why, n.plan.why, "why at {t}")
         testing.assertEqual(s.plan.alarms, n.plan.alarms, "alarms at {t}")
+        # A campaign completes on finished: it holds exactly when every
+        # member is done, and then none is in flight.
+        every = True
+        for member in c.est.keys():
+            if not c.is_done(member):
+                every = False
+        testing.assertEqual(s.finished, every, "finished when every member is done, at {t}")
+        testing.assertEqual(c.is_finished(), s.finished, "is_finished() is the step's, at {t}")
+        if s.finished:
+            testing.assertEqual(c.flying_devices(), set(), "in flight when finished, at {t}")
         rz = resumed
         sp = shown_plan
         sq = shown_prepares
@@ -5027,6 +5037,147 @@ def _test_the_plan_is_the_run_chains():
     separation = {"a": (True, 0), "b": (True, 0)}
     plan_is_run(daily("day", 0, HOUR, 2), devices("d", 20, 600, "day"), 4, 8, True, 600,
                 groups, priority, separation)
+
+
+def _test_results_stand_in_for_the_run():
+    """A campaign that is complete frees its members and keeps their
+    results. After a restart of fleetmgr, a new controller, configured as
+    the run's and started, takes each member's result: its final status at
+    the time it was done, with whether its rollback failed. It is finished
+    at once, has the same done times and the same failures, and plans a
+    member that gets a new attempt after the run as the controller of the
+    run does: at the same start, in the same window, or held for the same
+    reason by the same member. Every upgrade takes its estimate, as the new
+    controller expects. Each fixture is run to its end, and then each
+    member gets a new attempt alone, one row each. A member released in
+    the run whose device answered up-to-date is the exception, at the
+    end: the new controller has no release for it, as after any restart."""
+    gp, pp = pairs(12)
+    packed = {g: (False, 3600) for g in gp.keys()}
+    spread = {g: (True, 600) for g in gp.keys()}
+    chains = {"a": ["d0", "d1", "d2"], "b": ["d2", "d3"], "c": ["d5", "d4"]}
+    chain_priority = {"d0": 1, "d1": 2, "d2": 3, "d3": 4, "d5": 1, "d4": 2}
+    day9 = daily("day", 0, HOUR, 9)
+    # (case, windows, devices, target, max, must_place, groups, priorities,
+    # separation, the groups that hold on a failure, the members that fail,
+    # the members whose rollback fails, the members up to date before their
+    # release)
+    cases: list[(str, list[(str, int, int)], list[(str, int, str)], int, int, bool,
+                 dict[str, list[str]], dict[str, int], dict[str, (bool, int)], set[str],
+                 list[str], list[str], list[str])] = [
+        ("uniform", day9, devices("d", 20, 600, "day"), 4, 4, False,
+         {}, {}, {}, set(), [], [], []),
+        ("two schedules", [("night", 0, HOUR), ("weekend", 2 * HOUR, 3 * HOUR)],
+         devices("n", 5, 8, "night") + devices("w", 5, 8, "weekend"), 8, 16, False,
+         {}, {}, {}, set(), [], [], []),
+        ("deadline", daily("day", 0, HOUR, 2), devices("d", 30, 600, "day"), 4, 20, True,
+         {}, {}, {}, set(), [], [], []),
+        ("pairs 3600 s apart", day9, devices("d", 12, 600, "day"), 4, 4, False,
+         gp, pp, packed, set(), [], [], []),
+        ("spread pairs", day9, devices("d", 12, 600, "day") + devices("e", 12, 600, "day"),
+         4, 4, False, gp, pp, spread, set(), [], [], []),
+        ("chains", daily("day", 0, HOUR, 2), devices("d", 20, 600, "day"), 4, 8, True,
+         chains, chain_priority, {"a": (True, 0), "b": (True, 0)}, set(), [], [], []),
+        ("a hold group with a failure", day9, devices("d", 12, 600, "day"), 4, 4, False,
+         gp, pp, packed, {"g0"}, ["d0"], [], []),
+        ("a failed rollback", day9, devices("d", 12, 600, "day"), 4, 4, False,
+         gp, pp, packed, set(), ["d2"], ["d2"], []),
+        ("members up to date before their release", day9, devices("d", 12, 600, "day"), 4, 4,
+         False, gp, pp, packed, set(), [], [], ["d1", "d4", "d7"]),
+    ]
+    for case in cases:
+        est = case.2[0].1
+        c = controller(case.1, case.2, case.3, case.4, case.5, 1, est, case.6, case.7, case.8,
+                       hold_failed=case.9)
+        for name in case.12:
+            c.report(name, "up-to-date", 0)
+        sim.drive(c, 0, {}, 30 * DAY, failing=case.10, rollback=case.11)
+        testing.assertTrue(c.is_finished(), "{case.0}: the run is finished")
+        members = [d.0 for d in case.2]
+        t = 0
+        for m in members:
+            t = fleet_ctl.imax(t, c.done_time_of(m) + 1)
+        fresh = controller(case.1, case.2, case.3, case.4, case.5, 1, est, case.6, case.7,
+                           case.8, hold_failed=case.9)
+        for m in members:
+            k = c.known(m)
+            fresh.report(m, c.final_status[k], c.done_time_of(m), c.rollback_failed[k])
+        testing.assertEqual(fresh.decide(t).finished, True,
+                            "{case.0}: the new controller is finished at once")
+        testing.assertEqual({m: fresh.done_time_of(m) for m in members},
+                            {m: c.done_time_of(m) for m in members}, "{case.0}: the done times")
+        testing.assertEqual((fresh.failed_devices(), fresh.failures, fresh.over_budget()),
+                            (c.failed_devices(), c.failures, c.over_budget()),
+                            "{case.0}: the failures")
+        for m in members:
+            a = c.copy()
+            b = fresh.copy()
+            a.drop({m})
+            b.drop({m})
+            a.report(m, "upgrade-needed", t)
+            b.report(m, "upgrade-needed", t)
+            pa = a.plan(t)
+            pb = b.plan(t)
+            testing.assertEqual((pb.starts.get(m), pb.why.get(m)),
+                                (pa.starts.get(m), pa.why.get(m)), "{case.0}: {m} with a new attempt")
+
+    # A member released that answers up-to-date did not go down, but it did
+    # take a slot, so the next member of its group waits the min-separation
+    # after it. The new controller takes it as done without a release and
+    # up to date, and the next member waits for it the same.
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], [("a", 600, "w"), ("b", 600, "w")], 1, 1,
+                   groups={"g": ["a", "b"]}, priority={"a": 1, "b": 2},
+                   separation={"g": (False, 3600)})
+    testing.assertEqual(c.decide(0).started, ["a"], "a starts")
+    c.report("a", "up-to-date", 600)
+    testing.assertEqual(c.decide(600).started, [], "b waits the min-separation")
+    testing.assertEqual(c.decide(4200).started, ["b"], "b starts after it")
+    c.report("b", "succeeded", 4800)
+    testing.assertEqual(c.decide(4800).finished, True, "the run is finished")
+    fresh = controller([("w", 0, fleet_ctl.OPEN_END)], [("a", 600, "w"), ("b", 600, "w")], 1, 1,
+                       groups={"g": ["a", "b"]}, priority={"a": 1, "b": 2},
+                       separation={"g": (False, 3600)})
+    for m in ["a", "b"]:
+        fresh.report(m, c.final_status[c.known(m)], c.done_time_of(m))
+    testing.assertEqual((c.prior("b"), fresh.prior("b")), ([("a", "g")], [("a", "g")]),
+                        "a released and up to date: in b's prior for both")
+    a = c.copy()
+    b = fresh.copy()
+    a.drop({"b"})
+    b.drop({"b"})
+    a.report("b", "upgrade-needed", 4801)
+    b.report("b", "upgrade-needed", 4801)
+    testing.assertEqual(b.plan(4801).starts.get("b"), a.plan(4801).starts.get("b"),
+                        "b with a new attempt starts at the same time for both")
+
+    # The other way round: b, after a in the group, is released and answers
+    # up-to-date. The controller of the run has b's release, so a with a new
+    # attempt waits the min-separation after b. The new controller takes b
+    # as done without a release and up to date, which ran no upgrade, so a
+    # does not wait for b.
+    c = controller([("w", 0, fleet_ctl.OPEN_END)], [("a", 600, "w"), ("b", 600, "w")], 1, 1,
+                   groups={"g": ["a", "b"]}, priority={"a": 1, "b": 2},
+                   separation={"g": (False, 3600)})
+    testing.assertEqual(c.decide(0).started, ["a"], "a starts")
+    c.report("a", "succeeded", 600)
+    testing.assertEqual(c.decide(4200).started, ["b"], "b starts after a")
+    c.report("b", "up-to-date", 4300)
+    testing.assertEqual(c.decide(4300).finished, True, "the run is finished")
+    testing.assertEqual(c.done_time_of("b"), 4300, "b is done at its answer")
+    fresh = controller([("w", 0, fleet_ctl.OPEN_END)], [("a", 600, "w"), ("b", 600, "w")], 1, 1,
+                       groups={"g": ["a", "b"]}, priority={"a": 1, "b": 2},
+                       separation={"g": (False, 3600)})
+    for m in ["a", "b"]:
+        fresh.report(m, c.final_status[c.known(m)], c.done_time_of(m))
+    a = c.copy()
+    b = fresh.copy()
+    a.drop({"a"})
+    b.drop({"a"})
+    a.report("a", "upgrade-needed", 4301)
+    b.report("a", "upgrade-needed", 4301)
+    testing.assertEqual((a.plan(4301).starts.get("a"), b.plan(4301).starts.get("a")),
+                        ((0, 7900), (0, 4301)),
+                        "a with a new attempt: after b in the run, at once after a restart")
 
 
 #############################################################################
