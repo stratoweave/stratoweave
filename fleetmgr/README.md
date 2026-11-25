@@ -164,12 +164,11 @@ member in a window, and puts the veto back when the member is done.
 
 A member's `device-status` shows the attempt that counts for the member.
 Of the attempts that its device reports for the campaign's name, that is
-the one `in-progress`, because a run of an earlier attempt is still under
-way, and else the member's `attempt` for the member's target release.
-Its `attempt` says which one. A member whose device has not answered that
-attempt shows `pending`, and the counters do not count it. A member that
-runs its target release already answers `up-to-date`: `succeeded` counts
-it, and `up-to-date` counts it again.
+the one `in-progress`, and else the member's `attempt` for the member's
+target release. Its `attempt` says which one. A member whose device has
+not answered that attempt shows `pending`, and the counters do not count
+it. A member that runs its target release already answers `up-to-date`:
+`succeeded` counts it, and `up-to-date` counts it again.
 
 A member answers the campaign's target with `upgrade-needed` or a final
 status, and the campaign releases a member only once it answers
@@ -178,28 +177,27 @@ one that is up to date, or one that succeeded or failed before it left the
 campaign and joined it again with the same attempt, is done at once: it
 takes no window. The next member of its redundancy groups waits the
 group's `min-separation` from the answer of a member that is up to date,
-or, when that member upgraded in the run before a new attempt or before it
-joined again, from the end of that upgrade. After
-one that succeeded or failed before, it waits the `min-separation` from
-that member's report. When the member's device tells when it last booted,
-its `last-boot` in `state/platform`, a later boot moves the end of that
-upgrade. For any other member the boot takes the place of its answer or
-report, for example after a restart of fleetmgr, when the campaign did
-not see its upgrade end: the next member need not wait for a device that
-has run the target for months. But the next member never waits less than
-the `min-separation` from the end of an upgrade that the member ran in the
-run. A failed one still counts as failed: it counts against
-`failure-budget` and holds its redundancy groups as their `failure-policy`
-says. A member that needs the upgrade also waits the `min-separation` from
-when each other member of its redundancy groups was done after an upgrade
-in the run, or with a final status other than `up-to-date`, also a member
-after it in the group. A member that shows `pending` or `unknown` has not
-answered. Until it answers, the plan holds the member in its window, and
-the plan's alarms name it. A campaign in `plan` plans again as the answers
-come in. Before the first run, its plan is that of a run that starts now,
-so it shows what `run` would do. A campaign created directly in `run`
-promises its windows in the order its members answer. Create it in `plan`
-first to keep the campaign's order.
+or, when that member upgraded in the run before it joined again, from the
+end of that upgrade. After one that succeeded or failed before, it waits
+the `min-separation` from that member's report. When the member's device
+tells when it last booted, its `last-boot` in `state/platform`, a later
+boot moves the end of that upgrade. For any other member the boot takes
+the place of its answer or report, for example after a restart of
+fleetmgr, when the campaign did not see its upgrade end: the next member
+need not wait for a device that has run the target for months. But the
+next member never waits less than the `min-separation` from the end of an
+upgrade that the member ran in the run. A failed one still counts as
+failed: it counts against `failure-budget` and holds its redundancy groups
+as their `failure-policy` says. A member that needs the upgrade also waits
+the `min-separation` from when each other member of its redundancy groups
+was done after an upgrade in the run, or with a final status other than
+`up-to-date`, also a member after it in the group. A member that shows
+`pending` or `unknown` has not answered. Until it answers, the plan holds
+the member in its window, and the plan's alarms name it. A campaign in
+`plan` plans again as the answers come in. Before the first run, its plan
+is that of a run that starts now, so it shows what `run` would do. A
+campaign created directly in `run` promises its windows in the order its
+members answer. Create it in `plan` first to keep the campaign's order.
 
 A device in the fleet is in one campaign at most, also while the campaign
 is in `plan` and after it is done. An edit that names a device in a second
@@ -261,17 +259,15 @@ Stopping and running a campaign again does not try its failed members
 again, and neither does removing a member and adding it again: its device
 keeps the final status of its attempt. A member removed while in flight
 stops before its install and answers `upgrade-needed`, so added again it
-waits for a window. To try a member again, change its `attempt`, for
-example from 0 to 1. The campaign then takes it as a new member: the
-device reads its release again, and the campaign holds the member until
-it answers the new attempt, and releases it in a window. A member that
-succeeded reads again and answers `up-to-date`; when it upgraded in the
-run, the next member of its redundancy groups waits the `min-separation`
-from the end of that upgrade, or from a later boot of its device, not from
-the answer. A member in flight gets
-the campaign's veto back: its run stops before the install, or, past the
-install, finishes and holds its slot until it ends. To prepare a member
-again without a new attempt, change its `prepare-attempt` instead.
+waits for a window. To try a member again whose attempt failed, as
+`failure-budget` below counts it, change its `attempt`, for example from 0
+to 1. The member keeps its image. The campaign then takes it as a new
+member: the device reads its release again, and the campaign holds the
+member until it answers the new attempt, and releases it in a window. An
+edit that gives any other member a new attempt fails and changes nothing,
+with "upgrade-campaign NAME gives no new attempt to DEVICES: the attempt of
+each has not failed". To prepare a member again without a new attempt,
+change its `prepare-attempt` instead.
 
 With `failure-budget`, a campaign stops its releases when too many members
 fail. The budget is a percent of the members the campaign has, rounded
@@ -337,11 +333,11 @@ the other members. With `continue`, the default, a member that failed or
 rolled back holds them only until it is done and up again; the next
 member starts after the group's `min-separation`. A member whose rollback
 failed holds them until an operator acts, as all failures do with
-`hold`. So does a member with a new attempt that was set while a run of
-an earlier one failed its rollback: the device may run the release that
-run installed, uncommitted, so the new attempt does not start. The member
-shows `not-started`, with the failed attempt in its `reason`, and counts
-as failed until it has another attempt.
+`hold`. So does a member that shows `not-started`, with the failed
+attempt in its `reason`: the run of another attempt on its device failed
+its rollback, so the device may run the release that run installed,
+uncommitted, and the member's attempt does not start. It counts as failed
+until it has another attempt.
 
 With `notification-period`, in days, a campaign uses only the windows that
 open that long or more after its `run-since`, so that the customers of its

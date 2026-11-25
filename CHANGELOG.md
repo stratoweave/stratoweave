@@ -701,21 +701,18 @@
   is the time Fleet Manager first starts on this version, or, for a
   campaign in `plan`, the time it next goes to `run`. 0, the default, gives
   no notice. [#795]
-- A campaign member has an `attempt`. Changing it tries the member again:
-  the campaign takes it as a new member, its device reads its release
-  again, and a member that failed is released again in a window. A member
-  in flight gets the campaign's veto back. A run past its install finishes
-  and holds its slot and its redundancy groups until it ends, also when the
-  same edit gives the member's image a new version. Removing a member and
-  adding it again no longer tries it again: its device keeps the final
-  status of its attempt. `device-status` shows the attempt that counts, the
-  one in progress or else the member's attempt, in its new `attempt`, and
-  no longer the `upgrade-campaign` and `target-release` of the device. A
-  member with a new attempt no longer counts against the failure budget.
-  A new attempt set while a run fails its rollback does not start: the
-  member shows `not-started`, counts as failed, and holds its redundancy
-  groups as a failed rollback does, until it has another attempt. [#804]
-  [#814] [#854]
+- A campaign member has an `attempt`. Changing the attempt of a member that
+  failed tries it again: the campaign takes it as a new member, its device
+  reads its release again, and the member is released again in a window.
+  Removing a member and adding it again no longer tries it again: its device
+  keeps the final status of its attempt. `device-status` shows the attempt
+  that counts, the one in progress or else the member's attempt, in its new
+  `attempt`, and no longer the `upgrade-campaign` and `target-release` of
+  the device. A member with a new attempt no longer counts against the
+  failure budget. A member that shows `not-started`, because the run of
+  another attempt on its device failed its rollback, counts as failed, and
+  holds its redundancy groups as a failed rollback does, until it has
+  another attempt. [#804] [#814]
 - A redundancy group's new `failure-policy` says what a failed member does
   to the other members. With `continue`, the default, a member that failed
   or rolled back holds them only until it is done and up again, and the
@@ -747,14 +744,14 @@
   attempt. It takes no window and no slot, and adds nothing to the pace or
   the ramp. The next member of its redundancy groups waits the group's
   `min-separation` from the answer of a member that is up to date, or, when
-  that member upgraded in the run before it got a new attempt or joined
-  again, from the end of that upgrade. After one that succeeded or failed
-  before, it waits the `min-separation` from that member's report. A failed
-  one still counts against the failure budget and holds its groups as their
-  `failure-policy` says. The plan shows it in no window, and the campaign
-  page counts it as already done. It waits again when its final status
-  goes, unless its rollback failed. Before, it waited for a window of its
-  schedule and held a slot there until the next decision. [#830]
+  that member upgraded in the run before it joined again, from the end of
+  that upgrade. After one that succeeded or failed before, it waits the
+  `min-separation` from that member's report. A failed one still counts
+  against the failure budget and holds its groups as their `failure-policy`
+  says. The plan shows it in no window, and the campaign page counts it as
+  already done. It waits again when its final status goes, unless its
+  rollback failed. Before, it waited for a window of its schedule and held a
+  slot there until the next decision. [#830]
 - A paused campaign carries its run on. Before, setting a campaign from `plan`
   back to `run` started a new run: the members released before the pause were
   released again, the windows and the prepare turns were given out again, and
@@ -1060,8 +1057,11 @@
   released, and the image's version. An edit that gives such a member
   another image, or that changes or removes the version of its image in the
   image list, fails and changes nothing, and the error names the campaign
-  and the members. A pause and a restart of fleetmgr keep this. Before, a
-  new version made a member that was done upgrade again.
+  and the members. A pause and a restart of fleetmgr keep this. A campaign
+  gives a new attempt only to a member whose attempt failed, as the failure
+  budget counts it, and an edit that gives one to any other member fails the
+  same way. Before, a new version made a member that was done upgrade again,
+  and a new attempt made a member that succeeded read its release again.
 
 ### Dependencies
 
@@ -1478,7 +1478,6 @@ next. Give it a spin. We’d love to hear what you think.
 [#850]: https://github.com/stratoweave/stratoweave/pull/850
 [#851]: https://github.com/stratoweave/stratoweave/pull/851
 [#853]: https://github.com/stratoweave/stratoweave/pull/853
-[#854]: https://github.com/stratoweave/stratoweave/pull/854
 [#855]: https://github.com/stratoweave/stratoweave/pull/855
 [#856]: https://github.com/stratoweave/stratoweave/pull/856
 [#857]: https://github.com/stratoweave/stratoweave/pull/857
