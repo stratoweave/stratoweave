@@ -2877,39 +2877,20 @@ def _test_a_new_attempt_in_a_pause_forgets_only_its_member():
 
 
 def _test_a_new_target():
-    """retarget() takes a new target release for members, as a new version
-    of their image gives it. Each device then reports for the new target:
-    no status until it reads it, then upgrade-needed, or up-to-date when
-    it runs that release already. A member in flight stays released. A
-    waiting member keeps its promise and forgets its prepare: a member let
-    prepare is no longer let, and takes a turn again once it answers the
-    new target. A member that is released and done waits again with no
-    promise: its done time goes, and the member after it in its
-    redundancy group waits for it again. A plain failure no longer holds
-    the group, but a failed rollback stays done and holds the group until
-    an operator acts, also when it failed before its release, as when it
-    left the campaign and joined it again with the same attempt. An image
-    that is removed and added back, or a version that changes and changes
-    back, is two new targets. When the image is back, the device answers
-    with the succeeded that it keeps for its attempt: the member is done
-    again at that answer, and the member after it waits the min-separation
-    from then. When the version is back, the device reads again and
-    answers up-to-date: the member is done again. When the device answered
-    upgrade-needed for the changed version, the member is done at the
-    up-to-date answer, and the member after it waits the min-separation
-    from then. When the version changed back before the device answered
-    it, the member after it waits the min-separation from the end of its
-    upgrade. When the device tells that it booted in the upgrade, at 300,
-    the member is done at that boot instead of its answer, but not before
-    the end of its upgrade, at 600. When it booted after the upgrade, at
-    700, the member is done at that boot. The same occurs when the new
-    targets come in a pause."""
+    """retarget() takes a new target release for members. Each device then
+    reports for the new target: no status until it reads it, then
+    upgrade-needed, or up-to-date when it runs that release already. A
+    waiting member keeps its promise, and its turn to prepare goes; it takes
+    a turn again once it answers the new target. A member let prepare is no
+    longer let. A member released that has no final report waits again,
+    promised the window it was released in: it is released again once it
+    answers, or at once when its device still runs the old target, which
+    keeps its slot until it ends. A member that is up to date waits again
+    once its status goes, and is done again when it answers up-to-date."""
     # ONE: d0 is let prepare at 0, and d1 is promised the window.
-    for case in ["let", "prepared", "waiting"]:
+    for case in ["let", "waiting"]:
         c = one()
         c.decide(0)
-        if case == "prepared":
-            c.report_prepare("d0", "done")
         name = "d1" if case == "waiting" else "d0"
         promised = c.promised_window(name)
         c.retarget({name})
@@ -2920,196 +2901,36 @@ def _test_a_new_target():
         c.report(name, "upgrade-needed", 60)
         testing.assertEqual(name in [e.1 for e in c.turns(60).0], True, case)
 
-    no_hold: set[str] = set()
-    # (case, whether the group holds on a failure, how r1 ends, or "" while
-    # it is in flight, whether its rollback fails, what r1 answers each new
-    # target after it reports no status, or "" for nothing, whether r1 is
-    # still released after them, r1's done time and r2's gate then, why r2
-    # is held at 1200, where and when the plan at 1200 starts r1 and r2,
-    # when r1's device last booted, or None when it does not tell, and
-    # whether the new targets come in a pause)
-    cases: list[(str, bool, str, bool, list[str], bool, (int, int), ?(str, str),
-                 (?(int, int), ?(int, int)), ?int, bool)] = [
-        ("done", False, "succeeded", False, ["upgrade-needed"], False, (-1, -1), None,
-         ((0, 1800), (0, 6000)), None, False),
-        ("failed, hold", True, "failed", False, ["upgrade-needed"], False, (-1, -1), None,
-         ((0, 1800), (0, 6000)), None, False),
-        ("failed rollback", False, "failed", True, ["upgrade-needed"], True, (600, -1),
-         ("group-failed", "r1"), (None, None), None, False),
-        ("removed and added back", False, "succeeded", False, ["", "succeeded"], False,
-         (850, 850 + HOUR), None, (None, (0, 850 + HOUR)), None, False),
-        ("removed and added back, booted in the upgrade", False, "succeeded", False,
-         ["", "succeeded"], False, (600, 600 + HOUR), None, (None, (0, 600 + HOUR)), 300,
-         False),
-        ("changed and changed back", False, "succeeded", False, ["upgrade-needed", "up-to-date"],
-         False, (850, 850 + HOUR), None, (None, (0, 850 + HOUR)), None, False),
-        ("changed and changed back, booted in the upgrade", False, "succeeded", False,
-         ["upgrade-needed", "up-to-date"], False, (600, 600 + HOUR), None,
-         (None, (0, 600 + HOUR)), 300, False),
-        ("changed and changed back in a pause, booted in the upgrade", False, "succeeded",
-         False, ["upgrade-needed", "up-to-date"], False, (600, 600 + HOUR), None,
-         (None, (0, 600 + HOUR)), 300, True),
-        ("changed back before an answer", False, "succeeded", False, ["", "up-to-date"], False,
-         (600, 600 + HOUR), None, (None, (0, 600 + HOUR)), None, False),
-        ("changed back before an answer, booted after the upgrade", False, "succeeded", False,
-         ["", "up-to-date"], False, (700, 700 + HOUR), None, (None, (0, 700 + HOUR)), 700,
-         False),
-        ("in flight", False, "", False, [""], True, (-1, -1), None, (None, (0, 5400)), None,
-         False),
+    # d0 is released at 0, one at a time. (case, what d0 reports after the
+    # new target, whether the decision at 30 starts it, and whether it is
+    # in flight to upgrade then)
+    w = ("w", 0, fleet_ctl.OPEN_END)
+    released: list[(str, str, list[str], bool)] = [
+        ("answers the new target", "upgrade-needed", ["d0"], True),
+        ("still runs the old target", "in-progress", [], False),
     ]
-    devs = [("r1", 600, "w"), ("r2", 600, "w"), ("d0", 600, "w"), ("d1", 600, "w")]
-    for case in cases:
-        label = case.0
-        c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["r1", "r2"]},
-                       priority={"r1": 1, "r2": 2}, separation={"g": (False, HOUR)},
-                       hold_failed={"g"} if case.1 else no_hold)
-        testing.assertEqual(c.decide(0).started, ["r1"], label)
-        if case.2 != "":
-            c.report("r1", case.2, 600, case.3)
-            testing.assertEqual(c.decide(600).started, ["d0"], label)
-        c.report_last_boot("r1", case.9)
-        if case.10:
-            # d0 still upgrades, so the run that goes on keeps it.
-            c.report("d0", "in-progress", 650)
-            c.stop()
-        for j in range(len(case.4)):
-            c.retarget({"r1"})
-            c.report("r1", None, 700 + 100 * j)
-            if case.4[j] != "":
-                c.report("r1", case.4[j], 750 + 100 * j)
-        if case.10:
-            c.start()
-        testing.assertEqual(c.is_released("r1"), case.5, label)
-        testing.assertEqual((c.done_time_of("r1"), c.gate(c.known("r2"))), case.6, label)
-        if case.2 != "":
-            c.report("d0", "succeeded", 1200)
-        s = c.decide(1200)
-        testing.assertEqual(s.started, ["d1"] if case.2 != "" else [], label)
-        testing.assertEqual(s.plan.why.get("r2"), case.7, label)
-        testing.assertEqual((s.plan.starts.get("r1"), s.plan.starts.get("r2")), case.8, label)
-
-    # r1's rollback failed before its release, as when it left the campaign
-    # and joined it again with the same attempt: it is done without a
-    # release, and a new target leaves it done and failed.
-    label = "failed rollback, not released"
-    c = controller([("w", 0, fleet_ctl.OPEN_END)], devs, 1, 1, groups={"g": ["r1", "r2"]},
-                   priority={"r1": 1, "r2": 2}, separation={"g": (False, HOUR)})
-    c.report("r1", "failed", 0, True)
-    testing.assertEqual(c.decide(0).started, ["d0"], label)
-    c.report("d0", "succeeded", 600)
-    testing.assertEqual(c.decide(600).started, ["d1"], label)
-    c.retarget({"r1", "r2"})
-    for name in ["r1", "r2"]:
-        c.report(name, None, 700)
-        c.report(name, "upgrade-needed", 750)
-    testing.assertEqual((c.is_released("r1"), c.is_done("r1"), sorted(list(c.failed_devices())),
-                         c.gate(c.known("r2"))), (False, True, ["r1"], -1), label)
-    c.report("d1", "succeeded", 1200)
-    s = c.decide(1200)
-    testing.assertEqual(s.started, [], label)
-    testing.assertEqual(s.plan.why.get("r2"), ("group-failed", "r1"), label)
-    testing.assertEqual(s.plan.starts.get("r1"), None, label)
-
-
-def _test_a_new_target_in_a_pause_lets_a_member_prepare_again():
-    """d0 of 600 s, with prepare on, in a window of an hour at 1000 every
-    day: its deadline is 850. It is let prepare at 0, prepares, and is
-    released at 1000. The run pauses before d0 reports in-progress, and its
-    image gets a new version: in the edit that resumes at 5000, or at 2000
-    in the pause, and d0 answers the new target at 2100. The plan in the
-    pause shows no prepare-start for d0. The resume takes d0 back, as it
-    did not start its run, promised the window a day later. It has not
-    prepared the new image, so once it answers, it is let prepare at the
-    next decision, and that is its prepare-start."""
-    # (case, when the new version comes, when d0 answers it, the next
-    # decision)
-    cases: list[(str, int, int, int)] = [
-        ("one edit", 5000, 5010, 5010),
-        ("in the pause", 2000, 2100, 5000),
-    ]
-    for case in cases:
-        label = case.0
-        c = controller(daily("w", 1000, HOUR, 3), devices("d", 1, 600, "w"), 1, 1, prepare=True)
-        c.decide(0)
-        testing.assertEqual(c.prepare_at, {"d0": 0}, label)
-        c.report_prepare("d0", "done")
-        testing.assertEqual(c.decide(1000).started, ["d0"], label)
-        c.stop()
+    for case in released:
+        c = open_window(2, 1, 1)
+        testing.assertEqual(c.decide(0).started, ["d0"], case.0)
         c.retarget({"d0"})
-        if case.1 < 5000:
-            # The members report again for the new target.
-            c.report("d0", None, case.1)
-            c.report_prepare("d0", None)
-            c.report("d0", "upgrade-needed", case.2)
-            testing.assertEqual(c.carried_on(case.2).prepares(case.2).starts.get("d0"), None,
-                                label)
-        c.start()
-        if case.1 == 5000:
-            c.report("d0", None, case.1)
-            c.report_prepare("d0", None)
-        c.revoke_prepares(5000)
-        testing.assertEqual(c.is_released("d0"), False, label)
-        if case.2 > 5000:
-            c.report("d0", "upgrade-needed", case.2)
-        t = case.3
-        s = c.decide(t)
-        testing.assertEqual(c.promised_window("d0"), ("w", DAY + 1000, DAY + 1000 + HOUR), label)
-        testing.assertEqual((c.prepare_at.get("d0"), "d0" in c.allowed,
-                             s.prepares.starts.get("d0")), (t, True, t), label)
+        testing.assertEqual((c.is_released("d0"), c.promised_window("d0")), (False, w), case.0)
+        c.report("d0", None, 10)
+        c.report("d0", case.1, 20)
+        s = c.decide(30)
+        testing.assertEqual((s.started, c.is_released("d0"), "d0" in c.upgrading()),
+                            (case.2, True, case.3), case.0)
 
-
-def _test_a_member_upgrading_at_a_new_target_prepares_it_again():
-    """d0 of 600 s, with prepare on, in a window of an hour at 1000 every
-    day. It is let prepare at 0, prepares, is released at 1000, and reports
-    in-progress at 1010. The run pauses, and the edit that resumes at 5000
-    gives its image a new version. Its upgrade to the old version ends,
-    and at 5100 it answers the new target: it waits again, promised the
-    window a day later. It has not prepared the new image, so it is let
-    prepare at that decision, and that is its prepare-start."""
-    c = controller(daily("w", 1000, HOUR, 3), devices("d", 1, 600, "w"), 1, 1, prepare=True)
+    # d1 is up to date, so it is done without a release.
+    c = open_window(2, 1, 1)
+    c.report("d1", "up-to-date", 0)
     c.decide(0)
-    c.report_prepare("d0", "done")
-    testing.assertEqual(c.decide(1000).started, ["d0"])
-    c.report("d0", "in-progress", 1010)
-    c.stop()
-    c.retarget({"d0"})
-    c.start()
-    c.report("d0", None, 5000)
-    c.report_prepare("d0", None)
-    c.revoke_prepares(5000)
-    c.report("d0", "upgrade-needed", 5100)
-    s = c.decide(5100)
-    testing.assertEqual(c.is_released("d0"), False)
-    testing.assertEqual(c.promised_window("d0"), ("w", DAY + 1000, DAY + 1000 + HOUR))
-    testing.assertEqual((c.prepare_at.get("d0"), "d0" in c.allowed, s.prepares.starts.get("d0")),
-                        (5100, True, 5100))
-
-
-def _test_a_member_that_ended_in_a_pause_waits_for_a_window_for_a_new_target():
-    """d0 of 600 s in a window of an hour at 1000 every day. It is released
-    at 1000, and the run pauses at 1500. d0 succeeds at 1610, in the pause,
-    so no step counts it. The edit that resumes at 5000 gives its image a
-    new version: d0 is done for the old version, and waits for a window for
-    the new one. It upgrades nothing outside a window, and starts in the
-    window a day later. r, after it in a group with a min-separation of an
-    hour, waits for d0 to be done again, an hour after that, which is the
-    window two days later."""
-    devs = [("d0", 600, "w"), ("r", 600, "w")]
-    c = controller(daily("w", 1000, HOUR, 3), devs, 1, 1, groups={"g": ["d0", "r"]},
-                   priority={"d0": 1, "r": 2}, separation={"g": (False, HOUR)})
-    testing.assertEqual(c.decide(1000).started, ["d0"])
-    c.report("d0", "in-progress", 1010)
-    c.stop()
-    c.report("d0", "succeeded", 1610)
-    c.retarget({"d0"})
-    c.start()
-    c.report("d0", None, 5000)
-    testing.assertEqual((c.is_released("d0"), c.upgrading()), (False, set()))
-    c.report("d0", "upgrade-needed", 5100)
-    s = c.decide(5100)
-    testing.assertEqual(s.started, [])
-    testing.assertEqual(s.plan.starts.get_def("d0", (-1, -1)).1, DAY + 1000)
-    testing.assertEqual(s.plan.starts.get_def("r", (-1, -1)).1, 2 * DAY + 1000)
+    c.retarget({"d1"})
+    testing.assertEqual(c.is_done("d1"), True, "up to date, before its status goes")
+    c.report("d1", None, 10)
+    testing.assertEqual(c.is_done("d1"), False, "up to date, its status gone")
+    c.report("d1", "up-to-date", 20)
+    testing.assertEqual((c.is_done("d1"), c.is_released("d1")), (True, False),
+                        "up to date again")
 
 
 def _test_a_failed_rollback_counts_against_the_budget_until_an_operator_acts():
@@ -3890,10 +3711,9 @@ def _test_a_failed_rollback_holds_its_group_until_an_operator_acts():
     same attempt: then r1 is done without a release. It stays done and
     failed, and holds r2, also when its status is lost, as
     after a restart of its flotilla, when every status is lost and only
-    r2's comes back, after a pause, and when r1 and r2 get a new target,
-    which they answer."""
+    r2's comes back, and after a pause."""
     devs = [("r1", 600, "w"), ("r2", 600, "w")]
-    events = ["", "status lost", "every status lost", "pause", "new target"]
+    events = ["", "status lost", "every status lost", "pause"]
     for joined in [False, True]:
         for event in events:
             label = "joined {joined}, {event}"
@@ -3914,11 +3734,6 @@ def _test_a_failed_rollback_holds_its_group_until_an_operator_acts():
             elif event == "pause":
                 c.stop()
                 c.start()
-            elif event == "new target":
-                c.retarget({"r1", "r2"})
-                for name in ["r1", "r2"]:
-                    c.report(name, None, 650)
-                    c.report(name, "upgrade-needed", 660)
             testing.assertEqual((c.is_released("r1"), c.is_done("r1"),
                                  sorted(list(c.failed_devices()))), (not joined, True, ["r1"]),
                                 label)
@@ -4656,24 +4471,18 @@ def _test_a_member_forgotten_after_its_upgrade_keeps_its_min_separation():
 def _test_a_member_that_waits_again_waits_for_the_members_after_it():
     """r1 and r2 pack in group g with a min-separation of 1 h, one at a
     time, in a window that never closes. r1 upgrades from 0 to 600, and r2
-    from 4200 to 4800. Then r1 waits again: its image gets a new version at
-    4860, or it gets a new attempt, and r2 too or not, and the devices that
-    wait again answer upgrade-needed at 4900. r2 upgraded after r1, so r1
-    waits the min-separation from the end of r2's upgrade, to 8400, also
-    when r2 answers upgrade-needed after its new attempt. When r2 waits
-    again too, it waits for r1, to 12600. When the new version comes at
-    4500, while r2 still upgrades, r2 keeps its release, and r1 waits for
-    r2 to be done at 4800, and the min-separation after that."""
+    from 4200 to 4800. Then r1 waits again: it gets a new attempt at 4860,
+    and r2 too or not, and the devices that wait again answer
+    upgrade-needed at 4900. r2 upgraded after r1, so r1 waits the
+    min-separation from the end of r2's upgrade, to 8400, also when r2
+    answers upgrade-needed after its new attempt. When r2 waits again too,
+    it waits for r1, to 12600."""
     devs = [("r1", 600, "w"), ("r2", 600, "w")]
-    # (case, how r1 waits again: a new target or a new attempt, whether r2
-    # waits again too, when r1 waits again, and the start of r2 in the plan
+    # (case, whether r2 waits again too, and the start of r2 in the plan
     # then, or -1 when the plan does not start it)
-    cases: list[(str, str, bool, int, int)] = [
-        ("new target for r1", "target", False, 4860, -1),
-        ("new target for both", "target", True, 4860, 8400 + 600 + HOUR),
-        ("new target while r2 upgrades", "target", True, 4500, -1),
-        ("new attempt for r1", "attempt", False, 4860, -1),
-        ("new attempt for both", "attempt", True, 4860, 8400 + 600 + HOUR),
+    cases: list[(str, bool, int)] = [
+        ("new attempt for r1", False, -1),
+        ("new attempt for both", True, 8400 + 600 + HOUR),
     ]
     for case in cases:
         label = case.0
@@ -4683,29 +4492,17 @@ def _test_a_member_that_waits_again_waits_for_the_members_after_it():
         c.report("r1", "succeeded", 600)
         testing.assertEqual(c.decide(600).started, [], label)
         testing.assertEqual(c.decide(4200).started, ["r2"], label)
-        t = case.3
-        if t > 4800:
-            c.report("r2", "succeeded", 4800)
-            testing.assertEqual(c.decide(4800).started, [], label)
-        again = {"r1", "r2"} if case.2 else {"r1"}
-        if case.1 == "target":
-            c.retarget(again)
-            for name in again:
-                c.report(name, None, t)
-        else:
-            c.drop(again)
+        c.report("r2", "succeeded", 4800)
+        testing.assertEqual(c.decide(4800).started, [], label)
+        again = {"r1", "r2"} if case.1 else {"r1"}
+        c.drop(again)
         for name in again:
-            if name == "r1" or t > 4800:
-                c.report(name, "upgrade-needed", t + 40)
-        if t < 4800:
-            testing.assertEqual(c.is_released("r2"), True, label)
-            c.report("r2", "succeeded", 4800)
-            t = 4760
-        s = c.decide(t + 40)
+            c.report(name, "upgrade-needed", 4900)
+        s = c.decide(4900)
         testing.assertEqual(s.started, [], label)
         testing.assertEqual(c.gate(c.known("r1")), 8400, label)
         testing.assertEqual((s.plan.starts.get_def("r1", (-1, -1)).1,
-                             s.plan.starts.get_def("r2", (-1, -1)).1), (8400, case.4), label)
+                             s.plan.starts.get_def("r2", (-1, -1)).1), (8400, case.2), label)
         testing.assertEqual(c.decide(8400).started, ["r1"], label)
 
 

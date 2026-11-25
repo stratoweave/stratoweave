@@ -762,32 +762,25 @@
   that are done keep their start and finish, and the next members of their
   redundancy groups wait the `min-separation` from when they were done. A member
   that still upgrades keeps its slot and the campaign's veto, also when its
-  final report comes in the pause or its image gets a new version. A member
-  released before the pause that stopped before its install waits again in the
-  window it was released in, before the members promised that window after it.
-  The waiting members keep their windows, and the ramp, the concurrency and the
-  pace stay. Each member keeps its `prepare-start`: one that prepared is not let
-  prepare again, and one that was let and has not prepared is let again. In
-  `plan`, the plan shows what the run does when it goes on. To start a campaign
-  over, delete it and create it again. A new version of a member's image makes a
-  member that is done wait again and upgrade to it, and lets a member prepare it
-  again. A member whose device runs that version already is done again; when it
-  upgraded in the run, the next members of its redundancy groups still wait the
-  `min-separation` from the end of that upgrade or a later boot, or from its
-  answer or boot when its device answered `upgrade-needed` in between. The next
-  members never wait less than the `min-separation` from the end of an upgrade
-  that a member ran in the run, also when its device tells a boot before then. A
-  member that needs the upgrade waits the `min-separation` from when each other
-  member of its redundancy groups was done after an upgrade in the run, or with
-  a final status other than `up-to-date`, also one after it in the group, as
-  when it waits again after a new version or a new attempt, also after a restart
-  of fleetmgr, or when it is added to a running campaign; before, it could start
-  right after such a member was done. A member whose upgrade to the old version
-  ended in the pause is done for that version, and upgrades to the new one in a
-  window. A member whose rollback failed stays done and failed, holds its
+  final report comes in the pause. A member released before the pause that
+  stopped before its install waits again in the window it was released in,
+  before the members promised that window after it. The waiting members keep
+  their windows, and the ramp, the concurrency and the pace stay. Each member
+  keeps its `prepare-start`: one that prepared is not let prepare again, and one
+  that was let and has not prepared is let again. In `plan`, the plan shows what
+  the run does when it goes on. To start a campaign over, delete it and create
+  it again. The next members of a member's redundancy groups never wait less
+  than the `min-separation` from the end of an upgrade that the member ran in
+  the run, also when its device tells a boot before then. A member that needs
+  the upgrade waits the `min-separation` from when each other member of its
+  redundancy groups was done after an upgrade in the run, or with a final status
+  other than `up-to-date`, also one after it in the group, as when it waits
+  again after a new attempt, also after a restart of fleetmgr, or when it is
+  added to a running campaign; before, it could start right after such a member
+  was done. A member whose rollback failed stays done and failed, holds its
   redundancy groups and counts against the failure budget, until its device
   reports another final status, it gets a new attempt, or it leaves the
-  campaign, also when its status is lost. [#855] [#854]
+  campaign, also when its status is lost. [#855]
 - A change to a running campaign moves less of its plan. A higher
   `target-concurrency` or a new `max-concurrency` keeps the concurrency
   that the run rose to, capped at the new max; only a lower target starts
@@ -1063,6 +1056,12 @@
   page at a time. The log's header shows the level the device logs at,
   which its settings set (`debug/log-level`). The top sends a fleet
   device's log request on to the device's flotilla. [#853]
+- A campaign keeps the image of each member that it has let prepare or
+  released, and the image's version. An edit that gives such a member
+  another image, or that changes or removes the version of its image in the
+  image list, fails and changes nothing, and the error names the campaign
+  and the members. A pause and a restart of fleetmgr keep this. Before, a
+  new version made a member that was done upgrade again.
 
 ### Dependencies
 

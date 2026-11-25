@@ -164,9 +164,8 @@ member in a window, and puts the veto back when the member is done.
 
 A member's `device-status` shows the attempt that counts for the member.
 Of the attempts that its device reports for the campaign's name, that is
-the one `in-progress`, because a run of an earlier attempt or target
-release is still under way, and else the member's `attempt` for the
-member's target release.
+the one `in-progress`, because a run of an earlier attempt is still under
+way, and else the member's `attempt` for the member's target release.
 Its `attempt` says which one. A member whose device has not answered that
 attempt shows `pending`, and the counters do not count it. A member that
 runs its target release already answers `up-to-date`: `succeeded` counts
@@ -179,8 +178,8 @@ one that is up to date, or one that succeeded or failed before it left the
 campaign and joined it again with the same attempt, is done at once: it
 takes no window. The next member of its redundancy groups waits the
 group's `min-separation` from the answer of a member that is up to date,
-or, when that member upgraded in the run before a new target release, a
-new attempt or before it joined again, from the end of that upgrade. After
+or, when that member upgraded in the run before a new attempt or before it
+joined again, from the end of that upgrade. After
 one that succeeded or failed before, it waits the `min-separation` from
 that member's report. When the member's device tells when it last booted,
 its `last-boot` in `state/platform`, a later boot moves the end of that
@@ -248,31 +247,15 @@ after. A member that keeps a promise but that the plan can start in no
 window stays in its promised window in the plan, and the plan's alarm says
 that it will miss it.
 
-A new version of a member's image, or another image with another version,
-gives the member a new target release. A waiting member keeps its window.
-A member that is done, also one that failed, waits again until it answers
-the new target, and upgrades in a window of its schedule, after the
-members promised a window before. The next member of its redundancy groups
-waits for it again, and a failure no longer holds them. A member whose
-device runs the new target already is done again once it answers
-`up-to-date`, as when a version changes and changes back. When it upgraded
-in the run, the next member of its redundancy groups still waits the
-`min-separation` from the end of that upgrade, or from a later boot. When
-the device answered `upgrade-needed` in between, the next member waits
-from the `up-to-date` answer instead, or from the device's boot when it
-tells, but not from before the end of that upgrade. When an image is
-removed and added back, the device keeps the final status of its attempt,
-and the member is done again with it when the device answers. After a
-success, or a failure in a group whose `failure-policy` is `continue`, the
-next member of its redundancy groups waits the `min-separation` from that
-answer, or from the device's boot when it tells, but not from before the
-end of an upgrade that the member ran in the run. A member whose upgrade
-to the old target ended while the campaign was paused is done for that
-target, and upgrades to the new one in a window. A member whose rollback
-failed stays done and failed, holds its redundancy groups and counts
-against `failure-budget` until its device reports another final status, it
-gets a new attempt, or it leaves the campaign, also when its status is
-lost.
+A campaign keeps the image of each member that it has let prepare or
+released, and the image's version. An edit that gives such a member
+another image, or that changes or removes the version of its image in the
+image list, fails and changes nothing, with "upgrade-campaign NAME keeps
+the image and the release of DEVICES: it has let each prepare or released
+it". A pause and a restart of fleetmgr keep this. Until then, a member's
+image may change: a waiting member keeps its window, and the campaign
+holds it until it answers the new target. A member removed from the
+campaign and added again is a new member.
 
 Stopping and running a campaign again does not try its failed members
 again, and neither does removing a member and adding it again: its device
@@ -452,9 +435,8 @@ deadline it is not let again, and the alarm names it. A member let that
 has not begun its prepare a debounce after it was let, or that retries
 it, is named in the alarm once its deadline has passed, and stays let. A
 member that prepared is not let prepare again until its `prepare-attempt`
-changes, as below. A new target release lets a member prepare again once
-it answers the new target. The upgrade in the window still copies the
-image again, so windows are not shorter.
+changes, as below. The upgrade in the window still copies the image
+again, so windows are not shorter.
 
 To prepare a member again, as after a failed prepare, change its
 `prepare-attempt`, for example from 0 to 1. In `run`, the campaign lets
