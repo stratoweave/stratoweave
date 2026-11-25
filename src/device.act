@@ -291,6 +291,59 @@ def is_transient(err: Exception) -> bool:
     return isinstance(err, TransientError)
 
 
+def _job_text(job: SoftwareJob) -> str:
+    """A job as its state, message and progress, like "running: add:
+    extract" or "running: transferred 10 of 40 bytes (25%)"."""
+    s = job.state
+    text = s if s is not None else "unknown"
+    message = job.message
+    if message is not None:
+        text += ": " + message
+    progress = job.progress
+    if progress is not None:
+        text += " (" + str(progress) + "%)"
+    return text
+
+
+def software_log_fields(state: SoftwareState) -> list[(name: str, value: str)]:
+    """The software state for a log line: the campaign and the target, and
+    of the newest attempt its status, stage, jobs, the verdicts of the
+    checks that ran and the reason. Leaves that are not set are left out,
+    and so are the details of the verdicts: the manager logs them when the
+    checks end."""
+    fields: list[(name: str, value: str)] = []
+    campaign = state.upgrade_campaign
+    if campaign is not None:
+        fields.append((name="campaign", value=campaign))
+    target = state.target_release
+    if target is not None:
+        fields.append((name="target", value=target))
+    numbers = [e.number for e in state.attempt]
+    if len(numbers) == 0:
+        return fields
+    e = state.attempt.get(max(numbers))
+    if e is not None:
+        fields.append((name="attempt", value=str(e.number)))
+        status = e.status
+        if status is not None:
+            fields.append((name="status", value=status))
+        stage = e.stage
+        if stage is not None:
+            fields.append((name="stage", value=stage))
+        for job in e.job:
+            fields.append((name=job.name, value=_job_text(job)))
+        pre = e.precheck.verdict
+        if pre is not None and pre != VERDICT_NOT_RUN:
+            fields.append((name="precheck", value=pre))
+        post = e.postcheck.verdict
+        if post is not None and post != VERDICT_NOT_RUN:
+            fields.append((name="postcheck", value=post))
+        reason = e.reason
+        if reason is not None:
+            fields.append((name="reason", value=reason))
+    return fields
+
+
 # These builders only initialize newly allocated adata objects.
 pure def _initial_software_state() -> SoftwareState:
     return SoftwareState()
@@ -1112,15 +1165,16 @@ actor SoftwareManager(name: str, log_handler: logging.Handler, devmgr: DeviceMgr
         kind = checking
         checking = ""
         decision += 1
+        detail = "no {kind}s registered"
         if len(passed) > 0:
             # What each check saw, so the verdict tells the story on its own.
             parts: list[str] = []
             for r in sorted(passed.keys()):
                 reason = passed[r]
                 parts.append("{r}: {reason}" if reason != "" else r)
-            _record_check(kind, VERDICT_PASS, "; ".join(parts))
-        else:
-            _record_check(kind, VERDICT_PASS, "no {kind}s registered")
+            detail = "; ".join(parts)
+        _log.info("software: {kind}s passed", {"device": name, "detail": detail})
+        _record_check(kind, VERDICT_PASS, detail)
         if kind == "precheck":
             why = _why_not_install()
             if why is not None:
@@ -1990,11 +2044,20 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
         if cb is not None:
             cb(oper.to_gdata())
 
+    # The software state as the log showed it last
+    var software_logged = ""
+
     def on_software_state(state: SoftwareState) -> None:
-        """SoftwareManager pushes its oper state: fuse and publish."""
-        attempts = ["{e.number}: " + str(e.status) + " at " + str(e.stage) for e in state.attempt]
-        _log.info("DeviceMgr: software status",
-                  {"device": name, "attempts": ", ".join(attempts)})
+        """SoftwareManager pushes its oper state: fuse and publish. Log it
+        when what the log shows of it changed."""
+        fields = software_log_fields(state)
+        shown = " ".join([f.name + "=" + f.value for f in fields])
+        if shown != software_logged:
+            software_logged = shown
+            data: dict[str, ?value] = {"device": name}
+            for f in fields:
+                data[f.name] = f.value
+            _log.info("DeviceMgr: software status", data)
         oper.software.state = state
         update_oper()
 
@@ -2243,7 +2306,7 @@ actor DeviceMgr(dev_types: dict[str, DeviceType]={}, env: ?Env=None, name: str, 
             _log.debug("Ignoring a connect from an adapter the device does not have", {"adapter": dev_type})
 
     def _adapter_connected(reporter: str, new_modset: dict[str, ModCap], new_schema_key: ?SchemaKey):
-        _log.debug("Device connected", {"adapter": reporter, "new_modset": new_modset, "schema_modules": len(new_schema_key.modules) if new_schema_key is not None else None})
+        _log.debug("Device connected", {"adapter": reporter, "modules": len(new_modset), "schema_modules": len(new_schema_key.modules) if new_schema_key is not None else None})
         is_primary = False
         if reporter == primary_type:
             is_primary = True

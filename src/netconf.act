@@ -17,6 +17,7 @@ import logging
 import net
 import std.random
 import testing
+import time
 import std.xml as xml
 from pipe import Pipe, actor_pipe_pair, create_actor_pipe_pair, connect_actor_pipe_pair
 
@@ -48,6 +49,52 @@ NS_YANG_ACTION = "urn:ietf:params:xml:ns:yang:1"
 def is_ok_reply(rpc_reply: xml.Node) -> bool:
     """Return whether an rpc-reply is a successful response with no data."""
     return rpc_reply.tag == "rpc-reply" and len(rpc_reply.children) == 1 and rpc_reply.children[0].tag == "ok"
+
+
+class LogXml(object):
+    """An XML node as a log value. It is encoded only when a log writes the
+    line, so a debug line costs nothing at a higher level."""
+    node: xml.Node
+
+    def __init__(self, node: xml.Node):
+        self.node = node
+
+    def __str__(self) -> str:
+        return xml.encode(self.node)
+
+
+# A log line names at most this many of the paths that a filter selects.
+FILTER_PATHS_LOGGED = 8
+
+
+def _selected_paths(n: xml.Node, prefix: str) -> list[str]:
+    path = prefix + n.tag
+    if len(n.children) == 0:
+        text = n.text
+        if text is not None and text.strip() != "":
+            return [path + "=" + text.strip()]
+        return [path]
+    paths: list[str] = []
+    for c in n.children:
+        paths.extend(_selected_paths(c, path + "/"))
+    return paths
+
+
+def filter_text(filter: xml.Node) -> str:
+    """Return what a <filter> selects, for a log line: the select of an
+    XPath filter, or the paths of the nodes that a subtree filter selects,
+    like "install-oper-data/install-oper, native/version". A content match
+    node shows its value, like "partitions/name=bootflash:"."""
+    for name, value in filter.attributes:
+        if name == "select" or name.endswith(":select"):
+            return value
+    paths: list[str] = []
+    for c in filter.children:
+        paths.extend(_selected_paths(c, ""))
+    if len(paths) > FILTER_PATHS_LOGGED:
+        more = len(paths) - FILTER_PATHS_LOGGED
+        return ", ".join(paths[:FILTER_PATHS_LOGGED]) + f" and {more} more"
+    return ", ".join(paths)
 
 # TODO: I think this should be in __builtin__
 class UnreachableError(Exception):
@@ -236,6 +283,12 @@ actor Client(
     # RPCs requested before the server's hello. The hello sets the framing of
     # the session, so they are sent after it.
     var unsent_rpcs: list[(message_id: str, content: xml.Node)] = []
+    # The RPCs sent and not answered, for the log line of their reply.
+    var rpc_sent: dict[str, (rpc: str, since: time.Stopwatch)] = {}
+    # The error of the last failed connect, and the failed connects since the
+    # last session. A device that reloads refuses connections for minutes.
+    var connect_error = ""
+    var connect_failures = 0
 
     var p: ?Pipe = pipe
     var state = STATE_NONE
@@ -341,6 +394,7 @@ actor Client(
             rpc_cb(self, None, SessionClosedError("Session closed"))
         rpc_cbs = {}
         unsent_rpcs = []
+        rpc_sent = {}
 
     # TODO: Close protocol
     def close(cb: ?action() -> None=None) -> None:
@@ -389,7 +443,7 @@ actor Client(
             if framing == SEPARATOR_FRAMING:
                 data.write_bytes(LEGACY_SEPARATOR)
                 _msg = data.read_all_bytes()
-                _log.trace("Sending message", {"msg": _msg})
+                _log.trace("Sending message", {"size": len(_msg)})
                 p.write(_msg)
             elif framing == CHUNKED_FRAMING:
                 while True:
@@ -400,7 +454,7 @@ actor Client(
 
                     _chunk = data.read_bytes(chunk_size)
                     if _chunk is not None:
-                        _log.trace("Sending chunk", {"chunk_size": chunk_size, "chunk": _chunk})
+                        _log.trace("Sending chunk", {"chunk_size": chunk_size})
                         p.write(("\n#" + str(chunk_size) + "\n").encode())
                         p.write(_chunk)
                     else:
@@ -435,11 +489,12 @@ actor Client(
         buf: Buffer = Buffer()
         buf.write_str(xml.encode(root))
 
-        _log.debug("Sending RPC", {"message-id": message_id_text, "content": content})
+        _log.debug("Sending RPC", {"message-id": message_id_text, "rpc": content.tag, "xml": LogXml(fixed_content)})
+        rpc_sent[message_id_text] = (rpc=content.tag, since=time.Stopwatch())
         _send_message(buf)
 
     def get(cb: action(Client, ?xml.Node, ?NetconfError) -> None, filter: ?xml.Node=None) -> None:
-        _log.info("NETCONF get")
+        _log.info("NETCONF get", {"message-id": message_id, "filter": filter_text(filter) if filter is not None else None})
         nc_nsdefs = [(None, NS_NC_1_0)]
         children = []
         if filter is not None:
@@ -447,7 +502,7 @@ actor Client(
         rpc(xml.Node("get", nc_nsdefs, children=children), cb)
 
     def get_config(cb: action(Client, ?xml.Node, ?NetconfError) -> None, datastore: str="running", filter: ?xml.Node=None) -> None:
-        _log.info("NETCONF get-config")
+        _log.info("NETCONF get-config", {"message-id": message_id, "datastore": datastore, "filter": filter_text(filter) if filter is not None else None})
         nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
         children = [
             xml.Node("source", [], nc_prefix, children=[
@@ -459,7 +514,7 @@ actor Client(
         rpc(xml.Node("get-config", nc_nsdefs, nc_prefix, children=children), cb)
 
     def edit_config(config: list[xml.Node], cb: action(Client, ?NetconfError) -> None, datastore: str="running", default_operation: ?str=None) -> None:
-        _log.info("NETCONF edit-config", {"datastore": datastore, "default-operation": default_operation})
+        _log.info("NETCONF edit-config", {"message-id": message_id, "datastore": datastore, "default-operation": default_operation})
         nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
         edit_config_children = [
             xml.Node("target", [], nc_prefix, children=[
@@ -477,17 +532,17 @@ actor Client(
         rpc(xml.Node("edit-config", nc_nsdefs, nc_prefix, children=edit_config_children), lambda c, _, err: cb(c, err))
 
     def commit(cb: action(Client, ?NetconfError) -> None) -> None:
-        _log.info("NETCONF commit", {})
+        _log.info("NETCONF commit", {"message-id": message_id})
         nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
         rpc(xml.Node("commit", nc_nsdefs, nc_prefix), lambda c, _, err: cb(c, err))
 
     def discard_changes(cb: action(Client, ?NetconfError) -> None) -> None:
-        _log.info("NETCONF discard-changes", {})
+        _log.info("NETCONF discard-changes", {"message-id": message_id})
         nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
         rpc(xml.Node("discard-changes", nc_nsdefs, nc_prefix), lambda c, _, err: cb(c, err))
 
     def lock(cb: action(Client, ?NetconfError) -> None, datastore: str) -> None:
-        _log.info("NETCONF lock", {"datastore": datastore})
+        _log.info("NETCONF lock", {"message-id": message_id, "datastore": datastore})
         nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
         rpc(xml.Node("lock", nc_nsdefs, nc_prefix, children=[
             xml.Node("target", [], nc_prefix, children=[
@@ -496,7 +551,7 @@ actor Client(
         ]), lambda c, _, err: cb(c, err))
 
     def unlock(cb: action(Client, ?NetconfError) -> None, datastore: str) -> None:
-        _log.info("NETCONF unlock", {"datastore": datastore})
+        _log.info("NETCONF unlock", {"message-id": message_id, "datastore": datastore})
         nc_nsdefs = [(nc_prefix, NS_NC_1_0)]
         rpc(xml.Node("unlock", nc_nsdefs, nc_prefix, children=[
             xml.Node("target", [], nc_prefix, children=[
@@ -533,7 +588,7 @@ actor Client(
         ietf-yang-push over ietf-event-notifications RPC shape; the default is
         standard YANG Push over ietf-subscribed-notifications.
         """
-        _log.info("NETCONF establish-subscription", {"datastore": datastore, "stream": stream, "period": period, "on_change": on_change, "event_notifs": event_notifs})
+        _log.info("NETCONF establish-subscription", {"message-id": message_id, "datastore": datastore, "stream": stream, "period": period, "on_change": on_change, "event_notifs": event_notifs})
         op = yp.build_establish_subscription(datastore, subtree_filter, xpath_filter, period, on_change, dampening_period, sync_on_start, event_notifs, xpath_nsdefs, stream, stream_nsdefs)
         def _on_reply(c: Client, reply: ?xml.Node, err: ?NetconfError) -> None:
             if err is not None:
@@ -557,7 +612,7 @@ actor Client(
     def delete_subscription(cb: action(Client, ?NetconfError) -> None, id: int,
                             event_notifs: bool=False) -> None:
         """Delete a YANG-push subscription previously established on this session."""
-        _log.info("NETCONF delete-subscription", {"id": id, "event_notifs": event_notifs})
+        _log.info("NETCONF delete-subscription", {"message-id": message_id, "id": id, "event_notifs": event_notifs})
         def _on_reply(c: Client, reply: ?xml.Node, err: ?NetconfError) -> None:
             if err is not None:
                 cb(c, err)
@@ -587,12 +642,12 @@ actor Client(
         reject any further RPC here with resource-denied — plan for a dedicated
         session in that case.
         """
-        _log.info("NETCONF create-subscription", {"stream": stream})
+        _log.info("NETCONF create-subscription", {"message-id": message_id, "stream": stream})
         rpc(yp.build_create_subscription(stream, subtree_filter, start_time, stop_time),
             lambda c, _, err: cb(c, err))
 
     def get_schema(cb: action(Client, ?xml.Node, ?NetconfError) -> None, identifier: str, version: ?str=None, format: str="yang") -> None:
-        _log.info("NETCONF get-schema", {"identifier": identifier, "version": version, "format": format})
+        _log.info("NETCONF get-schema", {"message-id": message_id, "identifier": identifier, "version": version, "format": format})
         # get-schema is part of ietf-netconf-monitoring, not base NETCONF
         nc_nsdefs = [(None, "urn:ietf:params:xml:ns:yang:ietf-netconf-monitoring")]
         children = [xml.Node("identifier", text=identifier)]
@@ -894,7 +949,7 @@ actor Client(
         if len(msg) == 0:
             _log.debug("Ignoring empty message")
             return
-        _log.trace("MSG:", {"msg": msg})
+        _log.trace("Received message", {"size": len(msg), "msg": msg})
         try:
             # Fixups are active from the server's hello on
             root = xml.decode(_apply_raw_message_fixups(msg))
@@ -927,7 +982,7 @@ actor Client(
                 else:
                     _log.warning("Ignoring <notification> in unexpected namespace", {"namespace": notif_ns})
             elif root.tag == "rpc-reply": # TODO: check namespace as well?
-                _on_msg_rpc_reply(root)
+                _on_msg_rpc_reply(root, len(msg))
             elif root.tag == "hello": # TODO: check namespace as well?
                 _on_msg_hello(root)
             else:
@@ -969,7 +1024,7 @@ actor Client(
                 _log.debug("NETCONF 1.1 supported, switching to chunked framing")
                 framing = CHUNKED_FRAMING
 
-    def _on_msg_rpc_reply(root: xml.Node) -> None:
+    def _on_msg_rpc_reply(root: xml.Node, size: int) -> None:
         msg_id: ?str = None
         for attr_name, attr_val in root.attributes:
             # Handle both "message-id" and "nc:message-id" attributes
@@ -1002,24 +1057,32 @@ actor Client(
 
             cb = rpc_cbs[callback_id]
             del rpc_cbs[callback_id]
+            error: ?NetconfError = None
             if len(fixed_root.children) == 0:
-                cb(self, fixed_root, NetconfError("Empty <rpc-reply>"))
-            elif is_ok_reply(fixed_root):
-                cb(self, fixed_root, None)
-            else:
-                # Parse for errors
+                error = NetconfError("Empty <rpc-reply>")
+            elif not is_ok_reply(fixed_root):
+                # A data reply or rpc-errors
                 error = _parse_rpc_errors(fixed_root)
-
-                if error is not None:
-                    # Error response
-                    cb(self, fixed_root, error)
-                else:
-                    # Normal data response - pass the whole root
-                    cb(self, fixed_root, None)
+            _log_reply(callback_id, size, error)
+            cb(self, fixed_root, error)
         else:
             _log.error("No more RPC callbacks", {"msg-id": msg_id})
 
 
+
+    def _log_reply(message_id: str, size: int, error: ?NetconfError) -> None:
+        """Log the reply to an RPC: which RPC it answers, how long it took
+        and its error."""
+        data: dict[str, ?value] = {"message-id": message_id}
+        sent = rpc_sent.get(message_id)
+        if sent is not None:
+            del rpc_sent[message_id]
+            data["rpc"] = sent.rpc
+            data["seconds"] = f"{sent.since.elapsed().to_float():.3f}"
+        data["size"] = size
+        if error is not None:
+            data["error"] = error.error_message
+        _log.debug("Received rpc-reply", data)
 
     def _on_msg_notification(root: xml.Node) -> None:
         _on_notif = on_notif
@@ -1102,10 +1165,21 @@ actor Client(
 
     def _on_connect(err: ?Exception):
         if err is not None:
-            _log.error("Failed to connect", {"err": err})
+            # The first failure of a kind is an error. Its repeats, every
+            # second while a device reloads, are not news.
+            text = str(err)
+            data: dict[str, ?value] = {"address": address, "port": port, "err": err}
+            if text != connect_error:
+                _log.error("Failed to connect", data)
+            else:
+                _log.debug("Failed to connect", data)
+            connect_error = text
+            connect_failures += 1
             on_connect(self, err)
         else:
-            _log.info("Connected", {"address": address, "port": port, "username": username})
+            _log.info("Connected", {"address": address, "port": port, "username": username, "failed-connects": connect_failures})
+            connect_error = ""
+            connect_failures = 0
             # Each session starts with the hello exchange in base:1.0 framing
             framing = SEPARATOR_FRAMING
             framing_failed = False
@@ -1521,6 +1595,32 @@ test_port = 42830
 test_address = "127.0.0.1"
 test_username = "admin"
 test_password = "admin"
+
+
+def _test_filter_text():
+    cases: list[(str, str, str)] = [
+        ("one path",
+         "<filter type=\"subtree\"><device-hardware-data xmlns=\"x\"><device-hardware><device-system-data><software-version/></device-system-data></device-hardware></device-hardware-data></filter>",
+         "device-hardware-data/device-hardware/device-system-data/software-version"),
+        ("siblings",
+         "<filter type=\"subtree\"><install-oper-data xmlns=\"x\"><install-oper/><install-oper-hist/></install-oper-data></filter>",
+         "install-oper-data/install-oper, install-oper-data/install-oper-hist"),
+        ("content match",
+         "<filter type=\"subtree\"><file-systems xmlns=\"x\"><file-system><name>bootflash:</name></file-system></file-systems></filter>",
+         "file-systems/file-system/name=bootflash:"),
+        ("xpath", "<filter type=\"xpath\" select=\"/a/b\"/>", "/a/b"),
+        ("empty", "<filter type=\"subtree\"/>", ""),
+        ("many paths",
+         "<filter><r xmlns=\"x\"><a/><b/><c/><d/><e/><f/><g/><h/><i/><j/></r></filter>",
+         "r/a, r/b, r/c, r/d, r/e, r/f, r/g, r/h and 2 more"),
+    ]
+    for name, text, want in cases:
+        testing.assertEqual(filter_text(xml.decode(text)), want, name)
+
+
+def _test_log_xml():
+    n = xml.decode("<xcopy xmlns=\"x\"><source>a</source></xcopy>")
+    testing.assertEqual(str(LogXml(n)), xml.encode(n))
 
 
 def _test_data_reply(value: str) -> list[xml.Node]:
