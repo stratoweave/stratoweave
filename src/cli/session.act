@@ -7,7 +7,9 @@ so a slow device never stops the editor.
 `show <path>` reads configuration and state with a NETCONF get, and `request`
 sends an RPC, or an action inside an action element. `monitor notifications`
 subscribes to event notifications, and each one prints above the prompt as
-it arrives.
+it arrives. `monitor <path>` subscribes to the data at a path with YANG-push
+and shows it in a pane above the CLI, which keeps the rows below the panes.
+As a one-shot command, it uses the whole terminal for the data.
 
 `configure` starts a candidate configuration from the running configuration,
 if there is none with changes yet. The candidate lives in the session: it
@@ -23,6 +25,7 @@ import std.argparse
 import std.xml as xml
 import file
 import logging
+import time
 
 import yang.schema as yschema
 import yang.gdata as ygdata
@@ -40,11 +43,65 @@ from device_meta_config import \
 import cli.candidate as candidate
 import cli.command as command
 import cli.lineedit as lineedit
+import cli.pane as pane
 import cli.path as cpath
 
 
 # The owner name of the CLI's notification subscriptions on the DeviceMgr.
 NOTIF_OWNER = "ncurl-cli"
+
+
+def pane_owner(number: int) -> str:
+    """Return the owner name of the subscription of a pane on the DeviceMgr."""
+    return "ncurl-cli-pane-{number}"
+
+
+def clock() -> str:
+    """Return the time of day as hours, minutes and seconds."""
+    t = time.now()
+    return f"{t.hour:02d}:{t.minute:02d}:{t.second:02d}"
+
+
+class Monitor(object):
+    """A pane that shows the data at a path as the device sends it.
+
+    gen tells the subscriptions of a pane number apart, so an update for a
+    pane that was replaced is dropped. title is how often the data comes and
+    the path. lines holds the last data shown, and changed the lines that
+    differed from the update before.
+    """
+    number: int
+    gen: int
+    cmd: command.Command
+    title: str
+    updates: int
+    when: str
+    lines: list[str]
+    changed: set[int]
+    error: ?str
+
+    def __init__(self, number: int, gen: int, cmd: command.Command, title: str):
+        self.number = number
+        self.gen = gen
+        self.cmd = cmd
+        self.title = title
+        self.updates = 0
+        self.when = ""
+        self.lines = []
+        self.changed = set()
+        self.error = None
+
+    def header(self) -> str:
+        """Return the header line of the pane: the pane number and state first, then the path, which a narrow terminal cuts."""
+        h = " pane {self.number}  "
+        if self.updates > 0:
+            h += "{self.updates} updates, last {self.when}"
+        else:
+            h += "waiting for data"
+        e = self.error
+        if e is not None:
+            h += ", error: " + e
+        return h + "  " + self.title
 
 # Terminal sequences that turn bracketed paste on and off.
 BRACKETED_PASTE_ON = "\x1b[?2004h"
@@ -119,6 +176,13 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
     var pending: ?command.Command = None
     var notif_specs: set[swadapter.NotifSpec] = set()
     var notif_warning: ?str = None
+    var monitors: list[Monitor] = []
+    var monitor_gen = 0
+    var screen = False
+    var rows = 24
+    var cols = 80
+    var areas: list[pane.Area] = []
+    var size_gen = 0
 
     def out(text: str):
         print(text, end="", flush=True)
@@ -146,7 +210,13 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
             d = dev
             if d is not None and len(notif_specs) > 0:
                 d.remove_notif_subscriptions(NOTIF_OWNER)
+            if d is not None:
+                for m in monitors:
+                    d.remove_subscriptions(pane_owner(m.number))
             if interactive:
+                if len(areas) > 0:
+                    # The shell gets the whole terminal back, below the panes.
+                    out(pane.reset_region() + "\x1b[{rows};1H\n")
                 out(BRACKETED_PASTE_OFF)
             env.exit(code)
 
@@ -198,7 +268,7 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
                 handle_key(pending_keys.pop(0))
         elif len(lines) > 0:
             execute(lines.pop(0))
-        elif len(oneshot) > 0 and len(notif_specs) == 0:
+        elif len(oneshot) > 0 and len(notif_specs) == 0 and len(monitors) == 0:
             # A one-shot monitor runs until it is interrupted.
             finish(1 if failed else 0)
 
@@ -269,8 +339,12 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
             return
         if n == "monitor notifications":
             monitor_notifications(cmd)
+        elif n == "monitor data":
+            monitor_data(cmd)
         elif n == "monitor stop":
             monitor_stop(cmd)
+        elif n == "monitor stop pane":
+            close_pane(cmd.pane, True)
         elif n == "monitor list":
             monitor_list()
         if n == "configure":
@@ -440,13 +514,15 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
         declare_notifs()
 
     def monitor_stop(cmd: command.Command):
-        """Stop showing the command's notifications, or all notifications.
+        """Stop showing the command's notifications, or all notifications and close all panes.
 
         While the CLI shows all notifications, a name does not stop one of
         them, and the CLI says so.
         """
         if len(cmd.args) == 0:
             notif_specs = set()
+            for m in list(monitors):
+                close_pane(m.number, False)
         else:
             drop = set(["{a[0].node.namespace} {a[0].node.name}" for a in cmd.args])
             specs = set()
@@ -469,11 +545,15 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
         declare_notifs()
 
     def monitor_list():
-        """Print the notifications the CLI shows and the device channels they come on."""
+        """Print the panes, the notifications the CLI shows and the device channels they come on."""
         s = schema
         d = dev
+        rows_out = []
+        for m in monitors:
+            rows_out.append(m.header().strip())
         if len(notif_specs) == 0:
-            show_text("No notifications are shown")
+            rows_out.append("No notifications are shown")
+            show_text("\n".join(rows_out))
             return
         names = []
         for sp in notif_specs:
@@ -483,11 +563,169 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
                     names.append(command.notification_name(s, nm))
             else:
                 names.append("all notifications")
-        rows = sorted(names)
+        rows_out.extend(sorted(names))
         if d is not None:
             for c in d.notif_status():
-                rows.append("channel " + c.description())
-        show_text("\n".join(rows))
+                rows_out.append("channel " + c.description())
+        show_text("\n".join(rows_out))
+
+    def monitor_data(cmd: command.Command):
+        """Show the data at the command's path in a pane, as the device sends it.
+
+        The pane is the one the command names, or the first free one. A pane
+        that is open gets the new path.
+        """
+        s = schema
+        d = dev
+        res = cmd.path
+        if s is not None and d is not None and res is not None:
+            number = cmd.pane
+            if number == 0:
+                used = set([m.number for m in monitors])
+                for k in range(1, pane.MAX_PANES + 1):
+                    if k not in used:
+                        number = k
+                        break
+            if number == 0:
+                fail("every pane is in use; close one with monitor stop pane N")
+                return
+            monitor_gen += 1
+            g = monitor_gen
+            how = "on change" if cmd.on_change else "every {cmd.period} s"
+            title = how + "  " + " ".join(cpath.path_tokens(s, res.steps, "data"))
+            m = Monitor(number, g, cmd, title)
+            if find_monitor(number) is not None:
+                # A new subscription sends its data again, also for the same path.
+                d.remove_subscriptions(pane_owner(number))
+            kept = [x for x in monitors if x.number != number]
+            kept.append(m)
+            monitors = sorted_monitors(kept)
+            filt = command.subtree_filter(res.steps)
+            spec = ygdata.SubscriptionSpec(filt, on_change=True) if cmd.on_change else ygdata.SubscriptionSpec(filt, period=float(cmd.period))
+            d.declare_subscriptions(pane_owner(number), lambda t, e: self.on_pane(number, g, t, e), {spec})
+            if interactive:
+                relayout(False)
+            elif screen:
+                draw_screen(m)
+
+    def close_pane(number: int, warn: bool):
+        """Stop the subscription of a pane and close it."""
+        d = dev
+        m = find_monitor(number)
+        if m is None:
+            if warn:
+                say("warning: pane {number} is not open")
+            return
+        if d is not None:
+            d.remove_subscriptions(pane_owner(number))
+        monitors = [x for x in monitors if x.number != number]
+        if interactive:
+            relayout(False)
+
+    def find_monitor(number: int) -> ?Monitor:
+        for m in monitors:
+            if m.number == number:
+                return m
+        return None
+
+    def sorted_monitors(ms: list[Monitor]) -> list[Monitor]:
+        """Return the monitors in pane number order."""
+        res = []
+        for k in range(1, pane.MAX_PANES + 1):
+            for m in ms:
+                if m.number == k:
+                    res.append(m)
+        return res
+
+    def on_pane(number: int, g: int, tree: ?ygdata.Node, e: ?Exception):
+        """Show an update of the data of a pane."""
+        m = find_monitor(number)
+        s = schema
+        if m is not None and s is not None:
+            if done or m.gen != g:
+                return
+            if e is not None:
+                m.error = device_error(e).replace("\n", " ")
+            elif tree is not None:
+                c = command.Context(s, tree)
+                text = command.output(c, command.refresh(c, m.cmd))
+                new = text.split("\n") if text != "" else []
+                m.changed = pane.changed_lines(m.lines, new)
+                m.lines = new
+                m.updates += 1
+                m.when = clock()
+                m.error = None
+            if interactive:
+                draw_pane(m)
+            elif screen:
+                draw_screen(m)
+            elif e is not None:
+                print("{clock()}  pane {m.number}  {m.title}  error: {m.error}", err=True)
+            elif tree is not None:
+                print("{m.when}  pane {m.number}  {m.title}")
+                for l in m.lines:
+                    print(pane.INDENT_TEXT + l)
+
+    def draw_pane(m: Monitor):
+        """Draw a pane in its area, when the panes fit in the terminal."""
+        for k in range(len(monitors)):
+            if monitors[k].number == m.number and k < len(areas):
+                out(pane.frame(areas[k], cols, m.header(), m.lines, m.changed))
+
+    def draw_screen(m: Monitor):
+        """Draw the data of a one-shot monitor over the terminal, with the cursor on the last row."""
+        r0 = rows
+        size_now()
+        clear = ""
+        if len(areas) == 0 or r0 != rows:
+            clear = "\x1b[2J"
+        areas = [pane.Area(1, rows - 1)]
+        out(clear + pane.frame(areas[0], cols, m.header(), m.lines, m.changed) + "\x1b[{rows};1H")
+
+    def size_now():
+        """Read the terminal size, or keep the last one when there is no terminal."""
+        sz = env.stdio.term_size()
+        if sz is not None:
+            cols = sz.columns
+            rows = sz.rows
+
+    def relayout(redraw_line: bool):
+        """Place the panes above the CLI and limit the CLI's scrolling to the rows below them.
+
+        The terminal is cleared, and the CLI starts again on the last row.
+        Without panes, the whole terminal scrolls again.
+        """
+        size_now()
+        had = len(areas) > 0
+        areas = pane.layout(rows, len(monitors))
+        if len(areas) == 0:
+            if had or redraw_line:
+                out(pane.reset_region() + "\x1b[2J\x1b[{rows};1H")
+            if len(monitors) > 0:
+                say("warning: the terminal has too few rows for {len(monitors)} panes")
+        else:
+            out("\x1b[2J" + pane.scroll_region(pane.cli_top(areas), rows) + "\x1b[{rows};1H")
+            for m in monitors:
+                draw_pane(m)
+        if len(monitors) > 0:
+            # The panes come back when a terminal that was too small grows.
+            size_gen += 1
+            g = size_gen
+            after 1.0: check_size(g)
+        if redraw_line and ready and not busy and not done:
+            out(editor.render())
+
+    def check_size(g: int):
+        """Place the panes again when the terminal size changes, once a second while panes are open."""
+        if done or g != size_gen or len(monitors) == 0:
+            return
+        r0 = rows
+        c0 = cols
+        size_now()
+        if rows != r0 or cols != c0:
+            relayout(True)
+        else:
+            after 1.0: check_size(g)
 
     def on_notif(ev: ?swadapter.NotifEvent, err: ?Exception):
         # An event or warning can still arrive after monitor stop.
@@ -668,7 +906,10 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
         elif kind == "space":
             on_space()
         elif kind == "clear":
-            out("\x1b[H\x1b[2J" + editor.render())
+            if len(monitors) > 0:
+                relayout(True)
+            else:
+                out("\x1b[H\x1b[2J" + editor.render())
         else:
             out(editor.render())
 
@@ -765,6 +1006,7 @@ actor CliSession(env: Env, args: std.argparse.Args, log_handler: logging.Handler
 
     proc def __startup__():
         interactive = len(oneshot) == 0 and env.stdio.stdin_is_tty() and env.stdio.stdout_is_tty()
+        screen = len(oneshot) > 0 and env.stdio.stdout_is_tty()
         if args.get_bool("verbose"):
             log_handler.set_output_level(logging.TRACE)
             log_handler.add_sink(EditorSink(log_line))
