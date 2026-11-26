@@ -199,12 +199,17 @@ function firstFew(names: string[], n: number): string {
   return names.slice(0, n).join(', ') + (more > 0 ? ` and ${more.toLocaleString()} more` : '');
 }
 
-/** device name -> owning campaign, from every campaign's member list. */
-export function campaignOwners(campaigns: { name: string; devices: string[] }[]): Map<string, string> {
+/** device name -> owning campaign, from every campaign's member list. A
+ * member that its campaign has freed has no owner: another campaign can
+ * take it. */
+export function campaignOwners(
+  campaigns: { name: string; devices: string[]; deviceStatus: { device: string; freed: number | null }[] }[]
+): Map<string, string> {
   const owners = new Map<string, string>();
   for (const campaign of campaigns) {
+    const freed = new Set(campaign.deviceStatus.filter((r) => r.freed !== null).map((r) => r.device));
     for (const device of campaign.devices) {
-      if (!owners.has(device)) owners.set(device, campaign.name);
+      if (!owners.has(device) && !freed.has(device)) owners.set(device, campaign.name);
     }
   }
   return owners;

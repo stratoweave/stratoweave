@@ -610,19 +610,20 @@
   member's veto when it releases the member, and puts it back when the
   member is done. Before, a campaign wrote nothing until it released a
   member in a window. [#783]
-- A device in the fleet is in one campaign at most, also while the
-  campaign is in `plan` and after it is done. An edit that names a device
-  in a second campaign fails with "Cannot merge leaves with different
-  values at /software/upgrade-campaign". To move a device, remove it from
-  its campaign, or delete the campaign, in an earlier edit. A device that
-  is not in the fleet gets nothing from a campaign, so two campaigns can
-  name it. The edit that adds it to the fleet then fails with the same
-  error until only one campaign names it. [#783]
+- One campaign at most acquires a device in the fleet, also while the
+  campaign is in `plan`. An edit that makes a second campaign acquire a
+  device fails with "Cannot merge leaves with different values at
+  /software/upgrade-campaign". To move an acquired device, remove it from
+  its campaign, or delete the campaign, in an earlier edit. A device that is
+  not in the fleet gets nothing from a campaign, so two campaigns can name
+  it. The edit that adds it to the fleet then fails with the same error
+  while two campaigns that have not freed it name it. [#783]
 - A campaign's `device-status` shows a member's status only when the status
   is for the campaign's intent, its name and the member's target release,
-  and `pending` otherwise. The counters count only those statuses. Before, a
-  `succeeded` left from an earlier campaign made a member done at its
-  release, with no upgrade. [#783]
+  its result once the campaign has freed it, and `pending` otherwise. The
+  counters count only those statuses and results. Before, a `succeeded` left
+  from an earlier campaign made a member done at its release, with no
+  upgrade. [#783]
 - Setting a running campaign back to `plan` pauses it: members in flight
   stop before their install, and are released again when the campaign runs
   again. A member that still reports `in-progress` for the campaign when it
@@ -855,6 +856,18 @@
   run reports `unknown`, waits the same way: past the last start that fits
   its window, the campaign puts its veto back. Before, its device could
   start the run when it connected after the window. [#870]
+- A campaign in `run` whose members are all done, also when some failed, is
+  complete and frees its members: it keeps each member's result and writes
+  nothing more to their devices, so another campaign can acquire them, also
+  in the edit that removes them from the first. Before, a device stayed in
+  its campaign until an operator removed it or deleted the campaign.
+  `state/completed` says when, and a freed member's `device-status` shows
+  its result with `freed` and `finished`; the counters count the results,
+  and a restart of fleetmgr keeps them. A member that waits, is held, is not
+  in the fleet or has no window keeps the campaign incomplete. A new
+  `attempt` for a freed member whose attempt failed, or a new member,
+  acquires the device again, and the campaign frees it again once it is
+  done.
 - Each `/fleet/device` has the platform that its flotilla reads from the
   device under `state/platform`, absent until the device has connected. A
   campaign's `device-status` has each member's `version` and `model` instead
@@ -981,6 +994,11 @@
   devices already run the picked image and how many run a newer release.
   It leaves out the devices that run their image, unless told not to, and
   warns that the campaign would downgrade the newer ones. [#816]
+- The new campaign page leaves out only the devices that a campaign has
+  acquired, so a device that a complete campaign freed can join a new
+  campaign. The campaigns list shows when a campaign was complete, and a
+  device's page shows, for a campaign that freed it, when the device was
+  done and when it was freed, in place of its planned start.
 - The devices and device pages show whether each device can be reached.
   [#816]
 - The redundancy group pages set a group's `failure-policy` next to its
@@ -1314,7 +1332,7 @@
   `target-release` and `image-url`. Add the images to `/images/image`, with
   their `version`, set `/images/url-base`, and name an image for each member.
   [#743]
-- A device can be in one Fleet Manager campaign only. Before you upgrade,
+- One Fleet Manager campaign at most acquires a device. Before you upgrade,
   remove each device that two campaigns name from one of them. Otherwise
   Fleet Manager cannot load its configuration and does not start. [#783]
 - Since a NETCONF `<edit-config>` transaction completes before the devices

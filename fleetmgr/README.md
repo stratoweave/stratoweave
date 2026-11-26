@@ -199,15 +199,48 @@ is that of a run that starts now, so it shows what `run` would do. A
 campaign created directly in `run` promises its windows in the order its
 members answer. Create it in `plan` first to keep the campaign's order.
 
-A device in the fleet is in one campaign at most, also while the campaign
-is in `plan` and after it is done. An edit that names a device in a second
-campaign fails with "Cannot merge leaves with different values at
-/software/upgrade-campaign". To move a device to another campaign, first
-remove it from its campaign, or delete the campaign. Then add it to the
-other campaign in a later edit. A move in one edit fails too. A campaign
-gives a member that is not in the fleet nothing, so two campaigns can name
-it. The edit that adds such a device to the fleet then fails with the same
-error, until only one campaign names it.
+One campaign at most acquires a device in the fleet, in `plan` and in
+`run`. An edit that makes a second campaign acquire a device fails with
+"Cannot merge leaves with different values at /software/upgrade-campaign".
+To move an acquired device to another campaign, first remove it from its
+campaign, or delete the campaign. Then add it to the other campaign in a
+later edit. A move in one edit fails too. A campaign gives a member that
+is not in the fleet nothing, so two campaigns can name it. The edit that
+adds such a device to the fleet then fails with the same error, while two
+campaigns that have not freed it name it.
+
+A campaign in `run` is complete when every member is done: the attempt
+that counts for it has a final status, also when it failed, and it is not
+in flight. The campaign then frees its members, all in one commit: it
+keeps each member's result in its memory and writes nothing more to their
+devices, so another campaign can acquire them, also in the edit that
+removes them from this one. A freed member's `device-status` shows its
+result, with `freed` and `finished`, and nothing that its device reports.
+The counters count the results, and `state/completed` is when the campaign
+freed its members. Each member that is not done keeps the campaign
+incomplete. A member that cannot start, such as one held by
+`failure-budget`, one that is not in the fleet or one with no window
+before the deadline, keeps it incomplete until an operator removes the
+member or lifts what holds it. Only `run` completes a campaign: a campaign
+in `plan` whose members are all up to date completes when it is set to
+`run`. A restart of fleetmgr keeps the results and frees nothing again;
+the plan then shows the freed members in no window.
+
+A new `attempt` for a freed member whose attempt failed acquires its
+device again, and so does adding a member: the campaign is incomplete
+until that member is done, and then frees it again with its new result.
+Such an edit fails while another campaign has acquired the device. A
+freed member that is removed and added again is acquired again too, and
+is done at once: its device keeps the final status of its attempt. A
+member with a new attempt waits for its freed group-mates by their
+results: behind one that failed in a group that holds, one whose rollback
+failed and one that is down, and for the group's `min-separation` from
+when the group-mate was done, also when its device reports a later boot.
+Freed failures still count against `failure-budget`. Nothing else
+acquires a freed member again: it keeps its result through a new
+`prepare-attempt`, a pause, and another image or version of its image
+when the campaign has not let it prepare or released it. Removing a freed
+member forgets its result.
 
 Setting a running campaign back to `plan` pauses it. A member in flight
 stops before its install and shows `upgrade-needed`. A member past its
@@ -276,16 +309,18 @@ of 50. A member has failed while its status for the campaign's intent is
 `failed`, `rolled-back` or `not-started`, as the `failed` counter counts
 it, and while its rollback failed, also when its status is lost, until its
 device reports another final status, it gets a new attempt, or it leaves
-the campaign. A pause keeps the count. A restart of fleetmgr loses it,
-because the device status is not saved: a failed member answers again, and
-the campaign can release it. When more members have failed than the
-budget, no member starts or prepares: the members in flight finish, the
-others keep their windows, and the plan's alarm says "N device(s) failed,
-more than the failure budget of M: no more devices start". To go on, raise
-or remove the budget, or give failed members a new attempt or remove them.
-A member with a new attempt no longer counts as failed. Each member
-removed also makes the budget smaller: at 2 percent, 3 failed members of
-100 stop the releases, and 2 of 99 still do.
+the campaign. A pause keeps the count. A restart of fleetmgr keeps the
+failures of the freed members, whose results the campaign saves, and loses
+the others, because the device status is not saved: a failed member that
+is not freed answers again, and the campaign can release it. When more
+members have failed than the budget, no member starts or prepares: the
+members in flight finish, the others keep their windows, and the plan's
+alarm says "N device(s) failed, more than the failure budget of M: no more
+devices start". To go on, raise or remove the budget, or give failed
+members a new attempt or remove them. A member with a new attempt no
+longer counts as failed. Each member removed also makes the budget
+smaller: at 2 percent, 3 failed members of 100 stop the releases, and 2 of
+99 still do.
 
 A member is down while its flotilla is not connected to it, or while the
 top is not connected to its flotilla. A member that has not connected

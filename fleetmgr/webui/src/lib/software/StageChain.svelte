@@ -18,7 +18,8 @@
     running: 'running',
     failed: 'failed',
     todo: 'not reached',
-    skipped: 'not needed'
+    skipped: 'not needed',
+    unknown: 'not known'
   };
 
   const ROLLBACK_TEXT: Record<RollbackState, string> = {
@@ -265,6 +266,10 @@
   .dot.skipped {
     border-color: var(--sw-bar-rest);
     background: var(--sw-bar-rest);
+  }
+
+  .dot.unknown {
+    border-style: dashed;
   }
 
   .dot.running {

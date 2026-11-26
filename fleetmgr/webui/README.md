@@ -38,8 +38,9 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   references `/fleetmgr:fleet/device`, the image names an entry of the
   image list. A new campaign takes three steps. Devices: the selection
   filters on type, model, version, name, address, description and
-  schedule, or starts from pasted names; devices another campaign has are
-  left out. Back keeps the filters. Images: one row per
+  schedule, or starts from pasted names; devices that another campaign
+  has acquired are left out, so a device that a complete campaign freed
+  can join. Back keeps the filters. Images: one row per
   model in the selection, offering the images that list the model; the
   family default is preselected when exactly one default image lists the
   model. Devices that have not reported a model are left out, and a model
@@ -123,12 +124,15 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   shared by the devices, groups and new-campaign pages and the search. A
   write through the RESTCONF client drops the cache and Refresh bypasses
   it; changes made elsewhere show when it expires.
-- The campaigns, schedules, groups and new-campaign pages read the
-  campaigns with `content=config` (RFC 8040), which leaves out the
-  published state: the device rows and the plan, most of the subtree once
-  a campaign has members. The campaigns list adds each campaign's counters
-  and alarm lines from one GET of its `state` with `fields`, which costs
-  the server the same as a leaf GET at any campaign size.
+- The campaigns, schedules and groups pages read the campaigns with
+  `content=config` (RFC 8040), which leaves out the published state: the
+  device rows and the plan, most of the subtree once a campaign has
+  members. The new-campaign page reads each campaign's members and the
+  `freed` of its device rows, to leave out only the devices that a
+  campaign has acquired. The campaigns list adds each campaign's counters,
+  `completed` among them, and alarm lines from one GET of its `state` with
+  `fields`, which costs the server the same as a leaf GET at any campaign
+  size.
 - Polling. The campaign page ticks every 1.5 s, one tick at a time and
   none while the tab is hidden. A campaign with up to 600 members gets its
   `state` node (plan and per-device rows, ~150 B per member) every tick; a
@@ -290,6 +294,8 @@ step running now pulses, a failed step is red with a cross, and a rollback
 shows as ↺ after it; the device's `reason` says why the run stopped. A
 run whose prepare failed for a transient reason waits at prepare, and its
 detail says that it waits to prepare again, with the device's message. A
+device that a campaign freed after a rollback keeps no check verdicts: its
+post-check and commit show as not known, with a dashed ring. A
 device that waits for its window shows prepare running while it prepares
 its target ahead, and done once it has; while its prepare waits to be
 tried again, the step does not pulse. Next to

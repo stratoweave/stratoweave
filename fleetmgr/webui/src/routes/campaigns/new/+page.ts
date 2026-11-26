@@ -1,7 +1,7 @@
 import { errorText } from '#lib/core/errors.ts';
 import { restconfGetCachedOrNull, restconfGetOrNull } from '#lib/core/restconf/client.ts';
 import {
-  CAMPAIGN_MEMBERS,
+  CAMPAIGN_OWNERS,
   FLEET_LIST,
   IMAGES_ROOT,
   SCHEDULES_ROOT,
@@ -20,7 +20,7 @@ async function loadInventory(fetch: typeof globalThis.fetch) {
     const [images, schedules, software, fleet] = await Promise.all([
       restconfGetOrNull<unknown>(IMAGES_ROOT, fetch),
       restconfGetOrNull<unknown>(SCHEDULES_ROOT, fetch),
-      restconfGetOrNull<unknown>(CAMPAIGN_MEMBERS, fetch),
+      restconfGetOrNull<unknown>(CAMPAIGN_OWNERS, fetch),
       restconfGetCachedOrNull<unknown>(FLEET_LIST, fetch)
     ]);
     return {

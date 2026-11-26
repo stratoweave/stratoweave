@@ -2,8 +2,10 @@
 
 import { STEPS, STEP_LABEL, type DeviceStatusRow, type Step } from './model';
 
-/** skipped: the device was already on the target, so no step ran. */
-export type StepState = 'done' | 'running' | 'failed' | 'todo' | 'skipped';
+/** skipped: the device was already on the target, so no step ran.
+ * unknown: the step ran or did not, and failed or did not, as for the
+ * steps after the install of a freed member that rolled back. */
+export type StepState = 'done' | 'running' | 'failed' | 'todo' | 'skipped' | 'unknown';
 export type RollbackState = 'running' | 'done' | 'failed';
 
 export interface StageView {
@@ -20,11 +22,16 @@ function chain(at: number, state: StepState, rollback: RollbackState | null = nu
   };
 }
 
-/** The step a rollback followed. The post-check verdict tells a failed
- * commit (pass) from a failed post-check (fail) or one with no time left
- * to run (not-run). */
-function rolledBackFrom(row: DeviceStatusRow): number {
-  return STEPS.indexOf(row.postcheck.verdict === 'pass' ? 'commit' : 'postcheck');
+/** The chain of a run that rolled back, with the rollback in state. The
+ * post-check verdict tells a failed commit (pass) from a failed post-check
+ * (fail) or one with no time left to run (not-run). A freed member keeps
+ * no verdict, so its post-check and commit are unknown. */
+function rolledBack(row: DeviceStatusRow, rollback: RollbackState): StageView {
+  if (row.freed !== null) {
+    const at = STEPS.indexOf('postcheck');
+    return { steps: STEPS.map((step, i) => ({ step, state: i < at ? 'done' : 'unknown' })), rollback };
+  }
+  return chain(STEPS.indexOf(row.postcheck.verdict === 'pass' ? 'commit' : 'postcheck'), 'failed', rollback);
 }
 
 /** Whether the member ran the target release before the campaign touched
@@ -55,11 +62,11 @@ export function stageView(row: DeviceStatusRow): StageView {
       if (!alreadyOnTarget(row)) return chain(STEPS.length, 'todo');
       return { steps: STEPS.map((step) => ({ step, state: 'skipped' })), rollback: null };
     case 'rolled-back':
-      return chain(rolledBackFrom(row), 'failed', 'done');
+      return rolledBack(row, 'done');
     case 'in-progress':
     case 'failed': {
       const now = status === 'in-progress' ? 'running' : 'failed';
-      if (stage === 'rollback') return chain(rolledBackFrom(row), 'failed', now);
+      if (stage === 'rollback') return rolledBack(row, now);
       if (stage !== null) return chain(STEPS.indexOf(stage), now);
       return chain(0, 'todo');
     }
@@ -122,7 +129,8 @@ export function stageDetail(row: DeviceStatusRow): string {
   if (doing) return doing;
   if (view.steps[0].state === 'skipped') return 'already on the target release';
   const failed = view.steps.find((s) => s.state === 'failed');
-  if (!failed) return '';
+  // A rollback after unknown steps has only its reason.
+  if (!failed) return view.rollback !== null ? row.reason : '';
   const why = row.reason || `${STEP_LABEL[failed.step]} failed`;
   return view.rollback === 'running' ? `rolling back: ${why}` : why;
 }
