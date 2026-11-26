@@ -143,7 +143,8 @@ lookup instead.
 
 ## SSH transport parameters
 
-Every SSH-based adapter -- NETCONF over SSH and the IOS XE CLI adapter -- reads
+Every SSH-based adapter -- NETCONF over SSH, the IOS XE CLI adapter and the
+SCP adapter -- reads
 its transport settings from the device's `ssh` container, or from the `ssh`
 container of its `extra-adapter` entry. Leave it out and the SSH library's
 defaults apply; set it to deal with devices that need something narrower or
@@ -228,6 +229,40 @@ An adapter runs as an extra adapter when it reports its device type with its
 modules, `dev.on_connect(modules, schema_key, dmc.type)`, and a lost
 connection with `dev.on_disconnect(dmc.type)`. A report without the device type
 is the one of the adapter of the device type.
+
+### SCP adapter
+
+`adapters.scp.ScpAdapter` copies files from the image folder
+(`software.image_dir`) to a device over SCP. Its module, `stratoweave-scp`,
+has one RPC, `put`, with the file's path in the image folder, `local-file`,
+and where the device writes it, `remote-file`, in the form that the device's
+SCP server takes: `bootflash:x.bin` on IOS XE, `/harddisk:/x.bin` on IOS XR,
+`/var/tmp/x.bin` on Junos. Register it as a device type, and list it in
+`extra-adapter`:
+
+```acton title="src/myapp/device_types.act"
+"scp": swdev.DeviceType(
+    name="scp",
+    adapter_type=scp.ScpAdapter,
+    src_dnode=scp_data.SRC_DNODE,
+    oper_src_dnode=scp_data.SRC_DNODE)
+```
+
+The adapter logs in to the SSH server of the device's CLI, port 22 by
+default. The NETCONF SSH servers of IOS XE, IOS XR and Junos take no SCP on
+port 830: IOS XE answers the `scp` command with a NETCONF hello, IOS XR
+refuses it, and Junos runs NETCONF on any channel of that port. IOS XE takes
+SCP on port 22 once it has `ip scp server enable`.
+
+Each transfer has an SSH connection of its own, so a transfer does not hold
+up the commands of a CLI adapter on the same SSH server. The adapter logs in
+once when it gets its configuration and shows as connected when the login
+works. It stays connected until a transfer cannot log in. The RPC returns
+when the device has written the file. A device that refuses the file, such
+as IOS XE for a file system that it does not have, says so only after all
+of the file is sent; that error is a `PermanentError`. A connection that
+ends the transfer gives a `TransientError`. Transfers of one file at the
+same time share one copy of it in memory.
 
 ## Device logs
 

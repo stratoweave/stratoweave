@@ -1,0 +1,355 @@
+"""Copy files to a device over SCP, with the stratoweave-scp module.
+
+The adapter runs beside the adapter of another device type, as an extra
+adapter. Its put RPC sends a file of the image folder to the device. It
+logs in to the SSH server of the device's CLI, port 22 by default: the
+NETCONF SSH servers of IOS XE, IOS XR and Junos take no SCP on port 830.
+Each transfer has an SSH connection of its own, so it does not hold up
+another adapter on the same SSH server, such as the IOS XE CLI adapter.
+IOS XE closes the connection when the exec channel of the transfer ends.
+
+The adapter logs in once when it gets its configuration, to tell DeviceMgr
+whether the device takes the credentials. After a failed login it tries
+again later. It stays connected until a transfer cannot log in.
+
+The device reports an error in the file only after all of the file is
+sent, as IOS XE does for a file system that it does not have. The adapter
+therefore checks what it can before it sends: the file in the image folder
+and the form of the remote file.
+"""
+
+import logging
+import net
+import ssh
+import std.xml as xml
+import yang.gdata as gdata
+
+import device as swdev
+import image_dir as swimg
+import adapters.scp_data as scp_data
+import adapters.scp_yang as scp_yang
+from device_meta_config import stratoweave_rfs__device_entry as DeviceMetaConfig
+from device_schema import DeviceSchema
+from adapters.adapter import DeviceAdapter, ModCap, ConfigError, NotConnectedError, \
+    PermanentError, TransientError, SubscriptionStatus, SUBSCRIPTION_POLL, ssh_client, tcp_connect_cap
+
+## Seconds that a transfer can take at least, and the slowest rate in bytes
+## per second that a transfer gets more time for. An IOS XE 17.9 C1111 writes
+## about 450 000 bytes per second to bootflash.
+TRANSFER_TIMEOUT_MIN = 300.0
+TRANSFER_RATE_MIN = 100000
+
+## Seconds between login attempts after a failure: the first delay, and the
+## limit for the delay that doubles after each failure.
+RETRY_FIRST = 1.0
+RETRY_MAX = 60.0
+
+_RFS_NS = "http://stratoweave.org/yang/stratoweave-rfs"
+
+
+def modules() -> dict[str, ModCap]:
+    """Return the modules that the adapter implements."""
+    return {scp_yang.MODULE: ModCap(scp_yang.MODULE, scp_yang.NS)}
+
+
+def remote_name(remote_file: str) -> str:
+    """Return the file name in remote_file: the text after the last '/' or
+    ':'. Raise ValueError when remote_file has no file name, or has a
+    character that no device takes in a path."""
+    if any([c in remote_file for c in ["\n", "\r", "\x00"]]):
+        raise ValueError("invalid remote file: it has a newline or a NUL character")
+    start = max([remote_file.rfind("/"), remote_file.rfind(":")]) + 1
+    name = remote_file[start:]
+    if name in ["", ".", ".."]:
+        raise ValueError("invalid remote file '{remote_file}': it names no file")
+    return name
+
+
+## The starts of the errors of ssh.ScpPut that say that the connection, not
+## the device, ended the transfer.
+# TODO: upstream: ScpPut gives its error as text only.
+_CONNECTION_ERRORS = ["timeout", "Session closed", "SCP channel closed before the transfer completed",
+                      "remote scp killed by signal"]
+
+
+def transfer_error(remote_file: str, err: str) -> Exception:
+    """Return the error of a transfer to remote_file that ssh.ScpPut ended
+    with err: a TransientError when the connection ended it, else a
+    PermanentError, because a device that refuses a file refuses it again."""
+    text = "SCP to {remote_file} failed: {err.strip()}"
+    for start in _CONNECTION_ERRORS:
+        if err.startswith(start):
+            return TransientError(text)
+    return PermanentError(text)
+
+
+def transfer_timeout(size: int) -> float:
+    """Return the seconds that the transfer of size bytes can take."""
+    return TRANSFER_TIMEOUT_MIN + float(size) / float(TRANSFER_RATE_MIN)
+
+
+def put_input(request: gdata.Node) -> scp_data.stratoweave_scp__put__input:
+    """Return the input of a put request. Raise ValueError for another RPC
+    or for input that is not valid."""
+    items = list(request.children.items())
+    if len(items) != 1:
+        raise ValueError("an RPC request must have exactly one child")
+    rpc_id, body = items[0]
+    if rpc_id != gdata.Id(scp_yang.NS, "put"):
+        raise ValueError("RPC " + str(rpc_id) + " is not supported by the SCP adapter")
+    inp = scp_data.stratoweave_scp__put__input.from_gdata(body)
+    swimg.check_name(inp.local_file)
+    remote_name(inp.remote_file)
+    return inp
+
+
+def _settings(dmc: DeviceMetaConfig) -> ?gdata.Node:
+    """The part of dmc that the login uses."""
+    selected = gdata.FNode(children=[gdata.FNode(gdata.Id(_RFS_NS, name))
+                                   for name in ["address", "credentials", "ssh"]])
+    return gdata.filter(dmc.to_gdata(), selected)
+
+
+actor ScpPutRun(dev: swdev.DeviceMgr, dmc: DeviceMetaConfig, inp: scp_data.stratoweave_scp__put__input,
+                cap: ?net.TCPConnectCap,
+                done: action(?gdata.Node, ?Exception) -> None,
+                on_login_failed: action() -> None, log_handler: logging.Handler):
+    """One transfer: read the file from the image folder, log in, send it
+    with ssh.ScpPut, close the connection and give done the RPC output or
+    the error. A failed login also calls on_login_failed."""
+    _log = logging.Logger(log_handler)
+    var client: ?ssh.Client = None
+    var stamp: ?str = None
+    var data = b""
+    var images: ?swimg.ImageReader = None
+    var finished = False
+
+    def _finish(out: ?gdata.Node, err: ?Exception):
+        if finished:
+            return
+        finished = True
+        i = images
+        s = stamp
+        if i is not None and s is not None:
+            i.done(s)
+        data = b""
+        c = client
+        if c is not None:
+            c.close()
+        done(out, err)
+
+    def _sent(p: ssh.ScpPut, err: ?str):
+        if err is not None:
+            _log.warning("SCP: transfer failed", {"local_file": inp.local_file, "remote_file": inp.remote_file, "error": err})
+            _finish(None, transfer_error(inp.remote_file, err))
+            return
+        _log.info("SCP: transfer done", {"local_file": inp.local_file, "remote_file": inp.remote_file, "size": len(data)})
+        _finish(scp_data.stratoweave_scp__put__output(size=u64(len(data))).to_gdata(), None)
+
+    def _on_connect(c: ssh.Client, err: ?Exception):
+        if finished:
+            c.close()
+            return
+        if err is not None:
+            on_login_failed()
+            _finish(None, NotConnectedError("SSH login failed: " + swdev.error_text(err)))
+            return
+        _log.info("SCP: sending", {"local_file": inp.local_file, "remote_file": inp.remote_file, "size": len(data)})
+        ssh.ScpPut(c, inp.remote_file, data, _sent, name=remote_name(inp.remote_file),
+                   timeout=transfer_timeout(len(data)))
+
+    def _on_close(c: ssh.Client, reason: str):
+        # ScpPut reports a connection that closes during the transfer.
+        pass
+
+    def _on_hostkey(c: ssh.Client, state: str, info: ssh.HostKeyInfo):
+        # The NETCONF and the IOS XE CLI adapters do not check host keys either.
+        c.accept_hostkey()
+
+    def _start(i: swimg.ImageReader, k: net.TCPConnectCap):
+        try:
+            read = await async i.read(inp.local_file)
+        except Exception as e:
+            _finish(None, PermanentError("cannot read {inp.local_file} in the image folder: " + swdev.error_text(e)))
+            return
+        images = i
+        stamp = read.stamp
+        data = read.data
+        try:
+            client = ssh_client(k, dmc, _on_connect, _on_close, _on_hostkey)
+        except Exception as e:
+            _finish(None, e)
+
+    def __startup__():
+        i = dev.get_images()
+        k = cap
+        if i is not None and k is not None:
+            _start(i, k)
+        elif i is None:
+            _finish(None, PermanentError("the system has no image folder: set software.image_dir"))
+        else:
+            _finish(None, NotConnectedError("the SCP adapter cannot open network connections"))
+
+
+actor ScpDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler, env: ?Env, retry_first: float):
+    """Log in to the device to tell DeviceMgr whether it is connected, and
+    run the transfers.
+
+    A change of the address, the credentials or the SSH settings logs in
+    again. The driver reports its device type, so it can run beside the
+    adapter of another device type.
+    """
+    _log = logging.Logger(log_handler)
+    tcp = tcp_connect_cap(env)
+    var dmc: ?DeviceMetaConfig = None
+    var settings: ?gdata.Node = None
+    var generation = 0
+    var closed = False
+    var ready = False
+    var checking = False
+
+    def _type() -> ?str:
+        d = dmc
+        return d.type if d is not None else None
+
+    def _check(gen: int, delay: float):
+        """Log in, and close the connection at once."""
+        if closed or gen != generation:
+            return
+        d = dmc
+        k = tcp
+        if d is not None and k is not None:
+            _login(gen, delay, d, k)
+
+    def _login(gen: int, delay: float, d: DeviceMetaConfig, k: net.TCPConnectCap):
+        checking = True
+
+        def on_connect(c: ssh.Client, err: ?Exception):
+            c.close()
+            if closed or gen != generation:
+                return
+            checking = False
+            if err is not None:
+                wait = delay
+                next_delay = delay * 2.0 if delay * 2.0 < RETRY_MAX else RETRY_MAX
+                _log.warning("SCP: login failed", {"error": err, "retry_in": wait})
+                dev.on_disconnect(_type())
+                after now wait: _check(gen, next_delay)
+                return
+            ready = True
+            _log.info("SCP: login works")
+            async dev.on_connect(modules(), None, _type())
+
+        def on_close(c: ssh.Client, reason: str):
+            pass
+
+        def on_hostkey(c: ssh.Client, state: str, info: ssh.HostKeyInfo):
+            c.accept_hostkey()
+
+        try:
+            ssh_client(k, d, on_connect, on_close, on_hostkey)
+        except Exception as e:
+            checking = False
+            _log.warning("SCP: cannot log in", {"error": e})
+            dev.on_disconnect(_type())
+
+    def _login_failed():
+        """A transfer could not log in: the device is not connected until
+        a login works again."""
+        if closed or not ready:
+            return
+        ready = False
+        dev.on_disconnect(_type())
+        if not checking:
+            _check(generation, retry_first)
+
+    def set_dmc(new_dmc: DeviceMetaConfig):
+        if closed:
+            return
+        dmc = new_dmc
+        new_settings = _settings(new_dmc)
+        if settings == new_settings:
+            return
+        settings = new_settings
+        generation += 1
+        ready = False
+        checking = False
+        _check(generation, retry_first)
+
+    def rpc(cb: action(?gdata.Node, ?Exception) -> None, request: gdata.Node):
+        try:
+            inp = put_input(request)
+        except Exception as e:
+            cb(None, e)
+            return
+        d = dmc
+        if d is not None and ready:
+            ScpPutRun(dev, d, inp, tcp, cb, _login_failed, log_handler)
+        else:
+            cb(None, NotConnectedError("the SCP adapter is not connected"))
+
+    def close(on_close: ?action() -> None=None):
+        closed = True
+        generation += 1
+        if on_close is not None:
+            on_close()
+
+
+class ScpAdapter(DeviceAdapter):
+    """Device adapter that copies files to a device over SCP.
+
+    The device address and port are those of the SSH server, port 22 by
+    default. retry_first is the delay in seconds before the first new login
+    after a failure.
+    """
+    def __init__(self, dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, init_dmc: DeviceMetaConfig,
+                 schema_registry: swdev.SchemaRegistry, log_handler, env: ?Env,
+                 retry_first: float=RETRY_FIRST):
+        self._log_handler = log_handler
+        self._env = env
+        self._modules = modules()
+        self._driver = ScpDriver(dev, log_handler, env, retry_first)
+
+    def set_dmc(self, new_dmc: DeviceMetaConfig):
+        self._driver.set_dmc(new_dmc)
+
+    def configure(self, done, new_diff, new_conf, running_conf):
+        done(ConfigError("the SCP adapter does not configure devices", new_diff, new_conf), None)
+
+    def get_capabilities(self) -> list[str]:
+        return []
+
+    def get_modules(self) -> dict[str, ModCap]:
+        return self._modules
+
+    def subscription_method(self) -> str:
+        return SUBSCRIPTION_POLL
+
+    def subscription_status(self) -> SubscriptionStatus:
+        return SubscriptionStatus(SUBSCRIPTION_POLL, emulated=True)
+
+    def fetch_config(self, done: action(?gdata.Node, ?Exception) -> None):
+        done(gdata.Container({}), None)
+
+    def get_config(self) -> ?gdata.Node:
+        return gdata.Container({})
+
+    def get(self, cb: action(?gdata.Node, ?Exception) -> None, filt: ?gdata.FNode=None):
+        cb(gdata.Container({}), None)
+
+    def rpc(self, cb: action(?gdata.Node, ?Exception) -> None, gdata_rpc: gdata.Node):
+        self._driver.rpc(cb, gdata_rpc)
+
+    def rpc_xml(self, cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node):
+        cb(None, ConfigError("the SCP adapter does not support XML RPCs"))
+
+    def declare_subscriptions(self, owner_id: str, cb: action(?gdata.Node, ?Exception) -> None,
+                              want: set[gdata.SubscriptionSpec], synced: ?action(str) -> None=None):
+        if len(want) > 0:
+            cb(None, PermanentError("the SCP adapter has no data to subscribe to"))
+
+    def remove_subscriptions(self, owner_id: str):
+        pass
+
+    def close(self, on_close: ?action() -> None=None):
+        self._driver.close(on_close)

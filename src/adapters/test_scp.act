@@ -1,0 +1,452 @@
+"""Tests of the SCP adapter.
+
+A local SSH server plays the SCP server of a device: it answers the exec
+of scp -t as OpenSSH and IOS XE do, and records what it receives.
+"""
+
+import file
+import logging
+import net
+import ssh
+import testing
+import yang
+import yang.gdata as gdata
+
+import device as swdev
+import device_oper as swdevoper
+import image_dir as swimg
+import adapters.scp as scp
+import adapters.scp_data as scp_data
+import adapters.scp_yang as scp_yang
+from adapters.adapter import DeviceAdapter, PermanentError, TransientError
+from device_schema import DeviceSchema
+from device_meta_config import stratoweave_rfs__device_entry as Dmc, \
+    stratoweave_rfs__device__credentials as Credentials
+
+
+def _name(remote_file: str) -> str:
+    try:
+        return scp.remote_name(remote_file)
+    except ValueError as e:
+        return "error: " + e.error_message
+
+
+def _test_remote_name():
+    cases: list[(remote_file: str, want: str)] = [
+        (remote_file="bootflash:x.bin", want="x.bin"),
+        (remote_file="/harddisk:/x.bin", want="x.bin"),
+        (remote_file="/var/tmp/x.bin", want="x.bin"),
+        (remote_file="cf3:/images/x.bin", want="x.bin"),
+        (remote_file="x.bin", want="x.bin"),
+        (remote_file="bootflash:", want="error: invalid remote file 'bootflash:': it names no file"),
+        (remote_file="/var/tmp/", want="error: invalid remote file '/var/tmp/': it names no file"),
+        (remote_file="/var/tmp/..", want="error: invalid remote file '/var/tmp/..': it names no file"),
+        (remote_file="", want="error: invalid remote file '': it names no file"),
+        (remote_file="bootflash:a\nb", want="error: invalid remote file: it has a newline or a NUL character"),
+    ]
+    for c in cases:
+        testing.assertEqual(_name(c.remote_file), c.want, repr(c.remote_file))
+
+
+def _test_transfer_timeout():
+    cases: list[(size: int, want: float)] = [
+        (size=0, want=300.0),
+        (size=100000, want=301.0),
+        (size=1000000000, want=10300.0),
+    ]
+    for c in cases:
+        testing.assertEqual(scp.transfer_timeout(c.size), c.want, str(c.size))
+
+
+def _test_transfer_error():
+    cases: list[(err: str, want: str)] = [
+        (err="timeout", want="transient: SCP to bootflash:x.bin failed: timeout"),
+        (err="Session closed", want="transient: SCP to bootflash:x.bin failed: Session closed"),
+        (err="SCP channel closed before the transfer completed (remote exit status 1)",
+         want="transient: SCP to bootflash:x.bin failed: SCP channel closed before the transfer completed (remote exit status 1)"),
+        (err="remote scp killed by signal TERM", want="transient: SCP to bootflash:x.bin failed: remote scp killed by signal TERM"),
+        (err="unexpected SCP reply: Administratively disabled.\r\n",
+         want="permanent: SCP to bootflash:x.bin failed: unexpected SCP reply: Administratively disabled."),
+        (err="unexpected SCP reply: <?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+         want="permanent: SCP to bootflash:x.bin failed: unexpected SCP reply: <?xml version=\"1.0\" encoding=\"UTF-8\"?>"),
+        (err="Write failed", want="permanent: SCP to bootflash:x.bin failed: Write failed"),
+        (err="SSH channel request failed: channel closed",
+         want="permanent: SCP to bootflash:x.bin failed: SSH channel request failed: channel closed"),
+        (err="remote scp exited with status 1: scp: disk full",
+         want="permanent: SCP to bootflash:x.bin failed: remote scp exited with status 1: scp: disk full"),
+    ]
+    for c in cases:
+        e = scp.transfer_error("bootflash:x.bin", c.err)
+        kind = "transient" if isinstance(e, TransientError) else "permanent" if isinstance(e, PermanentError) else "other"
+        testing.assertEqual(kind + ": " + swdev.error_text(e), c.want, c.err)
+
+
+def _request(rpc: str, local_file: str, remote_file: str) -> gdata.Node:
+    inp = scp_data.stratoweave_scp__put__input(local_file, remote_file).to_gdata()
+    return gdata.Container({gdata.Id(scp_yang.NS, rpc): inp})
+
+
+def _input(rpc: str, local_file: str, remote_file: str) -> str:
+    try:
+        inp = scp.put_input(_request(rpc, local_file, remote_file))
+        return inp.local_file + " -> " + inp.remote_file
+    except ValueError as e:
+        return "error: " + e.error_message
+
+
+def _test_put_input():
+    cases: list[(rpc: str, local_file: str, remote_file: str, want: str)] = [
+        (rpc="put", local_file="iosxe/a.bin", remote_file="bootflash:a.bin", want="iosxe/a.bin -> bootflash:a.bin"),
+        (rpc="get", local_file="iosxe/a.bin", remote_file="bootflash:a.bin",
+         want="error: RPC " + str(gdata.Id(scp_yang.NS, "get")) + " is not supported by the SCP adapter"),
+        (rpc="put", local_file="../a.bin", remote_file="bootflash:a.bin",
+         want="error: Invalid image path '../a.bin': name each folder and file with letters, digits, '.', '_' and '-', at most 200 characters, not starting with '.', and join them with '/', at most 400 characters in all"),
+        (rpc="put", local_file="iosxe/a.bin", remote_file="bootflash:",
+         want="error: invalid remote file 'bootflash:': it names no file"),
+    ]
+    for c in cases:
+        testing.assertEqual(_input(c.rpc, c.local_file, c.remote_file), c.want, c.rpc + " " + c.local_file + " " + c.remote_file)
+
+
+actor _FakeScp(t: testing.EnvT, behaviour: str, on_listen: action(int) -> None, on_rejected: action() -> None):
+    """An SSH server that acts as the SCP server of a device, for the user
+    admin with the password admin. It calls on_rejected when it refuses a
+    login. behaviour is "ok": it receives the file;
+    "fail-data": it refuses the file after its data, as IOS XE does for a
+    file system that it does not have; or "not-scp": it answers the exec as
+    IOS XE does without ip scp server enable."""
+    var execs: list[str] = []
+    var headers: list[str] = []
+    var received: list[bytes] = []
+    var state = "header"
+    var buf = b""
+    var size = 0
+
+    def _on_listen(s: ssh.Server, err: ?str):
+        if err is not None:
+            on_listen(0)
+        else:
+            on_listen(int(s.bound_port()))
+
+    def _on_server_close(s: ssh.Server, reason: str):
+        pass
+
+    def _on_session(session: ssh.ServerSession):
+        pass
+
+    def _on_auth(session: ssh.ServerSession, request: ssh.AuthRequest):
+        if request.method == "password" and request.user == "admin" and request.password == "admin":
+            session.accept_auth()
+        else:
+            session.reject_auth("invalid credentials")
+            on_rejected()
+
+    def _on_data(channel: ssh.ServerChannel, data: ?bytes):
+        if data is not None:
+            _received(channel, data)
+        elif state == "done":
+            channel.send_exit_status(0)
+            channel.close()
+
+    def _received(channel: ssh.ServerChannel, data: bytes):
+        buf += data
+        if state == "header":
+            nl = buf.find(b"\n")
+            if nl < 0:
+                return
+            line = buf[:nl].decode()
+            buf = buf[nl + 1:]
+            headers.append(line)
+            size = int(line.split(" ")[1])
+            state = "data"
+            channel.write(b"\x00")
+        if state == "data" and len(buf) >= size + 1:
+            received.append(buf[:size])
+            buf = b""
+            state = "done"
+            if behaviour == "fail-data":
+                channel.write(b"\x01Write failed\n")
+            else:
+                channel.write(b"\x00")
+
+    def _on_stderr(channel: ssh.ServerChannel, data: ?bytes):
+        pass
+
+    def _on_channel_close(channel: ssh.ServerChannel, reason: str):
+        pass
+
+    def _on_channel(session: ssh.ServerSession):
+        session.accept_channel(ssh.ServerChannel(session, _on_data, _on_stderr, _on_channel_close))
+
+    def _on_exec(session: ssh.ServerSession, channel: ssh.ServerChannel, command: str):
+        execs.append(command)
+        channel.accept_request()
+        state = "header"
+        buf = b""
+        if behaviour == "not-scp":
+            channel.write(b"Administratively disabled.\r\n")
+            channel.send_exit_status(1)
+            channel.close()
+        else:
+            channel.write(b"\x00")
+
+    def seen() -> list[str]:
+        """What the server got: each exec, header and file content."""
+        out: list[str] = []
+        for e in execs:
+            out.append("exec " + e)
+        for h in headers:
+            out.append("header " + h)
+        for r in received:
+            out.append("data " + r.decode())
+        return out
+
+    server = ssh.Server(net.TCPListenCap(net.TCPCap(net.NetCap(t.env.cap))),
+                        "127.0.0.1", u16(0), _on_listen, _on_server_close,
+                        _on_session, _on_auth, _on_channel, on_exec=_on_exec)
+
+    def close():
+        server.close()
+
+
+proc def _adapter(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, dmc: Dmc, registry: swdev.SchemaRegistry,
+                  log_handler: logging.Handler, env: ?Env) -> DeviceAdapter:
+    return scp.ScpAdapter(dev, bundled_schema, dmc, registry, log_handler, env, retry_first=0.2)
+
+
+# Each case puts local_file to remote_file on a _FakeScp with behaviour, as
+# admin with password. want is what the put gives, its size or the start of
+# its error, then what the server got.
+_PUT_CASES: list[(name: str, behaviour: str, local_file: str, remote_file: str, password: str, want: list[str])] = [
+    (name="sent", behaviour="ok", local_file="iosxe/a.bin", remote_file="bootflash:a.bin", password="admin",
+     want=["size 5", "exec scp -t 'bootflash:a.bin'", "header C0644 5 a.bin", "data hello"]),
+    (name="sent to an IOS XR path", behaviour="ok", local_file="iosxe/a.bin", remote_file="/harddisk:/a.bin", password="admin",
+     want=["size 5", "exec scp -t '/harddisk:/a.bin'", "header C0644 5 a.bin", "data hello"]),
+    (name="the device fails the write", behaviour="fail-data", local_file="iosxe/a.bin", remote_file="bootflash:a.bin", password="admin",
+     want=["error: SCP to bootflash:a.bin failed: Write failed", "exec scp -t 'bootflash:a.bin'", "header C0644 5 a.bin", "data hello"]),
+    (name="the device takes no SCP", behaviour="not-scp", local_file="iosxe/a.bin", remote_file="bootflash:a.bin", password="admin",
+     want=["error: SCP to bootflash:a.bin failed: unexpected SCP reply: Administratively disabled.", "exec scp -t 'bootflash:a.bin'"]),
+    (name="no such file", behaviour="ok", local_file="missing.bin", remote_file="bootflash:missing.bin", password="admin",
+     want=["error: cannot read missing.bin in the image folder: "]),
+    (name="no file name", behaviour="ok", local_file="iosxe/a.bin", remote_file="bootflash:", password="admin",
+     want=["error: invalid remote file 'bootflash:': it names no file"]),
+    (name="the login fails", behaviour="ok", local_file="iosxe/a.bin", remote_file="bootflash:a.bin", password="wrong",
+     want=["error: the SCP adapter is not connected"]),
+]
+
+
+actor _test_put(t: testing.EnvT):
+    """Each case of _PUT_CASES through DeviceMgr, with the SCP adapter as
+    the device's adapter and an image folder that has iosxe/a.bin."""
+    var folder = ""
+    var images: ?swimg.ImageReader = None
+    var index = 0
+    var server: ?_FakeScp = None
+    var dev: ?swdev.DeviceMgr = None
+    var asked = False
+    var finished = False
+
+    def finish(err: ?Exception):
+        if finished:
+            return
+        finished = True
+        s = server
+        if s is not None:
+            s.close()
+        file.FS(file.FileCap(t.env.cap)).rmtree(folder)
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def check(got: list[str]):
+        c = _PUT_CASES[index]
+        s = server
+        if s is not None:
+            got.extend(s.seen())
+            s.close()
+        server = None
+        try:
+            testing.assertEqual(len(got), len(c.want), c.name + ": " + str(got))
+            for i in range(len(got)):
+                testing.assertTrue(got[i].startswith(c.want[i]), c.name + ": " + got[i])
+            r = images
+            if r is not None:
+                testing.assertEqual(r.in_use(), 0, c.name + ": the transfer keeps the file")
+        except Exception as e:
+            finish(e)
+            return
+        index += 1
+        start()
+
+    def put(d: swdev.DeviceMgr):
+        c = _PUT_CASES[index]
+        def done(out: ?scp_data.stratoweave_scp__put__output, err: ?Exception):
+            if err is not None:
+                check(["error: " + swdev.error_text(err)])
+            elif out is not None:
+                check(["size " + str(out.size)])
+            else:
+                check(["no output"])
+        scp_data.rpc_root(swdev.DeviceTreeProvider(d)).put(done, scp_data.stratoweave_scp__put__input(c.local_file, c.remote_file))
+
+    def ask():
+        d = dev
+        if d is not None and not asked and not finished:
+            asked = True
+            put(d)
+
+    def on_oper(n: ?gdata.Node):
+        """Put once the adapter is connected."""
+        if n is not None:
+            for e in swdevoper.stratoweave_rfs__device_entry.from_gdata(n).state.adapter:
+                c = e.connected
+                if e.type == "scp" and c is not None and c:
+                    ask()
+
+    def rejected():
+        """Put once the server has refused the login of the case."""
+        ask()
+
+    def listening(p: int):
+        if p == 0:
+            finish(ValueError("the SSH server did not start"))
+            return
+        c = _PUT_CASES[index]
+        schema = yang.compile(scp_yang.models)
+        types = {"scp": swdev.DeviceType("scp", _adapter, schema, oper_src_dnode=schema)}
+        d = swdev.DeviceMgr(types, t.env, "dev", t.log_handler, lambda name: None, swdev.SchemaRegistry(), images=images)
+        dev = d
+        asked = False
+        d.set_update_oper(on_oper)
+        dmc = Dmc("dev", Credentials("admin", c.password), type="scp")
+        dmc.address.create("mgmt", "127.0.0.1", port=u64(p))
+        d.set_dmc(dmc)
+
+    def start():
+        if index >= len(_PUT_CASES):
+            finish(None)
+            return
+        server = _FakeScp(t, _PUT_CASES[index].behaviour, listening, rejected)
+
+    def __startup__():
+        t.timeout(20.0)
+        fc = file.FileCap(t.env.cap)
+        fs = file.FS(fc)
+        folder = fs.mktmpdir("test_scp_")
+        await async fs.mkdir(folder + "/iosxe")
+        f = file.WriteFile(file.WriteFileCap(fc), folder + "/iosxe/a.bin")
+        await async f.write(b"hello")
+        await async f.close()
+        images = swimg.ImageReader(fc, folder)
+        start()
+
+
+# A test against a real device. Run it with, for example:
+#
+#   SCP_PORT=28422 SCP_REMOTE=bootflash:scp-live.bin \
+#   acton test --tag scp --module adapters.test_scp
+#
+# SCP_ADDRESS (default 127.0.0.1), SCP_PORT (default 22), SCP_USERNAME and
+# SCP_PASSWORD (default admin, as in the lab) select the device. The test
+# sends a file of SCP_SIZE bytes (default 1048576) to SCP_REMOTE. With
+# SCP_BAD_REMOTE, it also sends the file there and wants the device to
+# refuse it, as IOS XE does for a file system that it does not have.
+
+proc def _setting(t: testing.EnvT, name: str, default: str) -> str:
+    value = t.env.vars.getenv(name)
+    return value if value is not None else default
+
+
+def _pattern(size: int) -> bytes:
+    """size bytes of a repeating pattern."""
+    block = bytes([i % 251 for i in range(65536)])
+    out = b""
+    while len(out) + len(block) <= size:
+        out += block
+    return out + block[:size - len(out)]
+
+
+proc def _test_live_put(t: testing.EnvT):
+    t.require("scp")
+    size = int(_setting(t, "SCP_SIZE", "1048576"))
+    t.timeout(30.0 + 2.0 * scp.transfer_timeout(size))
+    _LivePut(t, _setting(t, "SCP_ADDRESS", "127.0.0.1"), int(_setting(t, "SCP_PORT", "22")),
+             _setting(t, "SCP_USERNAME", "admin"), _setting(t, "SCP_PASSWORD", "admin"),
+             size, _setting(t, "SCP_REMOTE", ""), _setting(t, "SCP_BAD_REMOTE", ""))
+
+
+actor _LivePut(t: testing.EnvT, address: str, port: int, username: str, password: str, size: int,
+               remote: str, bad_remote: str):
+    """Send a file to a real device, and to bad_remote when it is set."""
+    var folder = ""
+    var dev: ?swdev.DeviceMgr = None
+    var started = False
+    var finished = False
+
+    def finish(err: ?Exception):
+        if finished:
+            return
+        finished = True
+        file.FS(file.FileCap(t.env.cap)).rmtree(folder)
+        if err is not None:
+            t.failure(err)
+        else:
+            t.success()
+
+    def _put(d: swdev.DeviceMgr, to: str, done: action(?scp_data.stratoweave_scp__put__output, ?Exception) -> None):
+        scp_data.rpc_root(swdev.DeviceTreeProvider(d)).put(done, scp_data.stratoweave_scp__put__input("live.bin", to))
+
+    def refused(out: ?scp_data.stratoweave_scp__put__output, err: ?Exception):
+        if err is not None:
+            if isinstance(err, PermanentError):
+                print("refused: " + swdev.error_text(err))
+                finish(None)
+            else:
+                finish(ValueError("not a refusal: " + swdev.error_text(err)))
+        else:
+            finish(ValueError("the device took the file at {bad_remote}"))
+
+    def sent(out: ?scp_data.stratoweave_scp__put__output, err: ?Exception):
+        d = dev
+        if err is not None:
+            finish(err)
+            return
+        got = out.size if out is not None else None
+        if got != u64(size):
+            finish(ValueError("sent {got} bytes, not {size}"))
+            return
+        print("sent {size} bytes to {remote}")
+        if bad_remote != "" and d is not None:
+            _put(d, bad_remote, refused)
+        else:
+            finish(None)
+
+    def on_oper(n: ?gdata.Node):
+        d = dev
+        if n is not None and d is not None and not started:
+            for e in swdevoper.stratoweave_rfs__device_entry.from_gdata(n).state.adapter:
+                c = e.connected
+                if e.type == "scp" and c is not None and c:
+                    started = True
+                    _put(d, remote, sent)
+
+    def __startup__():
+        if remote == "":
+            finish(ValueError("set SCP_REMOTE"))
+            return
+        fc = file.FileCap(t.env.cap)
+        fs = file.FS(fc)
+        folder = fs.mktmpdir("test_scp_live_")
+        f = file.WriteFile(file.WriteFileCap(fc), folder + "/live.bin")
+        await async f.write(_pattern(size))
+        await async f.close()
+        schema = yang.compile(scp_yang.models)
+        types = {"scp": swdev.DeviceType("scp", scp.ScpAdapter, schema, oper_src_dnode=schema)}
+        d = swdev.DeviceMgr(types, t.env, "live", t.log_handler, lambda name: None, swdev.SchemaRegistry(),
+                            images=swimg.ImageReader(fc, folder))
+        dev = d
+        d.set_update_oper(on_oper)
+        dmc = Dmc("live", Credentials(username, password), type="scp")
+        dmc.address.create("mgmt", address, port=u64(port))
+        d.set_dmc(dmc)

@@ -329,6 +329,15 @@
   `rollback`, `run`, `show` and `show | compare`. With a command as
   arguments, it runs that command and exits. Without a terminal, it reads
   commands line by line from stdin. [#843] [#862] [#866] [#871]
+- The SCP adapter, `adapters.scp.ScpAdapter`, copies files from the image
+  folder to a device over SCP, as an extra adapter. Its `put` RPC sends one
+  file. It logs in to the SSH server of the device's CLI, port 22 by
+  default, on a connection of its own for each transfer. IOS XE, IOS XR and
+  Junos take no SCP on the NETCONF port, 830. A device that refuses the
+  file gives a `PermanentError`, a lost connection a `TransientError`.
+  `DeviceRegistry` and `DeviceMgr` take `images`, an
+  `image_dir.ImageReader` of the image folder; StratoWeave gives them one
+  when `software.image_dir` is set.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
