@@ -497,6 +497,12 @@
   gives to prepares: the most that the members of one software campaign
   use together to copy their images, when the campaign sets none. It is 1
   Gbit/s by default. [#856]
+- The software intent of a device has `image-file`, the image's file in the
+  image folder. The IOS XE adapter sends `image-file` with the SCP adapter
+  when the device has one, and needs no `image-url` then; it reports the
+  size of the file on bootflash while it sends. A device that answers
+  `Administratively disabled.` needs `ip scp server enable`, and the
+  prepare fails with that.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade

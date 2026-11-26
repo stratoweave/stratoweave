@@ -16,9 +16,11 @@
 # release that the device has added needs no image file. An image file on
 # bootflash that passes a check stays: the checksum of the software intent,
 # else the signature that the image holds, both with the verify RPC of the
-# IOS XE CLI adapter. A missing file, or one that fails, is transferred with
-# xcopy and checked again. Without the CLI adapter, prepare transfers the
-# file and install trusts what prepare staged.
+# IOS XE CLI adapter. A missing file, or one that fails, is transferred and
+# checked again: sent from the image folder by the SCP adapter when the
+# device has one, else fetched by the device with xcopy. Without the CLI
+# adapter, prepare transfers the file and install trusts what prepare
+# staged.
 #
 # Cleanup and retry are not implemented. Cleanup leaves the previous image on
 # the device.
@@ -42,6 +44,8 @@ import yang.gdata as ygdata
 import device as swdev
 import adapters.iosxe_cli_data as xecli_data
 import adapters.iosxe_cli_yang as xecli_yang
+import adapters.scp_data as scp_data
+import adapters.scp_yang as scp_yang
 import adapters.software_iosxe_oper as ixoper
 from adapters.adapter import BusyError, NotConnectedError, TransientError
 import adapters.software_iosxe_rpc as ixrpc
@@ -359,14 +363,25 @@ def upgrade_plan(modules: set[str]) -> (check: str, transfer: str, listing: str,
     only when it has not, as on IOS XE 16.8 without NETCONF. No NETCONF
     module checks a file's content, so the check of an image runs over the
     CLI. check reads the running release, install also reads the versions
-    that the device has."""
+    that the device has. The transfer is "scp" when the device has the SCP
+    adapter: the adapter sends the image from the image folder. Else the
+    device fetches it, see fetch_transfer."""
     cli = "cli" if xecli_yang.MODULE in modules else ""
     check = "netconf" if HARDWARE_MODULE in modules else cli
-    transfer = "netconf" if XCOPY_MODULE in modules else cli
+    transfer = "scp" if scp_yang.MODULE in modules else fetch_transfer(modules)
     listing = "netconf" if FILES_MODULE in modules else cli
     install = "netconf" if INSTALL_MODULE in modules else cli
     delete = "netconf" if CISCO_RPC_MODULE in modules else cli
     return (check=check, transfer=transfer, listing=listing, verify=cli, install=install, delete=delete)
+
+
+def fetch_transfer(modules: set[str]) -> str:
+    """Return how a device with these modules fetches its image from the
+    image URL: "netconf" with xcopy, else "cli" with the copy of the CLI
+    adapter, else ""."""
+    if XCOPY_MODULE in modules:
+        return "netconf"
+    return "cli" if xecli_yang.MODULE in modules else ""
 
 
 def adapter_wait_left(down: dict[str, float], wait: float) -> float:
@@ -773,6 +788,26 @@ def image_filename(url: str) -> str:
     return parts[len(parts) - 1]
 
 
+def staged_filename(url: ?str, image_file: ?str) -> str:
+    """Return the filename that the image lands under on bootflash: the
+    final path component of image_file, else that of url. "" without
+    either."""
+    if image_file is not None and image_file != "":
+        parts = image_file.split("/")
+        return parts[len(parts) - 1]
+    if url is not None and url != "":
+        return image_filename(url)
+    return ""
+
+
+def scp_failure(detail: str) -> str:
+    """Return why a transfer over SCP failed: the error of the SCP adapter,
+    and what IOS XE needs when it refuses SCP."""
+    if "Administratively disabled" in detail:
+        return detail + " (the device needs ip scp server enable)"
+    return detail
+
+
 def redact_url(url: str) -> str:
     """A URL with any embedded credentials removed, for logging.
 
@@ -880,6 +915,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     # synchronously here would call back into the same actor and deadlock.
     _rpcs = ixrpc.rpc_root(swdev.DeviceTreeProvider(dev))
     _cli = xecli_data.rpc_root(swdev.DeviceTreeProvider(dev))
+    _scp = scp_data.rpc_root(swdev.DeviceTreeProvider(dev))
 
     var _phase = ""          # stage | add | activate | commit | abort
     var _gen = 0
@@ -901,6 +937,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     # Monotonic seconds when activate was sent; the device timer runs from there.
     var _activated_at: ?int = None
     var _url = ""
+    # The image's file in the image folder, which the SCP adapter sends.
+    var _image_file = ""
     # The checksum that staging checks the image against, if any.
     var _check: ?(algorithm: str, digest: str) = None
     # The file, its stamp and the check that it passed last, so that a later
@@ -913,6 +951,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     var _one_shot = False
     # A copy over the CLI runs, whose progress the driver reads.
     var _copying = False
+    # The SCP adapter sends the image, and the driver reads the size of the
+    # file on bootflash.
+    var _sending = False
     # An install command over the CLI runs, whose step the driver reads.
     var _installing = False
     # The conversion to install mode committed the release with its
@@ -1029,6 +1070,20 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
             return None
         return url
 
+    def _image_source(release: str) -> bool:
+        """Read where the image comes from at job start: the image URL and
+        the image's file. False, after ending the job, without either."""
+        url = _image_url()
+        f = dev.get_dmc().software.image_file
+        name = staged_filename(url, f)
+        if name == "":
+            _finish(ValueError("no image-url or image-file configured for release {release}"))
+            return False
+        _url = url if url is not None else ""
+        _image_file = f if f is not None else ""
+        _filename = name
+        return True
+
     def _start(phase: str, done: action(?Exception) -> None, release: str) -> bool:
         """Claim the driver for a job. False, after reporting, if one is running."""
         if _busy():
@@ -1106,12 +1161,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def prepare(done: action(?Exception) -> None, release: str) -> None:
         if not _start("stage", done, release):
             return
-        url = _image_url()
-        if url is None:
-            _finish(ValueError("no image-url configured for release {release}"))
+        if not _image_source(release):
             return
-        _url = url!
-        _filename = image_filename(url!)
         _then_add = False
         _stage_when_connected(_gen, False)
 
@@ -1370,14 +1421,21 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     def _transfer() -> None:
         _step("transferring the image")
         how = upgrade_plan(_modules()).transfer
-        if how == "cli":
-            _transfer_cli()
+        if how == "scp" and _image_file == "":
+            how = fetch_transfer(_modules())
+        if how == "scp":
+            _transfer_scp()
             return
-        if how != "netconf":
+        if how == "" or _url == "":
             if len(dev.get_unconnected_durations()) > 0:
                 _finish(NotConnectedError("download failed: no adapter that can transfer the image is connected"))
-            else:
+            elif how == "":
                 _fail("the device has no way to transfer the image: no {XCOPY_MODULE} and no CLI adapter")
+            else:
+                _fail("no image-url configured: without an SCP adapter, the device fetches its image")
+            return
+        if how == "cli":
+            _transfer_cli()
             return
         url = _url
         _expect_stage = STAGE_DOWNLOAD
@@ -1413,6 +1471,46 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _copying = True
         after now poll_period: _poll_copy(gen)
         _cli.copy(copied, xecli_data.stratoweave_iosxe_cli__copy__input(url, "bootflash:", _filename))
+
+    def _transfer_scp() -> None:
+        """Send the image file of the intent with the SCP adapter, which
+        returns when the device has written the file. While it runs, report
+        the size of the file on bootflash. Then check it, as after xcopy."""
+        gen = _gen
+        remote = "bootflash:" + _filename
+        _log.info("software: sending image over SCP", {"file": _image_file, "to": remote})
+        def sent(out: ?scp_data.stratoweave_scp__put__output, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            _sending = False
+            if err is not None:
+                _fail(scp_failure(swdev.error_text(err!)), err)
+                return
+            size = out.size if out is not None else None
+            _log.info("software: image sent", {"file": _filename, "size": size})
+            if size is not None:
+                _report_transfer(size)
+            _end_phase()
+        _sending = True
+        after now poll_period: _poll_sent(gen)
+        _scp.put(sent, scp_data.stratoweave_scp__put__input(_image_file, remote))
+
+    def _poll_sent(gen: int) -> None:
+        """Report the size of the image file on bootflash every poll period
+        while the SCP adapter sends it, from the listing over NETCONF or the
+        CLI. IOS XE writes the file as it arrives."""
+        if gen != _gen or not _sending:
+            return
+        listing = upgrade_plan(_modules()).listing
+        if listing != "":
+            def listed(root: ?ygdata.Node, err: ?Exception) -> None:
+                if gen != _gen or not _sending or err is not None:
+                    return
+                n = staged_size(root, _filename)
+                if n is not None:
+                    _report_transfer(n!)
+            dev.get(listed, bootflash_filter(listing))
+        after now poll_period: _poll_sent(gen)
 
     def _poll_copy(gen: int) -> None:
         """Report how far the copy over the CLI is, every poll period while
@@ -1467,12 +1565,8 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         add the image unless the device has added it, and activate it."""
         if not _start("stage", done, release):
             return
-        url = _image_url()
-        if url is None:
-            _finish(ValueError("no image-url configured for release {release}"))
+        if not _image_source(release):
             return
-        _url = url!
-        _filename = image_filename(url!)
         _activated_at = None
         _then_add = True
         _one_shot = False
