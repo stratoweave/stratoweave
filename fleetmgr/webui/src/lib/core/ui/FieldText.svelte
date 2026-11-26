@@ -84,3 +84,10 @@
   <small id={`${uid}-meta`} class:field__meta--error={!!error} class="field__meta">{metaText}</small>
   {#if tooltip}<span id={`${uid}-tip`} class="sr-only">{tooltip}</span>{/if}
 </div>
+
+<style>
+  /* Smaller mono text, but as tall as a field or select beside it. */
+  .input.mono {
+    line-height: calc(var(--sw-text-sm) * 1.5);
+  }
+</style>

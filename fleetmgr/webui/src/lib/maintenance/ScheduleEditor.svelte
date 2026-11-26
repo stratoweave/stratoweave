@@ -5,6 +5,7 @@
   import { errorText } from '#lib/core/errors.ts';
   import { leaveNotice } from '#lib/core/notice.ts';
   import ConfirmDialog from '#lib/core/ui/ConfirmDialog.svelte';
+  import FieldSelect from '#lib/core/ui/FieldSelect.svelte';
   import FieldText from '#lib/core/ui/FieldText.svelte';
   import Section from '#lib/core/ui/Section.svelte';
   import {
@@ -18,33 +19,40 @@
   import { HORIZON_DAYS, WEEKDAYS, occurrences } from '#lib/maintenance/occurrences.ts';
   import { scheduleColors } from '#lib/maintenance/palette.ts';
   import {
+    REPEAT_OPTIONS,
     campaignsText,
+    draftDuration,
     draftFromSchedule,
     draftKey,
     draftToSchedule,
+    draftWindow,
     emptyDraft,
+    endDayOptions,
+    freeWindowId,
+    labelledWindowText,
     newWindowDraft,
     parseTimeOfDay,
-    parseUtcOffset,
     rowOfRule,
-    ruleText,
+    utcOffsetOptions,
+    windowDraft,
+    windowText,
     scheduleCreatePatch,
     scheduleToJson,
     usageChangeText,
     validateScheduleDraft,
+    withDayToggled,
+    withEnd,
+    withEndDay,
+    withRepeat,
+    withRule,
+    withStart,
+    type Repeat,
     type ScheduleDraft,
     type ScheduleUsage,
     type WindowDraft
   } from '#lib/maintenance/schedule-form.ts';
   import { DATA_ROOT, SCHEDULE_LIST_ROOT, type MaintenanceWindow, type Schedule } from '#lib/software/model.ts';
-  import {
-    clockLabel,
-    dayLabel,
-    formatDuration,
-    formatTimeOfDay,
-    parseDuration,
-    sameLocalDay
-  } from '#lib/core/time.ts';
+  import { clockLabel, dayLabel, formatDuration, sameLocalDay } from '#lib/core/time.ts';
 
   interface Props {
     /** null creates a new schedule. */
@@ -72,7 +80,7 @@
   // Where the operator asked to go with the changes unsaved.
   let leaveTo = $state<URL | null>(null);
   let leaving = false;
-  // The rule the calendar added or changed last, for a screen reader.
+  // The window the calendar added or changed last, for a screen reader.
   let calendarMessage = $state('');
   let rulesEl: HTMLElement | null = $state(null);
   let addRuleButton: HTMLButtonElement | null = $state(null);
@@ -113,51 +121,49 @@
     return `${devices} · ${campaigns}`;
   });
 
-  function rulePreview(w: WindowDraft): string {
-    const at = parseTimeOfDay(w.at);
-    const duration = parseDuration(w.duration);
-    const offset = parseUtcOffset(draft.utcOffset);
-    if (at === null || duration === null || duration <= 0 || offset === null) return '';
-    return ruleText({ at, duration, days: w.days }, offset);
+  function summary(w: WindowDraft): string {
+    const window = draftWindow(w);
+    return window ? windowText(window) : '';
   }
 
-  function patchWindow(id: number, partial: Partial<WindowDraft>): void {
-    draft = { ...draft, windows: draft.windows.map((w) => (w.id === id ? { ...w, ...partial } : w)) };
+  function lengthText(w: WindowDraft): string {
+    const duration = draftDuration(w);
+    return duration !== null && duration > 0 ? formatDuration(duration) : '';
   }
 
-  function toggleDay(w: WindowDraft, day: string): void {
-    const days = w.days.includes(day) ? w.days.filter((d) => d !== day) : [...w.days, day];
-    patchWindow(w.id, { days: WEEKDAYS.filter((d) => days.includes(d)) });
+  function patchWindow(id: number, next: (w: WindowDraft) => WindowDraft): void {
+    draft = { ...draft, windows: draft.windows.map((w) => (w.id === id ? next(w) : w)) };
   }
 
   function addRule(): void {
-    // Open the new rule an hour after the latest one so it does not collide
-    // on the key.
+    // Start the new window an hour after the latest one, so that it shows
+    // apart on the calendar.
     const ats = draft.windows.map((w) => parseTimeOfDay(w.at)).filter((a): a is number => a !== null);
     const at = ats.length > 0 ? (Math.max(...ats) + 3600) % 86400 : 79200;
-    draft = { ...draft, windows: [...draft.windows, newWindowDraft({ at: formatTimeOfDay(at - (at % 60)) })] };
+    draft = { ...draft, windows: [...draft.windows, newWindowDraft(freeWindowId(draft.windows), at - (at % 60))] };
   }
 
-  // The calendar moves or resizes a rule, or adds one; the rows follow.
+  // The calendar moves or resizes a window, or adds one; the rows follow.
   function changeRuleFromCalendar(from: MaintenanceWindow, to: MaintenanceWindow): void {
     const row = rowOfRule(draft, from);
     if (!row) return;
-    patchWindow(row.id, { at: formatTimeOfDay(to.at), duration: formatDuration(to.duration), days: [...to.days] });
+    patchWindow(row.id, (w) => withRule(w, to));
     touched = true;
     void showRule(row.id, 'changed');
   }
 
   function addRuleFromCalendar(rule: MaintenanceWindow): void {
-    // The opening time is the key: a rule with the same time and length
-    // on other weekdays takes the new day instead.
-    const same = draft.windows.find(
-      (w) => w.days.length > 0 && parseTimeOfDay(w.at) === rule.at && parseDuration(w.duration) === rule.duration
-    );
+    // A weekly window with the same start and length takes the new day
+    // instead of a second window.
+    const same = draft.windows.find((w) => {
+      const window = draftWindow(w);
+      return w.repeat !== 'daily' && window?.at === rule.at && window.duration === rule.duration;
+    });
     if (same) {
-      patchWindow(same.id, { days: WEEKDAYS.filter((d) => same.days.includes(d) || rule.days.includes(d)) });
+      patchWindow(same.id, (w) => withRule(w, { ...rule, id: w.id, days: [...(draftWindow(w)?.days ?? []), ...rule.days] }));
       void showRule(same.id, 'changed');
     } else {
-      const row = newWindowDraft({ at: formatTimeOfDay(rule.at), duration: formatDuration(rule.duration), days: [...rule.days] });
+      const row = windowDraft({ ...rule, id: freeWindowId(draft.windows) });
       draft = { ...draft, windows: [...draft.windows, row] };
       void showRule(row.id, 'added');
     }
@@ -167,7 +173,7 @@
   // On a phone the form sits above the calendar, out of view: the row the
   // calendar added or changed lights up, and a screen reader hears which.
   async function showRule(id: number, what: 'added' | 'changed'): Promise<void> {
-    const text = `Rule ${draft.windows.findIndex((w) => w.id === id) + 1} ${what}`;
+    const text = `Window ${draft.windows.findIndex((w) => w.id === id) + 1} ${what}`;
     // Emptied first, so that the same text twice is read twice.
     calendarMessage = '';
     await tick();
@@ -183,8 +189,8 @@
   async function removeRule(id: number): Promise<void> {
     const index = draft.windows.findIndex((w) => w.id === id);
     draft = { ...draft, windows: draft.windows.filter((w) => w.id !== id) };
-    // The button is gone: focus goes on to the rule that moved up into its
-    // place, or to Add a rule after the last one.
+    // The button is gone: focus goes on to the window that moved up into
+    // its place, or to Add window after the last one.
     await tick();
     const next = draft.windows[index];
     const field = next ? rulesEl?.querySelector<HTMLElement>(`[data-rule="${next.id}"] input`) : null;
@@ -219,8 +225,8 @@
       if (isNew) {
         await restconfPatchJson(DATA_ROOT, scheduleCreatePatch(saved));
       } else {
-        // PUT replaces the whole entry: a rule removed here disappears,
-        // which a merging PATCH could not do since `at` is the key.
+        // PUT replaces the whole entry: a window removed here disappears,
+        // which a merging PATCH could not do.
         await restconfPutJson(
           getListEntryPath(SCHEDULE_LIST_ROOT, saved.name),
           wrapListEntryBody(SCHEDULE_LIST_ROOT, scheduleToJson(saved))
@@ -324,15 +330,12 @@
           onchange={(v) => (draft = { ...draft, name: v })}
           ontouch={() => (touched = true)}
         />
-        <FieldText
-          label="UTC offset"
-          value={draft.utcOffset}
-          error={errors['utc-offset']}
-          mono={true}
-          placeholder="+01:00"
+        <FieldSelect
+          label="Time zone"
+          value={String(draft.utcOffset)}
+          options={utcOffsetOptions(draft.utcOffset)}
           help="No daylight saving"
-          onchange={(v) => (draft = { ...draft, utcOffset: v })}
-          ontouch={() => (touched = true)}
+          onchange={(v) => (draft = { ...draft, utcOffset: Number(v) })}
         />
       </div>
     </Section>
@@ -340,57 +343,107 @@
       {#if draft.windows.length > 0}
         <div class="rules" bind:this={rulesEl}>
           {#each draft.windows as w, index (w.id)}
+            {@const atError = errors[`window.${w.id}.at`]}
+            {@const endError = errors[`window.${w.id}.end`]}
+            {@const daysError = errors[`window.${w.id}.days`]}
             <div class="rule" data-rule={w.id}>
               <div class="rule-head">
-                <span class="kick">Rule {index + 1}</span>
-                <span class="rule-preview mono">{rulePreview(w)}</span>
+                <span class="kick">Window {index + 1}</span>
+                <span class="rule-preview">{summary(w)}</span>
                 <button
                   class="btn btn-secondary btn-sm btn-danger-ghost"
                   type="button"
-                  aria-label={`Remove rule ${index + 1}`}
+                  aria-label={`Remove window ${index + 1}`}
                   onclick={() => removeRule(w.id)}
                 >
                   Remove
                 </button>
               </div>
-              <div class="rule-fields">
-                <FieldText
-                  label="Opens at"
-                  value={w.at}
-                  error={errors[`window.${w.id}.at`]}
-                  mono={true}
-                  placeholder="22:00"
-                  onchange={(v) => patchWindow(w.id, { at: v })}
-                  ontouch={() => (touched = true)}
-                />
-                <FieldText
-                  label="Duration"
-                  value={w.duration}
-                  error={errors[`window.${w.id}.duration`]}
-                  mono={true}
-                  placeholder="4h"
-                  onchange={(v) => patchWindow(w.id, { duration: v })}
-                  ontouch={() => (touched = true)}
-                />
-              </div>
-              <div class="field" role="group" aria-label={`Rule ${index + 1} weekdays`}>
-                <span class="field__label">
-                  Weekdays
-                  <span class="days-hint">{w.days.length === 0 ? 'Every day' : ''}</span>
-                </span>
-                <div class="days">
-                  {#each WEEKDAYS as day (day)}
-                    <button
-                      class="day-toggle"
-                      class:on={w.days.includes(day)}
-                      type="button"
-                      aria-pressed={w.days.includes(day)}
-                      onclick={() => toggleDay(w, day)}
-                    >
-                      {day[0].toUpperCase() + day.slice(1)}
-                    </button>
-                  {/each}
+              <div class="rows">
+                <label class="row-label" for={`w${w.id}-label`}>Label</label>
+                <div class="row-ctl">
+                  <input
+                    id={`w${w.id}-label`}
+                    class="input label"
+                    value={w.label}
+                    placeholder="Optional"
+                    oninput={(e) => patchWindow(w.id, (x) => ({ ...x, label: e.currentTarget.value }))}
+                  />
                 </div>
+
+                <label class="row-label" for={`w${w.id}-at`}>Starts</label>
+                <div class="row-ctl">
+                  <input
+                    id={`w${w.id}-at`}
+                    class="input mono time"
+                    class:has-error={!!atError}
+                    aria-invalid={atError ? 'true' : undefined}
+                    value={w.at}
+                    placeholder="22:00"
+                    oninput={(e) => patchWindow(w.id, (x) => withStart(x, e.currentTarget.value))}
+                    onblur={() => (touched = true)}
+                  />
+                </div>
+                {#if atError}<small class="row-error">{atError}</small>{/if}
+
+                <label class="row-label" for={`w${w.id}-end`}>Ends</label>
+                <div class="row-ctl">
+                  <input
+                    id={`w${w.id}-end`}
+                    class="input mono time"
+                    class:has-error={!!endError}
+                    aria-invalid={endError ? 'true' : undefined}
+                    value={w.end}
+                    placeholder="02:00"
+                    oninput={(e) => patchWindow(w.id, (x) => withEnd(x, e.currentTarget.value))}
+                    onblur={() => (touched = true)}
+                  />
+                  <select
+                    class="select compact"
+                    aria-label={`Window ${index + 1} ends on`}
+                    value={String(w.endDay)}
+                    onchange={(e) => patchWindow(w.id, (x) => withEndDay(x, Number(e.currentTarget.value)))}
+                  >
+                    {#each endDayOptions(w.endDay) as option (option.value)}
+                      <option value={option.value}>{option.label}</option>
+                    {/each}
+                  </select>
+                  <span class="length">{lengthText(w)}</span>
+                </div>
+                {#if endError}<small class="row-error">{endError}</small>{/if}
+
+                <label class="row-label" for={`w${w.id}-repeat`}>Repeat</label>
+                <div class="row-ctl">
+                  <select
+                    id={`w${w.id}-repeat`}
+                    class="select compact repeat"
+                    value={w.repeat}
+                    onchange={(e) => patchWindow(w.id, (x) => withRepeat(x, e.currentTarget.value as Repeat))}
+                  >
+                    {#each REPEAT_OPTIONS as option (option.value)}
+                      <option value={option.value}>{option.label}</option>
+                    {/each}
+                  </select>
+                </div>
+                {#if w.repeat === 'weekly'}
+                  <div class="row-ctl days" role="group" aria-label={`Window ${index + 1} weekdays`}>
+                    {#each WEEKDAYS as day (day)}
+                      <button
+                        class="day-toggle"
+                        class:on={w.days.includes(day)}
+                        type="button"
+                        aria-pressed={w.days.includes(day)}
+                        onclick={() => {
+                          patchWindow(w.id, (x) => withDayToggled(x, day));
+                          touched = true;
+                        }}
+                      >
+                        {day[0].toUpperCase() + day.slice(1)}
+                      </button>
+                    {/each}
+                  </div>
+                  {#if daysError}<small class="row-error">{daysError}</small>{/if}
+                {/if}
               </div>
             </div>
           {/each}
@@ -398,7 +451,7 @@
       {/if}
       <div class="rule-actions">
         <button class="btn btn-secondary btn-sm" type="button" bind:this={addRuleButton} onclick={addRule}>
-          Add a rule
+          Add window
         </button>
         {#each validation.warnings as warning (warning)}
           <span class="warning">{warning}</span>
@@ -437,16 +490,16 @@
               <th>Opens</th>
               <th>Closes</th>
               <th class="right">Length</th>
-              <th>Rule</th>
+              <th>Window</th>
             </tr>
           </thead>
           <tbody>
-            {#each upcoming as o (o.start)}
+            {#each upcoming as o (`${o.rule.id}@${o.start}`)}
               <tr>
                 <td class="mono">{dayLabel(o.start)} {clockLabel(o.start)}</td>
                 <td class="mono">{sameLocalDay(o.start, o.end) ? '' : `${dayLabel(o.end)} `}{clockLabel(o.end)}</td>
                 <td class="mono right">{formatDuration(o.end - o.start)}</td>
-                <td class="hint">{ruleText(o.rule, previewSchedule.utcOffset)}</td>
+                <td class="hint">{labelledWindowText(o.rule)}</td>
               </tr>
             {/each}
           </tbody>
@@ -525,7 +578,7 @@
     }
   }
 
-  /* The rules part with a line, not a box in the card. Each reaches 10px
+  /* The windows part with a line, not a box in the card. Each reaches 10px
      past the fields, room for the light after a calendar edit; the
      negative margins keep the fields in line with the ones above. */
   .rules {
@@ -567,10 +620,60 @@
     text-overflow: ellipsis;
   }
 
-  .rule-fields {
+  /* Label column and controls, the way a calendar event inspector lays
+     out starts, ends and repeat. */
+  .rows {
     display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 10px;
+    grid-template-columns: 56px minmax(0, 1fr);
+    align-items: center;
+    gap: 8px 12px;
+  }
+
+  .row-label {
+    justify-self: end;
+    font-size: var(--sw-text-xs);
+    color: var(--sw-text-muted);
+  }
+
+  .row-ctl {
+    grid-column: 2;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .row-error {
+    grid-column: 2;
+    margin-top: -4px;
+    font-size: var(--sw-text-xs);
+    color: var(--sw-danger);
+  }
+
+  .time {
+    width: 84px;
+    flex: none;
+    padding: 7px 10px;
+    font-size: 12px;
+  }
+
+  .length {
+    margin-left: auto;
+    font-family: var(--sw-font-mono);
+    font-size: var(--sw-text-xs);
+    color: var(--sw-text-muted);
+    white-space: nowrap;
+  }
+
+  .repeat {
+    min-width: 160px;
+  }
+
+  .label {
+    flex: 1;
+    min-width: 0;
+    padding: 7px 10px;
+    font-size: 12px;
   }
 
   .days {
@@ -579,15 +682,9 @@
     gap: 4px;
   }
 
-  .days-hint {
-    margin-left: auto;
-    font-weight: 400;
-    color: var(--sw-text-muted);
-  }
-
   .day-toggle {
     min-width: 0;
-    min-height: 34px;
+    min-height: 30px;
     border-radius: var(--sw-radius-sm);
     border: 1px solid var(--sw-border-default);
     background: var(--sw-bg-input);
