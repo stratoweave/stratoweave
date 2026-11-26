@@ -1423,11 +1423,12 @@ actor _UpgradeRun(t: testing.EnvT, name: str, upgrade_duration: float,
                   settled: action(swxemock.IosXeSoftwareMock, swdev.DeviceMgr,
                                   str) -> None,
                   timeout: float=2.5, bundle: bool=False, xcopy_records: bool=True,
-                  xcopy_status: bool=True):
+                  xcopy_status: bool=True, vrf: ?str=None, copy_empty: bool=False):
     """Drive one mock device from software intent to a settled status, then
     call `settled` with the mock, the device and the status. The timeout
-    failure dumps what the device saw. xcopy_records and xcopy_status are
-    the mock's."""
+    failure dumps what the device saw. xcopy_records, xcopy_status and
+    copy_empty are the mock's. vrf is the file-transfer VRF of the
+    device."""
     var dev_ref: ?swdev.DeviceMgr = None
     var mock: ?swxemock.IosXeSoftwareMock = None
     var finished = False
@@ -1461,13 +1462,15 @@ actor _UpgradeRun(t: testing.EnvT, name: str, upgrade_duration: float,
                 m = swxemock.IosXeSoftwareMock(ms!, t.log_handler,
                                                upgrade_duration=upgrade_duration,
                                                failure=failure, running=running, bundle=bundle,
-                                               xcopy_records=xcopy_records, xcopy_status=xcopy_status)
+                                               xcopy_records=xcopy_records, xcopy_status=xcopy_status,
+                                               copy_empty=copy_empty)
                 mock = m
                 m.attach()
                 dmc = DeviceMetaConfig(name, Credentials("admin", "admin"),
                                        type="iosxe",
                                        software=Software("camp-1", target, image_url=image_url))
                 dmc.mock.enabled = True
+                dmc.file_transfer.vrf = vrf
                 d!.set_dmc(dmc)
                 after 0.02: poll()
                 return
@@ -1622,22 +1625,58 @@ def _test_upgrade_plan_follows_the_modules():
     netconf = {swxe.HARDWARE_MODULE, swxe.XCOPY_MODULE, swxe.INSTALL_MODULE, swxe.FILES_MODULE, swxe.CISCO_RPC_MODULE}
     no_files = {swxe.HARDWARE_MODULE, swxe.XCOPY_MODULE, swxe.INSTALL_MODULE}
     scp_mod = {scp_yang.MODULE}
+    no_xcopy = {swxe.HARDWARE_MODULE, swxe.INSTALL_MODULE, swxe.FILES_MODULE, swxe.CISCO_RPC_MODULE}
     # Columns: check, transfer, listing, verify, install, delete.
     cases = [
-        ("NETCONF and the CLI, as a C1111 with 17.15", netconf | cli,
+        ("NETCONF and the CLI, as a C1111 with 17.15", netconf | cli, False,
          ("netconf", "netconf", "netconf", "cli", "netconf", "netconf")),
-        ("NETCONF without the files and delete, and the CLI", no_files | cli,
+        ("NETCONF without the files and delete, and the CLI", no_files | cli, False,
          ("netconf", "netconf", "cli", "cli", "netconf", "cli")),
-        ("only the CLI, as a C1111 with 16.8.1", cli, ("cli", "cli", "cli", "cli", "cli", "cli")),
-        ("only NETCONF, without the CLI adapter", netconf, ("netconf", "netconf", "netconf", "", "netconf", "netconf")),
-        ("NETCONF, the CLI and SCP", netconf | cli | scp_mod, ("netconf", "scp", "netconf", "cli", "netconf", "netconf")),
-        ("only the CLI and SCP", cli | scp_mod, ("cli", "scp", "cli", "cli", "cli", "cli")),
-        ("only SCP", scp_mod, ("", "scp", "", "", "", "")),
-        ("nothing", set(), ("", "", "", "", "", "")),
+        ("only the CLI, as a C1111 with 16.8.1", cli, False, ("cli", "cli", "cli", "cli", "cli", "cli")),
+        ("only NETCONF, without the CLI adapter", netconf, False,
+         ("netconf", "netconf", "netconf", "", "netconf", "netconf")),
+        ("NETCONF, the CLI and SCP", netconf | cli | scp_mod, False,
+         ("netconf", "scp", "netconf", "cli", "netconf", "netconf")),
+        ("only the CLI and SCP", cli | scp_mod, False, ("cli", "scp", "cli", "cli", "cli", "cli")),
+        ("only SCP", scp_mod, False, ("", "scp", "", "", "", "")),
+        ("nothing", set(), False, ("", "", "", "", "", "")),
+        ("a VRF: copy over the CLI", netconf | cli, True, ("netconf", "cli", "netconf", "cli", "netconf", "netconf")),
+        ("a VRF without the CLI: the copy RPC", no_xcopy, True,
+         ("netconf", "netconf", "netconf", "", "netconf", "netconf")),
+        ("a VRF without the copy RPC: copy over the CLI", no_files | cli, True,
+         ("netconf", "cli", "cli", "cli", "netconf", "cli")),
+        ("a VRF without the copy RPC and the CLI", no_files, True, ("netconf", "", "", "", "netconf", "")),
+        ("a VRF and SCP: the SCP adapter sends", netconf | cli | scp_mod, True,
+         ("netconf", "scp", "netconf", "cli", "netconf", "netconf")),
     ]
-    for name, modules, want in cases:
-        p = swxe.upgrade_plan(modules)
+    for name, modules, vrf, want in cases:
+        p = swxe.upgrade_plan(modules, vrf)
         testing.assertEqual((p.check, p.transfer, p.listing, p.verify, p.install, p.delete), want, name)
+
+
+def _test_copy_error():
+    """The error line of the output of copy, as the copy RPC of a C8000V
+    with 17.18.2 quotes it."""
+    cases: list[(str, str, str)] = [
+        ("a missing file",
+         "inconsistent value: \nDestination filename [c-404.bin]? \nAccessing http://172.27.0.3:8080/missing.bin..." +
+         "\n%Error opening http://172.27.0.3:8080/missing.bin (HTTP error: Connection failure)",
+         "%Error opening http://172.27.0.3:8080/missing.bin (HTTP error: Connection failure)"),
+        ("a closed port",
+         "inconsistent value: \nDestination filename [c-port.bin]? \nAccessing http://172.27.0.3:9999/test1.bin..." +
+         "\n%Error opening http://172.27.0.3:9999/test1.bin (HTTP error: Connection timeout)",
+         "%Error opening http://172.27.0.3:9999/test1.bin (HTTP error: Connection timeout)"),
+        ("an scp file that the server does not have",
+         "inconsistent value: \nDestination filename [c-s-glob.bin]? \n" +
+         "%Error opening scp://*:*@172.27.0.4/srv/test1.bin (No such file)",
+         "%Error opening scp://*:*@172.27.0.4/srv/test1.bin (No such file)"),
+        ("constructed: a warning before the error",
+         "%Warning: There is a file already existing with this name\n%Error opening http://10.0.0.9/a.bin (HTTP error: Connection failure)",
+         "%Error opening http://10.0.0.9/a.bin (HTTP error: Connection failure)"),
+        ("no error line", "inconsistent value: \nsomething else", "inconsistent value: something else"),
+    ]
+    for what, message, want in cases:
+        testing.assertEqual(want, swxe.copy_error(message), what)
 
 
 def _files_root(partitions: list[(name: str, paths: list[str])]) -> ygdata.Node:
@@ -1882,6 +1921,12 @@ def _fake_scp(recorder: _ScpRecorder) -> proc(swdev.DeviceMgr, DeviceSchema, Dev
     return adapter
 
 
+## A copy of the image over the CLI.
+COPY_COMMAND = "copy " + IMAGE_URL + " bootflash:" + IMAGE_FILE
+COPY_QUESTION = "Destination filename [" + IMAGE_FILE + "]? "
+COPY_DONE = "\r\nAccessing " + IMAGE_URL + "...\r\nLoading " + IMAGE_URL + " !!\r\n1000 bytes copied in 0.128 secs (7812 bytes/sec)"
+
+
 def new_iosxe_cli_mock_device_mgr(t: testing.EnvT, name: str,
                                   on_reconf: action(str) -> None, files: bool=True,
                                   scp_recorder: ?_ScpRecorder=None) -> swdev.DeviceMgr:
@@ -1919,11 +1964,12 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
                   running: str=OLD_RELEASE, committed: ?str=None, files: bool=True,
                   verify_delay: float=0.0, restamped: bool=False, upgrade_duration: float=0.0,
                   sized: bool=False, xcopy_records: bool=True, xcopy_status: bool=True,
-                  scp_recorder: ?_ScpRecorder=None, image_url: bool=True, image_file: ?str=None):
+                  scp_recorder: ?_ScpRecorder=None, image_url: bool=True, image_file: ?str=None,
+                  vrf: ?str=None):
     """Drive one mock device with a sha512 image checksum from software intent
     to a settled status. The CliMock answers dir bootflash: with dir_output,
-    and with a listing that has the image once the device took an xcopy, and
-    the verify of the image with verify_output. When dir_output lists the
+    and with a listing that has the image once the device took an xcopy or
+    a copy over the CLI, and the verify of the image with verify_output. When dir_output lists the
     image, the image is on bootflash from the start. preadded is a release
     that the device has added from the start. Without checksum, the intent
     has no checksum, and the CliMock answers the check of the image's
@@ -1934,13 +1980,14 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
     intent has the image size of the mock. With scp_recorder, the device
     has an SCP adapter that gives its puts to it. Without image_url, the
     intent has no image URL; image_file is the image's file in the image
-    folder that it names. The progress that the prepare job showed is in
-    progress_seen."""
+    folder that it names. vrf is the file-transfer VRF of the device. The
+    progress that the prepare job showed is in progress_seen."""
     var dev_ref: ?swdev.DeviceMgr = None
     var mock: ?swxemock.IosXeSoftwareMock = None
     var cli: ?xecli.CliMock = None
     var finished = False
     var progress_seen: list[u64] = []
+    var cli_copied = False
 
     def on_reconf(n: str) -> None:
         pass
@@ -1953,6 +2000,10 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
             return
         if "xcopy" in m!.get_rpcs():
             c!.set_reply("dir bootflash:", DIR_STAGED)
+        if not cli_copied and COPY_COMMAND in c!.get_commands():
+            # A copy over the CLI writes the file that NETCONF installs.
+            cli_copied = True
+            m!.place(IMAGE_FILE, swxemock.IMAGE_SIZE)
         seen = d!.get_swmgr().get_job_progress("prepare")
         if seen is not None and (len(progress_seen) == 0 or progress_seen[-1] != seen!):
             progress_seen.append(seen!)
@@ -2003,6 +2054,9 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         c.set_reply(clitest.STARTUP_CHANGE_COMMAND, clitest.CONFIG_CHANGE_SAVED)
         c.set_reply(VERIFY_COMMAND, verify_output)
         c.set_reply(VERIFY_IMAGE_COMMAND, image_output)
+        c.set_question(COPY_COMMAND, COPY_QUESTION, "", COPY_DONE)
+        c.set_delay(COPY_COMMAND, 0.1)
+        c.set_reply_on(COPY_COMMAND, "dir bootflash:", DIR_STAGED)
         c.set_delay(VERIFY_COMMAND, verify_delay)
         if restamped:
             c.set_reply_on(VERIFY_COMMAND, "dir bootflash:", DIR_STAGED_LATER)
@@ -2017,6 +2071,7 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         dmc.extra_adapter.create("iosxe-cli")
         if scp_recorder is not None:
             dmc.extra_adapter.create("scp")
+        dmc.file_transfer.vrf = vrf
         d.set_dmc(dmc)
         after 0.02: poll()
 
@@ -2325,6 +2380,86 @@ actor _test_iosxe_transfer_progress(t: testing.EnvT):
 
 
 
+actor _test_iosxe_vrf_copies_the_image(t: testing.EnvT):
+    """A device that reaches the image through a VRF gets it with copy over
+    the CLI, not xcopy, and the run goes on as after xcopy."""
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["install", "activate", "install-commit", "remove"], m.get_rpcs())
+            testing.assertTrue(COPY_COMMAND in c.get_commands(), "the image is copied over the CLI: {c.get_commands()}")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def __startup__():
+        _StagingRun(t, "d-vrf-copy", DIR_EMPTY, VERIFY_EQUAL, settled, vrf="xfer")
+
+
+
+actor _test_iosxe_vrf_copy_rpc_without_the_cli(t: testing.EnvT):
+    """Without the CLI adapter, a device that reaches the image through a
+    VRF gets it with the copy RPC, and the run goes on as after xcopy."""
+    def settled(m: swxemock.IosXeSoftwareMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["copy", "install", "activate", "install-commit", "remove"], m.get_rpcs())
+            inputs = m.get_inputs()
+            source = inputs.source
+            destination = inputs.destination
+            testing.assertTrue(source is not None and source == IMAGE_URL, "the copy fetches the image URL: {source}")
+            testing.assertTrue(destination is not None and destination == IMAGE_FILE,
+                               "the copy writes the image file on bootflash: {destination}")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def __startup__():
+        _UpgradeRun(t, "d-vrf-copy-rpc", 0.0, swxemock.FAILURE_NONE, OLD_RELEASE,
+                    NEW_REQUESTED, IMAGE_URL, settled, vrf="xfer")
+
+
+
+actor _test_iosxe_vrf_copy_failure_fails_prepare(t: testing.EnvT):
+    """Without the CLI adapter, a copy RPC through a VRF that fails fails
+    prepare with the error line of copy, without the credentials of the
+    URL."""
+    def settled(m: swxemock.IosXeSoftwareMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("failed", status, "a failed copy is a failed run")
+            testing.assertEqual(["copy"], m.get_rpcs(), "nothing may be installed after a failed copy")
+            url = swxe.redact_url(IMAGE_URL)
+            testing.assertEqual("download failed: %Error opening " + url + " (HTTP error: Connection failure)",
+                                d.get_swmgr().get_reason(), "the reason is the error of copy")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def __startup__():
+        _UpgradeRun(t, "d-vrf-copy-fails", 0.0, swxemock.FAILURE_DOWNLOAD, OLD_RELEASE,
+                    NEW_REQUESTED, IMAGE_URL, settled, vrf="xfer")
+
+
+
+actor _test_iosxe_vrf_copy_of_an_empty_file_fails_prepare(t: testing.EnvT):
+    """A copy RPC over scp that cannot connect replies that it succeeded
+    and leaves an empty file. Prepare fails, also when the intent has no
+    checksum and no image size to check the file against."""
+    def settled(m: swxemock.IosXeSoftwareMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("failed", status, "an empty image is a failed run")
+            testing.assertEqual(["copy"], m.get_rpcs(), "nothing may be installed from an empty file")
+            testing.assertEqual("download failed: copy left " + IMAGE_FILE + " empty", d.get_swmgr().get_reason())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def __startup__():
+        _UpgradeRun(t, "d-vrf-copy-empty", 0.0, swxemock.FAILURE_NONE, OLD_RELEASE,
+                    NEW_REQUESTED, IMAGE_URL, settled, vrf="xfer", copy_empty=True)
+
+
+
 actor _test_iosxe_xcopy_without_records_ends_at_the_image_size(t: testing.EnvT):
     """Without records and without the status of the xcopy, the transfer
     ends when the file on bootflash has the image size of the intent."""
@@ -2423,6 +2558,7 @@ actor _test_iosxe_checksum_mismatch_fails_in_prepare(t: testing.EnvT):
 #   IOSXE_SOFTWARE_SIZE       the size of the image in bytes, optional; without
 #                             it the driver does not check the room on bootflash
 #   IOSXE_SOFTWARE_CLI_ONLY   1 to start without NETCONF, as on IOS XE 16.8
+#   IOSXE_SOFTWARE_VRF        the file-transfer VRF of the device, optional
 #   IOSXE_LOG_LEVEL           the log level of the device, e.g. trace for the
 #                             text that the CLI session receives
 #
@@ -2536,6 +2672,9 @@ actor TestLiveSoftwareUpgradeActor(t: testing.EnvT, log, release, url, sha512, s
             if size != "":
                 software.image_size = u64(int(size))
             m = DeviceMetaConfig("xe", clitest.live_credentials(t), type="iosxe")
+            vrf = clitest.live_setting(t, "IOSXE_SOFTWARE_VRF", "")
+            if vrf != "":
+                m.file_transfer.vrf = vrf
             level = clitest.live_setting(t, "IOSXE_LOG_LEVEL", "")
             if level != "":
                 m.debug.log_level = level
@@ -2562,9 +2701,6 @@ actor TestLiveSoftwareUpgradeActor(t: testing.EnvT, log, release, url, sha512, s
 
 ## The old image that a device in bundle mode boots.
 BUNDLE_IMAGE = "bootflash:c8000v-universalk9.17.18.02.SPA.bin"
-COPY_COMMAND = "copy " + IMAGE_URL + " bootflash:" + IMAGE_FILE
-COPY_QUESTION = "Destination filename [" + IMAGE_FILE + "]? "
-COPY_DONE = "\r\nAccessing " + IMAGE_URL + "...\r\nLoading " + IMAGE_URL + " !!\r\n1000 bytes copied in 0.128 secs (7812 bytes/sec)"
 ADD_COMMAND = "install add file bootflash:" + IMAGE_FILE
 ACTIVATE_COMMAND = "install activate auto-abort-timer 30 prompt-level none"
 ONE_SHOT_COMMAND = "install add file bootflash:" + IMAGE_FILE + " activate commit prompt-level none"

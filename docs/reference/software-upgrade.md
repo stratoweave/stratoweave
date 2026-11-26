@@ -217,7 +217,7 @@ connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
 | read the versions | `install-version-state-info` | `show install summary` |
 | list bootflash | `Cisco-IOS-XE-platform-software-oper` | `dir bootflash:` |
 | check the image | none | `verify /sha512`, `verify /md5`, or `verify` for the signature |
-| prepare | `xcopy` from `image-url` to bootflash | `copy` |
+| prepare | `xcopy` from `image-url` to bootflash, or `copy` of `Cisco-IOS-XE-rpc` with a transfer VRF | `copy` |
 | prepare with the SCP adapter | `put` of `image-file` to bootflash | `put` of `image-file` to bootflash |
 | install | `install` (add only), then `activate` with a 30 minute auto-abort timer | `install add`, then `install activate auto-abort-timer 30` |
 | commit | `install-commit` | `install commit` |
@@ -240,6 +240,25 @@ connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
   it waits, where `Cisco-IOS-XE-xcopy-rpc` has the leaf, from IOS XE 17.8.
   The device then ends a transfer from a server that stops sending, with
   `derr-oper-tout`.
+- `xcopy` takes a `vrf` but does not use it, and does not follow the
+  source interface of the configuration (C8000V with 17.18.2). With
+  `file-transfer/vrf` on the device, a device that fetches its image
+  fetches it with `copy` instead: over the IOS XE CLI adapter when the
+  device has one, else with the `copy` RPC of `Cisco-IOS-XE-rpc`. The SCP
+  adapter sends an image without a VRF. `copy` goes out from the source
+  interface that the device configuration sets for the scheme of
+  `image-url`: `ip http client source-interface` for http and https, `ip
+  ssh source-interface` for scp, `ip ftp source-interface` for ftp. That
+  interface puts the copy in its VRF. Over the CLI, prepare shows how far
+  the copy is from the marks that it prints, and the NETCONF session stays
+  free. The reply of the `copy` RPC comes when the copy ends, and the
+  device answers no other RPC of the NETCONF session before it, so prepare
+  shows no progress. A failed `copy` fails prepare with the error line of
+  copy, as `%Error opening http://10.0.0.9/a.bin (HTTP error: Connection
+  failure)`. Over the CLI, a copy over scp that cannot connect says `%
+  Destination unreachable; gateway or host down`; the `copy` RPC replies
+  that it succeeded and leaves an empty file, so prepare fails on an empty
+  file.
 - `activate` names the image by the version the device gave it during the
   add, for example `17.18.03a.0.5540`.
 - The device reboots after `activate` and after `abort`. Read errors during

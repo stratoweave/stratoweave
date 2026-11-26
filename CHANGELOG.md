@@ -515,6 +515,16 @@
   server that stops sending then ends on the device, with
   `derr-oper-tout`. Before, it did not end, and the xcopys and installs
   after it waited, also those of the next attempt.
+- A device can have a transfer VRF, `file-transfer/vrf`. An IOS XE device
+  that fetches its image then fetches it with copy, not xcopy, which does
+  not use a VRF: over the IOS XE CLI adapter when the device has one,
+  which shows how far the copy is and leaves the NETCONF session free,
+  else with the `copy` RPC of `Cisco-IOS-XE-rpc`, which shows no progress
+  while it runs. Copy goes out from the source interface that the device
+  configuration sets for the scheme of the URL, such as `ip http client
+  source-interface`. A copy RPC that leaves an empty file, as over scp
+  when it cannot connect, fails prepare. fleetmgr carries the leaf to its
+  devices.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
