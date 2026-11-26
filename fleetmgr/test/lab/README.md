@@ -85,8 +85,8 @@ or in the environment; the top of the Justfile lists them all.
 
 A campaign upgrades each member once, and a device is in one campaign at
 most. So run `just upgrade-clear` before you run `just upgrade` again with
-another `RELEASE`, as for the downgrade above. Without it, the campaign
-keeps a member that is done, with the new target, held by its veto.
+another `RELEASE`, as for the downgrade above. Without it, the edit fails:
+the campaign keeps the image of each member that it has released.
 
 Staging takes about two minutes for a ~1 GB image and the reload another
 four. The post-check then waits for a BGP sample taken after the reload that

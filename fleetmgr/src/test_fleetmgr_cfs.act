@@ -18,6 +18,8 @@ from stratoweave.device_meta_config import \
 
 import stratoweave.fleet_ctl as fctl
 import stratoweave.fleet_ctl_sim as sim
+import stratoweave.image_list as image_list
+import yang.adata as yadata
 import fleetmgr.cfs as cfs
 import fleetmgr.rfs as rfs
 import fleetmgr.devices.flotilla as flotilla_dev
@@ -209,6 +211,11 @@ IMAGE = "c8000v-universalk9.17.18.03a.SPA.bin"
 IMAGE_MD5 = "35a91bebe3b1f38606bd0a845426929f"
 IMAGE_SIZE = 962330352
 URL_BASE = "https://images.example/"
+OTHER_IMAGE = "c8000v-universalk9.17.18.04.SPA.bin"
+
+# The image list of _rules_inventory() before an edit: (name, version,
+# file, size).
+RULES_IMAGES = [(IMAGE, "17.18.03a", "", IMAGE_SIZE), (OTHER_IMAGE, "17.18.04", "", IMAGE_SIZE)]
 
 
 def _with_images(linked: y_0.root) -> y_0.root:
@@ -362,69 +369,77 @@ def _test_campaign_function_renders_the_claim():
     name, target and veto. In run, the members that the output written last
     has in flight, without the veto, keep no veto. A prev of another
     campaign gives none in flight. In run with allow-staging, the members
-    that prev lets prepare stay let, while the campaign gives them the
-    same target release."""
+    that prev lets prepare stay let. A member that prev marks image-locked
+    at the target that the memory has for it stays marked. prev is written
+    as the actor writes it: the member in flight or let prepare is marked.
+    A member in flight that prev does not mark gets the veto again."""
     names = ["cpe-1", "cpe-2", "cpe-3"]
     inventory = _with_nightly(_flat_inventory(names))
     linked = inventory.to_gdata()
     run = _paced_campaign(names)
-    prev = cfs.campaign_config(run, inventory, {"cpe-2"}, set(), None).to_gdata()
+    # The memory of the edit before: each member as it is now.
+    memory = cfs.campaign_memory(None, cfs.chosen_members(run, inventory), set())
+    prev = cfs.campaign_config(run, inventory, {"cpe-2"}, set(), None, {"cpe-2"}).to_gdata()
+    unmarked = cfs.campaign_config(run, inventory, {"cpe-2"}, set(), None).to_gdata()
     other = InputCampaign(name="other", admin_state="run")
     for name in names:
         other.device.create(name, image=IMAGE)
-    prev_other = cfs.campaign_config(other, inventory, {"cpe-2"}, set(), None).to_gdata()
+    prev_other = cfs.campaign_config(other, inventory, {"cpe-2"}, set(), None,
+                                     {"cpe-2"}).to_gdata()
     staging = _paced_campaign(names)
     staging.allow_staging = True
-    prev_staged = cfs.campaign_config(staging, inventory, set(), {"cpe-2"}, None).to_gdata()
+    prev_staged = cfs.campaign_config(staging, inventory, set(), {"cpe-2"}, None,
+                                      {"cpe-2"}).to_gdata()
     testing.assertEqual(_staged(prev_staged), ["cpe-2"], "prev lets cpe-2 prepare")
     # (case, prev, the campaign, the members in flight and let prepare)
     written: list[(str, gdata.Node, InputCampaign, set[str], set[str])] = [
         ("prev has cpe-2 in flight", prev, run, {"cpe-2"}, set()),
+        ("prev has cpe-2 in flight without the mark", unmarked, run, set(), set()),
         ("the prev of another campaign has none of this one", prev_other, run, set(), set()),
         ("prev lets cpe-2 prepare", prev_staged, staging, set(), {"cpe-2"}),
         ("without allow-staging no member is let prepare", prev_staged, run, set(), set()),
     ]
     for case in written:
-        w = cfs.written_in(case.1, case.2, inventory)
+        marks = cfs.written_marks(case.1, case.2.name)
+        w = cfs.written_in(case.2, marks, cfs.locked_members(memory, marks))
         testing.assertEqual(w.0, case.3, case.0)
         testing.assertEqual(w.1, case.4, case.0)
-    # (case, admin-state, prev, the vetoed members)
-    cases: list[(str, str, ?gdata.Node, list[str])] = [
-        ("plan, no prev", "plan", None, names),
-        ("plan, cpe-2 in flight in prev", "plan", prev, names),
-        ("run, no prev", "run", None, names),
-        ("run, cpe-2 in flight in prev", "run", prev, ["cpe-1", "cpe-3"]),
-        ("run, prev of another campaign", "run", prev_other, names),
+    # (case, admin-state, prev, the vetoed members, the marks)
+    cases: list[(str, str, ?gdata.Node, list[str], list[str])] = [
+        ("plan, no prev", "plan", None, names, []),
+        ("plan, cpe-2 in flight in prev", "plan", prev, names, ["cpe-2 locked"]),
+        ("run, no prev", "run", None, names, []),
+        ("run, cpe-2 in flight in prev", "run", prev, ["cpe-1", "cpe-3"], ["cpe-2 locked"]),
+        ("run, prev of another campaign", "run", prev_other, names, []),
     ]
     for case in cases:
         campaign = _paced_campaign(names)
         campaign.admin_state = case.1
-        out = cfs.UpgradeCampaign().transform(campaign, linked, None, case.2).0.to_gdata()
+        out = cfs.UpgradeCampaign().transform(campaign, linked, memory, case.2).0.to_gdata()
         vetoed, free, targeted, unnamed = _vetoed(out, "paced")
         testing.assertEqual(vetoed, case.3, case.0)
         testing.assertEqual(sorted(vetoed + free), names, case.0)
         testing.assertEqual(targeted, names, case.0)
         testing.assertEqual(unnamed, [], case.0)
         testing.assertEqual(_staged(out), [], case.0)
+        testing.assertEqual(_mark_rows(out), case.4, case.0)
 
     # prev is in run with allow-staging, and lets cpe-2 prepare. (case,
-    # admin-state, allow-staging, the version of the image, and the members
-    # with allow-staging)
-    staged_cases: list[(str, str, bool, str, list[str])] = [
-        ("run, on", "run", True, "17.18.03a", ["cpe-2"]),
-        ("run, off", "run", False, "17.18.03a", []),
-        ("plan, on", "plan", True, "17.18.03a", []),
-        ("run, on, the image's version is now 17.18.04", "run", True, "17.18.04", []),
+    # admin-state, allow-staging, and the members with allow-staging)
+    staged_cases: list[(str, str, bool, list[str])] = [
+        ("run, on", "run", True, ["cpe-2"]),
+        ("run, off", "run", False, []),
+        ("plan, on", "plan", True, []),
     ]
     for case in staged_cases:
         campaign = _paced_campaign(names)
         campaign.admin_state = case.1
         campaign.allow_staging = case.2
-        lk = _with_version(_with_nightly(_flat_inventory(names)), case.3).to_gdata()
-        out = cfs.UpgradeCampaign().transform(campaign, lk, None, prev_staged).0.to_gdata()
+        out = cfs.UpgradeCampaign().transform(campaign, linked, memory, prev_staged).0.to_gdata()
         vetoed, free, targeted, unnamed = _vetoed(out, "paced")
         testing.assertEqual(vetoed, names, case.0)
-        testing.assertEqual(_staged(out), case.4, case.0)
+        testing.assertEqual(_staged(out), case.3, case.0)
+        testing.assertEqual(_mark_rows(out), ["cpe-2 locked"], case.0)
 
     # With nothing changed the wrapper returns the last output itself, so
     # TTT skips the members.
@@ -434,11 +449,241 @@ def _test_campaign_function_renders_the_claim():
         ("cpe-2 let prepare", staging, prev_staged),
     ]
     for case in unchanged:
-        wrapped = cfs.UpgradeCampaign().transform_wrapper(case.1.to_gdata(), linked, None, None,
-                                                          case.2)
+        wrapped = cfs.UpgradeCampaign().transform_wrapper(case.1.to_gdata(), linked,
+                                                          memory?.to_gdata(), None, case.2)
         testing.assertEqual(wrapped.0, case.2, "the function gives what the actor wrote: " + case.0)
         testing.assertTrue(ttt.same_node(wrapped.0, case.2),
                            "the wrapper returns prev itself: " + case.0)
+
+
+def _rules_inventory(images: list[(str, str, str, int)]) -> y_0.root:
+    """The fleet cpe-1 to cpe-3, and the image list images, each as (name,
+    version, file, size). "" leaves the version or the file out."""
+    root = y_0.root()
+    root.images.url_base = URL_BASE
+    for im in images:
+        image = root.images.image.create(im.0, os="IOS XE")
+        if im.1 != "":
+            image.version = im.1
+        if im.2 != "":
+            image.file = im.2
+        image.size = u64(im.3)
+    for name in ["cpe-1", "cpe-2", "cpe-3"]:
+        root.fleet.device.create(name, type="iosxe",
+                                 credentials=InputCredentials(username="admin"))
+    return root
+
+
+def _committed(members: list[(str, str, str, int, bool)]) -> ?gdata.Node:
+    """The memory of campaign A with each member in members as (device,
+    image, target release, attempt, image-locked), or None for none."""
+    if len(members) == 0:
+        return None
+    memory = InputMemory()
+    for m in members:
+        e = memory.member.create(m.0, image=m.1, target_release=m.2, attempt=u64(m.3))
+        if m.4:
+            e.image_locked = True
+    return memory.to_gdata()
+
+
+def _written(entries: list[(str, str, int, bool)], failed: list[str]=[]) -> ?gdata.Node:
+    """The output of campaign A as its actor wrote it, with each device in
+    entries as (name, target release, attempt, image-locked), and
+    attempt-failed for the devices in failed, or None for none."""
+    if len(entries) == 0:
+        return None
+    o = y_1.root()
+    for e in entries:
+        sw = o.rfs.create(cfs.flotilla_of(e.0)).device.create(e.0).software
+        sw.upgrade_campaign = "A"
+        sw.target_release = e.1
+        sw.attempt = u64(e.2)
+        if e.3:
+            sw.image_locked = True
+        if e.0 in failed:
+            sw.attempt_failed = True
+    return o.to_gdata()
+
+
+def _kept_image(names: str) -> str:
+    """The error of an edit that gives the members names of campaign A
+    another image or another version."""
+    return "upgrade-campaign A keeps the image and the release of {names}: it has let each " \
+           + "prepare or released it"
+
+
+def _test_campaign_edit_rules():
+    """An edit of campaign A, or of its image list, fails with an error
+    that names the campaign and the members, and the memory stays, when it
+    gives a member whose image the campaign keeps another image or another
+    version of its image. The campaign keeps the image of a member that the
+    memory, the members as the last edit took them, locks, and of a member
+    that the output written last marks image-locked with the target release
+    that the memory has for it. A mark with another target is stale: an
+    edit overtook the write that set it. Moving the image's file, or a new
+    size, keeps its version. A member removed loses its lock, and a member
+    that the memory does not have is new. The error names five members at
+    most. Otherwise the memory keeps each member as the edit takes it,
+    and whether the campaign keeps its image."""
+    moved = [(IMAGE, "17.18.03a", "iosxe/17.18/" + IMAGE, IMAGE_SIZE),
+             (OTHER_IMAGE, "17.18.04", "", IMAGE_SIZE)]
+    resized = [(IMAGE, "17.18.03a", "", 1), (OTHER_IMAGE, "17.18.04", "", IMAGE_SIZE)]
+    newer = [(IMAGE, "17.18.04", "", IMAGE_SIZE), (OTHER_IMAGE, "17.18.04", "", IMAGE_SIZE)]
+    removed = [(OTHER_IMAGE, "17.18.04", "", IMAGE_SIZE)]
+    renamed = [("renamed.bin", "17.18.03a", "", IMAGE_SIZE),
+               (OTHER_IMAGE, "17.18.04", "", IMAGE_SIZE)]
+    other_newer = [(IMAGE, "17.18.03a", "", IMAGE_SIZE), (OTHER_IMAGE, "17.18.05", "", IMAGE_SIZE)]
+    seven = ["d1", "d2", "d3", "d4", "d5", "d6", "d7"]
+    # (case, the memory as (device, image, target, attempt, image-locked),
+    # the output written last as (device, target, attempt, image-locked),
+    # the members after the edit as (device, image, attempt), the image
+    # list after the edit, the error, or "", and the members that the
+    # memory locks after the edit)
+    cases: list[(str, list[(str, str, str, int, bool)], list[(str, str, int, bool)],
+                 list[(str, str, int)], list[(str, str, str, int)], str, list[str])] = [
+        ("untouched, another image", [("cpe-1", IMAGE, "17.18.03a", 0, False)],
+         [("cpe-1", "17.18.03a", 0, False)], [("cpe-1", OTHER_IMAGE, 0)], RULES_IMAGES, "", []),
+        ("untouched, a new version", [("cpe-1", IMAGE, "17.18.03a", 0, False)],
+         [("cpe-1", "17.18.03a", 0, False)], [("cpe-1", IMAGE, 0)], newer, "", []),
+        ("locked, another image", [("cpe-1", IMAGE, "17.18.03a", 0, True)],
+         [("cpe-1", "17.18.03a", 0, True)], [("cpe-1", OTHER_IMAGE, 0)], RULES_IMAGES,
+         _kept_image("cpe-1"), []),
+        ("locked, a new version", [("cpe-1", IMAGE, "17.18.03a", 0, True)],
+         [("cpe-1", "17.18.03a", 0, True)], [("cpe-1", IMAGE, 0)], newer,
+         _kept_image("cpe-1"), []),
+        ("locked, the image removed", [("cpe-1", IMAGE, "17.18.03a", 0, True)],
+         [("cpe-1", "17.18.03a", 0, True)], [("cpe-1", IMAGE, 0)], removed,
+         _kept_image("cpe-1"), []),
+        ("locked, the image renamed", [("cpe-1", IMAGE, "17.18.03a", 0, True)],
+         [("cpe-1", "17.18.03a", 0, True)], [("cpe-1", "renamed.bin", 0)], renamed,
+         _kept_image("cpe-1"), []),
+        ("locked, the image's file moved", [("cpe-1", IMAGE, "17.18.03a", 0, True)],
+         [("cpe-1", "17.18.03a", 0, True)], [("cpe-1", IMAGE, 0)], moved, "", ["cpe-1"]),
+        ("locked, a new size", [("cpe-1", IMAGE, "17.18.03a", 0, True)],
+         [("cpe-1", "17.18.03a", 0, True)], [("cpe-1", IMAGE, 0)], resized, "", ["cpe-1"]),
+        ("marked, another image", [("cpe-1", IMAGE, "17.18.03a", 0, False)],
+         [("cpe-1", "17.18.03a", 0, True)], [("cpe-1", OTHER_IMAGE, 0)], RULES_IMAGES,
+         _kept_image("cpe-1"), []),
+        ("marked, the same image", [("cpe-1", IMAGE, "17.18.03a", 0, False)],
+         [("cpe-1", "17.18.03a", 0, True)], [("cpe-1", IMAGE, 0)], RULES_IMAGES, "", ["cpe-1"]),
+        ("stale mark", [("cpe-1", OTHER_IMAGE, "17.18.04", 0, False)],
+         [("cpe-1", "17.18.03a", 0, True)], [("cpe-1", OTHER_IMAGE, 0)], RULES_IMAGES, "", []),
+        ("stale mark, a new version", [("cpe-1", OTHER_IMAGE, "17.18.04", 0, False)],
+         [("cpe-1", "17.18.03a", 0, True)], [("cpe-1", OTHER_IMAGE, 0)], other_newer, "", []),
+        ("marked, not in the memory", [], [("cpe-1", "17.18.03a", 0, True)],
+         [("cpe-1", IMAGE, 0)], newer, "", []),
+        ("locked, removed", [("cpe-1", IMAGE, "17.18.03a", 0, True),
+                             ("cpe-2", IMAGE, "17.18.03a", 0, False)],
+         [("cpe-1", "17.18.03a", 0, True), ("cpe-2", "17.18.03a", 0, False)],
+         [("cpe-2", IMAGE, 0)], RULES_IMAGES, "", []),
+        ("locked, not in the fleet, another image", [("cpe-9", IMAGE, "17.18.03a", 0, True)],
+         [], [("cpe-9", OTHER_IMAGE, 0)], RULES_IMAGES, _kept_image("cpe-9"), []),
+        ("only the untouched member changes", [("cpe-1", IMAGE, "17.18.03a", 0, True),
+                                               ("cpe-2", IMAGE, "17.18.03a", 0, False)],
+         [("cpe-1", "17.18.03a", 0, True), ("cpe-2", "17.18.03a", 0, False)],
+         [("cpe-1", IMAGE, 0), ("cpe-2", OTHER_IMAGE, 0)], RULES_IMAGES, "", ["cpe-1"]),
+        ("a new version names only the locked member", [("cpe-1", IMAGE, "17.18.03a", 0, True),
+                                                        ("cpe-2", IMAGE, "17.18.03a", 0, False)],
+         [("cpe-1", "17.18.03a", 0, True), ("cpe-2", "17.18.03a", 0, False)],
+         [("cpe-1", IMAGE, 0), ("cpe-2", IMAGE, 0)], newer, _kept_image("cpe-1"), []),
+        ("seven locked members", [(d, IMAGE, "17.18.03a", 0, True) for d in seven], [],
+         [(d, OTHER_IMAGE, 0) for d in seven], RULES_IMAGES,
+         _kept_image("d1, d2, d3, d4, d5 and 2 more"), []),
+        ("the first edit", [], [], [("cpe-1", IMAGE, 0)], RULES_IMAGES, "", []),
+    ]
+    for case in cases:
+        campaign = InputCampaign(name="A", admin_state="run")
+        for m in case.3:
+            campaign.device.create(m.0, image=m.1, attempt=u64(m.2))
+        inventory = _rules_inventory(case.4)
+        got = ""
+        locked: list[str] = []
+        try:
+            out = cfs.UpgradeCampaign().transform_wrapper(campaign.to_gdata(),
+                                                          inventory.to_gdata(),
+                                                          _committed(case.1), None,
+                                                          _written(case.2))
+            m = out.1
+            if m is not None:
+                memory = InputMemory.from_gdata(m)
+                locked = sorted([e.device for e in memory.member if e.image_locked])
+                kept = {e.device: (e.image, e.target_release, e.attempt) for e in memory.member}
+                chosen = {n: (c.image, c.target, c.attempt)
+                          for n, c in cfs.chosen_members(campaign, inventory).items()}
+                testing.assertEqual(kept, chosen, "{case.0}: the memory keeps each member")
+        except ValueError as e:
+            got = e.error_message
+        testing.assertEqual(got, case.5, case.0)
+        testing.assertEqual(locked, case.6, case.0)
+
+
+def _no_attempt(names: str) -> str:
+    """The error of an edit that gives the members names of campaign A a new
+    attempt that they may not have."""
+    return "upgrade-campaign A gives no new attempt to {names}: the attempt of each has not " \
+           + "failed"
+
+
+def _test_campaign_attempt_rules():
+    """An edit of campaign A that gives a member a new attempt fails with an
+    error that names the campaign and the members, unless the output
+    written last marks the member attempt-failed with the attempt that the
+    memory has for it. A new member, which the memory does not have, may
+    have any attempt. A failed member with a new attempt keeps its
+    image. The output marks attempt-failed the members
+    whose mark the edit keeps: not one with a new attempt."""
+    locked = [("cpe-1", IMAGE, "17.18.03a", 0, True)]
+    marked = [("cpe-1", "17.18.03a", 0, True)]
+    # (case, the memory as (device, image, target, attempt, image-locked),
+    # the output written last as (device, target, attempt, image-locked),
+    # the devices it marks attempt-failed, the members after the edit as
+    # (device, image, attempt), the error, or "", and the members that the
+    # output marks attempt-failed)
+    cases: list[(str, list[(str, str, str, int, bool)], list[(str, str, int, bool)], list[str],
+                 list[(str, str, int)], str, list[str])] = [
+        ("failed, a new attempt", locked, marked, ["cpe-1"], [("cpe-1", IMAGE, 1)], "", []),
+        ("failed, the same attempt", locked, marked, ["cpe-1"], [("cpe-1", IMAGE, 0)], "",
+         ["cpe-1"]),
+        ("succeeded, a new attempt", locked, marked, [], [("cpe-1", IMAGE, 1)],
+         _no_attempt("cpe-1"), []),
+        ("waiting, a new attempt", [("cpe-1", IMAGE, "17.18.03a", 0, False)],
+         [("cpe-1", "17.18.03a", 0, False)], [], [("cpe-1", IMAGE, 1)], _no_attempt("cpe-1"),
+         []),
+        ("failed in an earlier attempt", [("cpe-1", IMAGE, "17.18.03a", 1, True)], marked,
+         ["cpe-1"], [("cpe-1", IMAGE, 2)], _no_attempt("cpe-1"), []),
+        ("a new member", [], [], [], [("cpe-1", IMAGE, 3)], "", []),
+        ("failed, a new attempt and another image", locked, marked, ["cpe-1"],
+         [("cpe-1", OTHER_IMAGE, 1)], _kept_image("cpe-1"), []),
+        ("both rules", [("cpe-1", IMAGE, "17.18.03a", 0, True),
+                        ("cpe-2", IMAGE, "17.18.03a", 0, False)],
+         [("cpe-1", "17.18.03a", 0, True), ("cpe-2", "17.18.03a", 0, False)], [],
+         [("cpe-1", OTHER_IMAGE, 0), ("cpe-2", IMAGE, 1)],
+         _kept_image("cpe-1") + "; " + _no_attempt("cpe-2"), []),
+    ]
+    for case in cases:
+        campaign = InputCampaign(name="A", admin_state="run")
+        for m in case.4:
+            campaign.device.create(m.0, image=m.1, attempt=u64(m.2))
+        got = ""
+        failed: list[str] = []
+        try:
+            out = cfs.UpgradeCampaign().transform_wrapper(campaign.to_gdata(),
+                                                          _rules_inventory(RULES_IMAGES).to_gdata(),
+                                                          _committed(case.1), None,
+                                                          _written(case.2, case.3))
+            failed = [r.split(" ")[0] for r in _mark_rows(out.0) if r.endswith(" failed")]
+        except ValueError as e:
+            got = e.error_message
+        testing.assertEqual(got, case.5, case.0)
+        testing.assertEqual(failed, case.6, case.0)
+    # A new prepare attempt is no new attempt.
+    campaign = InputCampaign(name="A", admin_state="run")
+    campaign.device.create("cpe-1", image=IMAGE, prepare_attempt=u64(1))
+    out = cfs.UpgradeCampaign().transform_wrapper(campaign.to_gdata(),
+                                                  _rules_inventory(RULES_IMAGES).to_gdata(),
+                                                  _committed(locked), None, _written(marked))
+    testing.assertEqual(_mark_rows(out.0), ["cpe-1 locked"], "a new prepare attempt")
 
 
 proc def _test_campaign_edit_keeps_its_output(t: testing.AsyncT):
@@ -959,36 +1204,102 @@ def _test_campaign_writes_the_prepare_attempt():
 
 
 def _test_intent_patch():
-    """The patch of a decision changes the veto and allow-staging of the
-    members that went in flight or left it, and of the members let prepare
-    or no longer let, and gives the same output as writing the whole
+    """The patch of a decision changes the veto, allow-staging,
+    image-locked and attempt-failed of the members that went in flight or
+    left it, of the members let prepare or no longer let, of the members
+    marked or no longer marked, and of the members whose attempt failed or
+    no longer failed, and gives the same output as writing the whole
     campaign again. With no change there is no patch."""
     names = ["cpe-1", "cpe-2", "cpe-3"]
     inventory = _with_nightly(_flat_inventory(names))
     campaign = _paced_campaign(names)
     campaign.allow_staging = True
-    # (case, the members in flight and let prepare before, and after)
-    cases: list[(str, (set[str], set[str]), (set[str], set[str]))] = [
-        ("cpe-2 is released", (set(), set()), ({"cpe-2"}, set())),
-        ("cpe-2 is done", ({"cpe-2"}, set()), (set(), set())),
-        ("cpe-1 is done and cpe-2 is released", ({"cpe-1"}, set()), ({"cpe-2"}, set())),
-        ("cpe-2 is let prepare", (set(), set()), (set(), {"cpe-2"})),
-        ("cpe-2 is done preparing", (set(), {"cpe-2"}), (set(), set())),
-        ("cpe-2 is released while it prepares", (set(), {"cpe-2"}), ({"cpe-2"}, set())),
-        ("cpe-1 is done preparing and cpe-3 is let", (set(), {"cpe-1"}), (set(), {"cpe-3"})),
+    # (case, the members in flight, let prepare, marked and failed before,
+    # and after)
+    cases: list[(str, (set[str], set[str], set[str], set[str]),
+                 (set[str], set[str], set[str], set[str]))] = [
+        ("cpe-2 is released", (set(), set(), set(), set()), ({"cpe-2"}, set(), {"cpe-2"}, set())),
+        ("cpe-2 is done", ({"cpe-2"}, set(), {"cpe-2"}, set()), (set(), set(), {"cpe-2"}, set())),
+        ("cpe-1 is done and cpe-2 is released", ({"cpe-1"}, set(), {"cpe-1"}, set()),
+         ({"cpe-2"}, set(), {"cpe-1", "cpe-2"}, set())),
+        ("cpe-2 is let prepare", (set(), set(), set(), set()),
+         (set(), {"cpe-2"}, {"cpe-2"}, set())),
+        ("cpe-2 is done preparing", (set(), {"cpe-2"}, {"cpe-2"}, set()),
+         (set(), set(), {"cpe-2"}, set())),
+        ("cpe-2 is released while it prepares", (set(), {"cpe-2"}, {"cpe-2"}, set()),
+         ({"cpe-2"}, set(), {"cpe-2"}, set())),
+        ("cpe-1 is done preparing and cpe-3 is let", (set(), {"cpe-1"}, {"cpe-1"}, set()),
+         (set(), {"cpe-3"}, {"cpe-1", "cpe-3"}, set())),
+        ("cpe-3 is marked", (set(), set(), set(), set()), (set(), set(), {"cpe-3"}, set())),
+        ("cpe-3 is no longer marked", (set(), set(), {"cpe-3"}, set()),
+         (set(), set(), set(), set())),
+        ("cpe-2 fails", ({"cpe-2"}, set(), {"cpe-2"}, set()),
+         (set(), set(), {"cpe-2"}, {"cpe-2"})),
+        ("cpe-2 has a new attempt", (set(), set(), {"cpe-2"}, {"cpe-2"}),
+         (set(), set(), {"cpe-2"}, set())),
     ]
     for case in cases:
         old = case.1
         new = case.2
-        first = cfs.campaign_config(campaign, inventory, old.0, old.1, None).to_gdata()
-        then = cfs.campaign_config(campaign, inventory, new.0, new.1, None).to_gdata()
+        first = cfs.campaign_config(campaign, inventory, old.0, old.1, None, old.2,
+                                    old.3).to_gdata()
+        then = cfs.campaign_config(campaign, inventory, new.0, new.1, None, new.2,
+                                   new.3).to_gdata()
         testing.assertNotEqual(first, then, case.0)
         patched = cfs.intent_patch(first, campaign, inventory, old, new)
         testing.assertEqual(patched, then, case.0)
-    same = ({"cpe-2"}, {"cpe-1"})
-    unchanged = cfs.campaign_config(campaign, inventory, same.0, same.1, None).to_gdata()
+    same = ({"cpe-2"}, {"cpe-1"}, {"cpe-1", "cpe-2"}, {"cpe-3"})
+    unchanged = cfs.campaign_config(campaign, inventory, same.0, same.1, None, same.2,
+                                    same.3).to_gdata()
     testing.assertEqual(cfs.intent_patch(unchanged, campaign, inventory, same, same), None,
                         "nothing changes")
+
+
+def _mark_rows(out: gdata.Node) -> list[str]:
+    """Each mark in out, the output of a campaign, sorted: "device locked"
+    for a device with image-locked, and "device failed" for one with
+    attempt-failed."""
+    rows: list[str] = []
+    for flotilla in y_1.root.from_gdata(out).rfs:
+        for dev in flotilla.device:
+            locked = dev.software.image_locked
+            if locked is not None and locked:
+                rows.append("{dev.name} locked")
+            failed = dev.software.attempt_failed
+            if failed is not None and failed:
+                rows.append("{dev.name} failed")
+    return sorted(rows)
+
+
+def _test_campaign_config_marks_the_members_it_keeps_the_image_of():
+    """Each member in the fleet that is in locked gets image-locked, in plan
+    and in run, also in flight; with names, only those members are written.
+    Each member in the fleet that is in failed gets attempt-failed. cpe-9
+    is not in the fleet and gets nothing."""
+    inventory = _flat_inventory(["cpe-1", "cpe-2", "cpe-3"])
+    # (case, admin-state, the members in flight, locked, the members to
+    # write, the marks)
+    cases: list[(str, str, set[str], ?set[str], ?set[str], list[str])] = [
+        ("none", "run", set(), None, None, []),
+        ("plan", "plan", set(), {"cpe-1", "cpe-2"}, None, ["cpe-1 locked", "cpe-2 locked"]),
+        ("run, cpe-2 in flight", "run", {"cpe-2"}, {"cpe-1", "cpe-2"}, None,
+         ["cpe-1 locked", "cpe-2 locked"]),
+        ("not in the fleet", "run", set(), {"cpe-9"}, None, []),
+        ("names", "run", set(), {"cpe-1", "cpe-2"}, {"cpe-2", "cpe-3"}, ["cpe-2 locked"]),
+    ]
+    for case in cases:
+        campaign = InputCampaign(name="paced", admin_state=case.1)
+        for name in ["cpe-1", "cpe-2", "cpe-3", "cpe-9"]:
+            campaign.device.create(name, image=IMAGE)
+        o = cfs.campaign_config(campaign, inventory, case.2, set(), case.4, case.3).to_gdata()
+        testing.assertEqual(_mark_rows(o), case.5, case.0)
+    # Each member in failed gets attempt-failed.
+    campaign = InputCampaign(name="paced", admin_state="run")
+    for name in ["cpe-1", "cpe-2", "cpe-9"]:
+        campaign.device.create(name, image=IMAGE)
+    o = cfs.campaign_config(campaign, inventory, set(), set(), None, {"cpe-1"},
+                            {"cpe-2", "cpe-9"})
+    testing.assertEqual(_mark_rows(o.to_gdata()), ["cpe-1 locked", "cpe-2 failed"], "failed")
 
 
 def _test_prepare_for():
@@ -3705,176 +4016,6 @@ actor TestCampaignTriesAFailedMemberAgainWithANewAttemptActor(t: testing.AsyncT,
         after 6.0: timeout()
 
 
-proc def _TriedAgainInFlight(t: testing.AsyncT, version: str):
-    """Run a campaign over cpe-1 and cpe-2, one at a time; both answer
-    17.18.03a. The member released first is tried again while its run is
-    under way, in one edit that also gives the image the version version.
-    The other member answers version. The campaign puts the veto of the
-    first member back, and its run, which goes on for the old attempt and
-    17.18.03a, keeps its slot, so the other member waits. When the old run
-    ends and the member answers the new attempt, the slot is free and the
-    campaign releases a member."""
-    t.timeout(8.0)
-    both = ["cpe-1", "cpe-2"]
-    linked = _flat_inventory(both).to_gdata()
-    edited = _with_version(_flat_inventory(both), version).to_gdata()
-
-    TriedAgainInFlightActor(t=t, version=version, both=both, linked=linked, edited=edited)
-
-
-actor TriedAgainInFlightActor(t: testing.AsyncT, version: str, both, linked, edited):
-    var controller: ?cfs.UpgradeCampaignTransform = None
-    var stage = 0
-    var done = False
-    var first = ""
-    var other = ""
-
-    def fail(message: str) -> None:
-        if not done:
-            done = True
-            t.failure(ValueError(message))
-
-    def report(name: str, status: str, attempt: int, target: str) -> None:
-        cc = controller
-        if cc is not None:
-            cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
-                      _attempt_state(status, "now", target, u64(attempt), None, None).0, None)
-
-    def on_output(out: gdata.Node) -> None:
-        if done:
-            return
-        vetoed, free, targeted, unnamed = _vetoed(out, "now")
-        if stage == 0:
-            if len(free) == 1:
-                first = free[0]
-                other = "cpe-2" if first == "cpe-1" else "cpe-1"
-                stage = 1
-                report(first, "in-progress", 0, "17.18.03a")
-                cc = controller
-                if cc is not None:
-                    cc.on_conf(_with_attempt(both, first, 1), edited)
-                report(other, "upgrade-needed", 0, version)
-        elif stage == 1:
-            if free != []:
-                fail("{first} tried again in flight: not vetoed {free}")
-            elif _attempts(out).get(first) == u64(1):
-                stage = 2
-                after 2.5: old_run_ends()
-        elif stage == 2:
-            fail("while the old run of {first} is under way: not vetoed {free}")
-        elif stage == 3 and len(free) == 1:
-            done = True
-            t.success()
-
-    def old_run_ends() -> None:
-        if stage == 2 and not done:
-            stage = 3
-            report(first, "failed", 0, "17.18.03a")
-            report(first, "upgrade-needed", 1, version)
-
-    def timeout() -> None:
-        fail("at stage {stage}, no member was released after the old run ended")
-
-    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, lambda o: None, None)
-
-    def __startup__():
-        controller = ctl
-        ctl.on_conf(_with_attempt(both, "cpe-1", 0), linked)
-        for name in both:
-            report(name, "upgrade-needed", 0, "17.18.03a")
-        ctl.on_subscriptions_synced()
-        after 7.0: timeout()
-
-
-proc def _test_campaign_holds_a_member_with_a_new_attempt_in_flight_until_its_run_ends(t: testing.AsyncT):
-    """A member tried again while its run is under way keeps its slot until
-    that run ends."""
-    _TriedAgainInFlight(t, "17.18.03a")
-
-
-proc def _test_campaign_holds_a_member_with_a_new_attempt_and_image_in_flight_until_its_run_ends(t: testing.AsyncT):
-    """A member tried again while its run is under way, in one edit that
-    also changes the version of its image, keeps its slot until the run of
-    the old target ends."""
-    _TriedAgainInFlight(t, "17.18.04")
-
-
-proc def _test_campaign_holds_a_member_with_a_new_image_in_flight_through_a_pause(t: testing.AsyncT):
-    """Run a campaign over cpe-1 and cpe-2, one at a time; both answer
-    17.18.03a. While the run of the member released first is under way, one
-    edit gives the image the version 17.18.04 and sets the campaign to plan,
-    and the next edit sets it to run again. The other member answers
-    17.18.04. The run of the first member goes on for 17.18.03a, and keeps
-    its slot through the pause, so the other member waits. When that run
-    ends and the member answers 17.18.04, the slot is free and the campaign
-    releases a member."""
-    t.timeout(8.0)
-    both = ["cpe-1", "cpe-2"]
-    linked = _flat_inventory(both).to_gdata()
-    edited = _with_version(_flat_inventory(both), "17.18.04").to_gdata()
-
-    NewImageThroughPauseActor(t=t, both=both, linked=linked, edited=edited)
-
-
-actor NewImageThroughPauseActor(t: testing.AsyncT, both, linked, edited):
-    var controller: ?cfs.UpgradeCampaignTransform = None
-    var stage = 0
-    var done = False
-    var first = ""
-
-    def fail(message: str) -> None:
-        if not done:
-            done = True
-            t.failure(ValueError(message))
-
-    def report(name: str, status: str, target: str) -> None:
-        cc = controller
-        if cc is not None:
-            cc.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
-                      _tagged(status, "now", target), None)
-
-    def on_output(out: gdata.Node) -> None:
-        if done:
-            return
-        vetoed, free, targeted, unnamed = _vetoed(out, "now")
-        if stage == 0:
-            if len(free) == 1:
-                first = free[0]
-                other = "cpe-2" if first == "cpe-1" else "cpe-1"
-                stage = 1
-                report(first, "in-progress", "17.18.03a")
-                cc = controller
-                if cc is not None:
-                    cc.on_conf(_now_campaign("plan", both), edited)
-                    report(other, "upgrade-needed", "17.18.04")
-                    cc.on_conf(_now_campaign("run", both), edited)
-                after 2.5: old_run_ends()
-        elif stage == 1 and free != []:
-            fail("while the old run of {first} is under way: not vetoed {free}")
-        elif stage == 2 and len(free) == 1:
-            done = True
-            t.success()
-
-    def old_run_ends() -> None:
-        if stage == 1 and not done:
-            stage = 2
-            report(first, "succeeded", "17.18.03a")
-            report(first, "upgrade-needed", "17.18.04")
-
-    def timeout() -> None:
-        fail("at stage {stage}, no member was released after the old run ended")
-
-    ctl = cfs.UpgradeCampaignTransform(_campaign_path("now"), on_output, lambda o: None, None)
-
-    def __startup__():
-        controller = ctl
-        ctl.on_conf(_now_campaign("run", both), linked)
-        for name in both:
-            report(name, "upgrade-needed", "17.18.03a")
-        ctl.on_subscriptions_synced()
-        after 7.0: timeout()
-
-
 actor _test_campaign_counts_a_failed_member_that_joins_again_as_failed(t: testing.AsyncT):
     """A member that failed, left the campaign and joined it again with the
     same attempt counts as failed, and is not released again: its device
@@ -5316,107 +5457,6 @@ actor RunsAgainActor(t: testing.AsyncT, names, soon):
         after 5.0: timeout()
 
 
-proc def _NewImage(t: testing.AsyncT, released: bool):
-    """A campaign over cpe-1 alone, and a new version of its image. When
-    released is False, the campaign is soon, with allow-staging: cpe-1 is
-    let prepare at once, and the new version stops that; once cpe-1
-    answers the new version, it is let prepare again, at once. When
-    released is True, the campaign is now: cpe-1 is released and succeeds,
-    and the new version makes it wait again; once it answers the new
-    version, the campaign releases it again."""
-    t.timeout(6.0)
-    names = ["cpe-1"]
-    now = time.time().unix_s()
-    soon = _soon(names, "run", True, now)
-    campaign = _now_campaign("run", names) if released else soon.0
-    name = "now" if released else "soon"
-    old = (_flat_inventory(names) if released else soon.1).to_gdata()
-    newer = _with_version(_flat_inventory(names) if released else _soon(names, "run", True, now).1,
-                          "17.18.04").to_gdata()
-
-    NewImageActor(t=t, released=released, names=names, campaign=campaign, name=name, old=old,
-                  newer=newer)
-
-
-actor NewImageActor(t: testing.AsyncT, released: bool, names, campaign, name, old, newer):
-    var controller: ?cfs.UpgradeCampaignTransform = None
-    var stage = 0
-    var done = False
-
-    def fail(message: str) -> None:
-        if not done:
-            done = True
-            t.failure(ValueError(message))
-
-    def report(status: str, target: str) -> None:
-        cc = controller
-        if cc is not None:
-            cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
-                      _tagged(status, name, target), None)
-
-    def on_output(out: gdata.Node) -> None:
-        if done:
-            return
-        vetoed, free, targeted, unnamed = _vetoed(out, name)
-        staged = _staged(out)
-        # Whether cpe-1 is let go for its target: released, or let prepare.
-        going = False
-        if released:
-            if free == names:
-                going = True
-        elif staged == names:
-            going = True
-        cc = controller
-        if cc is not None:
-            if stage == 0 and going:
-                if released:
-                    stage = 1
-                    report("succeeded", "17.18.03a")
-                else:
-                    stage = 2
-                    cc.on_conf(campaign, newer)
-            elif stage == 1 and vetoed == names:
-                stage = 2
-                cc.on_conf(campaign, newer)
-            elif stage == 2:
-                if going:
-                    fail("cpe-1 let go with the new image before it answered")
-                else:
-                    stage = 3
-                    report("upgrade-needed", "17.18.04")
-            elif stage == 3 and going:
-                done = True
-                t.success()
-
-    def timeout() -> None:
-        fail("at stage {stage}, cpe-1 was not let go for the new image")
-
-    ctl = cfs.UpgradeCampaignTransform(_campaign_path(name), on_output, lambda o: None, None)
-
-    def __startup__():
-        controller = ctl
-        ctl.on_conf(campaign, old)
-        report("upgrade-needed", "17.18.03a")
-        ctl.on_subscriptions_synced()
-        after 5.0: timeout()
-
-
-actor _test_campaign_lets_a_member_prepare_a_new_image(t: testing.AsyncT):
-    """A member let prepare is let again, for a new version of its image,
-    once it answers that version."""
-
-    def __startup__():
-        _NewImage(t, False)
-
-
-actor _test_campaign_upgrades_a_done_member_to_a_new_image(t: testing.AsyncT):
-    """A member that is done is released again for a new version of its
-    image, once it answers that version."""
-
-    def __startup__():
-        _NewImage(t, True)
-
-
 proc def _test_campaign_in_plan_replans_on_answers(t: testing.AsyncT):
     """A campaign in plan plans again when its members answer: the alarm
     that names the members that have not answered goes once they
@@ -5868,28 +5908,23 @@ proc def _PrepareTurn(t: testing.AsyncT, event: str):
     - "prepared": cpe-1 reports its prepare done.
     - "failed": cpe-1 is down at its turn: its prepare fails.
     - "run to plan": the campaign is set to plan.
-    - "image": the image gets a new version. The transform function on
-      the output written last lets no member prepare either.
 
-    After "prepared", "failed", "run to plan" and "image", the next output
-    must hold every member and let no member prepare."""
-    turn: ?gdata.Node = None
+    After "prepared", "failed" and "run to plan", the next output must hold
+    every member and let no member prepare."""
     done = False
     names = ["cpe-1", "cpe-2", "cpe-3"]
     now = time.time().unix_s()
     first = "cpe-2" if event == "down" else "cpe-1"
     soon = _soon(names, _soon_state(event), True, now)
     linked = soon.1.to_gdata()
-    newer = _with_version(_soon(names, "run", True, now).1, "17.18.04").to_gdata()
 
-    PrepareTurnActor(t=t, event=event, _initial_turn=turn, _initial_done=done, names=names, now=now, first=first, soon=soon, linked=linked, newer=newer)
+    PrepareTurnActor(t=t, event=event, _initial_done=done, names=names, now=now, first=first, soon=soon, linked=linked)
 
 
-actor PrepareTurnActor(t: testing.AsyncT, event: str, _initial_turn: ?gdata.Node, _initial_done, names, now, first, soon, linked, newer):
+actor PrepareTurnActor(t: testing.AsyncT, event: str, _initial_done, names, now, first, soon, linked):
     var controller: ?cfs.UpgradeCampaignTransform = None
     var phase = 0
     var ran = False
-    var turn: ?gdata.Node = _initial_turn
     var done = _initial_done
 
     def fail(message: str) -> None:
@@ -5916,8 +5951,6 @@ actor PrepareTurnActor(t: testing.AsyncT, event: str, _initial_turn: ?gdata.Node
         elif cc is not None:
             if event == "run to plan":
                 cc.on_conf(_soon(names, "plan", True, now).0, linked)
-            elif event == "image":
-                cc.on_conf(soon.0, newer)
 
     def on_output(out: gdata.Node) -> None:
         if done:
@@ -5935,18 +5968,9 @@ actor PrepareTurnActor(t: testing.AsyncT, event: str, _initial_turn: ?gdata.Node
                 succeed()
             else:
                 phase = 1
-                turn = out
                 act()
         elif vetoed != names or staged != []:
             fail("after {event}: vetoed {vetoed}, let prepare {staged}")
-        elif event == "image":
-            last = turn
-            if last is not None:
-                again = cfs.UpgradeCampaign().transform(soon.0, newer, None, last).0.to_gdata()
-                if _staged(again) != []:
-                    fail("after the image change the function lets {_staged(again)} prepare")
-                else:
-                    succeed()
         else:
             succeed()
 
@@ -6021,14 +6045,6 @@ actor _test_campaign_run_to_plan_ends_the_turns(t: testing.AsyncT):
 
     def __startup__():
         _PrepareTurn(t, "run to plan")
-
-
-actor _test_campaign_image_change_ends_a_turn(t: testing.AsyncT):
-    """A new image version stops the prepare of the old target: the campaign
-    lets no member prepare until it answers the new target."""
-
-    def __startup__():
-        _PrepareTurn(t, "image")
 
 
 proc def _test_campaign_without_allow_staging_prepares_nothing(t: testing.AsyncT):
@@ -6346,28 +6362,20 @@ actor TestCampaignShowsThePreparesActor(t: testing.AsyncT, _initial_done, names,
 
 
 
-proc def _PrepareAlarm(t: testing.AsyncT, event: str):
+proc def _test_campaign_forgets_the_prepare_of_a_member_that_goes(t: testing.AsyncT):
     """Run the campaign soon over cpe-1 and cpe-2 with allow-staging. cpe-1
     failed to prepare, and cpe-2 has prepared. Once the campaign shows the
-    alarm for cpe-1 and counts cpe-2 as prepared, the event happens:
-
-    - "gone": cpe-1's state goes, as when its flotilla no longer has it.
-    - "image": the image gets a new version, so neither prepare is for the
-      campaign's intent any more.
-
-    The campaign must then drop the alarm. cpe-2 still counts as prepared
-    after "gone", and no longer after "image"."""
+    alarm for cpe-1 and counts cpe-2 as prepared, cpe-1's state goes, as
+    when its flotilla no longer has it. The campaign drops the alarm, and
+    cpe-2 still counts as prepared."""
     names = ["cpe-1", "cpe-2"]
-    now = time.time().unix_s()
-    soon = _soon(names, "run", True, now)
-    newer = _with_version(_soon(names, "run", True, now).1, "17.18.04").to_gdata()
+    soon = _soon(names, "run", True, time.time().unix_s())
     alarm = "1 device(s) failed to prepare and copy the image in their window: cpe-1"
-    after_event = u64(1) if event == "gone" else u64(0)
 
-    PrepareAlarmActor(t=t, event=event, soon=soon, newer=newer, alarm=alarm, after_event=after_event)
+    PrepareAlarmActor(t=t, soon=soon, alarm=alarm)
 
 
-actor PrepareAlarmActor(t: testing.AsyncT, event: str, soon, newer, alarm, after_event):
+actor PrepareAlarmActor(t: testing.AsyncT, soon, alarm):
     var controller: ?cfs.UpgradeCampaignTransform = None
     var phase = 0
     var done = False
@@ -6387,17 +6395,13 @@ actor PrepareAlarmActor(t: testing.AsyncT, event: str, soon, newer, alarm, after
             if alarm not in alarms:
                 return
             if o.state.prepared != u64(1):
-                fail("before {event}: prepared {o.state.prepared}")
+                fail("before cpe-1 went: prepared {o.state.prepared}")
             elif cc is not None:
                 phase = 1
-                if event == "gone":
-                    cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), None,
-                              None)
-                else:
-                    cc.on_conf(soon.0, newer)
+                cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"), None, None)
         elif alarm not in alarms:
-            if o.state.prepared != after_event:
-                fail("after {event}: prepared {o.state.prepared}")
+            if o.state.prepared != u64(1):
+                fail("after cpe-1 went: prepared {o.state.prepared}")
             else:
                 done = True
                 t.success()
@@ -6413,24 +6417,8 @@ actor PrepareAlarmActor(t: testing.AsyncT, event: str, soon, newer, alarm, after
         ctl.on_rfs((rfs_name=cfs.flotilla_of("cpe-2"), device_name="cpe-2"),
                    _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "done", "17.18.03a"), None)
         ctl.on_subscriptions_synced()
-        after 5.0: fail("at phase {phase} of {event}, the alarm stayed")
+        after 5.0: fail("at phase {phase}, the alarm stayed")
 
-
-
-actor _test_campaign_forgets_the_prepare_of_a_member_that_goes(t: testing.AsyncT):
-    """A member whose state goes takes its failed prepare, and the alarm
-    for it, with it."""
-
-    def __startup__():
-        _PrepareAlarm(t, "gone")
-
-
-actor _test_campaign_image_change_ends_the_prepare_alarm(t: testing.AsyncT):
-    """A new image version makes the prepares of the old target stale: the
-    alarm for a failed prepare goes, and a done prepare no longer counts."""
-
-    def __startup__():
-        _PrepareAlarm(t, "image")
 
 
 actor _NoticePlan(t: testing.AsyncT, paused: bool):
@@ -6692,3 +6680,819 @@ actor TestCampaignKeepsRunSinceThroughAPauseAndARestartActor(t: testing.EnvT, fs
 
     def __startup__():
         layer.edit_config(root.to_gdata(), None, ran)
+
+
+#############################################################################
+# The image lock: the campaign keeps the image of each member that it has
+# let prepare or released
+#############################################################################
+
+def _lock_campaign(admin_state: str, members: list[(str, str, int)]) -> InputCampaign:
+    """Campaign A in admin_state over members, each as (device, image,
+    attempt), in one window that is open now."""
+    campaign = InputCampaign(name="A", admin_state=admin_state)
+    for m in members:
+        campaign.device.create(m.0, image=m.1, attempt=u64(m.2))
+    return campaign
+
+
+def _lock_rows(out: ?gdata.Node) -> list[str]:
+    """Each device in out, written by a campaign, as "device campaign target
+    attempt held", or free without its campaign's veto, with " locked" when
+    it has image-locked and " failed" when it has attempt-failed, sorted."""
+    lines: list[str] = []
+    if out is not None:
+        for flotilla in y_1.root.from_gdata(out).rfs:
+            for dev in flotilla.device:
+                sw = dev.software
+                c = sw.upgrade_campaign
+                if c is not None:
+                    written = sw.attempt
+                    attempt = written if written is not None else u64(0)
+                    held = "held" if sw.veto.get(cfs.veto_holder(c)) is not None else "free"
+                    marks = ""
+                    locked = sw.image_locked
+                    if locked is not None and locked:
+                        marks += " locked"
+                    failed = sw.attempt_failed
+                    if failed is not None and failed:
+                        marks += " failed"
+                    lines.append("{dev.name} {c} {sw.target_release} {attempt} {held}{marks}")
+    return sorted(lines)
+
+
+actor _CaseResults(t: testing.EnvT, names: list[str]):
+    """Collect the result of each case, and pass t when every case
+    passes."""
+    var results: dict[str, ?str] = {}
+    var done = False
+
+    def on_case(name: str, error: ?str) -> None:
+        if done:
+            return
+        results[name] = error
+        if len(results) == len(names):
+            done = True
+            failed = ["{n}: {results[n]}" for n in names if results[n] is not None]
+            if len(failed) == 0:
+                t.success()
+            else:
+                t.failure(ValueError("; ".join(failed)))
+
+
+actor MarksActor(case: str, conf: InputCampaign, linked: gdata.Node,
+                 reports: list[(str, y1_oper.stratoweave_rfs__rfs__device__state)], late: bool,
+                 status: str, want: list[str], report: action(str, ?str) -> None):
+    """Run the actor of campaign conf over linked, tell it reports, each as
+    (device, state), and sync, or sync first when late. Report case, and
+    what went wrong or None, once cpe-1 shows status and the output written
+    last has the marks want, as _mark_rows() gives them."""
+    var marked: list[str] = []
+    var seen = "nothing"
+    var done = False
+
+    def finish(error: ?str) -> None:
+        if not done:
+            done = True
+            report(case, error)
+
+    def on_output(out: gdata.Node) -> None:
+        marked = _mark_rows(out)
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if oper is not None:
+            r = oper.state.device_status.get("cpe-1")
+            got = r.status if r is not None else None
+            seen = "cpe-1 {got}, marked {marked}"
+            if got == status and marked == want:
+                finish(None)
+
+    def timeout() -> None:
+        finish(seen)
+
+    def __startup__():
+        ctl = cfs.UpgradeCampaignTransform(_campaign_path(conf.name), self.on_output,
+                                           self.on_oper, None)
+        ctl.on_conf(conf, linked)
+        if late:
+            ctl.on_subscriptions_synced()
+        for r in reports:
+            ctl.on_rfs((rfs_name=cfs.flotilla_of(r.0), device_name=r.0), r.1, None)
+        if not late:
+            ctl.on_subscriptions_synced()
+        after now 5.0: timeout()
+
+
+proc def _test_campaign_marks_its_members(t: testing.EnvT):
+    """The actor marks image-locked each member that it lets prepare or
+    releases. A member that waits or that is up to date is not marked. The
+    actor marks attempt-failed each member whose attempt failed, rolled
+    back, failed its rollback or did not start, in run and in plan, also
+    when the report comes after the replay."""
+    t.timeout(10.0)
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    now = time.time().unix_s()
+    linked = _rules_inventory(RULES_IMAGES).to_gdata()
+    soon = _soon(names, "run", True, now)
+    run = _lock_campaign("run", [("cpe-1", IMAGE, 0)])
+    plan = _lock_campaign("plan", [("cpe-1", IMAGE, 0)])
+    answered = [(name, _tagged("upgrade-needed", "soon", "17.18.03a")) for name in names]
+    # (case, the campaign, its linked input, what each device reports, the
+    # status of cpe-1 once it is published, and the members marked)
+    cases: list[(str, InputCampaign, gdata.Node,
+                 list[(str, y1_oper.stratoweave_rfs__rfs__device__state)], str, list[str])] = [
+        ("let prepare", soon.0, soon.1.to_gdata(), answered, "upgrade-needed", ["cpe-1 locked"]),
+        ("released", run, linked, [("cpe-1", _tagged("upgrade-needed", "A", "17.18.03a"))],
+         "upgrade-needed", ["cpe-1 locked"]),
+        ("up to date", run, linked, [("cpe-1", _tagged("up-to-date", "A", "17.18.03a"))],
+         "up-to-date", []),
+        ("waits in plan", plan, linked, [("cpe-1", _tagged("upgrade-needed", "A", "17.18.03a"))],
+         "upgrade-needed", []),
+        ("failed", plan, linked, [("cpe-1", _tagged("failed", "A", "17.18.03a"))], "failed",
+         ["cpe-1 failed"]),
+        ("failed, in run", run, linked, [("cpe-1", _tagged("failed", "A", "17.18.03a"))],
+         "failed", ["cpe-1 failed"]),
+        ("rolled back", plan, linked, [("cpe-1", _tagged("rolled-back", "A", "17.18.03a"))],
+         "rolled-back", ["cpe-1 failed"]),
+        ("failed its rollback", plan, linked,
+         [("cpe-1", _attempt_state("failed", "A", "17.18.03a", u64(0), "rollback", None).0)],
+         "failed", ["cpe-1 failed"]),
+        ("not started", plan, linked, [("cpe-1", _tagged("not-started", "A", "17.18.03a"))],
+         "not-started", ["cpe-1 failed"]),
+    ]
+    # The same, with the reports after the sync.
+    late: list[(str, InputCampaign, gdata.Node,
+                list[(str, y1_oper.stratoweave_rfs__rfs__device__state)], str, list[str])] = [
+        ("failed after the replay, in plan", plan, linked,
+         [("cpe-1", _tagged("failed", "A", "17.18.03a"))], "failed", ["cpe-1 failed"]),
+    ]
+    collector = _CaseResults(t, [c.0 for c in cases] + [c.0 for c in late])
+    for c in cases:
+        MarksActor(c.0, c.1, c.2, c.3, False, c.4, c.5, collector.on_case)
+    for c in late:
+        MarksActor(c.0, c.1, c.2, c.3, True, c.4, c.5, collector.on_case)
+
+
+proc def _test_campaign_takes_its_locks_from_memory(t: testing.AsyncT):
+    """A new actor of campaign A, in plan, as after a restart of fleetmgr,
+    marks cpe-1, which the memory locks, and not cpe-2. Once cpe-1 leaves
+    the campaign, it loses the mark, also when it joins again."""
+    t.timeout(6.0)
+    linked = _rules_inventory(RULES_IMAGES).to_gdata()
+    both = _lock_campaign("plan", [("cpe-1", IMAGE, 0), ("cpe-2", IMAGE, 0)])
+    without = _lock_campaign("plan", [("cpe-2", IMAGE, 0)])
+    memory = InputMemory()
+    memory.member.create("cpe-1", image=IMAGE, target_release="17.18.03a", image_locked=True)
+    memory.member.create("cpe-2", image=IMAGE, target_release="17.18.03a")
+    left = InputMemory()
+    left.member.create("cpe-2", image=IMAGE, target_release="17.18.03a")
+    again = InputMemory()
+    again.member.create("cpe-1", image=IMAGE, target_release="17.18.03a")
+    again.member.create("cpe-2", image=IMAGE, target_release="17.18.03a")
+    LocksFromMemoryActor(t=t, linked=linked, both=both, without=without, memory=memory,
+                         left=left, again=again)
+
+
+actor LocksFromMemoryActor(t: testing.AsyncT, linked, both, without, memory, left, again):
+    var outputs: list[list[str]] = []
+    var done = False
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        outputs.append(_mark_rows(out))
+        if len(outputs) == 3:
+            done = True
+            want = [["cpe-1 locked"], [], []]
+            if outputs == want:
+                t.success()
+            else:
+                t.failure(ValueError("marked {outputs}, not {want}"))
+
+    def __startup__():
+        ctl = cfs.UpgradeCampaignTransform(_campaign_path("A"), self.on_output, lambda o: None,
+                                           None)
+        ctl.on_conf(both, linked, memory)
+        ctl.on_conf(without, linked, left)
+        ctl.on_conf(both, linked, again)
+
+
+proc def _test_campaign_marks_a_member_that_an_ask_lets_prepare(t: testing.AsyncT):
+    """Run the campaign soon over cpe-1 to cpe-3 with allow-staging. cpe-1
+    is let prepare at once, and its prepare is done. cpe-3 waits for its
+    turn, and the campaign has not touched it. An operator then raises the
+    prepare-attempt of cpe-3, and the campaign lets cpe-3 prepare at once.
+    Pass t when the write that lets cpe-3 prepare marks it image-locked."""
+    t.timeout(6.0)
+    names = ["cpe-1", "cpe-2", "cpe-3"]
+    now = time.time().unix_s()
+    AskMarksActor(t=t, names=names, soon=_soon(names, "run", True, now),
+                  asked=_asked(names, "cpe-3", now))
+
+
+actor AskMarksActor(t: testing.AsyncT, names, soon, asked):
+    var controller: ?cfs.UpgradeCampaignTransform = None
+    var stage = 0
+    var marked: list[str] = []
+    var done = False
+
+    def fail(message: str) -> None:
+        if not done:
+            done = True
+            t.failure(ValueError(message))
+
+    def on_output(out: gdata.Node) -> None:
+        if done:
+            return
+        staged = _staged(out)
+        marked = _mark_rows(out)
+        cc = controller
+        if stage == 0 and staged == ["cpe-1"] and cc is not None:
+            stage = 1
+            cc.on_rfs((rfs_name=cfs.flotilla_of("cpe-1"), device_name="cpe-1"),
+                      _tagged_prepare("upgrade-needed", "soon", "17.18.03a", "done", "17.18.03a"),
+                      None)
+        elif stage == 2:
+            # The first write after the ask is the one that lets cpe-3.
+            if "cpe-3" in staged and "cpe-3 locked" in marked:
+                done = True
+                t.success()
+            else:
+                fail("the write after the ask lets prepare {staged}, and marks {marked}")
+
+    def on_oper(oper: ?y0_oper.software__software__upgrade_campaign_entry) -> None:
+        if done or oper is None:
+            return
+        r = oper!.state.device_status.get("cpe-1")
+        cc = controller
+        if stage == 1 and r is not None and r.prepare.state == "done" and cc is not None:
+            if "cpe-3 locked" in marked:
+                fail("cpe-3 is marked before the ask")
+                return
+            stage = 2
+            cc.on_conf(asked.0, asked.1.to_gdata())
+
+    def timeout() -> None:
+        fail("at stage {stage}, cpe-3 was not let prepare: marked {marked}")
+
+    def __startup__():
+        ctl = cfs.UpgradeCampaignTransform(_campaign_path("soon"), on_output, self.on_oper, None)
+        controller = ctl
+        ctl.on_conf(soon.0, soon.1.to_gdata())
+        for name in names:
+            ctl.on_rfs((rfs_name=cfs.flotilla_of(name), device_name=name),
+                       _tagged("upgrade-needed", "soon", "17.18.03a"), None)
+        ctl.on_subscriptions_synced()
+        after 5.0: timeout()
+
+
+actor _Wire(write: action(gdata.Node) -> None):
+    """The way from a campaign actor to its transform: it holds the writes
+    of the output, in order, while held."""
+    var held = False
+    var queue: list[gdata.Node] = []
+
+    def output(conf: gdata.Node) -> None:
+        if held:
+            queue.append(conf)
+        else:
+            write(conf)
+
+    def hold() -> None:
+        held = True
+
+    def release_one() -> None:
+        if len(queue) > 0:
+            write(queue[0])
+            queue = queue[1:]
+
+    def waiting() -> int:
+        return len(queue)
+
+
+actor _Campaigns():
+    """The actor of each campaign of a _campaign_stack(), and the _Wire that
+    its writes go through, by the campaign's name."""
+    var acts: dict[str, cfs.UpgradeCampaignTransform] = {}
+    var wires: dict[str, _Wire] = {}
+
+    def register(name: str, a: cfs.UpgradeCampaignTransform, w: _Wire) -> None:
+        acts[name] = a
+        wires[name] = w
+
+    def actor_of(name: str) -> ?cfs.UpgradeCampaignTransform:
+        return acts.get(name)
+
+    def wire_of(name: str) -> ?_Wire:
+        return wires.get(name)
+
+    def clear() -> None:
+        acts = {}
+        wires = {}
+
+
+def _campaign_links(conf: gdata.Node) -> list[ttt.TaggedPath]:
+    """The links of a campaign, as fleetmgr's top generates them: the
+    schedules, the redundancy groups, the image list, and the fleet entry of
+    each member."""
+    res = [ttt.TaggedPath("schedules", gdata.FNode(gdata.Id("urn:fleetmgr:maintenance", "schedules"))),
+           ttt.TaggedPath("redundancy-groups",
+                          gdata.FNode(gdata.Id("urn:fleetmgr:fleetmgr", "redundancy-groups"))),
+           ttt.TaggedPath("images", gdata.FNode(gdata.Id(
+               "http://stratoweave.org/yang/stratoweave-images", "images")))]
+    devices = conf.get_opt_list(gdata.Id("urn:fleetmgr:software", "device"))
+    if devices is not None:
+        for e in devices.elements.values():
+            name = e.get_opt_value(gdata.Id("urn:fleetmgr:software", "name"))
+            if name is not None:
+                res.append(ttt.TaggedPath("inventory", gdata.FNode(
+                    gdata.Id("urn:fleetmgr:fleetmgr", "fleet"), children=[gdata.FNode(
+                        gdata.Id("urn:fleetmgr:fleetmgr", "device"), children=[gdata.FNode(
+                            gdata.Id("urn:fleetmgr:fleetmgr", "name"), value_match=name)])])))
+    return res
+
+
+def _campaign_stack(register: action(str, cfs.UpgradeCampaignTransform, _Wire) -> None,
+                    log_handler: logging.Handler, db: swlmdb.LmdbStore) -> ttt.Layer:
+    """A layer like fleetmgr's top, over a sink, with the campaigns' real
+    transform function and actor. The actors hear from no device: a test
+    tells them what each device reports. register gets each campaign's
+    actor, and the _Wire that its writes go through."""
+    lower = ttt.Sink()
+
+    pure def input(c: gdata.Node):
+        return InputCampaign.from_gdata(c)
+    pure def memory(m: ?gdata.Node):
+        return InputMemory.from_gdata(m) if m is not None else None
+    pure def campaign_name(path: ttt.Path) -> str:
+        return y0_oper.software__software__upgrade_campaign_entry.from_gdata(
+            ttt.path_key_data(path)).name
+
+    def make(params: ttt.TransformActorParams) -> ttt.TransformActor:
+        wire = _Wire(params.write_output)
+        oper = yadata.ToGdataPrevWrapper(params.update_oper)
+        a = cfs.UpgradeCampaignTransform(params.path, wire.output, oper.update, None)
+        register(campaign_name(params.path), a, wire)
+        return ttt.TransformActor(action lambda c, l, m: a.on_conf(input(c), l, memory(m)),
+                                  lambda m: a.shutdown(memory(m)))
+
+    root = ttt.Container({
+        gdata.Id("http://stratoweave.org/yang/stratoweave-images", "images"):
+            ttt.Transform(image_list.ImageList, None, None, lower, log_handler),
+        gdata.Id("urn:fleetmgr:maintenance", "schedules"):
+            ttt.Transform(cfs.Schedules, None, None, lower, log_handler),
+        gdata.Id("urn:fleetmgr:fleetmgr", "fleet"): ttt.Container({
+            gdata.Id("urn:fleetmgr:fleetmgr", "device"):
+                ttt.List(ttt.Transform(cfs.Device, None, None, lower, log_handler),
+                         [gdata.Id("urn:fleetmgr:fleetmgr", "name")])},
+            ns='urn:fleetmgr:fleetmgr', module='fleetmgr'),
+        gdata.Id("urn:fleetmgr:fleetmgr", "redundancy-groups"):
+            ttt.Transform(cfs.RedundancyGroups, None, None, lower, log_handler),
+        gdata.Id("urn:fleetmgr:software", "software"): ttt.Container({
+            gdata.Id("urn:fleetmgr:software", "upgrade-campaign"):
+                ttt.List(ttt.Transform(cfs.UpgradeCampaign, make, _campaign_links, lower,
+                                       log_handler),
+                         [gdata.Id("urn:fleetmgr:software", "name")])},
+            ns='urn:fleetmgr:software', module='software'),
+    })
+    return ttt.Layer("0", root, lower, db)
+
+
+def _published(data: ?gdata.Node, name: str) -> ?y0_oper.software__software__upgrade_campaign_entry:
+    """The campaign name in data, the configuration and state of the layer
+    of the campaigns, when it has published its state."""
+    if data is not None:
+        c = y0_oper.root.from_gdata(data).software.upgrade_campaign.get(name)
+        if c is not None and c.state.total is not None:
+            return c
+    return None
+
+
+def _lock_root(members: list[(str, str, int)], images: list[(str, str, str, int)],
+               concurrency: int) -> y_0.root:
+    """The fleet and the image list images of _rules_inventory(), and
+    campaign A in run over members, each as (device, image, attempt), which
+    upgrades concurrency devices at once, with no stagger, in a window that
+    is open."""
+    root = _rules_inventory(images)
+    campaign = root.software.upgrade_campaign.create("A", admin_state="run",
+                                                     target_concurrency=u64(concurrency),
+                                                     max_concurrency=u64(3), stagger=u64(0))
+    for m in members:
+        campaign.device.create(m.0, image=m.1, attempt=u64(m.2))
+    return root
+
+
+class _LockStep(object):
+    """One step of a _LockActor() case. kind names it, and the step uses the
+    fields that it needs:
+
+    - edit: campaign A over members, the image list images and the
+      concurrency, as _lock_root() takes them; error is "" when TTT
+      accepts the edit, and else a part of the error.
+    - report: device reports status for campaign A and target.
+    - sync: the actor's subscriptions are in sync, so it decides.
+    - hold: hold the actor's writes. release-one: let the first held write
+      go on.
+    - restart: fleetmgr restarts from its database.
+    - queued: the actor has want[0] writes held.
+    - rows: the layer below shows want, as _lock_rows() gives it.
+    - config: the configuration is that of the last edit TTT accepted."""
+    kind: str
+    members: list[(str, str, int)]
+    images: list[(str, str, str, int)]
+    concurrency: int
+    error: str
+    device: str
+    status: str
+    target: str
+    want: list[str]
+
+    def __init__(self, kind: str, members: list[(str, str, int)],
+                 images: list[(str, str, str, int)], concurrency: int, error: str, device: str,
+                 status: str, target: str, want: list[str]):
+        self.kind = kind
+        self.members = members
+        self.images = images
+        self.concurrency = concurrency
+        self.error = error
+        self.device = device
+        self.status = status
+        self.target = target
+        self.want = want
+
+
+def _lock_edit(members: list[(str, str, int)], images: list[(str, str, str, int)]=RULES_IMAGES,
+               concurrency: int=3, error: str="") -> _LockStep:
+    """An edit of campaign A, the image list and the concurrency."""
+    return _LockStep("edit", members, images, concurrency, error, "", "", "", [])
+
+
+def _lock_report(device: str, status: str, target: str="17.18.03a") -> _LockStep:
+    """What device reports to the actor of campaign A."""
+    return _LockStep("report", [], [], 0, "", device, status, target, [])
+
+
+def _lock_step(kind: str, want: list[str]=[]) -> _LockStep:
+    """A step that is not an edit or a report."""
+    return _LockStep(kind, [], [], 0, "", "", "", "", want)
+
+
+proc def _lock_case(case: str, steps: list[_LockStep], fc: file.FileCap,
+                    log_handler: logging.Handler, report: action(str, ?str) -> None) -> None:
+    """Run the steps of case on a _campaign_stack() over an LMDB database of
+    its own, then report the case and what went wrong, or None
+    (_LockActor)."""
+    fs = file.FS(fc)
+    cap = file.WriteFileCap(fc)
+    db_path = fs.mktmpdir("test_campaign_image_lock_")
+    db = swlmdb.LmdbStore(cap, db_path)
+    campaigns = _Campaigns()
+    stack = _campaign_stack(campaigns.register, log_handler, db)
+    _LockActor(case, steps, fs, cap, db_path, db, campaigns, stack, y_0.root(), log_handler,
+               report)
+
+
+actor _LockActor(case: str, steps: list[_LockStep], fs: file.FS, cap: file.WriteFileCap,
+                 db_path: str, _initial_db: swlmdb.LmdbStore, campaigns: _Campaigns,
+                 _initial_stack: ttt.Layer, _initial_root: y_0.root,
+                 log_handler: logging.Handler, report: action(str, ?str) -> None):
+    """Run the steps of case on stack, over the LMDB database at db_path,
+    then report the case and what went wrong, or None. A check looks again
+    every 50 ms, for five seconds at most."""
+    var db = _initial_db
+    var stack = _initial_stack
+    var last = _initial_root
+    var pending = _initial_root
+    var step = 0
+    var tries = 0
+    var done = False
+    var verdict: ?str = None
+
+    def finish(error: ?str) -> None:
+        if done:
+            return
+        done = True
+        verdict = error
+        cleanup(0)
+
+    def cleanup(attempt: int) -> None:
+        """Close the database once no transaction of the stack is open, and
+        remove it."""
+        try:
+            await async db.db.close()
+        except Exception as e:
+            if attempt < 50:
+                after 0.1: cleanup(attempt + 1)
+                return
+            report(case, "the database did not close: {e}")
+            return
+        await async fs.rmtree(db_path)
+        await async fs.rmdir(db_path)
+        report(case, verdict)
+
+    def advance() -> None:
+        step += 1
+        tries = 0
+        after 0.0: run()
+
+    def again(what: str) -> None:
+        tries += 1
+        if tries > 100:
+            finish("step {step} ({steps[step].kind}): {what}")
+        else:
+            after 0.05: run()
+
+    def check(ok: bool, got: str) -> None:
+        if ok:
+            advance()
+        else:
+            again(got)
+
+    def edited(result: value) -> None:
+        if done:
+            return
+        s = steps[step]
+        if isinstance(result, Exception):
+            if s.error == "":
+                finish("step {step}: the edit failed: {result}")
+            elif s.error not in str(result):
+                finish("step {step}: the edit failed with {result}, not {s.error}")
+            else:
+                advance()
+        elif s.error != "":
+            finish("step {step}: the edit was accepted")
+        else:
+            last = pending
+            advance()
+
+    def restart() -> None:
+        """Restart once no transaction of the stack is open: a new stack
+        restores the database of the old one."""
+        try:
+            await async db.db.close()
+        except Exception as e:
+            again("the database did not close: {e}")
+            return
+        db = swlmdb.LmdbStore(cap, db_path)
+        campaigns.clear()
+        stack = _campaign_stack(campaigns.register, log_handler, db)
+        stack.load_from_db(restored, True)
+
+    def restored(error: ?Exception) -> None:
+        if error is not None:
+            finish("step {step}: the restore failed: {error}")
+            return
+        stack.newsession().recompute(recomputed)
+
+    def recomputed(r: value) -> None:
+        if isinstance(r, Exception):
+            finish("step {step}: the recompute after the restart failed: {r}")
+            return
+        advance()
+
+    def on_wire(s: _LockStep, w: _Wire) -> None:
+        k = s.kind
+        if k == "hold":
+            w.hold()
+            advance()
+        elif k == "release-one":
+            w.release_one()
+            advance()
+        else:
+            n = w.waiting()
+            check([str(n)] == s.want, "{n} writes held")
+
+    def on_actor(s: _LockStep, a: cfs.UpgradeCampaignTransform) -> None:
+        if s.kind == "report":
+            state = _attempt_state(s.status, "A", s.target, u64(0), None, None).0
+            a.on_rfs((rfs_name=cfs.flotilla_of(s.device), device_name=s.device), state, None)
+        else:
+            a.on_subscriptions_synced()
+        advance()
+
+    def run() -> None:
+        if done:
+            return
+        if step == len(steps):
+            finish(None)
+            return
+        s = steps[step]
+        k = s.kind
+        if k == "edit":
+            pending = _lock_root(s.members, s.images, s.concurrency)
+            d = gdata.diff(last.to_gdata(), pending.to_gdata())
+            if d is not None:
+                stack.edit_config(d, None, edited)
+            else:
+                finish("step {step}: the edit changes nothing")
+        elif k == "restart":
+            restart()
+        elif k == "rows":
+            got = _lock_rows(stack.below().get())
+            check(got == s.want, "rows {got}")
+        elif k == "config":
+            d = gdata.diff(last.to_gdata(), y_0.root.from_gdata(stack.get()).to_gdata())
+            check(d is None, "the configuration differs from that of the last edit: "
+                  + (d.prsrc() if d is not None else ""))
+        elif k == "hold" or k == "release-one" or k == "queued":
+            w = campaigns.wire_of("A")
+            if w is not None:
+                on_wire(s, w)
+            else:
+                again("no actor of A")
+        else:
+            a = campaigns.actor_of("A")
+            c = _published(stack.get_data(), "A")
+            if a is not None and c is not None:
+                on_actor(s, a)
+            else:
+                again("no state of A")
+
+    def __startup__():
+        after 0.0: run()
+
+
+proc def _lock_cases(t: testing.EnvT, cases: list[(str, list[_LockStep])]) -> None:
+    """Run each case on a _lock_case() of its own, all at once, and pass t
+    when every case passes."""
+    t.timeout(60.0)
+    fc = file.FileCap(t.env.cap)
+    collector = _CaseResults(t, [c.0 for c in cases])
+    for case in cases:
+        _lock_case(case.0, case.1, fc, t.log_handler, collector.on_case)
+
+
+# Campaign A over cpe-1 to cpe-3: cpe-1 and cpe-3 answer, and are released
+# one after the other and marked. cpe-1 succeeds and cpe-3 fails. cpe-2
+# does not answer, and the campaign has not touched it.
+LOCK_MEMBERS = [("cpe-1", IMAGE, 0), ("cpe-2", IMAGE, 0), ("cpe-3", IMAGE, 0)]
+
+
+def _touched_two() -> list[_LockStep]:
+    """The steps that bring campaign A to LOCK_MEMBERS."""
+    return [
+        _lock_edit(LOCK_MEMBERS),
+        _lock_report("cpe-1", "upgrade-needed"),
+        _lock_report("cpe-3", "upgrade-needed"),
+        _lock_step("sync"),
+        _lock_step("rows", ["cpe-1 A 17.18.03a 0 free locked", "cpe-2 A 17.18.03a 0 held",
+                            "cpe-3 A 17.18.03a 0 held"]),
+        _lock_report("cpe-1", "succeeded"),
+        _lock_step("rows", ["cpe-1 A 17.18.03a 0 held locked", "cpe-2 A 17.18.03a 0 held",
+                            "cpe-3 A 17.18.03a 0 free locked"]),
+        _lock_report("cpe-3", "failed"),
+        _lock_step("rows", ["cpe-1 A 17.18.03a 0 held locked", "cpe-2 A 17.18.03a 0 held",
+                            "cpe-3 A 17.18.03a 0 held locked failed"]),
+    ]
+
+
+proc def _test_campaign_rejects_an_edit_of_a_touched_member(t: testing.EnvT):
+    """On a layer like fleetmgr's top: after LOCK_MEMBERS, an edit that
+    gives cpe-1 another image fails and names it, and so do an edit of the
+    image list that gives IMAGE a new version, and one that removes IMAGE,
+    which name cpe-1 and cpe-3. Each leaves the configuration and the
+    intent as they were. Moving the file of IMAGE, another image for cpe-2,
+    and removing cpe-1 are accepted; added again with another image, cpe-1
+    is a new member."""
+    held = ["cpe-1 A 17.18.03a 0 held locked", "cpe-2 A 17.18.03a 0 held",
+            "cpe-3 A 17.18.03a 0 held locked failed"]
+    newer = [(IMAGE, "17.18.04", "", IMAGE_SIZE), (OTHER_IMAGE, "17.18.04", "", IMAGE_SIZE)]
+    removed = [(OTHER_IMAGE, "17.18.04", "", IMAGE_SIZE)]
+    moved = [(IMAGE, "17.18.03a", "iosxe/17.18/" + IMAGE, IMAGE_SIZE),
+             (OTHER_IMAGE, "17.18.04", "", IMAGE_SIZE)]
+    other_two = [("cpe-1", IMAGE, 0), ("cpe-2", OTHER_IMAGE, 0), ("cpe-3", IMAGE, 0)]
+    _lock_cases(t, [
+        ("touched members keep their image", _touched_two() + [
+            _lock_edit([("cpe-1", OTHER_IMAGE, 0), ("cpe-2", IMAGE, 0), ("cpe-3", IMAGE, 0)],
+                       error=_kept_image("cpe-1")),
+            _lock_edit(LOCK_MEMBERS, newer, error=_kept_image("cpe-1, cpe-3")),
+            _lock_edit(LOCK_MEMBERS, removed, error=_kept_image("cpe-1, cpe-3")),
+            _lock_step("config"),
+            _lock_step("rows", held),
+            _lock_edit(LOCK_MEMBERS, moved),
+            _lock_edit(other_two, moved),
+            _lock_step("rows", ["cpe-1 A 17.18.03a 0 held locked", "cpe-2 A 17.18.04 0 held",
+                                "cpe-3 A 17.18.03a 0 held locked failed"]),
+            _lock_edit([("cpe-2", OTHER_IMAGE, 0), ("cpe-3", IMAGE, 0)], moved),
+            _lock_edit([("cpe-1", OTHER_IMAGE, 0), ("cpe-2", OTHER_IMAGE, 0), ("cpe-3", IMAGE, 0)],
+                       moved),
+            _lock_step("rows", ["cpe-1 A 17.18.04 0 held", "cpe-2 A 17.18.04 0 held",
+                                "cpe-3 A 17.18.03a 0 held locked failed"]),
+        ]),
+    ])
+
+
+proc def _test_campaign_rejects_a_new_attempt_of_a_member_that_did_not_fail(t: testing.EnvT):
+    """On a layer like fleetmgr's top: after LOCK_MEMBERS, an edit that
+    gives cpe-1, which succeeded, a new attempt fails and names it, and so
+    does one that gives cpe-2, which waits, a new attempt; each leaves the
+    configuration as it was. A new attempt with another image for cpe-3,
+    which failed, fails too. A new attempt for cpe-3 alone is accepted: it
+    keeps its image, and is no longer marked attempt-failed."""
+    _lock_cases(t, [
+        ("a new attempt only for a failed member", _touched_two() + [
+            _lock_edit([("cpe-1", IMAGE, 1), ("cpe-2", IMAGE, 0), ("cpe-3", IMAGE, 0)],
+                       error=_no_attempt("cpe-1")),
+            _lock_edit([("cpe-1", IMAGE, 0), ("cpe-2", IMAGE, 1), ("cpe-3", IMAGE, 0)],
+                       error=_no_attempt("cpe-2")),
+            _lock_step("config"),
+            _lock_edit([("cpe-1", IMAGE, 0), ("cpe-2", IMAGE, 0), ("cpe-3", OTHER_IMAGE, 1)],
+                       error=_kept_image("cpe-3")),
+            _lock_edit([("cpe-1", IMAGE, 0), ("cpe-2", IMAGE, 0), ("cpe-3", IMAGE, 1)]),
+            _lock_step("rows", ["cpe-1 A 17.18.03a 0 held locked", "cpe-2 A 17.18.03a 0 held",
+                                "cpe-3 A 17.18.03a 1 held locked"]),
+        ]),
+    ])
+
+
+proc def _test_campaign_keeps_its_rules_after_an_edit_that_only_removes_members(t: testing.EnvT):
+    """On a layer like fleetmgr's top: after LOCK_MEMBERS, an edit that
+    only removes cpe-2 keeps the rules for the members that stay. Then an
+    edit that gives cpe-1, which succeeded, a new attempt or another image
+    fails, and a new attempt for cpe-3, which failed, is accepted."""
+    t.skip("TTT does not run a transform for an edit that only removes links: https://github.com/stratoweave/stratoweave/issues/827")
+    _lock_cases(t, [
+        ("a removal", _touched_two() + [
+            _lock_edit([("cpe-1", IMAGE, 0), ("cpe-3", IMAGE, 0)]),
+            _lock_step("rows", ["cpe-1 A 17.18.03a 0 held locked",
+                                "cpe-3 A 17.18.03a 0 held locked failed"]),
+            _lock_edit([("cpe-1", IMAGE, 1), ("cpe-3", IMAGE, 0)], error=_no_attempt("cpe-1")),
+            _lock_edit([("cpe-1", OTHER_IMAGE, 0), ("cpe-3", IMAGE, 0)],
+                       error=_kept_image("cpe-1")),
+            _lock_step("config"),
+            _lock_edit([("cpe-1", IMAGE, 0), ("cpe-3", IMAGE, 1)]),
+        ]),
+    ])
+
+
+proc def _test_campaign_keeps_its_locks_through_a_restart(t: testing.EnvT):
+    """On a layer like fleetmgr's top, campaign A releases cpe-1, and
+    fleetmgr restarts with no edit in between. The recompute after the
+    restart succeeds, the new actor marks cpe-1, and an edit that gives
+    cpe-1 another image fails."""
+    members = [("cpe-1", IMAGE, 0), ("cpe-2", IMAGE, 0)]
+    _lock_cases(t, [
+        ("a restart", [
+            _lock_edit(members),
+            _lock_report("cpe-1", "upgrade-needed"),
+            _lock_step("sync"),
+            _lock_step("rows", ["cpe-1 A 17.18.03a 0 free locked", "cpe-2 A 17.18.03a 0 held"]),
+            _lock_step("restart"),
+            _lock_step("rows", ["cpe-1 A 17.18.03a 0 held locked", "cpe-2 A 17.18.03a 0 held"]),
+            _lock_edit([("cpe-1", OTHER_IMAGE, 0), ("cpe-2", IMAGE, 0)],
+                       error=_kept_image("cpe-1")),
+        ]),
+    ])
+
+
+proc def _test_campaign_lets_an_edit_overtake_a_release(t: testing.EnvT):
+    """On a layer like fleetmgr's top, campaign A decides to release cpe-1
+    at 17.18.03a, but the write of the release waits, and an edit gives
+    cpe-1 OTHER_IMAGE first: TTT accepts it, as the campaign has not
+    touched cpe-1 yet.
+
+    The write of the release lands then, with the mark of cpe-1 at the old
+    target. Then:
+
+    - "the release lands late": an edit that changes nothing of cpe-1 is
+      accepted, and gives cpe-1 the campaign's veto at 17.18.04, without
+      the mark; so does the recompute after a restart, and then cpe-1 takes
+      its first image again.
+    - "the first image again": an edit that gives cpe-1 IMAGE again before
+      the next write of the actor lands is accepted, and gives cpe-1 the
+      campaign's veto at 17.18.03a, without the mark: the release that the
+      edit before overtook does not come back.
+    - "the actor takes the release back": the write of the actor after the
+      edit follows: cpe-1 has the campaign's veto at 17.18.04, without the
+      mark."""
+    one = [("cpe-1", IMAGE, 0)]
+    other = [("cpe-1", OTHER_IMAGE, 0)]
+    overtaken = [
+        _lock_edit(one),
+        _lock_report("cpe-1", "upgrade-needed"),
+        _lock_step("hold"),
+        _lock_step("sync"),
+        _lock_step("queued", ["1"]),
+        _lock_edit(other),
+        _lock_step("queued", ["2"]),
+        _lock_step("release-one"),
+        _lock_step("rows", ["cpe-1 A 17.18.03a 0 free locked"]),
+    ]
+    _lock_cases(t, [
+        ("the release lands late", overtaken + [
+            _lock_edit(other, concurrency=2),
+            _lock_step("rows", ["cpe-1 A 17.18.04 0 held"]),
+            _lock_step("restart"),
+            _lock_step("rows", ["cpe-1 A 17.18.04 0 held"]),
+            _lock_edit(one, concurrency=2),
+        ]),
+        ("the first image again", overtaken + [
+            _lock_edit(one),
+            _lock_step("rows", ["cpe-1 A 17.18.03a 0 held"]),
+        ]),
+        ("the actor takes the release back", overtaken + [
+            _lock_step("release-one"),
+            _lock_step("rows", ["cpe-1 A 17.18.04 0 held"]),
+        ]),
+    ])

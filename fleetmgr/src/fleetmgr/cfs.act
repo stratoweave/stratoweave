@@ -643,7 +643,8 @@ def veto_holder(campaign: str) -> str:
 def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_entry,
                    i: y_0.software__software__upgrade_campaign_entry,
                    image: ?y_0.stratoweave_images__images__image_entry, attempt: u64,
-                   prepare_attempt: u64, url_base: ?str, held: bool, prepare: bool) -> None:
+                   prepare_attempt: u64, url_base: ?str, held: bool, prepare: bool,
+                   locked: bool, failed: bool) -> None:
     """Write the software intent of campaign i for one device to its
     flotilla. The intent is the campaign's name, the release of the
     device's image, the member's attempt and prepare attempt, the URL to
@@ -654,7 +655,11 @@ def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_
     too: the device reads the release it runs, but does not install the
     target. When held and prepare are true, allow-staging is written as
     true: the device may prepare the target while the veto holds the
-    install. Otherwise allow-staging is left out, which means false."""
+    install. Otherwise allow-staging is left out, which means false. When
+    locked is true, image-locked is written as true: the campaign has let
+    the device prepare or released it. When failed is true, attempt-failed
+    is written as true: the attempt of the device failed. Otherwise each
+    is left out."""
     software = o.rfs.create(flotilla_of(fleet_device.name)).device.create(fleet_device.name).software
     software.upgrade_campaign = i.name
     software.attempt = attempt
@@ -670,6 +675,10 @@ def route_software(o: y_1_loose.root, fleet_device: y_0.fleetmgr__fleet__device_
         software.veto.create(veto_holder(i.name), reason=CAMPAIGN_VETO_REASON)
         if prepare:
             software.allow_staging = True
+    if locked:
+        software.image_locked = True
+    if failed:
+        software.attempt_failed = True
 
 
 def image_file(image: y_0.stratoweave_images__images__image_entry) -> str:
@@ -720,7 +729,8 @@ def member_prepare_attempts(i: y_0.software__software__upgrade_campaign_entry) -
 
 
 def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory: y_0.root,
-                    unheld: set[str], allowed: set[str], names: ?set[str]) -> y_1_loose.root:
+                    unheld: set[str], allowed: set[str], names: ?set[str],
+                    locked: ?set[str]=None, failed: ?set[str]=None) -> y_1_loose.root:
     """Return the software intent of campaign i for its members, or only for
     the members in names when names is not None.
 
@@ -729,8 +739,11 @@ def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory
     and has a version. Each member also gets the campaign's veto, except
     when the campaign runs and the member is in unheld, the members in
     flight. When the campaign runs with allow-staging, each member with the
-    veto that is in allowed, the members let prepare, gets allow-staging. A
-    member that is not in the fleet gets nothing."""
+    veto that is in allowed, the members let prepare, gets allow-staging.
+    Each member in locked, the members that the campaign has let prepare
+    or released, gets image-locked, and each member in failed, the members
+    whose attempt failed, gets attempt-failed. A member that is not in the
+    fleet gets nothing."""
     o = base.o_root()
     run = i.admin_state == "run"
     staging = False
@@ -755,8 +768,15 @@ def campaign_config(i: y_0.software__software__upgrade_campaign_entry, inventory
             prepare = False
             if staging and member.name in allowed:
                 prepare = True
+            lock = False
+            if locked is not None and member.name in locked:
+                lock = True
+            fail = False
+            if failed is not None and member.name in failed:
+                fail = True
             route_software(o, fleet_device, i, member_image(inventory, member.image),
-                           member.attempt, member.prepare_attempt, url_base, held, prepare)
+                           member.attempt, member.prepare_attempt, url_base, held, prepare,
+                           lock, fail)
     return o
 
 
@@ -791,62 +811,199 @@ def image_alarms(i: y_0.software__software__upgrade_campaign_entry, inventory: y
     return alarms
 
 
-def written_in(prev: ?ygdata.Node, i: y_0.software__software__upgrade_campaign_entry,
-               inventory: y_0.root) -> (set[str], set[str]):
-    """Return the members in flight and the members let prepare in prev, the
-    output campaign i wrote last. A member is in flight when prev gives it
-    the campaign's name without the campaign's veto. A member is let
-    prepare when prev gives it the campaign's name and allow-staging, with
-    the target release that the campaign gives it now. Either needs the
-    attempt that the campaign gives the member now: a member with a new
-    attempt is a new member. A campaign that does not run has neither, and one
-    without allow-staging has no member let prepare."""
-    unheld: set[str] = set()
-    allowed: set[str] = set()
-    if i.admin_state == "run" and prev is not None:
-        holder = veto_holder(i.name)
-        targets: dict[str, str] = {}
-        if i.allow_staging:
-            targets = member_targets(i, inventory)
-        attempts = member_attempts(i)
+def written_marks(prev: ?ygdata.Node, campaign: str) \
+        -> dict[str, (target: ?str, attempt: u64, held: bool, prepare: bool, locked: bool,
+                      failed: bool)]:
+    """Return what prev, the output that campaign wrote last, gives each of
+    its devices: the target release, the attempt, and whether the device
+    has the campaign's veto, allow-staging, image-locked and
+    attempt-failed."""
+    marks: dict[str, (target: ?str, attempt: u64, held: bool, prepare: bool, locked: bool,
+                      failed: bool)] = {}
+    if prev is not None:
+        holder = veto_holder(campaign)
         o = y_1_loose.root.from_gdata(prev)
         for flotilla in o.rfs:
             for dev in flotilla.device:
                 sw = dev.software
-                written = sw.attempt
-                if sw.upgrade_campaign == i.name \
-                   and (written if written is not None else u64(0)) == attempts.get_def(dev.name, 0):
-                    if sw.veto.get(holder) is None:
-                        unheld.add(dev.name)
+                if sw.upgrade_campaign == campaign:
+                    written = sw.attempt
                     staged = sw.allow_staging
-                    target = targets.get(dev.name)
-                    if staged is not None and staged and target is not None \
-                       and sw.target_release == target:
-                        allowed.add(dev.name)
+                    locked = sw.image_locked
+                    failed = sw.attempt_failed
+                    marks[dev.name] = (target=sw.target_release,
+                                       attempt=written if written is not None else u64(0),
+                                       held=sw.veto.get(holder) is not None,
+                                       prepare=staged is not None and staged,
+                                       locked=locked is not None and locked,
+                                       failed=failed is not None and failed)
+    return marks
+
+
+def written_in(i: y_0.software__software__upgrade_campaign_entry,
+               marks: dict[str, (target: ?str, attempt: u64, held: bool, prepare: bool,
+                                 locked: bool, failed: bool)],
+               locked: set[str]) -> (set[str], set[str]):
+    """Return the members in flight and the members let prepare in the
+    output that campaign i wrote last, as marks gives it. Each is a member
+    in locked, the members whose image the campaign keeps, with the attempt
+    that i gives it: a member with a new attempt is a new member. A member
+    is in flight without the campaign's veto, and let prepare with
+    allow-staging. A campaign that does not run has neither, and one
+    without allow-staging has no member let prepare."""
+    unheld: set[str] = set()
+    allowed: set[str] = set()
+    if i.admin_state == "run":
+        for name in locked:
+            m = marks.get(name)
+            member = i.device.get(name)
+            if m is not None and member is not None and m.attempt == member.attempt:
+                if not m.held:
+                    unheld.add(name)
+                if i.allow_staging and m.prepare:
+                    allowed.add(name)
     return (unheld, allowed)
 
 
+def chosen_members(i: y_0.software__software__upgrade_campaign_entry,
+                   inventory: y_0.root) -> dict[str, (image: ?str, target: ?str, attempt: u64)]:
+    """Return each member of campaign i with its image, the version of the
+    image in the image list of inventory, and its attempt. A member that
+    is not in the fleet has them too. The version is None when the image
+    is not in the image list or has no version."""
+    chosen: dict[str, (image: ?str, target: ?str, attempt: u64)] = {}
+    for member in i.device:
+        target: ?str = None
+        image = member_image(inventory, member.image)
+        if image is not None:
+            target = image.version
+        chosen[member.name] = (image=member.image, target=target, attempt=member.attempt)
+    return chosen
+
+
+def locked_members(memory: ?CampaignMemory,
+                   marks: dict[str, (target: ?str, attempt: u64, held: bool, prepare: bool,
+                                     locked: bool, failed: bool)]) -> set[str]:
+    """Return the members in memory, the memory of a campaign, whose image
+    the campaign keeps: the ones that the memory locks, and the ones that
+    marks, what the output written last gives each device, gives
+    image-locked with the target release that the memory has for them."""
+    locked: set[str] = set()
+    if memory is not None:
+        for c in memory.member:
+            m = marks.get(c.device)
+            if c.image_locked or (m is not None and m.locked and m.target == c.target_release):
+                locked.add(c.device)
+    return locked
+
+
+def failed_members(marks: dict[str, (target: ?str, attempt: u64, held: bool, prepare: bool,
+                                     locked: bool, failed: bool)],
+                   chosen: dict[str, (image: ?str, target: ?str, attempt: u64)]) -> set[str]:
+    """Return the members in chosen that marks, what the output written last
+    gives each device, gives attempt-failed with the attempt that chosen
+    gives them: their attempt failed, and they have no new attempt."""
+    failed: set[str] = set()
+    for name, now in chosen.items():
+        m = marks.get(name)
+        if m is not None and m.failed and m.attempt == now.attempt:
+            failed.add(name)
+    return failed
+
+
+# The most members that an error of an edit names.
+ERROR_NAMES = 5
+
+
+def names_text(names: list[str]) -> str:
+    """Return names sorted and joined by ", ", at most ERROR_NAMES of them,
+    then " and N more" for the others."""
+    s = sorted(names)
+    text = ", ".join(s[:ERROR_NAMES])
+    if len(s) > ERROR_NAMES:
+        text += " and {len(s) - ERROR_NAMES} more"
+    return text
+
+
+def edit_error(campaign: str, memory: ?CampaignMemory,
+               marks: dict[str, (target: ?str, attempt: u64, held: bool, prepare: bool,
+                                 locked: bool, failed: bool)],
+               chosen: dict[str, (image: ?str, target: ?str, attempt: u64)],
+               locked: set[str]) -> str:
+    """Return why an edit that gives the members of campaign what chosen
+    gives them fails, or "" when it does not. memory has the members as the
+    last edit took them, marks what the output written last gives each
+    device, and locked the members whose image the campaign keeps. The
+    edit fails when it gives a member in locked another image or another
+    version of its image than the memory has. It fails too when it gives a
+    member another attempt than the memory has, unless marks gives the
+    member attempt-failed with the attempt that the memory has."""
+    moved: list[str] = []
+    retried: list[str] = []
+    if memory is not None:
+        for c in memory.member:
+            now = chosen.get(c.device)
+            if now is not None:
+                if c.device in locked \
+                   and (now.image != c.image or now.target != c.target_release):
+                    moved.append(c.device)
+                m = marks.get(c.device)
+                if now.attempt != c.attempt \
+                   and not (m is not None and m.failed and m.attempt == c.attempt):
+                    retried.append(c.device)
+    errors: list[str] = []
+    if len(moved) > 0:
+        errors.append("upgrade-campaign {campaign} keeps the image and the release of "
+                      + "{names_text(moved)}: it has let each prepare or released it")
+    if len(retried) > 0:
+        errors.append("upgrade-campaign {campaign} gives no new attempt to "
+                      + "{names_text(retried)}: the attempt of each has not failed")
+    return "; ".join(errors)
+
+
+def campaign_memory(run_since: ?int,
+                    chosen: dict[str, (image: ?str, target: ?str, attempt: u64)],
+                    locked: set[str]) -> ?CampaignMemory:
+    """Return the memory of a campaign with the run-since run_since, and
+    with each member as chosen gives it, and whether the campaign keeps its
+    image, as locked says. Return None for neither."""
+    if run_since is None and len(chosen) == 0:
+        return None
+    memory = CampaignMemory()
+    if run_since is not None:
+        memory.run_since = u64(run_since)
+    for name, c in chosen.items():
+        m = memory.member.create(name, image=c.image, target_release=c.target,
+                                 attempt=c.attempt)
+        if name in locked:
+            m.image_locked = True
+    return memory
+
+
 def intent_patch(output: ygdata.Node, i: y_0.software__software__upgrade_campaign_entry,
-                 inventory: y_0.root, old: (set[str], set[str]),
-                 new: (set[str], set[str])) -> ?ygdata.Node:
+                 inventory: y_0.root, old: (set[str], set[str], set[str], set[str]),
+                 new: (set[str], set[str], set[str], set[str])) -> ?ygdata.Node:
     """Return output, the intent of campaign i written with old, changed to
     the intent written with new. Each of old and new is the members in
-    flight and the members let prepare. Only the members in one set of a
-    pair and not in the other change: a member that goes in flight loses
-    the campaign's veto, a member that leaves flight gets it back, and a
-    member gets or loses allow-staging. Return None when nothing changes.
+    flight, the members let prepare, the members whose image the campaign
+    keeps and the members whose attempt failed. Only the members in one set
+    of a pair and not in the other change: a member that goes in flight
+    loses the campaign's veto, a member that leaves flight gets it back,
+    and a member gets or loses allow-staging, image-locked or
+    attempt-failed. Return None when nothing changes.
 
     The change is a diff, because a patch removes a veto entry or a leaf
     only when it says that the entry or the leaf is absent."""
     changed: set[str] = set()
-    for pair in [(old.0, new.0), (new.0, old.0), (old.1, new.1), (new.1, old.1)]:
+    for pair in [(old.0, new.0), (new.0, old.0), (old.1, new.1), (new.1, old.1),
+                 (old.2, new.2), (new.2, old.2), (old.3, new.3), (new.3, old.3)]:
         for name in pair.0:
             if name not in pair.1:
                 changed.add(name)
     if len(changed) == 0:
         return None
-    a = campaign_config(i, inventory, old.0, old.1, changed).to_gdata()
-    b = campaign_config(i, inventory, new.0, new.1, changed).to_gdata()
+    a = campaign_config(i, inventory, old.0, old.1, changed, old.2, old.3).to_gdata()
+    b = campaign_config(i, inventory, new.0, new.1, changed, new.2, new.3).to_gdata()
     d = ygdata.diff(a, b)
     if d is None:
         return None
@@ -948,13 +1105,21 @@ def run_since_at(admin_state: str, kept: ?int, now: int) -> ?int:
 class UpgradeCampaign(base.UpgradeCampaign):
     def transform(self, i, linked, memory, prev_output):
         """Return the software intent of campaign i for its members, as the
-        actor writes it, and the campaign's memory. The members that
-        prev_output, the output written last, has in flight stay in flight,
-        and the members it lets prepare stay let. So an edit of the
+        actor writes it, and the campaign's memory. The members whose image
+        the campaign keeps stay marked, and those of them that prev_output,
+        the output written last, has in flight or lets prepare stay so
+        (written_in()). The members whose attempt failed stay marked until
+        they get a new attempt (failed_members()). So an edit of the
         campaign, or of its linked input, keeps what the actor wrote. An
-        edit that turns allow-staging off, sets the campaign to plan, or
-        gives a member a new target release, stops letting the member
-        prepare.
+        edit that turns allow-staging off or sets the campaign to plan stops
+        letting the members prepare.
+
+        The campaign keeps the image of each member that it has let prepare
+        or released, and the image's version (locked_members()). An edit
+        that breaks a rule of edit_error() raises its error, which names the
+        campaign and the members, and so the edit fails. An edit of the
+        image list reaches the campaign through its link, and fails the same
+        way.
 
         The output gives each member in the fleet the campaign's name in the
         operator's transaction. So an edit that puts a device of the fleet
@@ -965,14 +1130,20 @@ class UpgradeCampaign(base.UpgradeCampaign):
 
         The memory that it returns keeps the run-since of memory, the
         memory of the last commit. The edit that first sets the campaign to
-        run gives it the time of the edit."""
+        run gives it the time of the edit. It also keeps each member as this
+        edit takes it, and whether the campaign keeps its image."""
         inventory = y_0.root.from_gdata(linked)
-        w = written_in(prev_output, i, inventory)
+        marks = written_marks(prev_output, i.name)
+        chosen = chosen_members(i, inventory)
+        locked = locked_members(memory, marks)
+        error = edit_error(i.name, memory, marks, chosen, locked)
+        if error != "":
+            raise ValueError(error)
+        w = written_in(i, marks, locked)
         since = run_since_at(i.admin_state, kept_run_since(memory), time.time().unix_s())
-        out_memory: ?CampaignMemory = None
-        if since is not None:
-            out_memory = CampaignMemory(run_since=u64(since))
-        return (campaign_config(i, inventory, w.0, w.1, None), out_memory)
+        return (campaign_config(i, inventory, w.0, w.1, None, locked,
+                                failed_members(marks, chosen)),
+                campaign_memory(since, chosen, locked))
 
 
 pure def _empty_inventory() -> y_0.root:
@@ -1028,14 +1199,24 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     the actor plans what run would do, again when what the members report
     changes: before the first run a run that starts now, and in a pause the
     run that carries on. A member that leaves the campaign is forgotten:
-    added again, it is a new member. So is a member with a new attempt. A
-    member with a new target release keeps its promise; one that is done
-    for the old target waits again, and upgrades to the new one, or is done
-    again when its device runs it already. One whose rollback failed stays
-    done until its device reports another final status, it gets a new
-    attempt, or it leaves the campaign, also when its status is lost. A run
-    of an earlier attempt or target release that is still under way counts
-    in flight until it ends.
+    added again, it is a new member. So is a member with a new attempt. One
+    whose rollback failed stays done until its device reports another
+    final status, it gets a new attempt, or it leaves the campaign, also
+    when its status is lost. A run of an earlier attempt or target release
+    that is still under way counts in flight until it ends.
+
+    The actor marks image-locked each member that it lets prepare or
+    releases, in the write that lets or releases it. It also marks the
+    members that the campaign's memory locks, so a pause and a restart
+    keep the marks. A member keeps its mark until it leaves the
+    campaign. An edit that gives a member another image or version can
+    commit before the write that lets the member prepare or releases it
+    lands, as the member is not marked yet. The edit wins: the member
+    loses the mark and waits for the new target, and the transform function
+    holds it, as it keeps a member in flight or let prepare only while the
+    campaign keeps its image. The actor marks attempt-failed each member
+    whose attempt failed, as the failure budget counts it, until that
+    changes.
 
     With allow-staging, in run, the actor writes allow-staging for each
     member from its turn to prepare until its prepare ends, it is released,
@@ -1114,6 +1295,11 @@ actor UpgradeCampaignTransform(path: ttt.Path,
     var output: ygdata.Node = _empty_output()
     var unheld: set[str] = set()
     var allowed: set[str] = set()
+    # The members that the campaign has let prepare or released, which the
+    # output written last marks image-locked.
+    var touched: set[str] = set()
+    # The members that the output written last marks attempt-failed.
+    var marked_failed: set[str] = set()
 
     def unheld_now() -> set[str]:
         """Return the members in flight that run an upgrade. A member that
@@ -1122,6 +1308,31 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         final report has not counted yet, such as one that finished during
         a pause."""
         return ctl.upgrading()
+
+    def failed_now() -> set[str]:
+        """Return the members to mark attempt-failed."""
+        return {name for name in members if ctl.has_failed(name)}
+
+    def write_changes(in_flight: set[str], prep: set[str], locks: set[str],
+                      fails: set[str]) -> None:
+        """Write the output again with in_flight, the members in flight,
+        prep, the members let prepare, locks, the members marked
+        image-locked, and fails, the members marked attempt-failed. Only the
+        members that change are written (intent_patch()). A campaign that
+        does not decide, such as one in plan, writes its attempt-failed
+        marks so."""
+        current = campaign
+        if current is not None:
+            patched = intent_patch(output, current, inventory,
+                                   (unheld, allowed, touched, marked_failed),
+                                   (in_flight, prep, locks, fails))
+            if patched is not None:
+                output = patched
+                write_output(output)
+            unheld = in_flight
+            allowed = prep
+            touched = locks
+            marked_failed = fails
 
     def counted(name: str):
         """Return the attempt of the device name that counts for the
@@ -1388,6 +1599,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         if gen != generation:
             return
         debounce_armed = False
+        write_changes(unheld, allowed, touched, failed_now())
         replan(time.time().unix_s())
         publish()
 
@@ -1486,6 +1698,7 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             after 0.0: decide(gen)
         else:
             # The replay's statuses came before the sync. Plan with them.
+            write_changes(unheld, allowed, touched, failed_now())
             replan(time.time().unix_s())
             publish()
 
@@ -1521,19 +1734,11 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         plan_alarms = s.plan.alarms
         plan_why = s.plan.why
         plan_prepares = s.prepares
-        # Write only the members that went in flight or left it, and the
-        # members let prepare or no longer let. A copy, so that the next
-        # decision does not change the set the output was written with.
         in_flight = unheld_now()
+        # A copy, so that the next decision does not change the set the
+        # output was written with.
         prep = fctl.copy_set(ctl.allowed)
-        if current is not None:
-            patched = intent_patch(output, current, inventory, (unheld, allowed),
-                                   (in_flight, prep))
-            if patched is not None:
-                output = patched
-                write_output(output)
-            unheld = in_flight
-            allowed = prep
+        write_changes(in_flight, prep, touched | in_flight | prep, failed_now())
         wake = s.wake
         if not s.finished and (wake < 0 or wake > t + HORIZON_REFRESH):
             # Devices that wait for windows beyond the horizon.
@@ -1597,6 +1802,15 @@ actor UpgradeCampaignTransform(path: ttt.Path,
             if name in old_names and name not in tried_again \
                and new_targets.get(name) != targets.get(name):
                 retargeted.add(name)
+        # A member whose target changes, or that left, is untouched again,
+        # and each member that the memory locks is touched: a new actor, as
+        # after a restart, takes the touches from the memory.
+        touched = {name for name in touched
+                   if name in names and new_targets.get(name) == targets.get(name)}
+        if memory is not None:
+            for m in memory.member:
+                if m.image_locked:
+                    touched.add(m.device)
         # The released devices, the ramp and the promises stay: a replan
         # goes on from where the run is.
         configure_campaign(ctl, conf, inventory, now, member_info, run_since)
@@ -1604,10 +1818,10 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         # a new attempt. Added again, a member waits until it answers, and
         # starts in a window.
         ctl.drop(left | tried_again)
-        # A member done for its old target waits again, and the prepares
-        # for the old target go. This comes before the run starts or
-        # stops, so that a plan in a pause shows what the run does, and
-        # before the members report again below.
+        # The prepares for the old target go, and a member released for it
+        # that has no final report waits again. This comes before the run
+        # starts or stops, so that a plan in a pause shows what the run
+        # does, and before the members report again below.
         ctl.retarget(retargeted)
         take_all_live()
         run_now = conf.admin_state == "run"
@@ -1637,10 +1851,15 @@ actor UpgradeCampaignTransform(path: ttt.Path,
         # In plan every member is held.
         unheld = unheld_now() if run_now else set()
         allowed = fctl.copy_set(ctl.allowed)
+        # This write marks each member that it lets prepare or releases,
+        # such as a member asked to prepare again.
+        touched = touched | unheld | allowed
+        marked_failed = failed_now()
         # The members that did not change keep the nodes of the output
         # written last. The transform function reused the same nodes, so
         # TTT writes again only the members that this edit changed.
-        output = campaign_config(conf, inventory, unheld, allowed, None).to_gdata(
+        output = campaign_config(conf, inventory, unheld, allowed, None, touched,
+                                 marked_failed).to_gdata(
             output if isinstance(output, ygdata.Container) else None)
         write_output(output)
         member_alarms = image_alarms(conf, inventory)
