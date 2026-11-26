@@ -503,6 +503,13 @@
   size of the file on bootflash while it sends. A device that answers
   `Administratively disabled.` needs `ip scp server enable`, and the
   prepare fails with that.
+- A failed IOS XE xcopy fails prepare at once, with the reason of the
+  device, as `download failed: derr-http-returned-error: Curl error - 22`.
+  Before it sends the xcopy, the adapter subscribes to `xcopy-status` of
+  `Cisco-IOS-XE-xcopy-events`, now in `adapters.software_iosxe_yang.models`:
+  apps regenerate their IOS XE device type. The status also ends a
+  transfer that succeeded: IOS XE 17.9.5a records no xcopy, so without an
+  image size its transfer did not end until the timeout.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade

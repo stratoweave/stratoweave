@@ -20,7 +20,8 @@
 # checked again: sent from the image folder by the SCP adapter when the
 # device has one, else fetched by the device with xcopy. Without the CLI
 # adapter, prepare transfers the file and install trusts what prepare
-# staged.
+# staged. The status notifications of the xcopy end the transfer as soon as
+# it ends, and give the reason of a failure.
 #
 # Cleanup and retry are not implemented. Cleanup leaves the previous image on
 # the device.
@@ -47,7 +48,7 @@ import adapters.iosxe_cli_yang as xecli_yang
 import adapters.scp_data as scp_data
 import adapters.scp_yang as scp_yang
 import adapters.software_iosxe_oper as ixoper
-from adapters.adapter import BusyError, NotConnectedError, TransientError
+from adapters.adapter import BusyError, NotConnectedError, NotifEvent, NotifSpec, TransientError
 import adapters.software_iosxe_rpc as ixrpc
 
 from device_meta_config import stratoweave_rfs__device_entry as DeviceMetaConfig
@@ -86,6 +87,11 @@ RELOAD_POLL_PERIOD = 20.0
 # an adapter that never connects, like NETCONF on IOS XE 16.8.
 ADAPTER_WAIT = 120.0
 ADAPTER_POLL = 5.0
+# Seconds that a transfer waits for its subscription to the status of the
+# xcopy before it sends the xcopy without it.
+SUBSCRIBE_WAIT = 30.0
+# The owner of the subscription to the status of the xcopys.
+XCOPY_OWNER = "iosxe-software-xcopy"
 # Generous: the transfer and the add each take minutes.
 MAX_POLLS = 180
 
@@ -347,6 +353,11 @@ def aggregate(root: ?ygdata.Node, uuid: str, expect_stage: str,
 
 HARDWARE_MODULE = "Cisco-IOS-XE-device-hardware-oper"
 XCOPY_MODULE = "Cisco-IOS-XE-xcopy-rpc"
+XCOPY_EVENTS_MODULE = "Cisco-IOS-XE-xcopy-events"
+NS_XCOPY_EVENTS = "http://cisco.com/ns/yang/Cisco-IOS-XE-xcopy-events"
+XCOPY_STATUS = ygdata.Id(NS_XCOPY_EVENTS, "xcopy-status")
+XCOPY_SUCCESS = "xcopy-success"
+XCOPY_FAILED = "xcopy-failed"
 INSTALL_MODULE = "Cisco-IOS-XE-install-rpc"
 FILES_MODULE = "Cisco-IOS-XE-platform-software-oper"
 CISCO_RPC_MODULE = "Cisco-IOS-XE-rpc"
@@ -443,6 +454,43 @@ def transfer_failure(cause: str, free: ?u64, size: ?u64) -> str:
     if free is not None and size is not None and free < size:
         return "{cause}: bootflash: has {free} bytes free, the image is {size}"
     return cause
+
+
+def xcopy_failure(errcode: str, errstr: str, download_error: str) -> str:
+    """Return why an xcopy failed, from the leaves of its xcopy-status: the
+    download error of IOS XE 17.18 and later, else the error code, then the
+    error string of the copy utility, as "derr-no-con: Curl error - 7"."""
+    code = download_error if download_error != "" and download_error != "derr-ok" else errcode
+    if code == "" and errstr == "":
+        return XCOPY_FAILED
+    if code == "":
+        return errstr
+    if errstr == "":
+        return code
+    return code + ": " + errstr
+
+
+def xcopy_status(payload: ?ygdata.Node) -> ?(uuid: str, status: str, reason: str):
+    """Return the uuid and the status of an xcopy from the payload of its
+    xcopy-status notification, and the reason when the xcopy failed, else
+    "". None when the payload has no uuid or no status."""
+    uuid = _xcopy_leaf(payload, "uuid")
+    status = _xcopy_leaf(payload, "status")
+    errcode = _xcopy_leaf(payload, "errcode")
+    errstr = _xcopy_leaf(payload, "errstr")
+    download_error = _xcopy_leaf(payload, "dwnld-err")
+    if uuid == "" or status == "":
+        return None
+    reason = xcopy_failure(errcode, errstr, download_error) if status == XCOPY_FAILED else ""
+    return (uuid=uuid, status=status, reason=reason)
+
+
+def _xcopy_leaf(payload: ?ygdata.Node, name: str) -> str:
+    if payload is not None:
+        v = payload.get_opt_str(ygdata.Id(NS_XCOPY_EVENTS, name))
+        if v is not None:
+            return v
+    return ""
 
 
 def room_needed(image_size: ?u64) -> ?u64:
@@ -969,6 +1017,10 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
     # packages of the add.
     var _room_removed = False
     var _after_remove = ""
+    # The generation whose xcopy the driver sent, so that it goes out once.
+    var _xcopy_sent = -1
+    # The driver subscribed to the status of its xcopys.
+    var _watching = False
 
     def _finish(err: ?Exception) -> None:
         d = _done
@@ -976,6 +1028,9 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         _done = None
         _activate_booting = False
         _gen += 1
+        if _watching:
+            _watching = False
+            dev.remove_notif_subscriptions(XCOPY_OWNER)
         if d is not None:
             d!(err)
 
@@ -1437,11 +1492,42 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
         if how == "cli":
             _transfer_cli()
             return
-        url = _url
         _expect_stage = STAGE_DOWNLOAD
         gen = _gen
         _log.info("software: staging image",
-                  {"url": redact_url(url), "uuid": _uuid})
+                  {"url": redact_url(_url), "uuid": _uuid})
+        if XCOPY_EVENTS_MODULE in _modules():
+            _watch_xcopy(gen)
+        else:
+            _send_xcopy(gen)
+
+    def _watch_xcopy(gen: int) -> None:
+        """Subscribe to the status of the xcopy, then send it. Only the
+        status tells why an xcopy failed, and on IOS XE 17.9.5a only the
+        status tells that it ended. Send the xcopy also when the
+        subscription fails or is not in place after SUBSCRIBE_WAIT: then
+        the records and the file on bootflash end it."""
+        def on_event(ev: ?NotifEvent, err: ?Exception) -> None:
+            if gen != _gen:
+                return
+            if err is not None:
+                _log.info("software: no xcopy status from the device", {"error": swdev.error_text(err!)})
+                _send_xcopy(gen)
+            elif ev is not None:
+                _on_xcopy_status(gen, ev.payload)
+        def synced(owner_id: str) -> None:
+            _send_xcopy(gen)
+        _watching = True
+        dev.declare_notif_subscriptions(XCOPY_OWNER, on_event, {NotifSpec(XCOPY_STATUS)}, synced)
+        after now SUBSCRIBE_WAIT: _send_xcopy(gen)
+
+    def _send_xcopy(gen: int) -> None:
+        """Send the xcopy of the transfer of generation gen, once, and poll
+        the records when the device accepts it."""
+        if gen != _gen or _xcopy_sent == gen:
+            return
+        _xcopy_sent = gen
+        url = _url
         def on_rpc(out: ?ixrpc.Cisco_IOS_XE_xcopy_rpc__xcopy__output,
                    err: ?Exception) -> None:
             if gen != _gen:
@@ -1452,6 +1538,19 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 return
             after now poll_period: _poll(gen)
         _rpcs.xcopy(on_rpc, xcopy_input(_uuid, url, _filename))
+
+    def _on_xcopy_status(gen: int, payload: ?ygdata.Node) -> None:
+        """Fail the transfer with the reason of the device when its xcopy
+        failed, and check the image when it succeeded. The status of
+        another xcopy, and a status while the xcopy runs, change nothing."""
+        s = xcopy_status(payload)
+        if s is not None and s.uuid == _uuid:
+            if s.status == XCOPY_FAILED:
+                _log.info("software: the device reports that the xcopy failed", {"uuid": _uuid, "reason": s.reason})
+                _fail_transfer(s.reason)
+            elif s.status == XCOPY_SUCCESS:
+                _log.info("software: the device reports that the xcopy succeeded", {"uuid": _uuid})
+                _end_phase()
 
     def _transfer_cli() -> None:
         """Copy the image with the CLI's copy, which returns when the copy

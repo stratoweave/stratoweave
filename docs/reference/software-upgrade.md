@@ -228,6 +228,14 @@ connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
   reads `install-oper-data` for the records with its UUID until the
   operation ends. A CLI command returns when it ends, or when the session
   ends as the device reloads.
+- Before it sends `xcopy`, the adapter subscribes to `xcopy-status` of
+  `Cisco-IOS-XE-xcopy-events`, which IOS XE sends on the
+  `yang-notif-native` stream. `xcopy-failed` fails prepare at once with the
+  reason of the device, as `download failed: derr-http-returned-error:
+  Curl error - 22` for a file that the http server does not have:
+  `install-oper-data` says only `install-download-fail`, and IOS XE 17.9.5a
+  records no `xcopy` at all. `xcopy-success` ends the transfer. Without the
+  subscription, the records and the size of the file end it.
 - `activate` names the image by the version the device gave it during the
   add, for example `17.18.03a.0.5540`.
 - The device reboots after `activate` and after `abort`. Read errors during
