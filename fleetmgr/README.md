@@ -559,6 +559,14 @@ uploads the image files into the top's image folder,
 container is a transform that produces no configuration, so campaigns link
 the whole list.
 
+A fleet device with an `extra-adapter` of type `scp` gets its image sent
+instead: its flotilla copies the image's file from the image folder to the
+device over SCP, on port 22 unless the entry sets `port`, and the device
+needs no `url-base`. The top gives each flotilla the image folder of its
+command line. The campaign writes the image's file into the software
+intent of every member, and alarms on a missing `url-base` only for the
+members that fetch their image.
+
 The RFS transform renders that entry directly into the flotilla's standard
 `/device` schema. Its actor keeps one on-change subscription on the flotilla
 to the device's `/device/software/state` and `/device/state`, and publishes

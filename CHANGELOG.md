@@ -1095,6 +1095,12 @@
   budget counts it, and an edit that gives one to any other member fails the
   same way. Before, a new version made a member that was done upgrade again,
   and a new attempt made a member that succeeded read its release again.
+- A fleet device with an `extra-adapter` of type `scp` gets its image sent
+  from the image folder over SCP. Campaigns write the image's file into the
+  software intent, and alarm on a missing `url-base` only for the members
+  that fetch their image. The top gives its flotillas the image folder of
+  its command line. The lab CEs take SCP, and `just SCP=1 add-devices`
+  onboards them with the SCP adapter.
 
 ### Dependencies
 
