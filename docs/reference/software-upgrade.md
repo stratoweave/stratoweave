@@ -236,6 +236,10 @@ connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
   `install-oper-data` says only `install-download-fail`, and IOS XE 17.9.5a
   records no `xcopy` at all. `xcopy-success` ends the transfer. Without the
   subscription, the records and the size of the file end it.
+- The adapter gives `xcopy` a `timeout` of 29 minutes, a minute less than
+  it waits, where `Cisco-IOS-XE-xcopy-rpc` has the leaf, from IOS XE 17.8.
+  The device then ends a transfer from a server that stops sending, with
+  `derr-oper-tout`.
 - `activate` names the image by the version the device gave it during the
   add, for example `17.18.03a.0.5540`.
 - The device reboots after `activate` and after `abort`. Read errors during

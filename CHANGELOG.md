@@ -510,6 +510,11 @@
   apps regenerate their IOS XE device type. The status also ends a
   transfer that succeeded: IOS XE 17.9.5a records no xcopy, so without an
   image size its transfer did not end until the timeout.
+- The IOS XE adapter gives an xcopy a timeout of 29 minutes, from IOS XE
+  17.8, a minute less than it waits for the transfer. A transfer from a
+  server that stops sending then ends on the device, with
+  `derr-oper-tout`. Before, it did not end, and the xcopys and installs
+  after it waited, also those of the next attempt.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade

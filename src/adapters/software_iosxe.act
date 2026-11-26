@@ -94,6 +94,10 @@ SUBSCRIBE_WAIT = 30.0
 XCOPY_OWNER = "iosxe-software-xcopy"
 # Generous: the transfer and the add each take minutes.
 MAX_POLLS = 180
+# Minutes after which the device ends an xcopy that has not ended and says
+# so in its status: a minute before the driver stops waiting for it, after
+# MAX_POLLS polls of POLL_PERIOD.
+XCOPY_TIMEOUT = 29
 
 # Minutes the device waits for install-commit after activation before it
 # reverts. 30 is the smallest value it accepts.
@@ -358,6 +362,8 @@ NS_XCOPY_EVENTS = "http://cisco.com/ns/yang/Cisco-IOS-XE-xcopy-events"
 XCOPY_STATUS = ygdata.Id(NS_XCOPY_EVENTS, "xcopy-status")
 XCOPY_SUCCESS = "xcopy-success"
 XCOPY_FAILED = "xcopy-failed"
+## The first revision of Cisco-IOS-XE-xcopy-rpc with timeout, IOS XE 17.8.
+XCOPY_TIMEOUT_REVISION = "2022-03-01"
 INSTALL_MODULE = "Cisco-IOS-XE-install-rpc"
 FILES_MODULE = "Cisco-IOS-XE-platform-software-oper"
 CISCO_RPC_MODULE = "Cisco-IOS-XE-rpc"
@@ -906,11 +912,22 @@ def timeout_error(op: str, unreachable: bool) -> Exception:
     return ValueError(text)
 
 
-def xcopy_input(uuid: str, url: str, filename: str) -> ixrpc.Cisco_IOS_XE_xcopy_rpc__xcopy__input:
-    """Stage an image. `destination_path` must be a bare filename: the device
-    prepends /bootflash itself, so passing a path doubles it and fails."""
+def xcopy_takes_timeout(revision: ?str) -> bool:
+    """Return True if xcopy takes a timeout in this revision of
+    Cisco-IOS-XE-xcopy-rpc. A revision is a date, so revisions compare as
+    text."""
+    if revision is not None:
+        return revision >= XCOPY_TIMEOUT_REVISION
+    return False
+
+
+def xcopy_input(uuid: str, url: str, filename: str, timeout: ?u64=None) -> ixrpc.Cisco_IOS_XE_xcopy_rpc__xcopy__input:
+    """Stage an image, within timeout minutes when it is given. The device
+    rejects a timeout before IOS XE 17.8. `destination_path` must be a bare
+    filename: the device prepends /bootflash itself, so passing a path
+    doubles it and fails."""
     return ixrpc.Cisco_IOS_XE_xcopy_rpc__xcopy__input(
-        uuid=uuid, source_path=url, destination_path=filename)
+        uuid=uuid, source_path=url, destination_path=filename, timeout=timeout)
 
 
 def install_input(uuid: str, filename: str) -> ixrpc.Cisco_IOS_XE_install_rpc__install__input:
@@ -1523,11 +1540,16 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
 
     def _send_xcopy(gen: int) -> None:
         """Send the xcopy of the transfer of generation gen, once, and poll
-        the records when the device accepts it."""
+        the records when the device accepts it. Give it XCOPY_TIMEOUT when
+        the device takes a timeout."""
         if gen != _gen or _xcopy_sent == gen:
             return
         _xcopy_sent = gen
         url = _url
+        timeout: ?u64 = None
+        mod = dev.get_connected_modules().get(XCOPY_MODULE)
+        if mod is not None and xcopy_takes_timeout(mod.revision):
+            timeout = u64(XCOPY_TIMEOUT)
         def on_rpc(out: ?ixrpc.Cisco_IOS_XE_xcopy_rpc__xcopy__output,
                    err: ?Exception) -> None:
             if gen != _gen:
@@ -1537,7 +1559,7 @@ actor IosXeSoftwareDriver(dev: swdev.DeviceMgr, log_handler: logging.Handler,
                 _fail(swdev.error_text(err!).replace(url, redact_url(url)), err)
                 return
             after now poll_period: _poll(gen)
-        _rpcs.xcopy(on_rpc, xcopy_input(_uuid, url, _filename))
+        _rpcs.xcopy(on_rpc, xcopy_input(_uuid, url, _filename, timeout))
 
     def _on_xcopy_status(gen: int, payload: ?ygdata.Node) -> None:
         """Fail the transfer with the reason of the device when its xcopy
