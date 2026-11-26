@@ -229,3 +229,62 @@ actor ImageDir(cap: file.FileCap, path: str):
                 raise Conflict("{dst} already exists")
         await async _fs.rename(_file(src), _file(dst))
         return kind
+
+
+def _stamp(name: str, size: int, modified: float) -> str:
+    """What tells one content of the file name from another: its name, its
+    size and its modification time."""
+    return "{name}\x00{size}\x00{modified}"
+
+
+actor ImageReader(cap: file.FileCap, path: str):
+    """Reads the image files of the folder at path for the transfers that
+    send them. Transfers that use the same file at the same time share one
+    copy of its content: read gives each of them the same bytes, until the
+    last one calls done. A file that has changed since is read again."""
+    _fs = file.FS(cap)
+    _rcap = file.ReadFileCap(cap)
+    # The content of each file in use, by its stamp, and how many
+    # transfers use it.
+    var _open: dict[str, (data: bytes, users: int)] = {}
+
+    def _read_all(full: str) -> bytes:
+        r = file.ReadFile(_rcap, full)
+        try:
+            return r.read()
+        finally:
+            r.close()
+
+    def read(name: str) -> (data: bytes, stamp: str):
+        """The content of the image file name, and the stamp to give done
+        when the transfer no longer uses it. Raises ValueError for a bad
+        name or a name that is not a file, and OSError when the file cannot
+        be read."""
+        check_name(name)
+        full = file.join_path([path, name])
+        st = _fs.stat(full)
+        if not st.is_file():
+            raise ValueError("{name} in the image folder is not a file")
+        stamp = _stamp(name, int(st.size), st.mtime)
+        f = _open.get(stamp)
+        if f is not None:
+            _open[stamp] = (data=f.data, users=f.users + 1)
+            return (data=f.data, stamp=stamp)
+        data = _read_all(full)
+        if len(data) != int(st.size):
+            raise OSError("{name} in the image folder changed while it was read")
+        _open[stamp] = (data=data, users=1)
+        return (data=data, stamp=stamp)
+
+    def done(stamp: str) -> None:
+        """A transfer no longer uses the content that read gave with stamp."""
+        f = _open.get(stamp)
+        if f is not None:
+            if f.users > 1:
+                _open[stamp] = (data=f.data, users=f.users - 1)
+            else:
+                del _open[stamp]
+
+    def in_use() -> int:
+        """The number of file contents that transfers use now."""
+        return len(_open)
