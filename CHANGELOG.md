@@ -59,6 +59,10 @@
   the layer below under a source name taken from its (actor wrapper) object
   address on the heap, which obviously does not work across restarts. The
   source name is now a hash of the transform's path. [#857]
+- Callbacks follow Acton's new effect hierarchy, which puts `pure` below
+  `action` and keeps `proc` and `mut` callbacks out of actor interfaces
+  [acton#3471]. Transform actors get their `update_oper` and
+  `update_dynstate` callbacks as actions. [#875]
 
 ### Northbound APIs
 - Fixed NETCONF `<get-config>` returning the operational state published by
@@ -329,6 +333,16 @@
   `rollback`, `run`, `show` and `show | compare`. With a command as
   arguments, it runs that command and exits. Without a terminal, it reads
   commands line by line from stdin. [#843] [#862] [#866] [#871]
+- The device log says what each NETCONF RPC does: `NETCONF get` and
+  `NETCONF get-config` name the paths that their filter selects,
+  `Sending RPC` has the RPC's XML, and a debug line `Received rpc-reply`
+  gives the RPC that a reply answers, how long it took and its size. The
+  software status line has the campaign, the target, the status and stage,
+  the jobs with their step and progress, the check verdicts and the reason,
+  and is logged only when it changes. Both log formats remove the user and
+  password from URLs, such as an scp image URL. A connect error that
+  repeats, as while a device reloads, is logged as an error once, then at
+  debug. [#874]
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
@@ -1062,6 +1076,7 @@
   budget counts it, and an edit that gives one to any other member fails the
   same way. Before, a new version made a member that was done upgrade again,
   and a new attempt made a member that succeeded read its release again.
+  [#876]
 
 ### Dependencies
 
@@ -1071,8 +1086,9 @@
   generational garbage collector [acton#3390], HTTP server bodies as bytes
   [acton#3403], compressed HTTP responses [acton#3404], the raw terminal
   mode of stdin [acton#3419], the `on_listen` callback of HTTP listeners
-  [acton#3418] and declarative actor construction with automatic startup
-  [acton#3442].
+  [acton#3418], declarative actor construction with automatic startup
+  [acton#3442] and the effect hierarchy with `pure` below `action`
+  [acton#3471].
 
 #### acton-yang
 - gdata is encoded as compact XML and JSON by default, as in the Acton
@@ -1169,6 +1185,9 @@
   Parsing the 1115 modules of Cisco XRd 25.3.1 takes 26% less time and
   allocates 76% less. Their full compile is only about 4% faster, because
   many modules are parsed concurrently. [acton-yang#567] [#847] [#860]
+- Builds with Acton's new effect hierarchy [acton#3471].
+  `yang.adata.ToGdataPrevWrapper` is an actor, so the `update` callback that
+  it gives a transform actor is an action. [#875]
 
 #### acton-ssh
 - Fixed SSH events being delivered out of the order libssh raises them.
@@ -1208,25 +1227,28 @@
 - A failed connect or a dropped connection reports the socket's error, such
   as "connection refused" or "no route to host", instead of "bad file
   descriptor". [acton-ssh#22] [#818]
-- Builds with Acton's declarative actor construction and automatic startup.
-  [acton-ssh#26] [acton-ssh#27] [#847]
+- Builds with Acton's declarative actor construction and automatic startup,
+  and with its new effect hierarchy [acton#3471]. [acton-ssh#26]
+  [acton-ssh#27] [#847] [#875]
 - Copies the strings and buffers of libssh messages before its callbacks get
   them, as Acton's C string and bytes constructors borrow the buffer instead
   of copying it [acton#3448]. [#849]
 
 #### acton-lmdb
 - Builds with Zig 0.17. [acton-lmdb#6] [#670]
-- Builds with Acton's declarative actor construction and automatic startup.
-  [acton-lmdb#7] [#847]
+- Builds with Acton's declarative actor construction and automatic startup,
+  and with its new effect hierarchy [acton#3471]. [acton-lmdb#7] [#847]
+  [#875]
 - Copies the values of lookups and cursors before the transaction or cursor
   moves on, as Acton's C bytes constructors borrow the buffer instead of
   copying it [acton#3448]. [#849]
 
 #### actmf
 - Updated for explicit defaults, for Acton library modules imported from
-  `std`, and for the changes to the `yang.data.YangData` protocol and
-  `yang.schema.DNode.gname` in acton-yang. [actmf#76] [actmf#77] [actmf#78]
-  [actmf#79] [actmf#80] [#741] [#762] [#790] [#833]
+  `std`, for Acton's new effect hierarchy [acton#3471], and for the changes
+  to the `yang.data.YangData` protocol and `yang.schema.DNode.gname` in
+  acton-yang. [actmf#76] [actmf#77] [actmf#78] [actmf#79] [actmf#80] [#741]
+  [#762] [#790] [#833] [#875]
 
 #### actsnmp
 - New dependency: an SNMP implementation in Acton, with SNMPv1, v2c and v3
@@ -1240,6 +1262,8 @@
 - Imports Acton library modules from `std`. [#833]
 - The `respond` callback of handlers and middleware takes the body as
   `bytes` instead of `str`, as `http.Server` in Acton does. [acton#3403]
+- `Router.use()` takes a middleware as a pure function of the next handler
+  instead of a `proc`. [#875]
 
 #### pipe
 - `create_actor_pipe_pair()` creates the two ends of an actor pipe in an
@@ -1282,6 +1306,12 @@
   generator's `compile()` and `gen_app()`. A transform actor that took
   `dev.tree_provider()` in its body can build `swdev.DeviceTreeProvider(dev)`
   there instead. [#846]
+- Transform actors take `update_oper` and `update_dynstate` as
+  `action(...)` instead of `proc(...)`. The generated transform code passes
+  actions, and Acton no longer accepts `proc` callbacks in an actor's
+  parameters [acton#3471]. For the same reason, a handler that gives its
+  http-router `respond` callback to another actor must give it an action of
+  its own actor that calls `respond`. [#875]
 - `adapter_type` and `software_adapter_type` in a `DeviceType` take `?Env`
   instead of `?net.TCPConnectCap`. Adapters in other repositories, like
   sw-adapter-cisco-ios-cli, need the same change. [#702]
@@ -1489,6 +1519,9 @@ next. Give it a spin. We’d love to hear what you think.
 [#870]: https://github.com/stratoweave/stratoweave/pull/870
 [#871]: https://github.com/stratoweave/stratoweave/pull/871
 [#872]: https://github.com/stratoweave/stratoweave/pull/872
+[#874]: https://github.com/stratoweave/stratoweave/pull/874
+[#875]: https://github.com/stratoweave/stratoweave/pull/875
+[#876]: https://github.com/stratoweave/stratoweave/pull/876
 [actmf#76]: https://github.com/stratoweave/actmf/pull/76
 [actmf#77]: https://github.com/stratoweave/actmf/pull/77
 [actmf#78]: https://github.com/stratoweave/actmf/pull/78
@@ -1504,6 +1537,7 @@ next. Give it a spin. We’d love to hear what you think.
 [acton#3419]: https://github.com/actonlang/acton/pull/3419
 [acton#3442]: https://github.com/actonlang/acton/pull/3442
 [acton#3448]: https://github.com/actonlang/acton/pull/3448
+[acton#3471]: https://github.com/actonlang/acton/pull/3471
 [acton-lmdb#6]: https://github.com/stratoweave/acton-lmdb/pull/6
 [acton-lmdb#7]: https://github.com/stratoweave/acton-lmdb/pull/7
 [acton-ssh#6]: https://github.com/actonlang/acton-ssh/pull/6
