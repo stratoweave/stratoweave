@@ -378,6 +378,33 @@ binary and have the HTTP server serve it alongside the APIs. Pass a
 `static_assets` module. Each asset is sent unchanged, with a `Content-Type`
 from its file extension.
 
+To embed the files of a directory, such as a web UI build, use an Acton
+derived module that calls `std.build.derive.embed_files`. With this entry
+in `Build.act`, the module `myapp.webui_assets` has `files`, a
+`dict[str, bytes]` from URL path (`/index.html`, `/_app/...`) to content:
+
+```python
+derived_modules = {
+    myapp.webui_assets: (
+        function=std.build.derive.embed_files,
+        inputs=["webui/build/"],
+        args=(strip="webui/build")
+    )
+}
+```
+
+```python
+import myapp.webui_assets as webui_assets
+
+stratoweave.main(sysspec.SYSSPEC, env, static_assets=webui_assets.files)
+```
+
+The compiler puts the files in the binary as read-only data, so nothing is
+read or copied when the program starts. `acton build` needs the directory,
+so commit the web UI build, or build it before `acton build`. Fleet Manager
+does this, see `fleetmgr/Build.act`. Derived modules need Acton
+0.31.0.20261126 or newer.
+
 Behavior:
 
 - Every asset is served on `GET <path>` on the same listener and port as the
@@ -386,6 +413,9 @@ Behavior:
   parameterized route, so registered API routes always take precedence and can
   never be shadowed by an asset. Installing fails if the application already
   registered its own root-level `GET` wildcard.
+- An asset path is matched as the request sends it, without percent-decoding.
+  A file whose name a URL must encode, such as one with a space, is never
+  served. Use only letters, digits and `._-/` in file names.
 - Assets under `/_app/immutable/` (content-hashed filenames) are served with
   `Cache-Control: public, max-age=31536000, immutable`; everything else with
   `no-cache`.

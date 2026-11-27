@@ -8,8 +8,8 @@ import { vitePreprocess } from '@sveltejs/vite-plugin-svelte';
 import { defineConfig } from 'vite';
 
 // Deterministic, content-derived app version: identical sources produce an
-// identical build (the embedded-assets module is committed and must not
-// change without a UI change), while any UI change produces a new one, so
+// identical build (build/ is committed and must not change without a UI
+// change), while any UI change produces a new one, so
 // SvelteKit's version.json polling makes stale open tabs reload after an
 // upgrade instead of failing on hashed chunks the new binary no longer
 // serves.
@@ -41,9 +41,9 @@ const API_PROXY_TARGET = process.env.STRATOWEAVE_API_ORIGIN ?? 'http://127.0.0.1
 
 export default defineConfig({
   plugins: [
-    // A static SPA: `just gen-webui` embeds the build into the fleetmgr
-    // binary, whose HTTP server serves it next to RESTCONF with an
-    // index.html fallback for client-routed pages.
+    // A static SPA: `just build` embeds build/ into the fleetmgr binary
+    // (derived_modules in ../Build.act), whose HTTP server serves it next
+    // to RESTCONF with an index.html fallback for client-routed pages.
     sveltekit({
       preprocess: vitePreprocess(),
       adapter: adapterStatic({ fallback: 'index.html' }),

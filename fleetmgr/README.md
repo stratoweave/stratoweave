@@ -503,11 +503,11 @@ the most at once, its notification period and its failure budget. The new
 campaign page counts, for each model, the devices that already run the
 picked image or a newer release, and leaves out the ones that run it. The
 devices pages show whether each device can be reached. The top serves the
-UI itself: the static build is embedded
-in the `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so with
+UI itself: the static build in `webui/build` is committed and embedded
+in the `fleetmgr` binary (`derived_modules` in `Build.act`), so with
 `just demo` running the UI is at http://127.0.0.1:18200/. After a UI change,
-`just gen-webui` rebuilds the UI and regenerates that module (needs Node),
-then `just build` picks it up. For UI work,
+`just gen-webui` rebuilds `webui/build` (needs Node), then `just build`
+picks it up. For UI work,
 
     just webui
 
