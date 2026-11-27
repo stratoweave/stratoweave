@@ -1,65 +1,124 @@
-// The schedule editor's draft: text fields the way an operator types them
-// (a time of day, a duration, a UTC offset), validated into the model's
-// seconds and minutes, and turned into the YANG-JSON the API takes.
+// The schedule editor's draft: a window the way a calendar event is typed
+// (starts, ends, repeat), validated into the model's time of day, duration
+// and weekdays, and turned into the YANG-JSON the API takes.
 
 import type { Campaign, Device, MaintenanceWindow, Schedule, ScheduleJson } from '#lib/software/model.ts';
-import {
-  formatDuration,
-  formatLocalTime,
-  formatTimeOfDay,
-  formatUtcOffset,
-  parseDuration
-} from '#lib/core/time.ts';
-import { WEEKDAYS } from './occurrences';
+import { formatDuration, formatTimeOfDay, formatUtcOffset } from '#lib/core/time.ts';
+import { WEEKDAYS, type Weekday } from './occurrences';
+
+const DAY = 86400;
+
+/** How a window repeats. The model has weekdays only: an empty list is
+ * every day, the presets are fixed lists. */
+export type Repeat = 'daily' | 'weekdays' | 'weekends' | 'weekly';
+
+export const REPEAT_OPTIONS: { value: Repeat; label: string }[] = [
+  { value: 'daily', label: 'Every day' },
+  { value: 'weekdays', label: 'Every weekday' },
+  { value: 'weekends', label: 'Every weekend' },
+  { value: 'weekly', label: 'Weekly' }
+];
+
+const PRESET_DAYS: Record<'weekdays' | 'weekends', Weekday[]> = {
+  weekdays: ['mon', 'tue', 'wed', 'thu', 'fri'],
+  weekends: ['sat', 'sun']
+};
+
+const DAY_NAMES: Record<Weekday, string> = {
+  mon: 'Mon',
+  tue: 'Tue',
+  wed: 'Wed',
+  thu: 'Thu',
+  fri: 'Fri',
+  sat: 'Sat',
+  sun: 'Sun'
+};
+
+function sameDays(a: string[], b: string[]): boolean {
+  return a.length === b.length && a.every((d) => b.includes(d));
+}
+
+/** The repeat a stored weekday list reads as. */
+export function repeatOf(days: string[]): Repeat {
+  if (days.length === 0) return 'daily';
+  if (sameDays(days, PRESET_DAYS.weekdays)) return 'weekdays';
+  if (sameDays(days, PRESET_DAYS.weekends)) return 'weekends';
+  return 'weekly';
+}
+
+/** The weekday list a repeat stores. */
+export function daysOfRepeat(repeat: Repeat, days: string[]): string[] {
+  if (repeat === 'daily') return [];
+  if (repeat === 'weekly') return WEEKDAYS.filter((d) => days.includes(d));
+  return [...PRESET_DAYS[repeat]];
+}
 
 export interface WindowDraft {
-  /** Row identity while editing; the model's key is `at`. */
+  /** The model's key, also the row identity while editing. */
   id: number;
+  /** The optional label as typed. */
+  label: string;
+  repeat: Repeat;
+  /** Picked weekdays; only 'weekly' uses them, the others keep them for
+   * a switch back. */
+  days: string[];
   /** Local time of day, HH:MM. */
   at: string;
-  /** 30m, 2h30m, 1d; a bare number is seconds. */
-  duration: string;
-  days: string[];
+  /** Local time of day the window closes, HH:MM, endDay days after it
+   * opens. */
+  end: string;
+  endDay: number;
+  /** The last length that parsed: a new start keeps it, as a calendar
+   * moves an event. */
+  duration: number | null;
 }
 
 export interface ScheduleDraft {
   name: string;
-  /** ±HH:MM east of UTC. */
-  utcOffset: string;
+  /** Minutes east of UTC. */
+  utcOffset: number;
   windows: WindowDraft[];
 }
 
-let nextRowId = 1;
-
-export function newWindowDraft(partial: Partial<WindowDraft> = {}): WindowDraft {
-  return { id: nextRowId++, at: '22:00', duration: '4h', days: [], ...partial };
-}
-
-export function emptyDraft(): ScheduleDraft {
-  return { name: '', utcOffset: '+00:00', windows: [newWindowDraft()] };
-}
-
-export function draftFromSchedule(s: Schedule): ScheduleDraft {
+/** A draft row for a window of the model. */
+export function windowDraft(w: MaintenanceWindow): WindowDraft {
+  const endAbs = w.at + w.duration;
   return {
-    name: s.name,
-    utcOffset: formatUtcOffset(s.utcOffset),
-    windows: s.windows.map((w) =>
-      newWindowDraft({ at: formatTimeOfDay(w.at), duration: formatDuration(w.duration), days: [...w.days] })
-    )
+    id: w.id,
+    label: w.description,
+    repeat: repeatOf(w.days),
+    days: [...w.days],
+    at: formatTimeOfDay(w.at),
+    end: formatTimeOfDay(endAbs % DAY),
+    endDay: Math.floor(endAbs / DAY),
+    duration: w.duration
   };
 }
 
-/** "+01:00", "-05:00", "+1", "0", "UTC+08:00" -> minutes east of UTC;
- * null when unparsable. */
-export function parseUtcOffset(text: string): number | null {
-  const t = text.trim().toUpperCase().replace(/^UTC/, '').replace(/^GMT/, '');
-  if (t === '' || t === 'Z') return 0;
-  const m = /^([+-]?)(\d{1,2})(?::?(\d{2}))?$/.exec(t);
-  if (!m) return null;
-  const sign = m[1] === '-' ? -1 : 1;
-  const minutes = Number(m[3] ?? '0');
-  if (minutes > 59) return null;
-  return sign * (Number(m[2]) * 60 + minutes);
+export function newWindowDraft(id: number, at = 79200): WindowDraft {
+  return windowDraft({ id, description: '', at, duration: 4 * 3600, days: [] });
+}
+
+/** The lowest id no window has yet. */
+export function freeWindowId(windows: { id: number }[]): number {
+  const used = new Set(windows.map((w) => w.id));
+  let id = 1;
+  while (used.has(id)) id++;
+  return id;
+}
+
+/** The viewer's current offset when the model allows it. */
+function browserOffset(): number {
+  const off = -new Date().getTimezoneOffset();
+  return off >= OFFSET_MIN && off <= OFFSET_MAX ? off : 0;
+}
+
+export function emptyDraft(): ScheduleDraft {
+  return { name: '', utcOffset: browserOffset(), windows: [newWindowDraft(1)] };
+}
+
+export function draftFromSchedule(s: Schedule): ScheduleDraft {
+  return { name: s.name, utcOffset: s.utcOffset, windows: s.windows.map(windowDraft) };
 }
 
 /** "22:00", "7:30", "12:07:18" -> seconds after midnight; null when
@@ -74,11 +133,70 @@ export function parseTimeOfDay(text: string): number | null {
   return h * 3600 + min * 60 + sec;
 }
 
-export interface DraftValidation {
-  ok: boolean;
-  /** By field: name, utc-offset, window.<id>.at, window.<id>.duration. */
-  errors: Record<string, string>;
-  warnings: string[];
+/** The window's length from its start and end; null when either does
+ * not parse. Zero or less when it ends before it starts. */
+export function draftDuration(w: Pick<WindowDraft, 'at' | 'end' | 'endDay'>): number | null {
+  const at = parseTimeOfDay(w.at);
+  const end = parseTimeOfDay(w.end);
+  if (at === null || end === null) return null;
+  return w.endDay * DAY + end - at;
+}
+
+/** A new start: the end moves along and the length stays. */
+export function withStart(w: WindowDraft, text: string): WindowDraft {
+  const at = parseTimeOfDay(text);
+  if (at === null || w.duration === null || w.duration <= 0) return { ...w, at: text };
+  const endAbs = at + w.duration;
+  return { ...w, at: text, end: formatTimeOfDay(endAbs % DAY), endDay: Math.floor(endAbs / DAY) };
+}
+
+/** A new end time: an end at or before the start is on the next day,
+ * unless a later day is picked. */
+export function withEnd(w: WindowDraft, text: string): WindowDraft {
+  const at = parseTimeOfDay(w.at);
+  const end = parseTimeOfDay(text);
+  let endDay = w.endDay;
+  if (at !== null && end !== null && endDay <= 1) endDay = end <= at ? 1 : 0;
+  return withLength({ ...w, end: text, endDay });
+}
+
+export function withEndDay(w: WindowDraft, endDay: number): WindowDraft {
+  return withLength({ ...w, endDay });
+}
+
+function withLength(w: WindowDraft): WindowDraft {
+  const duration = draftDuration(w);
+  return duration !== null && duration > 0 ? { ...w, duration } : w;
+}
+
+export function withRepeat(w: WindowDraft, repeat: Repeat): WindowDraft {
+  // Weekly starts from the days the preset had.
+  const days = repeat === 'weekly' && w.repeat !== 'weekly' ? daysOfRepeat(w.repeat, w.days) : w.days;
+  return { ...w, repeat, days };
+}
+
+export function withDayToggled(w: WindowDraft, day: string): WindowDraft {
+  const days = w.days.includes(day) ? w.days.filter((d) => d !== day) : [...w.days, day];
+  return { ...w, days: WEEKDAYS.filter((d) => days.includes(d)) };
+}
+
+/** A window changed on the calendar. A preset stays when the days still
+ * match it, else the window turns weekly. */
+export function withRule(w: WindowDraft, rule: MaintenanceWindow): WindowDraft {
+  const next = windowDraft(rule);
+  const repeat = w.repeat === 'weekly' && rule.days.length > 0 ? 'weekly' : next.repeat;
+  return { ...next, id: w.id, label: w.label, repeat };
+}
+
+/** Options for the end's day: the same day up to a week later, more when
+ * a stored window is longer. */
+export function endDayOptions(endDay: number): { value: string; label: string }[] {
+  const last = Math.max(6, endDay);
+  const out: { value: string; label: string }[] = [];
+  for (let d = 0; d <= last; d++) {
+    out.push({ value: String(d), label: d === 0 ? 'same day' : d === 1 ? 'next day' : `${d} days later` });
+  }
+  return out;
 }
 
 // The model's range for utc-offset: UTC-12:00 to UTC+14:00.
@@ -86,6 +204,44 @@ const OFFSET_MIN = -720;
 const OFFSET_MAX = 840;
 // duration is a uint32.
 const DURATION_MAX = 4294967295;
+
+// The offsets in use around the world, in minutes east of UTC.
+const OFFSETS = [
+  -720, -660, -600, -570, -540, -480, -420, -360, -300, -240, -210, -180, -120, -60, 0, 60, 120, 180, 210, 240, 270,
+  300, 330, 345, 360, 390, 420, 480, 525, 540, 570, 600, 630, 660, 720, 765, 780, 825, 840
+];
+
+/** Time zone options; a stored offset outside the usual ones is kept. */
+export function utcOffsetOptions(current: number): { value: string; label: string }[] {
+  const all = OFFSETS.includes(current) ? OFFSETS : [...OFFSETS, current].sort((a, b) => a - b);
+  return all.map((m) => ({ value: String(m), label: `UTC${formatUtcOffset(m)}` }));
+}
+
+export interface DraftValidation {
+  ok: boolean;
+  /** By field: name, window.<id>.at, window.<id>.end, window.<id>.days. */
+  errors: Record<string, string>;
+  warnings: string[];
+}
+
+/** "Window 2 opens at the same time as window 1 on Fri." when window i
+ * opens on a day at the same time as an earlier one; the planner would
+ * count only the longer. '' when it does not. */
+function sameStartError(windows: (MaintenanceWindow | null)[], i: number): string {
+  const w = windows[i];
+  if (!w) return '';
+  const days = (x: MaintenanceWindow) => (x.days.length === 0 ? [...WEEKDAYS] : x.days);
+  for (let j = 0; j < i; j++) {
+    const o = windows[j];
+    if (!o || o.at !== w.at) continue;
+    const common = WEEKDAYS.filter((d) => days(w).includes(d) && days(o).includes(d));
+    if (common.length === 0) continue;
+    const text = daysText(common);
+    const when = common.length === 7 ? 'every day' : `on ${/^Week/.test(text) ? text.toLowerCase() : text}`;
+    return `Window ${i + 1} opens at the same time as window ${j + 1} ${when}.`;
+  }
+  return '';
+}
 
 export function validateScheduleDraft(
   draft: ScheduleDraft,
@@ -105,74 +261,67 @@ export function validateScheduleDraft(
       errors['name'] = `${name} already exists.`;
     }
   }
-  const offset = parseUtcOffset(draft.utcOffset);
-  if (offset === null) {
-    errors['utc-offset'] = 'An offset like +01:00 or -05:00.';
-  } else if (offset < OFFSET_MIN || offset > OFFSET_MAX) {
-    errors['utc-offset'] = 'Between -12:00 and +14:00.';
-  }
-  const seen = new Map<number, number>();
-  for (const w of draft.windows) {
-    const at = parseTimeOfDay(w.at);
-    if (at === null) {
-      errors[`window.${w.id}.at`] = 'A time of day like 22:00 or 22:00:30.';
-    } else if (seen.has(at)) {
-      errors[`window.${w.id}.at`] = `Rule ${seen.get(at)} already opens at ${w.at}; the opening time is the key.`;
+  const parsed = draft.windows.map(draftWindow);
+  draft.windows.forEach((w, i) => {
+    if (parseTimeOfDay(w.at) === null) {
+      errors[`window.${w.id}.at`] = 'A time of day like 22:00.';
     } else {
-      seen.set(at, draft.windows.indexOf(w) + 1);
+      const clash = sameStartError(parsed, i);
+      if (clash) errors[`window.${w.id}.at`] = clash;
     }
-    const duration = parseDuration(w.duration);
-    if (duration === null) {
-      errors[`window.${w.id}.duration`] = 'A duration like 30m, 2h30m or 1d.';
-    } else if (duration <= 0) {
-      errors[`window.${w.id}.duration`] = 'Longer than zero.';
-    } else if (duration > DURATION_MAX) {
-      errors[`window.${w.id}.duration`] = `At most ${DURATION_MAX.toLocaleString()} seconds.`;
+    const duration = draftDuration(w);
+    if (parseTimeOfDay(w.end) === null) {
+      errors[`window.${w.id}.end`] = 'A time of day like 02:00.';
+    } else if (duration !== null && duration <= 0) {
+      errors[`window.${w.id}.end`] = 'Ends before it starts.';
+    } else if (duration !== null && duration > DURATION_MAX) {
+      errors[`window.${w.id}.end`] = `At most ${formatDuration(DURATION_MAX)}.`;
     }
-  }
+    if (w.repeat === 'weekly' && w.days.length === 0) {
+      errors[`window.${w.id}.days`] = 'Pick at least one day.';
+    }
+  });
   if (draft.windows.length === 0) {
     warnings.push('Without windows the schedule offers no time: campaigns defaulting to it and devices bound to it plan nothing.');
   }
   return { ok: Object.keys(errors).length === 0, errors, warnings };
 }
 
+/** The draft row as a window of the model; null while it does not
+ * parse. */
+export function draftWindow(w: WindowDraft): MaintenanceWindow | null {
+  const at = parseTimeOfDay(w.at);
+  const duration = draftDuration(w);
+  if (at === null || duration === null || duration <= 0) return null;
+  if (w.repeat === 'weekly' && w.days.length === 0) return null;
+  return { id: w.id, description: w.label.trim(), at, duration, days: daysOfRepeat(w.repeat, w.days) };
+}
+
 /** The draft as a parsed schedule. Rows that do not parse are left out,
  * so a half-typed draft still previews. */
 export function draftToSchedule(draft: ScheduleDraft): Schedule {
   const windows: MaintenanceWindow[] = [];
-  const seen = new Set<number>();
   for (const w of draft.windows) {
-    const at = parseTimeOfDay(w.at);
-    const duration = parseDuration(w.duration);
-    if (at === null || duration === null || duration <= 0 || seen.has(at)) continue;
-    seen.add(at);
-    windows.push({ at, duration, days: WEEKDAYS.filter((d) => w.days.includes(d)) });
+    const window = draftWindow(w);
+    if (window !== null) windows.push(window);
   }
-  windows.sort((a, b) => a.at - b.at);
-  return { name: draft.name.trim(), utcOffset: parseUtcOffset(draft.utcOffset) ?? 0, windows };
+  windows.sort((a, b) => a.at - b.at || a.id - b.id);
+  return { name: draft.name.trim(), utcOffset: draft.utcOffset, windows };
 }
 
 /** The draft as a save would store it, to tell an edited draft from the
- * one loaded: a row compares by value where it parses ("4h" is "240m"),
- * as typed where it does not, and the rows in any order. */
+ * one loaded: a row compares by value where it parses, as typed where it
+ * does not, and the rows in any order. */
 export function draftKey(draft: ScheduleDraft): string {
   const rows = draft.windows.map((w) =>
-    JSON.stringify([
-      parseTimeOfDay(w.at) ?? w.at.trim(),
-      parseDuration(w.duration) ?? w.duration.trim(),
-      WEEKDAYS.filter((d) => w.days.includes(d))
-    ])
+    JSON.stringify(draftWindow(w) ?? [w.id, w.label, w.at.trim(), w.end.trim(), w.endDay, w.repeat, w.days])
   );
-  return JSON.stringify([draft.name.trim(), parseUtcOffset(draft.utcOffset) ?? draft.utcOffset.trim(), rows.sort()]);
+  return JSON.stringify([draft.name.trim(), draft.utcOffset, rows.sort()]);
 }
 
-/** The draft row a rule of draftToSchedule(draft) came from: the first
- * row that parses with that opening time, the one draftToSchedule keeps. */
+/** The draft row a rule of draftToSchedule(draft) came from. */
 export function rowOfRule(draft: ScheduleDraft, rule: MaintenanceWindow): WindowDraft | undefined {
-  return draft.windows.find((w) => {
-    const duration = parseDuration(w.duration);
-    return parseTimeOfDay(w.at) === rule.at && duration !== null && duration > 0;
-  });
+  return draft.windows.find((w) => w.id === rule.id);
 }
 
 /** The wire entry. The offset is always sent: a PUT replaces the entry,
@@ -182,7 +331,8 @@ export function scheduleToJson(s: Schedule): ScheduleJson {
     name: s.name,
     'utc-offset': s.utcOffset,
     window: s.windows.map((w) => {
-      const entry: { at: number; duration: number; day?: string[] } = { at: w.at, duration: w.duration };
+      const entry: NonNullable<ScheduleJson['window']>[number] = { id: w.id, at: w.at, duration: w.duration };
+      if (w.description) entry.description = w.description;
       if (w.days.length > 0) entry.day = [...w.days];
       return entry;
     })
@@ -195,15 +345,61 @@ export function scheduleCreatePatch(s: Schedule): { 'maintenance:schedules': { s
   return { 'maintenance:schedules': { schedule: [scheduleToJson(s)] } };
 }
 
-/** One rule: "tue,wed,thu 22:00 (UTC+01:00) for 4h". */
-export function ruleText(w: MaintenanceWindow, utcOffset: number): string {
-  return `${w.days.length > 0 ? w.days.join(',') : 'daily'} ${formatLocalTime(w.at, utcOffset)} for ${formatDuration(w.duration)}`;
+/** "Every day", "Weekdays", "Weekends", "Tue–Thu", "Mon, Wed". */
+export function daysText(days: string[]): string {
+  const idx = WEEKDAYS.map((d, i) => (days.includes(d) ? i : -1)).filter((i) => i >= 0);
+  if (idx.length === 0 || idx.length === 7) return 'Every day';
+  const repeat = repeatOf(days);
+  if (repeat === 'weekdays') return 'Weekdays';
+  if (repeat === 'weekends') return 'Weekends';
+  // Runs of three or more days read as a range.
+  const parts: string[] = [];
+  for (let i = 0; i < idx.length; ) {
+    let j = i;
+    while (j + 1 < idx.length && idx[j + 1] === idx[j] + 1) j++;
+    if (j - i >= 2) {
+      parts.push(`${DAY_NAMES[WEEKDAYS[idx[i]]]}–${DAY_NAMES[WEEKDAYS[idx[j]]]}`);
+    } else {
+      for (let k = i; k <= j; k++) parts.push(DAY_NAMES[WEEKDAYS[idx[k]]]);
+    }
+    i = j + 1;
+  }
+  return parts.join(', ');
 }
 
-/** Every rule of a schedule, joined with a middle dot. */
-export function scheduleRulesText(s: Schedule): string {
+/** "Tue–Thu 22:00–02:00", "Fri 20:00 – Sun 08:00", "Every day
+ * 22:00–06:00 +2 days". An end before the start reads as the next day;
+ * a later end is spelled out. */
+export function windowText(w: MaintenanceWindow): string {
+  const endAbs = w.at + w.duration;
+  const endDay = Math.floor(endAbs / DAY);
+  const end = formatTimeOfDay(endAbs % DAY);
+  const days = daysText(w.days);
+  if (endDay === 0 || (endDay === 1 && endAbs % DAY < w.at)) return `${days} ${formatTimeOfDay(w.at)}–${end}`;
+  if (w.days.length === 1) {
+    const i = WEEKDAYS.indexOf(w.days[0] as Weekday);
+    if (i >= 0) return `${days} ${formatTimeOfDay(w.at)} – ${DAY_NAMES[WEEKDAYS[(i + endDay) % 7]]} ${end}`;
+  }
+  return `${days} ${formatTimeOfDay(w.at)}–${end} +${endDay} day${endDay === 1 ? '' : 's'}`;
+}
+
+/** windowText after the label, if any: "weeknights: Mon–Fri 22:00–01:00". */
+export function labelledWindowText(w: MaintenanceWindow): string {
+  return w.description ? `${w.description}: ${windowText(w)}` : windowText(w);
+}
+
+/** One window with the schedule's zone: "weeknights: Tue–Thu 22:00–02:00
+ * UTC+01:00". */
+export function ruleText(w: MaintenanceWindow, utcOffset: number): string {
+  return `${labelledWindowText(w)} UTC${formatUtcOffset(utcOffset)}`;
+}
+
+/** Every window of a schedule, joined with a middle dot, the zone once at
+ * the end unless left out. */
+export function scheduleRulesText(s: Schedule, withZone = true): string {
   if (s.windows.length === 0) return 'no windows';
-  return s.windows.map((w) => ruleText(w, s.utcOffset)).join(' · ');
+  const text = s.windows.map(windowText).join(' · ');
+  return withZone ? `${text} UTC${formatUtcOffset(s.utcOffset)}` : text;
 }
 
 export interface ScheduleUsage {

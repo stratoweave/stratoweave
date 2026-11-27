@@ -60,13 +60,6 @@ export function formatUtcOffset(minutes: number): string {
   return `${sign}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
 }
 
-/** Local time-of-day seconds and a schedule's UTC offset -> "04:00 (UTC-05:00)":
- * the time of day in the schedule's own zone, the zone spelled out so a
- * negative offset does not read as a time range. */
-export function formatLocalTime(at: number, utcOffsetMinutes: number): string {
-  return `${formatTimeOfDay(at)} (UTC${formatUtcOffset(utcOffsetMinutes)})`;
-}
-
 function localDate(d: Date): string {
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
 }

@@ -149,9 +149,11 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   only while it is newer than the reload. Nothing ever polls
   `GET /restconf/data` — it also hauls the full yang-library.
 - Schedules are the shared `maintenance:schedules` entries: a name, a
-  `utc-offset` in minutes and a `window` list keyed by `at`, the local
-  time of day a rule opens, with a `duration` and an optional `day`
-  leaf-list. New names are limited to letters, digits, dots, dashes and
+  `utc-offset` in minutes and a `window` list keyed by a numeric `id`,
+  with an optional `description`, `at` (the local time of day a rule
+  opens), a `duration` and an optional `day` leaf-list. The editor gives a
+  new window the lowest free `id` and shows the description as the
+  window's label. New names are limited to letters, digits, dots, dashes and
   underscores since they end up in URLs; an existing entry opens and saves
   whatever its name. Creating one PATCHes the datastore root; saving an
   existing one PUTs the whole entry, because a rule removed in the editor
@@ -161,7 +163,14 @@ Type check: `npm run check`. After UI changes: `just gen-webui`, then
   page draws a week of every schedule's occurrences in the viewer's local
   clock; the occurrences are generated the way the planner generates them,
   so what the calendar shows is the supply of windows a campaign will be
-  placed into. In the editor the calendar edits the rules: drag a window
+  placed into. The editor types a window like a calendar event: starts,
+  ends (the same day up to six days later; a new start keeps the length)
+  and repeat (every day, every weekday, every weekend, or weekly on picked
+  days). An empty `day` list means every day, so weekly needs at least one
+  day. Two windows may open at the same time only on different days (the
+  planner would count only the longer one). The time zone is a fixed `utc-offset` picked from the usual
+  offsets, a new schedule defaulting to the browser's. In the editor the
+  calendar edits the rules: drag a window
   to move it, an edge to resize it, or across an empty stretch of a day to
   add one, in quarter-hour steps. A rule has one opening time, so moving
   one window moves all of its weekdays in time; sideways only the dragged

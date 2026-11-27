@@ -139,7 +139,7 @@
   function describe(b: Block): string {
     const o = b.occurrence;
     const s = byName.get(o.schedule);
-    const rule = s ? ` · rule ${ruleText(o.rule, s.utcOffset)}` : '';
+    const rule = s ? ` · ${ruleText(o.rule, s.utcOffset)}` : '';
     return `${o.schedule}: opens ${formatClock(o.start)}, closes ${formatClock(o.end)}${rule}`;
   }
 
@@ -355,7 +355,7 @@
   </div>
   {#each columns as col, i (col.start)}
     <div class="day" class:today={i === todayIndex} data-col={i}>
-      {#each perDay[i] as b, j (`${b.occurrence.schedule}@${b.occurrence.start}`)}
+      {#each perDay[i] as b, j (`${b.occurrence.schedule}#${b.occurrence.rule.id}@${b.occurrence.start}`)}
         {@const color = colorOf(b.occurrence.schedule)}
         {@const h = height(b)}
         {@const dragged = draggedRule !== null && b.occurrence.rule === draggedRule}

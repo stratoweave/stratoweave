@@ -101,7 +101,7 @@
           <thead>
             <tr>
               <th>Schedule</th>
-              <th>UTC offset</th>
+              <th>Time zone</th>
               <th>Windows</th>
               {#if usageShown}
                 <th class="right">Bound devices</th>
@@ -119,7 +119,7 @@
                   </a>
                 </td>
                 <td class="mono">UTC{formatUtcOffset(row.schedule.utcOffset)}</td>
-                <td class="mono rules">{scheduleRulesText(row.schedule)}</td>
+                <td class="rules">{scheduleRulesText(row.schedule, false)}</td>
                 {#if usageShown}
                   <td class="tn right">
                     {#if row.usage === null}

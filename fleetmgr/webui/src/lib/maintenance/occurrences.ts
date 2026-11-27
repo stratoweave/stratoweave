@@ -172,14 +172,14 @@ export function moveRule(
   const raw = rule.at + shift;
   const carry = Math.floor(raw / DAY);
   const at = mod(raw, DAY);
-  if (rule.days.length === 0) return { at, duration: rule.duration, days: [] };
+  if (rule.days.length === 0) return { ...rule, at, days: [] };
   const dragged = weekdayOf(occStart + utcOffset * 60);
   const others = dayIndexes(rule.days)
     .filter((i) => i !== dragged)
     .map((i) => mod(i + carry, 7));
   let moved = mod(dragged + carry + dayMove, 7);
   if (others.includes(moved)) moved = mod(dragged + carry, 7);
-  return { at, duration: rule.duration, days: daysFromIndexes([...others, moved]) };
+  return { ...rule, at, days: daysFromIndexes([...others, moved]) };
 }
 
 /** The rule after one edge of its occurrence opening at `occStart` moved
@@ -194,14 +194,15 @@ export function resizeRule(
 ): MaintenanceWindow {
   const occEnd = occStart + rule.duration;
   if (edge === 'end') {
-    return { at: rule.at, duration: Math.max(SNAP_S, to - occStart), days: [...rule.days] };
+    return { ...rule, duration: Math.max(SNAP_S, to - occStart), days: [...rule.days] };
   }
   const start = Math.min(to, occEnd - SNAP_S);
   return { ...moveRule(rule, utcOffset, occStart, start - occStart, 0), duration: occEnd - start };
 }
 
-/** A rule on one weekday for a span dragged out on the calendar. */
+/** A rule on one weekday for a span dragged out on the calendar. Its id
+ * is 0: the editor gives it one. */
 export function ruleForSpan(start: number, end: number, utcOffset: number): MaintenanceWindow {
   const local = start + utcOffset * 60;
-  return { at: mod(local, DAY), duration: end - start, days: [WEEKDAYS[weekdayOf(local)]] };
+  return { id: 0, description: '', at: mod(local, DAY), duration: end - start, days: [WEEKDAYS[weekdayOf(local)]] };
 }

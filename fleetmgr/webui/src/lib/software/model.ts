@@ -129,6 +129,8 @@ interface DeviceStatusJson {
 
 /** One recurrence rule of a schedule: a local time of day. */
 interface WindowJson {
+  id: number;
+  description?: string;
   at: number;
   duration: number;
   day?: string[];
@@ -522,6 +524,10 @@ export interface GroupPolicy {
 }
 
 export interface MaintenanceWindow {
+  /** The key within the schedule. */
+  id: number;
+  /** Optional label; '' for none. */
+  description: string;
   /** Local time of day the window opens, seconds after midnight. */
   at: number;
   duration: number;
@@ -931,11 +937,13 @@ export function parseSchedules(json: unknown): Schedule[] {
   const tree = (json as DataTreeJson)?.['maintenance:schedules'];
   const schedules = (tree?.schedule ?? []).map((s) => {
     const windows = (s.window ?? []).map((w) => ({
+      id: num(w.id),
+      description: w.description ?? '',
       at: num(w.at),
       duration: num(w.duration),
       days: w.day ?? []
     }));
-    windows.sort((a, b) => a.at - b.at);
+    windows.sort((a, b) => a.at - b.at || a.id - b.id);
     return { name: s.name, utcOffset: num(s['utc-offset'] ?? 0), windows };
   });
   schedules.sort((a, b) => a.name.localeCompare(b.name));
