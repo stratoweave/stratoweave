@@ -1,0 +1,1 @@
+import{q as e}from"./DG_eqXSH.js";async function t(t){await e(),t?.querySelector(`[aria-invalid="true"], [data-error-focus]`)?.focus()}export{t};

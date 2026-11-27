@@ -1,0 +1,1 @@
+import{ot as e}from"./DG_eqXSH.js";var t=e({text:``});export{t};
