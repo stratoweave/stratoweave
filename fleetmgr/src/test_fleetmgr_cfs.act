@@ -6976,16 +6976,22 @@ def _request_text(d: ?gdata.Node) -> str:
 
 
 actor _Wire(write: action(gdata.Node) -> None, request: action(?gdata.Node) -> None):
-    """The way from a campaign actor to its transform. It counts the writes
-    of the output, and holds them, in order, while held. It logs the
+    """The way between a campaign actor and its transform. It counts the
+    writes of the output, and holds them, in order, while held. It logs the
     dynstate writes, and holds them, in order, while the requests are
-    held."""
+    held. It gives the actor each commit, and counts them. It keeps the
+    number of the last request that it passed on, and of the last request
+    that the memory of a commit took."""
     var held = False
     var queue: list[gdata.Node] = []
     var writes = 0
     var requests_held = False
     var requests: list[?gdata.Node] = []
     var log: list[str] = []
+    var prev: ?gdata.Container = None
+    var asked = 0
+    var took = 0
+    var delivered = 0
 
     def output(conf: gdata.Node) -> None:
         writes += 1
@@ -6994,12 +7000,36 @@ actor _Wire(write: action(gdata.Node) -> None, request: action(?gdata.Node) -> N
         else:
             write(conf)
 
-    def dynstate(d: ?gdata.Node) -> None:
+    def pass_on(d: ?gdata.Node) -> None:
+        asked = cfs.asked_request(InputDynstate.from_gdata(d))
+        request(d)
+
+    def dynstate(data: ?InputDynstate) -> None:
+        d = data?.to_gdata(prev)
+        prev = d if isinstance(d, gdata.Container) else None
         log.append(_request_text(d))
         if requests_held:
             requests.append(d)
         else:
-            request(d)
+            pass_on(d)
+
+    def deliver(a: cfs.UpgradeCampaignTransform, conf: InputCampaign, linked: gdata.Node,
+                memory: ?InputMemory) -> None:
+        """Give the actor a committed configuration and memory."""
+        delivered += 1
+        took = cfs.kept_request(memory)
+        a.on_conf(conf, linked, memory)
+
+    def shut(a: cfs.UpgradeCampaignTransform, memory: ?InputMemory) -> None:
+        """Shut the actor down with the memory of the last commit."""
+        delivered += 1
+        took = cfs.kept_request(memory)
+        a.shutdown(memory)
+
+    def progress() -> (asked: int, took: int, delivered: int):
+        """The number of the last request passed on, of the last request
+        that the memory of a commit took, and the count of commits."""
+        return (asked=asked, took=took, delivered=delivered)
 
     def hold() -> None:
         held = True
@@ -7018,12 +7048,12 @@ actor _Wire(write: action(gdata.Node) -> None, request: action(?gdata.Node) -> N
     def release_requests() -> None:
         requests_held = False
         for d in requests:
-            request(d)
+            pass_on(d)
         requests = []
 
     def release_request() -> None:
         if len(requests) > 0:
-            request(requests[0])
+            pass_on(requests[0])
             requests = requests[1:]
 
     def seen() -> (int, list[str]):
@@ -7045,6 +7075,26 @@ actor _Campaigns():
 
     def wire_of(name: str) -> ?_Wire:
         return wires.get(name)
+
+    def unsettled() -> list[str]:
+        """The campaigns that have not settled, each as text: the memory of
+        the campaign has not taken the last request that its actor sent, or
+        a commit reached the actor while this looked. The actor answers
+        between the two looks at its wire, so it has acted on each commit
+        delivered before the first look, and its requests have reached the
+        wire before the second."""
+        res: list[str] = []
+        for campaign, w in wires.items():
+            first = w.progress()
+            a = acts.get(campaign)
+            freed: set[str] = set()
+            if a is not None:
+                freed = a.freed_members()
+            second = w.progress()
+            if second.took < second.asked or second.delivered != first.delivered:
+                res.append("{campaign} asked {second.asked}, took {second.took}, "
+                           + "{second.delivered - first.delivered} commits arrived, freed {freed}")
+        return res
 
     def clear() -> None:
         acts = {}
@@ -7090,12 +7140,11 @@ def _campaign_stack(register: action(str, cfs.UpgradeCampaignTransform, _Wire) -
 
     def make(params: ttt.TransformActorParams) -> ttt.TransformActor:
         wire = _Wire(params.write_output, params.update_dynstate)
-        dyn = yadata.ToGdataPrevWrapper(wire.dynstate)
         oper = yadata.ToGdataPrevWrapper(params.update_oper)
-        a = cfs.UpgradeCampaignTransform(params.path, wire.output, dyn.update, oper.update, None)
+        a = cfs.UpgradeCampaignTransform(params.path, wire.output, wire.dynstate, oper.update, None)
         register(campaign_name(params.path), a, wire)
-        return ttt.TransformActor(action lambda c, l, m: a.on_conf(input(c), l, memory(m)),
-                                  lambda m: a.shutdown(memory(m)))
+        return ttt.TransformActor(action lambda c, l, m: wire.deliver(a, input(c), l, memory(m)),
+                                  lambda m: wire.shut(a, memory(m)))
 
     root = ttt.Container({
         gdata.Id("http://stratoweave.org/yang/stratoweave-images", "images"):
@@ -7367,7 +7416,8 @@ actor _StackActor(case: str, steps: list[_Step], fs: file.FS, cap: file.WriteFil
                   log_handler: logging.Handler, report: action(str, ?str) -> None):
     """Run the steps of case on stack, over the LMDB database at db_path,
     then report the case and what went wrong, or None. A check looks again
-    every 50 ms, for five seconds at most."""
+    every 50 ms, for five seconds at most, and a wait lasts its seconds,
+    both on the wall clock."""
     var db = _initial_db
     var stack = _initial_stack
     var last = _initial_root
@@ -7411,7 +7461,7 @@ actor _StackActor(case: str, steps: list[_Step], fs: file.FS, cap: file.WriteFil
         if tries > 100:
             finish("step {step} ({steps[step].kind}): {what}")
         else:
-            after 0.05: run()
+            after now 0.05: run()
 
     def check(ok: bool, got: str) -> None:
         if ok:
@@ -7437,8 +7487,14 @@ actor _StackActor(case: str, steps: list[_Step], fs: file.FS, cap: file.WriteFil
             advance()
 
     def restart() -> None:
-        """Restart once no transaction of the stack is open: a new stack
-        restores the database of the old one."""
+        """Restart once every campaign has settled (_Campaigns.unsettled()),
+        and no transaction of the stack is open: a new stack restores the
+        database of the old one. A commit is in the database before its
+        memory reaches the actor."""
+        unsettled = campaigns.unsettled()
+        if unsettled != []:
+            again("not settled: " + "; ".join(unsettled))
+            return
         try:
             await async db.db.close()
         except Exception as e:
@@ -7595,7 +7651,7 @@ actor _StackActor(case: str, steps: list[_Step], fs: file.FS, cap: file.WriteFil
         elif k == "restart":
             restart()
         elif k == "wait":
-            after s.seconds: advance()
+            after now s.seconds: advance()
         elif k == "acquired":
             got = _acquired(stack.below().get())
             check(got == s.want, "acquired {got}")
@@ -7613,7 +7669,7 @@ actor _StackActor(case: str, steps: list[_Step], fs: file.FS, cap: file.WriteFil
                 if k == "quiet" and tries == 0:
                     # Let the time pass first, then check once.
                     tries = 100
-                    after s.seconds: run()
+                    after now s.seconds: run()
                 else:
                     on_wire(s, w)
             else:
