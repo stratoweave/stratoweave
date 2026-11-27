@@ -1,0 +1,1 @@
+function e(e){return`/devices/${encodeURIComponent(e)}`}function t(e){return`/campaigns/${encodeURIComponent(e)}`}function n(e,n){return`${t(e)}/devices/${encodeURIComponent(n)}`}export{t as n,e as r,n as t};

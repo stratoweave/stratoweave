@@ -1080,6 +1080,11 @@
   budget counts it, and an edit that gives one to any other member fails the
   same way. Before, a new version made a member that was done upgrade again,
   and a new attempt made a member that succeeded read its release again.
+- The web UI build is committed as files in `fleetmgr/webui/build`, and the
+  fleetmgr build embeds them with Acton's `embed`, through a derived module
+  in `fleetmgr/Build.act`. The generated `webui_assets.act` and
+  `gen-embedded-assets.mjs` are gone, and `just gen-webui` only builds the
+  UI. Building fleetmgr needs Acton 0.31.0.20261126 or newer.
 
 ### Dependencies
 
@@ -1341,10 +1346,12 @@
   device instead: `state/adapter` shows whether it is connected, and the
   inspection API's `/device/<name>/info` and `/device/<name>/log` show its
   queue and what was sent to it. [#792]
-- `stratoweave.main()` takes `static_assets` as `dict[str, bytes]`. Have the
-  web UI build embed each file as a `bytes` literal, as fleetmgr's
-  `gen-embedded-assets.mjs` does. http-router handlers and middleware call
-  `respond` with a `bytes` body: call `.encode()` on a `str` body.
+- `stratoweave.main()` takes `static_assets` as `dict[str, bytes]`. Embed
+  the files of the web UI build with a derived module that calls
+  `std.build.derive.embed_files`, as `fleetmgr/Build.act` does. See
+  "Embedded static assets" in the HTTP API docs. http-router handlers and
+  middleware call `respond` with a `bytes` body: call `.encode()` on a `str`
+  body.
 
 ## [26.10] - 2026-10-23
 

@@ -5,10 +5,11 @@ inventory, software images and software upgrade campaigns over RESTCONF.
 
 It is a static SPA served by the fleetmgr top itself, next to its RESTCONF
 API on the same origin, so there is no proxy and no CORS: `just gen-webui`
-(from ../) builds it and writes the build into `src/fleetmgr/webui_assets.act`
-as embedded assets, which the top serves with an `index.html` fallback for
-client-routed pages. That module is committed; the build is byte-deterministic
-(see `vite.config.ts`) so it only changes with the UI. Writes send
+(from ../) builds it into `build/`, and `just build` embeds those files in
+the binary (`derived_modules` in ../Build.act). The top serves them with an
+`index.html` fallback for client-routed pages. `build/` is committed, so
+building fleetmgr needs no Node; the build is byte-deterministic (see
+`vite.config.ts`) so it only changes with the UI. Writes send
 `async: true` so a PATCH returns when the transaction commits instead of
 after devices finish applying — a real install takes minutes.
 
@@ -24,7 +25,7 @@ after devices finish applying — a real install takes minutes.
     # -> http://localhost:3000, /restconf, the image folder routes and /layer proxied to FLEETMGR_API
 
 Type check: `npm run check`. After UI changes: `just gen-webui`, then
-`just build` and commit the regenerated module.
+`just build` and commit `build/`.
 
 ## How it reads and writes
 

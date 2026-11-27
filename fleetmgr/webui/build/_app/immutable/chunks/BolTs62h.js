@@ -1,0 +1,1 @@
+var e=[`#9085e9`,`#d55181`,`#3987e5`],t=`#6b7a99`;function n(t){let n=[...new Set(t)].sort((e,t)=>e.localeCompare(t));return new Map(n.map((t,n)=>[t,e[n]??`#6b7a99`]))}export{n,t};

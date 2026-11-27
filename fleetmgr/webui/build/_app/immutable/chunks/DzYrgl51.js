@@ -1,0 +1,1 @@
+import{n as e}from"./CQhSoEAn.js";var t=[];async function n(n,r=``){t=n;try{await e(r?`/images/new?${new URLSearchParams({folder:r})}`:`/images/new`)}finally{t===n&&(t=[])}}function r(){let e=t;return t=[],e}export{r as n,n as t};

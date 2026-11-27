@@ -1,0 +1,1 @@
+import{$ as e}from"./DG_eqXSH.js";function t(t,n){e(()=>{let e=t(),r=!0;return e.then(e=>{r&&n(e)}),()=>{r=!1}})}export{t};
