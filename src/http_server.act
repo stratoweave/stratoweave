@@ -4,6 +4,7 @@ import std.json
 import logging
 import net
 
+import auth as swauth
 import device as swdev
 import device_log_api as swdevlog
 import image_dir as swimg
@@ -42,6 +43,7 @@ actor HttpServer(
     top_oper_schema: yschema.DRoot,
     cfs: ttt.Layer,
     dev_registry: swdev.DeviceRegistry,
+    auth_check: action(str, ?str, ?bytes, action(bool) -> None) -> None,
     schema_for_layer: (int) -> yschema.DRoot,
     oper_schema_for_layer: (int) -> yschema.DRoot,
     install_extra_routes: ?((http_router.Router) -> None) = None,
@@ -53,6 +55,10 @@ actor HttpServer(
     image_dir: ?swimg.ImageDir = None,
     device_log_api: ?swdevlog.DeviceLogApi = None
 ):
+    """Serve the HTTP API, RESTCONF and the web UI.
+
+    Every request needs HTTP Basic credentials that auth_check accepts.
+    """
     _ROUTER_CTX_DEVICE_KEY = "dev"
     http_log = logging.Logger(log_handler)
 
@@ -420,18 +426,43 @@ actor HttpServer(
         g.get("/diff", _router_handle_device_diff)
         g.get("/target", _router_handle_device_target)
         g.get("/running", _router_handle_device_running)
-        g.get("/resync", _router_handle_device_resync)
+        g.post("/resync", _router_handle_device_resync)
         g.get("/info", _router_handle_device_info)
         g.get("/log", _router_handle_device_log)
         g.get("/q", _router_handle_device_queue_list)
         g.get("/q/{{id}}", _router_handle_device_queue_get)
         g.post("/q/{{id}}/set_approval", _router_handle_device_queue_set_approval)
 
+    pure def _router_login_middleware(next_handler: proc(http_router.Context, proc(int, dict[str, str], bytes) -> None) -> None) -> proc(http_router.Context, proc(int, dict[str, str], bytes) -> None) -> None:
+        """Let a request through when auth_check accepts its HTTP Basic
+        credentials, and set the context value "user" to the user name."""
+        def wrapped(ctx: http_router.Context, respond: proc(int, dict[str, str], bytes) -> None):
+            credentials = swauth.basic_credentials(ctx.request.headers.get("authorization"))
+            if credentials is not None:
+                user = credentials.user
+                # auth_check answers through checked, which runs in this
+                # actor, so the handlers run here, inside the recoverer that
+                # follows.
+                def checked(ok: bool):
+                    if ok:
+                        ctx.set("user", user)
+                        next_handler(ctx, respond)
+                    else:
+                        respond(401, {"WWW-Authenticate": swauth.CHALLENGE}, b"Login required")
+                auth_check(user, credentials.password, None, checked)
+            else:
+                respond(401, {"WWW-Authenticate": swauth.CHALLENGE}, b"Login required")
+        return wrapped
+
     http_router_root = http_router.Router()
-    def _on_http_server_request(server, request, respond):
+    def serve(request: std.http.Request, respond: action(int, dict[str, str], bytes) -> None):
+        """Answer request like a request from a connection."""
         def send_response(status: int, headers: dict[str, str], body: bytes):
             respond(status, headers, body)
         http_router_root.serve(request, send_response)
+
+    def _on_http_server_request(server, request, respond):
+        serve(request, respond)
 
     def _on_http_accept(server):
         server.cb_install(_on_http_server_request, _on_http_server_error)
@@ -447,6 +478,8 @@ actor HttpServer(
 
     def __startup__():
         http_router_root.use(http_router.access_log_middleware(http_log))
+        http_router_root.use(swauth.cross_origin_middleware)
+        http_router_root.use(_router_login_middleware)
         http_router_root.use(http_router.recoverer_middleware(http_log))
 
         http_router_root.get("/config-queue", _router_handle_config_queue)

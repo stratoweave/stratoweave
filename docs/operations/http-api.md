@@ -11,8 +11,13 @@ You can call these endpoints against any StratoWeave orchestrator with a base
 URL like this:
 
 ```sh
-curl "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/running?format=xml"
+curl -u admin:admin "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/running?format=xml"
 ```
+
+!!! note "Login"
+    Every request needs the name and password of a user, which `curl -u`
+    sends. The examples log in as `admin` with the password `admin`; see
+    [Users and logins](users.md) for how to give a user.
 
 A few conventions matter when you call these endpoints directly:
 
@@ -34,7 +39,7 @@ SORESPO quicklab Makefiles use these inspection endpoints today:
 - `GET /device/<name>/target?format=<fmt>`
 - `GET /device/<name>/running?format=<fmt>`
 - `GET /device/<name>/diff?format=<fmt>`
-- `GET /device/<name>/resync`
+- `POST /device/<name>/resync`
 
 Typical Make targets include:
 
@@ -109,7 +114,7 @@ Supported formats:
 Example:
 
 ```sh
-curl "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/running?format=xml"
+curl -u admin:admin "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/running?format=xml"
 ```
 
 If the device cannot be read, the endpoint returns a `200` with the
@@ -129,7 +134,7 @@ Supported formats:
 Example:
 
 ```sh
-curl "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/target?format=xml"
+curl -u admin:admin "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/target?format=xml"
 ```
 
 If no target configuration is available, the endpoint returns a `200` with the
@@ -148,7 +153,7 @@ Supported formats:
 Example:
 
 ```sh
-curl "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/diff?format=xml"
+curl -u admin:admin "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/diff?format=xml"
 ```
 
 If there is no diff, the endpoint returns `# No differences`. If either side is
@@ -222,10 +227,11 @@ follows the file, also when it was rotated in between.
 A system that writes no log files, with an empty `log.dir`, answers `404`.
 
 On a Fleet Manager top, a fleet device is managed by a flotilla, and the top
-sends the request on to the flotilla's HTTP server.
+sends the request on to the flotilla's HTTP server, logged in as the
+flotilla's user.
 
 ```sh
-curl "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/log-entries?level=error,warning&q=commit"
+curl -u admin:admin "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/log-entries?level=error,warning&q=commit"
 ```
 
 ### `GET /device/<name>/q`
@@ -298,13 +304,13 @@ Each item contains:
 
 This is the best endpoint for a global approval queue view.
 
-### `GET /device/<name>/resync`
+### `POST /device/<name>/resync`
 Triggers a device resynchronization and returns a JSON acknowledgement.
 
 Example:
 
 ```sh
-curl "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/resync"
+curl -u admin:admin -X POST "$STRATOWEAVE_API_ORIGIN/device/AMS-CORE-1/resync"
 ```
 
 Response:
@@ -336,16 +342,16 @@ A layer with no operational state returns an empty document for `nonconfig`.
 Examples:
 
 ```sh
-curl -H "Accept: application/yang-data+xml" \
+curl -u admin:admin -H "Accept: application/yang-data+xml" \
   "$STRATOWEAVE_API_ORIGIN/layer/0"
 
-curl -H "Accept: application/yang-data+json" \
+curl -u admin:admin -H "Accept: application/yang-data+json" \
   "$STRATOWEAVE_API_ORIGIN/layer/2"
 
-curl -H "Accept: application/yang-data+acton-adata" \
+curl -u admin:admin -H "Accept: application/yang-data+acton-adata" \
   "$STRATOWEAVE_API_ORIGIN/layer/3?loose=true"
 
-curl -H "Accept: application/yang-data+json" \
+curl -u admin:admin -H "Accept: application/yang-data+json" \
   "$STRATOWEAVE_API_ORIGIN/layer/0?content=nonconfig"
 ```
 
@@ -402,5 +408,6 @@ Behavior:
 
 Limitations:
 
-- `HEAD` is not supported by the HTTP server; use `curl -sD- -o /dev/null`
-  rather than `curl -I` when inspecting response headers.
+- `HEAD` is not supported by the HTTP server; use
+  `curl -u admin:admin -sD- -o /dev/null` rather than `curl -I` when
+  inspecting response headers.

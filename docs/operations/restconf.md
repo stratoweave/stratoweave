@@ -2,6 +2,8 @@
 
 StratoWeave orchestrators expose a standard RESTCONF interface rooted at
 `/restconf` for retrieving and modifying northbound service intent.
+Every request needs the name and password of a user. The examples log in
+as `admin` with the password `admin`; see [Users and logins](users.md).
 
 ## Entry points
 
@@ -17,14 +19,14 @@ Returns the top-level northbound data tree.
 XML example:
 
 ```sh
-curl -H "Accept: application/yang-data+xml" \
+curl -u admin:admin -H "Accept: application/yang-data+xml" \
   "$STRATOWEAVE_API_ORIGIN/restconf/data"
 ```
 
 JSON example:
 
 ```sh
-curl -H "Accept: application/yang-data+json" \
+curl -u admin:admin -H "Accept: application/yang-data+json" \
   "$STRATOWEAVE_API_ORIGIN/restconf/data"
 ```
 
@@ -42,7 +44,7 @@ For example, a StratoWeave orchestrator can accept northbound intent updates
 like this:
 
 ```sh
-curl -f -X PATCH \
+curl -u admin:admin -f -X PATCH \
   -H "Content-Type: application/yang-data+xml" \
   -d @netinfra.xml \
   "$STRATOWEAVE_API_ORIGIN/restconf/data"
@@ -51,7 +53,7 @@ curl -f -X PATCH \
 JSON payloads can also be used:
 
 ```sh
-curl -f -X PATCH \
+curl -u admin:admin -f -X PATCH \
   -H "Content-Type: application/yang-data+json" \
   -d @netinfra.json \
   "$STRATOWEAVE_API_ORIGIN/restconf/data"
@@ -60,7 +62,7 @@ curl -f -X PATCH \
 To remove a node, send `DELETE` to the resource path below `/restconf/data`:
 
 ```sh
-curl -f -X DELETE \
+curl -u admin:admin -f -X DELETE \
   "$STRATOWEAVE_API_ORIGIN/restconf/data/netinfra:netinfra/router=STO-CORE-1"
 ```
 
@@ -81,7 +83,7 @@ SORESPO quicklab also uses RESTCONF resource paths for simple validation, for
 example:
 
 ```sh
-curl -sS -f -H "Accept: application/yang-data+json" \
+curl -u admin:admin -sS -f -H "Accept: application/yang-data+json" \
   "$STRATOWEAVE_API_ORIGIN/restconf/data/netinfra:netinfra/router=AMS-CORE-1"
 ```
 

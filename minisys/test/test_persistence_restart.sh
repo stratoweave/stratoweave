@@ -5,6 +5,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ACTON_BIN="${ACTON:-acton}"
 ACTON_BUILD_ARGS="${ACTON_BUILD_ARGS:-}"
 CURL_BIN="${CURL:-curl}"
+# The admin user of users.xml
+AUTH="admin:admin"
+USERS_FILE="$ROOT_DIR/minisys/test/common/users.xml"
 PORT="${PORT:-$((18080 + RANDOM % 1000))}"
 DB_PATH="$ROOT_DIR/minisys/test/persistence-restart.db"
 BIN_FILE="$ROOT_DIR/minisys/out/bin/mini"
@@ -26,7 +29,7 @@ fail() {
 wait_for_http() {
     local url="http://127.0.0.1:${PORT}/layer/0"
     for _ in $(seq 1 100); do
-        if "$CURL_BIN" --connect-timeout 1 --max-time 2 -fsS -H "Accept: application/yang-data+json" "$url" >/dev/null 2>&1; then
+        if "$CURL_BIN" --connect-timeout 1 --max-time 2 -fsS -u "$AUTH" -H "Accept: application/yang-data+json" "$url" >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
@@ -37,7 +40,7 @@ wait_for_http() {
 start_mini() {
     (
         cd "$ROOT_DIR"
-        exec "$BIN_FILE" --db "$DB_PATH" --http.port "$PORT"
+        exec "$BIN_FILE" --db "$DB_PATH" --http.port "$PORT" "$USERS_FILE"
     ) >/dev/null 2>&1 &
     PID=$!
     wait_for_http
@@ -61,7 +64,7 @@ stop_mini() {
 }
 
 layer0_json() {
-    "$CURL_BIN" --connect-timeout 1 --max-time 5 -fsS -H "Accept: application/yang-data+json" "http://127.0.0.1:${PORT}/layer/0"
+    "$CURL_BIN" --connect-timeout 1 --max-time 5 -fsS -u "$AUTH" -H "Accept: application/yang-data+json" "http://127.0.0.1:${PORT}/layer/0"
 }
 
 compact_json() {
@@ -82,6 +85,7 @@ start_mini
 "$CURL_BIN" -fsS -X PATCH \
     --connect-timeout 1 \
     --max-time 5 \
+    -u "$AUTH" \
     -H "Content-Type: application/yang-data+json" \
     --data-binary "$CONFIG_JSON" \
     "http://127.0.0.1:${PORT}/restconf/data" >/dev/null

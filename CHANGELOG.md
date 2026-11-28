@@ -59,6 +59,12 @@
   the layer below under a source name taken from its (actor wrapper) object
   address on the heap, which obviously does not work across restarts. The
   source name is now a hash of the transform's path. [#857]
+- `SysSpec.compile` adds the stratoweave-users module, `swyang.users`, to the
+  top layer of every application, so every application can hold the users
+  that log in. A layer definition need not list it.
+- The NETCONF and HTTP servers open when TTT has committed the startup
+  configuration files, not before them, so the users from those files can log
+  in from the first connection.
 
 ### Northbound APIs
 - Fixed NETCONF `<get-config>` returning the operational state published by
@@ -118,9 +124,21 @@
   since an earlier answer, filtered by levels and text, with a count of the
   messages of each level. Each message is an object like a line of the
   `json` log format, from either format. An application gives
-  `stratoweave.main()` a `remote_device_http` function for the devices that
-  another StratoWeave system manages, and the request goes on to that
-  system. [#853]
+  `stratoweave.main()` a `remote_device_http` function that gives, for a
+  device that another StratoWeave system manages, the address, HTTP port and
+  login of that system, and the request goes on to it. [#853]
+- NETCONF checks logins against the users in `/users`, from the new
+  stratoweave-users module. A user logs in with a password, which the entry
+  holds as a crypt(3) hash (yescrypt, or bcrypt with cost 10 to 12), or with
+  an SSH key, a line of a `.pub` file. Give the first user in a startup
+  configuration file. Before, NETCONF took only `netconf.user` and
+  `netconf.password`, and no keys. See the users and logins reference.
+- The HTTP server needs the HTTP Basic credentials of a user on every
+  request, the web UI included, and checks them as NETCONF does. It refuses
+  requests that change state when a browser sends them from a page of
+  another origin, and it tells browsers not to show its pages in frames.
+- `POST /device/<name>/resync` replaces the GET, so no GET request changes
+  state.
 
 ### Devices & Adapters
 - SNMP device adapters are generated from MIBs. The system generator
@@ -1307,6 +1325,10 @@
   actor body, and `connect_actor_pipe_pair()` connects them in
   `__startup__`. `actor_pipe_pair()` does both. [pipe#2] [#847]
 
+#### actxcrypt
+- New dependency: libxcrypt for Acton, which computes crypt(3) password
+  hashes. Logins use it to check the hashes in `/users`.
+
 ### Documentation
 - The software upgrade reference is rewritten to match the code, and is part
   of the guide. [#697] [#699]
@@ -1388,6 +1410,21 @@
   web UI build embed each file as a `bytes` literal, as fleetmgr's
   `gen-embedded-assets.mjs` does. http-router handlers and middleware call
   `respond` with a `bytes` body: call `.encode()` on a `str` body.
+- The settings `netconf.user` and `netconf.password` are gone. Only the users
+  in `/users` log in, to NETCONF and to HTTP. Give the first user in a
+  startup configuration file; see the users and logins reference. A settings
+  file or command line with an old name fails at startup, and an old
+  environment variable such as `STRATOWEAVE_NETCONF__PASSWORD` has no effect.
+- The `netconf.log` lines `NETCONF user authenticated` and `NETCONF
+  authentication failed` are now `Login accepted` and `Login refused`, the
+  same lines as in `http.log`.
+- Regenerate the generated code of every application with `make gen`, so its
+  top layer gets `/users`. Until then no user can log in.
+- Every HTTP client must log in as a user in `/users`, for example with
+  `curl -u`. A proxy that serves StratoWeave over plain HTTP must pass the
+  `Host` header through, or writes from browsers get 403. Call resync with
+  `POST /device/<name>/resync`. The TMF service catalog answers 405 with
+  `Allow: GET` to POST, PUT, PATCH and DELETE, instead of 401.
 
 ## [26.10] - 2026-10-23
 

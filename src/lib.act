@@ -7,6 +7,7 @@ import net
 import tmf.cfs
 
 import app as swapp
+import auth as swauth
 import db as swdb
 import db.etcd as swetcd
 import db.lmdb as swlmdb
@@ -27,7 +28,7 @@ def main(sysspec: swapp.SysSpec, env: Env, http: bool=True, netconf: bool=True,
          system_settings_files: ?list[str]=None,
          system_settings: ?list[dict[str, ?value]]=None,
          static_assets: ?dict[str, bytes]=None,
-         remote_device_http: ?com(str) -> ?(str, int)=None):
+         remote_device_http: ?com(str) -> ?(str, int, str, str)=None):
     """Start a production StratoWeave application.
 
     This entrypoint wires together the standard runtime components used by a
@@ -44,9 +45,10 @@ def main(sysspec: swapp.SysSpec, env: Env, http: bool=True, netconf: bool=True,
             content, e.g. a built web UI) served by the HTTP server alongside
             the APIs, with SPA fallback; see the static_assets module
         remote_device_http: For a device that another StratoWeave system
-            manages, the address and HTTP port of that system, else None.
-            The HTTP server sends requests for the device's log there; see
-            the device_log_api module
+            manages, the address and HTTP port of that system and the user
+            and password that log in to it, else None. The HTTP server sends
+            requests for the device's log there; see the device_log_api
+            module
 
     Startup behavior:
         Any startup config files provided on the command line are merged and
@@ -107,7 +109,7 @@ def _start(sysspec: swapp.SysSpec, env: Env,
            system_settings: swapp.SystemSettings,
            http: bool, netconf: bool,
            static_assets: ?dict[str, bytes]=None,
-           remote_device_http: ?com(str) -> ?(str, int)=None):
+           remote_device_http: ?com(str) -> ?(str, int, str, str)=None):
     fcap = file.FileCap(env.cap)
     rfcap = file.ReadFileCap(fcap)
 
@@ -166,19 +168,26 @@ def _start(sysspec: swapp.SysSpec, env: Env,
     enable_tmf = len(tmf.cfs.services_from_schema(top_schema)) > 0 if http else False
 
     com def start_runtime(netconf_host_key: ?str):
-        if http:
-            tcpl_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))
-            connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(env.cap)))
-            device_log_api = swdevlog.DeviceLogApi(logs.device_logs, dev_registry, connect_cap, remote_device_http, logs.http)
-            swhttp.HttpServer(tcpl_cap, top_schema=top_schema, top_oper_schema=top_oper_schema, cfs=cfs, dev_registry=dev_registry, schema_for_layer=sysspec.schema_for_layer, oper_schema_for_layer=sysspec.oper_schema_for_layer, static_assets=static_assets, enable_tmf_api=enable_tmf, log_handler=logs.http, port=system_settings.http_port, image_dir=image_dir, device_log_api=device_log_api)
+        # The servers open when TTT has committed the startup configuration,
+        # so the users in it can log in from the first connection.
+        com def start_servers():
+            # One LocalAuth per server: each logs to the log of its server,
+            # and HTTP logins do not hold up SSH logins.
+            if http:
+                tcpl_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))
+                connect_cap = net.TCPConnectCap(net.TCPCap(net.NetCap(env.cap)))
+                device_log_api = swdevlog.DeviceLogApi(logs.device_logs, dev_registry, connect_cap, remote_device_http, logs.http)
+                http_auth = swauth.LocalAuth(cfs, logs.http)
+                swhttp.HttpServer(tcpl_cap, top_schema=top_schema, top_oper_schema=top_oper_schema, cfs=cfs, dev_registry=dev_registry, auth_check=http_auth.check, schema_for_layer=sysspec.schema_for_layer, oper_schema_for_layer=sysspec.oper_schema_for_layer, static_assets=static_assets, enable_tmf_api=enable_tmf, log_handler=logs.http, port=system_settings.http_port, image_dir=image_dir, device_log_api=device_log_api)
 
-        if netconf:
-            nc_listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))
-            netconf_port = system_settings.netconf_port
-            swnetconf.NetconfServer(nc_listen_cap, log_handler=logs.netconf, top_schema=top_schema, top_oper_schema=top_oper_schema, cfs=cfs, yang_sources=sysspec.src_yang_for_layer(0), port=netconf_port, username=system_settings.netconf_user, password=system_settings.netconf_password, host_key=netconf_host_key, on_listen=lambda error: lifecycle.netconf_listening(netconf_port, error), ssh_transport=system_settings.netconf_ssh.transport_config())
+            if netconf:
+                nc_listen_cap = net.TCPListenCap(net.TCPCap(net.NetCap(env.cap)))
+                netconf_port = system_settings.netconf_port
+                netconf_auth = swauth.LocalAuth(cfs, logs.netconf)
+                swnetconf.NetconfServer(nc_listen_cap, log_handler=logs.netconf, top_schema=top_schema, top_oper_schema=top_oper_schema, cfs=cfs, yang_sources=sysspec.src_yang_for_layer(0), auth_check=netconf_auth.check, port=netconf_port, host_key=netconf_host_key, on_listen=lambda error: lifecycle.netconf_listening(netconf_port, error), ssh_transport=system_settings.netconf_ssh.transport_config())
+            log.info("StratoWeave running")
 
-        swapp.StartupConfigApplier(system_settings.startup_config_files, system_settings.exit_on_done, top_schema, cfs, lifecycle.exit, rfcap, logs.startup)
-        log.info("StratoWeave running")
+        swapp.StartupConfigApplier(system_settings.startup_config_files, system_settings.exit_on_done, top_schema, cfs, start_servers, lifecycle.exit, rfcap, logs.startup)
 
     swapp.StartupBootstrap(cfs, db is not None, system_settings.netconf_host_key_path if netconf else None, rfcap, start_runtime, lifecycle.exit, logs.startup)
 

@@ -11,6 +11,9 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 ACTON_BIN="${ACTON:-acton}"
 ACTON_BUILD_ARGS="${ACTON_BUILD_ARGS:-}"
 CURL_BIN="${CURL:-curl}"
+# The admin user of users.xml
+AUTH="admin:admin"
+USERS_FILE="$ROOT_DIR/minisys/test/common/users.xml"
 PORT="${PORT:-$((18080 + RANDOM % 1000))}"
 BIN_FILE="$ROOT_DIR/minisys/out/bin/mini"
 WORK_DIR="$(mktemp -d)"
@@ -37,7 +40,7 @@ fail() {
 wait_for_http() {
     local url="http://127.0.0.1:${PORT}/image-file"
     for _ in $(seq 1 100); do
-        if "$CURL_BIN" --connect-timeout 1 --max-time 2 -fsS "$url" >/dev/null 2>&1; then
+        if "$CURL_BIN" --connect-timeout 1 --max-time 2 -fsS -u "$AUTH" "$url" >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.1
@@ -49,7 +52,7 @@ start_mini() {
     # A relative folder, so mini resolves it against its working directory
     (
         cd "$WORK_DIR"
-        exec "$BIN_FILE" --http.port "$PORT" --software.image-dir images
+        exec "$BIN_FILE" --http.port "$PORT" --software.image-dir images "$USERS_FILE"
     ) >/dev/null 2>&1 &
     PID=$!
     wait_for_http
@@ -60,14 +63,14 @@ start_mini() {
 # that off.
 upload() {
     local path="$1" file="$2"
-    STATUS="$("$CURL_BIN" -sS --connect-timeout 1 --max-time 30 -o "$WORK_DIR/reply" -w '%{http_code}' -H 'Expect:' -T "$file" "http://127.0.0.1:${PORT}${path}")"
+    STATUS="$("$CURL_BIN" -sS --connect-timeout 1 --max-time 30 -u "$AUTH" -o "$WORK_DIR/reply" -w '%{http_code}' -H 'Expect:' -T "$file" "http://127.0.0.1:${PORT}${path}")"
     BODY="$(cat "$WORK_DIR/reply")"
 }
 
 # Send a RESTCONF request under /restconf/data, the way the web UI does
 restconf() {
     local method="$1" path="$2" data="${3:-}"
-    local args=(-sS --connect-timeout 1 --max-time 10 -o "$WORK_DIR/reply" -w '%{http_code}' -X "$method" -H 'Accept: application/yang-data+json')
+    local args=(-sS --connect-timeout 1 --max-time 10 -u "$AUTH" -o "$WORK_DIR/reply" -w '%{http_code}' -X "$method" -H 'Accept: application/yang-data+json')
     if [[ -n "$data" ]]; then
         args+=(-H 'Content-Type: application/yang-data+json' --data-binary "$data")
     fi
@@ -78,7 +81,7 @@ restconf() {
 # Send a request to the image folder routes, with data as JSON
 call() {
     local method="$1" path="$2" data="${3:-}"
-    local args=(-sS --connect-timeout 1 --max-time 10 -o "$WORK_DIR/reply" -w '%{http_code}' -X "$method")
+    local args=(-sS --connect-timeout 1 --max-time 10 -u "$AUTH" -o "$WORK_DIR/reply" -w '%{http_code}' -X "$method")
     if [[ -n "$data" ]]; then
         args+=(-H 'Content-Type: application/json' --data-binary "$data")
     fi
@@ -104,6 +107,11 @@ mkdir "$IMAGE_DIR"
 { printf '\r\n\r\n\0\377'; head -c $((3 * 1024 * 1024 - 6)) /dev/urandom; } > "$WORK_DIR/source.bin"
 
 start_mini
+
+# A request without credentials gets 401
+STATUS="$("$CURL_BIN" -sS --connect-timeout 1 --max-time 10 -o /dev/null -w '%{http_code}' "http://127.0.0.1:${PORT}/image-file")"
+[[ "$STATUS" == 401 ]] || fail "expected 401 without credentials, got $STATUS"
+
 upload "/image-file/$NAME" "$WORK_DIR/source.bin"
 expect 200 ""
 cmp "$WORK_DIR/source.bin" "$IMAGE_DIR/$NAME" || fail "the uploaded file differs from the source"

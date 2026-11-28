@@ -1,0 +1,199 @@
+"""Logins to the NETCONF and HTTP servers.
+
+The users are the entries of /users in the top layer, from the
+stratoweave-users module. A user logs in with a password, which the entry
+holds as a crypt(3) hash, or with an SSH key of the entry. An empty password
+never logs in.
+
+LocalAuth.check has the shape of the auth_check of acton-ssh's
+SshPipeListener. The NETCONF server gives it to SSH. The HTTP server calls
+it for HTTP Basic credentials.
+"""
+
+import std.base64
+import std.http
+import http_router
+import logging
+import xcrypt
+
+import ttt
+import yang.gdata as ygdata
+
+NS = "http://stratoweave.org/yang/stratoweave-users"
+USERS = ygdata.Id(NS, "users")
+_USER = ygdata.Id(NS, "user")
+_PASSWORD = ygdata.Id(NS, "password")
+_AUTHORIZED_KEY = ygdata.Id(NS, "authorized-key")
+
+# The HTTP answer to a request without valid credentials, see RFC 7617
+CHALLENGE = 'Basic realm="StratoWeave", charset="UTF-8"'
+
+actor LocalAuth(cfs: ttt.Layer, log_handler: logging.Handler):
+    """Check logins against the users in cfs.
+
+    Each check reads /users, so a change applies to the next login.
+    LocalAuth keeps, for each user, the last password that gave the hash of
+    the user. When the same password comes with the same hash, LocalAuth
+    does not compute the hash again: HTTP Basic sends the password with each
+    request. A kept password does not apply to a changed hash.
+    """
+    _log = logging.Logger(log_handler)
+    var _kept: dict[str, (hashed: str, password: str)] = {}
+
+    def _matches(user: str, password: ?str, pubkey: ?bytes) -> bool:
+        data = cfs.get_data(ygdata.FNode(USERS), ttt.CONTENT_CONFIG)
+        users: ?ygdata.List = data?.get_opt_cnt(USERS)?.get_opt_list(_USER)
+        entry: ?ygdata.Node = users?.get_opt_list_entry(ygdata.key_str_part(user))
+        if pubkey is not None:
+            if entry is not None:
+                return _has_key(entry.get_opt_strs(_AUTHORIZED_KEY), pubkey)
+        elif password is not None and password != "":
+            hashed = entry?.get_opt_str(_PASSWORD)
+            if hashed is not None:
+                return _password_matches(user, password, hashed)
+            # Take as long as for a user with a password
+            other = _any_password(users)
+            if other is not None:
+                _verify(password, other)
+        return False
+
+    def _password_matches(user: str, password: str, hashed: str) -> bool:
+        kept = _kept.get(user)
+        if kept is not None and kept.hashed == hashed and _equal(kept.password.encode(), password.encode()):
+            return True
+        if _verify(password, hashed):
+            _kept[user] = (hashed=hashed, password=password)
+            return True
+        return False
+
+    def accepts(user: str, password: ?str, pubkey: ?bytes) -> bool:
+        """Return True if user logs in with password or pubkey, and log the
+        login.
+
+        pubkey is "type base64". SSH gives a key only after the client
+        proves that it has the private key.
+        """
+        method = "password" if password is not None else "publickey"
+        if _matches(user, password, pubkey):
+            _log.info("Login accepted", {"user": user, "method": method})
+            return True
+        if password is not None:
+            _log.warning("Login refused", {"user": user, "method": method})
+        else:
+            # Clients try their keys before a password
+            _log.debug("Login refused", {"user": user, "method": method})
+        return False
+
+    def check(user: str, password: ?str, pubkey: ?bytes, respond: action(bool) -> None):
+        """Answer accepts through respond, in the shape of the auth_check of
+        acton-ssh's SshPipeListener."""
+        respond(accepts(user, password, pubkey))
+
+
+def basic_credentials(authorization: ?str) -> ?(user: str, password: str):
+    """Return the user and the password of an HTTP Basic Authorization
+    header, see RFC 7617, or None for any other value."""
+    if authorization is not None and authorization[:6].lower() == "basic ":
+        try:
+            parts = std.base64.decode(authorization[6:].strip().encode()).decode().split(":", 1)
+            if len(parts) == 2:
+                return (user=parts[0], password=parts[1])
+        except ValueError:
+            pass
+    return None
+
+
+def basic_authorization(user: str, password: str) -> str:
+    """Return the HTTP Basic Authorization header for user and password, see
+    RFC 7617."""
+    return "Basic " + std.base64.encode((user + ":" + password).encode()).decode()
+
+
+def cross_origin(request: std.http.Request) -> bool:
+    """Return True for a request that can change state and that a browser
+    sent from a page of another origin.
+
+    GET, HEAD and OPTIONS do not change state. A browser tells where a
+    request comes from in Sec-Fetch-Site over HTTPS and to localhost, and in
+    Origin otherwise. A client that sends neither is not a browser.
+    """
+    if request.method.upper() in {"GET", "HEAD", "OPTIONS"}:
+        return False
+    site = request.headers.get("sec-fetch-site")
+    if site is not None:
+        return site not in {"same-origin", "none"}
+    origin = request.headers.get("origin")
+    if origin is not None:
+        parts = origin.split("://", 1)
+        if len(parts) != 2:
+            return True
+        return parts[1] != request.headers.get_def("host", "")
+    return False
+
+
+# TODO: upstream to http_router: it has no middleware against requests from
+# other origins, such as CrossOriginProtection in Go's net/http.
+pure def cross_origin_middleware(next_handler: proc(http_router.Context, proc(int, dict[str, str], bytes) -> None) -> None) -> proc(http_router.Context, proc(int, dict[str, str], bytes) -> None) -> None:
+    """Refuse the requests that cross_origin finds, and tell browsers not to
+    show the answers in a frame of another page.
+
+    A browser also sends the HTTP Basic credentials of a server with the
+    requests that pages of other sites make, so such a page could act as the
+    user.
+    """
+    def wrapped(ctx: http_router.Context, respond: proc(int, dict[str, str], bytes) -> None):
+        def no_frames(status: int, headers: dict[str, str], body: bytes):
+            out = {k: v for k, v in headers.items()}
+            out["X-Frame-Options"] = "DENY"
+            respond(status, out, body)
+        if cross_origin(ctx.request):
+            no_frames(403, {}, b"Cross-origin request refused")
+        else:
+            next_handler(ctx, no_frames)
+    return wrapped
+
+
+def _has_key(keys: list[str], pubkey: bytes) -> bool:
+    """Return True if pubkey is one of keys. pubkey is "type base64", as SSH
+    gives it, and a line of keys can have a comment after the key."""
+    for key in keys:
+        fields = key.split(" ", 2)
+        if len(fields) >= 2 and (fields[0] + " " + fields[1]).encode() == pubkey:
+            return True
+    return False
+
+
+def _any_password(users: ?ygdata.List) -> ?str:
+    """Return the password hash of a user in users, or None if no user has a
+    password."""
+    if users is not None:
+        for e in users.elements.values():
+            hashed = e.get_opt_str(_PASSWORD)
+            if hashed is not None:
+                return hashed
+    return None
+
+
+# TODO: upstream to xcrypt: it has no verify(phrase, hashed) that refuses a
+# phrase with a NUL and compares the hashes in constant time.
+def _verify(password: str, hashed: str) -> bool:
+    """Return True if password gives the crypt(3) hash hashed."""
+    # crypt(3) reads the password only up to a NUL
+    if "\x00" in password:
+        return False
+    try:
+        return _equal(xcrypt.crypt(password, hashed).encode(), hashed.encode())
+    except ValueError:
+        return False
+
+
+# TODO: upstream to Acton's stdlib: it has no compare in constant time, such
+# as Python's hmac.compare_digest.
+def _equal(a: bytes, b: bytes) -> bool:
+    """Return True if a equals b. The time does not show where they differ."""
+    if len(a) != len(b):
+        return False
+    diff = 0
+    for i in range(len(a)):
+        diff |= a[i] ^ b[i]
+    return diff == 0

@@ -95,8 +95,8 @@ demo-reschedule` reopens a running demo's windows shortly; give it the same
 window length and schedule list, `just demo-reschedule 14400 europe` for the
 big demo.
 
-`just run` starts the same top and flotillas with no config: no devices,
-images or campaigns.
+`just run` starts the same top and flotillas with no devices, images or
+campaigns.
 
 For bottom-node development, `just flotilla` still starts one standalone
 instance on the first flotilla's ports. Do not run it alongside `just demo`.
@@ -135,10 +135,10 @@ re-creating the device.
 
 Inspect the top CFS and the bottom RFS independently:
 
-    curl -H "Accept: application/yang-data+json" \
+    curl -u admin:admin -H "Accept: application/yang-data+json" \
       http://127.0.0.1:18200/restconf/data
 
-    curl -H "Accept: application/yang-data+json" \
+    curl -u admin:admin -H "Accept: application/yang-data+json" \
       http://127.0.0.1:18201/restconf/data
 
 The second response should contain the `stratoweave-rfs:device` entries the
@@ -505,7 +505,9 @@ picked image or a newer release, and leaves out the ones that run it. The
 devices pages show whether each device can be reached. The top serves the
 UI itself: the static build is embedded
 in the `fleetmgr` binary as `src/fleetmgr/webui_assets.act`, so with
-`just demo` running the UI is at http://127.0.0.1:18200/. After a UI change,
+`just demo` running the UI is at http://127.0.0.1:18200/. The browser asks
+for a login: `admin`/`admin`, the user of `users.xml`; see
+[Users and logins](../docs/operations/users.md). After a UI change,
 `just gen-webui` rebuilds the UI and regenerates that module (needs Node),
 then `just build` picks it up. For UI work,
 
@@ -530,7 +532,8 @@ the device name's hash modulo ten, plus one. Acton hashes a string the same
 way on every run, so the placement survives restarts. The device's transform
 writes its entry under `/rfs{flotilla-N}/device`, and the top's own
 `/device{flotilla-N}` entry with device type `flotilla`, the flotilla's local
-NETCONF port and the flotillas' default `admin`/`admin` NETCONF login.
+NETCONF port and the `admin`/`admin` NETCONF login, which the supervisor
+gives each flotilla in `users.xml`.
 Every device on a flotilla writes the same entry, so the top connects to a
 flotilla once it has a device.
 
