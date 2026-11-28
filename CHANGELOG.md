@@ -503,6 +503,28 @@
   size of the file on bootflash while it sends. A device that answers
   `Administratively disabled.` needs `ip scp server enable`, and the
   prepare fails with that.
+- A failed IOS XE xcopy fails prepare at once, with the reason of the
+  device, as `download failed: derr-http-returned-error: Curl error - 22`.
+  Before it sends the xcopy, the adapter subscribes to `xcopy-status` of
+  `Cisco-IOS-XE-xcopy-events`, now in `adapters.software_iosxe_yang.models`:
+  apps regenerate their IOS XE device type. The status also ends a
+  transfer that succeeded: IOS XE 17.9.5a records no xcopy, so without an
+  image size its transfer did not end until the timeout.
+- The IOS XE adapter gives an xcopy a timeout of 29 minutes, from IOS XE
+  17.8, a minute less than it waits for the transfer. A transfer from a
+  server that stops sending then ends on the device, with
+  `derr-oper-tout`. Before, it did not end, and the xcopys and installs
+  after it waited, also those of the next attempt.
+- A device can have a transfer VRF, `file-transfer/vrf`. An IOS XE device
+  that fetches its image then fetches it with copy, not xcopy, which does
+  not use a VRF: over the IOS XE CLI adapter when the device has one,
+  which shows how far the copy is and leaves the NETCONF session free,
+  else with the `copy` RPC of `Cisco-IOS-XE-rpc`, which shows no progress
+  while it runs. Copy goes out from the source interface that the device
+  configuration sets for the scheme of the URL, such as `ip http client
+  source-interface`. A copy RPC that leaves an empty file, as over scp
+  when it cannot connect, fails prepare. fleetmgr carries the leaf to its
+  devices.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade

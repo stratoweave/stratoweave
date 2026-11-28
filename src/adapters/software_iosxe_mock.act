@@ -118,6 +118,11 @@ SUB_VERIFY_FAIL = "install-verify-pkg-fail"
 # 17.9.5a.
 SUB_ADD_PRECHK_FAIL = "install-add-prechk-fail"
 SUB_COMMIT_FAIL = "install-img-commit-fail"
+# The xcopy-status of a failed xcopy, as a C8000V with 17.18.2 sends it for
+# a file that the http server does not have.
+XCOPY_ERRCODE = "xcopy-utility-failed"
+XCOPY_ERRSTR = "Curl error - 22"
+XCOPY_DOWNLOAD_ERROR = "derr-http-returned-error"
 
 HISTORY_MAX = 20
 RPCS_MAX = 50
@@ -304,6 +309,23 @@ def version_state_info(state: str, version: str) -> ygdata.Node:
         q("version-state"): ygdata.Leaf(state, ns=ns, module=mod),
         q("version"): ygdata.Leaf(version, ns=ns, module=mod),
     }, ns=ns, module=mod)
+
+
+def xcopy_status_event(uuid: str, status: str, errcode: str="xcopy-no-error", errstr: str="",
+                       download_error: str="derr-ok") -> xml.Node:
+    """Return the xcopy-status notification of the xcopy uuid, as a C8000V
+    with 17.18.2 sends it over http: the percentage and the sizes are 0."""
+    leaves = [("uuid", uuid), ("status", status), ("percentage", "0"), ("filesize", "0"),
+              ("downloaded-size", "0"), ("errcode", errcode), ("errstr", errstr), ("dwnld-err", download_error)]
+    return xml.Node("xcopy-status", nsdefs=[(None, swxe.NS_XCOPY_EVENTS)],
+                    children=[xml.Node(name, text=text) for name, text in leaves])
+
+
+def copy_failure(url: str, file: str) -> str:
+    """Return the message of the rpc-error of a copy RPC whose source the
+    http server does not have, as a C8000V with 17.18.2 sends it."""
+    return "inconsistent value: \nDestination filename [" + file + "]? \nAccessing " + url + \
+        "...\n%Error opening " + url + " (HTTP error: Connection failure)"
 
 
 def bgp_up(failure: str, running: str, committed: str) -> bool:
@@ -518,6 +540,8 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
                         prestaged_size: ?int=None,
                         bundle: bool=False,
                         xcopy_records: bool=True,
+                        xcopy_status: bool=True,
+                        copy_empty: bool=False,
                         last_boot: ?int=None):
     """Model the staged and added image, running and committed release, and
     install history. Also serve a chassis entry with part-number `model` and
@@ -555,7 +579,8 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
     `failure` reproduces one IOS XE failure:
 
       download-failed   xcopy accepted, then the download stage fails with
-                        install-download-fail
+                        install-download-fail, and the xcopy-status says
+                        why: derr-http-returned-error: Curl error - 22
       add-failed        install accepted, then the add pre-check fails with
                         install-verify-pkg-fail
       activate-refused  activate rejected, as when the image was not added
@@ -571,8 +596,13 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
                         until a commit or an abort
       ospf-lost         the OSPF neighbor 10.255.0.3 is stuck in init while
                         the activated release runs, until a commit or an abort
-    Without xcopy_records the mock records no operation for an xcopy, as
-    IOS XE 17.9.5a does.
+    The mock sends the xcopy-status notifications of each xcopy: when it
+    starts and when it ends, with the reason of the failure. Without
+    xcopy_records the mock records no operation for an xcopy, as IOS XE
+    17.9.5a does, and without xcopy_status it sends no xcopy-status.
+    The copy RPC of Cisco-IOS-XE-rpc replies when the copy ends; with
+    copy_empty it replies that it succeeded and leaves an empty file, as a
+    copy over scp that cannot connect.
     """
     _log = logging.Logger(log_handler)
 
@@ -586,8 +616,10 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
     var rpcs: list[str] = []
     var last_source: ?str = None
     var last_destination: ?str = None
-    # The xcopy that writes the image file now, by uuid.
+    # The xcopy that writes the image file now, by uuid, or the copy RPC, by
+    # its count.
     var downloading: ?str = None
+    var copies = 0
     var last_path: ?str = None
     var last_one_shot: ?str = None
     var last_act_version: ?str = None
@@ -683,6 +715,15 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         _publish()
         after now delay / float(DOWNLOAD_STEPS): _grow(uuid, step + 1, delay)
 
+    def _xcopy_status(uuid: str, status: str, failed: bool=False) -> None:
+        if not xcopy_status:
+            return
+        if failed:
+            mock_server.emit_event(xcopy_status_event(uuid, status, XCOPY_ERRCODE, XCOPY_ERRSTR,
+                                                      XCOPY_DOWNLOAD_ERROR))
+        else:
+            mock_server.emit_event(xcopy_status_event(uuid, status))
+
     def _finish_xcopy(uuid: str) -> None:
         _ended(uuid)
         if downloading == uuid:
@@ -690,13 +731,33 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
         if failure == FAILURE_DOWNLOAD:
             if staged is not None and staged_size < image_size:
                 staged = None
-            _fail(uuid, "1", _DOWNLOAD_STAGES, swxe.STAGE_DOWNLOAD, SUB_DOWNLOAD_FAIL)
+            if xcopy_records:
+                _fail(uuid, "1", _DOWNLOAD_STAGES, swxe.STAGE_DOWNLOAD, SUB_DOWNLOAD_FAIL)
+            _xcopy_status(uuid, swxe.XCOPY_FAILED, True)
         else:
             staged = last_destination
             staged_size = image_size
             if xcopy_records:
                 _record(uuid, "1", _DOWNLOAD_STAGES)
+            _xcopy_status(uuid, swxe.XCOPY_SUCCESS)
         _publish()
+
+    def _finish_copy(token: str, respond: action(children: ?list[xml.Node], tag: ?str,
+                                                  message: ?str) -> None) -> None:
+        """End the copy RPC token, which replies only now."""
+        if downloading == token:
+            downloading = None
+        if failure == FAILURE_DOWNLOAD:
+            if staged is not None and staged_size < image_size:
+                staged = None
+            _publish()
+            respond(None, "invalid-value", copy_failure(last_source if last_source is not None else "",
+                                                        last_destination if last_destination is not None else ""))
+            return
+        staged = last_destination
+        staged_size = 0 if copy_empty else image_size
+        _publish()
+        respond([xml.Node("result", text="RPC request successful")], None, None)
 
     def _finish_add(uuid: str, release: str) -> None:
         _ended(uuid)
@@ -790,6 +851,21 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
             respond([xml.Node("result", text="Delete successful")], None, None)
             return
 
+        # Cisco-IOS-XE-rpc copy has no uuid either: it replies when the copy
+        # ends, and writes the file as it goes.
+        if request.tag == "copy":
+            last_source = _leaf_of(request, "source-drop-node-name")
+            dest = _leaf_of(request, "destination-drop-node-name")
+            last_destination = dest[len("bootflash:"):] if dest is not None and dest.startswith("bootflash:") else dest
+            copies += 1
+            token = "copy-" + str(copies)
+            delay = _delay("xcopy")
+            if delay > 0.0:
+                downloading = token
+                after now delay / float(DOWNLOAD_STEPS): _grow(token, 1, delay)
+            after now delay: _finish_copy(token, respond)
+            return
+
         uuid = _uuid_of(request)
         if uuid is None:
             respond(None, "missing-element", "no uuid in request")
@@ -807,6 +883,8 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
                 nsdefs=[(None, "http://cisco.com/ns/yang/Cisco-IOS-XE-xcopy-rpc")],
                 text=uuid!,
             )], None, None)
+            _xcopy_status(uuid!, "xcopy-start")
+            _xcopy_status(uuid!, "xcopy-inprogress")
             delay = _delay("xcopy")
             if xcopy_records:
                 _run(uuid!, _DOWNLOAD_STAGES, delay)
@@ -893,7 +971,8 @@ actor IosXeSoftwareMock(mock_server: swna.NetconfMockServer,
 
     def place(file: str, size: int) -> None:
         """Put file, of size bytes, on bootflash, as an image that another
-        adapter sends to the device, such as the SCP adapter."""
+        adapter sends to the device, such as the SCP adapter, or that a copy
+        over the CLI writes."""
         staged = file
         staged_size = size
         _publish()
