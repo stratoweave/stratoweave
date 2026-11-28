@@ -28,6 +28,7 @@ Set under `stratoweave-rfs:device=<name>/software`:
 | --- | --- |
 | `target-release` | Release the device should run. Setting it makes the manager read the device, and upgrade it if no veto holds the install. |
 | `image-url` | URL the device downloads the image from. The last part of the path is the file name on the device. |
+| `image-file` | The image's file in the image folder (`software.image_dir`), for an adapter that sends the image to the device. The last part of the path is the file name on the device, also with `image-url`. |
 | `veto[holder]` | While any entry exists, no install starts. The manager still reads the device. An install already running goes on. |
 | `upgrade-campaign` | Campaign whose intent this is. The manager answers each attempt at `target-release` in this campaign as an entry of `state/attempt`. |
 | `attempt` | A number, 0 by default. A new value is a new attempt: the manager reads the device again, and runs a failed upgrade again. A run of another attempt that is under way finishes first. |
@@ -217,6 +218,7 @@ connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
 | list bootflash | `Cisco-IOS-XE-platform-software-oper` | `dir bootflash:` |
 | check the image | none | `verify /sha512`, `verify /md5`, or `verify` for the signature |
 | prepare | `xcopy` from `image-url` to bootflash | `copy` |
+| prepare with the SCP adapter | `put` of `image-file` to bootflash | `put` of `image-file` to bootflash |
 | install | `install` (add only), then `activate` with a 30 minute auto-abort timer | `install add`, then `install activate auto-abort-timer 30` |
 | commit | `install-commit` | `install commit` |
 | rollback | `abort` | `install abort` |
@@ -244,9 +246,17 @@ connects, like NETCONF on 16.8, holds up only the first stage of an upgrade.
   again, also deleted and copied anew, gets another index. A check of a
   735 MB image takes about a minute on a C1111. The driver keeps the
   checks in memory: after a restart it checks again.
+- A device with the SCP adapter as an extra adapter gets its image sent
+  from the image folder: the `put` RPC of the adapter copies `image-file`
+  to bootflash, and the device needs no `image-url`. A device without it
+  fetches its image from `image-url`. The device needs `ip scp server
+  enable`; the adapter says so when the device answers `Administratively
+  disabled.`, and the prepare fails.
 - While the image transfers, the adapter reports how far it is: over
   NETCONF from the size of the file on bootflash at each poll of the
-  `xcopy`, over the CLI from the marks that `copy` prints, one `!` per
+  `xcopy`; during the SCP `put`, which IOS XE writes as it arrives, from
+  that size in the listing over NETCONF, else in `dir bootflash:`; over
+  the CLI from the marks that `copy` prints, one `!` per
   196608 bytes over http (measured on 16.8.1 and 17.15.06). The CLI adapter answers a
   read of `copy-progress` from what the running copy printed, without a
   command.

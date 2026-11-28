@@ -33,7 +33,12 @@ import adapters.software_iosxe as swxe
 import adapters.software_iosxe_mock as swxemock
 import adapters.software_iosxe_oper as ixoper
 import adapters.software_iosxe_yang as swxe_yang
-from adapters.adapter import DeviceAdapter, NoAdapter, BusyError, NotConnectedError, TransientError
+import adapters.scp as scp
+import adapters.scp_data as scp_data
+import adapters.scp_yang as scp_yang
+import std.xml as xml
+from adapters.adapter import DeviceAdapter, NoAdapter, BusyError, NotConnectedError, TransientError, \
+    PermanentError, ModCap, SubscriptionStatus, SUBSCRIPTION_POLL
 from device_schema import DeviceSchema
 
 from device_meta_config import \
@@ -423,6 +428,31 @@ def _test_image_filename_and_paths():
                         "activate must set the abort timer")
     testing.assertEqual("u", swxe.commit_input("u").uuid, "commit carries the uuid")
     testing.assertEqual("u", swxe.abort_input("u").uuid, "abort carries the uuid")
+
+
+def _test_staged_filename():
+    cases: list[(url: ?str, image_file: ?str, want: str)] = [
+        (url=IMAGE_URL, image_file=None, want=IMAGE_FILE),
+        (url=None, image_file="iosxe/" + IMAGE_FILE, want=IMAGE_FILE),
+        (url=None, image_file=IMAGE_FILE, want=IMAGE_FILE),
+        (url=IMAGE_URL, image_file="iosxe/other.bin", want="other.bin"),
+        (url=IMAGE_URL, image_file="", want=IMAGE_FILE),
+        (url=None, image_file=None, want=""),
+        (url="", image_file="", want=""),
+    ]
+    for c in cases:
+        testing.assertEqual(swxe.staged_filename(c.url, c.image_file), c.want, "{c.url} {c.image_file}")
+
+
+def _test_scp_failure_names_the_scp_server():
+    cases: list[(detail: str, want: str)] = [
+        (detail="SCP to bootflash:x.bin failed: unexpected SCP reply: Administratively disabled.",
+         want="SCP to bootflash:x.bin failed: unexpected SCP reply: Administratively disabled. (the device needs ip scp server enable)"),
+        (detail="SCP to bootflash:x.bin failed: Write failed",
+         want="SCP to bootflash:x.bin failed: Write failed"),
+    ]
+    for c in cases:
+        testing.assertEqual(swxe.scp_failure(c.detail), c.want, c.detail)
 
 
 def _test_redact_url_strips_credentials():
@@ -1565,6 +1595,7 @@ def _test_upgrade_plan_follows_the_modules():
     cli = {xecli_yang.MODULE}
     netconf = {swxe.HARDWARE_MODULE, swxe.XCOPY_MODULE, swxe.INSTALL_MODULE, swxe.FILES_MODULE, swxe.CISCO_RPC_MODULE}
     no_files = {swxe.HARDWARE_MODULE, swxe.XCOPY_MODULE, swxe.INSTALL_MODULE}
+    scp_mod = {scp_yang.MODULE}
     # Columns: check, transfer, listing, verify, install, delete.
     cases = [
         ("NETCONF and the CLI, as a C1111 with 17.15", netconf | cli,
@@ -1573,6 +1604,9 @@ def _test_upgrade_plan_follows_the_modules():
          ("netconf", "netconf", "cli", "cli", "netconf", "cli")),
         ("only the CLI, as a C1111 with 16.8.1", cli, ("cli", "cli", "cli", "cli", "cli", "cli")),
         ("only NETCONF, without the CLI adapter", netconf, ("netconf", "netconf", "netconf", "", "netconf", "netconf")),
+        ("NETCONF, the CLI and SCP", netconf | cli | scp_mod, ("netconf", "scp", "netconf", "cli", "netconf", "netconf")),
+        ("only the CLI and SCP", cli | scp_mod, ("cli", "scp", "cli", "cli", "cli", "cli")),
+        ("only SCP", scp_mod, ("", "scp", "", "", "", "")),
         ("nothing", set(), ("", "", "", "", "", "")),
     ]
     for name, modules, want in cases:
@@ -1679,13 +1713,14 @@ VERIFY_COMMAND = "verify /sha512 bootflash:" + IMAGE_FILE + " " + HASH
 CONFIG_CHANGE_COMMANDS = [clitest.RUNNING_CHANGE_COMMAND, clitest.STARTUP_CHANGE_COMMAND]
 
 
-def _dir(files: list[str], free: int=1458692096, modified: str="Jun 18 2019 18:22:26") -> str:
-    """dir bootflash: of a C1111, with these files, modified at modified,
-    and free bytes."""
+def _dir(files: list[str], free: int=1458692096, modified: str="Jun 18 2019 18:22:26",
+         size: int=427968764) -> str:
+    """dir bootflash: of a C1111, with these files of size bytes, modified
+    at modified, and free bytes."""
     lines = ["", "", "Directory of bootflash:/", ""]
     i = 15
     for f in files:
-        lines.append("   " + str(i) + "  -rw-        427968764  " + modified + " +00:00  " + f)
+        lines.append("   " + str(i) + "  -rw-        " + str(size) + "  " + modified + " +00:00  " + f)
         i += 1
     lines.extend(["", "2885718016 bytes total (" + str(free) + " bytes free)", ""])
     return "\r\n".join(lines)
@@ -1708,10 +1743,126 @@ IMAGE_UNSIGNED = IMAGE_SIGNED.replace("Computed Hash   SHA1 : A6C3", "Computed H
     .replace("Digital signature successfully verified in file bootflash:" + IMAGE_FILE, "")
 
 
+actor _ScpRecorder(error: ?str=None, permanent: bool=False, slow: bool=False):
+    """What the SCP adapter of a mock device does. It records each put, and
+    gives it error, a PermanentError when permanent and else a
+    TransientError, or puts the image on the bootflash of the mock and its
+    CliMock. When slow, the image is first there with 400 of its bytes for
+    0.3 s."""
+    var calls: list[str] = []
+    var mock: ?swxemock.IosXeSoftwareMock = None
+    var cli: ?xecli.CliMock = None
+
+    def set_device(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock) -> None:
+        mock = m
+        cli = c
+
+    def connect(dev: swdev.DeviceMgr) -> None:
+        dev.on_connect(scp.modules(), None, "scp")
+
+    def _written(file: str, size: int) -> None:
+        m = mock
+        c = cli
+        if m is not None:
+            m.place(file, size)
+        if c is not None:
+            c.set_reply("dir bootflash:", _dir(["packages.conf", file], size=size))
+
+    def _done(file: str, size: int, cb: action(?ygdata.Node, ?Exception) -> None) -> None:
+        _written(file, size)
+        cb(scp_data.stratoweave_scp__put__output(size=u64(size)).to_gdata(), None)
+
+    def put(cb: action(?ygdata.Node, ?Exception) -> None, request: ygdata.Node) -> None:
+        try:
+            inp = scp.put_input(request)
+        except Exception as e:
+            cb(None, e)
+            return
+        calls.append(inp.local_file + " -> " + inp.remote_file)
+        e = error
+        if e is not None:
+            cb(None, PermanentError(e) if permanent else TransientError(e))
+            return
+        file = scp.remote_name(inp.remote_file)
+        size = swxemock.IMAGE_SIZE
+        if slow:
+            _written(file, 400)
+            after 0.3: _done(file, size, cb)
+        else:
+            _done(file, size, cb)
+
+    def get_calls() -> list[str]:
+        return calls
+
+
+class _FakeScpAdapter(DeviceAdapter):
+    """The SCP adapter of a mock device: it connects at once, and gives each
+    put to recorder."""
+    def __init__(self, dev: swdev.DeviceMgr, log_handler, env: ?Env, recorder: _ScpRecorder):
+        self._log_handler = log_handler
+        self._env = env
+        self._dev = dev
+        self._recorder = recorder
+
+    def supports_mocking(self) -> bool:
+        return True
+
+    def set_dmc(self, new_dmc: DeviceMetaConfig):
+        self._recorder.connect(self._dev)
+
+    def configure(self, done, new_diff, new_conf, running_conf):
+        done(None, None)
+
+    def get_capabilities(self) -> list[str]:
+        return []
+
+    def get_modules(self) -> dict[str, ModCap]:
+        return scp.modules()
+
+    def subscription_method(self) -> str:
+        return SUBSCRIPTION_POLL
+
+    def subscription_status(self) -> SubscriptionStatus:
+        return SubscriptionStatus(SUBSCRIPTION_POLL, emulated=True)
+
+    def fetch_config(self, done: action(?ygdata.Node, ?Exception) -> None):
+        done(ygdata.Container({}), None)
+
+    def get_config(self) -> ?ygdata.Node:
+        return ygdata.Container({})
+
+    def get(self, cb: action(?ygdata.Node, ?Exception) -> None, filt: ?ygdata.FNode=None):
+        cb(ygdata.Container({}), None)
+
+    def rpc(self, cb: action(?ygdata.Node, ?Exception) -> None, gdata_rpc: ygdata.Node):
+        self._recorder.put(cb, gdata_rpc)
+
+    def rpc_xml(self, cb: action(?xml.Node, ?Exception) -> None, xml_rpc: xml.Node):
+        cb(None, ValueError("no XML RPCs"))
+
+    def declare_subscriptions(self, owner_id: str, cb: action(?ygdata.Node, ?Exception) -> None,
+                              want: set[ygdata.SubscriptionSpec], synced: ?action(str) -> None=None):
+        pass
+
+    def remove_subscriptions(self, owner_id: str):
+        pass
+
+
+def _fake_scp(recorder: _ScpRecorder) -> proc(swdev.DeviceMgr, DeviceSchema, DeviceMetaConfig, swdev.SchemaRegistry, logging.Handler, ?Env) -> DeviceAdapter:
+    """Return an adapter type whose adapters give their puts to recorder."""
+    proc def adapter(dev: swdev.DeviceMgr, bundled_schema: DeviceSchema, dmc: DeviceMetaConfig,
+                     registry: swdev.SchemaRegistry, log_handler: logging.Handler, env: ?Env) -> DeviceAdapter:
+        return _FakeScpAdapter(dev, log_handler, env, recorder)
+    return adapter
+
+
 def new_iosxe_cli_mock_device_mgr(t: testing.EnvT, name: str,
-                                  on_reconf: action(str) -> None, files: bool=True) -> swdev.DeviceMgr:
+                                  on_reconf: action(str) -> None, files: bool=True,
+                                  scp_recorder: ?_ScpRecorder=None) -> swdev.DeviceMgr:
     """A mock device with NETCONF and the IOS XE CLI adapter beside it.
-    Without files, its NETCONF has no Cisco-IOS-XE-platform-software-oper."""
+    Without files, its NETCONF has no Cisco-IOS-XE-platform-software-oper.
+    With scp_recorder, the device has an SCP adapter that gives its puts to
+    it."""
     models = list(swxe_yang.models) if files else [swxe_yang.xcopy_rpc, swxe_yang.install_rpc,
                                                    swxe_yang.install_oper, swxe_yang.device_hardware_oper]
     schema = yang.compile(models)
@@ -1722,10 +1873,16 @@ def new_iosxe_cli_mock_device_mgr(t: testing.EnvT, name: str,
         "iosxe-cli": swdev.DeviceType(name="iosxe-cli", adapter_type=clitest.live_adapter,
                                       src_dnode=cli_schema, oper_src_dnode=cli_schema),
     }
+    if scp_recorder is not None:
+        scp_schema = yang.compile(scp_yang.models)
+        dev_types["scp"] = swdev.DeviceType(name="scp", adapter_type=_fake_scp(scp_recorder),
+                                            src_dnode=scp_schema, oper_src_dnode=scp_schema)
     dev = swdev.DeviceMgr(dev_types, t.env, name, t.log_handler, on_reconf, swdev.SchemaRegistry())
     dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe")
     dmc.mock.enabled = True
     dmc.extra_adapter.create("iosxe-cli")
+    if scp_recorder is not None:
+        dmc.extra_adapter.create("scp")
     dev.set_dmc(dmc)
     return dev
 
@@ -1735,7 +1892,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
                   timeout: float=2.5, preadded: ?str=None, checksum: bool=True, image_output: str="",
                   running: str=OLD_RELEASE, committed: ?str=None, files: bool=True,
                   verify_delay: float=0.0, restamped: bool=False, upgrade_duration: float=0.0,
-                  sized: bool=False, xcopy_records: bool=True):
+                  sized: bool=False, xcopy_records: bool=True, scp_recorder: ?_ScpRecorder=None,
+                  image_url: bool=True, image_file: ?str=None):
     """Drive one mock device with a sha512 image checksum from software intent
     to a settled status. The CliMock answers dir bootflash: with dir_output,
     and with a listing that has the image once the device took an xcopy, and
@@ -1747,7 +1905,10 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
     committed when it differs. When restamped, the image has another date
     after its first check, as when someone copies it again. upgrade_duration
     is the mock's; when sized, the intent has the image size of the mock.
-    The progress that the prepare job showed is in progress_seen."""
+    With scp_recorder, the device has an SCP adapter that gives its puts to
+    it. Without image_url, the intent has no image URL; image_file is the
+    image's file in the image folder that it names. The progress that the
+    prepare job showed is in progress_seen."""
     var dev_ref: ?swdev.DeviceMgr = None
     var mock: ?swxemock.IosXeSoftwareMock = None
     var cli: ?xecli.CliMock = None
@@ -1779,7 +1940,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         d = dev_ref
         if d is not None:
             mods = d.get_modules().0
-            if "Cisco-IOS-XE-install-oper" not in mods or xecli_yang.MODULE not in mods:
+            if "Cisco-IOS-XE-install-oper" not in mods or xecli_yang.MODULE not in mods or \
+                    (scp_recorder is not None and scp_yang.MODULE not in mods):
                 after 0.01: start()
                 return
             _attach(d)
@@ -1806,6 +1968,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
                                        xcopy_records=xcopy_records)
         mock = m
         cli = c
+        if scp_recorder is not None:
+            scp_recorder.set_device(m, c)
         m.attach()
         c.set_reply("dir bootflash:", dir_output)
         c.set_reply(clitest.RUNNING_CHANGE_COMMAND, clitest.CONFIG_CHANGE_SAVED)
@@ -1815,7 +1979,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         c.set_delay(VERIFY_COMMAND, verify_delay)
         if restamped:
             c.set_reply_on(VERIFY_COMMAND, "dir bootflash:", DIR_STAGED_LATER)
-        software = Software("camp-1", NEW_REQUESTED, image_url=IMAGE_URL)
+        software = Software("camp-1", NEW_REQUESTED, image_url=IMAGE_URL if image_url else None)
+        software.image_file = image_file
         if sized:
             software.image_size = u64(swxemock.IMAGE_SIZE)
         if checksum:
@@ -1823,6 +1988,8 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
         dmc = DeviceMetaConfig(name, Credentials("admin", "admin"), type="iosxe", software=software)
         dmc.mock.enabled = True
         dmc.extra_adapter.create("iosxe-cli")
+        if scp_recorder is not None:
+            dmc.extra_adapter.create("scp")
         d.set_dmc(dmc)
         after 0.02: poll()
 
@@ -1843,7 +2010,7 @@ actor _StagingRun(t: testing.EnvT, name: str, dir_output: str, verify_output: st
 
 
     def __startup__():
-        dev_ref = new_iosxe_cli_mock_device_mgr(t, name, on_reconf, files)
+        dev_ref = new_iosxe_cli_mock_device_mgr(t, name, on_reconf, files, scp_recorder)
         after 0.01: start()
         after timeout: report_timeout()
 
@@ -1971,6 +2138,125 @@ actor _test_iosxe_missing_image_is_copied_and_verified(t: testing.EnvT):
 
     def __startup__():
         _StagingRun(t, "d-missing", DIR_EMPTY, VERIFY_EQUAL, settled)
+
+
+
+actor _test_iosxe_missing_image_is_sent_over_scp(t: testing.EnvT):
+    """A device with an SCP adapter gets the image file of its intent sent
+    from the image folder, without an image URL and without xcopy, and the
+    CLI verifies it."""
+    recorder = _ScpRecorder()
+
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["install", "activate", "install-commit", "remove"], m.get_rpcs())
+            testing.assertEqual(["iosxe/" + IMAGE_FILE + " -> bootflash:" + IMAGE_FILE], recorder.get_calls(),
+                                "one put in prepare; install finds the image")
+            testing.assertTrue(VERIFY_COMMAND in c.get_commands(), "the image is verified")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def __startup__():
+        _StagingRun(t, "d-scp", DIR_EMPTY, VERIFY_EQUAL, settled, scp_recorder=recorder,
+                    image_url=False, image_file="iosxe/" + IMAGE_FILE)
+
+
+
+actor _test_iosxe_scp_without_image_file_fetches(t: testing.EnvT):
+    """A device with an SCP adapter, whose intent names no image file,
+    fetches its image from the image URL with xcopy."""
+    recorder = _ScpRecorder()
+
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            testing.assertEqual(["xcopy", "install", "activate", "install-commit", "remove"], m.get_rpcs())
+            testing.assertEqual([], recorder.get_calls())
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def __startup__():
+        _StagingRun(t, "d-scp-no-file", DIR_EMPTY, VERIFY_EQUAL, settled, scp_recorder=recorder)
+
+
+
+actor _test_iosxe_scp_refusal_fails_prepare(t: testing.EnvT):
+    """A device that refuses the SCP transfer fails prepare at once, with
+    the error of the SCP adapter and what IOS XE needs, and no xcopy. The
+    SCP adapter gives a refusal as a PermanentError."""
+    error = "SCP to bootflash:" + IMAGE_FILE + " failed: unexpected SCP reply: Administratively disabled."
+    recorder = _ScpRecorder(error=error, permanent=True)
+
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("failed", status, d.get_swmgr().get_reason())
+            reason = d.get_swmgr().get_reason()
+            testing.assertTrue(reason is not None and error + " (the device needs ip scp server enable)" in reason, str(reason))
+            testing.assertEqual([], m.get_rpcs())
+            testing.assertEqual(1, len(recorder.get_calls()))
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def __startup__():
+        _StagingRun(t, "d-scp-refused", DIR_EMPTY, VERIFY_EQUAL, settled, scp_recorder=recorder,
+                    image_file="iosxe/" + IMAGE_FILE)
+
+
+
+actor _test_iosxe_scp_progress(t: testing.EnvT):
+    """While the SCP adapter sends the image, the prepare job shows how far
+    it is, from the size of the file on bootflash."""
+    recorder = _ScpRecorder(slow=True)
+    var run: ?_StagingRun = None
+
+    def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+        try:
+            testing.assertEqual("succeeded", status, d.get_swmgr().get_reason())
+            r = run
+            seen = r!.get_progress_seen() if r is not None else []
+            testing.assertTrue(u64(40) in seen, "the progress of 400 of 1000 bytes: {seen}")
+            t.success()
+        except Exception as e:
+            t.failure(e)
+
+    def __startup__():
+        run = _StagingRun(t, "d-scp-progress", DIR_EMPTY, VERIFY_EQUAL, settled, scp_recorder=recorder,
+                          sized=True, image_url=False, image_file="iosxe/" + IMAGE_FILE, timeout=5.0)
+
+
+
+actor _test_iosxe_image_file_without_scp_fails_prepare(t: testing.EnvT):
+    """A device without an SCP adapter fetches its image: an intent with an
+    image file and no image URL fails prepare, and so does one with
+    neither."""
+    var left = 2
+
+    def check(want: str) -> action(swxemock.IosXeSoftwareMock, xecli.CliMock, swdev.DeviceMgr, str) -> None:
+        def settled(m: swxemock.IosXeSoftwareMock, c: xecli.CliMock, d: swdev.DeviceMgr, status: str) -> None:
+            try:
+                testing.assertEqual("failed", status, d.get_swmgr().get_reason())
+                reason = d.get_swmgr().get_reason()
+                testing.assertTrue(reason is not None and want in reason, str(reason))
+                testing.assertEqual([], m.get_rpcs())
+            except Exception as e:
+                t.failure(e)
+                return
+            left -= 1
+            if left == 0:
+                t.success()
+        return settled
+
+    def __startup__():
+        _StagingRun(t, "d-file-no-scp", DIR_EMPTY, VERIFY_EQUAL,
+                    check("no image-url configured: without an SCP adapter, the device fetches its image"),
+                    image_url=False, image_file="iosxe/" + IMAGE_FILE)
+        _StagingRun(t, "d-no-source", DIR_EMPTY, VERIFY_EQUAL,
+                    check("no image-url or image-file configured for release " + NEW_REQUESTED),
+                    image_url=False)
 
 
 

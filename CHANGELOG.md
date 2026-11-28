@@ -329,6 +329,15 @@
   `rollback`, `run`, `show` and `show | compare`. With a command as
   arguments, it runs that command and exits. Without a terminal, it reads
   commands line by line from stdin. [#843] [#862] [#866] [#871]
+- The SCP adapter, `adapters.scp.ScpAdapter`, copies files from the image
+  folder to a device over SCP, as an extra adapter. Its `put` RPC sends one
+  file. It logs in to the SSH server of the device's CLI, port 22 by
+  default, on a connection of its own for each transfer. IOS XE, IOS XR and
+  Junos take no SCP on the NETCONF port, 830. A device that refuses the
+  file gives a `PermanentError`, a lost connection a `TransientError`.
+  `DeviceRegistry` and `DeviceMgr` take `images`, an
+  `image_dir.ImageReader` of the image folder; StratoWeave gives them one
+  when `software.image_dir` is set.
 
 ### Software Images & Upgrades
 - Software images can be uploaded over HTTP into an image folder, set with
@@ -488,6 +497,12 @@
   gives to prepares: the most that the members of one software campaign
   use together to copy their images, when the campaign sets none. It is 1
   Gbit/s by default. [#856]
+- The software intent of a device has `image-file`, the image's file in the
+  image folder. The IOS XE adapter sends `image-file` with the SCP adapter
+  when the device has one, and needs no `image-url` then; it reports the
+  size of the file on bootflash while it sends. A device that answers
+  `Administratively disabled.` needs `ip scp server enable`, and the
+  prepare fails with that.
 
 ### Fleet Manager
 - Campaigns show each device's pre-check and post-check verdicts, upgrade
@@ -1080,6 +1095,12 @@
   budget counts it, and an edit that gives one to any other member fails the
   same way. Before, a new version made a member that was done upgrade again,
   and a new attempt made a member that succeeded read its release again.
+- A fleet device with an `extra-adapter` of type `scp` gets its image sent
+  from the image folder over SCP. Campaigns write the image's file into the
+  software intent, and alarm on a missing `url-base` only for the members
+  that fetch their image. The top gives its flotillas the image folder of
+  its command line. The lab CEs take SCP, and `just SCP=1 add-devices`
+  onboards them with the SCP adapter.
 
 ### Dependencies
 

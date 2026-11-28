@@ -89,7 +89,13 @@ that it has released. So run `just upgrade-clear` before you run
 Without it, the edit fails.
 
 Staging takes about two minutes for a ~1 GB image and the reload another
-four. The post-check then waits for a BGP sample taken after the reload that
+four.
+
+`just SCP=1 add-devices` onboards the CEs with the SCP adapter: their
+flotillas send the image from the image folder, which `just run` sets to
+`image-server/images`, instead of the CEs fetching it from the image
+server. The CEs take SCP on port 22 with `ip scp server enable` from their
+day-0 config. A C8000V wrote 100 MB in 12 s that way. The post-check then waits for a BGP sample taken after the reload that
 is back at the pre-check's baseline before the commit goes out.
 
 ## The demo fleets in the running lab
